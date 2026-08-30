@@ -2493,226 +2493,40 @@ fn a_region_that_cannot_find_an_items_end_blanks_the_attribute_not_the_file() {
 // The T-CONTAINER mechanical checklist
 // ---------------------------------------------------------------------------
 
-/// The nineteen tests `transaction_fault_matrix` row `T-CONTAINER` names in its
-/// `test:` field, transcribed from the frozen packet.
-///
-/// **Transcribed, not read.** The packet is not in this repository, so the list
-/// is a literal here the way [`PACKET_PRIMITIVES`] is — the no-self-oracle rule
-/// requires the expected values to come from the packet's text rather than from
-/// the tree, and a literal is the only shape that survives into CI.
-///
-/// Order is the packet's own. `windows_orphan_window_documented` is the last
-/// entry and the packet writes it as `windows_orphan_window_documented (ST-16)`;
-/// the trailing citation is not part of the identifier.
-const T_CONTAINER_TESTS: [&str; 19] = [
-    "container_intent_written_before_run",
-    "container_created_from_recorded_image_id_and_verified",
-    "substituted_image_id_refused_before_start",
-    "orphan_reclaimed_before_slot_reset",
-    "live_owner_untouched_while_dead_orphan_reclaimed",
-    "labeled_orphan_without_intent_reclaimed",
-    "same_run_resume_reclaims_earlier_incarnation_orphan",
-    "same_run_resume_censuses_recorded_root_after_default_changed",
-    "probe_name_reuse_across_incarnations_never_collides",
-    "repeated_crashes_reclaim_every_dead_incarnation",
-    "concurrent_reclaimers_converge",
-    "schema4_probe_container_owned_during_preflight_untouched_by_foreign_census",
-    "legacy_container_selection_refused_before_effects",
-    "census_refuses_when_intents_exist_without_reachable_runtime",
-    "census_proceeds_without_runtime_when_no_intent_exists",
-    "census_report_names_reclaimed_probe_boundary",
-    "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
-    "unix_reaper_kills_labeled_containers",
-    "windows_orphan_window_documented",
-];
+// The nineteen-name transcription, the presence predicate they share and both
+// bodies are in `contract_mappings::mappings`, beside this file, with the three
+// R3b enumerations below. The names here are the harness -- they are what the
+// contract, CI and `--list` know -- and each one delegates and does nothing
+// else.
+//
+// The boundary is drawn at "resolves a transcribed enumeration against the
+// tree, and writes nothing". Both do exactly that, so the child restores the
+// three effect denials `super` allows and takes no allowlist entry.
+//
+// `the_view_directory_has_one_definition_in_the_tree` below is a mapping test
+// by shape and deliberately did NOT follow them. It constructs a
+// `ContainerName` to drive the mount side against the census side, and that is
+// one of the five needles `runner::container::resolve::tests::
+// no_module_outside_the_container_runner_writes_a_container_intent` counts over
+// the WHOLE file -- not over a production region, so an inline `cfg(test)`
+// module does not close it. That census excludes this file by exact path and
+// its exclusion names this very test as the reason; a child holding it would
+// need a second exclusion there, which is a change to another slice's census
+// rather than a consequence of moving a declaration. The same cut, for the same
+// reason, that left the effectful build helpers out of `policy.rs`.
 
-/// Where `name` is defined as a `#[test]` function, over code with comments and
-/// string literals blanked.
-///
-/// Blanked, because the failure this predicate exists to avoid is a name that
-/// appears only in prose. Nine of the nineteen are quoted in a doc comment
-/// somewhere in `src/runner/container/**` — `substituted_image_id_refused_
-/// before_start` is named in `runtime.rs` and twice in `fake.rs` and is a
-/// function in neither — so a `grep` for the bare string passes on a tree that
-/// deleted the test and kept the sentence describing it.
-fn defining_test_sites(name: &str) -> Vec<String> {
-    let needle = format!("fn {name}(");
-    let mut sites = Vec::new();
-    for (path, source) in scanned_sources() {
-        let code = blank_comments_and_strings(&source);
-        let Some(index) = code.find(&needle) else {
-            continue;
-        };
-        // `#[test]` sits above the signature, separated at most by the other
-        // attributes a test carries (`#[cfg(...)]`, `#[should_panic]`) and by
-        // the doc comment, which blanking has already turned into spaces.
-        let preceding = &code[index.saturating_sub(400)..index];
-        if preceding.contains("#[test]") {
-            sites.push(path);
-        }
-    }
-    sites
-}
+mod contract_mappings;
 
-/// Every test `T-CONTAINER` names exists in this tree, as a test.
-///
-/// **The gate no gate was reading.** `phase9.sh` reads
-/// `decisions.pr_sequence[N].slice_contract.proof_tests` and fails a slice that
-/// deletes or renames one of its contract-named proof tests — the repair for
-/// `PR4-CONTRACT-NAMED-PROOF-TEST-DELETED`. All **four** of PR6's `proof_tests`
-/// are prose describing test families, so that gate parses zero identifiers out
-/// of this slice and its zero-checked-is-a-failure rule fires without measuring
-/// anything. The slice's actual mechanical checklist is somewhere else
-/// entirely: `transaction_fault_matrix` row `T-CONTAINER`'s `test:` field, which
-/// nothing in this repository read.
-///
-/// **This gate is orchestrator-added, not packet-required**, and says so rather
-/// than implying otherwise. The packet enumerates the nineteen tests; it does
-/// not require a meta-test that transcribes them. It is a control, kept because
-/// a slice whose only mechanical checklist is unread is worse off without one.
-///
-/// # What this proves, and what it does not
-///
-/// **Proves:** each of the nineteen names is a `#[test]` function in real code
-/// — not in a comment, not in a string literal, not merely a helper `fn` with
-/// the right name. A rename, a deletion, or a demotion to a plain function
-/// fails it by name, on every platform, because it is a source census rather
-/// than a symbol census (two of the nineteen are behind `cfg(unix)` /
-/// `cfg(windows)` and a symbol census would report each missing on the other
-/// platform).
-///
-/// **Does not prove:** that any of them tests what its name claims. A test with
-/// the right name and a tautological body satisfies this gate completely. That
-/// is the boundary, stated here rather than left for a reviewer to find: this
-/// is a **presence** gate over an enumeration nothing else reads, and the
-/// evidence that the nineteen hold their clauses is the mutation witnessing in
-/// the lanes' own reports, not this.
-///
-/// The second field it holds constant is the **body**; what varies is the
-/// name and the file. The controls at the end vary the other way — one body
-/// shape at a time, name held fixed — so the predicate is shown refusing a
-/// comment, a string and a plain `fn`, and accepting a real test.
+use contract_mappings::mappings;
+
 #[test]
 fn every_test_the_container_fault_row_names_is_a_test_in_this_tree() {
-    // The transcription itself is checked for the two ways a hand-written list
-    // decays: a duplicate (which would let a missing name hide behind a present
-    // one and keep the count at nineteen) and a name that is not an identifier.
-    let unique: BTreeSet<&str> = T_CONTAINER_TESTS.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        T_CONTAINER_TESTS.len(),
-        "the transcription repeats a name"
-    );
-    for name in T_CONTAINER_TESTS {
-        assert!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-                && name.contains('_'),
-            "`{name}` is not the snake_case identifier the fault row names"
-        );
-    }
-
-    let mut absent = Vec::new();
-    let mut found = 0usize;
-    for name in T_CONTAINER_TESTS {
-        match defining_test_sites(name).as_slice() {
-            [] => absent.push(name),
-            sites => {
-                found += 1;
-                assert_eq!(
-                    sites.len(),
-                    1,
-                    "`{name}` is defined as a test in {} files ({sites:?}); the fault row names \
-                     one test and two would let either rot",
-                    sites.len()
-                );
-            }
-        }
-    }
-    assert!(
-        absent.is_empty(),
-        "T-CONTAINER names {} tests and {} are not tests in src/: {absent:#?}\n\
-         The fault row is this slice's mechanical checklist and nothing else reads it.",
-        T_CONTAINER_TESTS.len(),
-        absent.len()
-    );
-    assert_eq!(found, T_CONTAINER_TESTS.len());
-
-    // POSITIVE CONTROL. A census that can only say yes reports success from a
-    // predicate that matched nothing -- `PR5-DOCKER-CENSUS-CANNOT-FAIL`, where a
-    // needle that lived inside a string made the search unfalsifiable. Drive the
-    // same predicate over a name that is not in the tree and require it to say
-    // so, so a `defining_test_sites` that returned a constant fails here.
-    assert!(
-        defining_test_sites("a_test_this_tree_does_not_contain_and_never_will").is_empty(),
-        "the predicate finds a test that does not exist, so its `absent` list means nothing"
-    );
-
-    // And it must be reading a tree. `scanned_sources` asserts its own walk
-    // found files; this asserts the *blanking* left code behind, because a
-    // blanker that erased everything would make every name absent and the
-    // failure would read as nineteen deleted tests.
-    let (_, container) = scanned_sources()
-        .into_iter()
-        .find(|(path, _)| path == "src/runner/container/tests.rs")
-        .expect("the container suite is in the scanned tree");
-    let blanked = blank_comments_and_strings(&container);
-    assert!(
-        blanked.contains("#[test]"),
-        "the blanker erased the code it is meant to leave"
-    );
-    assert!(
-        !blanked.contains("Orderings are most of the contract"),
-        "the blanker left a doc comment behind, so a name in prose would satisfy this gate"
-    );
+    mappings::every_fault_row_name_is_a_test_in_the_tree();
 }
 
-/// The presence predicate refuses every shape that is not a test.
-///
-/// Separated from the gate above so a failure says which half broke: the tree,
-/// or the thing that reads it. Each source varies exactly one property against
-/// the accepted shape and holds the name fixed.
 #[test]
 fn the_container_fault_row_predicate_refuses_a_name_that_is_only_prose() {
-    let name = "concurrent_reclaimers_converge";
-    let needle = format!("fn {name}(");
-
-    // Accepted: a real test.
-    let accepted = format!("#[test]\nfn {name}() {{ assert!(true); }}\n");
-    let code = blank_comments_and_strings(&accepted);
-    assert!(code.contains(&needle) && code.contains("#[test]"));
-
-    // Refused, one property changed at a time.
-    for (label, source) in [
-        (
-            "a doc comment",
-            format!("/// see fn {name}()\nfn other() {{}}\n"),
-        ),
-        (
-            "a line comment",
-            format!("// fn {name}()\nfn other() {{}}\n"),
-        ),
-        (
-            "a block comment",
-            format!("/* fn {name}() */\nfn other() {{}}\n"),
-        ),
-        (
-            "a string literal",
-            format!("const N: &str = \"fn {name}()\";\n"),
-        ),
-        ("a plain fn", format!("fn {name}() {{}}\n")),
-    ] {
-        let code = blank_comments_and_strings(&source);
-        let is_test = code
-            .find(&needle)
-            .is_some_and(|index| code[index.saturating_sub(400)..index].contains("#[test]"));
-        assert!(
-            !is_test,
-            "{label} satisfies the presence predicate, so the gate passes on a deleted test"
-        );
-    }
+    mappings::the_presence_predicate_refuses_a_non_test_shape();
 }
 
 /// The R19 view directory has **one** definition in this tree.
@@ -2864,288 +2678,14 @@ fn every_production_region_that_stops_early_stops_at_a_module() {
 // R3b: the enumerations the reconciliation promised and did not supply
 // ---------------------------------------------------------------------------
 
-/// The nine `expected_failures_refusals`, each with the **ordering predicate**
-/// it carries and the test that holds it.
-///
-/// `PR6-ENUM-011`. The reconciliation document states that the nine refusals
-/// and the twelve ST-16 variants "are mapped" and never supplies the mappings,
-/// so a clause with neither a named test nor an owned deferral was
-/// indistinguishable from one with both. A promise in a markdown file is not
-/// something a build can read; this is.
-///
-/// `(clause, ordering predicate, test)`. The ordering is written out because it
-/// is the **independently droppable** half: a refusal test that proves only
-/// *that* it refused holds none of "before any effect", "before any lock or
-/// effect", "before any spawn", "before start", "before any recovery event", or
-/// "by construction".
-const PR6_REFUSALS: [(&str, &str, &str); 9] = [
-    (
-        "[runner] kind = container under a schema-1..3 fresh run or resume",
-        "before any effect",
-        "legacy_container_selection_refused_before_effects",
-    ),
-    (
-        "unreachable runtime / reference absent / credential volume absent, at resolution",
-        "before any lock or effect",
-        "resolution_refuses_each_of_its_faults_before_any_lock_or_effect",
-    ),
-    (
-        "a recorded shell or agent CLI that fails inside the recorded image",
-        "before any recovery event or work spawn",
-        "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
-    ),
-    (
-        "a created container whose reported image id differs from the record",
-        "before start",
-        "substituted_image_id_refused_before_start",
-    ),
-    (
-        "reviewer write attempt",
-        "the mount is `:ro`, so the write fails in the runtime",
-        "real_docker_refuses_a_reviewer_write_to_its_read_only_mount",
-    ),
-    (
-        "gate write outside mount",
-        "the container root is read-only, so the write fails in the runtime",
-        "real_docker_a_gate_write_outside_every_declared_mount_fails",
-    ),
-    (
-        "container start without an intent",
-        "by construction",
-        "a_container_is_created_and_started_only_under_its_own_intent_record",
-    ),
-    (
-        "an intent naming this process's own incarnation at census time",
-        "before any effect",
-        "an_intent_naming_this_processs_own_incarnation_is_refused_before_any_effect",
-    ),
-    (
-        "an unreclaimable labeled container / intents without a reachable runtime",
-        "blocks admission; before any recovery event",
-        "census_refuses_when_intents_exist_without_reachable_runtime",
-    ),
-];
+// The three enumerations this section supplies -- the nine refusals with their
+// ordering predicates, the twelve ST-16 variants and the twelve clauses -- and
+// the body that holds them are in `contract_mappings::mappings` with the
+// T-CONTAINER transcription above. They are resolved by the same
+// `defining_test_sites` census and belong beside it; the name below is the
+// harness and delegates.
 
-/// The twelve ST-16 variants (a)–(l), each mapped to the test that drives it.
-///
-/// `PR6-ENUM-011`. `T_CONTAINER_TESTS` is the packet's `test:` field and is a
-/// *presence* list; this is the **variant** enumeration, which is a different
-/// axis — several variants share a named test and one variant is carried by a
-/// test the `test:` field does not name.
-const ST16_VARIANTS: [(char, &str, &str); 12] = [
-    (
-        'a',
-        "single owner dies -> next write-command start reclaims",
-        "orphan_reclaimed_before_slot_reset",
-    ),
-    (
-        'b',
-        "live coordinator A while dead B's orphan exists in the same private root",
-        "live_owner_untouched_while_dead_orphan_reclaimed",
-    ),
-    (
-        'c',
-        "labeled container without an intent, same liveness rule",
-        "labeled_orphan_without_intent_reclaimed",
-    ),
-    (
-        'd',
-        "the Unix reaper kills labeled containers",
-        "unix_reaper_kills_labeled_containers",
-    ),
-    (
-        'e',
-        "Windows documents the orphan window",
-        "windows_orphan_window_documented",
-    ),
-    (
-        'f',
-        "same-run resume censuses the recorded root after the default moved",
-        "same_run_resume_censuses_recorded_root_after_default_changed",
-    ),
-    (
-        'g',
-        "three incarnations, orphans from two dead ones, no collision",
-        "repeated_crashes_reclaim_every_dead_incarnation",
-    ),
-    (
-        'h',
-        "a foreign write command and the resuming incarnation converge",
-        "concurrent_reclaimers_converge",
-    ),
-    (
-        'i',
-        "schema-1..3 container selection refused; schema-4 probe containers untouched by a foreign census",
-        "schema4_probe_container_owned_during_preflight_untouched_by_foreign_census",
-    ),
-    (
-        'j',
-        "intents present and runtime unreachable -> refuse; no intent and no runtime -> proceed",
-        "census_proceeds_without_runtime_when_no_intent_exists",
-    ),
-    (
-        'k',
-        "a probe container killed before run_started is reclaimed, its boundary named",
-        "census_report_names_reclaimed_probe_boundary",
-    ),
-    (
-        'l',
-        "a resume whose pre-flight probe fails ends before any recovery event, resumable",
-        "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
-    ),
-];
-
-/// The clauses of `invariants_introduced` and of ST-20 that this slice owns,
-/// each with a test **or** an owned deferral.
-///
-/// `PR6-ENUM-011`. The reconciliation decomposed neither, so descendant
-/// containment, resumed-epoch attribution and report/status attribution had
-/// neither a named test nor an owner. A deferral is written as
-/// `defer:<slice>` and is as much an answer as a test name — what is not an
-/// answer is silence.
-const PR6_CLAUSES: [(&str, &str); 12] = [
-    (
-        "role mounts and no others",
-        "the_mount_set_is_the_roles_own_and_reaches_nothing_of_the_coordinators",
-    ),
-    (
-        "no engine refs, event log, or private artifacts visible",
-        "the_role_view_carries_no_engine_refs_and_no_link_back_into_the_repository",
-    ),
-    (
-        "disposable Git view",
-        "a_git_dependent_tool_reads_the_role_view_and_cannot_see_the_engines_refs",
-    ),
-    (
-        "probes certify the shell and CLI that will run",
-        "the_shell_probe_runs_through_this_runner_as_a_registered_container_invocation",
-    ),
-    (
-        "container contains descendants",
-        "real_docker_a_container_contains_a_daemonised_descendant",
-    ),
-    (
-        "INV-15: container intent/reclaim with incarnation-aware owner liveness",
-        "the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock",
-    ),
-    (
-        "every container invocation has an owner run whose identity precedes it",
-        "legacy_container_selection_refused_before_effects",
-    ),
-    (
-        "INV-23: resolution by inspection, immutable image id, creation from the id with verification",
-        "container_created_from_recorded_image_id_and_verified",
-    ),
-    (
-        "INV-23: rebuild-from-record, inspection refusals before any spawn",
-        "the_rebuild_returns_the_recorded_runner_exactly_however_the_config_differs",
-    ),
-    (
-        "ST-20: every probe and invocation of the RESUMED epoch executes under the recorded boundary",
-        "defer:PR7",
-    ),
-    (
-        "ST-20: report.json and status name the run's kind, policy, image reference, id and digest",
-        "defer:PR10",
-    ),
-    ("the container transition is wired into a run", "defer:PR7"),
-];
-
-/// Every enumeration the reconciliation promised is supplied here, and every
-/// entry either names a test that exists or defers to a named slice.
-///
-/// `PR6-ENUM-011`. Three separate claims, each of which the document made and
-/// none of which anything read:
-///
-/// 1. the **nine** refusals are mapped — and to an *ordering predicate* as well
-///    as to a test, because the ordering is the droppable half;
-/// 2. the **twelve** ST-16 variants (a)–(l) are mapped;
-/// 3. `invariants_introduced` and the prose `proof_tests` are decomposed into
-///    clauses, each with a test **or an owned deferral**.
-///
-/// A name that is not a `#[test]` in this tree fails here, through the same
-/// [`defining_test_sites`] census `T_CONTAINER_TESTS` uses — so this cannot be
-/// satisfied by prose, by a helper function with the right name, or by a string
-/// in a comment.
-///
-/// **What this does not prove**, stated for the same reason the gate above
-/// states it: that the named test holds the clause. This is a *mapping* gate.
-/// The evidence that the clauses hold is the mutation witnessing recorded in
-/// the repair reports.
 #[test]
 fn every_pr6_refusal_st16_variant_and_invariant_clause_names_a_test_or_an_owner() {
-    // (1) The nine refusals, with distinct clauses and distinct orderings.
-    assert_eq!(PR6_REFUSALS.len(), 9, "the contract states nine refusals");
-    let clauses: BTreeSet<&str> = PR6_REFUSALS.iter().map(|(clause, ..)| *clause).collect();
-    assert_eq!(clauses.len(), 9, "two rows name the same refusal");
-    let orderings: BTreeSet<&str> = PR6_REFUSALS.iter().map(|(_, order, _)| *order).collect();
-    assert!(
-        orderings.len() >= 5,
-        "the nine refusals carry {} distinct ordering predicates; a mapping in which every \
-         refusal has the same ordering is one that dropped the orderings",
-        orderings.len()
-    );
-
-    // (2) The twelve ST-16 variants, (a)-(l), each present exactly once.
-    assert_eq!(ST16_VARIANTS.len(), 12);
-    let letters: Vec<char> = ST16_VARIANTS.iter().map(|(letter, ..)| *letter).collect();
-    assert_eq!(
-        letters,
-        ('a'..='l').collect::<Vec<char>>(),
-        "the variants are not (a) through (l), in order and complete"
-    );
-
-    // (3) The clause decomposition, with deferrals owned by a named slice.
-    let deferred: Vec<&str> = PR6_CLAUSES
-        .iter()
-        .map(|(_, answer)| *answer)
-        .filter(|answer| answer.starts_with("defer:"))
-        .collect();
-    assert!(
-        !deferred.is_empty(),
-        "a decomposition in which nothing is deferred is one that quietly claimed PR7's and \
-         PR10's clauses"
-    );
-    for answer in &deferred {
-        let owner = answer.trim_start_matches("defer:");
-        assert!(
-            owner.starts_with("PR") && owner[2..].chars().all(|c| c.is_ascii_digit()),
-            "`{answer}` defers to nobody in particular"
-        );
-    }
-
-    // Every name that is not a deferral is a `#[test]` in this tree.
-    let named: Vec<&str> = PR6_REFUSALS
-        .iter()
-        .map(|(_, _, test)| *test)
-        .chain(ST16_VARIANTS.iter().map(|(_, _, test)| *test))
-        .chain(
-            PR6_CLAUSES
-                .iter()
-                .map(|(_, answer)| *answer)
-                .filter(|answer| !answer.starts_with("defer:")),
-        )
-        .collect();
-    assert!(named.len() >= 28, "{}", named.len());
-    for name in &named {
-        assert!(
-            !defining_test_sites(name).is_empty(),
-            "`{name}` is named by the PR6 reconciliation and is not a `#[test]` in this tree"
-        );
-    }
-
-    // And the ST-16 mapping is consistent with the packet's own `test:` field:
-    // every variant's test that appears there appears under the same name.
-    for (letter, _, test) in &ST16_VARIANTS {
-        if T_CONTAINER_TESTS.contains(test) {
-            continue;
-        }
-        // A variant carried by a test the `test:` field does not name is
-        // allowed and must be visible, not silent.
-        assert!(
-            matches!(letter, 'a' | 'b' | 'i'),
-            "ST-16 ({letter}) is mapped to `{test}`, which the packet's own `test:` field does \
-             not name; only the variants whose clause is split across tests may do that"
-        );
-    }
+    mappings::every_promised_mapping_names_a_test_or_an_owner();
 }
