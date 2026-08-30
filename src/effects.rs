@@ -2809,6 +2809,17 @@ pub(crate) mod lint_levels {
         /// the file failing to build, and a reader that folded it into a level
         /// would report a governance state for a file that has none.
         pub(crate) refused_downgrade: bool,
+        /// The prologue says something about this lint that the reader cannot
+        /// resolve to one answer for every supported target — a `cfg_attr`
+        /// whose condition names a target, a feature or `test`, or an
+        /// attribute shape the reader does not understand.
+        ///
+        /// It is a **refusal**, not a level: `level` is `None` whenever it is
+        /// set, so every census that asks "has this module closed the hole"
+        /// is told no. The field exists so a test can tell a prologue that
+        /// says nothing apart from one that says something unprovable; a
+        /// census does not need to, because both must be loud.
+        pub(crate) ambiguous: bool,
     }
 
     /// [`Resolution`] for `lint` over `source`'s file-module prologue.
@@ -2864,15 +2875,56 @@ pub(crate) mod lint_levels {
     ///
     /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
     /// [`super::normalize_lint`] is the bridge, as it is everywhere else here.
+    ///
+    /// # Structural, because a prefix match is not a parser
+    ///
+    /// `PR57-FINAL-001`. This used to read an attribute by stripping a level
+    /// keyword off the front of it, so it understood one shape — `deny(L)`
+    /// written literally — and was blind to every attribute that wraps one.
+    /// `#![cfg_attr(P, deny(L))]` read as stating nothing, which is loud and
+    /// merely wrong; but a prologue that DENIES the lint and then takes it back
+    ///
+    /// ```text
+    /// #![deny(clippy::disallowed_methods)]
+    /// #![cfg_attr(windows, allow(clippy::disallowed_methods))]
+    /// ```
+    ///
+    /// read as `deny`, and on Windows that file allows the lint. Both censuses
+    /// that consult this reader act on `deny`:
+    /// `effects::tests::every_allow_of_a_governed_lint_is_module_level_and_in_    /// the_allowlist` admits a per-site `#[expect]` only where the lint is
+    /// denied at module level, and
+    /// `runner::container::tests::every_child_module_of_the_container_funnel_    /// states_its_own_lint_level` reads a denial as `PR6-LANEF-004` closed.
+    ///
+    /// So attributes are now **parsed**: `cfg_attr` is unwrapped to any depth,
+    /// every attribute after its predicate is applied and not just the first,
+    /// and each level carries the condition it was written under.
+    ///
+    /// # What counts, and what refuses
+    ///
+    /// A level counts only when it is unconditional at module top level, or
+    /// when its condition is proven true on every supported target. [`Truth`]
+    /// proves exactly two — `all()` is true everywhere and `any()` is false
+    /// everywhere — and composes `all`/`any`/`not` over them, modelling no
+    /// target list of its own.
+    ///
+    /// Everything else **refuses**: a condition naming a target, a feature or
+    /// `test`; an attribute shape that is not understood and names the lint;
+    /// brackets that do not close. A refusal sets [`Resolution::ambiguous`] and
+    /// carries **no level at all**, so a census asking whether the module
+    /// closed the hole is told no. Wrongly red is allowed here and wrongly
+    /// green is not: the reverse hands a reviewer a guard that is not on every
+    /// target, which is the one failure this reader exists to prevent.
+    ///
+    /// Measured, not argued —
+    /// `effects::tests::the_file_level_lint_reader_refuses_a_condition_it_    /// cannot_prove` drives the provable conditions through `clippy-driver`
+    /// against a body that reaches `std::fs::write`, and compiles the slip
+    /// attempt itself on whichever host runs it.
     #[must_use]
     pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {
-        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
         let blanked = super::blank_comments_and_strings(source);
         let bytes = blanked.as_bytes();
-        let mut resolution = Resolution {
-            level: None,
-            refused_downgrade: false,
-        };
+        let mut applied: Vec<Applied> = Vec::new();
+        let mut readable = true;
         let mut at = 0;
         while at < bytes.len() {
             if bytes[at].is_ascii_whitespace() {
@@ -2881,53 +2933,263 @@ pub(crate) mod lint_levels {
             }
             // The prologue ends at the first token that is not an inner attribute.
             if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
-                return resolution;
+                break;
             }
             let open = at + 2;
             if bytes.get(open) != Some(&b'[') {
-                return resolution;
+                break;
             }
             let Some(close) = super::matching(bytes, open, b'[', b']') else {
-                return resolution;
+                // An inner attribute whose brackets do not close. Everything
+                // after it is unread, so the answer is a refusal rather than
+                // whatever the attributes before it happened to say.
+                readable = false;
+                break;
             };
-            let attribute = blanked[open + 1..close].trim();
-            for level in LEVELS {
-                let Some(rest) = attribute.strip_prefix(level) else {
-                    continue;
-                };
-                // `allowance(…)` strips to `ance(…)`, which opens nothing: the
-                // parenthesis is what makes the prefix an exact attribute name.
-                let Some(list) = rest
-                    .trim_start()
-                    .strip_prefix('(')
-                    .and_then(|body| body.strip_suffix(')'))
-                else {
-                    continue;
-                };
-                if !list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
-                    continue;
-                }
+            readable &=
+                read_attribute(&blanked[open + 1..close], lint, Truth::Always, &mut applied);
+            at = close + 1;
+        }
+        resolve(&applied, readable)
+    }
+
+    /// One level-setting attribute the prologue applies to the lint, with the
+    /// condition the reader proved it is under.
+    #[derive(Debug, Clone, Copy)]
+    struct Applied {
+        level: &'static str,
+        truth: Truth,
+    }
+
+    /// A `cfg` condition's truth over the targets this repository supports.
+    ///
+    /// The reader proves exactly two things — `all()` is the empty conjunction
+    /// and is true everywhere, `any()` is the empty disjunction and is false
+    /// everywhere — and composes `all`/`any`/`not` over them. **It models no
+    /// target list at all.** A list is a place to be wrong, and the way to be
+    /// wrong here is to report a module as guarded on a target where it is not,
+    /// so `windows`, `target_os = "…"`, `feature = "…"` and `test` are each
+    /// [`Truth::Unknown`] and stay that way.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Truth {
+        Always,
+        Never,
+        Unknown,
+    }
+
+    impl Truth {
+        /// Both conditions, which is what one `cfg_attr` inside another means.
+        fn both(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Never, _) | (_, Self::Never) => Self::Never,
+                (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+                _ => Self::Always,
+            }
+        }
+
+        /// Either condition.
+        fn either(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Always, _) | (_, Self::Always) => Self::Always,
+                (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+                _ => Self::Never,
+            }
+        }
+
+        /// The complement. An unprovable condition has an unprovable one.
+        fn negate(self) -> Self {
+            match self {
+                Self::Always => Self::Never,
+                Self::Never => Self::Always,
+                Self::Unknown => Self::Unknown,
+            }
+        }
+    }
+
+    /// [`Truth`] of one `cfg` predicate.
+    fn evaluate(predicate: &str) -> Truth {
+        let Some((head, body)) = split_call(predicate) else {
+            // A leaf: `test`, `windows`, `feature = "strict"`. Not modelled.
+            return Truth::Unknown;
+        };
+        match head {
+            "all" => split_top_level(body)
+                .into_iter()
+                .fold(Truth::Always, |truth, term| truth.both(evaluate(term))),
+            "any" => split_top_level(body)
+                .into_iter()
+                .fold(Truth::Never, |truth, term| truth.either(evaluate(term))),
+            "not" => match split_top_level(body).as_slice() {
+                [one] => evaluate(one).negate(),
+                // `not` takes exactly one predicate. Anything else is a shape
+                // this reader has not understood.
+                _ => Truth::Unknown,
+            },
+            _ => Truth::Unknown,
+        }
+    }
+
+    /// Read one attribute's contents — already blanked — and append every level
+    /// it applies to `lint`, each under the condition it is written beneath.
+    ///
+    /// `truth` is the condition inherited from the `cfg_attr` chain above it,
+    /// `Truth::Always` at the top. Returns **false** when the attribute names
+    /// the lint somewhere this reader could not resolve: an absence and a
+    /// refusal are not the same answer and the caller must not confuse them.
+    fn read_attribute(
+        attribute: &str,
+        lint: &str,
+        truth: Truth,
+        applied: &mut Vec<Applied>,
+    ) -> bool {
+        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
+        let attribute = attribute.trim();
+        let Some((head, body)) = split_call(attribute) else {
+            // Not a call: `#![no_std]`, `#![doc = "…"]`. It sets no level, and
+            // the string a `doc =` carries is already blanked.
+            return !mentions(attribute, lint);
+        };
+        if head == "cfg_attr" {
+            // `#![cfg_attr(P, a, b)]` applies EVERY attribute after the
+            // predicate, not just the first.
+            let mut terms = split_top_level(body);
+            if terms.is_empty() {
+                return !mentions(body, lint);
+            }
+            let condition = truth.both(evaluate(terms.remove(0)));
+            let mut readable = true;
+            for term in terms {
+                readable &= read_attribute(term, lint, condition, applied);
+            }
+            return readable;
+        }
+        if let Some(level) = LEVELS.iter().copied().find(|level| *level == head) {
+            if split_top_level(body)
+                .iter()
+                .any(|entry| names_lint(entry, lint))
+            {
+                applied.push(Applied { level, truth });
+            }
+            return true;
+        }
+        // Some other attribute. It governs no lint level, so it matters only if
+        // it names this lint somewhere the reader has not understood — and then
+        // it is a refusal, because the alternative is a reader guessing that
+        // nothing was stated.
+        !mentions(attribute, lint)
+    }
+
+    /// The level the applied attributes leave in force, in source order.
+    ///
+    /// Only [`Truth::Always`] attributes decide it: a [`Truth::Never`] one is
+    /// not in the file on any target and a [`Truth::Unknown`] one refuses the
+    /// whole answer. **A refusal carries no level**, so the two censuses that
+    /// consult this reader are told the module has stated nothing — which is
+    /// the direction that is loud.
+    fn resolve(applied: &[Applied], readable: bool) -> Resolution {
+        let mut level: Option<&'static str> = None;
+        let mut refused_downgrade = false;
+        let mut ambiguous = !readable;
+        for entry in applied {
+            match entry.truth {
+                Truth::Never => {}
+                Truth::Unknown => ambiguous = true,
                 // Ordered, and `forbid` is sticky. A weaker level after a
                 // `forbid` is `E0453`, which is the file not compiling rather
                 // than a level; anything else replaces what came before it.
-                if resolution.level == Some("forbid") {
-                    if matches!(level, "allow" | "warn" | "expect") {
-                        resolution.refused_downgrade = true;
+                Truth::Always => {
+                    if level == Some("forbid") {
+                        if matches!(entry.level, "allow" | "warn" | "expect") {
+                            refused_downgrade = true;
+                        }
+                    } else {
+                        level = Some(entry.level);
                     }
-                } else {
-                    resolution.level = Some(match level {
-                        "allow" => "allow",
-                        "expect" => "expect",
-                        "warn" => "warn",
-                        "deny" => "deny",
-                        _ => "forbid",
-                    });
                 }
-                break;
             }
-            at = close + 1;
         }
-        resolution
+        if ambiguous {
+            return Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            };
+        }
+        Resolution {
+            level,
+            refused_downgrade,
+            ambiguous: false,
+        }
+    }
+
+    /// `head` and the contents of `head(…)`, when `text` is exactly that call.
+    ///
+    /// `head` must be a bare identifier and the closing parenthesis must be the
+    /// last thing in `text`, so `allowance(…)` is a call named `allowance` and
+    /// `deny(a) something` is not a call at all. Both refusals are deliberate:
+    /// this is the structural half of the reader, and a prefix match is what it
+    /// replaced.
+    fn split_call(text: &str) -> Option<(&str, &str)> {
+        let text = text.trim();
+        let open = text.find('(')?;
+        let head = text[..open].trim_end();
+        if head.is_empty()
+            || !head
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return None;
+        }
+        let close = super::matching(text.as_bytes(), open, b'(', b')')?;
+        if !text[close + 1..].trim().is_empty() {
+            return None;
+        }
+        Some((head, &text[open + 1..close]))
+    }
+
+    /// `list` split on the commas that are not inside a nested group.
+    ///
+    /// `all(unix, windows), deny(L)` is two terms, not three. Empty terms are
+    /// dropped, so `all()` yields none — which is what makes the empty
+    /// conjunction true and the empty disjunction false.
+    fn split_top_level(list: &str) -> Vec<&str> {
+        let mut terms = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (index, byte) in list.bytes().enumerate() {
+            match byte {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    terms.push(list[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        terms.push(list[start..].trim());
+        terms.retain(|term| !term.is_empty());
+        terms
+    }
+
+    /// Whether `text` names `lint` as a word rather than as part of a longer one.
+    ///
+    /// The bare name, because an attribute may write either spelling, and
+    /// bounded on both sides so `disallowed_methods_extra` is not this lint.
+    fn mentions(text: &str, lint: &str) -> bool {
+        let bare = match super::normalize_lint(lint) {
+            Some(name) => name,
+            None => lint.rsplit("::").next().unwrap_or(lint),
+        };
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        text.match_indices(bare).any(|(at, _)| {
+            !text.as_bytes()[..at].last().copied().is_some_and(word)
+                && !text
+                    .as_bytes()
+                    .get(at + bare.len())
+                    .copied()
+                    .is_some_and(word)
+        })
     }
 
     /// The level in force for `lint` at `source`'s file-module scope, or none.

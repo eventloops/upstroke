@@ -4017,6 +4017,19 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
             "fn file_level_lint_state(",
             "fn names_lint(",
             "mod lint_levels",
+            // `PR57-FINAL-002`. Every part of the structural parser
+            // `PR57-FINAL-001` added is a census-only helper and each one is
+            // named here: a helper that drifts above the `#[cfg(test)]` cut is
+            // a shipped surface added for a test to call, which is the finding
+            // this file already carries once.
+            "struct Applied {",
+            "enum Truth {",
+            "fn evaluate(",
+            "fn read_attribute(",
+            "fn resolve(",
+            "fn split_call(",
+            "fn split_top_level(",
+            "fn mentions(",
         ] {
             if !whole.contains(needle) {
                 wrong.push(format!("`{needle}` is not in src/effects.rs at all"));
@@ -4056,6 +4069,53 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
         "the lint reader's module is `pub`, which is the surface this repair removed"
     );
 
+    // **Every item the module exposes at all, as a set.** `PR57-FINAL-002`
+    // asks whether a census-only helper became callable from outside; a needle
+    // per helper answers it only for the helpers somebody remembered to name.
+    // This reads the module's own text and compares what is visible for
+    // equality, so a *new* helper that arrives `pub(crate)` fails without
+    // having to be listed, and any `pub` at all fails twice — once here and
+    // once against `upstroke::effects`, which gains no surface from a
+    // `#[cfg(test)]` module and must gain none from this repair.
+    //
+    // Read from the blanked text: a doc comment saying `pub` is spaces by then,
+    // which is what `PR4-CENSUS-COMMENT-ORACLE` is about, and the blanking
+    // preserves the line structure this walks.
+    let blanked = blank_comments_and_strings(&source);
+    let braces = blanked
+        .find("mod lint_levels {")
+        .map(|at| at + "mod lint_levels ".len())
+        .expect("the reader's module is in this file");
+    let close = crate::effects::matching(blanked.as_bytes(), braces, b'{', b'}')
+        .expect("the reader's module closes");
+    // Whitespace inside a declaration is normalised, so the needles say what is
+    // visible rather than how rustfmt happened to space it.
+    let squeeze = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible: BTreeSet<String> = blanked[braces + 1..close]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub"))
+        .map(squeeze)
+        .collect();
+    assert_eq!(
+        visible,
+        [
+            "pub(crate) struct Resolution {",
+            "pub(crate) level: Option<&'static str>,",
+            "pub(crate) refused_downgrade: bool,",
+            "pub(crate) ambiguous: bool,",
+            "pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {",
+            "pub(crate) fn file_level_lint_state(source: &str, lint: &str) \
+             -> Option<&'static str> {",
+        ]
+        .into_iter()
+        .map(squeeze)
+        .collect::<BTreeSet<String>>(),
+        "the lint reader's visible surface moved. The two functions and the answer type are \
+         what `effects::tests` and `runner::container::tests` call; everything else the module \
+         holds is a helper and stays private"
+    );
+
     // The instrument still answers where it is used, so narrowing it did not
     // narrow it out of existence — under both spellings of a line ending.
     for prologue in [
@@ -4074,6 +4134,52 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
             "{prologue:?}"
         );
     }
+}
+
+/// Compile one prologue under this repository's own `clippy.toml` and report
+/// whether it built, plus every diagnostic that carries a code, as `(level, code)`.
+///
+/// Shared by the two file-level-lint-reader tests so both are measured by the
+/// same oracle: the reader is never its own authority for what rustc does.
+fn compile_prologue_probe(dir: &Path, tag: &str, source: &str) -> (bool, Vec<(String, String)>) {
+    let file = dir.join(format!("{tag}.rs"));
+    fs::write(&file, source).expect("the fixture");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).expect("an output directory");
+    let output = std::process::Command::new(clippy_driver())
+        .env("CLIPPY_CONF_DIR", repo_root())
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "lib",
+            "--emit=metadata",
+            "--error-format=json",
+        ])
+        .arg("--out-dir")
+        .arg(&out)
+        .arg(&file)
+        .output()
+        .expect("clippy-driver runs; the lint gate uses the same binary");
+    let mut diagnostics = Vec::new();
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(code) = value
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let level = value
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        diagnostics.push((level.to_owned(), code.to_owned()));
+    }
+    (output.status.success(), diagnostics)
 }
 
 /// **The file-level lint reader answers what rustc does**, on a table rustc
@@ -4111,55 +4217,18 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
     const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
     const LINT: &str = "clippy::disallowed_methods";
 
-    /// Compile one prologue and return whether it built, plus every diagnostic
-    /// that carries a code, as `(level, code)`.
-    fn compile(dir: &Path, tag: &str, source: &str) -> (bool, Vec<(String, String)>) {
-        let file = dir.join(format!("{tag}.rs"));
-        fs::write(&file, source).expect("the fixture");
-        let out = dir.join("out");
-        fs::create_dir_all(&out).expect("an output directory");
-        let output = std::process::Command::new(clippy_driver())
-            .env("CLIPPY_CONF_DIR", repo_root())
-            .args([
-                "--edition",
-                "2024",
-                "--crate-type",
-                "lib",
-                "--emit=metadata",
-                "--error-format=json",
-            ])
-            .arg("--out-dir")
-            .arg(&out)
-            .arg(&file)
-            .output()
-            .expect("clippy-driver runs; the lint gate uses the same binary");
-        let mut diagnostics = Vec::new();
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(code) = value
-                .get("code")
-                .and_then(|code| code.get("code"))
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            let level = value
-                .get("level")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            diagnostics.push((level.to_owned(), code.to_owned()));
-        }
-        (output.status.success(), diagnostics)
-    }
-
     /// What the compiler must have done, if the reader's answer is right.
     ///
     /// `(the crate builds, the levels at which the lint fired, E0453 present)`.
     /// The one hand-written sentence in this test, and every arm of it is
     /// reached by a row below.
     fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "no prologue in this table is conditional, so nothing here may read as a refusal; \
+             the conditional shapes are in \
+             `the_file_level_lint_reader_refuses_a_condition_it_cannot_prove`"
+        );
         if resolution.refused_downgrade {
             // Not a level: the prologue is rejected and the lint never runs.
             return (false, Vec::new(), true);
@@ -4244,7 +4313,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
     for (tag, prologue) in table {
         let source = format!("{prologue}{BODY}");
         let resolution = file_level_lint_resolution(&source, LINT);
-        let (built, diagnostics) = compile(&scratch, tag, &source);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
         let fired: Vec<String> = diagnostics
             .iter()
             .filter(|(_, code)| code == LINT)
@@ -4294,6 +4363,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         Resolution {
             level: Some("allow"),
             refused_downgrade: false,
+            ambiguous: false,
         },
         "deny then allow is effectively allow"
     );
@@ -4305,6 +4375,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         Resolution {
             level: Some("forbid"),
             refused_downgrade: true,
+            ambiguous: false,
         },
         "a forbid cannot be weakened; the attempt is E0453 and not a level"
     );
@@ -4339,6 +4410,446 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         restated.is_empty(),
         "the ordered reading is exercised by fixtures only while this holds: {restated:#?}"
     );
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **The file-level lint reader refuses a condition it cannot prove**, and the
+/// compiler decides which conditions those are.
+///
+/// `PR57-FINAL-001`. The reader read an inner attribute by stripping a level
+/// keyword off the front of it, so it understood exactly one shape:
+/// `#![deny(L)]` written literally at the top of the file. Everything else it
+/// answered `None` to — which is the loud direction for a lone `#![cfg_attr(P,
+/// deny(L))]` and the **silent** one for the shape that matters:
+///
+/// ```text
+/// #![deny(clippy::disallowed_methods)]
+/// #![cfg_attr(windows, allow(clippy::disallowed_methods))]
+/// ```
+///
+/// The second attribute is invisible to a front-of-string strip, so the reader
+/// answered `deny` — and on Windows that file allows the lint. Two censuses act
+/// on that answer. `every_allow_of_a_governed_lint_is_module_level_and_in_the_
+/// allowlist` admits a per-site `#[expect]` only in a file that DENIES the lint
+/// at module level, so the expectation "narrows a denial" that is not there;
+/// and `runner::container::tests::every_child_module_of_the_container_funnel_
+/// states_its_own_lint_level` reports the module as having closed
+/// `PR6-LANEF-004` on every target when it has closed it on all but one.
+///
+/// # The rule this pins
+///
+/// A `deny` or `forbid` counts only when it is **unconditional** at module top
+/// level, or when its condition is proven true on every supported target. The
+/// reader proves exactly two things — `all()` is true everywhere and `any()` is
+/// false everywhere, and `not`/`all`/`any` compose over those — and models no
+/// target list at all, because a list is a place to be wrong and being wrong
+/// here means reporting a module as guarded on a target where it is not. Every
+/// other predicate is a **refusal**: `ambiguous`, with no level. Wrongly red is
+/// allowed; wrongly green is not.
+///
+/// # How it is measured
+///
+/// Section (1) is the same clippy-driver oracle
+/// [`the_file_level_lint_reader_answers_what_rustc_does`] uses, restricted to
+/// conditions that resolve the same way on ubuntu, macos and windows — so a row
+/// here means the same thing on all three CI legs. `PR72-WIN-EOL-003`'s sibling
+/// hazard, a fixture whose *meaning* is platform-shaped, is why `windows` and
+/// `unix` appear nowhere in that table.
+///
+/// Section (2) is the slip attempt, and it is measured on whichever host runs
+/// it: the condition is chosen to be true here and unprovable everywhere, so
+/// clippy-driver really does let a `std::fs::write` through a prologue that
+/// opens with `#![deny]`. Its mirror, the same shape under a condition false on
+/// this host, really does refuse it. **One reader answer covers both compiler
+/// behaviours**, which is the whole argument for refusing rather than picking.
+#[test]
+fn the_file_level_lint_reader_refuses_a_condition_it_cannot_prove() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    /// The same body the sibling oracle uses: one denied path, so any level
+    /// that does not suppress a `disallowed_methods` diagnostic produces one.
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    /// What the compiler must have done, if the reader's answer is right.
+    ///
+    /// `(the crate builds, the levels at which the lint fired, E0453 present)`.
+    /// A refusal predicts nothing — that is what makes it a refusal — so the
+    /// rows driven through here are the ones the reader answers.
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "a refusal predicts no compiler behaviour and must not be driven through this bridge"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("conditional-levels");
+
+    // -----------------------------------------------------------------
+    // (1) The conditions that resolve identically on every CI leg.
+    //
+    // Every row is a prologue and nothing here says what it means: the reader
+    // is asked, its answer is turned into a prediction, and clippy-driver is
+    // the verdict. `all()` is the empty conjunction and is true; `any()` is the
+    // empty disjunction and is false. Both are stable across targets, which is
+    // what lets a table assert them on ubuntu, macos and windows alike.
+    // -----------------------------------------------------------------
+    let table: &[(&str, &str)] = &[
+        // Inactive on every target: the deny is not there, and a reader that
+        // counted it would report a guarded module with an unguarded build.
+        (
+            "cfg_attr_any_deny",
+            "#![cfg_attr(any(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_not_all_deny",
+            "#![cfg_attr(not(all()), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_any_forbid",
+            "#![cfg_attr(any(), forbid(clippy::disallowed_methods))]\n",
+        ),
+        // Active on every target: the deny IS there, and a reader that ignored
+        // every conditional would report an unguarded module that is guarded.
+        // This is the half a blanket "refuse all `cfg_attr`" rule gets wrong.
+        (
+            "cfg_attr_all_deny",
+            "#![cfg_attr(all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_all_forbid",
+            "#![cfg_attr(all(), forbid(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_not_any_deny",
+            "#![cfg_attr(not(any()), deny(clippy::disallowed_methods))]\n",
+        ),
+        // Nesting, both ways round. A `cfg_attr` may carry another, and the
+        // condition of the pair is the conjunction: one inactive level anywhere
+        // in the chain and the attribute is not applied.
+        (
+            "nested_all_all_deny",
+            "#![cfg_attr(all(), cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_all_any_deny",
+            "#![cfg_attr(all(), cfg_attr(any(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_any_all_deny",
+            "#![cfg_attr(any(), cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        // A `cfg_attr` applies EVERY attribute after its condition, not just
+        // the first. A reader that took `terms[1]` and stopped would miss this
+        // deny entirely.
+        (
+            "cfg_attr_two_attributes",
+            "#![cfg_attr(all(), allow(dead_code), deny(clippy::disallowed_methods))]\n",
+        ),
+        // Ordering still decides, and a conditional takes its place in the
+        // order. An inactive allow after a deny leaves the deny standing; an
+        // active one replaces it, and the effect really does slip through.
+        (
+            "deny_then_inactive_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "deny_then_active_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(all(), allow(clippy::disallowed_methods))]\n",
+        ),
+        // `forbid` is sticky against a conditional too: the weakening that is
+        // actually applied is `E0453` and the crate does not build, and the one
+        // that is not applied is not a weakening at all.
+        (
+            "forbid_then_active_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(all(), allow(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "forbid_then_inactive_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        ),
+    ];
+
+    let mut observed_shapes: BTreeSet<(bool, Vec<String>, bool)> = BTreeSet::new();
+    for (tag, prologue) in table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+        observed_shapes.insert((built, fired, rejected));
+
+        // The same prologue with the line endings the Windows guest gives it.
+        assert_eq!(
+            file_level_lint_resolution(&source.replace('\n', "\r\n"), LINT),
+            resolution,
+            "`{tag}` reads differently under CRLF"
+        );
+    }
+
+    // The table reaches all four compiler behaviours — clean, warned, errored
+    // and rejected outright — so a reader collapsed to one answer cannot pass
+    // it, and neither can one that refuses every conditional it sees.
+    assert!(
+        observed_shapes.len() >= 4,
+        "the conditional fixtures produced only {} distinct compiler outcomes: {observed_shapes:?}",
+        observed_shapes.len()
+    );
+
+    // -----------------------------------------------------------------
+    // (2) The slip attempt, measured on this host.
+    //
+    // `HOST_TRUE` holds on whichever CI leg is running and is unprovable to the
+    // reader on all of them; `HOST_FALSE` is its complement. The prologue is
+    // the one a reviewer reads as a denial in both cases.
+    // -----------------------------------------------------------------
+    let (host_true, host_false) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
+    for (tag, condition, effect_slipped) in [
+        ("slip_here", host_true, true),
+        ("slip_elsewhere", host_false, false),
+    ] {
+        let source = format!(
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr({condition}, allow(clippy::disallowed_methods))]\n{BODY}"
+        );
+        let resolution = file_level_lint_resolution(&source, LINT);
+        assert_eq!(
+            resolution,
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{tag}` — a prologue whose denial is undone on some supported target must be a \
+             refusal, not a level"
+        );
+
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let errored = diagnostics
+            .iter()
+            .any(|(level, code)| level == "error" && code == LINT);
+        assert_eq!(
+            (built, errored),
+            (effect_slipped, !effect_slipped),
+            "`{tag}` — `#![cfg_attr({condition}, allow(..))]` after a deny did not behave as this \
+             host requires: built={built} diagnostics={diagnostics:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) Every other predicate is a refusal, and refusing is not the same as
+    // reading nothing. These cannot be compiled portably — that is exactly why
+    // the reader may not guess at them — so the claim asserted is the reader's,
+    // and it is asserted as a value.
+    // -----------------------------------------------------------------
+    const REFUSED: &[(&str, &str)] = &[
+        (
+            "target_family",
+            "#![cfg_attr(windows, deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "target_family_negated",
+            "#![cfg_attr(not(unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "target_os",
+            "#![cfg_attr(target_os = \"linux\", deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_test",
+            "#![cfg_attr(test, deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "not_cfg_test",
+            "#![cfg_attr(not(test), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "feature",
+            "#![cfg_attr(feature = \"strict\", deny(clippy::disallowed_methods))]\n",
+        ),
+        // A disjunction the reader could be tempted to call exhaustive. It is
+        // not exhaustive to a reader that models no target list, and the tree
+        // does not gain one for this.
+        (
+            "any_of_two_families",
+            "#![cfg_attr(any(windows, unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        // One unprovable term anywhere in the chain refuses the whole of it.
+        (
+            "all_with_one_unprovable",
+            "#![cfg_attr(all(all(), unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "nested_outer_unprovable",
+            "#![cfg_attr(unix, cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_inner_unprovable",
+            "#![cfg_attr(all(), cfg_attr(unix, deny(clippy::disallowed_methods)))]\n",
+        ),
+        // THE ONE THIS REPAIR IS NAMED FOR: a denial undone on one target.
+        (
+            "deny_then_conditional_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        ),
+        // And the same against a forbid. Whether this file is `E0453` or a
+        // clean forbid depends on the target, so it is neither a level nor a
+        // refused downgrade: it is a refusal.
+        (
+            "forbid_then_conditional_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        ),
+        // An attribute this reader does not understand, that names the lint.
+        // Silence about it would be a reader guessing, and the guess it would
+        // make is that nothing is stated. Three ways to be unreadable, because
+        // they leave the parser at three different points: brackets that never
+        // close, a head that is not a level and is not `cfg_attr`, and one of
+        // those nested inside a condition that IS proven.
+        (
+            "unreadable_brackets",
+            "#![cfg_attr(all(), deny(clippy::disallowed_methods)]\n",
+        ),
+        // `allowance` begins with `allow` and is not it. The reader this
+        // replaced stripped level keywords off the front of an attribute and
+        // had to carry a comment about exactly this word; a structural reader
+        // sees a call named `allowance`, does not know it, and refuses because
+        // it names the lint.
+        (
+            "head_that_is_not_a_level",
+            "#![allowance(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "unreadable_under_a_proven_condition",
+            "#![cfg_attr(all(), lint_group(deny(clippy::disallowed_methods)))]\n",
+        ),
+    ];
+    for (tag, prologue) in REFUSED {
+        let source = format!("{prologue}{BODY}");
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            assert_eq!(
+                file_level_lint_resolution(&spelling, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` must be a refusal"
+            );
+            // The census-facing answer is the one that matters, and it is the
+            // fail-closed one: no per-site `#[expect]` is admitted against it,
+            // and no child module reads as having stated its own level.
+            assert_eq!(
+                crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                None,
+                "`{tag}` reached a census as a level"
+            );
+            assert!(
+                !file_level_denies(&spelling, LINT),
+                "`{tag}` read as a denial"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (4) A refusal is not the only way to be silent, and the two are
+    // distinguished. An inherited allow — a child module that states nothing
+    // and takes its level from the module tree above it, which is
+    // `PR6-LANEF-004` itself — reads as nothing STATED and is not a refusal;
+    // the reader never reaches for the parent it cannot see.
+    // -----------------------------------------------------------------
+    let inheriting = format!("//! A child module of a funnel that allows the lint.\n{BODY}");
+    assert_eq!(
+        file_level_lint_resolution(&inheriting, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: false,
+        },
+        "a module that states nothing states nothing; it does not state its ancestor's allow"
+    );
+    // And an unrelated conditional attribute is not about this lint at all.
+    // `src/engine/assembly.rs` and `src/engine/topology.rs` both open with one.
+    let unrelated = format!("#![cfg_attr(not(test), allow(dead_code))]\n{BODY}");
+    assert_eq!(
+        file_level_lint_resolution(&unrelated, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: false,
+        },
+        "a conditional attribute naming another lint is not an ambiguity about this one"
+    );
+    // Two files in this tree really do carry that prologue, so the claim above
+    // is about the tree and not only about a fixture.
+    for path in ["src/engine/assembly.rs", "src/engine/topology.rs"] {
+        let source = fs::read_to_string(repo_root().join(path)).expect("an engine module");
+        for lint in USED_GOVERNED_LINTS {
+            assert!(
+                !file_level_lint_resolution(&source, lint).ambiguous,
+                "{path} reads as a refusal for `{lint}`, so this repair turned a green tree red"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (5) The other reader fails closed in the other direction, so nothing
+    // slips between them. `governed_allows` finds an `allow`/`expect` at any
+    // depth, conditional or not — so a conditional allow still has to be in
+    // `effects/allowlist.toml`, and cannot hide from the placement census by
+    // wearing a `cfg_attr`.
+    // -----------------------------------------------------------------
+    for prologue in [
+        "#![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        "#![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        "#![cfg_attr(all(), cfg_attr(all(), allow(clippy::disallowed_methods)))]\n",
+    ] {
+        let found = governed_allows(&format!("{prologue}{BODY}"));
+        assert_eq!(
+            found.len(),
+            1,
+            "a conditional allow is invisible to the placement census: {prologue:?}"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "{prologue:?}");
+        assert!(found[0].inner, "{prologue:?}");
+    }
 
     let _ = fs::remove_dir_all(&scratch);
 }

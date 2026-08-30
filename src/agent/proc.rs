@@ -41,11 +41,9 @@
     clippy::disallowed_macros
 )]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,6 +51,31 @@ use crate::topology::effects::ProcessSite;
 
 use crate::error::UpstrokeError;
 use crate::topology::effects::{Injection, InjectionMode, SubEffectPoint};
+
+// **The bounded pipe drain, out of line.** Reading two pipes into snapshottable
+// buffers is the one part of this module that never touches a process: it takes
+// an opaque `R: Read`, a byte allowance and a grace, and knows nothing about
+// spawning, signalling, job objects or process groups. It moved out whole,
+// behaviour unchanged, and the supervision loop below calls into it exactly
+// where it called the same functions before.
+//
+// **It states its own lint level and does not inherit this file's.** A Rust
+// lint level is scoped by the module tree rather than by the file, so an
+// out-of-line child of a funnel that opens with `#![allow(disallowed_methods,
+// disallowed_types, disallowed_macros)]` silently gets all three -- that is
+// `PR6-LANEF-004`. `drain.rs` reaches no denied primitive, so it DENIES all
+// three rather than allowing any, and needs no `effects/allowlist.toml` row:
+// a denial is not an allowance. `runner::container::tests::every_child_module_\
+// of_the_container_funnel_states_its_own_lint_level` derives its domain from
+// the funnel list, so this file entered that census by existing.
+mod drain;
+
+// Private, and that is what keeps the path stable. `OUTPUT_LIMIT_BYTES` is
+// reached as `super::super::OUTPUT_LIMIT_BYTES` from
+// `proc::test_support::readiness`, and a private `use` binds a name for this
+// module and everything nested in it -- so the constant moving to a child
+// module is invisible from there.
+use drain::{DRAIN_GRACE_EXIT, DRAIN_GRACE_KILL, Drain, OUTPUT_LIMIT_BYTES, drain_limit_exceeded};
 
 /// The parent-side containment steps of one spawn, told to whoever is watching.
 ///
@@ -196,15 +219,6 @@ pub struct ProcessOutput {
     /// its owned process tree was terminated.
     pub output_limited: bool,
 }
-
-/// How long to keep draining pipes after the process is gone. Normally EOF is
-/// immediate; the grace only caps the pathological case of an orphaned
-/// grandchild still holding a write handle.
-const DRAIN_GRACE_EXIT: Duration = Duration::from_secs(2);
-const DRAIN_GRACE_KILL: Duration = Duration::from_millis(500);
-/// Per stream. Readers continue draining after this point so the child cannot
-/// block on a full pipe while the supervisor notices and terminates its tree.
-const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A direct child plus the platform primitive that owns its ordinary
 /// descendants. Keeping ownership beside `Child` prevents a successful wait
@@ -530,11 +544,6 @@ fn run_with_timeout_and_limit(
         timed_out,
         output_limited,
     })
-}
-
-fn drain_limit_exceeded(stdout: &Option<Drain>, stderr: &Option<Drain>) -> bool {
-    stdout.as_ref().is_some_and(Drain::limit_exceeded)
-        || stderr.as_ref().is_some_and(Drain::limit_exceeded)
 }
 
 /// Kill the whole process tree. Killing only the direct child is not enough
@@ -5293,72 +5302,6 @@ mod termination {
     }
 }
 
-/// A pipe reader whose buffer can be snapshotted without joining the thread,
-/// so an orphan holding the write end can never stall the supervisor.
-struct Drain {
-    buf: Arc<Mutex<Vec<u8>>>,
-    limited: Arc<AtomicBool>,
-    handle: thread::JoinHandle<()>,
-}
-
-impl Drain {
-    fn start<R: Read + Send + 'static>(mut pipe: R, limit: usize) -> Self {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::clone(&buf);
-        let limited = Arc::new(AtomicBool::new(false));
-        let reader_limited = Arc::clone(&limited);
-        let handle = thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut guard = match writer.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        let remaining = limit.saturating_sub(guard.len());
-                        let retained = remaining.min(n);
-                        guard.extend_from_slice(&chunk[..retained]);
-                        if retained < n {
-                            reader_limited.store(true, Ordering::SeqCst);
-                        }
-                    }
-                }
-            }
-        });
-        Self {
-            buf,
-            limited,
-            handle,
-        }
-    }
-
-    fn limit_exceeded(&self) -> bool {
-        self.limited.load(Ordering::SeqCst)
-    }
-
-    /// Wait up to `grace` for EOF, then snapshot whatever arrived. A reader
-    /// abandoned here exits on its own when the last write handle closes.
-    fn collect(self, grace: Duration) -> (String, bool) {
-        let deadline = Instant::now() + grace;
-        while !self.handle.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        if self.handle.is_finished() {
-            let _ = self.handle.join();
-        }
-        let snapshot = match self.buf.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        (
-            String::from_utf8_lossy(&snapshot).into_owned(),
-            self.limited.load(Ordering::SeqCst),
-        )
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -5699,6 +5642,11 @@ mod tests {
         if std::env::var_os("UPSTROKE_STDIN_HEX").is_none() {
             return;
         }
+        // Scoped, because this is the only `Read` in the file now: the drain
+        // took the trait with it when it moved out of line, and a file-level
+        // import for one test helper is an unused one in the non-test build.
+        use std::io::Read;
+
         let mut received = Vec::new();
         std::io::stdin()
             .read_to_end(&mut received)
