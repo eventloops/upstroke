@@ -661,6 +661,41 @@ fn configured_item_end(bytes: &[u8], start: usize) -> usize {
     start
 }
 
+/// Which level `source` states for `lint` -- `"allow"`, `"deny"`, or nothing.
+///
+/// **Nothing means the file inherits**, and inheriting is the finding.
+/// `PR6-LANEF-004`: a Rust lint level is scoped by the module tree and not by
+/// the file, so an out-of-line child of a funnel module silently takes that
+/// module's `#![allow(…)]` and the build-error leg of `effect_site_inventory.
+/// mechanism` (1) stops holding for exactly the files it exists for. A child
+/// that states nothing is therefore not "clean"; it is undecided.
+///
+/// Comments and string literals are blanked first, so a level quoted in prose
+/// -- which every file explaining this rule does -- is invisible.
+/// `PR4-CENSUS-COMMENT-ORACLE` is the standing entry for a census that counted
+/// its own explanation.
+///
+/// One implementation, deliberately. `runner::container::tests` derived this
+/// rule for the Container funnel's children and `effects::tests` needs the
+/// identical rule for the Process funnel's; a second hand-written copy is how
+/// `PR7-R5-ATT-001` began, with three censuses and three different rules.
+#[must_use]
+pub fn stated_lint_level(source: &str, lint: &str) -> Option<&'static str> {
+    let blanked = blank_comments_and_strings(source);
+    for (keyword, answer) in [("allow(", "allow"), ("deny(", "deny")] {
+        let mut rest = blanked.as_str();
+        while let Some(index) = rest.find(keyword) {
+            let after = &rest[index + keyword.len()..];
+            let end = after.find(')').unwrap_or(after.len());
+            if after[..end].contains(lint) {
+                return Some(answer);
+            }
+            rest = &rest[index + keyword.len()..];
+        }
+    }
+    None
+}
+
 /// Every `allow`/`expect` of a governed lint in `source`, with where it sits.
 ///
 /// Attributes are found in the blanked text and read out of the original, so a

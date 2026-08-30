@@ -81,6 +81,13 @@ The Process supervision primitives. Spawn enters through an API taking \
 combined funnel."""
 
 [[funnel]]
+path = "src/agent/proc/test_support/readiness.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2): the Process funnel's own out-of-line child; recorded at file granularity rather than inherited from src/agent/proc.rs"
+review = """
+The §12 readiness primitives, and TEST-ONLY: the file is reached solely through `agent::proc::test_support`, a `#[cfg(test)]` module, so nothing here is compiled into a production build and no production caller can reach it. It performs no funnel effect. The allowance is `disallowed_methods` alone, for the five staging-and-publication primitives a §12 signal needs -- `File::create_new`, `write_all`, `flush`, `rename`, `remove_file` -- none of which enters the durability barrier: the module deliberately stays out of `util::fsync_*` so the ledger deltas `rundir` and `runner::container` assert are not contaminated. `disallowed_types` and `disallowed_macros` are DENIED in the file, so no process handle, `OpenOptions` or stdout write can appear here without a build error. It returns no writable handle: `Producer::child` hands out a `&mut Child` the type's own `Drop` still kills, reaps and joins. This entry adds no permission -- it narrows to one lint, at one file, what the Process funnel's module-level attribute already granted by inheritance."""
+
+[[funnel]]
 path = "src/runner/container.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
 packet = "effect_site_inventory.mechanism (2): src/runner/{host,container,invocation}.rs; `FunnelGroup::Container.module()`"

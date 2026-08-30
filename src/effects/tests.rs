@@ -436,6 +436,171 @@ fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through
     assert_eq!(mechanisms, 9);
 }
 
+/// Every out-of-line child of the **Process funnel** states its own level for
+/// each governed lint.
+///
+/// `PR6-LANEF-004` was found on the Container funnel and repaired there. The
+/// finding is about `#![allow(…)]` and the module tree, not about containers:
+/// a Rust lint level is scoped by the module tree and **not** by the file, so
+/// the first out-of-line child of any allow-carrying funnel inherits its
+/// allowance silently, and the build-error leg of `effect_site_inventory.
+/// mechanism` (1) stops holding for exactly the module it exists for.
+/// `src/agent/proc.rs` is the second such funnel to grow children, and it grew
+/// its first in this slice; this is the same guard, over that tree.
+///
+/// The rule is `effects::stated_lint_level`, the one
+/// `runner::container::tests::every_child_module_of_the_container_funnel_
+/// states_its_own_lint_level` derived. It is a shared function rather than a
+/// second copy because `PR7-R5-ATT-001` is what three hand-written copies of
+/// one census rule cost.
+///
+/// The grid is {child} × {governed lint}, every cell asserted: a child that
+/// states nothing about a lint is inheriting, and inheriting is the defect.
+/// A stated `allow` is permitted only where `effects/allowlist.toml` records
+/// it, which is the same condition the placement scan above enforces.
+#[test]
+fn every_child_module_of_the_process_funnel_states_its_own_lint_level() {
+    const FUNNEL: &str = "src/agent/proc.rs";
+    const GOVERNED: [&str; 3] = [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types",
+        "clippy::disallowed_macros",
+    ];
+
+    // Derived from the funnel's own path, so the domain cannot drift away from
+    // the module it is about: `src/agent/proc.rs` owns `src/agent/proc/`.
+    let prefix = format!("{}/", FUNNEL.trim_end_matches(".rs"));
+    let sources = scanned_sources();
+    let children: Vec<&(String, String)> = sources
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .collect();
+    assert!(
+        !children.is_empty(),
+        "the walk found no child of {FUNNEL} under `{prefix}`; the census is measuring nothing"
+    );
+
+    let list = allowlist();
+    let records = |path: &str, lint: &str| {
+        list.funnel
+            .iter()
+            .chain(&list.legacy)
+            .filter(|entry| entry.path == path)
+            .any(|entry| entry.allows.iter().any(|allowed| allowed == lint))
+    };
+
+    let mut missing = Vec::new();
+    let mut unlisted = Vec::new();
+    let mut cells = 0;
+    for (path, source) in &children {
+        for lint in GOVERNED {
+            cells += 1;
+            match crate::effects::stated_lint_level(source, lint) {
+                None => missing.push(format!("{path} states nothing about `{lint}`")),
+                Some("allow") if !records(path, lint) => unlisted.push(format!(
+                    "{path} allows `{lint}` and {ALLOWLIST_TOML} does not record it"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a child of the Process funnel inherits its allow instead of stating a level of its          own, which is `PR6-LANEF-004` reopening on the second funnel:\n{missing:#?}"
+    );
+    assert!(unlisted.is_empty(), "{unlisted:#?}");
+    assert_eq!(cells, children.len() * GOVERNED.len());
+
+    // The funnel itself is the file that legitimately carries the allow, and it
+    // is in the allowlist. Asserted so "every child states a level" cannot
+    // become true by the funnel quietly denying itself out of existence.
+    let (_, funnel) = sources
+        .iter()
+        .find(|(path, _)| path == FUNNEL)
+        .expect("the Process funnel is in the tree");
+    for lint in GOVERNED {
+        assert_eq!(
+            crate::effects::stated_lint_level(funnel, lint),
+            Some("allow"),
+            "the Process funnel no longer allows `{lint}`"
+        );
+    }
+}
+
+/// The level scan refuses what it is for — driven over sources that state
+/// nothing, that state a level only in prose, and that state each level plainly.
+///
+/// **Red-first.** The case that matters is the FIRST one: a child that says
+/// nothing must read as `None`, because `None` is what
+/// `every_child_module_of_the_process_funnel_states_its_own_lint_level` turns
+/// into a finding. A predicate that answered `Some("allow")` for an inheriting
+/// file — the exact shape `PR6-LANEF-004` describes — would make that census
+/// pass on the defect it exists to catch, and nothing else here would notice.
+#[test]
+fn the_lint_level_scan_reports_an_inherited_level_as_stated_by_nobody() {
+    use crate::effects::stated_lint_level;
+    const LINT: &str = "clippy::disallowed_methods";
+
+    // (1) THE RED CASE. A file that states nothing inherits, and inheriting
+    //     must not read as a decision.
+    let inherits = "use std::fs;\nfn go() { let _ = fs::rename(\"a\", \"b\"); }\n";
+    assert_eq!(
+        stated_lint_level(inherits, LINT),
+        None,
+        "an inheriting child read as though it had stated a level, which is \
+         `PR6-LANEF-004` made invisible"
+    );
+
+    // (2) Each level is seen when it is really there.
+    assert_eq!(
+        stated_lint_level("#![allow(clippy::disallowed_methods)]\n", LINT),
+        Some("allow")
+    );
+    assert_eq!(
+        stated_lint_level("#![deny(clippy::disallowed_methods)]\n", LINT),
+        Some("deny")
+    );
+    // ... including alongside other lints in one attribute.
+    assert_eq!(
+        stated_lint_level(
+            "#![deny(clippy::disallowed_types, clippy::disallowed_methods)]\n",
+            LINT
+        ),
+        Some("deny")
+    );
+
+    // (3) FALSE POSITIVES. A level named in prose or in a string literal is not
+    //     a stated level — and every file that explains this rule names it in
+    //     prose, this one included. `PR4-CENSUS-COMMENT-ORACLE`.
+    for disguised in [
+        "//! #![allow(clippy::disallowed_methods)]\nfn go() {}\n",
+        "// #![deny(clippy::disallowed_methods)]\nfn go() {}\n",
+        "/* #![allow(clippy::disallowed_methods)] */\nfn go() {}\n",
+        "const F: &str = \"#![allow(clippy::disallowed_methods)]\";\n",
+        "const R: &str = r#\"#![deny(clippy::disallowed_methods)]\"#;\n",
+    ] {
+        assert_eq!(
+            stated_lint_level(disguised, LINT),
+            None,
+            "a level quoted in prose read as stated: {disguised:?}"
+        );
+    }
+
+    // (4) A real attribute in a file that also quotes one is still found, so
+    //     the blanking is not a blunt "delete everything".
+    let mixed = "// #![allow(clippy::disallowed_methods)]\n\
+                 #![deny(clippy::disallowed_methods)]\n";
+    assert_eq!(stated_lint_level(mixed, LINT), Some("deny"));
+
+    // (5) The lints are discriminated: a level stated for one governed lint is
+    //     not a level for another. Without this, denying `disallowed_types`
+    //     would satisfy the whole grid.
+    assert_eq!(
+        stated_lint_level("#![deny(clippy::disallowed_types)]\n", LINT),
+        None
+    );
+}
+
 /// `clippy::style`, `clippy::all` and `warnings` are governed and unused.
 ///
 /// Each would suppress far more than an effect denial — `warnings` would

@@ -42,26 +42,50 @@
 //! [`await_signal`] takes the [`Child`] in order to have one.
 // Reached only through `test_support`, the module above, which is already
 // `#[cfg(test)]`; this file is compiled by test builds alone. The declaration
-// there is a PLAIN `mod readiness;` for the reason the effects split gave one
-// commit earlier: `census_domain::declared_whole_file_test_modules` derives its
-// domain from `#[cfg(test)] mod name;` declarations, so a second attribute here
-// would take the count from seventeen to eighteen and put this file in the set
-// a `file_stem == "tests"` rule misses.
+// there is a PLAIN `mod readiness;`, which has a consequence worth stating
+// where it can be seen: `census_domain::declared_whole_file_test_modules`
+// derives its domain from `#[cfg(test)] mod name;` declarations only, so this
+// file is NOT in the set the tree-wide censuses subtract, and each of them
+// reads it as production. That is sound today -- the body names none of their
+// needles, which `every_production_process_start_is_classified` and the effects
+// censuses assert -- but it is sound by coincidence rather than by
+// construction, and an edit here could put a fixture inside a production
+// census's domain.
 //
-// **Two of the three effect denials are restored rather than inherited**, for
-// the reason `PR6-LANEF-004` gives: a Rust lint level is scoped by the module
-// tree and not by the file, so an out-of-line child of a funnel silently
-// inherits the funnel's allow, and an allowance that propagates by accident is
-// an allowance nobody decided. This file names no `OpenOptions`, `DirBuilder`
-// or `Command`, and prints nothing, so both denials hold as written.
+// Guarding the declaration instead is `PR55-CENSUS-DOMAIN-002`, and it is NOT
+// done here. It needs two structural extensions of the shared resolver, not
+// one: it must accept a visibility-qualified `#[cfg(test)] pub(crate) mod
+// name;`, and it must derive the candidate path through the ENCLOSING INLINE
+// module -- measured, the current derivation looks for
+// `src/agent/proc/readiness.rs` and this file is one directory deeper, so the
+// resolver asserts rather than resolves. It also moves a crate-wide count from
+// seventeen to eighteen, and that count is narrated in files outside this
+// slice's write lease. Widening the resolver toward inline nesting is the
+// direction its own doc calls unsafe, so it is a decision for the owner rather
+// than a repair to be taken here.
 //
-// `disallowed_methods` is the one that cannot join them here. Publication
-// reaches `File::create_new`, `write_all`, `flush`, `rename` and `remove_file`
-// -- five governed primitives, in test-only staging that must not enter the
-// durability barrier -- so restoring it would mean allowing it back, and an
-// allow is admissible only from a file `effects/allowlist.toml` records. That
-// entry is the Process funnel's own, `src/agent/proc.rs`, whose reviewed
-// allowance this file goes on inheriting for that single lint.
+// **All three governed lints are stated here, and none is inherited**, for the
+// reason `PR6-LANEF-004` gives: a Rust lint level is scoped by the module tree
+// and not by the file, so an out-of-line child of a funnel takes the funnel's
+// allow silently, and an allowance that propagates by accident is an allowance
+// nobody decided. `every_child_module_of_the_process_funnel_states_its_own_
+// lint_level` is the guard that keeps this file from drifting back.
+//
+// `disallowed_types` and `disallowed_macros` are DENIED: this file names no
+// `OpenOptions`, `DirBuilder` or `Command`, and prints nothing, so the two
+// denials hold as written and a future edit that reached one is a build error
+// here rather than a permission borrowed from `src/agent/proc.rs`.
+//
+// `disallowed_methods` is ALLOWED, and recorded rather than inherited.
+// Publication reaches `File::create_new`, `write_all`, `flush`, `rename` and
+// `remove_file` -- five governed primitives, in test-only staging that must not
+// enter the durability barrier, so no funnel site fits and the permission is
+// genuinely needed. What it must not be is silent: this file has its own entry
+// in the **funnel section** of `effects/allowlist.toml`, whose review clause
+// says the permission is test-only and reaches no production caller. The entry
+// widens nothing -- it records at file granularity exactly the permission this
+// code already had from the Process funnel's module-level attribute.
+#![allow(clippy::disallowed_methods)]
 #![deny(clippy::disallowed_types, clippy::disallowed_macros)]
 
 use std::io::{BufRead, BufReader, Read, Write};
