@@ -506,11 +506,32 @@ path = "src/status.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
 packet = "effect_site_inventory.mechanism (2): and any other module the PR5 review enumerates"
 legacy_effect = """
-LEGACY-EFFECT: `render` streams the settled view with `writeln!` on an \
-`io::Write` sink — the macro path `write_fmt`, which is why the denial names it \
-— and the husk-trichotomy tests build run directories with raw `fs` and a `git` \
-`Command`."""
-shrinks_when = "the status renderer returns a String rather than writing a sink, and its fixtures build run directories through the RunDir funnels."
+LEGACY-EFFECT: two lints for two different reasons, and only one of the two has \
+a production site at all. `clippy::disallowed_methods` covers six sites. The one \
+in production is `follow`, which streams each event to the caller's `&mut dyn \
+io::Write`; `writeln!` expands to `std::io::Write::write_fmt`, which is why the \
+denial names that path rather than the macro. The other five are the \
+husk-trichotomy fixture `status_asked_for_a_husk_id_names_which_husk_it_is`, \
+which builds and tears down a scratch repository with `fs::create_dir_all` \
+twice, `fs::remove_dir_all` twice and `Command::status` once. \
+`clippy::disallowed_types` covers exactly one site, and it is not production: \
+the same fixture's `Command::new("git")`, which needs a real repository because \
+the husk answer takes this repository's key over its canonical common git dir. \
+Neither lint is earned by `render` any more. The view is accumulated into a \
+`String` through `std::fmt::Write`, whose `write_fmt` is a different `DefId` and \
+is not denied, and it now lives in the private child `src/status/render.rs`, \
+which restores both denials rather than inheriting this allowance."""
+shrinks_when = """
+The two retire separately, and `clippy::disallowed_types` retires first, because \
+no production site names the type: it goes when \
+`status_asked_for_a_husk_id_names_which_husk_it_is` obtains its scratch \
+repository without constructing a `Command` — through the Runner, or through a \
+fixture funnel that owns the `git init` — and `follow` need not change for it. \
+`clippy::disallowed_methods` has two halves and goes only when both are done: \
+that same fixture's two `create_dir_all`, two `remove_dir_all` and one \
+`Command::status` move behind the RunDir funnels and the Runner, AND `follow` \
+stops writing to a sink from inside this module — by yielding its lines to a \
+caller that owns the sink, the way `render` already returns a `String`."""
 
 [[legacy]]
 path = "src/validate.rs"
