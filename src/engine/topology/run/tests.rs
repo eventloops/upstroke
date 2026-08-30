@@ -194,6 +194,129 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
     }
 }
 
+/// The bytes [`crate::effects::production_code`] blanked out of `source`.
+///
+/// The blanker is position-preserving, so the count is also the number of
+/// source positions the region no longer offers a needle. A scan is only
+/// meaningful over a region where this is non-zero: a comment or a literal left
+/// standing is text a substring search reads as production code.
+///
+/// # Panics
+///
+/// When the region is not its source's length. That is the other half of the
+/// same contract — an offset into a region that has changed length names a
+/// different line of the file the census is reporting on.
+fn blanked_bytes(source: &str, code: &str) -> usize {
+    assert_eq!(
+        code.len(),
+        source.len(),
+        "a production region of {} bytes against {} of source did not blank in place, so \
+         every line number derived from an offset into it names a different line",
+        code.len(),
+        source.len()
+    );
+    source
+        .as_bytes()
+        .iter()
+        .zip(code.as_bytes())
+        .filter(|(from, to)| from != to)
+        .count()
+}
+
+/// The region guard the source censuses in this file share, and what replaced
+/// the ratio each of them used to open with.
+///
+/// Each opened with `code.len() * n > source.len()`. That guard was written for
+/// a **truncating** region, where a short result really does mean "a census over
+/// a fraction of a file reports zero for the part it never read".
+/// [`crate::effects::production_code`] does not truncate — it overwrites
+/// comments, literals and `#[cfg(test)]` items with spaces and keeps every
+/// newline — so `code.len() == source.len()` whatever it removed, and the ratio
+/// was already true before the blanker ran. It could not tell a working blanker
+/// from one that had stopped removing anything, and over unblanked source a
+/// needle quoted in a doc comment is counted as a call site.
+///
+/// So the two halves are asserted apart: something was blanked, and enough was
+/// left to scan. `CODING_STANDARDS.md` §12 requires the first of every scan and
+/// the length contract of the blanker;
+/// [`the_blanked_region_count_falls_to_zero_when_nothing_was_removable`] is the
+/// control that this number can reach zero, which is what the ratio could not.
+///
+/// `retained_floor` is each census's own tolerance, carried across unchanged:
+/// the unblanked remainder must exceed one `retained_floor`th of the file.
+///
+/// # Panics
+///
+/// When the region changed length, blanked nothing, or retained less than its
+/// floor.
+fn assert_blanked_region(file: &str, source: &str, code: &str, retained_floor: usize) {
+    let blanked = blanked_bytes(source, code);
+    assert!(
+        blanked > 0,
+        "nothing was blanked out of {file}'s {} bytes. Either the file carries no comment \
+         and no literal, or the blanker has stopped removing them — and the second reads \
+         exactly like a clean file to every needle below",
+        source.len()
+    );
+    let retained = source.len() - blanked;
+    assert!(
+        retained * retained_floor > source.len(),
+        "{retained} of {file}'s {} bytes survived blanking, under one {retained_floor}th of \
+         it — a census over a fraction of a file reports zero for the part it never read",
+        source.len()
+    );
+}
+
+/// The blanked-region count reaches zero, which is what the ratio it replaced
+/// could not.
+///
+/// [`assert_blanked_region`] is the guard three source censuses in this file
+/// open with, and a guard that cannot fail is not a guard. These two fixtures
+/// are the control in both directions: one carries a removable region of each
+/// kind the region function knows, the other carries none, and the retired
+/// ratio is asserted here to be satisfied by the second.
+#[test]
+fn the_blanked_region_count_falls_to_zero_when_nothing_was_removable() {
+    const REMOVABLE: &str = "// a line comment\n\
+                             /* a block comment */\n\
+                             fn go() -> usize {\n\
+                             let quoted = \"a string literal\";\n\
+                             quoted.len()\n\
+                             }\n\
+                             #[cfg(test)]\n\
+                             mod fixture {\n\
+                             fn one() -> usize { 1 }\n\
+                             }\n";
+    const NOTHING_REMOVABLE: &str = "fn go() -> usize {\n\
+                                     1 + 1\n\
+                                     }\n";
+
+    let removable = crate::effects::production_code(REMOVABLE);
+    assert_eq!(
+        removable.len(),
+        REMOVABLE.len(),
+        "the region function is length-preserving by contract, which is the whole reason a \
+         length ratio cannot report what it removed"
+    );
+    assert!(
+        blanked_bytes(REMOVABLE, &removable) > 0,
+        "a comment, a literal and a `#[cfg(test)]` item were left standing: {removable:?}"
+    );
+
+    let nothing = crate::effects::production_code(NOTHING_REMOVABLE);
+    assert_eq!(
+        blanked_bytes(NOTHING_REMOVABLE, &nothing),
+        0,
+        "a source with nothing removable in it must count zero, or the guard the censuses \
+         open with is true of every input and proves nothing: {nothing:?}"
+    );
+    assert!(
+        nothing.len() * 10 > NOTHING_REMOVABLE.len(),
+        "the ratio these censuses used to carry is satisfied by a region that blanked \
+         nothing, which is why it could not stand in for a blanked-region count"
+    );
+}
+
 /// **Every append the driver makes propagates its error.**
 ///
 /// The append-error protocol is five obligations, and all five begin with the
@@ -216,21 +339,21 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
 /// and a truncating region would let a site below the cut through, which is
 /// `PR4-CENSUS-COMMENT-ORACLE` and is how the barrier census scanned 4.7% of
 /// this very file.
+///
+/// The guard on that region is [`assert_blanked_region`], which counts what was
+/// blanked. The length ratio this test used to open with could not: the region
+/// function preserves length by contract, so the ratio held of a blanker that
+/// had removed nothing and left every quoted `self.emit(` as a call site.
 #[test]
 fn every_driver_append_propagates_its_error() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/topology/run.rs"),
-    )
-    .expect("the driver's own source");
+    const FILE: &str = "src/engine/topology/run.rs";
+
+    let source =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE))
+            .expect("the driver's own source");
     let code = crate::effects::production_code(&source);
 
-    assert!(
-        code.len() * 10 > source.len(),
-        "the production region is {} of {} bytes — a census over a fraction of a \
-         file reports zero for the part it never read",
-        code.len(),
-        source.len()
-    );
+    assert_blanked_region(FILE, &source, &code, 10);
 
     let needle = "self.emit(";
     let mut sites = 0;
@@ -293,20 +416,20 @@ fn every_driver_append_propagates_its_error() {
 /// guards exactly that call's result. A second selector makes this count zero,
 /// not two — which is why the assertion is on the **canonical** name rather than
 /// on a total.
+///
+/// The region carries [`assert_blanked_region`] for the reason the append census
+/// above does: the ratio both used to open with is true of a region that blanked
+/// nothing, and a `select(` in a doc comment would then be counted as the call.
 #[test]
 fn the_loop_selects_through_one_function() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/topology/run.rs"),
-    )
-    .expect("the driver's own source");
+    const FILE: &str = "src/engine/topology/run.rs";
+
+    let source =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE))
+            .expect("the driver's own source");
     let code = crate::effects::production_code(&source);
 
-    assert!(
-        code.len() * 10 > source.len(),
-        "the production region is {} of {} bytes",
-        code.len(),
-        source.len()
-    );
+    assert_blanked_region(FILE, &source, &code, 10);
 
     // Calls, not definitions — neither is defined here, but the filter is the
     // one the barrier census learned to use and costs nothing.
@@ -361,6 +484,11 @@ fn the_loop_selects_through_one_function() {
 /// **The count is one and not zero.** Zero would mean the seam had been rewritten
 /// to resolve pools some other way, which is the same defect from the other
 /// side, so the assertion is an equality.
+///
+/// The needle controls at the end are controls on *identifier matching*; the
+/// premise underneath them — that the region was blanked at all — is
+/// [`assert_blanked_region`]'s, because the ratio this census used to open with
+/// held of a blanker that had removed nothing.
 #[test]
 fn the_frozen_pool_table_is_read_through_one_seam() {
     const FILE: &str = "src/engine/assembly.rs";
@@ -369,13 +497,7 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE))
             .expect("a source file");
     let code = crate::effects::production_code(&source);
-    assert!(
-        code.len() * 2 > source.len(),
-        "the production region of {FILE} is {} of {} bytes, so a count over it says little about \
-         the file",
-        code.len(),
-        source.len()
-    );
+    assert_blanked_region(FILE, &source, &code, 2);
 
     // **Free calls to `pool_for`, not the qualified spelling.** The needle was
     // the literal `capacity::pool_for(`, which does not match the ordinary way
@@ -423,6 +545,58 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
     );
 }
 
+/// Every `AttemptStarted4 { … }` literal in `code`, as `(line, pool field)`.
+///
+/// `code` is a blanked region, so a brace inside a comment or a string literal
+/// is already a space and can neither open a body nor close one.
+///
+/// **Every literal, and the extent is the matching brace.** The scan this
+/// replaces took `.find` — the first literal in the file — and sliced it to the
+/// first `})` after the needle, so a second construction site was outside the
+/// domain altogether and a delimiter that happened to fit the two live literals
+/// stood in for the body's real end. They do not close alike: the dispatch arm's
+/// is `})?;` and the retry arm's is inside `Ok(RetryOutcome::Start(Box::new(…)))`.
+/// A rule that fits both by luck fits the next one by luck too.
+///
+/// # Panics
+///
+/// When a literal's braces do not balance, or when one carries no `pool` field.
+/// Both are the census losing its subject, which is not the answer "the subject
+/// is clean".
+fn attempt_started_pools(code: &str) -> Vec<(usize, String)> {
+    const NEEDLE: &str = "AttemptStarted4 {";
+
+    let mut found = Vec::new();
+    for (at, _) in code.match_indices(NEEDLE) {
+        let line = code[..at].matches('\n').count() + 1;
+        let open = at + NEEDLE.len() - 1;
+        let mut depth = 0_i32;
+        let mut end = None;
+        for (offset, ch) in code[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            panic!("the `AttemptStarted4` at line {line} never closes its body");
+        };
+        let pool = code[open..end]
+            .lines()
+            .find_map(|field| field.trim().strip_prefix("pool:"))
+            .unwrap_or_else(|| panic!("the `AttemptStarted4` at line {line} has no `pool` field"));
+        found.push((line, pool.trim().to_owned()));
+    }
+    found
+}
+
 /// **Both arms of `attempt_started` get their pool from an authority.**
 ///
 /// `attempt_started` is appended from two places and they reach it differently:
@@ -433,9 +607,16 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
 /// recorded no pool while the plan it then built resolved one, and the two
 /// disagreed about the same attempt.
 ///
-/// The needle is the field's value in each production `AttemptStarted4` literal.
-/// A hard-coded `None` fails; anything that names something does not, because
-/// this census's claim is "not invented here", not "non-empty".
+/// The needle is the field's value in **every** production `AttemptStarted4`
+/// literal of each listed file, through [`attempt_started_pools`]. A hard-coded
+/// `None` fails; anything that names something does not, because this census's
+/// claim is "not invented here", not "non-empty".
+///
+/// **The domain is one literal per site, and that count is asserted.** The scan
+/// this replaces read the first literal in each file and stopped, so a second
+/// construction site — the ordinary way a third arm arrives — lay outside the
+/// scanned domain while `checked == SITES.len()` still read as full coverage.
+/// The control at the end of the test is that second-position violation.
 ///
 /// # Two corrections to what this test was said to be
 ///
@@ -489,25 +670,68 @@ fn both_attempt_started_arms_take_their_pool_from_an_authority() {
     for (file, why) in SITES {
         let source = std::fs::read_to_string(root.join(file)).expect("a source file");
         let code = crate::effects::production_code(&source);
-        let at = code
-            .find("AttemptStarted4 {")
-            .unwrap_or_else(|| panic!("{file} no longer constructs an `AttemptStarted4`"));
-        let rest = &code[at..];
-        let body = &rest[..rest.find("})").unwrap_or(rest.len())];
-        let pool = body
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("pool:"))
-            .unwrap_or_else(|| panic!("{file}'s `AttemptStarted4` has no `pool` field"));
-        checked += 1;
-        if pool.trim().starts_with("None") {
-            invented.push(format!("{file} — {why}"));
+        assert_blanked_region(file, &source, &code, 10);
+
+        let literals = attempt_started_pools(&code);
+        assert_eq!(
+            literals.len(),
+            1,
+            "{file} builds {} production `AttemptStarted4` literals and this census claims \
+             one arm per site. Zero means it no longer constructs one and the site has \
+             moved; a second is a third arm, and it needs its own `SITES` entry naming the \
+             authority it reads rather than a scan that stops at the first",
+            literals.len()
+        );
+        for (line, pool) in literals {
+            checked += 1;
+            if pool.starts_with("None") {
+                invented.push(format!("{file}:{line} — {why}"));
+            }
         }
     }
 
-    assert_eq!(checked, SITES.len(), "a site stopped being found");
+    assert_eq!(
+        checked,
+        SITES.len(),
+        "the per-site count above pins each file's boundary; this is the domain's size. Two \
+         arms are the whole of what this census claims, and it inspected {checked} literals"
+    );
     assert!(
         invented.is_empty(),
         "these append `attempt_started` with a hard-coded `pool: None`, so the ledger and the \
          plan disagree about which pool the attempt drained: {invented:?}"
+    );
+
+    // **The control the scan this replaced could not pass**, and the reason the
+    // domain is now every literal rather than the first. With the first arm
+    // correct, `.find` reported the file clean and the `pool: None` below it was
+    // never read. `CODING_STANDARDS.md` §12: a positive control inside a
+    // truncated domain does not prove the whole named domain was scanned.
+    const SECOND_ARM_INVENTS_ITS_POOL: &str = "fn dispatch() {\n\
+                                               let started = AttemptStarted4 {\n\
+                                               pool: plan.pool.clone(),\n\
+                                               };\n\
+                                               }\n\
+                                               fn retry() {\n\
+                                               let started = AttemptStarted4 {\n\
+                                               pool: None,\n\
+                                               };\n\
+                                               }\n";
+    let control = attempt_started_pools(SECOND_ARM_INVENTS_ITS_POOL);
+    assert_eq!(
+        control.len(),
+        2,
+        "the needle reads one literal per file again, so every construction site after the \
+         first is outside the domain this census reports on: {control:?}"
+    );
+    assert!(
+        control[1].1.starts_with("None"),
+        "a hard-coded `pool: None` in the second literal is what this census exists to \
+         catch, and the scan did not see it: {control:?}"
+    );
+    assert!(
+        !control[0].1.starts_with("None"),
+        "the control's first literal names an authority, so reporting it would make every \
+         correct arm an offender and the census's greens meaningless: {control:?}"
     );
 }
