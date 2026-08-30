@@ -26,7 +26,7 @@
 //!   assertion below clears its ledger first and reads the sequence that
 //!   follows.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -89,16 +89,73 @@ fn gate_timeout(started: &RunStarted4) -> Duration {
 
 static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
+/// A run directory tree of this test's own, owned so that it is reclaimed
+/// however the test ends.
+///
+/// §12 asks for "unique temporary directories with RAII cleanup" and §6 for
+/// cleanup "on early return, error, panic unwinding". The difference shows up
+/// on the failing path rather than the passing one: a trailing removal is the
+/// line a panicking assertion skips, and every fixture in this file builds a
+/// tree. On this project's build box a fixture leaked per test is inode
+/// exhaustion, which `df -h` reports as 72% full while every write fails.
+///
+/// Both halves live under [`Scratch::root`] — `with_private_root` is handed the
+/// same directory twice below, so the tree is `<root>/.upstroke/runs/<id>` and
+/// `<root>/runs/<id>` — which is what lets one removal reclaim the whole of it.
+///
+/// **Shared**, and that is the protocol rather than a convenience. Two tests
+/// below simulate a fresh process by dropping the [`Fixture`] and then reading
+/// the log the dead one left; the handles are what those tests end, not the
+/// disk. So the root outlives any single holder and the last one reclaims it —
+/// §6's "a purpose-built guard whose lifetime expresses the actual protocol".
+struct Scratch {
+    root: PathBuf,
+    paths: RunPaths,
+}
+
+/// So `scratch.events()`, `scratch.public` and `&scratch` read exactly as the
+/// `RunPaths` they wrap: the guard adds a lifetime, not an accessor to thread
+/// through every call site below.
+impl std::ops::Deref for Scratch {
+    type Target = RunPaths;
+
+    fn deref(&self) -> &RunPaths {
+        &self.paths
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // `RunDir.RemovePublicHusk` removes a directory's entries and then the
+        // directory. It is the one recursive delete this module can reach
+        // through a site-taking funnel: `src/engine/topology/**` is a
+        // `TOPOLOGY_MODULE`, where `clippy.toml` denies `std::fs::remove_dir_all`
+        // in tests too.
+        //
+        // `NoHooks`, never the fixture's own harness. Reclamation is this
+        // module's housekeeping, and recording it would put a `RunDir` effect
+        // into the very ledgers whose emptiness the absence tests above read.
+        let _ = crate::rundir::remove_public_husk(&self.root, &mut crate::rundir::NoHooks);
+    }
+}
+
 /// A run directory tree of this test's own, created through the `RunDir`
 /// funnels rather than with `create_dir_all`, which this module may not name.
 ///
 /// Numbered as well as named: several tests below want two independent runs.
-fn run_paths(tag: &str) -> RunPaths {
+fn run_paths(tag: &str) -> Arc<Scratch> {
     let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("upstroke-emit-{tag}-{}-{n}", std::process::id()));
+    // The one exit a `Drop` cannot cover: a process killed outright leaves its
+    // tree behind, and the counter restarts at zero every process, so a pid the
+    // OS has recycled can reproduce this whole name. Reclaiming first makes the
+    // fixture hermetic against that residue rather than creating over it — a
+    // stale `events.jsonl` would otherwise fail "a fresh run has no prefix".
+    // Names are unique within a process, so this can never reach a live one.
+    let _ = crate::rundir::remove_public_husk(&root, &mut crate::rundir::NoHooks);
     let paths = RunPaths::with_private_root(&root, RUN_ID, &root);
     paths.create().expect("the run directories");
-    paths
+    Arc::new(Scratch { root, paths })
 }
 
 /// A clock that does not move, so a committed line is a literal.
@@ -291,7 +348,6 @@ fn pool_body() -> TopologyEventBody {
 /// The whole of what one emit borrows, plus the harness the five families
 /// record into.
 struct Fixture {
-    paths: RunPaths,
     harness: Arc<Mutex<HookHarness>>,
     hooks: HarnessTopologyHooks,
     identity: RunIdentity,
@@ -301,6 +357,12 @@ struct Fixture {
     invocations: InvocationLedger,
     warnings: Vec<String>,
     clock: FixedClock,
+    /// Last, because struct fields drop in declaration order and this one
+    /// reclaims the directory `log`'s [`std::fs::File`] is open on. Windows is
+    /// a first-class target and does not remove a directory out from under an
+    /// open handle; ahead of `log` the removal would fail, and `Drop` has no
+    /// caller to return that failure to.
+    paths: Arc<Scratch>,
 }
 
 impl Fixture {
@@ -323,7 +385,6 @@ impl Fixture {
         let (log, bytes, _events, fold) = prefix.into_log_and_fold();
         assert!(bytes.is_empty(), "a fresh run has no prefix");
         Self {
-            paths,
             harness,
             hooks,
             identity: RunIdentity {
@@ -337,6 +398,7 @@ impl Fixture {
             invocations: InvocationLedger::new(),
             warnings,
             clock: FixedClock("2026-08-23T09:41:02Z"),
+            paths,
         }
     }
 
@@ -471,6 +533,102 @@ fn append_error(error: &EmitError) -> &UncancelledAppend {
 }
 
 // ---------------------------------------------------------------------------
+// The fixture's own cleanup
+// ---------------------------------------------------------------------------
+
+/// §6: cleanup "MUST also occur on early return, error, panic unwinding".
+///
+/// The unwinding path is the one worth measuring, and it is the one a trailing
+/// removal misses: the line that would have removed the tree is skipped by
+/// exactly the failing assertion that makes a surviving tree worth having. So
+/// the panicking arm is the claim, and the returning arm is its **control** —
+/// without it, "the root is absent afterwards" would be satisfied just as well
+/// by a fixture that never created one.
+///
+/// Both arms assert the tree exists *before* the guard drops, for the same
+/// reason: an absence is only evidence when a presence preceded it.
+#[test]
+fn the_scratch_tree_is_reclaimed_on_the_unwinding_path_as_well_as_the_returning_one() {
+    // The panicking arm never returns a value, so the root it observed is
+    // published to the caller before the body can end either way.
+    fn root_after(tag: &str, panicking: bool) -> PathBuf {
+        let seen = Arc::new(Mutex::new(PathBuf::new()));
+        let body = {
+            let seen = Arc::clone(&seen);
+            move || {
+                let scratch = run_paths(tag);
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone_from(&scratch.root);
+                assert!(
+                    scratch.root.is_dir() && scratch.public.is_dir() && scratch.private.is_dir(),
+                    "the guard created the tree it owns"
+                );
+                if panicking {
+                    panic!("a failing assertion of this fixture's own");
+                }
+            }
+        };
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        assert_eq!(
+            ended.is_err(),
+            panicking,
+            "the arm ended the way the case says it does"
+        );
+        let root = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !root.as_os_str().is_empty(),
+            "the body ran far enough to own a tree"
+        );
+        root
+    }
+
+    for (tag, panicking) in [("cleanup-return", false), ("cleanup-unwind", true)] {
+        let root = root_after(tag, panicking);
+        assert!(
+            !root.exists(),
+            "the guard reclaimed {}: panicking={panicking}",
+            root.display()
+        );
+    }
+}
+
+/// The protocol the two "a fresh process" tests rely on: dropping a [`Fixture`]
+/// ends its handles, not its tree.
+///
+/// Stated as a test of its own because it is a property of the guard rather
+/// than of either test that leans on it. A guard that reclaimed on the
+/// fixture's own `Drop` would leave both of those reading a directory this
+/// module had just deleted — and each would then be measuring the resume of a
+/// log that is not there, which is not the claim either one makes.
+#[test]
+fn dropping_a_fixture_ends_its_handles_and_the_last_share_ends_the_tree() {
+    let fixture = Fixture::started("share-outlives-fixture");
+    let paths = Arc::clone(&fixture.paths);
+    let root = paths.root.clone();
+    assert!(root.is_dir(), "the fixture created the tree");
+
+    drop(fixture);
+
+    // Not merely "the directory is still there": the surviving tree is still a
+    // readable run, which is what the resume in each of those tests asks of it.
+    assert!(
+        resume(&paths).fold().started().is_some(),
+        "the dead fixture's log outlived the handles onto it"
+    );
+
+    drop(paths);
+    assert!(
+        !root.exists(),
+        "and the last share reclaims it: {}",
+        root.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The barrier, before anything acts on what it proved
 // ---------------------------------------------------------------------------
 
@@ -507,6 +665,9 @@ fn open_syncs_surviving_prefix_before_any_recovery_effect() {
         AppendOutcome::Present,
         "the line is on disk; only its durability is in doubt"
     );
+    // A share of the run directory, not a copy of the paths: what this test
+    // ends is the handles onto the tree, and the tree has to outlive them for
+    // the resume below to have anything to read.
     let paths = earlier.paths.clone();
     drop(earlier);
 
@@ -605,6 +766,9 @@ fn open_sync_failure_refuses_resumably_with_no_fold_derived_effect() {
     let mut fixture = Fixture::started("open-sync-failure");
     fixture.emit(budget_body()).expect("a second durable line");
     let before = fixture.log_bytes();
+    // A share of the run directory, not a copy of the paths: what this test
+    // ends is the handles onto the tree, and the tree has to outlive them for
+    // the resume below to have anything to read.
     let paths = fixture.paths.clone();
     drop(fixture);
 
