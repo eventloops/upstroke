@@ -3310,7 +3310,7 @@ fn relative_slashed(path: &Path) -> String {
 ///   `//`-only strip this census used before saw neither a `/* … */` nor a
 ///   `const CFG_TEST_ATTR: &str = "#[cfg(test)]";`, and either one collapsed a
 ///   whole production file's region to nothing.
-/// * **A region that stops at `#[cfg(test)] mod tests;`.** Thirteen files in
+/// * **A region that stops at `#[cfg(test)] mod tests;`.** Fourteen files in
 ///   this tree declare their tests that way, and everything below such a
 ///   declaration is legal production code that a truncating region cannot see.
 ///   `production_code` removes the item and keeps the rest of the file.
@@ -3400,9 +3400,9 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // real production module from this census's domain.
     // Through the shared resolver. This loop stood here, in `runner::tests`
     // and — as a *third*, different rule — in `recover::tests`, which keyed on
-    // the file name and covered fourteen of the seventeen. `PR7-R5-ATT-001`.
+    // the file name and covered fourteen of the eighteen. `PR7-R5-ATT-001`.
     let test_modules: BTreeSet<PathBuf> =
-        crate::effects::census_domain::whole_file_test_modules(&files, 13);
+        crate::effects::census_domain::whole_file_test_modules(&src, &files, 13);
     assert!(
         test_modules.contains(&src.join("events").join("log").join("tests.rs")),
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"

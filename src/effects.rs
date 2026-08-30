@@ -171,6 +171,17 @@ pub struct GovernedAllow {
     pub lints: Vec<String>,
     /// Every lint it names, as written — so a widening is visible.
     pub written: Vec<String>,
+    /// Which attribute keywords the governed lints were found under: `allow`,
+    /// `expect`, or both if one attribute writes both.
+    ///
+    /// The two are not the same permission and the placement rule now
+    /// distinguishes them. `allow` is unconditional and says nothing when the
+    /// thing it permits stops happening; `expect` is refused by the compiler
+    /// when it goes unfulfilled, which is what makes a per-site one a count the
+    /// build owns rather than a claim a reviewer has to re-check.
+    pub keywords: Vec<&'static str>,
+    /// Whether it carries a `reason = "…"`.
+    pub reasoned: bool,
 }
 
 /// `source` with every comment and string literal replaced by spaces of the same
@@ -545,7 +556,7 @@ pub fn production_region(source: &str) -> String {
 /// **prohibition** question must not have. Three failures a prohibition census
 /// pays for with a truncating region, all three measured on this tree:
 ///
-/// * A file that declares its tests as `#[cfg(test)] mod tests;` — thirteen of
+/// * A file that declares its tests as `#[cfg(test)] mod tests;` — fourteen of
 ///   them here — puts every line **below** that declaration outside the region.
 ///   The declaration is usually the last item, so the hole is normally empty;
 ///   appending to the file fills it. Legal Rust, no comment trick, and it
@@ -689,6 +700,8 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         let attribute = &blanked[open + 1..close];
         let mut lints = Vec::new();
         let mut written = Vec::new();
+        let mut keywords: Vec<&'static str> = Vec::new();
+        let mut reasoned = false;
         for keyword in ["allow", "expect"] {
             let mut at = 0;
             while let Some(hit) = attribute[at..].find(keyword) {
@@ -699,15 +712,23 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
                         && attribute.as_bytes()[start - 1] != b'_';
                 if is_word_start && attribute.as_bytes().get(after) == Some(&b'(') {
                     if let Some(end) = matching(attribute.as_bytes(), after, b'(', b')') {
+                        let before = lints.len();
                         for entry in attribute[after + 1..end].split(',') {
                             let entry = entry.trim();
-                            if entry.is_empty() || entry.starts_with("reason") {
+                            if entry.is_empty() {
+                                continue;
+                            }
+                            if entry.starts_with("reason") {
+                                reasoned = true;
                                 continue;
                             }
                             written.push(entry.to_owned());
                             if let Some(name) = normalize_lint(entry) {
                                 lints.push(name.to_owned());
                             }
+                        }
+                        if lints.len() > before && !keywords.contains(&keyword) {
+                            keywords.push(keyword);
                         }
                     }
                 }
@@ -721,6 +742,8 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
                 module_level: is_module_level(&blanked, i, close, inner),
                 lints,
                 written,
+                keywords,
+                reasoned,
             });
         }
         i = close + 1;
@@ -1297,49 +1320,72 @@ pub(crate) mod census_domain {
     /// The resolution loop — assert exactly one of the two candidates exists,
     /// collect it — was written out at each caller, and a third caller wrote a
     /// different rule instead: `path.file_stem() == "tests"`. That covers the
-    /// fourteen files named `tests.rs` and **not** the three that are not:
-    /// `#[cfg(test)] mod scaffold;`, `mod premove;` and `mod fake;`. Seventeen,
-    /// not fourteen, and the three it missed are the ones a census is most
-    /// likely to trip over, because a scaffold and a fake exist to *name* the
-    /// things production names. Found by S5 round 5's `seams`, `attempt` and
-    /// `settle` lenses independently; the consolidation had been filed one
-    /// commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
+    /// fourteen files named `tests.rs` and **not** the four that are not:
+    /// `scaffold`, `premove`, `fake` and `readiness`. Eighteen, not fourteen,
+    /// and the four it misses are the ones a census is most likely to trip
+    /// over, because a scaffold, a fake and a readiness protocol exist to
+    /// *name* the things production names. Found by S5 round 5's `seams`,
+    /// `attempt` and `settle` lenses independently; the consolidation had been
+    /// filed one commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
     ///
     /// # Panics
     ///
     /// When a declaration resolves to no file or to both candidates — a skip
-    /// path naming no file is a skip that has stopped meaning anything — or
-    /// when fewer than `floor` declarations are derived, which is the control
-    /// against a derivation that has silently stopped finding anything.
+    /// path naming no file is a skip that has stopped meaning anything — when
+    /// two declarations resolve to one file, when the declaration graph is
+    /// cyclic, or when fewer than `floor` declarations are derived, which is
+    /// the control against a derivation that has silently stopped finding
+    /// anything.
     pub(crate) fn whole_file_test_modules(
+        source_root: &std::path::Path,
         files: &[PathBuf],
         floor: usize,
     ) -> std::collections::BTreeSet<PathBuf> {
-        let declarations = declared_whole_file_test_modules(files);
+        let declarations = declared_whole_file_test_modules(source_root, files);
         assert!(
             declarations.len() >= floor,
-            "only {} `#[cfg(test)] mod …;` declarations were derived and the floor is {floor}; \
+            "only {} test-only `mod …;` declarations were derived and the floor is {floor}; \
              the derivation is finding nothing",
             declarations.len()
         );
         let mut modules = std::collections::BTreeSet::new();
-        for (declared_in, name, candidates) in &declarations {
-            let present: Vec<&PathBuf> = candidates
-                .iter()
-                .filter(|candidate| candidate.is_file())
-                .collect();
-            assert_eq!(
-                present.len(),
-                1,
-                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
-                 path naming no file is a skip that has stopped meaning anything",
-                declared_in.display(),
-                present.len()
+        let mut edges: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for declaration in &declarations {
+            let resolved = sole_present(&declaration.candidates, &|path| path.is_file())
+                .unwrap_or_else(|present| {
+                    panic!(
+                        "`{}` declares `mod {};` under {} and {present} of {:?} exist. A skip \
+                         path naming no file is a skip that has stopped meaning anything",
+                        declaration.declared_in.display(),
+                        declaration.name,
+                        declaration.render_guard(),
+                        declaration.candidates
+                    )
+                })
+                .clone();
+            assert!(
+                modules.insert(resolved.clone()),
+                "two declarations resolve to `{}`; one of them is deriving a skip for a file it \
+                 does not declare",
+                resolved.display()
             );
-            modules.insert(present[0].clone());
+            edges.push((declaration.declared_in.clone(), resolved));
         }
+        // **The declaration graph is a forest.** Directory-derived candidates
+        // descend, so a cycle is not reachable from this tree — which is the
+        // reason to check rather than a reason not to: an unreachable path is
+        // one nobody would notice becoming reachable. A `#[path]` attribute is
+        // the one construct that could build one, and the scanner refuses those
+        // rather than resolving them, so this assertion and that refusal are
+        // one control with two halves.
+        assert!(
+            declaration_cycle(&edges).is_none(),
+            "the module declarations are cyclic, so no file's guard can be trusted: {:?}",
+            declaration_cycle(&edges)
+        );
         // **The control that binds every caller**, and it belongs here rather
-        // than at each of them. `the_declared_whole_file_test_modules_are_seventeen…`
+        // than at each of them.
+        // `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
         // asserts what this *returns*; it says nothing about whether a census
         // calls it, which is the defect `3a91626` repaired for two censuses and
         // this witness then reproduced one commit later (`R6-SETTLE-003`). A
@@ -1355,8 +1401,440 @@ pub(crate) mod census_domain {
         modules
     }
 
-    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
-    /// `(declaring file, name, [flat candidate, nested candidate])`.
+    /// A cycle in `edges`, as the path that closes it, or `None`.
+    ///
+    /// `edges` is (declaring file, declared file). The derivation treats that
+    /// relation as a forest — every guard is read from the file *above* — so a
+    /// cycle means the traversal would either not terminate or attribute a
+    /// guard to a file that does not inherit it.
+    ///
+    /// Pure and separately driven, because the real tree cannot produce one: a
+    /// census control that is only ever exercised on input that satisfies it is
+    /// a control nobody has seen refuse anything.
+    pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Depth-first search state. `Grey` is "on the path being walked", and
+        /// reaching a `Grey` node is what a back edge *is*.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Colour {
+            White,
+            Grey,
+            Black,
+        }
+
+        // **The full adjacency, not the first edge out of each node.** The
+        // first version followed `edges.iter().find(…)`, which walks one
+        // outgoing edge per node — so a node with two children whose *second*
+        // child closes the loop reported no cycle. `a -> b`, `a -> c`,
+        // `c -> a` was the shape, and it read as acyclic.
+        let mut adjacency: BTreeMap<&PathBuf, Vec<&PathBuf>> = BTreeMap::new();
+        let mut nodes: BTreeSet<&PathBuf> = BTreeSet::new();
+        for (from, to) in edges {
+            adjacency.entry(from).or_default().push(to);
+            nodes.insert(from);
+            nodes.insert(to);
+        }
+
+        let mut colour: BTreeMap<&PathBuf, Colour> =
+            nodes.iter().map(|node| (*node, Colour::White)).collect();
+        for start in &nodes {
+            if colour.get(start) != Some(&Colour::White) {
+                continue;
+            }
+            colour.insert(start, Colour::Grey);
+            // (node, how many of its outgoing edges have been taken). The stack
+            // IS the current path, which is what makes the cycle reportable.
+            let mut stack: Vec<(&PathBuf, usize)> = vec![(start, 0)];
+            while let Some((node, taken)) = stack.pop() {
+                let outgoing: &[&PathBuf] = adjacency
+                    .get(node)
+                    .map_or(&[][..], |edges| edges.as_slice());
+                let Some(next) = outgoing.get(taken).copied() else {
+                    colour.insert(node, Colour::Black);
+                    continue;
+                };
+                stack.push((node, taken + 1));
+                match colour.get(next) {
+                    Some(Colour::Grey) => {
+                        let path: Vec<&PathBuf> = stack.iter().map(|(at, _)| *at).collect();
+                        let from = path.iter().position(|at| *at == next).unwrap_or(0);
+                        let mut cycle: Vec<PathBuf> =
+                            path[from..].iter().map(|at| (*at).clone()).collect();
+                        cycle.push(next.clone());
+                        return Some(cycle);
+                    }
+                    Some(Colour::Black) => {}
+                    _ => {
+                        colour.insert(next, Colour::Grey);
+                        stack.push((next, 0));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The one of `candidates` that `exists` accepts, or how many it accepted.
+    ///
+    /// Zero is a declaration naming no file, which is a skip that has stopped
+    /// meaning anything. Two is `name.rs` and `name/mod.rs` both present, which
+    /// Rust itself refuses to compile and which a resolver that took the first
+    /// match would silently pick a side in. Both are refusals.
+    ///
+    /// `exists` is a parameter rather than a `Path::is_file` call so the two
+    /// refusals can be driven: neither is reachable from this tree, and a
+    /// control that has only ever seen compliant input is a control nobody has
+    /// watched refuse anything. It is also what keeps this body free of an
+    /// effect — the funnel section of the allowlist records `allows = []` for
+    /// this file and that claim is stronger than any other entry there.
+    pub(crate) fn sole_present<'a>(
+        candidates: &'a [PathBuf; 2],
+        exists: &dyn Fn(&std::path::Path) -> bool,
+    ) -> Result<&'a PathBuf, usize> {
+        let present: Vec<&PathBuf> = candidates
+            .iter()
+            .filter(|candidate| exists(candidate))
+            .collect();
+        match present.as_slice() {
+            [only] => Ok(only),
+            other => Err(other.len()),
+        }
+    }
+
+    /// Why a declaration's candidate files cannot be named.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum CandidateRefusal {
+        /// The declaring file is not inside the package the inventory was read
+        /// for, so that inventory does not say whether it is a crate root.
+        OutsideThePackage {
+            declared_in: PathBuf,
+            package_dir: PathBuf,
+        },
+    }
+
+    impl std::fmt::Display for CandidateRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::OutsideThePackage {
+                    declared_in,
+                    package_dir,
+                } => write!(
+                    f,
+                    "`{}` is not inside `{}`, so the target inventory read for that package \
+                     does not say whether it is a crate root",
+                    declared_in.display(),
+                    package_dir.display()
+                ),
+            }
+        }
+    }
+
+    /// Why a package's target inventory could not be established.
+    ///
+    /// Every variant is a **refusal to guess**. The resolution below turns on
+    /// which files Cargo compiles as crate roots, that is a fact only the
+    /// manifest holds, and the previous derivation held it as a rule about file
+    /// stems instead. A rule cannot be wrong quietly the way a stem test can:
+    /// when the authority is unavailable the census stops.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum InventoryRefusal {
+        /// `cargo metadata` could not be started at all.
+        NotRun { manifest: PathBuf, why: String },
+        /// It ran and exited non-zero.
+        Failed {
+            manifest: PathBuf,
+            status: String,
+            stderr: String,
+        },
+        /// Its output is not the JSON document this reads.
+        Unreadable { manifest: PathBuf, why: String },
+        /// No package in the document has that manifest path.
+        NoPackage { manifest: PathBuf },
+        /// The package has no targets, so nothing is a crate root.
+        NoTargets { manifest: PathBuf },
+    }
+
+    impl std::fmt::Display for InventoryRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotRun { manifest, why } => write!(
+                    f,
+                    "`cargo metadata` for `{}` could not be started ({why}), so the crate roots \
+                     are unknown and this census will not guess them from file names",
+                    manifest.display()
+                ),
+                Self::Failed {
+                    manifest,
+                    status,
+                    stderr,
+                } => write!(
+                    f,
+                    "`cargo metadata` for `{}` exited {status}: {stderr}",
+                    manifest.display()
+                ),
+                Self::Unreadable { manifest, why } => write!(
+                    f,
+                    "`cargo metadata` for `{}` did not answer with the document this reads \
+                     ({why})",
+                    manifest.display()
+                ),
+                Self::NoPackage { manifest } => write!(
+                    f,
+                    "`cargo metadata` named no package whose manifest is `{}`",
+                    manifest.display()
+                ),
+                Self::NoTargets { manifest } => write!(
+                    f,
+                    "the package at `{}` declares no target, so it has no crate root",
+                    manifest.display()
+                ),
+            }
+        }
+    }
+
+    /// **The files Cargo compiles as crate roots**, read from the manifest via
+    /// `cargo metadata` rather than inferred from their names.
+    ///
+    /// A crate root owns its own directory; every other file owns a directory
+    /// named after it. Which files are roots is a property of the *manifest*,
+    /// and the previous derivation decided it from the file's stem: `lib.rs` or
+    /// `main.rs` at the source root was a root, the same stem anywhere else was
+    /// refused, and anything else was an ordinary module. Both halves are wrong
+    /// against a manifest that says otherwise, and the second half is wrong
+    /// **silently**:
+    ///
+    /// * `[[bin]] path = "src/tools/odd.rs"` is a crate root with an arbitrary
+    ///   name. The stem rule reads it as the ordinary module `tools::odd`, so a
+    ///   `mod helper;` inside it resolves to `src/tools/odd/helper.rs` when
+    ///   Cargo compiles `src/tools/helper.rs`. That is a **different file** —
+    ///   the same competing-sibling hazard the nested-`lib.rs` refusal was
+    ///   written for, arriving through the door that refusal left open, and it
+    ///   does not announce itself: with no `src/tools/odd/helper.rs` present the
+    ///   wrong reading resolves rather than refusing.
+    /// * `examples/probe.rs` is this tree's live instance. It is an `example`
+    ///   target — a crate root — and `effects::tests::scanned_sources` walks
+    ///   `examples/**`, so the stem rule already answers `examples/probe` for a
+    ///   directory Cargo calls `examples`.
+    /// * A nested `src/a/lib.rs` the manifest never names is the ordinary module
+    ///   `a::lib`, which is decidable rather than ambiguous once the manifest is
+    ///   read. The old refusal was the honest answer to not knowing; this is the
+    ///   answer.
+    ///
+    /// Kinds are **not** filtered. `lib`, `bin`, `example`, `test`, `bench` and
+    /// `custom-build` are each a crate root of their own, and a census that
+    /// looked only at `lib`/`bin` would re-introduce the same class one kind at
+    /// a time.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CrateRoots {
+        package_dir: PathBuf,
+        roots: std::collections::BTreeSet<PathBuf>,
+    }
+
+    impl CrateRoots {
+        /// The inventory in one `cargo metadata --format-version 1` document,
+        /// for the package whose manifest is `manifest`.
+        ///
+        /// Pure over the document, which is what makes every refusal below
+        /// drivable: the acquisition is a process start and lives in
+        /// [`crate::effects::tests`], where this crate's governance puts one.
+        pub(crate) fn from_metadata_json(
+            json: &str,
+            manifest: &std::path::Path,
+        ) -> Result<Self, InventoryRefusal> {
+            let refuse = |why: &str| InventoryRefusal::Unreadable {
+                manifest: manifest.to_path_buf(),
+                why: why.to_owned(),
+            };
+            let document: serde_json::Value =
+                serde_json::from_str(json).map_err(|error| refuse(&error.to_string()))?;
+            let packages = document
+                .get("packages")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| refuse("no `packages` array"))?;
+            let package = packages
+                .iter()
+                .find(|package| {
+                    package
+                        .get("manifest_path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|path| std::path::Path::new(path) == manifest)
+                })
+                .ok_or_else(|| InventoryRefusal::NoPackage {
+                    manifest: manifest.to_path_buf(),
+                })?;
+            let targets = package
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| refuse("the package has no `targets` array"))?;
+            let mut roots = std::collections::BTreeSet::new();
+            for target in targets {
+                let source = target
+                    .get("src_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| refuse("a target carries no `src_path`"))?;
+                roots.insert(PathBuf::from(source));
+            }
+            if roots.is_empty() {
+                return Err(InventoryRefusal::NoTargets {
+                    manifest: manifest.to_path_buf(),
+                });
+            }
+            Ok(Self {
+                package_dir: manifest
+                    .parent()
+                    .ok_or_else(|| refuse("the manifest path has no directory"))?
+                    .to_path_buf(),
+                roots,
+            })
+        }
+
+        /// The directory the package's manifest sits in.
+        pub(crate) fn package_dir(&self) -> &std::path::Path {
+            &self.package_dir
+        }
+
+        /// Every crate root, absolute, in sorted order.
+        pub(crate) fn roots(&self) -> impl Iterator<Item = &std::path::Path> {
+            self.roots.iter().map(PathBuf::as_path)
+        }
+
+        /// Whether `path` is one of them.
+        pub(crate) fn is_root(&self, path: &std::path::Path) -> bool {
+            self.roots.contains(path)
+        }
+
+        /// Whether the package-relative, `/`-separated `relative` is one.
+        ///
+        /// The second caller reads the tree as repo-relative slash strings
+        /// rather than as paths, and one authority answering both is the point:
+        /// `PR5D-VISIBILITY-CHECK-DUPLICATED` is the standing entry for the rule
+        /// that got written twice, and the stem test *was* written twice — here
+        /// and in `effects::tests::cfg::module_dir`.
+        pub(crate) fn is_root_relative(&self, relative: &str) -> bool {
+            let mut candidate = self.package_dir.clone();
+            for part in relative.split('/') {
+                candidate.push(part);
+            }
+            self.is_root(&candidate)
+        }
+    }
+
+    /// The directory an out-of-line child of `declared_in` lives in.
+    ///
+    /// **A crate root owns its directory; an ordinary module owns a directory
+    /// named after it.** `mod.rs` is the first case wherever it sits — that is
+    /// what `mod.rs` means. Everything else is the first case exactly when the
+    /// manifest names it as a target's path, which is what [`CrateRoots`] reads
+    /// and what no rule about file names can answer.
+    ///
+    /// Refused rather than decided when `declared_in` is not inside the package
+    /// the inventory was read for: an inventory is a statement about one
+    /// package, and a file outside it is one the inventory is silent on.
+    pub(crate) fn module_directory(
+        roots: &CrateRoots,
+        declared_in: &std::path::Path,
+    ) -> Result<PathBuf, CandidateRefusal> {
+        let parent = declared_in
+            .parent()
+            .expect("a source file has a directory")
+            .to_path_buf();
+        let stem = declared_in.file_stem().expect("a source file has a name");
+        if roots.is_root(declared_in) {
+            return Ok(parent);
+        }
+        if !declared_in.starts_with(roots.package_dir()) {
+            return Err(CandidateRefusal::OutsideThePackage {
+                declared_in: declared_in.to_path_buf(),
+                package_dir: roots.package_dir().to_path_buf(),
+            });
+        }
+        if stem == "mod" {
+            return Ok(parent);
+        }
+        Ok(parent.join(stem))
+    }
+
+    /// The two files `mod <name>;` can name, given where it was written.
+    ///
+    /// `declared_in` is the declaring file; `inline_path` is the inline modules
+    /// enclosing the declaration, outermost first. **The inline path is part of
+    /// the directory**, which is the half a resolver reading only the file name
+    /// gets wrong: `mod readiness;` inside `proc.rs`'s inline `test_support`
+    /// names `proc/test_support/readiness.rs`, and flattened to
+    /// `proc/readiness.rs` it names nothing — a zero-candidate refusal if you
+    /// are lucky and the wrong file if you are not.
+    ///
+    /// `roots` is the package's target inventory, and [`module_directory`] is
+    /// why that is a parameter rather than a test on the file's stem.
+    pub(crate) fn candidates_for(
+        roots: &CrateRoots,
+        declared_in: &std::path::Path,
+        inline_path: &[String],
+        name: &str,
+    ) -> Result<[PathBuf; 2], CandidateRefusal> {
+        let mut dir = module_directory(roots, declared_in)?;
+        for enclosing in inline_path {
+            dir.push(enclosing);
+        }
+        Ok([
+            dir.join(format!("{name}.rs")),
+            dir.join(name).join("mod.rs"),
+        ])
+    }
+
+    /// Whether `candidate` stays inside `base` through plain path components.
+    ///
+    /// A module name is an identifier and a candidate is `base` joined with
+    /// identifiers, so this holds by construction — and is asserted anyway,
+    /// because the construction is what a `#[path = "../.."]` attribute would
+    /// change, and the failure it would cause is a census reading a file
+    /// outside the tree as declared inside it.
+    pub(crate) fn contained_in(base: &std::path::Path, candidate: &std::path::Path) -> bool {
+        let Ok(rest) = candidate.strip_prefix(base) else {
+            return false;
+        };
+        rest.components().count() > 0
+            && rest
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    }
+
+    /// One out-of-line `mod <name>;` the crate declares as test-only.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TestModuleDeclaration {
+        /// The file the declaration is written in.
+        pub(crate) declared_in: PathBuf,
+        /// The declared module's name.
+        pub(crate) name: String,
+        /// The **inline** modules enclosing the declaration, outermost first.
+        /// Empty when the declaration sits at the file's top level.
+        pub(crate) inline_path: Vec<String>,
+        /// The effective `cfg` predicate, rendered — the conjunction of every
+        /// enclosing inline module's predicate and the declaration's own.
+        pub(crate) guard: String,
+        /// `[<dir>/<name>.rs, <dir>/<name>/mod.rs]`, where `<dir>` is the
+        /// declaring file's module directory joined with [`Self::inline_path`].
+        pub(crate) candidates: [PathBuf; 2],
+    }
+
+    impl TestModuleDeclaration {
+        /// The guard and the inline path it was read through, for a diagnostic.
+        fn render_guard(&self) -> String {
+            if self.inline_path.is_empty() {
+                format!("`cfg({})`", self.guard)
+            } else {
+                format!(
+                    "`cfg({})` through `{}`",
+                    self.guard,
+                    self.inline_path.join("::")
+                )
+            }
+        }
+    }
+
+    /// Every out-of-line module declaration the crate compiles **only** under
+    /// `cfg(test)`, structurally resolved.
     ///
     /// Such a file is test code end to end. A region function has nothing to
     /// remove in one, so it would count the whole of it as production — a
@@ -1373,51 +1851,1103 @@ pub(crate) mod census_domain {
     /// measured, with a `git push` planted in it that the census then did not
     /// see. Over the whole tree the raw split derived 50 skip paths of which
     /// **34 named no file at all**, and a skip path naming no file is a skip
-    /// that has stopped meaning anything, so each caller asserts that exactly
-    /// one of the two candidates exists.
+    /// that has stopped meaning anything, so [`whole_file_test_modules`] asserts
+    /// that exactly one of the two candidates exists.
     ///
-    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
-    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
-    /// derive a skip leaves a test file inside a census's domain, where a
-    /// fixture is reported as an offender and someone looks; deriving one it
-    /// should not removes a real production file, silently. Only the first
-    /// direction is safe, so the predicate stays the narrow one.
+    /// # Structure, not a literal `#[cfg(test)] mod name;`
+    ///
+    /// The predicate used to be exactly that string, and it had two holes a
+    /// **text** rule cannot close and a structural one closes together:
+    ///
+    /// * **A visibility qualifier hid the declaration.** `#[cfg(test)]
+    ///   pub(crate) mod helpers;` was not matched, because the rule read `mod `
+    ///   immediately after the attribute. That direction was chosen as the safe
+    ///   one — failing to derive a skip leaves a test file in a census's domain,
+    ///   where a fixture reads as an offender and someone looks — and it is
+    ///   still the safe direction. It stopped being *necessary*: the scan below
+    ///   reads the item, so a qualifier is transparent rather than fatal.
+    /// * **An inline ancestor carried the guard.** `#[cfg(test)] mod
+    ///   test_support { … mod readiness; }` compiles `readiness.rs` only under
+    ///   `cfg(test)`, and the declaration inside carries no attribute at all.
+    ///   `src/agent/proc/test_support/readiness.rs` is that file; without the
+    ///   ancestry it is a whole test file with no `#[cfg(test)]` anywhere in it,
+    ///   which is precisely the shape every census here exists to skip.
+    ///
+    /// So the scan walks each file's **module structure**: brace depth, the
+    /// inline modules open at each point, and the `cfg` predicates on each of
+    /// them. A declaration is test-only when the conjunction of its own
+    /// predicate and every enclosing inline module's predicate is false
+    /// wherever `test` is false — [`entails_test`].
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// **No transitive closure over files.** `src/effects/tests.rs` is itself a
+    /// whole-file test module and declares `mod policy;`, so Rust compiles
+    /// `src/effects/tests/policy.rs` only under `cfg(test)` too — and this
+    /// derivation does not say so. Every census in this crate reads
+    /// [`super::production_code`], which removes `#[cfg(test)]` items from the
+    /// files it keeps, and those second-level files carry their own inline
+    /// `cfg(test)` modules and their own `#![deny]` prologues for exactly that
+    /// reason (`effects/tests/classification.rs` and its siblings say so at
+    /// length). Closing over the file graph would widen the skip set by a dozen
+    /// files whose contents no census has been measured against, which is a
+    /// change to what every census can see and not a bug fix. The measured
+    /// domain is the eighteen
+    /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+    /// names and counts — fourteen literal `#[cfg(test)] mod tests;`, plus
+    /// `scaffold`, `premove`, `fake` and `readiness`. A nineteenth arrives with
+    /// the slice that measures it.
+    ///
+    /// **No `#[path]`.** A `#[path]` attribute on a module is refused rather
+    /// than resolved: it is the one construct that can point a declaration
+    /// outside its own directory, and there are none in this tree.
+    ///
+    /// # Panics
+    ///
+    /// When a file cannot be read structurally at all — an attribute that never
+    /// closes, a brace that closes one too many, a `mod` with no name or no
+    /// terminator, a `cfg` predicate the entailment grammar cannot read, a
+    /// `#[path]`, or one name declared twice in one module. Every one of those
+    /// means the scan does not know what the file declares, and a scan that
+    /// does not know must not answer.
     pub(crate) fn declared_whole_file_test_modules(
+        source_root: &std::path::Path,
         files: &[PathBuf],
-    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+    ) -> Vec<TestModuleDeclaration> {
+        let roots = crate::effects::tests::crate_roots();
+        // **The inventory has to describe the tree being walked.** `source_root`
+        // is the caller's claim about where the crate's sources live, and the
+        // manifest's is the target paths; a `source_root` no target sits under
+        // means the two are about different trees, and every answer below would
+        // be resolved against an inventory that says nothing about the files in
+        // hand. Fail closed, in the same breath as the acquisition itself.
+        assert!(
+            roots.roots().any(|root| root.starts_with(source_root)),
+            "no target of the package at `{}` lives under `{}`, so its inventory does not \
+             describe the tree this census was handed: {:?}",
+            roots.package_dir().display(),
+            source_root.display(),
+            roots.roots().collect::<Vec<_>>()
+        );
         let mut found = Vec::new();
         for path in files {
-            let blanked = super::blank_comments_and_strings(
-                &std::fs::read_to_string(path).expect("read source"),
-            );
+            let source = std::fs::read_to_string(path).expect("read source");
+            let declarations = scan_module_declarations(&source)
+                .unwrap_or_else(|refusal| panic!("{}: {refusal}", path.display()));
             let parent = path.parent().expect("a source file has a directory");
-            let stem = path.file_stem().expect("a source file has a name");
-            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            for rest in blanked.split("#[cfg(test)]").skip(1) {
-                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
-                    continue;
-                };
-                let Some(name) = name.split(';').next().map(str::trim) else {
-                    continue;
-                };
-                if name.is_empty() || name.contains('{') {
+            for declaration in declarations {
+                if !declaration.test_only {
                     continue;
                 }
-                found.push((
-                    path.clone(),
-                    name.to_owned(),
-                    [
-                        dir.join(format!("{name}.rs")),
-                        dir.join(name).join("mod.rs"),
-                    ],
-                ));
+                let candidates =
+                    candidates_for(roots, path, &declaration.inline_path, &declaration.name)
+                        .unwrap_or_else(|refusal| panic!("{refusal}"));
+                for candidate in &candidates {
+                    assert!(
+                        contained_in(parent, candidate),
+                        "`{}` declares `mod {};` and the candidate `{}` leaves `{}`",
+                        path.display(),
+                        declaration.name,
+                        candidate.display(),
+                        parent.display()
+                    );
+                }
+                found.push(TestModuleDeclaration {
+                    declared_in: path.clone(),
+                    name: declaration.name,
+                    inline_path: declaration.inline_path,
+                    guard: declaration.guard,
+                    candidates,
+                });
             }
         }
         found
+    }
+
+    /// One `mod` declaration as the scan read it out of a file's structure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct ScannedDeclaration {
+        /// The declared module's name.
+        pub(crate) name: String,
+        /// The inline modules enclosing it, outermost first.
+        pub(crate) inline_path: Vec<String>,
+        /// The effective predicate, rendered.
+        pub(crate) guard: String,
+        /// Whether that predicate is false wherever `test` is false.
+        pub(crate) test_only: bool,
+    }
+
+    /// Why a file's structure could not be read, and where.
+    ///
+    /// Every variant is a refusal rather than a guess. The direction is the one
+    /// [`declared_whole_file_test_modules`] argues for: a scan that cannot tell
+    /// what a file declares must not answer, because both wrong answers are
+    /// silent — a missing skip reports a fixture as an offender, and a spurious
+    /// one removes a production file from every census below.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ScanRefusal {
+        /// `#[…` with no `]`.
+        UnclosedAttribute { line: usize },
+        /// A `}` with no `{`.
+        UnbalancedBraces { line: usize },
+        /// `mod` with no name, or a name followed by neither `;` nor `{`.
+        MalformedDeclaration { line: usize },
+        /// A `cfg` predicate the entailment grammar cannot read.
+        UnreadablePredicate {
+            line: usize,
+            written: String,
+            why: String,
+        },
+        /// `#[path = "…"]`, or a `cfg_attr` that could apply one.
+        UnsupportedPathAttribute { line: usize, name: String },
+        /// An inner `#![cfg(…)]`, which gates the module it is written in.
+        UnsupportedInnerCfg { line: usize },
+        /// One module name declared twice in one module.
+        DuplicateDeclaration { line: usize, name: String },
+        /// A macro body holding a module-shaped token sequence.
+        ModuleShapedMacroBody { line: usize, macro_name: String },
+    }
+
+    impl std::fmt::Display for ScanRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::UnclosedAttribute { line } => {
+                    write!(f, "line {line}: an attribute is never closed")
+                }
+                Self::UnbalancedBraces { line } => {
+                    write!(
+                        f,
+                        "line {line}: a `}}` closes a block that was never opened"
+                    )
+                }
+                Self::MalformedDeclaration { line } => write!(
+                    f,
+                    "line {line}: a `mod` declaration has no name, or no `;` or `{{` after it"
+                ),
+                Self::UnreadablePredicate { line, written, why } => write!(
+                    f,
+                    "line {line}: `cfg({written})` cannot be decided against `test`: {why}"
+                ),
+                Self::UnsupportedPathAttribute { line, name } => write!(
+                    f,
+                    "line {line}: `mod {name}` carries a `path` attribute, which this \
+                     derivation refuses rather than resolves"
+                ),
+                Self::UnsupportedInnerCfg { line } => write!(
+                    f,
+                    "line {line}: an inner `#![cfg(…)]` gates the module it is written in, \
+                     which this derivation does not model"
+                ),
+                Self::DuplicateDeclaration { line, name } => {
+                    write!(
+                        f,
+                        "line {line}: `mod {name};` is declared twice in one module"
+                    )
+                }
+                Self::ModuleShapedMacroBody { line, macro_name } => write!(
+                    f,
+                    "line {line}: the body of `{macro_name}!` holds a module-shaped token \
+                     sequence. A macro body is token trees, not items, and whether the \
+                     expansion declares a module is not readable from here"
+                ),
+            }
+        }
+    }
+
+    /// Every `mod` declaration in `source`, with the inline modules enclosing it
+    /// and the effective `cfg` predicate it inherits.
+    ///
+    /// Pure over `&str`, which is what makes the refusals above drivable: the
+    /// tree satisfies every one of them, so the only way to see one is to hand
+    /// this a source that does not.
+    ///
+    /// Comments and string literals are blanked first —
+    /// [`super::blank_comments_and_strings`], which also handles raw strings,
+    /// byte strings and char literals — so a `mod` written in prose is spaces.
+    /// The predicate text is read from the **raw** span at the same offsets,
+    /// because blanking erases what is inside a string and `feature = "x"` would
+    /// otherwise arrive as `feature = "   "`.
+    pub(crate) fn scan_module_declarations(
+        source: &str,
+    ) -> Result<Vec<ScannedDeclaration>, ScanRefusal> {
+        /// An inline `mod name { … }` that is open at the current position.
+        struct Scope {
+            /// The brace depth *outside* the module's body.
+            open_depth: usize,
+            name: String,
+            preds: Vec<Predicate>,
+            declared: std::collections::BTreeSet<String>,
+        }
+
+        let blanked = super::blank_comments_and_strings(source);
+        debug_assert_eq!(blanked.len(), source.len());
+        let bytes = blanked.as_bytes();
+        let line_of = |at: usize| blanked[..at].matches('\n').count() + 1;
+
+        let mut found = Vec::new();
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut top_level: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut pending: Vec<Predicate> = Vec::new();
+        let mut pending_path = false;
+        let mut depth = 0_usize;
+        let mut i = 0;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            // -- an attribute, which belongs to whatever item comes next -----
+            if byte == b'#' {
+                let inner = bytes.get(i + 1) == Some(&b'!');
+                let open = if inner { i + 2 } else { i + 1 };
+                if bytes.get(open) != Some(&b'[') {
+                    i += 1;
+                    continue;
+                }
+                let Some(close) = super::matching(bytes, open, b'[', b']') else {
+                    return Err(ScanRefusal::UnclosedAttribute { line: line_of(i) });
+                };
+                let raw = &source[open + 1..close];
+                let name = raw
+                    .trim_start()
+                    .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .next()
+                    .unwrap_or_default();
+                match name {
+                    "cfg" => {
+                        let written = raw
+                            .trim()
+                            .strip_prefix("cfg")
+                            .map(str::trim_start)
+                            .and_then(|rest| rest.strip_prefix('('))
+                            .and_then(|rest| rest.strip_suffix(')'))
+                            .unwrap_or_default()
+                            .trim();
+                        let pred = parse_predicate(written).map_err(|why| {
+                            ScanRefusal::UnreadablePredicate {
+                                line: line_of(i),
+                                written: written.to_owned(),
+                                why,
+                            }
+                        })?;
+                        if inner {
+                            return Err(ScanRefusal::UnsupportedInnerCfg { line: line_of(i) });
+                        }
+                        pending.push(pred);
+                    }
+                    // `path` names the file directly; `cfg_attr` can apply one
+                    // conditionally. Both are refused where they could reach a
+                    // module, which is decided when the item is read.
+                    "path" => pending_path = true,
+                    "cfg_attr" if raw.contains("path") => pending_path = true,
+                    _ => {}
+                }
+                i = close + 1;
+                continue;
+            }
+
+            // -- a macro, whose body is token trees and not items ------------
+            //
+            // `mod x;` inside `macro_rules! m { () => { mod x; } }` is not a
+            // declaration, and `#[cfg(test)] mod x;` inside one is not a
+            // test-only declaration: the tokens are only *shaped* like an item
+            // until something expands them. Walking into a macro body therefore
+            // invents declarations, which is the direction that removes a real
+            // production file from every census below.
+            //
+            // A macro invoked at item position **can** expand to a module,
+            // though, and this scan cannot tell which does. So the body is
+            // discarded when it holds nothing module-shaped and refused when it
+            // does: the discard is what stops the false positives, and the
+            // refusal is what stops the discard from becoming a blind spot.
+            // Measured on this tree: zero macro bodies hold one.
+            if let Some(invocation) = macro_at(bytes, i) {
+                let MacroInvocation { name, open, close } = invocation;
+                if let Some(shaped) = module_shaped_between(bytes, open + 1, close) {
+                    return Err(ScanRefusal::ModuleShapedMacroBody {
+                        line: line_of(shaped),
+                        macro_name: name,
+                    });
+                }
+                // Attributes stacked above a macro invocation belong to it.
+                pending.clear();
+                pending_path = false;
+                i = close + 1;
+                continue;
+            }
+
+            // -- a `mod` item, with any visibility qualifier in front of it ---
+            if let Some(shape) = module_at(bytes, i) {
+                let ModuleShape {
+                    name_at,
+                    name,
+                    body,
+                } = shape;
+                if name.is_empty() {
+                    return Err(ScanRefusal::MalformedDeclaration { line: line_of(i) });
+                }
+                if pending_path {
+                    return Err(ScanRefusal::UnsupportedPathAttribute {
+                        line: line_of(i),
+                        name,
+                    });
+                }
+                let mut preds: Vec<Predicate> = scopes
+                    .iter()
+                    .flat_map(|scope| scope.preds.iter().cloned())
+                    .collect();
+                preds.extend(pending.iter().cloned());
+                match body {
+                    Some(brace) => {
+                        scopes.push(Scope {
+                            open_depth: depth,
+                            name,
+                            preds: std::mem::take(&mut pending),
+                            declared: std::collections::BTreeSet::new(),
+                        });
+                        depth += 1;
+                        i = brace + 1;
+                    }
+                    None => {
+                        let declared = match scopes.last_mut() {
+                            Some(scope) => &mut scope.declared,
+                            None => &mut top_level,
+                        };
+                        if !declared.insert(name.clone()) {
+                            return Err(ScanRefusal::DuplicateDeclaration {
+                                line: line_of(name_at),
+                                name,
+                            });
+                        }
+                        let effective = Predicate::all(preds);
+                        found.push(ScannedDeclaration {
+                            name,
+                            inline_path: scopes.iter().map(|scope| scope.name.clone()).collect(),
+                            guard: effective.render(),
+                            test_only: entails_test(&effective),
+                        });
+                        pending.clear();
+                        // Past the `;`.
+                        i = bytes[name_at..]
+                            .iter()
+                            .position(|byte| *byte == b';')
+                            .map_or(bytes.len(), |at| name_at + at + 1);
+                    }
+                }
+                pending_path = false;
+                continue;
+            }
+
+            // -- anything else: the attributes above it are not a module's ---
+            pending.clear();
+            pending_path = false;
+            if byte == b'{' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if byte == b'}' {
+                if depth == 0 {
+                    return Err(ScanRefusal::UnbalancedBraces { line: line_of(i) });
+                }
+                depth -= 1;
+                scopes.retain(|scope| scope.open_depth < depth);
+                i += 1;
+                continue;
+            }
+            if super::is_ident_byte(byte) {
+                // **Past the whole token, `r#` included.** This advanced by
+                // `is_ident_byte`, and a raw identifier is not a run of
+                // identifier bytes: `r#mod` is `r`, a `#`, and `mod`. So the
+                // scan consumed the `r`, met the `#`, stepped over it as a
+                // non-attribute byte, and then read the *inside* of the token
+                // as though it stood at item position. `let r#mod = 1;` — valid
+                // Rust — became `mod = 1;`, a `mod` item with no name, and the
+                // whole file was refused; `use std::r#mod as tests;` inside a
+                // `#[cfg(test)]` module became `mod as;`, a test-only
+                // declaration the crate never wrote, whose skip names a file
+                // that does not exist. [`word`] is the token this scan reads
+                // everywhere else, and the fallback reads it too now.
+                i = word(bytes, i).end;
+                continue;
+            }
+            i += 1;
+        }
+        Ok(found)
+    }
+
+    /// A macro invocation or `macro_rules!` definition and its delimited body.
+    struct MacroInvocation {
+        /// The macro's name, for the diagnostic.
+        name: String,
+        /// The index of the body's opening delimiter.
+        open: usize,
+        /// The index of the matching closing delimiter.
+        close: usize,
+    }
+
+    /// [`MacroInvocation`] beginning at `at`, or `None`.
+    ///
+    /// The shape is an identifier, `!`, an optional second identifier — that is
+    /// `macro_rules! name { … }`, the one form that has one — and a delimited
+    /// group. Requiring the group is what keeps `a != b` out: after that `!`
+    /// comes `=`, which opens nothing. Requiring the second identifier only
+    /// after `macro_rules` is what keeps `if !condition { … }` out, which
+    /// otherwise reads as an invocation of `if` whose body is the block.
+    fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {
+        let name = word(bytes, at);
+        let after_name = name.end;
+        if name.text.is_empty() {
+            return None;
+        }
+        // **A keyword before a `!` is unary negation, not a macro name.**
+        // `if !(cond)`, `while !(cond)`, `return !(x)` are identifier, `!`,
+        // delimited group -- the same three tokens as `foo!(…)` -- so reading
+        // them as macros skips the grouped expression, and a `mod` written
+        // inside it (`if !({ mod local {} true })` is valid Rust) then reads as
+        // a module-shaped macro body and refuses the whole file. A macro's path
+        // segment cannot be a keyword unless it is written raw, and `r#if!(…)`
+        // is a macro called `if`, so the test is on the plain spelling only.
+        if !name.raw && is_keyword(name.text) {
+            return None;
+        }
+        // **Whitespace and comments may sit between the name and its `!`.**
+        // `macro_rules ! m { … }` and `quote /* why */ ! { … }` are both valid
+        // Rust, and `#[rustfmt::skip]` keeps either spelling in a real file —
+        // so requiring the `!` to be the very next byte made the guard miss
+        // exactly the macros somebody had gone out of their way to space out.
+        // Comments are already spaces in the view this reads, so one skip
+        // covers both.
+        let bang = whitespace(bytes, after_name);
+        if bytes.get(bang) != Some(&b'!') {
+            return None;
+        }
+        let mut cursor = whitespace(bytes, bang + 1);
+        // `macro_rules! name { … }` is the **only** form carrying a name
+        // between the `!` and the body, and reading one for every macro is
+        // what would make `if !condition { … }` an invocation of `if` once the
+        // gap above is allowed: identifier, `!`, identifier, delimiter — and
+        // the whole block would be skipped. Keyed on the one name that has it.
+        if !name.raw && name.text == b"macro_rules" {
+            // The defined name may itself be raw -- `macro_rules! r#mod { … }`
+            // is how a macro takes a keyword for a name.
+            let defined = word(bytes, cursor);
+            if !defined.text.is_empty() {
+                cursor = whitespace(bytes, defined.end);
+            }
+        }
+        let (opener, closer) = match bytes.get(cursor) {
+            Some(b'(') => (b'(', b')'),
+            Some(b'[') => (b'[', b']'),
+            Some(b'{') => (b'{', b'}'),
+            _ => return None,
+        };
+        let close = super::matching(bytes, cursor, opener, closer)?;
+        Some(MacroInvocation {
+            name: String::from_utf8_lossy(name.text).into_owned(),
+            open: cursor,
+            close,
+        })
+    }
+
+    /// Where a module-shaped token sequence starts inside `from..to`, if any.
+    ///
+    /// "Module-shaped" is the word `mod`, a name, and a `;` or `{` — the same
+    /// three tokens [`module_at`] reads, minus the visibility prefix, because
+    /// what matters here is only whether the body *could* expand to a module.
+    fn module_shaped_between(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+        let mut at = from;
+        while at < to {
+            if !super::is_ident_byte(bytes[at]) {
+                at += 1;
+                continue;
+            }
+            let keyword = word(bytes, at);
+            if !keyword.raw && keyword.text == b"mod" {
+                let name_at = whitespace(bytes, keyword.end);
+                if name_at > keyword.end {
+                    // The name may be raw: `mod r#type;` inside a macro body is
+                    // as module-shaped as `mod tests;` is.
+                    let declared = word(bytes, name_at);
+                    if !declared.text.is_empty()
+                        && matches!(
+                            bytes.get(whitespace(bytes, declared.end)),
+                            Some(b';' | b'{')
+                        )
+                    {
+                        return Some(at);
+                    }
+                }
+            }
+            at = keyword.end;
+        }
+        None
+    }
+
+    /// The identifier at `from`, and where it ends. Empty when there is none.
+    fn identifier(bytes: &[u8], from: usize) -> (usize, &[u8]) {
+        let mut end = from;
+        while end < bytes.len() && super::is_ident_byte(bytes[end]) {
+            end += 1;
+        }
+        (end, &bytes[from..end])
+    }
+
+    /// One identifier token, raw or plain.
+    struct Word<'a> {
+        /// Where the token ends, `r#` included.
+        end: usize,
+        /// Whether it was written `r#name`.
+        raw: bool,
+        /// The name, without any `r#`.
+        text: &'a [u8],
+    }
+
+    /// The identifier token at `from`, reading `r#name` as one token.
+    ///
+    /// **A raw identifier is one token and its name may be a keyword.** That is
+    /// the whole reason this exists: `mod r#type;` declares a module called
+    /// `type`, and a reader that stopped at the `#` saw `mod r` followed by
+    /// something that is not a terminator and refused the file. `raw` is an
+    /// ordinary identifier that merely begins with the same letter, so the
+    /// prefix counts only when a `#` and an identifier byte follow it.
+    fn word(bytes: &[u8], from: usize) -> Word<'_> {
+        if bytes.get(from) == Some(&b'r')
+            && bytes.get(from + 1) == Some(&b'#')
+            && bytes
+                .get(from + 2)
+                .is_some_and(|byte| super::is_ident_byte(*byte))
+        {
+            let (end, text) = identifier(bytes, from + 2);
+            return Word {
+                end,
+                raw: true,
+                text,
+            };
+        }
+        let (end, text) = identifier(bytes, from);
+        Word {
+            end,
+            raw: false,
+            text,
+        }
+    }
+
+    /// Rust's keywords, strict and reserved.
+    ///
+    /// **A keyword cannot be a macro's path segment**, and that is the only
+    /// structural thing separating `if !(…)` from `foo!(…)`: both are an
+    /// identifier, a `!` and a delimited group. Written raw it can --
+    /// `r#if!(…)` is a macro named `if` -- which is why [`Word`] carries that
+    /// bit rather than only the text.
+    const KEYWORDS: &[&[u8]] = &[
+        b"as",
+        b"break",
+        b"const",
+        b"continue",
+        b"crate",
+        b"dyn",
+        b"else",
+        b"enum",
+        b"extern",
+        b"false",
+        b"fn",
+        b"for",
+        b"if",
+        b"impl",
+        b"in",
+        b"let",
+        b"loop",
+        b"match",
+        b"mod",
+        b"move",
+        b"mut",
+        b"pub",
+        b"ref",
+        b"return",
+        b"self",
+        b"Self",
+        b"static",
+        b"struct",
+        b"super",
+        b"trait",
+        b"true",
+        b"type",
+        b"unsafe",
+        b"use",
+        b"where",
+        b"while",
+        b"async",
+        b"await",
+        b"dyn",
+        b"abstract",
+        b"become",
+        b"box",
+        b"do",
+        b"final",
+        b"macro",
+        b"override",
+        b"priv",
+        b"typeof",
+        b"unsized",
+        b"virtual",
+        b"yield",
+        b"try",
+        b"gen",
+    ];
+
+    /// Whether `text` is a Rust keyword written plainly.
+    fn is_keyword(text: &[u8]) -> bool {
+        KEYWORDS.contains(&text)
+    }
+
+    /// The first non-whitespace index at or after `from`.
+    fn whitespace(bytes: &[u8], from: usize) -> usize {
+        let mut at = from;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    }
+
+    /// A `mod` item beginning at `at`, past any visibility qualifier.
+    struct ModuleShape {
+        /// Where the module's name starts.
+        name_at: usize,
+        name: String,
+        /// The index of the body's `{`, or `None` for `mod name;`.
+        body: Option<usize>,
+    }
+
+    /// [`ModuleShape`] at `at`, or `None` when this is not a `mod` item.
+    ///
+    /// `pub`, `pub(crate)`, `pub(super)` and `pub(in a::b)` are transparent:
+    /// they are read and stepped over rather than treated as the start of some
+    /// other item, which is the whole of what "visibility-qualified declaration"
+    /// costs a structural scan. A text rule keyed on `mod ` immediately after
+    /// the attribute could not do it, and that is the hole this closes.
+    fn module_at(bytes: &[u8], at: usize) -> Option<ModuleShape> {
+        // Raw-aware throughout: `r#pub` and `r#mod` are identifiers named for
+        // keywords, not the keywords, and neither opens a module item.
+        let mut token = word(bytes, at);
+        if !token.raw && token.text == b"pub" {
+            let after = whitespace(bytes, token.end);
+            let cursor = if bytes.get(after) == Some(&b'(') {
+                super::matching(bytes, after, b'(', b')')? + 1
+            } else {
+                after
+            };
+            token = word(bytes, whitespace(bytes, cursor));
+        }
+        if token.raw || token.text != b"mod" {
+            return None;
+        }
+        // `mod` and the name must be separated: `models` is not `mod els`.
+        let after_keyword = whitespace(bytes, token.end);
+        if after_keyword == token.end {
+            return None;
+        }
+        // The declared name is the identifier without its `r#`: `mod r#type;`
+        // names `type.rs`, the way rustc resolves it.
+        let declared = word(bytes, after_keyword);
+        let name_end = declared.end;
+        let name = String::from_utf8_lossy(declared.text).into_owned();
+        let terminator = whitespace(bytes, name_end);
+        match bytes.get(terminator) {
+            Some(b'{') => Some(ModuleShape {
+                name_at: after_keyword,
+                name,
+                body: Some(terminator),
+            }),
+            Some(b';') => Some(ModuleShape {
+                name_at: after_keyword,
+                name,
+                body: None,
+            }),
+            // A name with neither terminator is malformed, and the caller
+            // refuses it. Reported through an empty-bodied shape so the caller
+            // sees the position rather than silently skipping the item.
+            _ => Some(ModuleShape {
+                name_at: after_keyword,
+                name: String::new(),
+                body: None,
+            }),
+        }
+    }
+
+    /// A `cfg` predicate, reduced to the one question this module asks of it.
+    ///
+    /// `effects::tests::cfg` models predicates *properly* — every `target_os`,
+    /// every CI valuation, which platform compiles which body — and answers a
+    /// different question with them. This decides one: is the predicate false
+    /// wherever `test` is false. So every atom that is not `test` collapses to
+    /// [`Predicate::Other`], and the grammar below is the whole of what the
+    /// derivation reads. A predicate it cannot parse is a refusal, not a guess.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Predicate {
+        /// The `test` atom itself.
+        Test,
+        /// Any other atom: a bare name, or `key = "value"`.
+        Other(String),
+        /// `all(…)`, and the conjunction an inline ancestry composes.
+        All(Vec<Predicate>),
+        /// `any(…)`.
+        Any(Vec<Predicate>),
+        /// `not(…)`.
+        Not(Box<Predicate>),
+    }
+
+    impl Predicate {
+        /// The conjunction of `parts`, flattened; the empty one is `All([])`,
+        /// which is true and entails nothing.
+        fn all(parts: Vec<Predicate>) -> Self {
+            if parts.len() == 1 {
+                parts.into_iter().next().unwrap_or(Self::All(Vec::new()))
+            } else {
+                Self::All(parts)
+            }
+        }
+
+        /// The predicate as it reads, for a diagnostic.
+        pub(crate) fn render(&self) -> String {
+            fn join(parts: &[Predicate]) -> String {
+                parts
+                    .iter()
+                    .map(Predicate::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+            match self {
+                Self::Test => "test".to_owned(),
+                Self::Other(written) => written.clone(),
+                Self::All(parts) if parts.is_empty() => "true".to_owned(),
+                Self::All(parts) => format!("all({})", join(parts)),
+                Self::Any(parts) => format!("any({})", join(parts)),
+                Self::Not(inner) => format!("not({})", inner.render()),
+            }
+        }
+    }
+
+    /// Whether `predicate` is false wherever `test` is false.
+    ///
+    /// Three-valued, with `test` bound to false and every other atom left
+    /// *unknown* — which is the only sound reading, because this module knows
+    /// nothing about platforms or features and must not pretend to. `all(test,
+    /// unix)` entails; `any(test, unix)` does not, because a Unix build without
+    /// `test` compiles it; `not(test)` does not.
+    pub(crate) fn entails_test(predicate: &Predicate) -> bool {
+        matches!(decide_without_test(predicate), Some(false))
+    }
+
+    /// `predicate` with `test = false` and every other atom unknown.
+    fn decide_without_test(predicate: &Predicate) -> Option<bool> {
+        match predicate {
+            Predicate::Test => Some(false),
+            Predicate::Other(_) => None,
+            Predicate::Not(inner) => decide_without_test(inner).map(|value| !value),
+            // Short-circuiting, and the `None` arms are the point: one
+            // undecidable conjunct does not make a conjunction undecidable if
+            // another is already false, and one undecidable disjunct does not
+            // make a disjunction undecidable if another is already true. The
+            // empty forms answer as `cfg` does -- `all()` is true, `any()` is
+            // false.
+            Predicate::All(parts) => {
+                let mut every_part_is_true = true;
+                for part in parts {
+                    match decide_without_test(part) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => every_part_is_true = false,
+                    }
+                }
+                every_part_is_true.then_some(true)
+            }
+            Predicate::Any(parts) => {
+                let mut every_part_is_false = true;
+                for part in parts {
+                    match decide_without_test(part) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => every_part_is_false = false,
+                    }
+                }
+                every_part_is_false.then_some(false)
+            }
+        }
+    }
+
+    /// `written` as a [`Predicate`], or why it cannot be read.
+    ///
+    /// The grammar is `all(…)`, `any(…)`, `not(P)`, and an atom — a bare name
+    /// or `name = "value"`. Anything else is refused: an unknown combinator, an
+    /// unbalanced paren, `not` with other than one argument, an empty atom.
+    pub(crate) fn parse_predicate(written: &str) -> Result<Predicate, String> {
+        let text = written.trim();
+        if text.is_empty() {
+            return Err("the predicate is empty".to_owned());
+        }
+        let name_end = text
+            .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+            .unwrap_or(text.len());
+        let (name, rest) = text.split_at(name_end);
+        let rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            // An atom: `test`, `unix`, or `key = "value"`.
+            if name.is_empty() {
+                return Err(format!("`{text}` does not begin with a name"));
+            }
+            if rest.is_empty() {
+                return Ok(if name == "test" {
+                    Predicate::Test
+                } else {
+                    Predicate::Other(name.to_owned())
+                });
+            }
+            let Some(value) = rest.strip_prefix('=') else {
+                return Err(format!("`{text}` is neither an atom nor a combinator"));
+            };
+            if value.trim().is_empty() {
+                return Err(format!("`{name}` is compared with nothing"));
+            }
+            return Ok(Predicate::Other(text.to_owned()));
+        }
+        let inner = split_arguments(rest)?;
+        let parts = inner
+            .into_iter()
+            .map(parse_predicate)
+            .collect::<Result<Vec<_>, _>>()?;
+        match name {
+            "all" => Ok(Predicate::All(parts)),
+            "any" => Ok(Predicate::Any(parts)),
+            "not" => match <[Predicate; 1]>::try_from(parts) {
+                Ok([only]) => Ok(Predicate::Not(Box::new(only))),
+                Err(parts) => Err(format!("`not` takes one predicate, not {}", parts.len())),
+            },
+            other => Err(format!("`{other}(…)` is not a predicate combinator")),
+        }
+    }
+
+    /// The comma-separated arguments of a parenthesised group starting at `(`.
+    fn split_arguments(text: &str) -> Result<Vec<&str>, String> {
+        let bytes = text.as_bytes();
+        let mut depth = 0_usize;
+        let mut close = None;
+        let mut quoted = false;
+        for (at, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b'(' if !quoted => depth += 1,
+                b')' if !quoted => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(format!("`{text}` has an unbalanced parenthesis"));
+        };
+        if !text[close + 1..].trim().is_empty() {
+            return Err(format!("`{text}` has text after its closing parenthesis"));
+        }
+        let body = &text[1..close];
+        if body.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut parts = Vec::new();
+        let mut depth = 0_usize;
+        let mut quoted = false;
+        let mut from = 0;
+        for (at, byte) in body.bytes().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b'(' if !quoted => depth += 1,
+                b')' if !quoted => depth -= 1,
+                b',' if !quoted && depth == 0 => {
+                    parts.push(&body[from..at]);
+                    from = at + 1;
+                }
+                _ => {}
+            }
+        }
+        let last = &body[from..];
+        if !last.trim().is_empty() {
+            parts.push(last);
+        }
+        Ok(parts)
+    }
+}
+
+/// The **file-module-level lint state** reader, for the governance censuses.
+///
+/// `#[cfg(test)]` and `pub(crate)`, and both halves are the point. This is a
+/// census instrument, not a product API: nothing the binary does consults it,
+/// and a `pub fn` here would have been a shipped surface added for a test to
+/// call. It sits at the BOTTOM beside [`census_domain`] for the same reason
+/// that module does — `production_region` cuts a file at its first
+/// `#[cfg(test)]` and
+/// `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
+/// pins the ten files whose cut lands on something that is not a module. This
+/// file is not one of them and must not become one.
+#[cfg(test)]
+pub(crate) mod lint_levels {
+    /// How a file's prologue resolves for one lint: the level **in force**, and
+    /// whether rustc refuses the prologue outright.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Resolution {
+        /// The level governing the file module, or `None` when its prologue
+        /// states none and the lint is left at whatever it inherits.
+        pub(crate) level: Option<&'static str>,
+        /// A later attribute tried to weaken a `forbid`. rustc answers `E0453`
+        /// and the crate does not compile, so this is not a level at all — it is
+        /// the file failing to build, and a reader that folded it into a level
+        /// would report a governance state for a file that has none.
+        pub(crate) refused_downgrade: bool,
+    }
+
+    /// [`Resolution`] for `lint` over `source`'s file-module prologue.
+    ///
+    /// "File-module level" is the whole of the claim, and it is narrower than
+    /// "somewhere in the file". A lint level is scoped by the module tree, so
+    /// `#![deny(clippy::disallowed_types)]` in a file's prologue governs the file
+    /// and everything nested in it — while `#[deny(clippy::disallowed_types)]`
+    /// written on a single `fn` governs that function and says nothing whatever
+    /// about the file, which goes on inheriting whatever its ancestors allow.
+    /// A scan that accepts the second in place of the first reports a module as
+    /// having stated its own level when it has not, which is `PR6-LANEF-004`
+    /// answered by the wrong evidence.
+    ///
+    /// So the walk is: from the first byte, over whitespace and **inner**
+    /// attributes only, stopping at the first token that is neither. That is
+    /// exactly the region an `#![…]` may govern the file module from, and it is the
+    /// same rule [`super::is_module_level`] applies to the inner half of its answer.
+    ///
+    /// # Ordered, because rustc is ordered
+    ///
+    /// `PR72-LEVELS-001`. This used to return at the **first** attribute naming
+    /// the lint, which is not what a prologue means. Lint levels at one scope
+    /// are applied in source order and the last one wins, so
+    /// `#![deny(L)] #![allow(L)]` is a file where `L` is **allowed** — and the
+    /// first-match reader called it a denial. That is the failure direction that
+    /// matters: a census asking "has this module closed the hole" was told yes
+    /// by a prologue whose second line reopens it, and the reopening line is
+    /// exactly what an author adding an exception writes.
+    ///
+    /// `forbid` is not symmetrical with the rest and is not modelled as if it
+    /// were. Once a lint is forbidden at a scope, a later `allow`, `warn` or
+    /// `expect` of it is `E0453` — the crate does not compile — while a later
+    /// `deny` or `forbid` is accepted and leaves the forbid in force. Both halves
+    /// are **measured** rather than reasoned: every row of
+    /// `effects::tests::the_file_level_lint_reader_answers_what_rustc_does` is
+    /// compiled by `clippy-driver` and this reader's answer is checked against
+    /// the diagnostics that come back, so no sentence here is the authority for
+    /// what the compiler does.
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// **Lint groups are not expanded.** `#![deny(clippy::all)]` denies this
+    /// lint to rustc and reads as `None` here. The direction is the safe one — a
+    /// census is told a module states nothing when it states something, which is
+    /// loud — and the tree is measured rather than trusted:
+    /// [`tests::the_three_blunt_governed_lints_are_used_by_nobody`] asserts that
+    /// `clippy::all`, `clippy::style` and `warnings` are used by no file at all.
+    ///
+    /// Comments and string literals are blanked first, so a level quoted in a doc
+    /// comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
+    /// this crate's effect fixtures are written as exactly those two shapes.
+    ///
+    /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
+    /// [`super::normalize_lint`] is the bridge, as it is everywhere else here.
+    #[must_use]
+    pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {
+        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
+        let blanked = super::blank_comments_and_strings(source);
+        let bytes = blanked.as_bytes();
+        let mut resolution = Resolution {
+            level: None,
+            refused_downgrade: false,
+        };
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at].is_ascii_whitespace() {
+                at += 1;
+                continue;
+            }
+            // The prologue ends at the first token that is not an inner attribute.
+            if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
+                return resolution;
+            }
+            let open = at + 2;
+            if bytes.get(open) != Some(&b'[') {
+                return resolution;
+            }
+            let Some(close) = super::matching(bytes, open, b'[', b']') else {
+                return resolution;
+            };
+            let attribute = blanked[open + 1..close].trim();
+            for level in LEVELS {
+                let Some(rest) = attribute.strip_prefix(level) else {
+                    continue;
+                };
+                // `allowance(…)` strips to `ance(…)`, which opens nothing: the
+                // parenthesis is what makes the prefix an exact attribute name.
+                let Some(list) = rest
+                    .trim_start()
+                    .strip_prefix('(')
+                    .and_then(|body| body.strip_suffix(')'))
+                else {
+                    continue;
+                };
+                if !list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
+                    continue;
+                }
+                // Ordered, and `forbid` is sticky. A weaker level after a
+                // `forbid` is `E0453`, which is the file not compiling rather
+                // than a level; anything else replaces what came before it.
+                if resolution.level == Some("forbid") {
+                    if matches!(level, "allow" | "warn" | "expect") {
+                        resolution.refused_downgrade = true;
+                    }
+                } else {
+                    resolution.level = Some(match level {
+                        "allow" => "allow",
+                        "expect" => "expect",
+                        "warn" => "warn",
+                        "deny" => "deny",
+                        _ => "forbid",
+                    });
+                }
+                break;
+            }
+            at = close + 1;
+        }
+        resolution
+    }
+
+    /// The level in force for `lint` at `source`'s file-module scope, or none.
+    ///
+    /// [`file_level_lint_resolution`] without the `E0453` bit, for the censuses
+    /// that ask only which level governs a module.
+    #[must_use]
+    pub(crate) fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
+        file_level_lint_resolution(source, lint).level
+    }
+
+    /// Whether an attribute entry names `lint`, qualified either way.
+    fn names_lint(entry: &str, lint: &str) -> bool {
+        if entry == lint {
+            return true;
+        }
+        match (super::normalize_lint(entry), super::normalize_lint(lint)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
     }
 }
 

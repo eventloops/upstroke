@@ -2983,26 +2983,37 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Which level `source` states for `lint`, or nothing.
+/// Which level `source` states for `lint` **at file-module level**, or nothing.
 ///
-/// Comments and string literals are blanked first, so a lint level quoted in a
-/// doc comment — which the file above and this one both do — is invisible.
-/// `PR4-CENSUS-COMMENT-ORACLE` is the standing entry for a census that counted
-/// its own prose.
+/// [`crate::effects::lint_levels::file_level_lint_state`] is the whole of it, and the
+/// delegation is the repair rather than a tidy-up. This body used to search the
+/// blanked file for `allow(` or `deny(` holding the lint name, anywhere — so an
+/// **item-level** `#[deny(clippy::disallowed_types)]` written on one `fn`
+/// satisfied a census whose entire subject is whether the *file module* states
+/// a level of its own. A lint level is scoped by the module tree: the item
+/// attribute governs that item, the file goes on inheriting the funnel's allow
+/// for everything else in it, and the census reported the hole closed.
+/// `forbid` was not recognised at all, so a file stating the strongest possible
+/// denial read as stating nothing.
+///
+/// The shared instrument walks the prologue — whitespace and inner attributes
+/// only — and stops at the first item, which is exactly the region an `#![…]`
+/// governs the file from. Comments and string literals are blanked there too,
+/// so a level quoted in prose is invisible (`PR4-CENSUS-COMMENT-ORACLE`).
 fn stated_lint_level(source: &str, lint: &str) -> Option<&'static str> {
-    let blanked = crate::effects::blank_comments_and_strings(source);
-    for (keyword, answer) in [("allow(", "allow"), ("deny(", "deny")] {
-        let mut rest = blanked.as_str();
-        while let Some(index) = rest.find(keyword) {
-            let after = &rest[index + keyword.len()..];
-            let end = after.find(')').unwrap_or(after.len());
-            if after[..end].contains(lint) {
-                return Some(answer);
-            }
-            rest = &rest[index + keyword.len()..];
-        }
-    }
-    None
+    crate::effects::lint_levels::file_level_lint_state(source, lint)
+}
+
+/// Whether a stated level closes `PR6-LANEF-004` for the lint it names.
+///
+/// `deny` and `forbid` are build errors and `allow` is a reviewed exception
+/// carrying an `effects/allowlist.toml` row. `warn` and `expect` are neither:
+/// they leave the module compiling and are indistinguishable from inheriting,
+/// which is the whole failure. Hoisted out of the grid so every level can be
+/// driven through it -- the tree states only two of the five, so the other
+/// three would otherwise be arms nobody has watched decide.
+fn closes_the_hole(stated: Option<&str>) -> bool {
+    matches!(stated, Some("allow" | "deny" | "forbid"))
 }
 
 /// Whether `effects/allowlist.toml` records `path` as allowing `lint`.
@@ -3024,10 +3035,11 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
         })
 }
 
-/// Every child module of the Container funnel **states its own lint level**.
+/// Every child module of a Process or Container funnel **states its own lint
+/// level**.
 ///
-/// `PR6-LANEF-004`, and it is the one finding of this slice whose repair is
-/// about the *next* lane rather than this one. `src/runner/container.rs` opens
+/// `PR6-LANEF-004`, and it is the one finding of that slice whose repair is
+/// about the *next* lane rather than its own. `src/runner/container.rs` opens
 /// with `#![allow(clippy::disallowed_methods, disallowed_types,
 /// disallowed_macros)]` — an **inner** attribute — and a Rust lint level is
 /// scoped by the **module tree**, not by the file. So every out-of-line child of
@@ -3036,7 +3048,16 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 /// it exists for: a `ContainerRuntime::start` planted in a child passed
 /// `cargo clippy --all-targets --all-features -- -D warnings`, measured twice.
 ///
-/// Every file in this directory now either **denies** a governed lint or
+/// **The Process funnel is in the domain too, and was not when this was
+/// written.** `src/agent/proc.rs` carries the identical inner allow and had no
+/// out-of-line child at all, so the census that closed the hole for one funnel
+/// left the other covered by nothing but the absence of a directory. It has one
+/// now — `src/agent/proc/test_support/readiness.rs` — and a census scoped to
+/// `src/runner/container/` would have watched it inherit all three allows in
+/// silence. The domain below is derived from the funnel list rather than
+/// written out, so the next funnel to grow a child is covered by the same line.
+///
+/// Every file under a funnel's directory either **denies** a governed lint or
 /// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
 /// grid is {file} × {which of the three governed lints}, every cell asserted:
 /// a file that states nothing about a lint is inheriting, and inheriting is the
@@ -3044,7 +3065,9 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 ///
 /// The negative controls at the end are what stop this being a census that
 /// cannot refuse: the predicate is driven over sources that state nothing, that
-/// state a level only inside a doc comment, and that state each level plainly.
+/// state a level only inside a doc comment, that state a level inside a string
+/// literal, that state each level plainly, and that allow a lint the allowlist
+/// records for a *different* file.
 #[test]
 fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     const GOVERNED: [&str; 3] = [
@@ -3052,12 +3075,44 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "clippy::disallowed_types",
         "clippy::disallowed_macros",
     ];
+    // Every funnel module that allows a governed lint at file scope, and
+    // therefore every module tree an out-of-line child can inherit one through.
+    // `src/runner/host.rs` has no directory today; it is named anyway, so the
+    // day it grows one the walk finds it rather than the reviewer having to.
+    const FUNNELS: [&str; 3] = [
+        "src/runner/container.rs",
+        "src/agent/proc.rs",
+        "src/runner/host.rs",
+    ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let children = walk(&root.join("src").join("runner").join("container"));
+
+    let mut children: Vec<PathBuf> = Vec::new();
+    let mut with_children = 0_usize;
+    for funnel in FUNNELS {
+        let directory = root.join(funnel.strip_suffix(".rs").unwrap_or(funnel));
+        if !directory.is_dir() {
+            continue;
+        }
+        with_children += 1;
+        children.extend(walk(&directory));
+    }
+    children.sort();
     assert!(
-        children.len() >= 8,
+        with_children >= 2,
+        "only {with_children} funnel(s) have an out-of-line child directory; the census is \
+         scoped to fewer module trees than the tree has"
+    );
+    assert!(
+        children.len() >= 9,
         "the walk found only {} child modules; the census is measuring nothing",
         children.len()
+    );
+    // The Process funnel's child is in the domain **by name**. A count alone
+    // would stay green if the walk lost the `src/agent/proc/` arm entirely, and
+    // that arm is the one this census was widened for.
+    assert!(
+        children.contains(&root.join("src/agent/proc/test_support/readiness.rs")),
+        "the Process funnel's only child is not in the census domain: {children:#?}"
     );
 
     let mut missing = Vec::new();
@@ -3072,35 +3127,93 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         let source = fs::read_to_string(path).expect("read source");
         for lint in GOVERNED {
             cells += 1;
-            match stated_lint_level(&source, lint) {
-                None => missing.push(format!("{relative} states nothing about `{lint}`")),
-                Some("allow") if !allowlist_records(&relative, lint) => unlisted.push(format!(
+            // **A denial or a recorded allowance, and nothing else counts.** A
+            // `warn` or an `expect` is not a build error, so a module that
+            // states one has not closed the hole this census is about; it is
+            // reported as stating nothing rather than quietly accepted.
+            let stated = stated_lint_level(&source, lint);
+            if stated == Some("allow") && !allowlist_records(&relative, lint) {
+                unlisted.push(format!(
                     "{relative} allows `{lint}` and effects/allowlist.toml does not record it"
-                )),
-                Some(_) => {}
+                ));
+            } else if !closes_the_hole(stated) {
+                missing.push(match stated {
+                    None => format!("{relative} states no file-module-level level for `{lint}`"),
+                    Some(weaker) => format!(
+                        "{relative} states `{weaker}` for `{lint}`, which is not a build error"
+                    ),
+                });
             }
         }
     }
     assert!(
         missing.is_empty(),
-        "a child of the Container funnel inherits its allow instead of stating a \
+        "a child of a Process or Container funnel inherits its allow instead of stating a \
          level of its own, which is `PR6-LANEF-004` reopening:\n{missing:#?}"
     );
     assert!(unlisted.is_empty(), "{unlisted:#?}");
     assert_eq!(cells, children.len() * 3);
 
-    // The funnel itself is the one file that legitimately carries the allow, and
-    // it is in the allowlist. Asserted here so "everything denies" cannot become
-    // true by the funnel quietly denying itself out of existence.
-    let funnel = fs::read_to_string(root.join("src/runner/container.rs")).expect("the funnel");
+    // The funnels themselves are the files that legitimately carry the allow,
+    // and each is in the allowlist. Asserted here so "everything denies" cannot
+    // become true by a funnel quietly denying itself out of existence.
+    for funnel in FUNNELS {
+        let source = fs::read_to_string(root.join(funnel)).expect("a funnel module");
+        for lint in GOVERNED {
+            assert_eq!(
+                stated_lint_level(&source, lint),
+                Some("allow"),
+                "the funnel `{funnel}` no longer allows `{lint}`"
+            );
+            assert!(allowlist_records(funnel, lint));
+        }
+    }
+
+    // And the Process funnel's child **denies all three at file scope**. It
+    // allowed one of them until `decisions/2026-08-30-readiness-lint-placement.md`,
+    // and the allowance is six per-site `#[expect]` attributes now: narrower
+    // than the file-scope allow it replaces, and counted by the compiler in both
+    // directions under `-D warnings` — a seventh denied call is an error, and an
+    // expectation that stops being met is `unfulfilled_lint_expectations`.
+    // `effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so`
+    // is the census that keeps the file, the row and the prose agreeing.
+    //
+    // The row still records **exactly** the one lint those expectations name and
+    // neither of the two that are only denied. An entry that is merely *present*
+    // is the widening this file's own history is about — `allows` is compared
+    // for equality by `effects::tests::every_allow_of_a_governed_lint_is_module_\
+    // level_and_in_the_allowlist`, and this is the same claim read from the
+    // other end, so a row that grew a second lint fails here too.
+    let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))
+        .expect("the child");
     for lint in GOVERNED {
         assert_eq!(
-            stated_lint_level(&funnel, lint),
-            Some("allow"),
-            "the Container funnel no longer allows `{lint}`"
+            stated_lint_level(&readiness, lint),
+            Some("deny"),
+            "the Process funnel's child no longer denies `{lint}` at file scope"
         );
-        assert!(allowlist_records("src/runner/container.rs", lint));
     }
+    assert!(allowlist_records(
+        "src/agent/proc/test_support/readiness.rs",
+        GOVERNED[0]
+    ));
+    for denied in [GOVERNED[1], GOVERNED[2]] {
+        assert!(
+            !allowlist_records("src/agent/proc/test_support/readiness.rs", denied),
+            "the readiness row records `{denied}`, which the file denies without excepting \
+             any site of it"
+        );
+    }
+
+    // The accept/reject decision, over every level the reader can return --
+    // including the two this tree does not use, whose arms would otherwise be
+    // written and never executed.
+    assert!(closes_the_hole(Some("deny")));
+    assert!(closes_the_hole(Some("forbid")));
+    assert!(closes_the_hole(Some("allow")));
+    assert!(!closes_the_hole(Some("warn")));
+    assert!(!closes_the_hole(Some("expect")));
+    assert!(!closes_the_hole(None));
 
     // Negative controls: the predicate refuses what it is for.
     assert_eq!(
@@ -3108,6 +3221,114 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         None,
         "a file that states nothing must read as stating nothing"
     );
+    // **Item level is not file level**, and this is the one the scan used to
+    // accept. A lint level is scoped by the module tree, so an attribute on a
+    // single `fn` governs that `fn` and leaves the rest of the file inheriting
+    // whatever its ancestors allow -- which is `PR6-LANEF-004` still open,
+    // reported closed.
+    for item_level in [
+        "#[deny(clippy::disallowed_methods)]\nfn go() {}\n",
+        "#[allow(clippy::disallowed_methods)]\nfn go() {}\n",
+        "fn go() {\n    #[deny(clippy::disallowed_methods)]\n    let _ = ();\n}\n",
+        "mod inner {\n    #![deny(clippy::disallowed_methods)]\n}\n",
+    ] {
+        assert_eq!(
+            stated_lint_level(item_level, GOVERNED[0]),
+            None,
+            "an attribute below the file module read as the file's own level: {item_level:?}"
+        );
+    }
+    // An inner attribute AFTER the prologue governs nothing above it and is not
+    // the file module's own statement either.
+    assert_eq!(
+        stated_lint_level(
+            "fn go() {}\n#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0]
+        ),
+        None,
+        "an inner attribute after the first item is not a file-module-level one"
+    );
+    // `forbid` is a denial and must read as one; `warn` is not and must not
+    // read as a level the census accepts.
+    assert_eq!(
+        stated_lint_level("#![forbid(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("forbid")
+    );
+    assert_eq!(
+        stated_lint_level("#![warn(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("warn")
+    );
+    // Both spellings of one lint are one lint, and a prologue of several
+    // attributes is walked through rather than stopped at.
+    assert_eq!(
+        stated_lint_level("#![deny(disallowed_methods)]\n", GOVERNED[0]),
+        Some("deny")
+    );
+    assert_eq!(
+        stated_lint_level(
+            "//! docs\n#![allow(clippy::too_many_arguments)]\n#![deny(clippy::disallowed_types)]\n",
+            GOVERNED[1]
+        ),
+        Some("deny")
+    );
+    assert_eq!(
+        stated_lint_level("#![allowance(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        None,
+        "a longer attribute name that merely starts with a level is not that level"
+    );
+    // **CRLF.** The prologue walk is over bytes, and the guest checks this tree
+    // out with `\r\n`. Every answer above is taken again over the same
+    // fixtures converted, so a walk that treated `\r` as the first token of an
+    // item -- and so ended the prologue at the first line break -- fails here
+    // rather than on the Windows leg.
+    for (fixture, lint, expected) in [
+        (
+            "#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0],
+            Some("deny"),
+        ),
+        (
+            "#![forbid(clippy::disallowed_types)]\n",
+            GOVERNED[1],
+            Some("forbid"),
+        ),
+        (
+            "//! docs\n#![allow(clippy::disallowed_methods)]\n#![deny(clippy::disallowed_macros)]\n",
+            GOVERNED[2],
+            Some("deny"),
+        ),
+        (
+            "#[deny(clippy::disallowed_methods)]\nfn go() {}\n",
+            GOVERNED[0],
+            None,
+        ),
+        (
+            "fn go() {}\n#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0],
+            None,
+        ),
+    ] {
+        assert_eq!(stated_lint_level(fixture, lint), expected, "{fixture:?}");
+        assert_eq!(
+            stated_lint_level(&fixture.replace('\n', "\r\n"), lint),
+            expected,
+            "CRLF changed the answer for {fixture:?}"
+        );
+    }
+    // And over the real files the census reads, both spellings.
+    for path in [
+        "src/agent/proc/test_support/readiness.rs",
+        "src/runner/container/env.rs",
+    ] {
+        let text = fs::read_to_string(root.join(path)).expect("a funnel child");
+        for lint in GOVERNED {
+            assert_eq!(
+                stated_lint_level(&text, lint),
+                stated_lint_level(&text.replace('\n', "\r\n"), lint),
+                "{path} reads differently under CRLF for `{lint}`"
+            );
+        }
+    }
     assert_eq!(
         stated_lint_level(
             "//! #![allow(clippy::disallowed_methods)]\nfn go() {}\n",
@@ -3115,6 +3336,14 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         ),
         None,
         "a level quoted in a doc comment is not a level"
+    );
+    assert_eq!(
+        stated_lint_level(
+            "const P: &str = \"#![allow(clippy::disallowed_methods)]\";\n",
+            GOVERNED[0]
+        ),
+        None,
+        "a level quoted in a string literal is not a level"
     );
     assert_eq!(
         stated_lint_level("#![deny(clippy::disallowed_methods)]\n", GOVERNED[0]),
@@ -3128,6 +3357,221 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "src/runner/container/env.rs",
         GOVERNED[0]
     ));
+    // A path that is in the allowlist for one lint does not read as recorded
+    // for another, and a path that is in it at all does not vouch for a
+    // different path: both are how an "is it listed?" check goes vacuous.
+    assert!(allowlist_records(
+        "src/runner/container/tests.rs",
+        GOVERNED[0]
+    ));
+    assert!(!allowlist_records(
+        "src/runner/container/tests.rs",
+        GOVERNED[1]
+    ));
+    assert!(!allowlist_records(
+        "src/agent/proc/test_support/readiness/nowhere.rs",
+        GOVERNED[0]
+    ));
+}
+
+/// Prose with its line endings and its wrapping taken out.
+///
+/// Two records state the same two numbers, and both wrap: the TOML with a
+/// trailing `\` and the Rust with a fresh `//`. A search for a phrase that
+/// crosses either wrap is a search for a spelling of a newline, and the guest
+/// checks this tree out with **CRLF** -- so `\n` and `\r\n` are two spellings
+/// again, and `find("… six\nsites")` matches on one platform only.
+///
+/// So nothing here reads a line ending. `str::lines` splits on `\n` and drops
+/// a trailing `\r` itself, `trim` would take any that survived, and what is
+/// rebuilt is the words: comment markers and TOML continuations removed, every
+/// whitespace run collapsed to one space. An explicit `replace('\r', "")` was
+/// written here first and deleted -- measured, it changes no answer, and a line
+/// that cannot fail is a line that says the normalisation is happening
+/// somewhere it is not.
+fn collapsed_prose(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("//!")
+            .or_else(|| line.strip_prefix("///"))
+            .or_else(|| line.strip_prefix("//"))
+            .unwrap_or(line);
+        let line = line.strip_suffix('\\').unwrap_or(line);
+        for wordish in line.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(wordish);
+        }
+    }
+    out
+}
+
+/// The denied-method paths `clippy.toml` names, as needles that find a call.
+///
+/// Derived from the denylist rather than written out, which is what makes the
+/// census below a **closed set**: a list of five needles can only ever confirm
+/// those five, and the question an allowance answers is "which primitives does
+/// this file reach", where a sixth is the whole risk.
+///
+/// Two needles per path, and the second only when the segment before the last
+/// is a type or a trait. `std::io::Write::write_all` is called as
+/// `.write_all(` and `std::fs::rename` as `fs::rename(`, so both forms are
+/// needed; but a method needle for `std::fs::write` would be `.write(` on any
+/// receiver at all, and `libc::write` the same, so those keep the path form
+/// only. The `(` is part of every needle, which is what keeps
+/// `File::create(` from matching `File::create_new(`.
+fn denied_call_needles() -> Vec<(String, Vec<String>)> {
+    let denylist = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(crate::effects::CLIPPY_TOML),
+    )
+    .expect("clippy.toml");
+    let table = denylist
+        .split("disallowed-methods = [")
+        .nth(1)
+        .expect("the disallowed-methods table")
+        .split("\n]")
+        .next()
+        .expect("the table ends");
+    let mut needles = Vec::new();
+    for line in table.lines() {
+        let Some(rest) = line.split("path = \"").nth(1) else {
+            continue;
+        };
+        let Some(path) = rest.split('"').next() else {
+            continue;
+        };
+        let segments: Vec<&str> = path.split("::").collect();
+        let Some(last) = segments.last() else {
+            continue;
+        };
+        let mut forms = Vec::new();
+        if let Some(penult) = segments.len().checked_sub(2).map(|at| segments[at]) {
+            forms.push(format!("{penult}::{last}("));
+            if penult.starts_with(char::is_uppercase) {
+                forms.push(format!(".{last}("));
+            }
+        } else {
+            forms.push(format!("{last}("));
+        }
+        needles.push((path.to_owned(), forms));
+    }
+    assert!(
+        needles.len() > 50,
+        "only {} denied methods were read out of clippy.toml",
+        needles.len()
+    );
+    needles
+}
+
+/// Every denied method `readiness.rs` reaches, and how many times.
+///
+/// Over the blanked source, so the prologue's own prose -- which spells every
+/// one of these names -- is not counted as a call. `PR4-CENSUS-COMMENT-ORACLE`.
+fn denied_calls_in(source: &str) -> BTreeMap<String, usize> {
+    let code = crate::effects::blank_comments_and_strings(source);
+    let mut found = BTreeMap::new();
+    for (path, forms) in denied_call_needles() {
+        let count: usize = forms.iter().map(|form| code.matches(form).count()).sum();
+        if count > 0 {
+            found.insert(path, count);
+        }
+    }
+    found
+}
+
+/// The readiness allowance names **exactly** the primitives it is written
+/// against, and the record's arithmetic is the tree's.
+///
+/// `PR72-COUNT-002`. Both records said "five calls", which is two claims run
+/// together and one of them wrong: there are five distinct denied **paths** and
+/// six **sites**, because `fs::remove_file` is called on each of the two
+/// failure paths. A reviewer checking the row against the file would have
+/// counted six and had no way to know which number the row meant.
+///
+/// **Closed over the denylist, not over a list of five.** The set comes from
+/// `clippy.toml` and is compared for equality, so a sixth primitive appearing
+/// in this file fails here whether or not anybody edits the row -- which is the
+/// only version of this census worth having, since an allowance is a claim
+/// about what a file may reach and a list of five needles can only confirm the
+/// five it already knows.
+#[test]
+fn the_readiness_allowance_names_the_paths_it_is_written_against() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let readiness = root.join("src/agent/proc/test_support/readiness.rs");
+    let source = fs::read_to_string(&readiness).expect("the readiness module");
+
+    let expected: BTreeMap<String, usize> = [
+        ("std::fs::File::create_new", 1),
+        ("std::io::Write::write_all", 1),
+        ("std::io::Write::flush", 1),
+        ("std::fs::rename", 1),
+        ("std::fs::remove_file", 2),
+    ]
+    .into_iter()
+    .map(|(path, count)| ((*path).to_owned(), count))
+    .collect();
+
+    let found = denied_calls_in(&source);
+    assert_eq!(
+        found, expected,
+        "the denied primitives readiness.rs reaches are not the ones its allowlist row is \
+         written against"
+    );
+    assert_eq!(found.len(), 5, "five distinct denied paths");
+    assert_eq!(
+        found.values().sum::<usize>(),
+        6,
+        "six sites across those five paths"
+    );
+
+    // **CRLF.** The guest checks this tree out with `\r\n`, and every count
+    // above has to be the same there. Converted deterministically from the
+    // source just read rather than assumed to be line-ending-blind.
+    assert_eq!(
+        denied_calls_in(&source.replace('\n', "\r\n")),
+        found,
+        "the denied-call census answers differently under CRLF"
+    );
+
+    // Both records carry the same two numbers, read through the wrapping and
+    // the line endings rather than around them.
+    let allowlist = fs::read_to_string(root.join("effects/allowlist.toml")).expect("the allowlist");
+    let row = allowlist
+        .split("[[")
+        .find(|block| block.contains("path = \"src/agent/proc/test_support/readiness.rs\""))
+        .expect("the readiness row");
+    for (record, text, phrase) in [
+        (
+            "effects/allowlist.toml",
+            row,
+            "FIVE DISTINCT DENIED PATHS ACROSS SIX SITES",
+        ),
+        (
+            "readiness.rs",
+            source.as_str(),
+            "five distinct denied paths across six sites",
+        ),
+    ] {
+        for spelling in [text.to_owned(), text.replace('\n', "\r\n")] {
+            assert!(
+                collapsed_prose(&spelling).contains(phrase),
+                "{record} no longer states `{phrase}`"
+            );
+        }
+    }
+
+    // And the row names each path it is written against, so the record is a
+    // closed set on its own side too.
+    let collapsed_row = collapsed_prose(row);
+    for path in expected.keys() {
+        assert!(
+            collapsed_row.contains(path.as_str()),
+            "the readiness allowlist row does not name `{path}`"
+        );
+    }
 }
 
 /// Every Docker-gated test is named in the list that counts them, and every
