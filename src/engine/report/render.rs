@@ -13,9 +13,14 @@
 //! delegates to: an inherent impl may live in any module of its own crate, and
 //! the method path is `RunReport::render` wherever the block is written. There
 //! is no shim and no second name, so `crate::engine::RunReport::render` is the
-//! same public API it was and every caller — `main`, `status`, `validate` —
-//! is untouched. The declaration in `super` is a plain private `mod`, so
-//! nothing nests under `engine::report::render` either.
+//! same public API it was, and the two production surfaces that reach it are
+//! untouched: `main`'s `finish`, which prints a run that has ended, and
+//! `status::render`, which prints the settled view and is the only production
+//! caller of `render_ledger`. Neither `validate` nor `capacity` is among them,
+//! though `main` calls `render` on both — each owns a `Report` of its own with
+//! its own inherent `render`, so the shared method name is three methods on
+//! three types rather than one. The declaration in `super` is a plain private
+//! `mod`, so nothing nests under `engine::report::render` either.
 //!
 //! A child module also sees its ancestors' private items, which is why
 //! `RunReport::committed_count` is still private to `super`. Feeding a free
