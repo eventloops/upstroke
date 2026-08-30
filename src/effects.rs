@@ -171,6 +171,17 @@ pub struct GovernedAllow {
     pub lints: Vec<String>,
     /// Every lint it names, as written — so a widening is visible.
     pub written: Vec<String>,
+    /// Which attribute keywords the governed lints were found under: `allow`,
+    /// `expect`, or both if one attribute writes both.
+    ///
+    /// The two are not the same permission and the placement rule now
+    /// distinguishes them. `allow` is unconditional and says nothing when the
+    /// thing it permits stops happening; `expect` is refused by the compiler
+    /// when it goes unfulfilled, which is what makes a per-site one a count the
+    /// build owns rather than a claim a reviewer has to re-check.
+    pub keywords: Vec<&'static str>,
+    /// Whether it carries a `reason = "…"`.
+    pub reasoned: bool,
 }
 
 /// `source` with every comment and string literal replaced by spaces of the same
@@ -689,6 +700,8 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         let attribute = &blanked[open + 1..close];
         let mut lints = Vec::new();
         let mut written = Vec::new();
+        let mut keywords: Vec<&'static str> = Vec::new();
+        let mut reasoned = false;
         for keyword in ["allow", "expect"] {
             let mut at = 0;
             while let Some(hit) = attribute[at..].find(keyword) {
@@ -699,15 +712,23 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
                         && attribute.as_bytes()[start - 1] != b'_';
                 if is_word_start && attribute.as_bytes().get(after) == Some(&b'(') {
                     if let Some(end) = matching(attribute.as_bytes(), after, b'(', b')') {
+                        let before = lints.len();
                         for entry in attribute[after + 1..end].split(',') {
                             let entry = entry.trim();
-                            if entry.is_empty() || entry.starts_with("reason") {
+                            if entry.is_empty() {
+                                continue;
+                            }
+                            if entry.starts_with("reason") {
+                                reasoned = true;
                                 continue;
                             }
                             written.push(entry.to_owned());
                             if let Some(name) = normalize_lint(entry) {
                                 lints.push(name.to_owned());
                             }
+                        }
+                        if lints.len() > before && !keywords.contains(&keyword) {
+                            keywords.push(keyword);
                         }
                     }
                 }
@@ -721,6 +742,8 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
                 module_level: is_module_level(&blanked, i, close, inner),
                 lints,
                 written,
+                keywords,
+                reasoned,
             });
         }
         i = close + 1;
@@ -1482,21 +1505,218 @@ pub(crate) mod census_domain {
     /// Why a declaration's candidate files cannot be named.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum CandidateRefusal {
-        /// A `lib.rs` or `main.rs` that is not at the crate's source root.
-        AmbiguousCrateRoot { declared_in: PathBuf },
+        /// The declaring file is not inside the package the inventory was read
+        /// for, so that inventory does not say whether it is a crate root.
+        OutsideThePackage {
+            declared_in: PathBuf,
+            package_dir: PathBuf,
+        },
     }
 
     impl std::fmt::Display for CandidateRefusal {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::AmbiguousCrateRoot { declared_in } => write!(
+                Self::OutsideThePackage {
+                    declared_in,
+                    package_dir,
+                } => write!(
                     f,
-                    "`{}` is named `lib.rs`/`main.rs` and is not at the crate's source root, so \
-                     whether it owns its own directory depends on the manifest, which this \
-                     derivation does not read",
-                    declared_in.display()
+                    "`{}` is not inside `{}`, so the target inventory read for that package \
+                     does not say whether it is a crate root",
+                    declared_in.display(),
+                    package_dir.display()
                 ),
             }
+        }
+    }
+
+    /// Why a package's target inventory could not be established.
+    ///
+    /// Every variant is a **refusal to guess**. The resolution below turns on
+    /// which files Cargo compiles as crate roots, that is a fact only the
+    /// manifest holds, and the previous derivation held it as a rule about file
+    /// stems instead. A rule cannot be wrong quietly the way a stem test can:
+    /// when the authority is unavailable the census stops.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum InventoryRefusal {
+        /// `cargo metadata` could not be started at all.
+        NotRun { manifest: PathBuf, why: String },
+        /// It ran and exited non-zero.
+        Failed {
+            manifest: PathBuf,
+            status: String,
+            stderr: String,
+        },
+        /// Its output is not the JSON document this reads.
+        Unreadable { manifest: PathBuf, why: String },
+        /// No package in the document has that manifest path.
+        NoPackage { manifest: PathBuf },
+        /// The package has no targets, so nothing is a crate root.
+        NoTargets { manifest: PathBuf },
+    }
+
+    impl std::fmt::Display for InventoryRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotRun { manifest, why } => write!(
+                    f,
+                    "`cargo metadata` for `{}` could not be started ({why}), so the crate roots \
+                     are unknown and this census will not guess them from file names",
+                    manifest.display()
+                ),
+                Self::Failed {
+                    manifest,
+                    status,
+                    stderr,
+                } => write!(
+                    f,
+                    "`cargo metadata` for `{}` exited {status}: {stderr}",
+                    manifest.display()
+                ),
+                Self::Unreadable { manifest, why } => write!(
+                    f,
+                    "`cargo metadata` for `{}` did not answer with the document this reads \
+                     ({why})",
+                    manifest.display()
+                ),
+                Self::NoPackage { manifest } => write!(
+                    f,
+                    "`cargo metadata` named no package whose manifest is `{}`",
+                    manifest.display()
+                ),
+                Self::NoTargets { manifest } => write!(
+                    f,
+                    "the package at `{}` declares no target, so it has no crate root",
+                    manifest.display()
+                ),
+            }
+        }
+    }
+
+    /// **The files Cargo compiles as crate roots**, read from the manifest via
+    /// `cargo metadata` rather than inferred from their names.
+    ///
+    /// A crate root owns its own directory; every other file owns a directory
+    /// named after it. Which files are roots is a property of the *manifest*,
+    /// and the previous derivation decided it from the file's stem: `lib.rs` or
+    /// `main.rs` at the source root was a root, the same stem anywhere else was
+    /// refused, and anything else was an ordinary module. Both halves are wrong
+    /// against a manifest that says otherwise, and the second half is wrong
+    /// **silently**:
+    ///
+    /// * `[[bin]] path = "src/tools/odd.rs"` is a crate root with an arbitrary
+    ///   name. The stem rule reads it as the ordinary module `tools::odd`, so a
+    ///   `mod helper;` inside it resolves to `src/tools/odd/helper.rs` when
+    ///   Cargo compiles `src/tools/helper.rs`. That is a **different file** —
+    ///   the same competing-sibling hazard the nested-`lib.rs` refusal was
+    ///   written for, arriving through the door that refusal left open, and it
+    ///   does not announce itself: with no `src/tools/odd/helper.rs` present the
+    ///   wrong reading resolves rather than refusing.
+    /// * `examples/probe.rs` is this tree's live instance. It is an `example`
+    ///   target — a crate root — and `effects::tests::scanned_sources` walks
+    ///   `examples/**`, so the stem rule already answers `examples/probe` for a
+    ///   directory Cargo calls `examples`.
+    /// * A nested `src/a/lib.rs` the manifest never names is the ordinary module
+    ///   `a::lib`, which is decidable rather than ambiguous once the manifest is
+    ///   read. The old refusal was the honest answer to not knowing; this is the
+    ///   answer.
+    ///
+    /// Kinds are **not** filtered. `lib`, `bin`, `example`, `test`, `bench` and
+    /// `custom-build` are each a crate root of their own, and a census that
+    /// looked only at `lib`/`bin` would re-introduce the same class one kind at
+    /// a time.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CrateRoots {
+        package_dir: PathBuf,
+        roots: std::collections::BTreeSet<PathBuf>,
+    }
+
+    impl CrateRoots {
+        /// The inventory in one `cargo metadata --format-version 1` document,
+        /// for the package whose manifest is `manifest`.
+        ///
+        /// Pure over the document, which is what makes every refusal below
+        /// drivable: the acquisition is a process start and lives in
+        /// [`crate::effects::tests`], where this crate's governance puts one.
+        pub(crate) fn from_metadata_json(
+            json: &str,
+            manifest: &std::path::Path,
+        ) -> Result<Self, InventoryRefusal> {
+            let refuse = |why: &str| InventoryRefusal::Unreadable {
+                manifest: manifest.to_path_buf(),
+                why: why.to_owned(),
+            };
+            let document: serde_json::Value =
+                serde_json::from_str(json).map_err(|error| refuse(&error.to_string()))?;
+            let packages = document
+                .get("packages")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| refuse("no `packages` array"))?;
+            let package = packages
+                .iter()
+                .find(|package| {
+                    package
+                        .get("manifest_path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|path| std::path::Path::new(path) == manifest)
+                })
+                .ok_or_else(|| InventoryRefusal::NoPackage {
+                    manifest: manifest.to_path_buf(),
+                })?;
+            let targets = package
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| refuse("the package has no `targets` array"))?;
+            let mut roots = std::collections::BTreeSet::new();
+            for target in targets {
+                let source = target
+                    .get("src_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| refuse("a target carries no `src_path`"))?;
+                roots.insert(PathBuf::from(source));
+            }
+            if roots.is_empty() {
+                return Err(InventoryRefusal::NoTargets {
+                    manifest: manifest.to_path_buf(),
+                });
+            }
+            Ok(Self {
+                package_dir: manifest
+                    .parent()
+                    .ok_or_else(|| refuse("the manifest path has no directory"))?
+                    .to_path_buf(),
+                roots,
+            })
+        }
+
+        /// The directory the package's manifest sits in.
+        pub(crate) fn package_dir(&self) -> &std::path::Path {
+            &self.package_dir
+        }
+
+        /// Every crate root, absolute, in sorted order.
+        pub(crate) fn roots(&self) -> impl Iterator<Item = &std::path::Path> {
+            self.roots.iter().map(PathBuf::as_path)
+        }
+
+        /// Whether `path` is one of them.
+        pub(crate) fn is_root(&self, path: &std::path::Path) -> bool {
+            self.roots.contains(path)
+        }
+
+        /// Whether the package-relative, `/`-separated `relative` is one.
+        ///
+        /// The second caller reads the tree as repo-relative slash strings
+        /// rather than as paths, and one authority answering both is the point:
+        /// `PR5D-VISIBILITY-CHECK-DUPLICATED` is the standing entry for the rule
+        /// that got written twice, and the stem test *was* written twice — here
+        /// and in `effects::tests::cfg::module_dir`.
+        pub(crate) fn is_root_relative(&self, relative: &str) -> bool {
+            let mut candidate = self.package_dir.clone();
+            for part in relative.split('/') {
+                candidate.push(part);
+            }
+            self.is_root(&candidate)
         }
     }
 
@@ -1504,28 +1724,15 @@ pub(crate) mod census_domain {
     ///
     /// **A crate root owns its directory; an ordinary module owns a directory
     /// named after it.** `mod.rs` is the first case wherever it sits — that is
-    /// what `mod.rs` means. `lib.rs` and `main.rs` are the first case *only at
-    /// the crate root*: Cargo's default targets are `<source_root>/lib.rs` and
-    /// `<source_root>/main.rs`, and `src/a/lib.rs` is the ordinary module
-    /// `a::lib`, whose out-of-line children live in `src/a/lib/`.
+    /// what `mod.rs` means. Everything else is the first case exactly when the
+    /// manifest names it as a target's path, which is what [`CrateRoots`] reads
+    /// and what no rule about file names can answer.
     ///
-    /// Reading the stem alone got that wrong in the direction that matters.
-    /// `src/a/lib.rs` declaring `#[cfg(test)] mod tests;` resolved to
-    /// `src/a/tests.rs` — a **different file**, a sibling that may well be
-    /// production, which the derivation would then have removed from every
-    /// census as though `a/lib.rs` had declared it. The competing sibling is
-    /// the whole hazard: with no `src/a/lib/tests.rs` present, the wrong
-    /// reading does not fail, it resolves.
-    ///
-    /// The remaining case is refused rather than decided. A manifest may name
-    /// any path as a `[lib]` or `[[bin]]` target, so a nested `lib.rs` *could*
-    /// be a crate root; this derivation does not read `Cargo.toml`, so it does
-    /// not know which of the two readings applies. There are none in this tree
-    /// — `src/lib.rs` and `src/main.rs` are the only crate roots — and one
-    /// arriving fails loudly instead of silently picking whichever reading the
-    /// stem rule happened to encode.
+    /// Refused rather than decided when `declared_in` is not inside the package
+    /// the inventory was read for: an inventory is a statement about one
+    /// package, and a file outside it is one the inventory is silent on.
     pub(crate) fn module_directory(
-        source_root: &std::path::Path,
+        roots: &CrateRoots,
         declared_in: &std::path::Path,
     ) -> Result<PathBuf, CandidateRefusal> {
         let parent = declared_in
@@ -1533,17 +1740,17 @@ pub(crate) mod census_domain {
             .expect("a source file has a directory")
             .to_path_buf();
         let stem = declared_in.file_stem().expect("a source file has a name");
-        if stem == "mod" {
+        if roots.is_root(declared_in) {
             return Ok(parent);
         }
-        if stem == "lib" || stem == "main" {
-            return if parent == source_root {
-                Ok(parent)
-            } else {
-                Err(CandidateRefusal::AmbiguousCrateRoot {
-                    declared_in: declared_in.to_path_buf(),
-                })
-            };
+        if !declared_in.starts_with(roots.package_dir()) {
+            return Err(CandidateRefusal::OutsideThePackage {
+                declared_in: declared_in.to_path_buf(),
+                package_dir: roots.package_dir().to_path_buf(),
+            });
+        }
+        if stem == "mod" {
+            return Ok(parent);
         }
         Ok(parent.join(stem))
     }
@@ -1558,15 +1765,15 @@ pub(crate) mod census_domain {
     /// `proc/readiness.rs` it names nothing — a zero-candidate refusal if you
     /// are lucky and the wrong file if you are not.
     ///
-    /// `source_root` is where the crate's roots live, and [`module_directory`]
-    /// is why that is a parameter rather than a test on the file's stem.
+    /// `roots` is the package's target inventory, and [`module_directory`] is
+    /// why that is a parameter rather than a test on the file's stem.
     pub(crate) fn candidates_for(
-        source_root: &std::path::Path,
+        roots: &CrateRoots,
         declared_in: &std::path::Path,
         inline_path: &[String],
         name: &str,
     ) -> Result<[PathBuf; 2], CandidateRefusal> {
-        let mut dir = module_directory(source_root, declared_in)?;
+        let mut dir = module_directory(roots, declared_in)?;
         for enclosing in inline_path {
             dir.push(enclosing);
         }
@@ -1707,6 +1914,21 @@ pub(crate) mod census_domain {
         source_root: &std::path::Path,
         files: &[PathBuf],
     ) -> Vec<TestModuleDeclaration> {
+        let roots = crate::effects::tests::crate_roots();
+        // **The inventory has to describe the tree being walked.** `source_root`
+        // is the caller's claim about where the crate's sources live, and the
+        // manifest's is the target paths; a `source_root` no target sits under
+        // means the two are about different trees, and every answer below would
+        // be resolved against an inventory that says nothing about the files in
+        // hand. Fail closed, in the same breath as the acquisition itself.
+        assert!(
+            roots.roots().any(|root| root.starts_with(source_root)),
+            "no target of the package at `{}` lives under `{}`, so its inventory does not \
+             describe the tree this census was handed: {:?}",
+            roots.package_dir().display(),
+            source_root.display(),
+            roots.roots().collect::<Vec<_>>()
+        );
         let mut found = Vec::new();
         for path in files {
             let source = std::fs::read_to_string(path).expect("read source");
@@ -1717,13 +1939,9 @@ pub(crate) mod census_domain {
                 if !declaration.test_only {
                     continue;
                 }
-                let candidates = candidates_for(
-                    source_root,
-                    path,
-                    &declaration.inline_path,
-                    &declaration.name,
-                )
-                .unwrap_or_else(|refusal| panic!("{refusal}"));
+                let candidates =
+                    candidates_for(roots, path, &declaration.inline_path, &declaration.name)
+                        .unwrap_or_else(|refusal| panic!("{refusal}"));
                 for candidate in &candidates {
                     assert!(
                         contained_in(parent, candidate),
@@ -2041,9 +2259,19 @@ pub(crate) mod census_domain {
                 continue;
             }
             if super::is_ident_byte(byte) {
-                while i < bytes.len() && super::is_ident_byte(bytes[i]) {
-                    i += 1;
-                }
+                // **Past the whole token, `r#` included.** This advanced by
+                // `is_ident_byte`, and a raw identifier is not a run of
+                // identifier bytes: `r#mod` is `r`, a `#`, and `mod`. So the
+                // scan consumed the `r`, met the `#`, stepped over it as a
+                // non-attribute byte, and then read the *inside* of the token
+                // as though it stood at item position. `let r#mod = 1;` — valid
+                // Rust — became `mod = 1;`, a `mod` item with no name, and the
+                // whole file was refused; `use std::r#mod as tests;` inside a
+                // `#[cfg(test)]` module became `mod as;`, a test-only
+                // declaration the crate never wrote, whose skip names a file
+                // that does not exist. [`word`] is the token this scan reads
+                // everywhere else, and the fallback reads it too now.
+                i = word(bytes, i).end;
                 continue;
             }
             i += 1;
@@ -2569,7 +2797,21 @@ pub(crate) mod census_domain {
 /// file is not one of them and must not become one.
 #[cfg(test)]
 pub(crate) mod lint_levels {
-    /// The lint level `source` states for `lint` **at file-module level**, or none.
+    /// How a file's prologue resolves for one lint: the level **in force**, and
+    /// whether rustc refuses the prologue outright.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Resolution {
+        /// The level governing the file module, or `None` when its prologue
+        /// states none and the lint is left at whatever it inherits.
+        pub(crate) level: Option<&'static str>,
+        /// A later attribute tried to weaken a `forbid`. rustc answers `E0453`
+        /// and the crate does not compile, so this is not a level at all — it is
+        /// the file failing to build, and a reader that folded it into a level
+        /// would report a governance state for a file that has none.
+        pub(crate) refused_downgrade: bool,
+    }
+
+    /// [`Resolution`] for `lint` over `source`'s file-module prologue.
     ///
     /// "File-module level" is the whole of the claim, and it is narrower than
     /// "somewhere in the file". A lint level is scoped by the module tree, so
@@ -2586,9 +2828,35 @@ pub(crate) mod lint_levels {
     /// exactly the region an `#![…]` may govern the file module from, and it is the
     /// same rule [`super::is_module_level`] applies to the inner half of its answer.
     ///
-    /// `forbid` counts, and `warn`/`expect` are reported as themselves rather than
-    /// folded into `deny`: a governance census that wants a denial should be able
-    /// to see that it got a warning instead.
+    /// # Ordered, because rustc is ordered
+    ///
+    /// `PR72-LEVELS-001`. This used to return at the **first** attribute naming
+    /// the lint, which is not what a prologue means. Lint levels at one scope
+    /// are applied in source order and the last one wins, so
+    /// `#![deny(L)] #![allow(L)]` is a file where `L` is **allowed** — and the
+    /// first-match reader called it a denial. That is the failure direction that
+    /// matters: a census asking "has this module closed the hole" was told yes
+    /// by a prologue whose second line reopens it, and the reopening line is
+    /// exactly what an author adding an exception writes.
+    ///
+    /// `forbid` is not symmetrical with the rest and is not modelled as if it
+    /// were. Once a lint is forbidden at a scope, a later `allow`, `warn` or
+    /// `expect` of it is `E0453` — the crate does not compile — while a later
+    /// `deny` or `forbid` is accepted and leaves the forbid in force. Both halves
+    /// are **measured** rather than reasoned: every row of
+    /// `effects::tests::the_file_level_lint_reader_answers_what_rustc_does` is
+    /// compiled by `clippy-driver` and this reader's answer is checked against
+    /// the diagnostics that come back, so no sentence here is the authority for
+    /// what the compiler does.
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// **Lint groups are not expanded.** `#![deny(clippy::all)]` denies this
+    /// lint to rustc and reads as `None` here. The direction is the safe one — a
+    /// census is told a module states nothing when it states something, which is
+    /// loud — and the tree is measured rather than trusted:
+    /// [`tests::the_three_blunt_governed_lints_are_used_by_nobody`] asserts that
+    /// `clippy::all`, `clippy::style` and `warnings` are used by no file at all.
     ///
     /// Comments and string literals are blanked first, so a level quoted in a doc
     /// comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
@@ -2597,10 +2865,14 @@ pub(crate) mod lint_levels {
     /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
     /// [`super::normalize_lint`] is the bridge, as it is everywhere else here.
     #[must_use]
-    pub(crate) fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
+    pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {
         const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
         let blanked = super::blank_comments_and_strings(source);
         let bytes = blanked.as_bytes();
+        let mut resolution = Resolution {
+            level: None,
+            refused_downgrade: false,
+        };
         let mut at = 0;
         while at < bytes.len() {
             if bytes[at].is_ascii_whitespace() {
@@ -2609,13 +2881,15 @@ pub(crate) mod lint_levels {
             }
             // The prologue ends at the first token that is not an inner attribute.
             if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
-                return None;
+                return resolution;
             }
             let open = at + 2;
             if bytes.get(open) != Some(&b'[') {
-                return None;
+                return resolution;
             }
-            let close = super::matching(bytes, open, b'[', b']')?;
+            let Some(close) = super::matching(bytes, open, b'[', b']') else {
+                return resolution;
+            };
             let attribute = blanked[open + 1..close].trim();
             for level in LEVELS {
                 let Some(rest) = attribute.strip_prefix(level) else {
@@ -2630,8 +2904,18 @@ pub(crate) mod lint_levels {
                 else {
                     continue;
                 };
-                if list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
-                    return Some(match level {
+                if !list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
+                    continue;
+                }
+                // Ordered, and `forbid` is sticky. A weaker level after a
+                // `forbid` is `E0453`, which is the file not compiling rather
+                // than a level; anything else replaces what came before it.
+                if resolution.level == Some("forbid") {
+                    if matches!(level, "allow" | "warn" | "expect") {
+                        resolution.refused_downgrade = true;
+                    }
+                } else {
+                    resolution.level = Some(match level {
                         "allow" => "allow",
                         "expect" => "expect",
                         "warn" => "warn",
@@ -2639,10 +2923,20 @@ pub(crate) mod lint_levels {
                         _ => "forbid",
                     });
                 }
+                break;
             }
             at = close + 1;
         }
-        None
+        resolution
+    }
+
+    /// The level in force for `lint` at `source`'s file-module scope, or none.
+    ///
+    /// [`file_level_lint_resolution`] without the `E0453` bit, for the censuses
+    /// that ask only which level governs a module.
+    #[must_use]
+    pub(crate) fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
+        file_level_lint_resolution(source, lint).level
     }
 
     /// Whether an attribute entry names `lint`, qualified either way.

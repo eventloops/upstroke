@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::census_domain::{CrateRoots, InventoryRefusal};
 use super::{
     ALLOWLIST_TOML, CLIPPY_TOML, DENIAL_CONTROL, DENIAL_FIXTURES, EFFECT_SITES_JSON,
     FROZEN_LEGACY_ALLOWLIST, FUNNEL_MODULES_JSON, REGENERATE, RESIDUE_CLASSES_JSON,
@@ -67,6 +68,83 @@ use classification::checks;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// This package's target inventory, read once from `cargo metadata`.
+///
+/// **The acquisition lives here and the authority lives in
+/// [`census_domain`](crate::effects::census_domain).** Reading a manifest means
+/// starting a process, and `effects/allowlist.toml` records `allows = []` for
+/// `src/effects.rs` on the strength of that file carrying no attribute and
+/// reaching no denied primitive — "a stronger claim than any other entry in
+/// this section makes", in the row's own words. This file is where the
+/// machinery that drives a toolchain already lives, for the reason its prologue
+/// gives: it is a whole-file test module, so a `Command::new(` in it is not in
+/// any production census's domain. So the process start is here, the parse and
+/// the resolution are beside the census that uses them, and neither half is
+/// somewhere it would have to be argued for.
+///
+/// # Panics
+///
+/// When the inventory cannot be established. That is the fail-closed half of
+/// `PR72-TARGETS-001`: which files Cargo compiles as crate roots decides which
+/// file every `mod name;` in the tree resolves to, and a census that cannot
+/// read the manifest must stop rather than fall back to a rule about file
+/// stems — the rule this replaces, whose failures resolve to a real sibling
+/// instead of announcing themselves.
+pub(in crate::effects) fn crate_roots() -> &'static CrateRoots {
+    static ROOTS: std::sync::OnceLock<CrateRoots> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| crate_roots_of(&repo_root()).unwrap_or_else(|refusal| panic!("{refusal}")))
+}
+
+/// The inventory of the package whose manifest sits in `manifest_dir`.
+///
+/// Separate from [`crate_roots`] and taking a directory, because a control that
+/// only ever runs against this tree's own manifest cannot show what the reader
+/// does with an arbitrary `[[bin]] path` — and an arbitrary `[[bin]] path` is
+/// the whole of what the stem rule got wrong.
+pub(in crate::effects) fn crate_roots_of(
+    manifest_dir: &Path,
+) -> Result<CrateRoots, InventoryRefusal> {
+    let manifest = manifest_dir.join("Cargo.toml");
+    CrateRoots::from_metadata_json(&cargo_metadata_json(&manifest)?, &manifest)
+}
+
+/// `cargo metadata` for one manifest, as its stdout.
+///
+/// `--no-deps` because only this package's targets are wanted, `--offline`
+/// because a census must not depend on a network, and the cargo the test binary
+/// was built by rather than whichever one is first on `PATH`: the MSRV job runs
+/// `cargo +1.85.0`, and an inventory read by a different toolchain than the one
+/// compiling the tree is an inventory of something else.
+fn cargo_metadata_json(manifest: &Path) -> Result<String, InventoryRefusal> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .arg("--manifest-path")
+        .arg(manifest)
+        .output()
+        .map_err(|error| InventoryRefusal::NotRun {
+            manifest: manifest.to_path_buf(),
+            why: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(InventoryRefusal::Failed {
+            manifest: manifest.to_path_buf(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|error| InventoryRefusal::Unreadable {
+        manifest: manifest.to_path_buf(),
+        why: error.to_string(),
+    })
 }
 
 /// Every `src/**/*.rs` and `examples/**/*.rs`, as `(repo-relative path, source)`.
@@ -122,6 +200,16 @@ struct AllowlistEntry {
     path: String,
     #[serde(default)]
     allows: Vec<String>,
+    /// How many **per-site** `#[expect(…)]` attributes of the recorded lints the
+    /// file carries, or zero when its allowance is the module-level one.
+    ///
+    /// `decisions/2026-08-30-readiness-lint-placement.md`. A per-site
+    /// expectation is narrower than a module-level allow and the compiler owns
+    /// its count in both directions; this is the reviewed number that count is
+    /// checked against, so an annotation appearing or vanishing has to pass
+    /// through a row a reviewer reads.
+    #[serde(default)]
+    expect_sites: usize,
     #[serde(default)]
     absent: bool,
     packet: String,
@@ -271,6 +359,150 @@ fn wrappers() -> Wrappers {
 /// Four things, and the fourth is the one a scan usually leaves out: an
 /// attribute's lint set must **equal** what the allowlist records, so a widening
 /// is a failure rather than a silent extra.
+/// **The readiness allowance is six per-site expectations, and every record
+/// says the same six.**
+///
+/// `PR72-PLACEMENT-001`. The file used to open with a blanket
+/// `#![allow(clippy::disallowed_methods)]`, and the census that guarded it —
+/// `runner::container::tests::the_readiness_allowance_names_the_paths_it_is_\
+/// written_against` — had to be the authority on which primitives the file
+/// reaches, because nothing else was: it derives the denied set from
+/// `clippy.toml` and compares it for equality, which is the only version of
+/// that census worth having while a whole file is allowed.
+///
+/// It is not the authority any more. The lint is **denied** at file scope and
+/// each of the six call sites carries its own
+/// `#[expect(clippy::disallowed_methods, reason = …)]`, so under the
+/// `-D warnings` the gate runs with, the compiler owns the count in both
+/// directions: a seventh denied call is an error, and a site that stops
+/// reaching a denied path is `unfulfilled_lint_expectations`. What is left for
+/// a test is **documentation synchronisation** — that the file's prologue, the
+/// six annotations and the `effects/allowlist.toml` row still say the same
+/// thing — and that is all this does. The arithmetic census upstream keeps
+/// its own job, which is now a second, independent reading of the same tree
+/// rather than the only one.
+///
+/// Every needle here is contained in one line, deliberately: `PR72-WIN-EOL-003`
+/// was two controls that searched for byte sequences spanning a line, which are
+/// `\r\n` on the guest and hold on Unix and nowhere else. A needle that cannot
+/// span a line ending cannot have that bug, so the records are written to keep
+/// their phrases on one line rather than being folded back together here.
+#[test]
+fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
+    const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
+    const LINT: &str = "clippy::disallowed_methods";
+    const SITES: usize = 6;
+    const DECISION: &str = "decisions/2026-08-30-readiness-lint-placement.md";
+    // The records are prose and spell the count as a word. The two are bound
+    // rather than restated: changing `SITES` without changing the word fails
+    // here instead of quietly searching for a phrase no record contains.
+    const SPELLED: [&str; 8] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight",
+    ];
+    let sites_in_words = SPELLED[SITES - 1];
+
+    let source = fs::read_to_string(repo_root().join(READINESS)).expect("the readiness module");
+
+    // (1) **All three governed lints are denied at file scope, and none is
+    // allowed there.** The deny is what makes an expectation a narrowing.
+    for lint in USED_GOVERNED_LINTS {
+        assert_eq!(
+            crate::effects::lint_levels::file_level_lint_state(&source, lint),
+            Some("deny"),
+            "{READINESS} must deny `{lint}` at file-module level"
+        );
+    }
+
+    // (2) **Exactly six per-site expectations, each of them an `expect` of that
+    // one lint, below module level, with a reason that names which site it is.**
+    // The indices are asserted as a set: six annotations that all said "site 1
+    // of 6" would satisfy a count and would mean the file had been copied
+    // rather than read.
+    let found = governed_allows(&source);
+    let per_site: Vec<&crate::effects::GovernedAllow> =
+        found.iter().filter(|allow| !allow.module_level).collect();
+    assert_eq!(
+        per_site.len(),
+        SITES,
+        "{READINESS} carries {} per-site governed attributes: {per_site:#?}",
+        per_site.len()
+    );
+    assert!(
+        found.len() == SITES,
+        "a governed attribute at module level is a file-scope allowance and this file has \
+         none: {found:#?}"
+    );
+    for allow in &per_site {
+        assert_eq!(allow.keywords, ["expect"], "{READINESS}:{}", allow.line);
+        assert_eq!(allow.written, [LINT], "{READINESS}:{}", allow.line);
+        assert!(allow.reasoned, "{READINESS}:{} has no reason", allow.line);
+    }
+    // The reasons are read out of the source rather than out of the attribute
+    // scan, because the scan blanks string literals — which is what keeps a
+    // fixture in a doc comment invisible, and what means the reason's text has
+    // to be read from the file itself.
+    let indices: BTreeSet<usize> = (1..=SITES)
+        .filter(|index| source.contains(&format!("site {index} of {SITES}")))
+        .collect();
+    assert_eq!(
+        indices,
+        (1..=SITES).collect::<BTreeSet<usize>>(),
+        "each expectation's reason names which of the {SITES} sites it is"
+    );
+
+    // (3) **The row records the same lint and the same count**, and names the
+    // decision that admits a per-site expectation at all.
+    let list = allowlist();
+    let row = list
+        .funnel
+        .iter()
+        .find(|entry| entry.path == READINESS)
+        .expect("the readiness row is in the funnel section");
+    assert_eq!(row.allows, vec![LINT.to_owned()]);
+    assert_eq!(row.expect_sites, SITES);
+
+    // (4) **The prose in both records states the count, on one line each.**
+    let phrase = format!("five distinct denied paths across {sites_in_words} sites");
+    let shouted = phrase.to_uppercase();
+    let allowlist_text =
+        fs::read_to_string(repo_root().join(ALLOWLIST_TOML)).expect("the allowlist");
+    for (record, text, needle) in [
+        (READINESS, source.as_str(), phrase.as_str()),
+        (ALLOWLIST_TOML, allowlist_text.as_str(), shouted.as_str()),
+    ] {
+        for spelling in [text.to_owned(), text.replace('\n', "\r\n")] {
+            assert!(
+                spelling.lines().any(|line| line.contains(needle)),
+                "{record} no longer states `{needle}` on a line of its own"
+            );
+        }
+        assert!(
+            text.contains(DECISION),
+            "{record} does not cite `{DECISION}`, which is what admits the placement"
+        );
+    }
+
+    // (5) **The decision exists.** A record cited by two files and absent from
+    // the tree is a citation nobody can follow.
+    assert!(
+        repo_root().join(DECISION).is_file(),
+        "`{DECISION}` is cited by both records and is not in the tree"
+    );
+}
+
+/// Whether `source`'s file-module prologue **denies** the governed `lint`.
+///
+/// `deny` and `forbid` both are: each makes the lint a build error for the whole
+/// module tree, which is what a per-site expectation has to be narrowing.
+/// `bare` because a row records `clippy::disallowed_methods` and a prologue may
+/// write either spelling; the reader normalises both.
+fn file_level_denies(source: &str, lint: &str) -> bool {
+    matches!(
+        crate::effects::lint_levels::file_level_lint_state(source, lint),
+        Some("deny" | "forbid")
+    )
+}
+
 #[test]
 fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {
     let list = allowlist();
@@ -304,11 +536,34 @@ fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {
             );
         };
         carried.insert(path.clone());
+        let mut per_site = 0;
         for allow in &found {
+            // **The one shape permitted below module level**, and every clause
+            // of it is load-bearing. `decisions/2026-08-30-readiness-lint-\
+            // placement.md` amends `mechanism` (2)'s "only as module-level
+            // attributes" for a per-site `#[expect]` and nothing else: an
+            // `expect` the compiler refuses when it goes unfulfilled, carrying
+            // its own reason, in a file that DENIES the lint at module level so
+            // the expectation narrows a denial instead of decorating an
+            // inheritance, and counted in a row a reviewer read.
+            if !allow.module_level
+                && allow.keywords == ["expect"]
+                && entry.expect_sites > 0
+                && allow.reasoned
+                && allow
+                    .lints
+                    .iter()
+                    .all(|lint| file_level_denies(&source, lint))
+            {
+                per_site += 1;
+                continue;
+            }
             assert!(
                 allow.module_level,
                 "{path}:{} allows {:?} below module level; `mechanism` (2) permits it \
-                 \"only as module-level attributes\"",
+                 \"only as module-level attributes\", and the per-site `#[expect]` the \
+                 2026-08-30 amendment admits needs a reason, a file-level deny of the same \
+                 lint, and an `expect_sites` count in {ALLOWLIST_TOML}",
                 allow.line, allow.lints
             );
             let marker = marker_before(&source, allow.line, allow.inner);
@@ -338,6 +593,23 @@ fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {
         assert_eq!(
             written, declared,
             "{path}: the attribute allows {written:?} and {ALLOWLIST_TOML} records {declared:?}"
+        );
+        assert_eq!(
+            per_site, entry.expect_sites,
+            "{path} carries {per_site} per-site `#[expect]` attributes and {ALLOWLIST_TOML} \
+             records {}",
+            entry.expect_sites
+        );
+    }
+
+    // A row recording per-site expectations for a file the scan never reached
+    // is a row nothing checks. The count above only runs for files the scan
+    // found an attribute in.
+    for (path, (entry, _)) in &recorded {
+        assert!(
+            entry.expect_sites == 0 || carried.contains(*path),
+            "{path} records {} per-site expectations and carries no governed attribute",
+            entry.expect_sites
         );
     }
 
@@ -3007,6 +3279,58 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
     let beside_a_raw_word = only("fn raw() {}\n#[cfg(test)]\nmod real;\n");
     assert_eq!(beside_a_raw_word.name, "real");
 
+    // **The token the fallback steps over is the whole token.**
+    // `PR72-RESOLVER-003`. Everything above reads `word`s; the "anything else"
+    // arm advanced by identifier *bytes*, and `r#mod` is not a run of them. It
+    // consumed the `r`, met the `#`, stepped over it as a byte that opens no
+    // attribute, and then read `mod …` — the **inside of a token** — as though
+    // it stood at item position.
+    //
+    // Measured, both shapes refuse: valid Rust, and the scan will not answer
+    // for the file. `let r#mod = 1;` becomes a `mod` item whose name is `=`,
+    // and `use std::r#mod as tests;` becomes `mod as` with no terminator after
+    // it. A refusal here is not a small failure — `declared_whole_file_test_
+    // modules` panics on it, so every census that skips test modules stops on a
+    // tree that compiles. Whether a given rescan refuses or instead *invents* a
+    // declaration is decided by the byte after the embedded name, and neither
+    // outcome is one this scan may have; the repair is that the inside of a
+    // token is never read as one.
+    let raw_binding = "fn f() { let r#mod = 1; }\n#[cfg(test)]\nmod tests;\n";
+    let read = scan_module_declarations(raw_binding).unwrap_or_else(|refusal| {
+        panic!("`let r#mod = 1;` is valid Rust and was refused: {refusal}")
+    });
+    assert_eq!(read.len(), 1, "{read:#?}");
+    assert_eq!(read[0].name, "tests");
+    assert!(read[0].test_only);
+
+    // The second shape, inside a `#[cfg(test)]` module so that anything the
+    // rescan derived would be test-only — a skip, for a file the crate never
+    // declared. It declares no module at all.
+    let raw_in_a_use = "#[cfg(test)]\nmod harness {\n    use std::r#mod as tests;\n}\n";
+    assert_eq!(
+        scan_module_declarations(raw_in_a_use),
+        Ok(Vec::new()),
+        "`use std::r#mod as tests;` declares no module, and the text inside `r#mod` is not an \
+         item"
+    );
+
+    // And the token boundary itself, in both spellings and both directions: a
+    // raw identifier is one token, an ordinary identifier that merely begins
+    // with `r` is another, and a bare `r` is a third.
+    for source in [
+        "fn f() { let r#mod = 1; }\n#[cfg(test)]\nmod real;\n",
+        "fn f() { let r#type = 1; }\n#[cfg(test)]\nmod real;\n",
+        "fn f() { let r = 1; }\n#[cfg(test)]\nmod real;\n",
+        "fn f() { let raw = 1; }\n#[cfg(test)]\nmod real;\n",
+    ] {
+        assert_eq!(only(source).name, "real", "{source:?}");
+        assert_eq!(
+            scan_module_declarations(&source.replace('\n', "\r\n")),
+            scan_module_declarations(source),
+            "CRLF: {source:?}"
+        );
+    }
+
     // (15) **A raw macro name is still a macro.** `r#if!(…)` is a macro called
     // `if`, so the keyword rule above must read the raw spelling as an
     // identifier rather than as the keyword it names.
@@ -3218,97 +3542,123 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
     // looks in `agent/proc/readiness.rs`, which does not exist — so the failure
     // is a zero-candidate refusal if you are lucky, and the wrong file if a
     // module of that name is ever added beside it.
-    let src = Path::new("src");
-    let proc = Path::new("src/agent/proc.rs");
-    let named = |root: &Path, file: &str, inline: &[String], name: &str| {
-        candidates_for(root, Path::new(file), inline, name)
+    let roots = crate::effects::tests::crate_roots();
+    let root = repo_root();
+    let named = |file: &str, inline: &[String], name: &str| {
+        candidates_for(roots, &root.join(file), inline, name)
     };
     assert_eq!(
         named(
-            src,
             "src/agent/proc.rs",
             &["test_support".to_owned()],
             "readiness"
         ),
         Ok([
-            PathBuf::from("src/agent/proc/test_support/readiness.rs"),
-            PathBuf::from("src/agent/proc/test_support/readiness/mod.rs"),
+            root.join("src/agent/proc/test_support/readiness.rs"),
+            root.join("src/agent/proc/test_support/readiness/mod.rs"),
         ])
     );
     assert_eq!(
-        named(src, "src/agent/proc.rs", &[], "readiness"),
+        named("src/agent/proc.rs", &[], "readiness"),
         Ok([
-            PathBuf::from("src/agent/proc/readiness.rs"),
-            PathBuf::from("src/agent/proc/readiness/mod.rs"),
+            root.join("src/agent/proc/readiness.rs"),
+            root.join("src/agent/proc/readiness/mod.rs"),
         ])
     );
-    let root = repo_root().join("src");
-    for flattened in candidates_for(&root, &root.join("agent/proc.rs"), &[], "readiness")
-        .expect("proc.rs is an ordinary module")
-    {
+    for flattened in named("src/agent/proc.rs", &[], "readiness").expect("inside the package") {
         assert!(
             !flattened.is_file(),
             "{} exists, so the flattening mutation would resolve instead of refusing",
             flattened.display()
         );
     }
-    assert!(proc.is_relative());
 
-    // **A crate root owns its directory; an ordinary module does not.**
-    // `mod.rs` is the first case wherever it sits, and `lib.rs`/`main.rs` only
-    // at the crate's source root.
+    // **A crate root owns its directory; an ordinary module does not**, and
+    // which files are roots is read from this package's manifest rather than
+    // from their names — `PR72-TARGETS-001`. `mod.rs` is the first case
+    // wherever it sits; everything else is the first case exactly when the
+    // manifest names it.
     assert_eq!(
-        named(src, "src/engine/mod.rs", &[], "tests").map(|pair| pair[0].clone()),
-        Ok(PathBuf::from("src/engine/tests.rs"))
+        named("src/engine/mod.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(root.join("src/engine/tests.rs"))
     );
     assert_eq!(
-        named(src, "src/lib.rs", &[], "effects").map(|pair| pair[0].clone()),
-        Ok(PathBuf::from("src/effects.rs"))
+        named("src/lib.rs", &[], "effects").map(|pair| pair[0].clone()),
+        Ok(root.join("src/effects.rs"))
     );
     assert_eq!(
-        named(src, "src/main.rs", &[], "tests").map(|pair| pair[0].clone()),
-        Ok(PathBuf::from("src/tests.rs"))
+        named("src/main.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(root.join("src/tests.rs"))
     );
-    // **The competing production sibling.** A nested `src/a/lib.rs` is the
-    // ordinary module `a::lib` unless the manifest says otherwise, so reading
-    // it as a crate root points `mod tests;` at `src/a/tests.rs` — a *different
-    // file*, a sibling that may well be production, which the derivation would
-    // then remove from every census as though `a/lib.rs` had declared it. That
-    // failure does not announce itself: with no `src/a/lib/tests.rs` present it
-    // resolves, it does not refuse. This derivation does not read `Cargo.toml`,
-    // so it refuses rather than choosing between the two readings.
-    assert_eq!(
-        named(src, "src/a/lib.rs", &[], "tests"),
-        Err(CandidateRefusal::AmbiguousCrateRoot {
-            declared_in: PathBuf::from("src/a/lib.rs")
-        })
+    // **The live instance the stem rule got wrong in this tree.**
+    // `examples/probe.rs` is an `example` target, so it is a crate root and its
+    // out-of-line children live in `examples/` — and `scanned_sources` walks
+    // `examples/**`, so this is inside a census's domain rather than
+    // hypothetical. A stem rule answers `examples/probe/`, which is a directory
+    // Cargo does not compile out of.
+    assert!(
+        roots.is_root(&root.join("examples/probe.rs")),
+        "`examples/probe.rs` is a target of this package: {:?}",
+        roots.roots().collect::<Vec<_>>()
     );
     assert_eq!(
-        named(src, "src/a/b/main.rs", &[], "tests"),
-        Err(CandidateRefusal::AmbiguousCrateRoot {
-            declared_in: PathBuf::from("src/a/b/main.rs")
-        })
+        named("examples/probe.rs", &[], "helper").map(|pair| pair[0].clone()),
+        Ok(root.join("examples/helper.rs"))
     );
-    // And the refusal is about *position*, not about the name: the same stem at
-    // the source root is a crate root, and `mod.rs` is never ambiguous.
-    assert!(module_directory(src, Path::new("src/lib.rs")).is_ok());
-    assert!(module_directory(src, Path::new("src/a/mod.rs")).is_ok());
+    // **The competing production sibling, decided rather than refused.** A
+    // nested `src/a/lib.rs` this manifest never names is the ordinary module
+    // `a::lib`, so `mod tests;` in it resolves to `src/a/lib/tests.rs`. Reading
+    // it as a crate root points at `src/a/tests.rs` — a *different file*, a
+    // sibling that may well be production, which the derivation would then
+    // remove from every census as though `a/lib.rs` had declared it, and with
+    // no `src/a/lib/tests.rs` present that wrong reading resolves rather than
+    // refusing. The old derivation could not tell the two apart and refused
+    // both; the manifest tells them apart.
     assert_eq!(
-        module_directory(src, Path::new("src/a/mod.rs")),
-        Ok(PathBuf::from("src/a"))
+        named("src/a/lib.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(root.join("src/a/lib/tests.rs"))
+    );
+    assert_eq!(
+        named("src/a/b/main.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(root.join("src/a/b/main/tests.rs"))
+    );
+    assert_eq!(
+        module_directory(roots, &root.join("src/a/mod.rs")),
+        Ok(root.join("src/a"))
     );
     // The sibling the wrong reading would have claimed, named so the two
     // readings are visible side by side rather than asserted apart.
     assert_eq!(
-        module_directory(src, Path::new("src/a/other.rs")),
-        Ok(PathBuf::from("src/a/other")),
+        module_directory(roots, &root.join("src/a/other.rs")),
+        Ok(root.join("src/a/other")),
         "an ordinary module owns a directory named after it, never its parent"
+    );
+    // **Outside the package is refused, not resolved.** An inventory is a
+    // statement about one package; a file that is not inside it is one the
+    // inventory says nothing about, and answering anyway would be the guess
+    // this repair removed.
+    let elsewhere = std::env::temp_dir().join("upstroke-not-this-package/src/lib.rs");
+    assert_eq!(
+        module_directory(roots, &elsewhere),
+        Err(CandidateRefusal::OutsideThePackage {
+            declared_in: elsewhere.clone(),
+            package_dir: root.clone(),
+        })
+    );
+    assert!(
+        CandidateRefusal::OutsideThePackage {
+            declared_in: elsewhere,
+            package_dir: root.clone(),
+        }
+        .to_string()
+        .contains("does not say whether it is a crate root"),
+        "the refusal says what it could not decide"
     );
 
     // (7) **Zero and two candidates.** Two is `x.rs` and `x/mod.rs` both
     // present — a competing `mod.rs` that Rust itself refuses to compile and
     // that a resolver taking the first match would silently pick a side in.
-    let pair = named(src, "src/a.rs", &[], "b").expect("an ordinary module");
+    let pair = named("src/a.rs", &[], "b").expect("an ordinary module");
     assert_eq!(sole_present(&pair, &|_| false), Err(0));
     assert_eq!(sole_present(&pair, &|_| true), Err(2));
     assert_eq!(sole_present(&pair, &|at| at == pair[0]), Ok(&pair[0]));
@@ -3387,6 +3737,251 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
         declaration_cycle(&deferred).is_some(),
         "a cycle two branches deep was not reached"
     );
+}
+
+/// A census handed a source root the manifest does not describe is **refused**.
+///
+/// The other half of `PR72-TARGETS-001`'s fail-closed side. `source_root` is the
+/// caller's claim about where the crate's sources live and the inventory is the
+/// manifest's; when no target sits under it the two are about different trees,
+/// and every module directory the census then resolves is resolved against an
+/// inventory that says nothing about the files in hand. Driven, because no
+/// caller in this tree passes such a root and an arm nobody has watched refuse
+/// is an arm nobody has watched.
+#[test]
+#[should_panic(expected = "does not describe the tree this census was handed")]
+fn a_census_handed_a_source_root_the_manifest_does_not_describe_is_refused() {
+    let elsewhere = std::env::temp_dir().join("upstroke-not-this-package");
+    let _ = crate::effects::census_domain::declared_whole_file_test_modules(&elsewhere, &[]);
+}
+
+/// The cfg census resolves a `mod name;` through the **same** target inventory.
+///
+/// `PR72-TARGETS-001`, second half. `cfg::module_dir` was a second copy of the
+/// rule `census_domain` had already stopped trusting — `matches!(stem, "mod" |
+/// "lib" | "main")` — and it was the copy that was still wrong on this tree
+/// rather than only on a hypothetical manifest: `examples/probe.rs` is an
+/// `example` target, `scanned_sources` walks `examples/**`, and the stem rule
+/// puts that file's children in `examples/probe/`. `PR5D-VISIBILITY-CHECK-\
+/// DUPLICATED` is the standing entry for a rule written twice; this is the
+/// second copy retired, and this is the control that says so, because the tree
+/// declares no `mod` inside `examples/probe.rs` today and a census that only
+/// ran over the tree would not notice either reading.
+#[test]
+fn the_cfg_census_resolves_module_directories_through_the_target_inventory() {
+    for (file, directory) in [
+        // A crate root owns its own directory. All three of this package's
+        // targets, so the answer is read from the manifest rather than from two
+        // stems that happen to agree with it.
+        ("src/lib.rs", "src"),
+        ("src/main.rs", "src"),
+        ("examples/probe.rs", "examples"),
+        // `mod.rs` is a crate root's shape wherever it sits.
+        ("src/engine/mod.rs", "src/engine"),
+        // And an ordinary module owns a directory named after it — including
+        // one whose stem is `lib`, which the retired rule read as a root.
+        ("src/effects.rs", "src/effects"),
+        ("src/a/lib.rs", "src/a/lib"),
+        ("src/a/main.rs", "src/a/main"),
+    ] {
+        assert_eq!(cfg::module_dir(file), directory, "`{file}`");
+    }
+}
+
+/// **The crate roots come from the manifest, and an arbitrary `[[bin]] path` is
+/// one of them.**
+///
+/// `PR72-TARGETS-001`. Which files Cargo compiles as crate roots decides which
+/// file every out-of-line `mod name;` in the tree resolves to, and the previous
+/// derivation decided it from the file's stem: `lib.rs`/`main.rs` at the source
+/// root was a root, the same stem deeper was refused, anything else was an
+/// ordinary module. A manifest may name **any** path as a target, so the third
+/// arm is a guess — and it is the arm that fails silently, because reading a
+/// root as an ordinary module points its children one directory too deep, at a
+/// sibling that may well exist.
+///
+/// Driven against a manifest built for it rather than against this tree, for
+/// the reason a refusal is always driven here: this package's targets are
+/// `src/lib.rs`, `src/main.rs` and `examples/probe.rs`, so nothing in it
+/// exercises an arbitrary bin path at all. The **exact inventory** is asserted,
+/// not a membership test, and the stem rule this replaces is written out beside
+/// it and shown to disagree — a control that both readings pass is a control
+/// that measures neither.
+#[test]
+fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {
+    use crate::effects::census_domain::{CrateRoots, InventoryRefusal, module_directory};
+
+    // The rule this replaces, written out so the disagreement is measured
+    // rather than asserted. `mod` is common ground; the roots are not.
+    fn by_stem(file: &Path) -> PathBuf {
+        let parent = file.parent().expect("a directory").to_path_buf();
+        let stem = file.file_stem().expect("a name");
+        if stem == "mod" || stem == "lib" || stem == "main" {
+            parent
+        } else {
+            parent.join(stem)
+        }
+    }
+
+    let scratch = scratch_dir("inventory");
+    fs::write(
+        scratch.join("Cargo.toml"),
+        "[package]\n\
+         name = \"upstroke-inventory-fixture\"\n\
+         version = \"0.0.0\"\n\
+         edition = \"2021\"\n\
+         \n\
+         [lib]\n\
+         path = \"src/lib.rs\"\n\
+         \n\
+         [[bin]]\n\
+         name = \"odd\"\n\
+         path = \"src/tools/odd.rs\"\n\
+         \n\
+         [[bin]]\n\
+         name = \"nested\"\n\
+         path = \"src/deep/nest/main.rs\"\n\
+         \n\
+         [workspace]\n",
+    )
+    .expect("the fixture manifest");
+
+    let inventory = crate_roots_of(&scratch).expect("cargo reads the fixture manifest");
+    assert_eq!(inventory.package_dir(), scratch.as_path());
+    assert_eq!(
+        inventory.roots().collect::<Vec<_>>(),
+        vec![
+            scratch.join("src/deep/nest/main.rs").as_path(),
+            scratch.join("src/lib.rs").as_path(),
+            scratch.join("src/tools/odd.rs").as_path(),
+        ],
+        "the inventory is exactly the manifest's three targets"
+    );
+
+    // Each of the three cases, and the stem rule's answer beside it.
+    for (file, owns, stem_says) in [
+        // An arbitrary bin path is a crate root: its children live beside it.
+        ("src/tools/odd.rs", "src/tools", "src/tools/odd"),
+        // So is a `main.rs` that is not at the source root, because this
+        // manifest says so — the case the old derivation refused outright.
+        ("src/deep/nest/main.rs", "src/deep/nest", "src/deep/nest"),
+        // And a `lib.rs` the manifest never names is an ordinary module, which
+        // the old derivation also refused.
+        ("src/a/lib.rs", "src/a/lib", "src/a"),
+    ] {
+        let declared_in = scratch.join(file);
+        assert_eq!(
+            module_directory(&inventory, &declared_in),
+            Ok(scratch.join(owns)),
+            "`{file}` owns `{owns}`"
+        );
+        assert_eq!(
+            by_stem(&declared_in),
+            scratch.join(stem_says),
+            "the stem rule's answer for `{file}` is recorded, not guessed"
+        );
+    }
+    // Two of the three disagree, and the two that do are the ones no rule about
+    // file names can get right. The third is common ground and is here so the
+    // comparison is not silently vacuous.
+    let disagreements = ["src/tools/odd.rs", "src/a/lib.rs"]
+        .into_iter()
+        .filter(|file| {
+            let declared_in = scratch.join(file);
+            module_directory(&inventory, &declared_in) != Ok(by_stem(&declared_in))
+        })
+        .count();
+    assert_eq!(
+        disagreements, 2,
+        "the manifest and the stem rule must disagree on the arbitrary bin path and on the \
+         nested `lib.rs`, or this control measures nothing"
+    );
+
+    // **Fail closed.** Every refusal is driven, because none is reachable from
+    // this tree and an unreachable arm is one nobody has watched work.
+    let missing = scratch.join("no-such-package");
+    assert!(
+        matches!(
+            crate_roots_of(&missing),
+            Err(InventoryRefusal::Failed { .. })
+        ),
+        "a manifest that does not exist is a refusal, not an empty inventory"
+    );
+    let manifest = scratch.join("Cargo.toml");
+    let refusals: Vec<InventoryRefusal> = [
+        "this is not json",
+        "{}",
+        "{\"packages\":[]}",
+        // A package that is not this one. Falling back to \"the first package\"
+        // here is the fail-open shape: an inventory for somebody else's targets
+        // reads as an inventory, and every module directory below is resolved
+        // against it.
+        "{\"packages\":[{\"manifest_path\":\"/somewhere/else/Cargo.toml\",\"targets\":[{\"src_path\":\"/somewhere/else/src/lib.rs\"}]}]}",
+        "{\"packages\":[{\"manifest_path\":\"PLACEHOLDER\",\"targets\":[]}]}",
+        "{\"packages\":[{\"manifest_path\":\"PLACEHOLDER\",\"targets\":[{\"name\":\"x\"}]}]}",
+    ]
+    .into_iter()
+    .map(|document| {
+        let document = document.replace(
+            "PLACEHOLDER",
+            &manifest.display().to_string().replace('\\', "\\\\"),
+        );
+        CrateRoots::from_metadata_json(&document, &manifest).expect_err("this document is refused")
+    })
+    .collect();
+    assert!(
+        matches!(refusals[0], InventoryRefusal::Unreadable { .. }),
+        "{:?}",
+        refusals[0]
+    );
+    assert!(
+        matches!(refusals[1], InventoryRefusal::Unreadable { .. }),
+        "{:?}",
+        refusals[1]
+    );
+    assert!(
+        matches!(refusals[2], InventoryRefusal::NoPackage { .. }),
+        "{:?}",
+        refusals[2]
+    );
+    assert!(
+        matches!(refusals[3], InventoryRefusal::NoPackage { .. }),
+        "a document describing a different package is refused rather than adopted: {:?}",
+        refusals[3]
+    );
+    assert!(
+        matches!(refusals[4], InventoryRefusal::NoTargets { .. }),
+        "{:?}",
+        refusals[4]
+    );
+    assert!(
+        matches!(refusals[5], InventoryRefusal::Unreadable { .. }),
+        "a target with no `src_path` is unreadable rather than skipped: {:?}",
+        refusals[5]
+    );
+    for refusal in &refusals {
+        assert!(
+            refusal.to_string().contains("cargo metadata")
+                || refusal.to_string().contains("declares no target"),
+            "the refusal names the authority it could not reach: {refusal}"
+        );
+    }
+
+    // And the real package's inventory is the one the census resolves against,
+    // read through the same reader.
+    let live = crate::effects::tests::crate_roots();
+    assert_eq!(live.package_dir(), repo_root().as_path());
+    assert_eq!(
+        live.roots().collect::<Vec<_>>(),
+        vec![
+            repo_root().join("examples/probe.rs").as_path(),
+            repo_root().join("src/lib.rs").as_path(),
+            repo_root().join("src/main.rs").as_path(),
+        ],
+        "this package's exact target inventory"
+    );
+
+    let _ = fs::remove_dir_all(&scratch);
 }
 
 /// The file-module-level lint reader is a **census instrument**, not a shipped
@@ -3479,6 +4074,273 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
             "{prologue:?}"
         );
     }
+}
+
+/// **The file-level lint reader answers what rustc does**, on a table rustc
+/// decides.
+///
+/// `PR72-LEVELS-001`. The reader returned at the *first* attribute naming the
+/// lint, and a prologue is ordered: `#![deny(L)] #![allow(L)]` is a file where
+/// `L` is allowed, and the reader called it a denial. Two censuses turn on that
+/// answer — `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`
+/// here and `runner::container::tests::every_child_module_of_the_container_
+/// funnel_states_its_own_lint_level` — and the wrong answer is the reassuring
+/// one: a module reported as having closed `PR6-LANEF-004` by a prologue whose
+/// next line reopens it.
+///
+/// **No lexical restatement is accepted as authority.** The table below does not
+/// say what each prologue means. Each row is compiled by `clippy-driver` under
+/// this repository's own `clippy.toml`, against a body that reaches
+/// `std::fs::write` — a denied path — and the *observed* diagnostics are the
+/// verdict. The reader is asked the same question and its answer is turned into
+/// a prediction of what the compiler must have emitted; the two are compared.
+/// The only sentence written by hand is the bridge between a level and its
+/// observable, and every arm of that bridge is exercised by a row, so a bridge
+/// that was wrong could not stay green.
+///
+/// The rows include the two shapes that are the whole reason for the repair —
+/// `deny` then `allow`, which must be **allow**, and `forbid` then `allow`,
+/// which is `E0453` and not a level at all — and the decoys the blanking exists
+/// for.
+#[test]
+fn the_file_level_lint_reader_answers_what_rustc_does() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    /// A body that reaches a denied path exactly once, so a `disallowed_methods`
+    /// diagnostic is produced by every level that does not suppress one.
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    /// Compile one prologue and return whether it built, plus every diagnostic
+    /// that carries a code, as `(level, code)`.
+    fn compile(dir: &Path, tag: &str, source: &str) -> (bool, Vec<(String, String)>) {
+        let file = dir.join(format!("{tag}.rs"));
+        fs::write(&file, source).expect("the fixture");
+        let out = dir.join("out");
+        fs::create_dir_all(&out).expect("an output directory");
+        let output = std::process::Command::new(clippy_driver())
+            .env("CLIPPY_CONF_DIR", repo_root())
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--emit=metadata",
+                "--error-format=json",
+            ])
+            .arg("--out-dir")
+            .arg(&out)
+            .arg(&file)
+            .output()
+            .expect("clippy-driver runs; the lint gate uses the same binary");
+        let mut diagnostics = Vec::new();
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(code) = value
+                .get("code")
+                .and_then(|code| code.get("code"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let level = value
+                .get("level")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            diagnostics.push((level.to_owned(), code.to_owned()));
+        }
+        (output.status.success(), diagnostics)
+    }
+
+    /// What the compiler must have done, if the reader's answer is right.
+    ///
+    /// `(the crate builds, the levels at which the lint fired, E0453 present)`.
+    /// The one hand-written sentence in this test, and every arm of it is
+    /// reached by a row below.
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        if resolution.refused_downgrade {
+            // Not a level: the prologue is rejected and the lint never runs.
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("levels");
+    // Every row is a prologue. Nothing here says what it means.
+    let table: &[(&str, &str)] = &[
+        ("bare", ""),
+        ("allow", "#![allow(clippy::disallowed_methods)]\n"),
+        ("warn", "#![warn(clippy::disallowed_methods)]\n"),
+        ("deny", "#![deny(clippy::disallowed_methods)]\n"),
+        ("forbid", "#![forbid(clippy::disallowed_methods)]\n"),
+        ("expect", "#![expect(clippy::disallowed_methods)]\n"),
+        (
+            "deny_then_allow",
+            "#![deny(clippy::disallowed_methods)]\n#![allow(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "allow_then_deny",
+            "#![allow(clippy::disallowed_methods)]\n#![deny(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "deny_then_warn",
+            "#![deny(clippy::disallowed_methods)]\n#![warn(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "deny_then_expect",
+            "#![deny(clippy::disallowed_methods)]\n#![expect(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "allow_warn_deny",
+            "#![allow(clippy::disallowed_methods)]\n#![warn(clippy::disallowed_methods)]\n\
+             #![deny(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "allow_then_forbid",
+            "#![allow(clippy::disallowed_methods)]\n#![forbid(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "forbid_then_allow",
+            "#![forbid(clippy::disallowed_methods)]\n#![allow(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "forbid_then_warn",
+            "#![forbid(clippy::disallowed_methods)]\n#![warn(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "forbid_then_deny",
+            "#![forbid(clippy::disallowed_methods)]\n#![deny(clippy::disallowed_methods)]\n",
+        ),
+        // The qualified and bare spellings are one lint, and the order still
+        // decides. `normalize_lint` is the bridge, and rustc accepts the bare
+        // name (with a rename warning of its own, which this ignores).
+        (
+            "deny_then_allow_bare",
+            "#![deny(clippy::disallowed_methods)]\n#![allow(disallowed_methods)]\n",
+        ),
+        // The decoys the blanking exists for: a level in prose and a level in a
+        // string literal govern nothing, and an outer attribute on an item is
+        // not the file module's.
+        (
+            "prose_decoy",
+            "//! `#![allow(clippy::disallowed_methods)]` is written here in prose.\n\
+             #![deny(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "attribute_after_the_prologue",
+            "#![deny(clippy::disallowed_methods)]\npub const S: &str = \
+             \"#![allow(clippy::disallowed_methods)]\";\n",
+        ),
+    ];
+
+    let mut observed_shapes: BTreeSet<(bool, Vec<String>, bool)> = BTreeSet::new();
+    for (tag, prologue) in table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+        observed_shapes.insert((built, fired, rejected));
+
+        // The same prologue with the line endings the Windows guest gives it.
+        assert_eq!(
+            file_level_lint_resolution(&source.replace('\n', "\r\n"), LINT),
+            resolution,
+            "`{tag}` reads differently under CRLF"
+        );
+    }
+
+    // **The table is not vacuous.** Four distinct compiler behaviours are
+    // reached — clean, warned, errored, and rejected outright — so a reader
+    // that collapsed to one answer could not pass.
+    assert!(
+        observed_shapes.len() >= 4,
+        "the fixtures produced only {} distinct compiler outcomes: {observed_shapes:?}",
+        observed_shapes.len()
+    );
+
+    // And the two claims the repair is named for, stated as values now that the
+    // compiler has confirmed the reader on every row above.
+    let deny_then_allow = format!(
+        "#![deny(clippy::disallowed_methods)]\n#![allow(clippy::disallowed_methods)]\n{BODY}"
+    );
+    assert_eq!(
+        file_level_lint_resolution(&deny_then_allow, LINT),
+        Resolution {
+            level: Some("allow"),
+            refused_downgrade: false,
+        },
+        "deny then allow is effectively allow"
+    );
+    let forbid_then_allow = format!(
+        "#![forbid(clippy::disallowed_methods)]\n#![allow(clippy::disallowed_methods)]\n{BODY}"
+    );
+    assert_eq!(
+        file_level_lint_resolution(&forbid_then_allow, LINT),
+        Resolution {
+            level: Some("forbid"),
+            refused_downgrade: true,
+        },
+        "a forbid cannot be weakened; the attempt is E0453 and not a level"
+    );
+
+    // **No file in this tree states one governed lint twice at file-module
+    // level**, so the ordering above changes no answer today. That is the point
+    // of measuring it: the repair is about what the reader does when one
+    // arrives, and this says none has, rather than leaving it to be believed.
+    let mut restated = Vec::new();
+    for (path, source) in scanned_sources() {
+        let blanked = blank_comments_and_strings(&source);
+        for lint in USED_GOVERNED_LINTS {
+            let bare = normalize_lint(lint).expect("a governed lint");
+            let stated = blanked
+                .split("#![")
+                .skip(1)
+                .filter(|attribute| {
+                    attribute
+                        .split(']')
+                        .next()
+                        .is_some_and(|body| body.contains(bare))
+                })
+                .count();
+            if stated > 1 {
+                restated.push(format!(
+                    "{path} states `{lint}` in {stated} inner attributes"
+                ));
+            }
+        }
+    }
+    assert!(
+        restated.is_empty(),
+        "the ordered reading is exercised by fixtures only while this holds: {restated:#?}"
+    );
+
+    let _ = fs::remove_dir_all(&scratch);
 }
 
 #[test]

@@ -47,32 +47,41 @@
 // child of a funnel inherits the funnel's allow silently -- which is
 // `PR6-LANEF-004`, measured twice in the Container subtree, and this file is
 // the first out-of-line child the Process funnel has ever had. All three
-// governed lints are therefore stated here rather than inherited.
+// governed lints are therefore stated here rather than inherited, and all three
+// are stated as DENIALS.
 //
-// **What each of the two attributes actually buys, measured on this tree at
-// this commit rather than assumed.** The naive reading of the pair is that the
-// allow is what lets the denied calls below compile and the deny is tidiness.
-// It is the other way round:
+// **The denial is the whole statement, and the six exceptions are per site.**
+// This file used to open with a blanket `#![allow(clippy::disallowed_methods)]`
+// beside the deny of the other two, and that allowance was measured at the time
+// to buy nothing at the build: `src/agent/proc.rs`'s own allow reaches here
+// through the module tree, so deleting the line changed no diagnostic. It was
+// written as a governance statement -- and a file-scope allow is the wrong
+// statement to make, because it is a claim about the FILE when what is true is
+// a claim about six lines of it. A seventh denied call, or a denied call in a
+// function that has nothing to do with publication, arrives under the same
+// allowance and nothing says so.
 //
-// * Deleting `#![deny(...)]` and planting a `std::process::Command` and a
-//   `println!` in this file compiles clean at
-//   `cargo clippy --all-targets --all-features -- -D warnings` -- zero
-//   `disallowed_types` and zero `disallowed_macros` diagnostics -- because
-//   `src/agent/proc.rs`'s inner `#![allow(...)]` reaches here through the
-//   module tree. With the deny restored the same plant is two errors. That is
-//   `PR6-LANEF-004` reproducing for the Process funnel, and the deny is what
-//   closes it.
-// * Deleting `#![allow(clippy::disallowed_methods)]` changes **nothing** at the
-//   build: the same inheritance covers all six sites. So the allow is not
-//   load-bearing for the compiler, and it is not written for the compiler. It
-//   is the governance statement -- `effects/allowlist.toml` records the exact
-//   lint set this file names and
-//   `effects::tests::every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`
-//   asserts the two are **equal**, so an allowance that widened here without
-//   widening the reviewed row is a build failure. Stating it also keeps this
-//   file out of the "inherits and says nothing" class that census refuses.
+// So the lint is denied at file scope like the other two, and each of the six
+// call sites carries its own `#[expect(clippy::disallowed_methods, reason = …)]`.
+// That makes the compiler the authority on the count, in both directions and
+// under the `-D warnings` the gate runs with:
 //
-// What the row is written against is the staged publication in
+//   * a SEVENTH denied call anywhere in this file is a build error, because
+//     nothing above it allows one; and
+//   * a site that stops reaching a denied path is `unfulfilled_lint_expectations`
+//     on its own `#[expect]`, so the annotations cannot outlive the calls they
+//     were written for.
+//
+// `effects/allowlist.toml` records the lint and the exact number of sites, and
+// `effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so`
+// asserts the file, the row and the prose agree. The amendment that admits a
+// per-site `#[expect]` below module level at all is
+// `decisions/2026-08-30-readiness-lint-placement.md`:
+// `decisions.effect_site_inventory.mechanism` (2) permits
+// an allowance "only as module-level attributes", and this is narrower than the
+// module-level allowance it replaces rather than a widening of it.
+//
+// What the six are written against is the staged publication in
 // `publish_between`: **five distinct denied paths across six sites** --
 // `File::create_new`, `write_all`, `flush`, `fs::rename` and `fs::remove_file`,
 // the last of which is called twice, once on the write-side failure path and
@@ -87,8 +96,11 @@
 // `runner::container::tests::every_child_module_of_the_container_funnel_states_its_own_lint_level`
 // is the census that refuses a Process- or Container-funnel child stating
 // neither level.
-#![allow(clippy::disallowed_methods)]
-#![deny(clippy::disallowed_types, clippy::disallowed_macros)]
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -240,17 +252,54 @@ pub(crate) fn publish_between(
     // removing a file this call does not own. Past this line the staging
     // file is provably ours — a name unique to this call, brought into
     // existence exclusively — so every failure below may remove it.
+    //
+    // Each of the six statements below reaches exactly one denied path and
+    // carries its own expectation. They are separate statements for that
+    // reason: an attribute on the combined `write_all(…).and_then(…)` would
+    // cover two sites with one annotation, and the count is the claim.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UPSTROKE-EFFECT: site 1 of 6. Brings the staging sibling into \
+                  existence exclusively, which is what makes every removal below \
+                  a removal of a file this call owns"
+    )]
     let mut file = std::fs::File::create_new(&staged)?;
-    let staged_write = file
-        .write_all(record.as_bytes())
-        .and_then(|()| file.flush());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UPSTROKE-EFFECT: site 2 of 6. Writes the framed record into the \
+                  staging name, never into the signal name"
+    )]
+    let written = file.write_all(record.as_bytes());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UPSTROKE-EFFECT: site 3 of 6. Flushes before the rename, so the \
+                  bytes are in the file the rename publishes"
+    )]
+    let staged_write = written.and_then(|()| file.flush());
     drop(file);
     if let Err(error) = staged_write {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "UPSTROKE-EFFECT: site 4 of 6. Removes the staging name on the \
+                      write-side failure path; the signal name was never created"
+        )]
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
     between();
-    if let Err(error) = std::fs::rename(&staged, signal) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UPSTROKE-EFFECT: site 5 of 6. The rename that makes the name and \
+                  the bytes visible together — §12's atomic publication"
+    )]
+    let renamed = std::fs::rename(&staged, signal);
+    if let Err(error) = renamed {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "UPSTROKE-EFFECT: site 6 of 6. Removes the staging name on the \
+                      rename-side failure path; this is the second of the two \
+                      removals, and the reason the six sites are five paths"
+        )]
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }

@@ -83,29 +83,41 @@ combined funnel."""
 [[funnel]]
 path = "src/agent/proc/test_support/readiness.rs"
 allows = ["clippy::disallowed_methods"]
+expect_sites = 6
 packet = "effect_site_inventory.mechanism (2), by attachment: the `mod readiness;` of src/agent/proc.rs's `#[cfg(test)] mod test_support`"
 review = """
 CODING_STANDARDS.md §12's readiness protocol, moved out of line from \
-`src/agent/proc.rs` and given an attribute of its own in the same commit -- \
+`src/agent/proc.rs` and given attributes of its own in the same commit -- \
 never inheriting one. A Rust lint level is scoped by the MODULE TREE and not by \
 the file, so this file would have inherited the Process funnel's \
 `#![allow(disallowed_methods, disallowed_types, disallowed_macros)]` silently: \
 that is `PR6-LANEF-004`, measured twice in the Container subtree, and this is \
 the first out-of-line child the Process funnel has ever had. \
-WHAT THE ALLOW IS FOR, exactly and only -- and it is not the compiler. \
-MEASURED: deleting the file's `#![allow(clippy::disallowed_methods)]` changes \
-nothing at `cargo clippy --all-targets --all-features -- -D warnings`, because \
-`src/agent/proc.rs`'s allow reaches here through the module tree; deleting its \
-`#![deny(...)]` lets a planted `std::process::Command` and `println!` through \
-with zero diagnostics, and restoring it makes them two errors. So the DENY is \
-the build control and the ALLOW is the reviewed statement this row is compared \
-with for equality. The calls it is written against: the atomic publication in \
+ALL THREE GOVERNED LINTS ARE DENIED AT FILE SCOPE, AND THE ALLOWANCE IS SIX \
+PER-SITE `#[expect]` ATTRIBUTES rather than a file-scope allow. That is \
+`PR72-PLACEMENT-001` and `decisions/2026-08-30-readiness-lint-placement.md` is \
+the amendment admitting it: `mechanism` (2) permits an allowance "only as \
+module-level attributes", and a per-site expectation is NARROWER than the \
+module-level allow it replaces, not a widening of it. \
+MEASURED, and it is why the old shape was wrong rather than merely untidy: \
+deleting the previous `#![allow(clippy::disallowed_methods)]` changed nothing \
+at `cargo clippy --all-targets --all-features -- -D warnings`, because \
+`src/agent/proc.rs`'s allow reaches here through the module tree. So it bought \
+no diagnostic and made a claim about the WHOLE FILE when what is true is a \
+claim about six lines of it: a seventh denied call, anywhere, arrived under the \
+same allowance and nothing said so. With the deny in place a seventh call is a \
+build error, and a site that stops reaching a denied path is \
+`unfulfilled_lint_expectations` on its own `#[expect]` -- so THE COMPILER OWNS \
+THE COUNT IN BOTH DIRECTIONS under the `-D warnings` the gate runs with, and \
+`expect_sites` above is the reviewed number it is checked against. \
+The calls the six are written against: the atomic publication in \
 `publish_between` is `std::fs::File::create_new` of a staging sibling, \
 `std::io::Write::write_all` and `std::io::Write::flush` of the framed record, \
 `std::fs::rename` onto the signal name, and `std::fs::remove_file` of the \
-staging name on either failure path. FIVE DISTINCT DENIED PATHS ACROSS SIX \
-SITES -- `std::fs::remove_file` is called twice, once on the write-side \
-failure path and once on the rename-side one -- AND NO OTHERS: there is no \
+staging name on either failure path. \
+FIVE DISTINCT DENIED PATHS ACROSS SIX SITES \
+-- `std::fs::remove_file` is called twice, once on the write-side failure \
+path and once on the rename-side one -- AND NO OTHERS: there is no \
 `fs::write`, no `OpenOptions`, no `create_dir`, and no durability barrier -- \
 §8 separates visibility from durability and a readiness signal needs only the \
 first, so nothing here touches `util::fsync_file`/`util::fsync_dir` or the \
@@ -118,7 +130,10 @@ rather than inherited, so a `std::process::Command`, a `std::fs::OpenOptions` \
 or a `println!` in this file is still a build error. \
 `runner::container::tests::every_child_module_of_the_container_funnel_states_\
 its_own_lint_level` is the census that refuses a Process- or Container-funnel \
-child stating neither."""
+child stating neither, and \
+`effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so` \
+is the one that keeps this row, this file's prologue and the six annotations \
+saying the same thing."""
 
 [[funnel]]
 path = "src/runner/container.rs"

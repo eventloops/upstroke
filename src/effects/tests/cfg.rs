@@ -559,10 +559,20 @@ fn balanced(bytes: &[u8], at: usize, open: u8, close: u8) -> Option<usize> {
 }
 
 /// The directory a file's `mod name;` declarations resolve inside.
-fn module_dir(path: &str) -> String {
+///
+/// **The crate roots come from the manifest**, through the one inventory
+/// `census_domain` resolves against. This used to read `matches!(stem, "mod" |
+/// "lib" | "main")` — a second, lexical copy of the rule that census had
+/// already stopped trusting, and the copy that was still wrong in this tree:
+/// `examples/probe.rs` is an `example` target, so it is a crate root whose
+/// children live in `examples/`, and the stem rule answered `examples/probe`.
+/// An arbitrary `[[bin]] path` is the same error with more room in it.
+/// `PR5D-VISIBILITY-CHECK-DUPLICATED` is the standing entry for a rule written
+/// twice; this is the second copy retired rather than re-synchronised.
+pub(super) fn module_dir(path: &str) -> String {
     let (parent, file) = path.rsplit_once('/').unwrap_or(("", path));
     let stem = file.strip_suffix(".rs").unwrap_or(file);
-    if matches!(stem, "mod" | "lib" | "main") {
+    if stem == "mod" || crate::effects::tests::crate_roots().is_root_relative(path) {
         parent.to_owned()
     } else if parent.is_empty() {
         stem.to_owned()

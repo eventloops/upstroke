@@ -3169,17 +3169,30 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         }
     }
 
-    // And the Process funnel's child allows **exactly** what its row records:
-    // one lint allowed, two re-denied. An entry that is merely *present* is the
-    // widening this file's own history is about — `allows` is compared for
-    // equality by `effects::tests::every_allow_of_a_governed_lint_is_module_\
+    // And the Process funnel's child **denies all three at file scope**. It
+    // allowed one of them until `decisions/2026-08-30-readiness-lint-placement.md`,
+    // and the allowance is six per-site `#[expect]` attributes now: narrower
+    // than the file-scope allow it replaces, and counted by the compiler in both
+    // directions under `-D warnings` — a seventh denied call is an error, and an
+    // expectation that stops being met is `unfulfilled_lint_expectations`.
+    // `effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so`
+    // is the census that keeps the file, the row and the prose agreeing.
+    //
+    // The row still records **exactly** the one lint those expectations name and
+    // neither of the two that are only denied. An entry that is merely *present*
+    // is the widening this file's own history is about — `allows` is compared
+    // for equality by `effects::tests::every_allow_of_a_governed_lint_is_module_\
     // level_and_in_the_allowlist`, and this is the same claim read from the
     // other end, so a row that grew a second lint fails here too.
     let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))
         .expect("the child");
-    assert_eq!(stated_lint_level(&readiness, GOVERNED[0]), Some("allow"));
-    assert_eq!(stated_lint_level(&readiness, GOVERNED[1]), Some("deny"));
-    assert_eq!(stated_lint_level(&readiness, GOVERNED[2]), Some("deny"));
+    for lint in GOVERNED {
+        assert_eq!(
+            stated_lint_level(&readiness, lint),
+            Some("deny"),
+            "the Process funnel's child no longer denies `{lint}` at file scope"
+        );
+    }
     assert!(allowlist_records(
         "src/agent/proc/test_support/readiness.rs",
         GOVERNED[0]
@@ -3187,7 +3200,8 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     for denied in [GOVERNED[1], GOVERNED[2]] {
         assert!(
             !allowlist_records("src/agent/proc/test_support/readiness.rs", denied),
-            "the readiness row records `{denied}`, which the file denies rather than allows"
+            "the readiness row records `{denied}`, which the file denies without excepting \
+             any site of it"
         );
     }
 
