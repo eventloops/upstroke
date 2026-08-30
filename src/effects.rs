@@ -165,11 +165,22 @@ pub const USED_GOVERNED_LINTS: &[&str] = &[
 /// reader will guess at.
 #[must_use]
 pub fn normalize_lint(entry: &str) -> Option<&'static str> {
-    let segment = entry.trim().rsplit("::").next()?.trim();
-    let (bare, end) = identifier_token(segment, 0)?;
-    if end != segment.len() {
-        return None;
+    // **Every segment, not just the last one.** Taking `rsplit("::").next()`
+    // and validating that alone left the leading segments unread, so
+    // `allow(\u{00A0}clippy::disallowed_methods)` -- a file rustc REFUSES,
+    // because U+00A0 is not Rust whitespace -- normalised to the governed lint
+    // and the reader reported an allowance for a file that does not compile.
+    // A path is a sequence of identifier tokens; all of them are checked.
+    let mut bare = None;
+    for segment in trim_rust(entry).split("::") {
+        let segment = trim_rust(segment);
+        let (name, end) = identifier_token(segment, 0)?;
+        if end != segment.len() {
+            return None;
+        }
+        bare = Some(name);
     }
+    let bare = bare?;
     GOVERNED_LINTS.iter().copied().find(|name| *name == bare)
 }
 
@@ -699,21 +710,15 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] != b'#' {
-            i += 1;
-            continue;
-        }
-        let inner = bytes.get(i + 1) == Some(&b'!');
-        let open = if inner { i + 2 } else { i + 1 };
-        if bytes.get(open) != Some(&b'[') {
-            i += 1;
-            continue;
-        }
-        let Some(close) = matching(bytes, open, b'[', b']') else {
+        let Some(opener) = attribute_opener(&blanked, i) else {
             i += 1;
             continue;
         };
-        let attribute = &blanked[open + 1..close];
+        let Some(close) = matching(bytes, opener.open, b'[', b']') else {
+            i += 1;
+            continue;
+        };
+        let attribute = &blanked[opener.open + 1..close];
         let mut lints = Vec::new();
         let mut written = Vec::new();
         let mut keywords: Vec<&'static str> = Vec::new();
@@ -722,7 +727,7 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
             for group in calls_named(attribute, keyword) {
                 let before = lints.len();
                 for entry in group.split(',') {
-                    let entry = entry.trim();
+                    let entry = trim_rust(entry);
                     if entry.is_empty() {
                         continue;
                     }
@@ -743,8 +748,8 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         if !lints.is_empty() {
             found.push(GovernedAllow {
                 line: blanked[..i].matches('\n').count() + 1,
-                inner,
-                module_level: is_module_level(&blanked, i, close, inner),
+                inner: opener.inner,
+                module_level: is_module_level(&blanked, i, close, opener.inner),
                 lints,
                 written,
                 keywords,
@@ -789,7 +794,7 @@ fn calls_named<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
         if name != keyword {
             continue;
         }
-        let open = skip_blank(bytes, after);
+        let open = skip_blank(text, after);
         if bytes.get(open) != Some(&b'(') {
             continue;
         }
@@ -835,15 +840,128 @@ fn identifier_token(text: &str, at: usize) -> Option<(&str, usize)> {
     Some((&text[start..end], end))
 }
 
-/// The first index at or after `at` that is not whitespace.
+/// Whether `character` is whitespace **to the Rust lexer**.
 ///
-/// Comments are spaces by the time either reader runs, so this is the whole of
-/// what may separate an attribute's name from its delimiter.
-fn skip_blank(bytes: &[u8], mut at: usize) -> usize {
-    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-        at += 1;
+/// `PR74-GOVERNED-LINT-TOKEN-003`. This is `Pattern_White_Space`, the set
+/// rustc's own lexer uses, and it is written out because it is NOT
+/// `char::is_whitespace` -- the two disagree in both directions, and each
+/// disagreement is a defect in one of the two possible flavours. Measured
+/// against `clippy-driver`, and the table lives in
+/// `effects::tests::the_governed_lint_readers_separate_tokens_the_way_the_\
+/// lexer_does`:
+///
+/// * `U+200E` and `U+200F` are Rust whitespace and are **not** `White_Space`.
+///   `char::is_whitespace` refuses a separator the compiler accepts, so a
+///   prologue that really does allow the lint reads as unreadable -- and
+///   `U+200E` is the one that survives `rustfmt` under a `rustfmt::skip`.
+/// * `U+00A0`, `U+1680`, `U+2000`, `U+2003`, `U+202F`, `U+205F`, `U+3000` are
+///   `White_Space` and are **not** Rust whitespace. `char::is_whitespace` steps
+///   over a character rustc refuses to compile, and the reader reports a level
+///   for a file that has none. That is the wrongly-green direction.
+const fn is_rust_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// The first index at or after `at` that is not Rust whitespace.
+///
+/// Advances by **characters**, because a separator need not be one byte:
+/// stepping a byte at a time would land inside `U+200E` and slice a panic out
+/// of the next `&text[..]`. Comments are already spaces by the time either
+/// reader runs, so between them this is the whole of what may separate two
+/// tokens -- an attribute's name from its delimiter, or the three tokens of an
+/// introducer.
+///
+/// An index that is past the end or inside a character is returned unchanged:
+/// a caller that has lost the boundary gets no progress rather than a panic.
+fn skip_blank(text: &str, mut at: usize) -> usize {
+    loop {
+        if at >= text.len() || !text.is_char_boundary(at) {
+            return at;
+        }
+        let Some(character) = text[at..].chars().next() else {
+            return at;
+        };
+        if !is_rust_whitespace(character) {
+            return at;
+        }
+        at += character.len_utf8();
     }
-    at
+}
+
+/// `text` without the Rust whitespace at either end.
+///
+/// `str::trim` is `char::is_whitespace`, which is the wrong set here for both
+/// of the reasons [`is_rust_whitespace`] gives.
+fn trim_rust(text: &str) -> &str {
+    let start = skip_blank(text, 0);
+    let mut end = text.len();
+    while end > start {
+        let Some(character) = text[start..end].chars().next_back() else {
+            break;
+        };
+        if !is_rust_whitespace(character) {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    &text[start..end]
+}
+
+/// One attribute introducer: the `#`, an optional `!`, and the `[`.
+struct AttributeOpener {
+    /// `#![…]` rather than `#[…]`.
+    inner: bool,
+    /// The index of the opening bracket itself.
+    open: usize,
+}
+
+/// The attribute introducer beginning at `at`, if one does.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-002`. `#`, `!` and `[` are three TOKENS and Rust
+/// puts no adjacency requirement on them: `# ! [allow(…)]`,
+/// `#/* why */![allow(…)]` and the same across line breaks are ordinary
+/// attributes, each measured and each suppressing the lint. Both readers
+/// required the bytes to be adjacent, so a denial taken back through a
+/// separated introducer read as a denial, and an allowance written that way was
+/// invisible to the placement census.
+///
+/// `at` is the `#` and stays the `#`: the returned `open` is the bracket's own
+/// index, so a caller's line number, byte offsets and placement decision are
+/// computed from exactly the positions they always were.
+///
+/// **Fail closed.** `None` whenever what follows is not an introducer, which is
+/// also what keeps `r#allow` from being read as one -- the `#` there is
+/// followed by an identifier rather than by `!` or `[`.
+fn attribute_opener(text: &str, at: usize) -> Option<AttributeOpener> {
+    let bytes = text.as_bytes();
+    if bytes.get(at) != Some(&b'#') {
+        return None;
+    }
+    let mut cursor = skip_blank(text, at + 1);
+    let inner = bytes.get(cursor) == Some(&b'!');
+    if inner {
+        cursor = skip_blank(text, cursor + 1);
+    }
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    Some(AttributeOpener {
+        inner,
+        open: cursor,
+    })
 }
 
 /// The index of the bracket closing the one at `open`, or `None`.
@@ -871,36 +989,46 @@ fn matching(bytes: &[u8], open: usize, opener: u8, closer: u8) -> Option<usize> 
 /// exists to refuse.
 fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> bool {
     if inner {
-        // Nothing but whitespace and other attributes may precede it.
-        let mut prefix = &blanked[..hash];
+        // Nothing but whitespace and complete attributes may precede it.
+        //
+        // Walked FORWARDS from the first byte. The backward walk this replaced
+        // searched for a literal `#![` or `#[`, which is the adjacency
+        // assumption `PR74-GOVERNED-LINT-TOKEN-002` is about, and it trimmed
+        // with `str::trim_end`, whose whitespace is not the lexer's. Forwards,
+        // the same [`attribute_opener`] both readers use decides what an
+        // attribute is, so all three agree by construction.
+        let mut at = 0;
         loop {
-            let trimmed = prefix.trim_end();
-            if trimmed.ends_with(']') {
-                let Some(open) = trimmed.rfind("#![").or_else(|| trimmed.rfind("#[")) else {
-                    return false;
-                };
-                prefix = &trimmed[..open];
-                continue;
+            at = skip_blank(blanked, at);
+            if at >= hash {
+                return at == hash;
             }
-            return trimmed.is_empty();
+            let Some(opener) = attribute_opener(blanked, at) else {
+                return false;
+            };
+            let Some(end) = matching(blanked.as_bytes(), opener.open, b'[', b']') else {
+                return false;
+            };
+            at = end + 1;
         }
     }
     // Outer: skip further attributes and whitespace, then require `mod`.
-    let mut rest = &blanked[close + 1..];
+    let mut at = close + 1;
     loop {
-        rest = rest.trim_start();
+        at = skip_blank(blanked, at);
+        let rest = &blanked[at.min(blanked.len())..];
         if rest.starts_with('#') {
-            let Some(open) = rest.find('[') else {
+            let Some(opener) = attribute_opener(blanked, at) else {
                 return false;
             };
-            let Some(end) = matching(rest.as_bytes(), open, b'[', b']') else {
+            let Some(end) = matching(blanked.as_bytes(), opener.open, b'[', b']') else {
                 return false;
             };
-            rest = &rest[end + 1..];
+            at = end + 1;
             continue;
         }
         for visibility in ["pub(crate)", "pub(super)", "pub", ""] {
-            let candidate = rest.strip_prefix(visibility).unwrap_or(rest).trim_start();
+            let candidate = trim_rust(rest.strip_prefix(visibility).unwrap_or(rest));
             if candidate.starts_with("mod ") {
                 return true;
             }
@@ -3021,28 +3149,34 @@ pub(crate) mod lint_levels {
         let mut applied: Vec<Applied> = Vec::new();
         let mut readable = true;
         let mut at = 0;
-        while at < bytes.len() {
-            if bytes[at].is_ascii_whitespace() {
-                at += 1;
-                continue;
-            }
-            // The prologue ends at the first token that is not an inner attribute.
-            if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
+        loop {
+            at = super::skip_blank(&blanked, at);
+            if at >= bytes.len() {
                 break;
             }
-            let open = at + 2;
-            if bytes.get(open) != Some(&b'[') {
+            // The prologue ends at the first token that is not an inner
+            // attribute. Which bytes are one is `super::attribute_opener`'s
+            // answer, the same one the placement scan gets, so the two readers
+            // cannot disagree about where an attribute begins.
+            let Some(opener) = super::attribute_opener(&blanked, at) else {
+                break;
+            };
+            if !opener.inner {
                 break;
             }
-            let Some(close) = super::matching(bytes, open, b'[', b']') else {
+            let Some(close) = super::matching(bytes, opener.open, b'[', b']') else {
                 // An inner attribute whose brackets do not close. Everything
                 // after it is unread, so the answer is a refusal rather than
                 // whatever the attributes before it happened to say.
                 readable = false;
                 break;
             };
-            readable &=
-                read_attribute(&blanked[open + 1..close], lint, Truth::Always, &mut applied);
+            readable &= read_attribute(
+                &blanked[opener.open + 1..close],
+                lint,
+                Truth::Always,
+                &mut applied,
+            );
             at = close + 1;
         }
         resolve(&applied, readable)
@@ -3138,7 +3272,7 @@ pub(crate) mod lint_levels {
         applied: &mut Vec<Applied>,
     ) -> bool {
         const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
-        let attribute = attribute.trim();
+        let attribute = super::trim_rust(attribute);
         let Some((head, body)) = split_call(attribute) else {
             // Not a call: `#![no_std]`, `#![doc = "…"]`. It sets no level, and
             // the string a `doc =` carries is already blanked.
@@ -3159,13 +3293,19 @@ pub(crate) mod lint_levels {
             return readable;
         }
         if let Some(level) = LEVELS.iter().copied().find(|level| *level == head) {
-            if split_top_level(body)
-                .iter()
-                .any(|entry| names_lint(entry, lint))
-            {
+            let entries = split_top_level(body);
+            if entries.iter().any(|entry| names_lint(entry, lint)) {
                 applied.push(Applied { level, truth });
+                return true;
             }
-            return true;
+            // An entry that MENTIONS the lint without parsing as its name is a
+            // shape this reader has not understood, and "this attribute says
+            // nothing about that lint" is the wrong answer for it.
+            // `allow(\u{00A0}clippy::disallowed_methods)` is the live case:
+            // U+00A0 is not Rust whitespace, rustc refuses the file, and
+            // silence here would let a census read the module as merely
+            // unannotated. A refusal is the loud answer and the true one.
+            return !entries.iter().any(|entry| mentions(entry, lint));
         }
         // Some other attribute. It governs no lint level, so it matters only if
         // it names this lint somewhere the reader has not understood — and then
@@ -3225,14 +3365,14 @@ pub(crate) mod lint_levels {
     /// this is the structural half of the reader, and a prefix match is what it
     /// replaced.
     fn split_call(text: &str) -> Option<(&str, &str)> {
-        let text = text.trim();
+        let text = super::trim_rust(text);
         let (head, after) = super::identifier_token(text, 0)?;
-        let open = super::skip_blank(text.as_bytes(), after);
+        let open = super::skip_blank(text, after);
         if text.as_bytes().get(open) != Some(&b'(') {
             return None;
         }
         let close = super::matching(text.as_bytes(), open, b'(', b')')?;
-        if !text[close + 1..].trim().is_empty() {
+        if !super::trim_rust(&text[close + 1..]).is_empty() {
             return None;
         }
         Some((head, &text[open + 1..close]))
@@ -3252,13 +3392,13 @@ pub(crate) mod lint_levels {
                 b'(' | b'[' | b'{' => depth += 1,
                 b')' | b']' | b'}' => depth = depth.saturating_sub(1),
                 b',' if depth == 0 => {
-                    terms.push(list[start..index].trim());
+                    terms.push(super::trim_rust(&list[start..index]));
                     start = index + 1;
                 }
                 _ => {}
             }
         }
-        terms.push(list[start..].trim());
+        terms.push(super::trim_rust(&list[start..]));
         terms.retain(|term| !term.is_empty());
         terms
     }

@@ -5208,6 +5208,471 @@ fn the_governed_lint_readers_consume_tokens_and_normalise_raw_identifiers() {
     let _ = fs::remove_dir_all(&scratch);
 }
 
+/// `rustfmt`, the binary the `cargo fmt` gate runs.
+fn rustfmt_binary() -> PathBuf {
+    let sysroot = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .expect("rustc runs; it built this test");
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned());
+    let name = if cfg!(windows) {
+        "rustfmt.exe"
+    } else {
+        "rustfmt"
+    };
+    let in_sysroot = sysroot.join("bin").join(name);
+    if in_sysroot.is_file() {
+        return in_sysroot;
+    }
+    PathBuf::from(name)
+}
+
+/// **Both readers separate tokens the way the lexer does.**
+///
+/// `PR74-GOVERNED-LINT-TOKEN-002` and `PR74-GOVERNED-LINT-TOKEN-003`, two more
+/// places where this file assumed bytes where Rust has tokens. The previous
+/// repair taught the readers to consume an identifier whole; it left two
+/// adjacency assumptions standing.
+///
+/// **The introducer is three tokens, not three bytes.** `#`, an optional `!`
+/// and `[` may be separated by anything the lexer calls whitespace, comments
+/// included. `# ! [allow(…)]`, `#/* why */![allow(…)]` and the same across line
+/// breaks are ordinary attributes -- each one measured below, each one
+/// suppressing the lint -- and both readers required the bytes to be adjacent.
+///
+/// **Rust's whitespace is not `char::is_whitespace`.** The lexer uses
+/// `Pattern_White_Space`, and the two sets disagree in BOTH directions, which
+/// is why the predicate is written out rather than borrowed:
+///
+/// * `U+200E` and `U+200F` are Rust whitespace and are **not** `White_Space`.
+///   A reader using `char::is_whitespace` refuses a separator the compiler
+///   accepts -- and `#![allow\u{200E}(clippy::disallowed_methods)]` compiles
+///   and suppresses.
+/// * `U+00A0`, `U+1680`, `U+2000`, `U+2003`, `U+202F`, `U+205F` and `U+3000`
+///   are `White_Space` and are **not** Rust whitespace. A reader using
+///   `char::is_whitespace` walks over a byte rustc refuses to compile, and
+///   reports a level for a file that has none.
+///
+/// Section (5) is why neither is merely theoretical: `rustfmt` normalises both
+/// shapes away, but under a `rustfmt::skip` -- an ordinary attribute this
+/// repository's gates do not forbid -- it preserves them exactly. Measured by
+/// running the same `rustfmt` binary the `cargo fmt` gate runs.
+#[test]
+fn the_governed_lint_readers_separate_tokens_the_way_the_lexer_does() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every shape in this table is one rustc accepts, so a refusal here is not the \
+             fail-closed answer -- it is the reader still unable to separate two tokens"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    /// Ask the compiler, and hold the reader to the answer.
+    fn measured(scratch: &Path, tag: &str, prologue: &str, body: &str, lint: &str) {
+        let source = format!("{prologue}{body}");
+        let resolution = file_level_lint_resolution(&source, lint);
+        let (built, diagnostics) = compile_prologue_probe(scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == lint)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+    }
+
+    let scratch = scratch_dir("lexer-separators");
+
+    // -----------------------------------------------------------------
+    // (1) The introducer, separated every way the lexer allows.
+    // -----------------------------------------------------------------
+    for (tag, prologue) in [
+        ("introducer_plain", format!("#![allow({LINT})]\n")),
+        (
+            "introducer_space_after_hash",
+            format!("# ![allow({LINT})]\n"),
+        ),
+        (
+            "introducer_space_before_bracket",
+            format!("#! [allow({LINT})]\n"),
+        ),
+        ("introducer_space_both", format!("# ! [allow({LINT})]\n")),
+        (
+            "introducer_comment_after_hash",
+            format!("#/* why */![allow({LINT})]\n"),
+        ),
+        (
+            "introducer_comment_before_bracket",
+            format!("#!/* why */[allow({LINT})]\n"),
+        ),
+        ("introducer_newlines", format!("#\n!\n[allow({LINT})]\n")),
+        (
+            "introducer_line_comment",
+            format!("#\n// why\n!\n// and why\n[allow({LINT})]\n"),
+        ),
+        // Denied, so the direction that fails loudly is exercised too.
+        ("introducer_split_deny", format!("# ! [deny({LINT})]\n")),
+        // **THE SLIP.** A denial taken back through a separated introducer.
+        (
+            "slip_by_split_introducer",
+            format!("#![deny({LINT})]\n# ! [allow({LINT})]\n"),
+        ),
+    ] {
+        measured(&scratch, tag, &prologue, BODY, LINT);
+    }
+
+    // -----------------------------------------------------------------
+    // (2) Every separator the lexer accepts, between `allow` and its `(`.
+    // `Pattern_White_Space` in full. A reader built on `char::is_whitespace`
+    // refuses the last four and fails this table.
+    // -----------------------------------------------------------------
+    const ACCEPTED: [(&str, &str); 11] = [
+        ("tab", "\u{0009}"),
+        ("line_feed", "\u{000A}"),
+        ("vertical_tab", "\u{000B}"),
+        ("form_feed", "\u{000C}"),
+        ("carriage_return", "\u{000D}"),
+        ("space", "\u{0020}"),
+        ("next_line", "\u{0085}"),
+        ("left_to_right_mark", "\u{200E}"),
+        ("right_to_left_mark", "\u{200F}"),
+        ("line_separator", "\u{2028}"),
+        ("paragraph_separator", "\u{2029}"),
+    ];
+    for (name, separator) in ACCEPTED {
+        measured(
+            &scratch,
+            &format!("accepted_{name}"),
+            &format!("#![allow{separator}({LINT})]\n"),
+            BODY,
+            LINT,
+        );
+        // And in the introducer, which is the same separator logic reused.
+        measured(
+            &scratch,
+            &format!("accepted_introducer_{name}"),
+            &format!("#{separator}!{separator}[allow({LINT})]\n"),
+            BODY,
+            LINT,
+        );
+    }
+    // The same separator INSIDE the lint list, which is the third place two
+    // tokens meet and the one `str::trim` gets wrong on its own. A path may be
+    // spaced around its `::` for the same reason.
+    for (tag, prologue) in [
+        ("entry_leading_mark", format!("#![allow(\u{200E}{LINT})]\n")),
+        (
+            "entry_trailing_mark",
+            format!("#![allow({LINT}\u{200E})]\n"),
+        ),
+        (
+            "entry_both_marks",
+            format!("#![allow(\u{200E}{LINT}\u{200E})]\n"),
+        ),
+        (
+            "path_spaced_around_its_colons",
+            "#![allow(clippy :: disallowed_methods)]\n".to_owned(),
+        ),
+        (
+            "entry_marks_on_a_deny",
+            format!("#![deny(\u{200E}{LINT}\u{200E})]\n"),
+        ),
+    ] {
+        measured(&scratch, tag, &prologue, BODY, LINT);
+    }
+
+    // The slip again, through the separator that survives formatting.
+    measured(
+        &scratch,
+        "slip_by_left_to_right_mark",
+        &format!("#![deny({LINT})]\n#![allow\u{200E}({LINT})]\n"),
+        BODY,
+        LINT,
+    );
+
+    // -----------------------------------------------------------------
+    // (3) Every separator the lexer REFUSES. These are `White_Space` and are
+    // not Rust whitespace, so a reader that skipped them would report a level
+    // for a file that does not compile. The reader must refuse instead —
+    // nearby non-whitespace Unicode is a shape it cannot read, not a gap it
+    // may step over.
+    // -----------------------------------------------------------------
+    const REFUSED: [(&str, &str); 9] = [
+        ("no_break_space", "\u{00A0}"),
+        ("ogham_space_mark", "\u{1680}"),
+        ("en_quad", "\u{2000}"),
+        ("em_space", "\u{2003}"),
+        ("narrow_no_break_space", "\u{202F}"),
+        ("medium_mathematical_space", "\u{205F}"),
+        ("ideographic_space", "\u{3000}"),
+        ("zero_width_space", "\u{200B}"),
+        ("zero_width_non_joiner", "\u{200C}"),
+    ];
+    for (name, separator) in REFUSED {
+        for (where_it_sits, source) in [
+            (
+                "before the delimiter",
+                format!("#![allow{separator}({LINT})]\n{BODY}"),
+            ),
+            (
+                "inside the lint list",
+                format!("#![allow({separator}{LINT})]\n{BODY}"),
+            ),
+        ] {
+            let tag = format!("{name} {where_it_sits}");
+            let (built, _) = compile_prologue_probe(
+                &scratch,
+                &format!("refused_{name}_{}", where_it_sits.replace(' ', "_")),
+                &source,
+            );
+            assert!(
+                !built,
+                "`{tag}` compiles, so it belongs in the accepted table and not this one"
+            );
+            assert_eq!(
+                file_level_lint_resolution(&source, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` was stepped over as though it were whitespace"
+            );
+            for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+                assert_eq!(
+                    crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                    None,
+                    "`{tag}` reached a census as a level"
+                );
+            }
+        }
+        let source = format!("#![allow{separator}({LINT})]\n{BODY}");
+        // The compiler refuses the file outright, which is what makes skipping
+        // the character wrong rather than merely generous.
+        let (built, _) = compile_prologue_probe(&scratch, &format!("refused_{name}"), &source);
+        assert!(
+            !built,
+            "`{name}` compiles, so it belongs in the accepted table and not this one"
+        );
+        assert_eq!(
+            file_level_lint_resolution(&source, LINT),
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{name}` was stepped over as though it were whitespace"
+        );
+        // Never a level, under either spelling of a line ending.
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            assert_eq!(
+                crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                None,
+                "`{name}` reached a census as a level"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (4) Placement and offsets are preserved. The introducer parser moved,
+    // and everything computed from the `#` — the line number, inner vs outer,
+    // module-level vs not — must be exactly what it was.
+    // -----------------------------------------------------------------
+    for (tag, source, wants_line, wants_inner, wants_module_level) in [
+        (
+            "inner_module_level_after_a_doc_comment",
+            format!("//! docs\n\n# ! [allow({LINT})]\n{BODY}"),
+            3,
+            true,
+            true,
+        ),
+        (
+            "inner_module_level_after_another_attribute",
+            format!("#![deny(clippy::disallowed_types)]\n#!/* c */[allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+        (
+            "inner_after_an_item_is_not_module_level",
+            format!("{BODY}# ! [allow({LINT})]\n"),
+            2,
+            true,
+            false,
+        ),
+        (
+            "outer_on_a_module_is_module_level",
+            format!("#  [allow({LINT})]\nmod inner {{}}\n"),
+            1,
+            false,
+            true,
+        ),
+        (
+            "outer_on_a_function_is_not_module_level",
+            format!("#  [allow({LINT})]\npub fn reaches() {{}}\n"),
+            1,
+            false,
+            false,
+        ),
+        (
+            "separator_before_the_bracket_keeps_the_line",
+            format!("// one\n// two\n#\u{200E}!\u{200E}[allow({LINT})]\n{BODY}"),
+            3,
+            true,
+            true,
+        ),
+        // **The attribute BEFORE it is separated too.** Deciding module level
+        // means stepping over everything that precedes the attribute, so a
+        // reader that can classify a separated introducer but cannot skip one
+        // still gets this wrong -- and the wrong answer is `false`, which the
+        // placement census refuses on.
+        (
+            "after_a_separated_attribute",
+            format!("# ! [deny(clippy::disallowed_types)]\n#![allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+        (
+            "after_a_mark_separated_attribute",
+            format!(
+                "#\u{200E}!\u{200E}[deny(clippy::disallowed_types)]\n#![allow({LINT})]\n{BODY}"
+            ),
+            2,
+            true,
+            true,
+        ),
+        // The introducer spans lines, so the reported line is the `#`'s and not
+        // the bracket's. Two different numbers, and only one of them is where a
+        // reviewer will look.
+        (
+            "introducer_across_lines_reports_the_hash_line",
+            format!("//! docs\n#\n!\n[allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+    ] {
+        let found = governed_allows(&source);
+        assert_eq!(found.len(), 1, "`{tag}` was not found at all: {found:#?}");
+        assert_eq!(found[0].line, wants_line, "`{tag}` line");
+        assert_eq!(found[0].inner, wants_inner, "`{tag}` inner");
+        assert_eq!(
+            found[0].module_level, wants_module_level,
+            "`{tag}` module_level"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "`{tag}` lints");
+    }
+
+    // **A `#` that opens no attribute is not an attribute**, and getting that
+    // wrong is not merely a spurious row. `r#type` is a raw identifier -- its
+    // `#` is followed by an identifier rather than by `!` or `[` -- and an
+    // opener that accepted it would run on to the next bracket group in the
+    // file, which is the REAL attribute below: one finding at the wrong line,
+    // reported as not module-level, and the attribute that matters skipped
+    // entirely because the scan resumes past it.
+    let raw_identifier_then_attribute = format!(
+        "pub fn first() {{ let r#type = 1; let _ = r#type; }}\n         #[allow({LINT})]\n         mod inner {{}}\n"
+    );
+    let found = governed_allows(&raw_identifier_then_attribute);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        found[0].line, 2,
+        "the finding is not the real attribute: {found:#?}"
+    );
+    assert!(!found[0].inner, "{found:#?}");
+    assert!(
+        found[0].module_level,
+        "the real module-level attribute was lost to a `#` that opens nothing: {found:#?}"
+    );
+
+    // An outer separated introducer really does govern the module it precedes:
+    // the denied call inside builds clean under it, so `module_level` above is
+    // a claim about a live attribute rather than about a fixture.
+    let (built, _) = compile_prologue_probe(
+        &scratch,
+        "outer_split_governs_its_module",
+        &format!(
+            "#![deny({LINT})]\n#  [allow({LINT})]\nmod inner {{ {} }}\n",
+            BODY.trim()
+        ),
+    );
+    assert!(
+        built,
+        "a separated outer introducer did not govern its module, so the placement fixture above \
+         is not measuring an attribute"
+    );
+
+    // -----------------------------------------------------------------
+    // (5) Formatting is not a defence. `rustfmt` normalises both shapes away —
+    // and under a `rustfmt::skip`, which nothing in this repository forbids, it
+    // preserves them byte for byte. Run against the same binary `cargo fmt`
+    // uses, so this is what the gate actually does rather than a claim about it.
+    // -----------------------------------------------------------------
+    let formatted = |name: &str, text: &str| -> String {
+        let file = scratch.join(format!("{name}.rs"));
+        fs::write(&file, text).expect("the fixture");
+        let out = std::process::Command::new(rustfmt_binary())
+            .args(["--edition", "2024"])
+            .arg(&file)
+            .output()
+            .expect("rustfmt runs; the fmt gate uses the same binary");
+        assert!(out.status.success(), "rustfmt refused `{name}`");
+        fs::read_to_string(&file).expect("the formatted fixture")
+    };
+    for (name, shape) in [
+        (
+            "lrm",
+            format!("#![allow\u{200E}({LINT})]\npub fn go() {{}}\n"),
+        ),
+        ("split", format!("# ! [allow({LINT})]\npub fn go() {{}}\n")),
+    ] {
+        let plain = formatted(&format!("fmt_plain_{name}"), &shape);
+        assert_eq!(
+            plain,
+            format!("#![allow({LINT})]\npub fn go() {{}}\n"),
+            "`{name}` — rustfmt no longer normalises this shape, so section (5) is stale"
+        );
+        let skipped = format!("#![rustfmt::skip]\n{shape}");
+        assert_eq!(
+            formatted(&format!("fmt_skipped_{name}"), &skipped),
+            skipped,
+            "`{name}` — under `rustfmt::skip` the shape must survive formatting untouched; that \
+             is why the readers cannot lean on the fmt gate to remove it"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
     oracles::the_configured_item_is_removed_and_the_rest_kept();
