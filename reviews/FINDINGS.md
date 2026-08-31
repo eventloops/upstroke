@@ -3933,3 +3933,51 @@ exist, not about whether a run passed. A class leaves §4 by being guarded.
 does not touch it either.
 
 Companion record: `reviews/2026-08-31-g2-gate-report.md`, "The serialized gate run".
+
+## 37. 2026-08-31 G2 checkpoint — the public schema-4 write path, carried
+
+Append-only. This section adds **one carried row** to the ledger under the
+owner's binding amendment 1a of 2026-08-31
+(`decisions/2026-08-31-inertness-premise-behavioural.md`). It changes no
+disposition in §35 or §36 and repairs nothing.
+
+The row exists because the owner ruled that prose in a decision record is not
+enough: **the panel must find this triaged in the ledger rather than discover
+it.** It is a *carried* row, not a defect report — the behavioural inertness
+condition is satisfied at the candidate head, and this row records the exact
+shape of what inertness does **not** cover, so nobody later mistakes the
+premise for a stronger one.
+
+### The carried row
+
+| ID | What | Owner | Why it is open |
+|---|---|---|---|
+| `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | **A library consumer can durably write schema-4 state through the checked funnel, using public API only, with no write-side activation check.** The path is three explicit topology choices: construct `RunStarted4 { schema: TOPOLOGY_SCHEMA, … }` — **25 fields, all `pub`, no `#[non_exhaustive]`** (`src/topology/events.rs:600`); check it with `TopologyLine::round_trip` (`src/events/log.rs:1242`); open the funnel with `EventLog::open` (`:466`) and commit it with `append_topology(site_for(&body), …)` (`:796`, `:1064`). `append_topology` delegates straight to `append_topology_hooked` (`:809`) and applies no ceiling test; **`TOPOLOGY_ACTIVATION` and `MAX_READABLE_SCHEMA` appear nowhere in `src/events/log.rs`** — activation gates *reading* only. The resulting log is state the same binary's own resume refuses by name, `SchemaRefusal::TopologyLogUnreadable` (`src/topology/schema.rs:338`, raised at `:241`) | project owner — **the PR12 activation slice** | **Carried, not repaired, and the premise it qualifies is unchanged.** Inertness is *behavioural* and holds: production's only `run_started` mint stamps schema 3 (`src/engine/coordinator.rs:164`), no CLI arm reaches the topology coordinator (`engine::topology` is `pub(crate)`, `src/engine/mod.rs:61`), the read ceiling is 3 by four const assertions evaluated in the ordinary build (`src/topology/schema.rs:98-101`), and `check_upgrade_transition` refuses every path into schema 4. **What this row denies is the stronger guarantee, not the premise**: a released library cannot be prevented from *creating* a schema-4 log, and never could — the legacy funnel already accepts any `pub u32` in `RunStarted.schema` (`src/events/mod.rs:315`), and plain `std::fs` binds no downstream crate at all. Log bytes are untrusted input and the code has always treated them so. **Repairing this is out of scope for the promotion by owner ruling**: narrowing `src/topology/` to `pub(crate)` would break `EventSite` in public log signatures and the frozen `compile_fail` doctests pinned to their failure reasons, report the whole topology tree dead under `-D warnings`, and produce a new candidate head that re-runs the suite, the eight gate artifacts and the 66-unit coverage map — to buy a guarantee `std::fs` refutes. A write-side inactivity guard in `append_topology` would strengthen a guarantee beyond PR7's frozen packet, which is managed debt and not an in-slice repair |
+
+### Venue, trigger and required evidence
+
+Recorded in §35's carried-row form so the row is auditable the same way the
+other 52 are.
+
+| Field | Value |
+|---|---|
+| **Class** | V4 — a numbered future slice implementer |
+| **Venue / owner** | project owner — the **PR12 activation slice** |
+| **`shrinks_when`** | the activation slice lands, **or** a visibility narrowing is scheduled |
+| **Re-opening trigger** | PR12 opens, or any slice schedules a narrowing of `src/topology/**` or the event funnel's public surface |
+| **Required evidence for the repair** | a write-side refusal with a red-first witness **and** a killed mutation; **plus** an accounting of the legacy funnel's unvalidated `RunStarted.schema` field, because a guard on the schema-4 path alone leaves the schema-3 path accepting any `u32` and the guarantee would still not hold |
+
+### What this row does not do
+
+- It does **not** reopen the inertness condition of
+  `decisions/2026-08-25-checkpoint-merges.md`. That condition is behavioural and
+  is satisfied at `50ed8c86`.
+- It does **not** authorize a visibility change. The owner ruled explicitly that
+  no visibility change to the code is authorized in this promotion.
+- It does **not** change the §35 totals as they were audited. §35's 52 carried
+  rows are the normalization of §2 at the time of the audit; this is a
+  **53rd carried row**, opened after it by owner amendment, and is counted
+  separately rather than folded back into a table it was not part of.
+
+Companion records: `decisions/2026-08-31-inertness-premise-behavioural.md`,
+`reviews/2026-08-31-g2-gate-report.md` ("Inert by default" §4).

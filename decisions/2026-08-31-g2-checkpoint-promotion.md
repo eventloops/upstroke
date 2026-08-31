@@ -119,10 +119,40 @@ no suite result can supply it. This remains the blocking obligation.
 
 **Obligation 6 is strengthened, not re-derived.** The inertness proofs were
 structural — read from the tree, not run. A fresh compile necessarily evaluated
-the three compile-time schema assertions, and
+the four compile-time schema assertions, and
 `max_parallel_above_one_is_refused_rather_than_read_past` passed with the rest.
 The schema-4 **visibility** conflict recorded in the gate report stands
 unchanged: `src/lib.rs:49` is `pub mod topology;`, the surface is **not**
 `pub(crate)`, and the condition is met behaviourally rather than by visibility.
 
 Evidence: `reviews/2026-08-31-g2-gate-report.md`, "The serialized gate run".
+
+## Addendum, 2026-08-31 (second) — owner rulings 1 and 2
+
+Appended, not applied in place. Two owner rulings of 2026-08-31 land against
+this record and are recorded in their own files:
+
+- **`2026-08-31-inertness-premise-behavioural.md`** (ruling 1, ratified as
+  amended) formalizes obligation 6. The inertness premise is **behavioural** and
+  holds at `50ed8c86`; the visibility form of the claim is **retired as false**
+  and must not reappear in any rewritten evidence. Binding amendment 1b corrected
+  the gate report: a library consumer can **write** schema-4 durable state
+  through the checked funnel, not merely name the vocabulary. Binding amendment
+  1a carries that as `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` in `reviews/FINDINGS.md`
+  §37, owned by the project owner at the **PR12 activation slice**. **No
+  visibility change to the code is authorized in this promotion**; narrowing is
+  post-G2 managed debt. The addendum above stands, with its "three compile-time
+  schema assertions" corrected to **four** (`src/topology/schema.rs:98-101`).
+- **`2026-08-31-panel-seats.md`** (ruling 2, ratified as amended) fills
+  **obligation 4**, which was the blocking one. The panel is three seats — Sol
+  `gpt-5.6-sol` at `max`, `claude-fable-5` at `max` explicitly pinned, and
+  `gemini-3.1-pro-high` via `agy` by absolute path — each with a recorded
+  invocation guard. Binding amendment 2a withdraws every pre-authorized
+  fallback: **one repair attempt, then wait for the owner, and the panel does not
+  convene partially.**
+
+**Obligation 4 is now *defined*, not discharged.** The seats are ratified; no
+seat has run. The panel convenes only after this branch lands and the PR #18
+body is rewritten, on a stable exact head, and any head movement afterwards
+invalidates the seats that already ran. Nothing in this addendum makes the gate
+pass.

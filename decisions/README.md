@@ -92,3 +92,12 @@ artifacts (§15); records promoted here are the durable subset.
   verified by construction, no `0.2.0` tag is authorized, and rollback is
   `git revert -m 1 MERGE_OID` — deliberately a high bar, because re-promotion then
   requires reverting the revert.
+- [2026-08-31 — the inertness premise is behavioural](2026-08-31-inertness-premise-behavioural.md):
+  the G2 inertness condition is behavioural and holds at the candidate head; the
+  `pub(crate)` visibility form is retired as false and unachievable. A library consumer can
+  WRITE schema-4 state through the checked funnel, carried as a ledger row for the PR12
+  activation slice. No visibility change to the code is authorized.
+- [2026-08-31 — the G2 panel's three seats](2026-08-31-panel-seats.md): one seat per family —
+  `gpt-5.6-sol` at max, `claude-fable-5` at max explicitly pinned, `gemini-3.1-pro-high` via
+  `agy` by absolute path — each with its invocation guard. No pre-authorized fallback: one
+  repair, then wait; the panel never convenes partially.

@@ -27,6 +27,19 @@ run" section; the inertness proofs, the bridge evidence and the CI evidence are
 untouched. Nothing is removed, and no artifact is upgraded past what the
 executing tests substantiate.
 
+**Revision, 2026-08-31 (third).** The owner's ruling 1 of 2026-08-31
+(`decisions/2026-08-31-inertness-premise-behavioural.md`) found §4 below
+**understated**: it said a library consumer can *name* the schema-4 vocabulary,
+when in fact a consumer can **write** schema-4 durable state through the checked
+funnel, using public API only and with no write-side activation check. Binding
+amendment 1b corrects that sentence, and it is corrected in place here, recorded
+the same way the serialized-run revision above is recorded. The finding is also
+carried as a ledger row — `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED`,
+`reviews/FINDINGS.md` §37 — under binding amendment 1a. **The promotion premise
+does not move**: inertness is behavioural, it holds at this head, and no
+visibility change to the code is authorized. §3's const-assertion count is
+corrected from three to four in the same pass.
+
 ## Verdict
 
 **The G2 gate does not pass at this candidate.** The serialized suite has now
@@ -198,13 +211,18 @@ The refusal is total over the two-by-two, with no default arm.
 - `LATEST_LEGACY_SCHEMA = 3` (`:44`), `TOPOLOGY_SCHEMA = LATEST_LEGACY_SCHEMA + 1` (`:48`).
 - `TOPOLOGY_ACTIVATION: TopologyActivation = TopologyActivation::Inactive` (`:73`) — the single activation constant.
 - `MAX_READABLE_SCHEMA = max_readable_schema(TOPOLOGY_ACTIVATION)` (`:89`), which is `3` while activation is `Inactive`.
-- Three compile-time assertions pin it (`:99-101`): `MAX_READABLE_SCHEMA == LATEST_LEGACY_SCHEMA`, `MAX_READABLE_SCHEMA == 3`, `TOPOLOGY_SCHEMA == LATEST_LEGACY_SCHEMA + 1`. Flipping activation without revisiting them fails the build rather than shipping quietly.
+- **Four** compile-time assertions pin it (`:98-101`): `matches!(TOPOLOGY_ACTIVATION, TopologyActivation::Inactive)`, `MAX_READABLE_SCHEMA == LATEST_LEGACY_SCHEMA`, `MAX_READABLE_SCHEMA == 3`, and `TOPOLOGY_SCHEMA == LATEST_LEGACY_SCHEMA + 1`. They are evaluated in the ordinary build — the one `src/main.rs` links — so flipping activation without revisiting them fails the build rather than shipping quietly. *(Corrected from "three, `:99-101`" in the first revision of this report; the activation assertion at `:98` was missed.)*
 - `fresh_writer_schema(selector)` (`:128`) maps `WriterSelector::Production` to 3 and `WriterSelector::TopologyPreview` to 4.
 
 **`WriterSelector::TopologyPreview` has no construction site outside
 `src/topology/schema.rs`.** Every occurrence in the tree is that file's own
 definition, its match arm, or its own unit tests. `fresh_writer_schema` likewise
 has no caller outside that file. No shipped command reaches either.
+
+**The scope of this heading is exactly "shipped command".** It is not a claim
+that schema-4 state cannot be written at all: a *library consumer* can write it
+through the public funnel, which §4 states and `reviews/FINDINGS.md` §37 carries
+as `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED`. Read the two together.
 
 There is also **no migration into schema 4**: `check_upgrade_transition`
 (`src/topology/schema.rs:282`) returns `SchemaRefusal::NoUpgradePath` for any
@@ -220,13 +238,42 @@ is.** `src/lib.rs:49` is `pub mod topology;`, and `src/topology/mod.rs` declares
 `census`, `effects`, `events`, `fold`, `leases`, `paths`, `queue`, `registry`
 and `schema` as `pub mod`. `TOPOLOGY_SCHEMA`, `MAX_READABLE_SCHEMA`,
 `TOPOLOGY_ACTIVATION`, `WriterSelector` and `fresh_writer_schema` are all `pub`.
-A library consumer can name the schema-4 vocabulary.
+
+**A library consumer can do more than name the schema-4 vocabulary: it can
+durably WRITE schema-4 state through the checked funnel, using public API only,
+and no write-side activation check stands in the way.** The path is three
+explicit topology choices — construct `RunStarted4 { schema: TOPOLOGY_SCHEMA, … }`
+(25 fields, all `pub`, no `#[non_exhaustive]`, `src/topology/events.rs:600`),
+check it with `TopologyLine::round_trip` (`src/events/log.rs:1242`), then open
+the funnel with `EventLog::open` (`:466`) and commit with
+`append_topology(site_for(&body), …)` (`:796`, `:1064`). `append_topology`
+delegates straight to `append_topology_hooked` (`:809`) and applies no ceiling
+test; `TOPOLOGY_ACTIVATION` and `MAX_READABLE_SCHEMA` appear **nowhere** in
+`src/events/log.rs`. **Activation gates reading, not writing.** The log so
+produced is state this same binary's resume refuses by name,
+`SchemaRefusal::TopologyLogUnreadable`.
+
+*This sentence replaces "a library consumer can name the schema-4 vocabulary",
+which was understated. Owner ruling 1, binding amendment 1b, 2026-08-31. The
+finding is carried as `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` in
+`reviews/FINDINGS.md` §37.*
 
 What is true, and what the condition actually needs, is **behavioural
-inertness**: the vocabulary is reachable, and nothing the binary ships drives
-it. That is what §3 above establishes — activation `Inactive`, the read ceiling
-pinned to 3 by compile-time assertion, the only schema-4 writer selector
-unconstructed outside its own module, and every upgrade into schema 4 refused.
+inertness**: the machinery is reachable, and nothing the binary ships drives it.
+That is what §3 above establishes — activation `Inactive`, the read ceiling
+pinned to 3 by four compile-time assertions, the only schema-4 writer selector
+unconstructed outside its own module, production's sole `run_started` mint
+stamping schema 3 (`src/engine/coordinator.rs:164`), the topology coordinator
+`pub(crate)` with no non-test callers (`src/engine/mod.rs:61`), and every upgrade
+into schema 4 refused.
+
+**And the stronger guarantee is unachievable, not merely unmet.** Visibility
+cannot deliver it: the legacy funnel already accepts any `pub u32` in
+`RunStarted.schema` (`src/events/mod.rs:315`), and plain `std::fs` binds no
+downstream crate at all. Log bytes are untrusted input, and this code has always
+treated them so. The property the project actually builds and pins is *"a
+schema-4 log cannot get itself read"* — refused loudly, precisely, and without
+misfolding — and that property holds.
 
 Recording this as "the surface remains `pub(crate)`" would have been a false
 statement about the tree, and a later reader checking it would find `pub mod
@@ -313,3 +360,6 @@ purpose.
 - `decisions/2026-08-31-g2-checkpoint-promotion.md` — the obligation-by-obligation reconciliation
 - `reviews/2026-08-31-g2-first-parent-coverage.md` — the review coverage map for `76b6a784..50ed8c86`
 - `reviews/FINDINGS.md` §35 — the checkpoint full-ledger audit and the recurrence-class review
+- `reviews/FINDINGS.md` §37 — `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED`, the carried row for the public write path
+- `decisions/2026-08-31-inertness-premise-behavioural.md` — the ruling that corrected §4
+- `decisions/2026-08-31-panel-seats.md` — the three ratified panel seats
