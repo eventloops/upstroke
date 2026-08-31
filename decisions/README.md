@@ -84,3 +84,10 @@ artifacts (§15); records promoted here are the durable subset.
   feedback onto the durable record; the schema-4 brief becomes a fold over it,
   derived once and called by both the live loop and a replay. `SCHEMA_VERSION`
   unmoved. Class C exception to the 2026-08-20 freeze, scoped to that field.
+- [2026-08-31 — the G2 checkpoint promotion candidate](2026-08-31-g2-checkpoint-promotion.md):
+  reconciles `2026-08-25-checkpoint-merges.md` obligation by obligation and leaves it
+  controlling in full. The ledger audit and the recurrence review are discharged; the
+  panel, six of the eight gate artifacts, and the serialized suite are owed. Inertness is
+  verified by construction, no `0.2.0` tag is authorized, and rollback is
+  `git revert -m 1 MERGE_OID` — deliberately a high bar, because re-promotion then
+  requires reverting the revert.

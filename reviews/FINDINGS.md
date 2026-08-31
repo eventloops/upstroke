@@ -3629,3 +3629,258 @@ reopening the settled scratch-deletion authority or widening the three-file leas
 | ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
 |---|---|---|---|---|---|---|---|---|---|
 | PR78-EMIT-UNWIND-REPORT-ORACLE | P2 | 4099d57b24c8b7d2dd44aeb3e3b24272eacf1a9c / src/engine/topology/emit/tests.rs:2575 | external stderr reporting is removed -> the unwinding arm sets its own delivered record -> the in-process observer and no-observer witnesses still pass -> a failed scratch reclaim again loses its cleanup report while the evidence claims the reporter is fixed | introduced_by_feature | correctness | PR78-EMIT-UNWIND-REPORT-LOST / repair 02b64604477c28b3ce24ed86a53cc5c81b916960 | Fable repair 6a21786 moves delivery observation outside the process: rundir scratch-tree witnesses spawn the exact emit test, capture its real fd 2, assert one correctly shaped report, assert silence for a successful unwind reclaim, and on Linux route fd 2 to /dev/full to prove a real write failure is suppressed without replacing the original panic. Five destructive mutations, including removing the stderr write and removing the reporter call, each turn the assigned oracle red and are absent from the committed tree | fixed |
+
+## 35. 2026-08-31 G2 checkpoint — the full-ledger audit `decisions/2026-08-25-checkpoint-merges.md` ordered
+
+This append-only section is the **full-ledger audit** the checkpoint record
+requires before a candidate is cut. It rewrites no historical row and reopens no
+disposition. It is measured at candidate head
+`50ed8c86ec60164011bfd393066c4c3696d3865b`, and its rule is
+**latest-disposition-wins**: where a row in §2 has been repaired, closed or
+superseded by a later section, the later disposition is the live one and §2's
+text stands as history.
+
+The audit is mechanical. Row counts come from the file, not from a prior
+summary, and every count below is reproducible from `reviews/FINDINGS.md` at
+this head.
+
+### The recount, and one structural defect it found
+
+§2's table occupies lines 112–176 (line 136 is blank). That is **64 physical
+table lines** — but **65 logical rows**, because one line carries two.
+
+**Line 156 joins two ledger rows with `||`.** It holds
+`PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` and then, after a doubled pipe,
+`PR7-CANDIDATE-TREE-UNVERIFIED`. Split on `|`, that line has **11 fields where
+every other row in the table has 6**. The consequence is not cosmetic: in
+rendered Markdown a `||` produces an empty cell and the second row's content
+spills into the first row's columns, so **`PR7-CANDIDATE-TREE-UNVERIFIED` is
+invisible as a row to anyone reading the rendered ledger**, and any line-based
+count of §2 under-counts by exactly one.
+
+This is §4's own shape — a measurement present in the file that no reader is
+positioned to act on. It is recorded here rather than repaired in place, because
+this file is append-only whatever the width of the edit, and the same route
+§27 and §28 took. **The row's disposition is unaffected**: its own text carries
+`FIXED 2026-08-26`, and it is dispositioned as repaired below.
+
+### The normalized totals
+
+| Bucket | Rows |
+|---|---:|
+| §2 logical rows | **65** |
+| — struck in place (withdrawn, historical) | 2 |
+| **Live rows carried into this audit** | **63** |
+| — **repaired**, by a later disposition | 8 |
+| — **closed, not owed** | 3 |
+| — **carried**, with a named venue, a re-opening trigger and required evidence | 52 |
+
+8 + 3 + 52 = 63. **Every live row lands in exactly one bucket**, which is the
+condition the checkpoint record states.
+
+The two struck rows are `~~PR4-MAIN-WIRING-UNWITNESSED~~` (line 134, deferral
+withdrawn as invalid, repaired in round 8) and
+`~~PR5-R1-PROCESS-START-CENSUS-UNSTRIPPED~~` (line 138, closed by PR7's census
+repair). They are already withdrawn in place and are not re-dispositioned here.
+
+### Repaired — 8 rows whose §2 text is now history
+
+| ID | Where the repair is recorded | What discharges it |
+|---|---|---|
+| `PR5-MACOS-CLIPPY-NEVER-RUN` | §3, 2026-08-28, "fired, and is REPAIRED" | Verified live at this head: `.github/workflows/ci.yml:113` defines `lint (macos)`, and it is wired into the aggregate in all three places — `merge-gate.needs` (`:152`), `LINT_MACOS_RESULT` (`:161`), and the loop that decides the aggregate's exit |
+| `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` | Its own §2 owner cell reads **fixed in PR7** | Warm-up probe discarded, median of the next three, premise asserted, bounded single retry. Ten consecutive guest runs green |
+| `PR7-CANDIDATE-TREE-UNVERIFIED` | In-row, `FIXED 2026-08-26`; per-instance Class B approval in §3 | `PreparedCandidate` retains `tree_sha`; `verify_object` compares the commit's tree against it; a same-parent different-tree commit is refused by a dedicated witness. **This is the row hidden by the `||` join above** |
+| `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` | In-row, `FIXED 2026-08-26, measured at bd3b9cd`; §22b; `decisions/2026-08-26-durable-retry-feedback.md` | `FailureRecord` carries `detail`; the brief is derived from the log by `Brief::replay`. Four witnesses, each with a mutation that kills it and leaves the others green |
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | §26, implementation-fixed at `185e392` | Dispatch validation derives the predicted region from the frozen fold state and refuses a divergent event-carried region |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | §26, implementation-fixed at `c0ec940` | Candidate success is judged against the task's frozen review plan; a partial or empty recorded pass set cannot satisfy the door |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | §26, implementation-fixed at `46780ea`, review repair `d895dd5` | The retained arm validates record/envelope identity and refuses a record whose public predicate says successful |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | §26, implementation-fixed at `6c6cb3d`, review repair `d895dd5` | Probe registration authority is structural and accounted; the execution seam is sealed and P4 verifies the granted capability recorded each probe |
+
+#### The W1 double-count, reconciled explicitly
+
+Four rows appear **twice** in this file with opposite dispositions, and a naive
+count of open rows counts each of them twice:
+
+| ID | §2 (early) | §26 (later) |
+|---|---|---|
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | line 155 — "Recorded, not repaired" | line 3473 — implementation-fixed at `185e392` |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | line 160 — "Recorded, not repaired" | line 3474 — implementation-fixed at `c0ec940` |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | line 161 — "Recorded, not repaired" | line 3475 — implementation-fixed at `46780ea` |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | line 162 — "Recorded, not repaired" | line 3476 — implementation-fixed at `6c6cb3d` |
+
+**§26's disposition is the live one for all four.** The §2 text stands as the
+record of why each was recorded rather than repaired at the time — the
+`src/topology/**` closure of the 2026-08-24 adjudication, and round 6's stop
+condition — and it is correct history. It is not an open obligation, and the
+audit counts each of these rows once, as repaired.
+
+The residual §22e entries for the same three W1 rows (lines 3268–3270) describe
+the repair *shape* that was then implemented in §26. They are superseded by
+§26 and are likewise not counted as open.
+
+### Closed, not owed — 3 rows
+
+The `PR4-PROGRAM-PATH-NOT-UNICODE` family is three §2 rows because each closure
+and narrowing was **appended as a new row** rather than moving the old one, which
+is this file's rule. All three are closed.
+
+| ID | Rationale |
+|---|---|
+| `PR4-PROGRAM-PATH-NOT-UNICODE` | Closed as **not reproducible in production** by `decisions/2026-08-25-commandspec-program-stays-string.md`. Every production route puts a bare CLI name in `CommandSpec.program`; `DESIGN.md:222` is unchanged and the W4 widening is withdrawn |
+| `PR4-PROGRAM-PATH-NOT-UNICODE-CLOSED` | "Closed, not repaired: there is nothing to repair." `Invocation::at`, the only constructor taking a path, is `#[cfg(test)]` and both call sites are in test modules; `Invocation::named` takes a `&str`, so `to_str()` cannot return `None` for anything production builds |
+| `PR4-PROGRAM-PATH-NOT-UNICODE-CLOSED-NARROWED` | Owner disposition 2026-08-29: the final narrowing had reached the decision record, its index entry and the pass proposal but not this file. "Closed by this row"; it is this row's scope statement that binds |
+
+**A note the count depends on:** these three are one finding, recorded three
+times. Read as three open rows they overstate the ledger's debt by two.
+
+### Carried — 52 rows, each with a venue, a trigger and required evidence
+
+Every carried row already names an owner in §2; none is ownerless. What this
+audit adds is a **venue class** with an explicit re-opening trigger and the
+evidence a repair must produce, so a row cannot be deferred to nobody — the
+failure `PR5-MACOS-CLIPPY-NEVER-RUN` was reopened for.
+
+| Class | Venue / owner | `shrinks_when` | Re-opening trigger | Required evidence for the repair |
+|---|---|---|---|---|
+| **V1** | The G2 PR3-layer pass | the pass lands and `src/topology/**` reopens under a Class-B approval | the G2 pass opens `src/topology/**` | a fold-side refusal with a red-first witness **and** a mutation the witness kills, both halves recorded |
+| **V2** | The project owner, for the G2 erratum list or a ruling | the owner writes the erratum clause or rules the question | the owner takes up the erratum list | the packet clause the ruling amends, quoted in the record, **plus** a test pinning the ruled behaviour |
+| **V3** | A file- or behaviour-triggered successor slice — the owner clause names the path *and the change*, not merely opening the file | the named slice changes the named path or behaviour | a slice changes that path/behaviour; **incidental contact does not fire it** (the clause restated 2026-08-27 for `PR5-RD-002`) | a red-first witness on the named path, a killed mutation, and — for the platform rows — a reproduction on the platform that failed, never a Linux-only green |
+| **V4** | A numbered future slice implementer (PR8, PR6/PR7, PR7–PR11, …) | that slice opens | the named slice opens | the slice's own per-head ceremony, with the row named in its ledger |
+| **V5** | The project owner, undirected | the owner rules | an owner ruling, or new evidence admissible under §"The authority rule" | a concrete failure sequence **and** a surviving mutation, as §"The authority rule" requires of any challenge |
+| **V6** | The post-v0.2 pass over PR3's layer | v0.2 completes and the pass opens | the post-v0.2 pass opens | as V1 |
+
+**The bar for every class is the same in one respect**: a deferral by the named
+owner, to nobody, is not a disposition. If a trigger fires and the owner declines,
+the decline is recorded as a new row with a **new** named successor — never as
+silence.
+
+The 52 rows, with their class and the owner text §2 gives them:
+
+| ID | Class | Venue / owner as recorded in §2 |
+|---|:---:|---|
+| `PR5-VERIFY-CLAUSE-NARROWER-THAN-STATED` | V2 | project owner — for the G2 erratum list |
+| `PR3-ATTEMPT-SHAPE` | V5 | project owner |
+| `PR5-ANSWER-MODULE-COLUMN` | V3 | PR6/PR7 implementer (the slice that next opens src/topology/effects.rs) |
+| `PR3-RUNNER-DIGEST` | V5 | project owner |
+| `PR3-REG-001-CONDITIONAL` | V4 | PR4-PR10 implementer |
+| `PR3-BEFORE-PHASE-SCOPE` | V4 | PR7–PR10 implementer |
+| `PR3-COMMIT-AUTHORSHIP` | V5 | project owner |
+| `PR3-CONTAINER-START-ROW` | V4 | PR6/PR7 implementer |
+| `PR3-FRAMEWORK-SILENT-1` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-2` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-3` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-4` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-5` | V4 | PR7–PR10 implementer |
+| `PR3-REPORT-DOUBLE-NAME` | V5 | project owner |
+| `PR4-SPAWN-SITE-PROBE-CONTEXT` | V4 | PR6/PR7 implementer |
+| `PR4-REG-001-STILL-EQUIVALENT` | V4 | PR4–PR10 implementer |
+| `PR4-R28-NEXT-COORDINATOR-UNWITNESSED` | V3 | PR5–PR7 implementer (the slice that owns rundir) |
+| `PR4-DESIGN-ROLE-SCOPED-ENV` | V5 | project owner |
+| `PR4-ADAPTER-RESOLVES-ON-THE-HOST` | V4 | PR6 implementer |
+| `PR5-CAPACITY-NOT-A-TOPOLOGY-RESOURCE` | V5 | project owner |
+| `PR5-C-FSYNC-UNOBSERVABLE` | V3 | PR7–PR11 implementer (the slice that owns the two-crash proof) |
+| `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN *(re-scoped: externally_reachable_fns only)*` | V3 | PR7+ implementer (the slice that owns effects::externally_reachable_fns) |
+| `PR5-C-LEGACY-APPEND-ERROR-CENSUS` | V3 | PR7 implementer, or whichever lane plumbs an observer through engine::Harness |
+| `PR5-R2-WIN-NON-SURROGATE-REPARSE` | V3 | PR6/PR7 implementer (the slice that next owns Windows containment) |
+| `PR5-R2-SNAPSHOT-INPUT-COMMIT-DEAD` | V3 | PR6/PR7 implementer (the slice that first requests two snapshots) |
+| `PR5-R2-IDUNREAD-BEFORE-THE-PARSE` | V4 | PR6/PR7 implementer |
+| `PR5-R2-WORKTREE-LOCK-RETENTION` | V3 | PR6/PR7 implementer (the slice that can pause a run) |
+| `PR5-R2-LEGACY-ENGINE-APPEND-FAILURE` | V3 | PR7 implementer, or whichever lane plumbs an observer through engine::Harness |
+| `PR5-R2-OBJECT-GROUP-TAKES-NO-SITE` | V5 | project owner |
+| `PR7-WRAPPERS-EMPTY-DOMAIN` | V6 | project owner — the post-v0.2 pass over PR3's layer |
+| `PR7-NARROWED-SURFACE-19-UNCALLED` | V3 | PR8/PR12, or whichever slice next opens these modules |
+| `PR7-MACOS-PROCESS-GROUP-FLAKE` | V3 | project owner / whichever slice next opens src/runner/host.rs |
+| `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` | V3 | PR6's owner, or whichever slice next opens the Container funnel — read_racing arrived in 9 |
+| `PR7-SCRATCH-FIXTURE-LEAK` | V3 | project owner / whichever slice owns shared test infrastructure |
+| `PR7-P3A-CREATOR-RETAINS` | V4 | PR7/PR12 implementer |
+| `PR7-CREATEINTEGRATION-ORDER-BACKWARDS` | V6 | project owner — the post-v0.2 pass over PR3's layer |
+| `PR7-FOLD-ACCESSORS-IN-PR3-LAYER` | V1 | project owner — adjudicated 2026-08-24, see §3; the deferred work is the G2 PR3-layer pas |
+| `PR7-STEP-D-LINEAGE-ARM-UNWITNESSED` | V3 | PR8 implementer (the slice that gives the merge queue a repair to spawn) |
+| `R3-SEAMS-006-ATT003-REPAIRED-POSTHOC` | V2 | project owner, if the residual is worth a row of its own |
+| `PR7-R4-CLAIMS-UNVERIFIED` | V2 | project owner — the claims protocol a fresh session carries |
+| `PR40-PROGRAM-PUBLIC-ADAPTER-SEAM` | V2 | project owner, carried by G2 W4 |
+| `PR40-CHARTER-BINDS-A-PROPOSAL` | V2 | project owner, carried by the documentation-authority pass |
+| `PR7-STD-PRIVATE-ROOT-LEXICAL-COMPARE` | V5 | project owner |
+| `PR7-STD-OWNER-RECORD-LEXICAL-AUTH` | V5 | project owner |
+| `PR7-STD-PRIVATE-ROOT-NO-CONTAINMENT` | V5 | project owner |
+| `PR7-STD-QUESTION-PAYLOAD-COMPONENT` | V5 | project owner |
+| `PR7-STD-ANSWER-STAGING-COMPONENT` | V5 | project owner |
+| `PR7-STD-OWNERSHIP-PROOF-UNCANONICAL` | V5 | project owner |
+| `PR7-STD-CONTAINER-LEXICAL-CONFINEMENT` | V5 | project owner |
+| `PR7-STD-CONTAINER-EXEC-UNBOUNDED` | V5 | project owner |
+| `PR43-MACOS-PROC-SIGNAL-FINGERPRINT` | V3 | project owner / the slice that next opens src/agent/proc.rs, once a controlled macOS environ |
+| `PR43-WINDOWS-TOPOLOGY-KILL-FINGERPRINT` | V3 | project owner / the slice that next opens the Windows topology kill harness |
+
+### Recurrence classes — §4 reviewed at the same sitting
+
+The checkpoint record requires §4's recurrence classes to be reviewed for
+structural guards at the same sitting as the ledger audit. §4 carries **18
+classes**. Each is given a guard verdict below:
+
+- **mechanical** — a named artifact in this tree fails if the class recurs;
+- **partial** — a mechanism catches part of the class, and the uncovered part is named;
+- **convention** — a written rule with no mechanical enforcement.
+
+| # | Class | Occurrences | Guard | The guard, or what is missing |
+|---:|---|---|:---:|---|
+| 1 | A surviving mutation named in a round's own prose and carried nowhere durable | 2 | convention | §4's own adopted rule: a round that names a surviving mutation and does not repair it appends it to §2 **in the same commit**, and a deferral must quote the passage that makes it out of scope. Nothing enforces this but a reader |
+| 2 | A boundary drawn narrower than the packet's sentence | 2 | convention | This file's "boundary rule" preamble |
+| 3 | A fix that introduced a new defect | 5 | partial | Repair rounds now require a red-first witness and a killed mutation per repair, which catches the introduced defect **when the repair is witnessed**. It does not catch a defect introduced outside the witnessed seam — which is how three of the five arrived |
+| 4 | Tests satisfied by a correlated field rather than the named one | 11 (PR2) + 11 (PR3/A1) + 2 (PR4) | partial | Withheld mutation catalogues, measured per slice. A catalogue is a measurement taken at a head, not a standing gate; a green suite proves tests pass, not that they still detect |
+| 5 | A guarantee proved for the variant that was looked at | 4 | convention | Totality by exhaustive match is the house style; no artifact requires it |
+| 6 | The thing that was supposed to prove it never ran | 2 | partial | `test-docs-consistency.sh` C3 pins the set of `.github/scripts/test-*.sh` files **equal** to the set the CI lint job invokes, both directions, which closes the shell-gate half. The `compile_fail` fixture half — a fixture no command executes — has no equivalent |
+| 7 | A source census fooled by a comment | 5 | mechanical | `every_production_process_start_is_classified` (`src/runner/mod.rs:1540`) and `every_production_runner_request_is_built_by_its_roles_builder` (`:1463`); and §27's replacement of substring matching with a YAML-1.2 structural oracle, `the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string` (`src/effects/tests.rs:1513`) and `the_workflow_shape_oracle_refuses_every_escape_the_ledger_names` (`:1563`) |
+| 8 | An enforcement artifact no gate validates | 2 | mechanical | `every_allowlist_entry_carries_its_justification_and_names_a_real_file` (`src/effects/tests.rs:898`) and `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` (`:507`) |
+| 9 | An element of a packet-named sequence with no implementation at all | 2 | convention | Sequence coverage is read, not gated |
+| 10 | `git checkout <path>` discarding uncommitted work while mutation-testing | 2 | convention | A session hazard. The standing mitigation is to restore from a disposable copy, never the live worktree |
+| 11 | An item inserted into a file re-targeting the doc comment above it | 11 at `51cfc01`, derived not maintained | convention | Found by derivation at one head; nothing maintains it |
+| 12 | A mutation whose anchor `cargo fmt` had moved, reported as a surviving mutation | 2 | convention | Pre-flight the anchors on a disposable copy before the measuring run, which is fail-fast |
+| 13 | An accumulator's witness proves the accumulation and not the read | 4 | convention | The rule is to assert the value the event carries, not the accumulator's reset |
+| 14 | A function used as its own expected-value oracle | 5 (PR3/A1) | convention | — |
+| 15 | A grid bounded short of its required domain | 8 (PR3/A1) | convention | — |
+| 16 | Omitted packet-required fields | 7 (PR3/A1) | convention | — |
+| 17 | A refutation that inspected the wrong item of that name | 1 | convention | Below the two-occurrence threshold §4 sets for a signal about the method; carried because it is recorded |
+| 18 | A command quoted as evidence becomes part of its own input | 4 | convention | All four introduced by the claims-protocol commits of 2026-08-26 |
+
+**Status, stated plainly: 2 of 18 classes are mechanically guarded, 3 are
+partially guarded, and 13 rest on convention.** That is the honest shape of the
+recurrence defence at this candidate, and it is the number a panel should weigh
+rather than the count of classes alone. The two mechanical guards are both in
+the effects/census layer, which is the layer that has had the most recurrence
+pressure — the guards followed the failures, which is the right order, but it
+means the eleven classes with no mechanical guard are the ones that have not yet
+cost enough to earn one.
+
+**No class is closed by this audit.** §4 is a watch list; a class leaves it by
+being guarded, not by being reviewed.
+
+### Reconciliation against the P1A ledger input
+
+The P1A read-only pass reported **64** early §2 rows, **2** struck, and **four**
+stale W1 rows later fixed. Re-derived at `50ed8c86`:
+
+| Quantity | P1A | This audit | Why they differ |
+|---|---:|---:|---|
+| §2 rows | 64 | **65** | P1A counted physical table lines. Line 156 carries two logical rows joined by `||`; the second, `PR7-CANDIDATE-TREE-UNVERIFIED`, is invisible to a line-based count and to a rendered read |
+| Struck rows | 2 | 2 | agrees |
+| Rows whose live disposition is *repaired* | 4 | **8** | P1A named the four W1 rows of §26. Four more carry a terminal disposition elsewhere: `PR5-MACOS-CLIPPY-NEVER-RUN` (§3), `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` (own owner cell), `PR7-CANDIDATE-TREE-UNVERIFIED` (in-row) and `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` (in-row, §22b) |
+| Rows closed, not owed | — | 3 | the `PR4-PROGRAM-PATH-NOT-UNICODE` family, one finding recorded three times |
+| Rows genuinely carried | — | **52** | 65 − 2 struck − 8 repaired − 3 closed |
+
+P1A's figures were correct for what they measured; the deltas are what a
+mechanical re-derivation at the candidate head adds, and both are recorded so
+neither has to be taken on trust.
+
+### What this audit does not do
+
+- It does **not** attest. The three-model panel is a separate obligation
+  (`decisions/2026-08-25-checkpoint-merges.md`), untouched by this section.
+- It does **not** run the suite. No claim here depends on a test result produced
+  during assembly.
+- It does **not** reopen any disposition, and it edits no historical row. The
+  `||` defect on line 156 is recorded, not repaired, for exactly that reason.
+- It does **not** claim a reviewer reread the candidate diff.
+
+Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md`,
+`reviews/2026-08-31-g2-gate-report.md`,
+`reviews/2026-08-31-g2-first-parent-coverage.md`.
