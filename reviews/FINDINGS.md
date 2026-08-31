@@ -3563,3 +3563,24 @@ The exact implementation full suite ran through the globally serialized build wr
 library 1,787 passed with 34 ignored, CLI 8 passed, and the example target had no
 tests. The fresh exact-head independent review and hosted checks remain required;
 this section grants neither review nor merge authority.
+
+## 31. 2026-08-31 PR #77 exact-head review — bounded scratch-authority repair
+
+This append-only section records the sole independent review of exact head
+`7db77d92a7bc7a9d80bea788453acfbf90a0eaa3` and the same-implementor bounded
+repair at `aa7a8ff6cf4d31bf76827a2048a504c0693e3269`. It does not rewrite the
+slice-1 dispositions in section 30. The earlier Windows gate failure and these
+review findings belong to the same reviewed implementation lineage and count as
+one unsuccessful exact-head attempt under the standing convergence policy.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR77-SCRATCH-UNWIND-REPORT-PANICS | P2 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / src/rundir.rs:3159 | an original panic unwinds through the scratch guard -> reclaim fails -> the unwind arm invokes an infallible-printing macro -> stderr reporting fails and panics -> the destructor double-panics and aborts, losing the original diagnosis | introduced_by_feature | correctness | 24830622530ae3998771dcebc39d51811730af2e / PR64-CLEANUP-003-RECLAIM-SILENCE | Repair aa7a8ff uses a fallible reporter whose result is explicitly matched; a deterministic reporter-failure witness proves simultaneous reclaim and report failure remains suppressed during unwind, while the non-unwinding reclaim failure still panics | fixed |
+| PR77-SCRATCH-ULID-WITNESS-ABSENT | P2 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / src/rundir.rs:2991 | ULID generation is replaced by a process ID or constant -> existing fixtures use distinct tags or bypass public naming -> all prior witnesses remain green -> two acquisitions for the same tag can collide instead of producing fresh roots | introduced_by_feature | correctness | 24830622530ae3998771dcebc39d51811730af2e | Repair aa7a8ff adds a same-parent, same-tag witness that requires distinct roots and ULID-shaped basenames; the PID and constant destructive mutations fail only this new witness, proving it closes the prior evidence gap | fixed |
+| PR77-DECISION-EFFECT-SITES-PATH | P3 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / decisions/2026-08-30-test-scratch-tree-ownership.md:14 | the decision cites effects/effect_sites.json -> that tracked path does not exist -> a maintainer cannot follow the claimed unchanged-inventory evidence to its authority file | introduced_by_feature | docs-contract | 24830622530ae3998771dcebc39d51811730af2e | Repair aa7a8ff corrects both references to the tracked root-level effect_sites.json; the artifact blob and its 70-total/14-RunDir census remain unchanged from the base | fixed |
+
+The review explicitly preserved the owner-deferred
+`PR64-CLEANUP-003-SCRATCH-PRECLEAN` slice-2 migration as non-blocking residue.
+The repaired exact head still requires the globally serialized full suite, fresh
+exact-head review, and hosted gates; this ledger append grants neither review nor
+merge authority.
