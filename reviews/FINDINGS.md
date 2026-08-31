@@ -3629,3 +3629,647 @@ reopening the settled scratch-deletion authority or widening the three-file leas
 | ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
 |---|---|---|---|---|---|---|---|---|---|
 | PR78-EMIT-UNWIND-REPORT-ORACLE | P2 | 4099d57b24c8b7d2dd44aeb3e3b24272eacf1a9c / src/engine/topology/emit/tests.rs:2575 | external stderr reporting is removed -> the unwinding arm sets its own delivered record -> the in-process observer and no-observer witnesses still pass -> a failed scratch reclaim again loses its cleanup report while the evidence claims the reporter is fixed | introduced_by_feature | correctness | PR78-EMIT-UNWIND-REPORT-LOST / repair 02b64604477c28b3ce24ed86a53cc5c81b916960 | Fable repair 6a21786 moves delivery observation outside the process: rundir scratch-tree witnesses spawn the exact emit test, capture its real fd 2, assert one correctly shaped report, assert silence for a successful unwind reclaim, and on Linux route fd 2 to /dev/full to prove a real write failure is suppressed without replacing the original panic. Five destructive mutations, including removing the stderr write and removing the reporter call, each turn the assigned oracle red and are absent from the committed tree | fixed |
+
+## 35. 2026-08-31 G2 checkpoint — the full-ledger audit `decisions/2026-08-25-checkpoint-merges.md` ordered
+
+This append-only section is the **full-ledger audit** the checkpoint record
+requires before a candidate is cut. It rewrites no historical row and reopens no
+disposition. It is measured at candidate head
+`50ed8c86ec60164011bfd393066c4c3696d3865b`, and its rule is
+**latest-disposition-wins**: where a row in §2 has been repaired, closed or
+superseded by a later section, the later disposition is the live one and §2's
+text stands as history.
+
+The audit is mechanical. Row counts come from the file, not from a prior
+summary, and every count below is reproducible from `reviews/FINDINGS.md` at
+this head.
+
+### The recount, and one structural defect it found
+
+§2's table occupies lines 112–176 (line 136 is blank). That is **64 physical
+table lines** — but **65 logical rows**, because one line carries two.
+
+**Line 156 joins two ledger rows with `||`.** It holds
+`PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` and then, after a doubled pipe,
+`PR7-CANDIDATE-TREE-UNVERIFIED`. Split on `|`, that line has **11 fields where
+every other row in the table has 6**. The consequence is not cosmetic: in
+rendered Markdown a `||` produces an empty cell and the second row's content
+spills into the first row's columns, so **`PR7-CANDIDATE-TREE-UNVERIFIED` is
+invisible as a row to anyone reading the rendered ledger**, and any line-based
+count of §2 under-counts by exactly one.
+
+This is §4's own shape — a measurement present in the file that no reader is
+positioned to act on. It is recorded here rather than repaired in place, because
+this file is append-only whatever the width of the edit, and the same route
+§27 and §28 took. **The row's disposition is unaffected**: its own text carries
+`FIXED 2026-08-26`, and it is dispositioned as repaired below.
+
+### The normalized totals
+
+| Bucket | Rows |
+|---|---:|
+| §2 logical rows | **65** |
+| — struck in place (withdrawn, historical) | 2 |
+| **Live rows carried into this audit** | **63** |
+| — **repaired**, by a later disposition | 8 |
+| — **closed, not owed** | 3 |
+| — **carried**, with a named venue, a re-opening trigger and required evidence | 52 |
+
+8 + 3 + 52 = 63. **Every live row lands in exactly one bucket**, which is the
+condition the checkpoint record states.
+
+The two struck rows are `~~PR4-MAIN-WIRING-UNWITNESSED~~` (line 134, deferral
+withdrawn as invalid, repaired in round 8) and
+`~~PR5-R1-PROCESS-START-CENSUS-UNSTRIPPED~~` (line 138, closed by PR7's census
+repair). They are already withdrawn in place and are not re-dispositioned here.
+
+### Repaired — 8 rows whose §2 text is now history
+
+| ID | Where the repair is recorded | What discharges it |
+|---|---|---|
+| `PR5-MACOS-CLIPPY-NEVER-RUN` | §3, 2026-08-28, "fired, and is REPAIRED" | Verified live at this head: `.github/workflows/ci.yml:113` defines `lint (macos)`, and it is wired into the aggregate in all three places — `merge-gate.needs` (`:152`), `LINT_MACOS_RESULT` (`:161`), and the loop that decides the aggregate's exit |
+| `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` | Its own §2 owner cell reads **fixed in PR7** | Warm-up probe discarded, median of the next three, premise asserted, bounded single retry. Ten consecutive guest runs green |
+| `PR7-CANDIDATE-TREE-UNVERIFIED` | In-row, `FIXED 2026-08-26`; per-instance Class B approval in §3 | `PreparedCandidate` retains `tree_sha`; `verify_object` compares the commit's tree against it; a same-parent different-tree commit is refused by a dedicated witness. **This is the row hidden by the `||` join above** |
+| `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` | In-row, `FIXED 2026-08-26, measured at bd3b9cd`; §22b; `decisions/2026-08-26-durable-retry-feedback.md` | `FailureRecord` carries `detail`; the brief is derived from the log by `Brief::replay`. Four witnesses, each with a mutation that kills it and leaves the others green |
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | §26, implementation-fixed at `185e392` | Dispatch validation derives the predicted region from the frozen fold state and refuses a divergent event-carried region |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | §26, implementation-fixed at `c0ec940` | Candidate success is judged against the task's frozen review plan; a partial or empty recorded pass set cannot satisfy the door |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | §26, implementation-fixed at `46780ea`, review repair `d895dd5` | The retained arm validates record/envelope identity and refuses a record whose public predicate says successful |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | §26, implementation-fixed at `6c6cb3d`, review repair `d895dd5` | Probe registration authority is structural and accounted; the execution seam is sealed and P4 verifies the granted capability recorded each probe |
+
+#### The W1 double-count, reconciled explicitly
+
+Four rows appear **twice** in this file with opposite dispositions, and a naive
+count of open rows counts each of them twice:
+
+| ID | §2 (early) | §26 (later) |
+|---|---|---|
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | line 155 — "Recorded, not repaired" | line 3473 — implementation-fixed at `185e392` |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | line 160 — "Recorded, not repaired" | line 3474 — implementation-fixed at `c0ec940` |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | line 161 — "Recorded, not repaired" | line 3475 — implementation-fixed at `46780ea` |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | line 162 — "Recorded, not repaired" | line 3476 — implementation-fixed at `6c6cb3d` |
+
+**§26's disposition is the live one for all four.** The §2 text stands as the
+record of why each was recorded rather than repaired at the time — the
+`src/topology/**` closure of the 2026-08-24 adjudication, and round 6's stop
+condition — and it is correct history. It is not an open obligation, and the
+audit counts each of these rows once, as repaired.
+
+The residual §22e entries for the same three W1 rows (lines 3268–3270) describe
+the repair *shape* that was then implemented in §26. They are superseded by
+§26 and are likewise not counted as open.
+
+### Closed, not owed — 3 rows
+
+The `PR4-PROGRAM-PATH-NOT-UNICODE` family is three §2 rows because each closure
+and narrowing was **appended as a new row** rather than moving the old one, which
+is this file's rule. All three are closed.
+
+| ID | Rationale |
+|---|---|
+| `PR4-PROGRAM-PATH-NOT-UNICODE` | Closed as **not reproducible in production** by `decisions/2026-08-25-commandspec-program-stays-string.md`. Every production route puts a bare CLI name in `CommandSpec.program`; `DESIGN.md:222` is unchanged and the W4 widening is withdrawn |
+| `PR4-PROGRAM-PATH-NOT-UNICODE-CLOSED` | "Closed, not repaired: there is nothing to repair." `Invocation::at`, the only constructor taking a path, is `#[cfg(test)]` and both call sites are in test modules; `Invocation::named` takes a `&str`, so `to_str()` cannot return `None` for anything production builds |
+| `PR4-PROGRAM-PATH-NOT-UNICODE-CLOSED-NARROWED` | Owner disposition 2026-08-29: the final narrowing had reached the decision record, its index entry and the pass proposal but not this file. "Closed by this row"; it is this row's scope statement that binds |
+
+**A note the count depends on:** these three are one finding, recorded three
+times. Read as three open rows they overstate the ledger's debt by two.
+
+### Carried — 52 rows, each with a venue, a trigger and required evidence
+
+Every carried row already names an owner in §2; none is ownerless. What this
+audit adds is a **venue class** with an explicit re-opening trigger and the
+evidence a repair must produce, so a row cannot be deferred to nobody — the
+failure `PR5-MACOS-CLIPPY-NEVER-RUN` was reopened for.
+
+| Class | Venue / owner | `shrinks_when` | Re-opening trigger | Required evidence for the repair |
+|---|---|---|---|---|
+| **V1** | The G2 PR3-layer pass | the pass lands and `src/topology/**` reopens under a Class-B approval | the G2 pass opens `src/topology/**` | a fold-side refusal with a red-first witness **and** a mutation the witness kills, both halves recorded |
+| **V2** | The project owner, for the G2 erratum list or a ruling | the owner writes the erratum clause or rules the question | the owner takes up the erratum list | the packet clause the ruling amends, quoted in the record, **plus** a test pinning the ruled behaviour |
+| **V3** | A file- or behaviour-triggered successor slice — the owner clause names the path *and the change*, not merely opening the file | the named slice changes the named path or behaviour | a slice changes that path/behaviour; **incidental contact does not fire it** (the clause restated 2026-08-27 for `PR5-RD-002`) | a red-first witness on the named path, a killed mutation, and — for the platform rows — a reproduction on the platform that failed, never a Linux-only green |
+| **V4** | A numbered future slice implementer (PR8, PR6/PR7, PR7–PR11, …) | that slice opens | the named slice opens | the slice's own per-head ceremony, with the row named in its ledger |
+| **V5** | The project owner, undirected | the owner rules | an owner ruling, or new evidence admissible under §"The authority rule" | a concrete failure sequence **and** a surviving mutation, as §"The authority rule" requires of any challenge |
+| **V6** | The post-v0.2 pass over PR3's layer | v0.2 completes and the pass opens | the post-v0.2 pass opens | as V1 |
+
+**The bar for every class is the same in one respect**: a deferral by the named
+owner, to nobody, is not a disposition. If a trigger fires and the owner declines,
+the decline is recorded as a new row with a **new** named successor — never as
+silence.
+
+The 52 rows, with their class and the owner text §2 gives them:
+
+| ID | Class | Venue / owner as recorded in §2 |
+|---|:---:|---|
+| `PR5-VERIFY-CLAUSE-NARROWER-THAN-STATED` | V2 | project owner — for the G2 erratum list |
+| `PR3-ATTEMPT-SHAPE` | V5 | project owner |
+| `PR5-ANSWER-MODULE-COLUMN` | V3 | PR6/PR7 implementer (the slice that next opens src/topology/effects.rs) |
+| `PR3-RUNNER-DIGEST` | V5 | project owner |
+| `PR3-REG-001-CONDITIONAL` | V4 | PR4-PR10 implementer |
+| `PR3-BEFORE-PHASE-SCOPE` | V4 | PR7–PR10 implementer |
+| `PR3-COMMIT-AUTHORSHIP` | V5 | project owner |
+| `PR3-CONTAINER-START-ROW` | V4 | PR6/PR7 implementer |
+| `PR3-FRAMEWORK-SILENT-1` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-2` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-3` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-4` | V4 | PR7–PR10 implementer |
+| `PR3-FRAMEWORK-SILENT-5` | V4 | PR7–PR10 implementer |
+| `PR3-REPORT-DOUBLE-NAME` | V5 | project owner |
+| `PR4-SPAWN-SITE-PROBE-CONTEXT` | V4 | PR6/PR7 implementer |
+| `PR4-REG-001-STILL-EQUIVALENT` | V4 | PR4–PR10 implementer |
+| `PR4-R28-NEXT-COORDINATOR-UNWITNESSED` | V3 | PR5–PR7 implementer (the slice that owns rundir) |
+| `PR4-DESIGN-ROLE-SCOPED-ENV` | V5 | project owner |
+| `PR4-ADAPTER-RESOLVES-ON-THE-HOST` | V4 | PR6 implementer |
+| `PR5-CAPACITY-NOT-A-TOPOLOGY-RESOURCE` | V5 | project owner |
+| `PR5-C-FSYNC-UNOBSERVABLE` | V3 | PR7–PR11 implementer (the slice that owns the two-crash proof) |
+| `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN *(re-scoped: externally_reachable_fns only)*` | V3 | PR7+ implementer (the slice that owns effects::externally_reachable_fns) |
+| `PR5-C-LEGACY-APPEND-ERROR-CENSUS` | V3 | PR7 implementer, or whichever lane plumbs an observer through engine::Harness |
+| `PR5-R2-WIN-NON-SURROGATE-REPARSE` | V3 | PR6/PR7 implementer (the slice that next owns Windows containment) |
+| `PR5-R2-SNAPSHOT-INPUT-COMMIT-DEAD` | V3 | PR6/PR7 implementer (the slice that first requests two snapshots) |
+| `PR5-R2-IDUNREAD-BEFORE-THE-PARSE` | V4 | PR6/PR7 implementer |
+| `PR5-R2-WORKTREE-LOCK-RETENTION` | V3 | PR6/PR7 implementer (the slice that can pause a run) |
+| `PR5-R2-LEGACY-ENGINE-APPEND-FAILURE` | V3 | PR7 implementer, or whichever lane plumbs an observer through engine::Harness |
+| `PR5-R2-OBJECT-GROUP-TAKES-NO-SITE` | V5 | project owner |
+| `PR7-WRAPPERS-EMPTY-DOMAIN` | V6 | project owner — the post-v0.2 pass over PR3's layer |
+| `PR7-NARROWED-SURFACE-19-UNCALLED` | V3 | PR8/PR12, or whichever slice next opens these modules |
+| `PR7-MACOS-PROCESS-GROUP-FLAKE` | V3 | project owner / whichever slice next opens src/runner/host.rs |
+| `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` | V3 | PR6's owner, or whichever slice next opens the Container funnel — read_racing arrived in 9 |
+| `PR7-SCRATCH-FIXTURE-LEAK` | V3 | project owner / whichever slice owns shared test infrastructure |
+| `PR7-P3A-CREATOR-RETAINS` | V4 | PR7/PR12 implementer |
+| `PR7-CREATEINTEGRATION-ORDER-BACKWARDS` | V6 | project owner — the post-v0.2 pass over PR3's layer |
+| `PR7-FOLD-ACCESSORS-IN-PR3-LAYER` | V1 | project owner — adjudicated 2026-08-24, see §3; the deferred work is the G2 PR3-layer pas |
+| `PR7-STEP-D-LINEAGE-ARM-UNWITNESSED` | V3 | PR8 implementer (the slice that gives the merge queue a repair to spawn) |
+| `R3-SEAMS-006-ATT003-REPAIRED-POSTHOC` | V2 | project owner, if the residual is worth a row of its own |
+| `PR7-R4-CLAIMS-UNVERIFIED` | V2 | project owner — the claims protocol a fresh session carries |
+| `PR40-PROGRAM-PUBLIC-ADAPTER-SEAM` | V2 | project owner, carried by G2 W4 |
+| `PR40-CHARTER-BINDS-A-PROPOSAL` | V2 | project owner, carried by the documentation-authority pass |
+| `PR7-STD-PRIVATE-ROOT-LEXICAL-COMPARE` | V5 | project owner |
+| `PR7-STD-OWNER-RECORD-LEXICAL-AUTH` | V5 | project owner |
+| `PR7-STD-PRIVATE-ROOT-NO-CONTAINMENT` | V5 | project owner |
+| `PR7-STD-QUESTION-PAYLOAD-COMPONENT` | V5 | project owner |
+| `PR7-STD-ANSWER-STAGING-COMPONENT` | V5 | project owner |
+| `PR7-STD-OWNERSHIP-PROOF-UNCANONICAL` | V5 | project owner |
+| `PR7-STD-CONTAINER-LEXICAL-CONFINEMENT` | V5 | project owner |
+| `PR7-STD-CONTAINER-EXEC-UNBOUNDED` | V5 | project owner |
+| `PR43-MACOS-PROC-SIGNAL-FINGERPRINT` | V3 | project owner / the slice that next opens src/agent/proc.rs, once a controlled macOS environ |
+| `PR43-WINDOWS-TOPOLOGY-KILL-FINGERPRINT` | V3 | project owner / the slice that next opens the Windows topology kill harness |
+
+### Recurrence classes — §4 reviewed at the same sitting
+
+The checkpoint record requires §4's recurrence classes to be reviewed for
+structural guards at the same sitting as the ledger audit. §4 carries **18
+classes**. Each is given a guard verdict below:
+
+- **mechanical** — a named artifact in this tree fails if the class recurs;
+- **partial** — a mechanism catches part of the class, and the uncovered part is named;
+- **convention** — a written rule with no mechanical enforcement.
+
+| # | Class | Occurrences | Guard | The guard, or what is missing |
+|---:|---|---|:---:|---|
+| 1 | A surviving mutation named in a round's own prose and carried nowhere durable | 2 | convention | §4's own adopted rule: a round that names a surviving mutation and does not repair it appends it to §2 **in the same commit**, and a deferral must quote the passage that makes it out of scope. Nothing enforces this but a reader |
+| 2 | A boundary drawn narrower than the packet's sentence | 2 | convention | This file's "boundary rule" preamble |
+| 3 | A fix that introduced a new defect | 5 | partial | Repair rounds now require a red-first witness and a killed mutation per repair, which catches the introduced defect **when the repair is witnessed**. It does not catch a defect introduced outside the witnessed seam — which is how three of the five arrived |
+| 4 | Tests satisfied by a correlated field rather than the named one | 11 (PR2) + 11 (PR3/A1) + 2 (PR4) | partial | Withheld mutation catalogues, measured per slice. A catalogue is a measurement taken at a head, not a standing gate; a green suite proves tests pass, not that they still detect |
+| 5 | A guarantee proved for the variant that was looked at | 4 | convention | Totality by exhaustive match is the house style; no artifact requires it |
+| 6 | The thing that was supposed to prove it never ran | 2 | partial | `test-docs-consistency.sh` C3 pins the set of `.github/scripts/test-*.sh` files **equal** to the set the CI lint job invokes, both directions, which closes the shell-gate half. The `compile_fail` fixture half — a fixture no command executes — has no equivalent |
+| 7 | A source census fooled by a comment | 5 | mechanical | `every_production_process_start_is_classified` (`src/runner/mod.rs:1540`) and `every_production_runner_request_is_built_by_its_roles_builder` (`:1463`); and §27's replacement of substring matching with a YAML-1.2 structural oracle, `the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string` (`src/effects/tests.rs:1513`) and `the_workflow_shape_oracle_refuses_every_escape_the_ledger_names` (`:1563`) |
+| 8 | An enforcement artifact no gate validates | 2 | mechanical | `every_allowlist_entry_carries_its_justification_and_names_a_real_file` (`src/effects/tests.rs:898`) and `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` (`:507`) |
+| 9 | An element of a packet-named sequence with no implementation at all | 2 | convention | Sequence coverage is read, not gated |
+| 10 | `git checkout <path>` discarding uncommitted work while mutation-testing | 2 | convention | A session hazard. The standing mitigation is to restore from a disposable copy, never the live worktree |
+| 11 | An item inserted into a file re-targeting the doc comment above it | 11 at `51cfc01`, derived not maintained | convention | Found by derivation at one head; nothing maintains it |
+| 12 | A mutation whose anchor `cargo fmt` had moved, reported as a surviving mutation | 2 | convention | Pre-flight the anchors on a disposable copy before the measuring run, which is fail-fast |
+| 13 | An accumulator's witness proves the accumulation and not the read | 4 | convention | The rule is to assert the value the event carries, not the accumulator's reset |
+| 14 | A function used as its own expected-value oracle | 5 (PR3/A1) | convention | — |
+| 15 | A grid bounded short of its required domain | 8 (PR3/A1) | convention | — |
+| 16 | Omitted packet-required fields | 7 (PR3/A1) | convention | — |
+| 17 | A refutation that inspected the wrong item of that name | 1 | convention | Below the two-occurrence threshold §4 sets for a signal about the method; carried because it is recorded |
+| 18 | A command quoted as evidence becomes part of its own input | 4 | convention | All four introduced by the claims-protocol commits of 2026-08-26 |
+
+**Status, stated plainly: 2 of 18 classes are mechanically guarded, 3 are
+partially guarded, and 13 rest on convention.** That is the honest shape of the
+recurrence defence at this candidate, and it is the number a panel should weigh
+rather than the count of classes alone. The two mechanical guards are both in
+the effects/census layer, which is the layer that has had the most recurrence
+pressure — the guards followed the failures, which is the right order, but it
+means the eleven classes with no mechanical guard are the ones that have not yet
+cost enough to earn one.
+
+**No class is closed by this audit.** §4 is a watch list; a class leaves it by
+being guarded, not by being reviewed.
+
+### Reconciliation against the P1A ledger input
+
+The P1A read-only pass reported **64** early §2 rows, **2** struck, and **four**
+stale W1 rows later fixed. Re-derived at `50ed8c86`:
+
+| Quantity | P1A | This audit | Why they differ |
+|---|---:|---:|---|
+| §2 rows | 64 | **65** | P1A counted physical table lines. Line 156 carries two logical rows joined by `||`; the second, `PR7-CANDIDATE-TREE-UNVERIFIED`, is invisible to a line-based count and to a rendered read |
+| Struck rows | 2 | 2 | agrees |
+| Rows whose live disposition is *repaired* | 4 | **8** | P1A named the four W1 rows of §26. Four more carry a terminal disposition elsewhere: `PR5-MACOS-CLIPPY-NEVER-RUN` (§3), `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE` (own owner cell), `PR7-CANDIDATE-TREE-UNVERIFIED` (in-row) and `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` (in-row, §22b) |
+| Rows closed, not owed | — | 3 | the `PR4-PROGRAM-PATH-NOT-UNICODE` family, one finding recorded three times |
+| Rows genuinely carried | — | **52** | 65 − 2 struck − 8 repaired − 3 closed |
+
+P1A's figures were correct for what they measured; the deltas are what a
+mechanical re-derivation at the candidate head adds, and both are recorded so
+neither has to be taken on trust.
+
+### What this audit does not do
+
+- It does **not** attest. The three-model panel is a separate obligation
+  (`decisions/2026-08-25-checkpoint-merges.md`), untouched by this section.
+- It does **not** run the suite. No claim here depends on a test result produced
+  during assembly.
+- It does **not** reopen any disposition, and it edits no historical row. The
+  `||` defect on line 156 is recorded, not repaired, for exactly that reason.
+- It does **not** claim a reviewer reread the candidate diff.
+
+Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md`,
+`reviews/2026-08-31-g2-gate-report.md`,
+`reviews/2026-08-31-g2-first-parent-coverage.md`.
+
+## 36. 2026-08-31 G2 checkpoint — the serialized suite result, and what it does not settle
+
+Append-only. This section records one measurement and changes **no disposition**
+in §35 or anywhere above it.
+
+Root ran the globally serialized suite at the exact committed candidate head
+`50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
+
+| Fact | Value |
+|---|---|
+| Command | `upstroke-build cargo test --all-targets --all-features` |
+| Exit status | `rc=0`, fresh compile |
+| Library | 1801 passed, 0 failed, 34 ignored |
+| Binary (`main`) | 8 passed, 0 failed |
+| Example | 0 tests |
+| Docker | live daemon, Docker server 29.7.2; the `real_docker_*` tests used it and passed |
+| Platform | Linux, this host only |
+
+§35 said of itself that it ran no suite and that no claim in it depended on a
+test result. That remains true of §35. This section is the separate measurement,
+recorded beside it rather than folded into it.
+
+**What it settles about the ledger: very little, and that is the honest reading.**
+
+- **No carried row fired.** 0 failed, so no §35 carried row was observed firing
+  on Linux in this run.
+- **That is not evidence of absence.** A green suite proves the tests passed, not
+  that they still detect — the standing lesson behind the withheld-mutation
+  catalogues in §4 class 4. None of the 52 carried rows is closed, narrowed, or
+  re-dated by this result, and none of their re-opening triggers fired.
+- **The platform-rated rows are untouched.** `PR7-MACOS-PROCESS-GROUP-FLAKE`,
+  `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` and `PR43-*` are macOS and Windows rows.
+  A Linux run cannot observe them, and a Linux green is exactly the false
+  closure `PR5-MACOS-CLIPPY-NEVER-RUN` was reopened for. Their rates stand as
+  recorded.
+- **The intermittent rows keep their rates.** One green run is one observation
+  against rates measured over many; §12's precedent is that a rate not recorded
+  when observed is a rate destroyed by the run that clears it. Nothing here
+  revises a rate in either direction.
+
+**The recurrence classes are unmoved.** §35's verdict — 2 of 18 mechanically
+guarded, 3 partial, 13 convention-only — is a statement about what artifacts
+exist, not about whether a run passed. A class leaves §4 by being guarded.
+
+**The `||` defect on line 156 is unrepaired**, deliberately, and this section
+does not touch it either.
+
+Companion record: `reviews/2026-08-31-g2-gate-report.md`, "The serialized gate run".
+
+## 37. 2026-08-31 G2 checkpoint — the public schema-4 write path, carried
+
+Append-only. This section adds **one carried row** to the ledger under the
+owner's binding amendment 1a of 2026-08-31
+(`decisions/2026-08-31-inertness-premise-behavioural.md`). It changes no
+disposition in §35 or §36 and repairs nothing.
+
+The row exists because the owner ruled that prose in a decision record is not
+enough: **the panel must find this triaged in the ledger rather than discover
+it.** It is a *carried* row, not a defect report — the behavioural inertness
+condition is satisfied at the candidate head, and this row records the exact
+shape of what inertness does **not** cover, so nobody later mistakes the
+premise for a stronger one.
+
+### The carried row
+
+| ID | What | Owner | Why it is open |
+|---|---|---|---|
+| `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | **A library consumer can durably write schema-4 state through the checked funnel, using public API only, with no write-side activation check.** The path is three explicit topology choices: construct `RunStarted4 { schema: TOPOLOGY_SCHEMA, … }` — **25 fields, all `pub`, no `#[non_exhaustive]`** (`src/topology/events.rs:600`); check it with `TopologyLine::round_trip` (`src/events/log.rs:1242`); open the funnel with `EventLog::open` (`:466`) and commit it with `append_topology(site_for(&body), …)` (`:796`, `:1064`). `append_topology` delegates straight to `append_topology_hooked` (`:809`) and applies no ceiling test; **`TOPOLOGY_ACTIVATION` and `MAX_READABLE_SCHEMA` appear nowhere in `src/events/log.rs`** — activation gates *reading* only. The resulting log is state the same binary's own resume refuses by name, `SchemaRefusal::TopologyLogUnreadable` (`src/topology/schema.rs:338`, raised at `:241`) | project owner — **the PR12 activation slice** | **Carried, not repaired, and the premise it qualifies is unchanged.** Inertness is *behavioural* and holds: production's only `run_started` mint stamps schema 3 (`src/engine/coordinator.rs:164`), no CLI arm reaches the topology coordinator (`engine::topology` is `pub(crate)`, `src/engine/mod.rs:61`), the read ceiling is 3 by four const assertions evaluated in the ordinary build (`src/topology/schema.rs:98-101`), and `check_upgrade_transition` refuses every path into schema 4. **What this row denies is the stronger guarantee, not the premise**: a released library cannot be prevented from *creating* a schema-4 log, and never could — the legacy funnel already accepts any `pub u32` in `RunStarted.schema` (`src/events/mod.rs:315`), and plain `std::fs` binds no downstream crate at all. Log bytes are untrusted input and the code has always treated them so. **Repairing this is out of scope for the promotion by owner ruling**: narrowing `src/topology/` to `pub(crate)` would break `EventSite` in public log signatures and the frozen `compile_fail` doctests pinned to their failure reasons, report the whole topology tree dead under `-D warnings`, and produce a new candidate head that re-runs the suite, the eight gate artifacts and the 66-unit coverage map — to buy a guarantee `std::fs` refutes. A write-side inactivity guard in `append_topology` would strengthen a guarantee beyond PR7's frozen packet, which is managed debt and not an in-slice repair |
+
+### Venue, trigger and required evidence
+
+Recorded in §35's carried-row form so the row is auditable the same way the
+other 52 are.
+
+| Field | Value |
+|---|---|
+| **Class** | V4 — a numbered future slice implementer |
+| **Venue / owner** | project owner — the **PR12 activation slice** |
+| **`shrinks_when`** | the activation slice lands, **or** a visibility narrowing is scheduled |
+| **Re-opening trigger** | PR12 opens, or any slice schedules a narrowing of `src/topology/**` or the event funnel's public surface |
+| **Required evidence for the repair** | a write-side refusal with a red-first witness **and** a killed mutation; **plus** an accounting of the legacy funnel's unvalidated `RunStarted.schema` field, because a guard on the schema-4 path alone leaves the schema-3 path accepting any `u32` and the guarantee would still not hold |
+
+### What this row does not do
+
+- It does **not** reopen the inertness condition of
+  `decisions/2026-08-25-checkpoint-merges.md`. That condition is behavioural and
+  is satisfied at `50ed8c86`.
+- It does **not** authorize a visibility change. The owner ruled explicitly that
+  no visibility change to the code is authorized in this promotion.
+- It does **not** change the §35 totals as they were audited. §35's 52 carried
+  rows are the normalization of §2 at the time of the audit; this is a
+  **53rd carried row**, opened after it by owner amendment, and is counted
+  separately rather than folded back into a table it was not part of.
+
+Companion records: `decisions/2026-08-31-inertness-premise-behavioural.md`,
+`reviews/2026-08-31-g2-gate-report.md` ("Inert by default" §4).
+
+## 38. 2026-08-31 PR #80 exact-head review — the full-ledger projection, completed
+
+Append-only. This section repairs the completeness defect the sole review of
+`e174d086efc71b8c837ed22e61f29f706ef9dacd` found in §35, and records that
+review's four dispositions. It rewrites no historical row.
+
+**§35's audit was not full, and the review was right.** §35 projected §2's 65
+logical rows and stopped there, while live deferred rows sat in other sections it
+never counted — including **all four `PR73-*` rows** (§29, lines 3539–3542) and
+**`PR64-CLEANUP-003-SCRATCH-PRECLEAN`** (§33, line 3617). §35's claim that
+"every live row" was categorized was therefore false, and the checkpoint
+record's obligation 2 was **overstated as discharged**. It is discharged here.
+
+The omission had teeth: `PR64-CLEANUP-003-SCRATCH-PRECLEAN` is the live sequence
+in which the predictable scratch helper meets another process's occupied root,
+recursively pre-cleans it before acquiring ownership, and deletes that process's
+content. An audit that does not count it is an audit that would let it through.
+
+### The canonical domain, stated before the counts
+
+**A canonical row is a markdown table row in this file whose first cell is a
+stable finding ID.** That domain is mechanically enumerable and is what the
+projection covers. Derived at this head:
+
+- **284** canonical row instances, over **197 distinct stable IDs**.
+- Physical lines carrying two logical rows are split on `||` (line 156), and
+  cells naming several IDs with `·` are expanded to one row each.
+- **Latest-disposition-wins**: for each ID, the instance at the greatest line
+  number is the live one. §35's own restatement table is excluded as a
+  restatement, not a source.
+
+**Completeness is asserted over this domain and no wider one.** Owner clauses
+that live in prose rather than a table row are *not* canonical rows; four exist
+and are named at the end of this section so they are not invisible.
+
+### The projection over all 197 canonical IDs
+
+| Terminal disposition | IDs |
+|---|---:|
+| **repaired** | 94 |
+| **carried** | 75 |
+| **settled** (§1, not re-raisable without new evidence) | 17 |
+| **closed, not owed** | 9 |
+| **struck** (withdrawn in place) | 2 |
+| **total** | **197** |
+
+94 + 75 + 17 + 9 + 2 = 197. **Every canonical ID has exactly one terminal
+disposition**, and the sum is the enumeration, not an estimate.
+
+Six IDs whose disposition cell carried no mechanical keyword were ruled by hand
+against their own prose and are listed for audit:
+`PR5D-PROOF-TESTS-COUNT` → closed ("recorded, no owner needed");
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY` → closed (a terminology
+correction, disposition unchanged); and `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`,
+`PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`,
+`PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`,
+`PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` → carried.
+
+### The 75 carried rows, by origin
+
+| Originating section | Carried |
+|---|---:|
+| §2 | 49 |
+| §15 — the six that need adjudication | 6 |
+| §20 — PR7 S5 rounds 3 and 4 | 5 |
+| "The hardening rule" | 4 |
+| §29 — PR #73 owner adjudication | 4 |
+| §8 — PR5 lane D | 2 |
+| §24, §25, §27, §33, §37 — one each | 5 |
+| **total** | **75** |
+
+**Why §2 shows 49 here and 52 in §35.** §35 counted §2 rows; this projection
+counts *IDs*, and five §2 IDs have a later instance elsewhere that wins:
+`TASK-DISPATCHED-REGION-UNVALIDATED`, `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN`,
+`PR7-G2-W1-RETAINED-ARM-UNGUARDED` and `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` resolve
+to §26 (repaired), and `PR4-ADAPTER-RESOLVES-ON-THE-HOST` resolves to the
+hardening rule (carried, counted there). §35's 52 minus the three §2-carried IDs
+that move out is 49. The two figures are consistent; they count different things,
+and this one is the full-ledger figure.
+
+### The 26 carried rows §35 missed, each with venue, trigger and evidence
+
+| ID | Section | Line |
+|---|---|---|
+| `PR4-INVOCATION-CONSTRUCTIBLE` | §The hardening rule | L842 |
+| `PR4-CENSUS-COMMENT-ORACLE` | §The hardening rule | L843 |
+| `PR4-ADAPTER-RESOLVES-ON-THE-HOST` | §The hardening rule | L844 |
+| `PR4A-SPAWN-WITHOUT-AMBIENT` | §The hardening rule | L845 |
+| `PR5D-ROW-MAPPING-REFUSAL-UNFIXTURED` | §8 | L927 |
+| `PR5D-TOOLBOX-DISCARDS-CLIPPY-OUTPUT` | §8 | L929 |
+| `PR5-RUNDIR-030` | §15 | L1417 |
+| `PR5-EVENTS-020` | §15 | L1418 |
+| `PR5-WORKSPACE-068` | §15 | L1419 |
+| `PR5-WORKSPACE-070` | §15 | L1420 |
+| `PR5-EVENTS-051` | §15 | L1421 |
+| `PR5-WORKSPACE-003` | §15 | L1422 |
+| `PR7-R4-LOOP-004` | §20 | L2175 |
+| `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT` | §20 | L2207 |
+| `PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG` | §20 | L2209 |
+| `PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF` | §20 | L2211 |
+| `PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` | §20 | L2212 |
+| `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | §24 | L3430 |
+| `PR47-PUBLIC-PROCESS-API-REMOVED` | §25 | L3459 |
+| `CI-CFG-UNSHIPPED-UNIX-REGION` | §27 | L3494 |
+| `PR73-TARGET-INVENTORY-001` | §29 | L3539 |
+| `PR73-LEXICAL-CLOSURE-001` | §29 | L3540 |
+| `PR73-LEXER-DIVERGENCE-001` | §29 | L3541 |
+| `PR73-LINT-SEMANTICS-001` | §29 | L3542 |
+| `PR64-CLEANUP-003-SCRATCH-PRECLEAN` | §33 | L3617 |
+| `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | §37 | L3955 |
+
+Venue, trigger and required evidence for each, in §35's carried-row form:
+
+| Group | Rows | Venue / owner | `shrinks_when` | Re-opening trigger | Required evidence |
+|---|---|---|---|---|---|
+| **Hardening** | `PR4-INVOCATION-CONSTRUCTIBLE`, `PR4-CENSUS-COMMENT-ORACLE`, `PR4-ADAPTER-RESOLVES-ON-THE-HOST`, `PR4A-SPAWN-WITHOUT-AMBIENT` | the named implementer slice (PR5–PR7, PR7, PR7/PR12) | that slice lands the hardening | the named slice opens | a witness that fails without the hardening, plus a killed mutation. These strengthen a guarantee beyond the frozen packet, so they are **managed debt, not in-slice repairs** |
+| **PR5 lane D** | `PR5D-ROW-MAPPING-REFUSAL-UNFIXTURED`, `PR5D-TOOLBOX-DISCARDS-CLIPPY-OUTPUT` | PR6/PR7 implementer; project owner (box tooling) | the fixture becomes constructible; the toolbox stops discarding Clippy output | a slice opens the row-mapping fixture, or the build wrapper is changed | a red-first fixture for the refusal; for the toolbox, a wrapper that surfaces Clippy output — a box-side fix, not a tree fix |
+| **§15 adjudication** | `PR5-RUNDIR-030`, `PR5-EVENTS-020`, `PR5-WORKSPACE-068`, `PR5-WORKSPACE-070`, `PR5-EVENTS-051`, `PR5-WORKSPACE-003` | **project owner — G2** | each is adjudicated **narrowed assertion** or **equivalent mutant** | the G2 adjudication sitting | per entry, the decision between a real detection loss and a re-expressed-prose equivalent. `PR5-EVENTS-051` **SURVIVED** and is the one repair of 38 that did not take; `PR5-WORKSPACE-003` is **Windows-only** — Linux kills it, so it needs the guest |
+| **§20 PR7 rounds** | `PR7-R4-LOOP-004`, `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`, `PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`, `PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`, `PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` | PR8/PR10 (closure); PR8+; project owner for the G2 erratum list | closure is implemented; the merge queue spawns a repair; the erratum is written | PR8 or PR10 opens, or the owner takes up the erratum list | a red-first witness on the arm plus a killed mutation. `PR7-R4-LOOP-004` additionally owes the **diagnostic**: an operator told "closure derives NotEnding" about a budget-stopped run is being told the wrong thing |
+| **Blocked** | `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | project owner | the packet reclassifies the pre-intent ephemeral commit | an owner packet decision | **Blocked, not deferrable by an implementer**: the packet and tests classify the commit as Git-owned R27 and require recovery to leave it. Deleting it contradicts an explicit contract |
+| **Accepted residual** | `PR47-PUBLIC-PROCESS-API-REMOVED` | project owner — a later compatibility-owned slice | that slice takes the compatibility question | a compatibility slice opens | the owner explicitly accepts the current wrapper behaviour for PR #47; **preserve as residue, not a gate blocker** |
+| **Platform scope** | `CI-CFG-UNSHIPPED-UNIX-REGION` | project owner — a platform-scope decision | a fourth Unix family is added to CI, or the region is removed | adding a BSD runner | a platform-scope decision, **not an in-slice oracle repair**. The census already requires the exact acknowledged set and fails if it changes |
+| **PR #73 deferred** | `PR73-TARGET-INVENTORY-001`, `PR73-LEXICAL-CLOSURE-001`, `PR73-LEXER-DIVERGENCE-001`, `PR73-LINT-SEMANTICS-001` | project owner — owner-adjudicated deferrals of 2026-08-30 | each named guard is widened: the walk covers workspace members; aliases under an expectation are forbidden; a blanked-view ASCII census lands; `cfg_attr` handling is added | a workspace member or path dependency is added; a third lexer-class recurrence; an inventory-pin edit | the recorded restriction becomes the trigger. All four are `pre_existing` and identical at comparison head `0f05b456`; each keeps its named backstop until repaired |
+| **Scratch pre-clean** | `PR64-CLEANUP-003-SCRATCH-PRECLEAN` | project owner — the bound **startup, recover and create migration** follow-up | that collision set receives an exact-base lease | the migration slice opens | occupied-root **preservation**, and **no pre-clean and no discarded cleanup result**. §32 marked this fixed by reusing the ID for a distinct emit helper; §33 corrected that to deferred, and it stays deferred here |
+| **Schema-4 write path** | `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | project owner — the PR12 activation slice | the activation slice lands, or a visibility narrowing is scheduled | PR12 opens, or a narrowing is scheduled | a write-side refusal with a red-first witness and a killed mutation, **plus** an accounting of the legacy funnel's unvalidated `RunStarted.schema` |
+
+### The four prose owner clauses, named so they are not invisible
+
+Outside the canonical row domain, four paragraphs carry an owner clause with no
+table row. They are **not** counted in the 197 and are listed so a later audit
+does not rediscover them as omissions: §3's dependency clause (line 237), §12's
+pre-existing-flake clause (line 1118), §18's two clauses (lines 1784, 1815), and
+§20's `effects::census_domain` clause (line 2241). Giving each a canonical row is
+work for the next ledger pass, not for this repair.
+
+### The PR #80 review's own four dispositions
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-LEDGER-AUDIT-NOT-FULL | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/FINDINGS.md:3633-3679 | §35 projects only §2's rows -> live deferred rows in other sections are never counted -> the audit claims every live row is categorized -> the checkpoint's obligation 2 is reported discharged while `PR64-CLEANUP-003-SCRATCH-PRECLEAN` and four `PR73-*` rows are untriaged -> the predictable scratch helper pre-cleans another process's occupied root and deletes its content | introduced_by_feature | correctness | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 / §35 | This section projects all 197 canonical IDs across the whole ledger — 94 repaired, 75 carried, 17 settled, 9 closed, 2 struck — with the domain stated before the counts and completeness asserted only over it. The 26 carried rows §35 missed each receive venue, trigger and required evidence | fixed |
+| PR80-CHECKPOINT-ORDER-REVERSED | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / decisions/2026-08-31-g2-checkpoint-promotion.md:11-23 | the record declares the candidate cut at `50ed8c86` -> the same record admits the gate has not passed and artifacts are missing -> the controlling order (gate and artifacts first, then the cut) is reversed -> an immutable decision is narrowed with no successor ruling; and the audit postdates `50ed8c86`, so that commit cannot carry it | introduced_by_feature | docs-contract | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 | `50ed8c86` is restated as the **pre-assembly baseline**, not a cut candidate; the candidate becomes the integration landing head after this evidence lands and the outstanding artifacts and gates complete. `2026-08-25-checkpoint-merges.md` remains controlling and unnarrowed; the third addendum and the gate report's "What `50ed8c86` is" carry the correction, and the owed artifacts are restated | fixed |
+| PR80-COVERAGE-EXEMPTION-INVENTED | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/2026-08-31-g2-first-parent-coverage.md:30 | the map treats `decisions/`, `proposals/`, `docs/`, root Markdown and ignore files as review-exempt -> `2026-08-20-review-invalidation-scope.md` authorises exactly `reviews/FINDINGS.md` -> units with no recorded review are counted as covered -> `59a6830`, which changed a decision plus `reviews/README.md`, is reported mapped | introduced_by_feature | docs-contract | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 | The exemption class is withdrawn. Class **X** now requires the unit's whole diff to be exactly `reviews/FINDINGS.md`, verified per unit (11 units, 12 commits). Class **M** requires every delta file to be byte-identical to the merged-in parent **and** that parent to be an ancestor of `origin/master` (2 units). Residue rises from 7 units to **18 units / 19 commits**, including `59a6830`, three master-forward merges carrying merge-authored conflict resolution, and the 14 pre-PR-regime commits. Totals re-derived: 33 S + 2 B + 2 M + 11 X + 18 R = 66 units, 418 commits | fixed |
+| PR80-PANEL-TEXT-STALE | P2 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/2026-08-31-g2-gate-report.md:59-62 | the gate report says panel membership is unsettled -> the same head adopts `2026-08-31-panel-seats.md` -> a current gate artifact asserts two contradictory states -> a reader cannot tell which is live | introduced_by_feature | docs-contract | e174d086efc71b8c837ed22e61f29f706ef9dacd | The gate report now states that membership is **settled and ratified** and that **no seat has run**, naming the three seats with their invocation guards. The promotion record's second addendum carries an in-place supersession marker pointing at its third addendum. No other sentence claims membership is unsettled | fixed |
+
+Companion records: `reviews/2026-08-31-g2-first-parent-coverage.md`,
+`reviews/2026-08-31-g2-gate-report.md`,
+`decisions/2026-08-31-g2-checkpoint-promotion.md` (third addendum).
+
+## 39. 2026-08-31 PR #80 second exact-head review — the projection made reproducible, and the labels closed
+
+Append-only. This section repairs the three P1 findings the sole review of
+`ada79bd76c791a6faac18f850929fbbd8cd7b237` returned, corrects §38's
+arithmetic by re-deriving it, and records the review's dispositions. It
+rewrites no historical row and reopens no disposition.
+
+### Reading rule for the labels in §§35–37
+
+§35 says "measured at candidate head" (line 3637; likewise its prose at
+lines 3847, 3871 and 3882), §36 "at the exact committed candidate head"
+(line 3893), §37 "satisfied at the candidate head" (line 3947). Per the
+promotion record's third addendum: `50ed8c86` is the **pre-assembly
+baseline**, `50a84acd…` the **committed evidence head**, and no candidate
+has been cut. Those sections stand as written under this file's append-only
+rule; this paragraph is the reading rule a later auditor applies. ("Candidate"
+in the product sense — the merge queue's prepared candidates,
+`PR7-CANDIDATE-TREE-UNVERIFIED` — is a different word and is untouched.)
+
+### The canonical-row domain, restated so a script can hold it
+
+§38's domain rule was not reproducible as stated: applied literally, its
+`||` split fires inside code spans (lines 102, 105 and 3864 carry a literal
+`||` in backticks) and its "first cell is a stable ID" admits prose cells
+that merely mention an id. The rules that close both holes:
+
+- **R1.** A physical table line is any line whose stripped form starts with
+  `|` and is not a separator row.
+- **R2.** A line splits into two logical rows at a `||` occurring **outside
+  backtick spans**, and only if **both** halves independently satisfy R3.
+  Exactly one line in this file splits: line 156.
+- **R3.** A logical row is **canonical** iff its first cell — after
+  stripping strikethrough, emphasis, backticks, and a trailing parenthetical
+  annotation such as `(a)` or `*(re-scoped: …)*` — consists **entirely** of
+  one finding id or a `·`-separated list of finding ids, an id matching
+  `^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$`.
+- **R4.** A `·` list expands to one instance per id at the same line.
+- **R5.** Restatement tables — audit views that re-list rows owned elsewhere
+  — are excluded as sources. At this head they are exactly: §35's four view
+  tables (lines 3689–3697, 3704–3709, 3727–3731, 3759–3812) and §38's
+  missed-rows listing (lines 4067–4094). §38's four-disposition table is a
+  **source** (the only instances of its `PR80-*` ids), as is the disposition
+  table at the end of this section. This section adds no other id-first-cell
+  rows, so it moves the projection by exactly its three new rows.
+- **R6.** For each id, the source instance with the greatest line number is
+  the live one (latest-disposition-wins).
+- **R7.** The winner classifies by section rule, then keyword, then an
+  explicit hand-ruled list — every hand ruling named below with its basis;
+  nothing is ruled silently.
+
+Section rules: §1 → settled; §5, §6, §7, §9, §10, §26, §31, §34 → repaired;
+"The hardening rule", §8, §15 → carried; §2 → repaired on an in-row
+`FIXED`/"fixed in PR7" marker, closed on "Closed, not repaired"/"Closed by
+this row", struck on `~~`, else carried. Elsewhere, keywords in the winning
+row: a leading bold `Carried` → carried; `Repaired`/`fixed in this slice`/
+`fixed by owner…`/`implementation-fixed` → repaired; `CLOSED`/`Closed by` →
+closed; a terminal cell `deferred` → carried; a terminal cell `fixed` →
+repaired; `accepted residual`, `blocked by packet`, or a bold `deferred`
+disposition cell → carried.
+
+Hand-ruled (complete list): `PR5-MACOS-CLIPPY-NEVER-RUN` → repaired (§3's
+dated 2026-08-28 challenge outcome; `lint (macos)` live in `ci.yml`);
+`PR4-PROGRAM-PATH-NOT-UNICODE` → closed (superseded by its `-CLOSED` and
+`-CLOSED-NARROWED` successor rows and
+`2026-08-25-commandspec-program-stays-string.md`);
+`PR5D-MSVC-CLIPPY-NEVER-RUN` → repaired (`lint (windows)` runs clippy
+natively on `windows-latest`; the deferred cross-target gate was superseded
+by the native job, and `clippy::items_after_test_module` is now a governed
+lint); `PR5-RD-001` → repaired (its row records the repair and witnesses);
+`PR5D-PROOF-TESTS-COUNT` → closed (recorded, no owner needed);
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY` → closed (a terminology
+correction; the disposition lives with the base id); and the four §20
+round-3 rows `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`,
+`PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`,
+`PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`,
+`PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` → carried (each
+names its owner in-row; no terminal keyword).
+
+### The corrected counts, and exactly what moved
+
+| Head | Distinct ids | repaired | carried | settled | closed | struck |
+|---|---:|---:|---:|---:|---:|---:|
+| `e174d086` (what §38 measured) | 197 | 94 | **77** | 17 | **7** | 2 |
+| `ada79bd7` (§38's four rows added, repaired) | 201 | 98 | 77 | 17 | 7 | 2 |
+| this head (this section's three rows added, repaired) | **204** | **101** | **77** | **17** | **7** | **2** |
+
+Confirmed by this re-derivation: §38's total of 197; repaired 94; settled
+17; struck 2; and its 26-missed-rows table — the non-§2 carried set is
+**exactly** those 26 ids. Corrected: **carried is 77, not 75, and closed is
+7, not 9.** The closed set, exhaustively: the three
+`PR4-PROGRAM-PATH-NOT-UNICODE*` rows (one finding recorded three times),
+`PR5D-PROOF-TESTS-COUNT`, `PR7-R3-EMIT-006-DEFER-ROUND-IS-A-BACKOFF-ROUND`,
+`PR7-R3-SETTLE-CAND-OBJ-REFUSAL-UNREACHABLE`, and
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY`. And §38's "§35's 52
+minus the three §2-carried IDs that move out is 49" is corrected to **"§35's
+52 minus one is 51"**: of the five ids §38 named, the four W1 ids sat in
+§35's *repaired* bucket, never its 52 carried, so they subtract nothing;
+only `PR4-ADAPTER-RESOLVES-ON-THE-HOST` changes origin (to the hardening
+rule). §2-origin carried is **51**, and 51 + 26 = 77. The two ids §38's
+split displaced into closed belong in carried; its grand total was right and
+its buckets were not, which is precisely why a published count must carry
+its derivation.
+
+### The prose owner clauses: five, by detector
+
+Detector: every non-table, non-heading line matching `Owner…:` (bold or
+plain, including "Owner ruling, DATE:"), then excluding clauses whose
+subject has a canonical row. Nine hits at this head; excluded: line 1413 (a
+heading), line 1366 and line 2187 (they annotate the §15 six and
+`PR7-R4-LOOP-004`, which have rows), and line 1182 (the 2026-08-27
+restatement of `PR5-RD-002`'s trigger; that id has rows and its live
+instance is §24, repaired). The row-less clauses are therefore **five**, not
+§38's "four": §3's dependency clause (line 237), §12's pre-existing-flake
+clause (line 1118), §18's two clauses (lines 1784 and 1815), and §20's
+`effects::census_domain` clause (line 2241). Giving each a canonical row
+remains work for the next ledger pass, not this repair.
+
+### The second review's three dispositions
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-CANDIDATE-LABEL-RECURRENCE | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / reviews/2026-08-31-g2-gate-report.md:76 | the head declares no candidate exists -> sibling passages still label `50ed8c86`/`50a84acd` the candidate head -> a reader convenes the panel or reuses evidence against the baseline -> the checkpoint order is re-reversed in effect | fix_regression | docs-contract | PR80-CHECKPOINT-ORDER-REVERSED | Gate-report fifth revision's terminology pass; appended errata in both decision records and the `decisions/README.md` index fix; the acceptance grep over the seven paths whose every remaining "candidate" hit is a negation, the future sense, a quotation, the branch name, or the product sense | fixed |
+| PR80-OWED-LIST-DROPS-ARTIFACT-7 | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / decisions/2026-08-31-g2-checkpoint-promotion.md:195 | the third addendum lists artifacts 2, 3, 4, 5 and 8 as the owed captured set -> the gate report counts six uncaptured including artifact 7's scan output -> an operator completes the shorter list and cuts a candidate without artifact 7 -> the eight-artifact precondition is violated | fix_regression | docs-contract | PR80-CHECKPOINT-ORDER-REVERSED | The fourth addendum corrects the list to 2, 3, 4, 5, 7 and 8 and names the gate report's artifact table the single enumerator, authoritative over any restatement | fixed |
+| PR80-LEDGER-PROJECTION-UNPROVEN | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / reviews/FINDINGS.md:4056 | §38 claims 52 minus three = 49 from a named set in which only one id moves origin -> its carried/closed split contradicts its own 26-row enumeration -> it states four prose clauses and enumerates five -> a gate relying on §38 declares the ledger discharged without a reproducible accounting | fix_regression | docs-contract | PR80-LEDGER-AUDIT-NOT-FULL | This section's domain rules R1–R7, complete hand-ruled list, and corrected counts (197 = 94+77+17+7+2 at `e174d086`; 204 = 101+77+17+7+2 here), re-derivable by any implementation of the stated rules | fixed |
+
+Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md` (fourth
+addendum), `reviews/2026-08-31-g2-gate-report.md` (fifth revision),
+`decisions/2026-08-31-inertness-premise-behavioural.md` (erratum).
+
+## 40. PR80 exact-head macOS sampler recurrence (2026-08-31)
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-MACOS-WORKSPACE-SAMPLER-COLD-PROBE-RECURRENCE | P2 | 2ba66b6e06fa40f9d9fe06dfd21e22517e14d2d6 / hosted run 33421539013, macOS job 99584874271, `workspace_manager::tests::sampled_git_child_kills_every_residue_classified_and_recovered` | the workspace-manager sampler measures a one-shot probe budget -> every scheduled kill lands after its child has completed -> all 32 observations are `Completed` and no killed-child residue is sampled -> the required macOS leg refuses the vacuous run | fix_regression | platform-correctness | PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE | The refusal is correct and the failed run remains durable evidence. The candidate's `src/` tree is byte-identical to the green `50ed8c86ec60164011bfd393066c4c3696d3865b` source tree (`f8d2b1c6dff093bd1b656d639fa33762e479b7f9`), so this evidence-only slice did not change the failed code. Owner: project owner; venue: post-promotion sampler-hardening work; shrinks when the workspace-manager sampler uses the established warm-up, median, actual-duration recalibration, and bounded-retry discipline and a controlled macOS repetition demonstrates that at least one kill lands without masking the vacuity oracle | deferred |
+
+## 41. PR80 artifact-enumerator reading rule (2026-08-31)
+
+The explicit artifact membership in the historical
+`PR80-OWED-LIST-DROPS-ARTIFACT-7` row in §39 records the defect and its then
+current repair; it is not an operative enumerator. The artifact table in
+`reviews/2026-08-31-g2-gate-report.md` is the sole operative enumerator of
+artifact membership and capture state. This section introduces no new
+artifact-membership list.
