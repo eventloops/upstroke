@@ -106,3 +106,22 @@ unaffected.
   structural proofs and the report's own refusal of the false wording.
 - `reviews/FINDINGS.md` §37 — the carried row amendment 1a requires.
 - `2026-08-31-panel-seats.md` — the panel that confirms this premise on the candidate.
+
+## Erratum, 2026-08-31 — the baseline label
+
+Appended per this folder's correction rule and the owner's append-only
+ruling of 2026-08-31; nothing above this heading is edited.
+
+The preamble and verdict above call
+`50ed8c86ec60164011bfd393066c4c3696d3865b` "the candidate head". That label
+recreates the checkpoint-order defect the PR #80 reviews named: under
+`2026-08-25-checkpoint-merges.md` the candidate is cut only after the G2
+gate passes and the eight artifacts exist, and **no candidate has been
+cut**. Read every "candidate head" above as **pre-assembly baseline**, and
+"not a repair of this candidate" as "not a repair of this promotion". The
+ruling's substance is unchanged and unamended: the owner's ratification
+adopted the condition as **satisfied at `50ed8c86`** — by sha — and it is.
+The panel's confirmation "on the candidate" refers, as it always did, to the
+eventual candidate: the integration landing head, once it exists. Companion
+corrections: the promotion record's third and fourth addenda and the gate
+report's fifth revision note.

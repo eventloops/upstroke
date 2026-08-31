@@ -1,14 +1,14 @@
 # 2026-08-31 — G2 gate report (artifact 1)
 
-This is **artifact 1** of the G2 checkpoint candidate's evidence, the one
+This is **artifact 1** of the G2 checkpoint's evidence, the one
 `decisions/2026-08-25-checkpoint-merges.md` names. It is written against the
-E5-extended input range, adopted for this candidate by the owner's direct
+E5-extended input range, adopted for this promotion by the owner's direct
 promotion amendment of 2026-08-31.
 
-Every derived fact below was re-measured on this host at the exact candidate
-head. Where a number came from an earlier baseline it is re-derived and the
-delta is stated. The private packet records are read but never reproduced: this
-report cites them only by stable internal reference
+Every derived fact below was re-measured on this host at the exact
+pre-assembly baseline. Where a number came from an earlier baseline it is
+re-derived and the delta is stated. The private packet records are read but
+never reproduced: this report cites them only by stable internal reference
 (`cumulative_review_gates.gates[G2].<field>`).
 
 - **Pre-assembly baseline:** `50ed8c86ec60164011bfd393066c4c3696d3865b` — **not a cut candidate**; see "What `50ed8c86` is" below
@@ -26,6 +26,20 @@ panel membership was unsettled while the same head adopted the three ratified
 seats — a current artifact cannot assert both. Both are corrected below. The
 other two blockers land on `reviews/FINDINGS.md` §38 and
 `reviews/2026-08-31-g2-first-parent-coverage.md`.
+
+**Revision, 2026-08-31 (fifth).** The follow-up review of `ada79bd7` returned
+three P1 findings, and all three are right. The one that lands on this file:
+the candidate label still stood on `50ed8c86` and `50a84acd` in passages the
+fourth revision did not sweep — the checkpoint-order blocker recurring through
+terminology. Every remaining current-status use of "candidate" for either sha
+in this report now reads **pre-assembly baseline** (`50ed8c86`) or **committed
+evidence head** (`50a84acd`); quotations and the future sense ("the candidate
+will be the integration landing head", "before a candidate is cut") are
+unchanged. The artifact table below remains the **single enumerator** of the
+owed captured set — six uncaptured: artifacts 2, 3, 4, 5, **7** and 8. The
+other two findings land on
+`decisions/2026-08-31-g2-checkpoint-promotion.md` (fourth addendum) and
+`reviews/FINDINGS.md` §39.
 
 ## What `50ed8c86` is
 
@@ -72,9 +86,10 @@ corrected from three to four in the same pass.
 
 ## Verdict
 
-**The G2 gate does not pass at this candidate.** The serialized suite has now
-run green at the exact candidate head, including the Docker-gated tests against
-a live daemon, and that discharges more than assembly could. It does not
+**The G2 gate does not pass at this baseline.** The serialized suite has now
+run green at the committed evidence head
+`50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`, including the Docker-gated tests
+against a live daemon, and that discharges more than assembly could. It does not
 discharge the gate, for two reasons that are not fixable by another Linux run:
 
 1. **The artifacts are captured evidence, not merely passing oracles.** Six of
@@ -100,7 +115,7 @@ the explicit verdict marker. No pre-authorized fallback: one repair attempt, the
 wait for the owner, and the panel never convenes partially. **No seat has run**,
 and no test result changes that.
 
-Nothing in this report is a claim that a reviewer reread the candidate diff.
+Nothing in this report is a claim that a reviewer reread the promotion diff.
 
 ## The eight required artifacts
 
@@ -199,8 +214,8 @@ compile necessarily evaluated.
    ratified (`decisions/2026-08-31-panel-seats.md`) and no seat has run.** No
    test result touches this.
 
-**Consequently the candidate is still not gate-passed, and no part of this
-record should be read as saying it is.**
+**Consequently the G2 gate is still not passed and no candidate has been cut;
+no part of this record should be read as saying otherwise.**
 
 ## Inert by default — verified, not assumed
 
@@ -212,19 +227,19 @@ from the paths named.
 
 `RunState::apply` — the legacy replay fold, and the whole of how v0.1 derives
 state from `events.jsonl` — is **byte-identical** between `master` and the
-candidate:
+baseline:
 
 | Side | Location | sha256 of the function region |
 |---|---|---|
 | `76b6a784` (master) | `src/events.rs:1069-1271` | `f5e8f1d632681b39a8b9d7c1d4b13c4dff9b04b3194da65e484b0af6a282b29d` |
-| `50ed8c86` (candidate) | `src/events/mod.rs:1165-1367` | `f5e8f1d632681b39a8b9d7c1d4b13c4dff9b04b3194da65e484b0af6a282b29d` |
+| `50ed8c86` (baseline) | `src/events/mod.rs:1165-1367` | `f5e8f1d632681b39a8b9d7c1d4b13c4dff9b04b3194da65e484b0af6a282b29d` |
 
 The file moved (`src/events.rs` → `src/events/mod.rs`) as part of the module
 split; the function did not change. Hashed rather than line-counted, because a
 one-character edit does not move a line count.
 
 `events::SCHEMA_VERSION` is `3` on both sides — `src/events.rs:52` on master,
-`src/events/mod.rs:64` on the candidate.
+`src/events/mod.rs:64` on the baseline.
 
 ### 2. `max_parallel` above 1 is refused until activation
 
@@ -323,7 +338,7 @@ topology` and be entitled to distrust the rest of the report.
 
 `Cargo.toml` is `version = "0.1.0"` on both `76b6a784` and `50ed8c86`. The only
 tag in the repository is `v0.1.0`. `CHANGELOG.md` carries an `## Unreleased`
-section and no `0.2.0` heading. Nothing in this candidate creates, moves, or
+section and no `0.2.0` heading. Nothing in this promotion creates, moves, or
 authorizes a tag.
 
 ## Bridge and promotion evidence
@@ -372,12 +387,12 @@ invalidation scope admits, and not something that has to be argued from a small
 diff.
 
 This also closes the earlier preservation blocker: `master`'s `docs/CNAME` is
-already incorporated in the candidate, by merge `50ed8c86`. Nothing about
+already incorporated in the baseline, by merge `50ed8c86`. Nothing about
 master-forward remains outstanding.
 
 ### CI evidence at `50ed8c86`
 
-Bridge-triggered, at the candidate head:
+Bridge-triggered, at the baseline `50ed8c86`:
 
 | Run | What | Result |
 |---|---|---|

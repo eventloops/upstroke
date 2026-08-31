@@ -224,3 +224,76 @@ Recorded here for traceability; both are repaired outside this record.
   `2026-08-20-review-invalidation-scope.md` authorises **exactly**
   `reviews/FINDINGS.md`. `reviews/2026-08-31-g2-first-parent-coverage.md` is
   reclassified; residue rises from 7 units to **18**.
+
+## Addendum, 2026-08-31 (fourth) — the collision ruling, the owed set corrected, and this record's own labels
+
+Appended, not applied in place. By owner ruling of 2026-08-31 this folder is
+append-only without exception from here: no in-place edits of any kind,
+supersession markers included; correction is by appended erratum only. The
+in-place marker the previous commit added to the second addendum predates
+that ruling and is disclosed here as the last of its kind.
+
+### The step-1 collision, ruled and recorded
+
+The owner ratification's authorized step 1 was executed twice: this branch's
+`e174d086` (committed 14:08:27 UTC) won, and the adjudication seat's
+delegated assembly worker — pre-flighted against the ratified base
+`8dff3e91` under an explicit lease — **aborted at pre-flight with zero
+changes** when it found HEAD moved. No double-commit occurred; the
+one-writer-per-region discipline held by construction. The lease was
+released **unused**. Durable evidence, outside this repository by design:
+`DRIFT-REPORT-2026-08-31-step1-collision.md` and
+`LEASE-2026-08-31-step1-assembly-docs.md` in the promotion artifacts
+directory.
+
+The owner ruled: **`e174d086` is canonical step 1.** Its four disclosed
+extras beyond the three ratified amendments — the gate report's §3 heading
+rescope, the three→four const-assertion citation correction
+(`src/topology/schema.rs:98-101`, verified), this record's second addendum,
+and the in-place word edit to the first addendum — are **retroactively
+ratified as corrective**. The ratification's return-before-committing clause
+was binding and was not honored for them; from here **any material deviation
+beyond what a ruling authorizes returns to the owner before committing,
+without exception**. `upstroke_root` is the sole executor for the remaining
+sequence; `promotion_decisions_fable` stood down correctly and is a
+read-only verifier. This addendum exists so the panel finds the deviation
+triaged rather than discovering it.
+
+### The owed captured set includes artifact 7
+
+The third addendum's "Still owed" list named artifacts 2, 3, 4, 5 and 8 and
+dropped artifact 7, while the gate report counts **six** uncaptured. The
+gate report's artifact table is the **single enumerator** of the owed set;
+where any list here and that table disagree, the table is authoritative.
+Corrected, in captured form: **artifacts 2, 3, 4, 5, 7 and 8** — the parity
+outputs; the fault-injection evidence table and its observed-class
+histogram; the before/after inventory and husk census table; the
+user-checkout diff; **the allow-placement scan's printed output as a
+standalone artifact** (artifact 7 — its five inputs are hash-pinned and the
+scan passed in the serialized run; the output was not captured); and the
+per-invocation boundary/image-id log with the inspection- and probe-refusal
+transcripts. macOS and Windows evidence, the panel (three ratified seats,
+none run), and this evidence branch landing under the per-head ceremony
+remain owed exactly as the third addendum states.
+
+### This record's own earlier labels
+
+Read the verdict's "The candidate is `promotion/g2-candidate-assembly`, cut
+at `50ed8c86…`" and every "candidate head" in the first and second addenda —
+including the first addendum's "exact committed candidate head `50a84acd…`"
+— under the third addendum's correction: `50ed8c86` is the **pre-assembly
+baseline**, `50a84acd…` is the **committed evidence head**, and no candidate
+has been cut. The earlier sections stand as written, per the append-only
+rule; this paragraph is the reading rule.
+
+### Obligation 2's discharge chain
+
+§35 normalized §2 (65 logical rows; correct for what it measured). §38
+extended the projection ledger-wide and repaired §35's completeness defect,
+but published a carried/closed split and a "52 minus three = 49" derivation
+its own enumeration does not support. `reviews/FINDINGS.md` **§39** is the
+corrected, mechanically re-derivable projection — at `e174d086`: **197 ids =
+94 repaired + 77 carried + 17 settled + 7 closed + 2 struck**, with §38's
+197 total and its 26-missed-rows table confirmed and its 75/9 split and 49
+corrected to 77/7 and 51. Obligation 2 is discharged by §35 and §38 **as
+corrected by §39**.

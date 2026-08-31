@@ -87,13 +87,15 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-31 — the G2 checkpoint promotion candidate](2026-08-31-g2-checkpoint-promotion.md):
   reconciles `2026-08-25-checkpoint-merges.md` obligation by obligation and leaves it
   controlling in full. The ledger audit and the recurrence review are discharged, and the
-  serialized suite ran green at the candidate head; the panel and the six captured gate
+  serialized suite ran green at the committed evidence head; the panel and the six captured gate
   artifacts, plus macOS and Windows, remain owed. Inertness is
   verified by construction, no `0.2.0` tag is authorized, and rollback is
   `git revert -m 1 MERGE_OID` — deliberately a high bar, because re-promotion then
-  requires reverting the revert.
+  requires reverting the revert. A fourth addendum records the step-1 collision
+  ruling, includes artifact 7 in the owed captured set, and binds this record to
+  correction by appended erratum.
 - [2026-08-31 — the inertness premise is behavioural](2026-08-31-inertness-premise-behavioural.md):
-  the G2 inertness condition is behavioural and holds at the candidate head; the
+  the G2 inertness condition is behavioural and holds at the pre-assembly baseline; the
   `pub(crate)` visibility form is retired as false and unachievable. A library consumer can
   WRITE schema-4 state through the checked funnel, carried as a ledger row for the PR12
   activation slice. No visibility change to the code is authorized.

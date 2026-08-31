@@ -4129,3 +4129,132 @@ work for the next ledger pass, not for this repair.
 Companion records: `reviews/2026-08-31-g2-first-parent-coverage.md`,
 `reviews/2026-08-31-g2-gate-report.md`,
 `decisions/2026-08-31-g2-checkpoint-promotion.md` (third addendum).
+
+## 39. 2026-08-31 PR #80 second exact-head review — the projection made reproducible, and the labels closed
+
+Append-only. This section repairs the three P1 findings the sole review of
+`ada79bd76c791a6faac18f850929fbbd8cd7b237` returned, corrects §38's
+arithmetic by re-deriving it, and records the review's dispositions. It
+rewrites no historical row and reopens no disposition.
+
+### Reading rule for the labels in §§35–37
+
+§35 says "measured at candidate head" (line 3637; likewise its prose at
+lines 3847, 3871 and 3882), §36 "at the exact committed candidate head"
+(line 3893), §37 "satisfied at the candidate head" (line 3947). Per the
+promotion record's third addendum: `50ed8c86` is the **pre-assembly
+baseline**, `50a84acd…` the **committed evidence head**, and no candidate
+has been cut. Those sections stand as written under this file's append-only
+rule; this paragraph is the reading rule a later auditor applies. ("Candidate"
+in the product sense — the merge queue's prepared candidates,
+`PR7-CANDIDATE-TREE-UNVERIFIED` — is a different word and is untouched.)
+
+### The canonical-row domain, restated so a script can hold it
+
+§38's domain rule was not reproducible as stated: applied literally, its
+`||` split fires inside code spans (lines 102, 105 and 3864 carry a literal
+`||` in backticks) and its "first cell is a stable ID" admits prose cells
+that merely mention an id. The rules that close both holes:
+
+- **R1.** A physical table line is any line whose stripped form starts with
+  `|` and is not a separator row.
+- **R2.** A line splits into two logical rows at a `||` occurring **outside
+  backtick spans**, and only if **both** halves independently satisfy R3.
+  Exactly one line in this file splits: line 156.
+- **R3.** A logical row is **canonical** iff its first cell — after
+  stripping strikethrough, emphasis, backticks, and a trailing parenthetical
+  annotation such as `(a)` or `*(re-scoped: …)*` — consists **entirely** of
+  one finding id or a `·`-separated list of finding ids, an id matching
+  `^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$`.
+- **R4.** A `·` list expands to one instance per id at the same line.
+- **R5.** Restatement tables — audit views that re-list rows owned elsewhere
+  — are excluded as sources. At this head they are exactly: §35's four view
+  tables (lines 3689–3697, 3704–3709, 3727–3731, 3759–3812) and §38's
+  missed-rows listing (lines 4067–4094). §38's four-disposition table is a
+  **source** (the only instances of its `PR80-*` ids), as is the disposition
+  table at the end of this section. This section adds no other id-first-cell
+  rows, so it moves the projection by exactly its three new rows.
+- **R6.** For each id, the source instance with the greatest line number is
+  the live one (latest-disposition-wins).
+- **R7.** The winner classifies by section rule, then keyword, then an
+  explicit hand-ruled list — every hand ruling named below with its basis;
+  nothing is ruled silently.
+
+Section rules: §1 → settled; §5, §6, §7, §9, §10, §26, §31, §34 → repaired;
+"The hardening rule", §8, §15 → carried; §2 → repaired on an in-row
+`FIXED`/"fixed in PR7" marker, closed on "Closed, not repaired"/"Closed by
+this row", struck on `~~`, else carried. Elsewhere, keywords in the winning
+row: a leading bold `Carried` → carried; `Repaired`/`fixed in this slice`/
+`fixed by owner…`/`implementation-fixed` → repaired; `CLOSED`/`Closed by` →
+closed; a terminal cell `deferred` → carried; a terminal cell `fixed` →
+repaired; `accepted residual`, `blocked by packet`, or a bold `deferred`
+disposition cell → carried.
+
+Hand-ruled (complete list): `PR5-MACOS-CLIPPY-NEVER-RUN` → repaired (§3's
+dated 2026-08-28 challenge outcome; `lint (macos)` live in `ci.yml`);
+`PR4-PROGRAM-PATH-NOT-UNICODE` → closed (superseded by its `-CLOSED` and
+`-CLOSED-NARROWED` successor rows and
+`2026-08-25-commandspec-program-stays-string.md`);
+`PR5D-MSVC-CLIPPY-NEVER-RUN` → repaired (`lint (windows)` runs clippy
+natively on `windows-latest`; the deferred cross-target gate was superseded
+by the native job, and `clippy::items_after_test_module` is now a governed
+lint); `PR5-RD-001` → repaired (its row records the repair and witnesses);
+`PR5D-PROOF-TESTS-COUNT` → closed (recorded, no owner needed);
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY` → closed (a terminology
+correction; the disposition lives with the base id); and the four §20
+round-3 rows `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`,
+`PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`,
+`PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`,
+`PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` → carried (each
+names its owner in-row; no terminal keyword).
+
+### The corrected counts, and exactly what moved
+
+| Head | Distinct ids | repaired | carried | settled | closed | struck |
+|---|---:|---:|---:|---:|---:|---:|
+| `e174d086` (what §38 measured) | 197 | 94 | **77** | 17 | **7** | 2 |
+| `ada79bd7` (§38's four rows added, repaired) | 201 | 98 | 77 | 17 | 7 | 2 |
+| this head (this section's three rows added, repaired) | **204** | **101** | **77** | **17** | **7** | **2** |
+
+Confirmed by this re-derivation: §38's total of 197; repaired 94; settled
+17; struck 2; and its 26-missed-rows table — the non-§2 carried set is
+**exactly** those 26 ids. Corrected: **carried is 77, not 75, and closed is
+7, not 9.** The closed set, exhaustively: the three
+`PR4-PROGRAM-PATH-NOT-UNICODE*` rows (one finding recorded three times),
+`PR5D-PROOF-TESTS-COUNT`, `PR7-R3-EMIT-006-DEFER-ROUND-IS-A-BACKOFF-ROUND`,
+`PR7-R3-SETTLE-CAND-OBJ-REFUSAL-UNREACHABLE`, and
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY`. And §38's "§35's 52
+minus the three §2-carried IDs that move out is 49" is corrected to **"§35's
+52 minus one is 51"**: of the five ids §38 named, the four W1 ids sat in
+§35's *repaired* bucket, never its 52 carried, so they subtract nothing;
+only `PR4-ADAPTER-RESOLVES-ON-THE-HOST` changes origin (to the hardening
+rule). §2-origin carried is **51**, and 51 + 26 = 77. The two ids §38's
+split displaced into closed belong in carried; its grand total was right and
+its buckets were not, which is precisely why a published count must carry
+its derivation.
+
+### The prose owner clauses: five, by detector
+
+Detector: every non-table, non-heading line matching `Owner…:` (bold or
+plain, including "Owner ruling, DATE:"), then excluding clauses whose
+subject has a canonical row. Nine hits at this head; excluded: line 1413 (a
+heading), line 1366 and line 2187 (they annotate the §15 six and
+`PR7-R4-LOOP-004`, which have rows), and line 1182 (the 2026-08-27
+restatement of `PR5-RD-002`'s trigger; that id has rows and its live
+instance is §24, repaired). The row-less clauses are therefore **five**, not
+§38's "four": §3's dependency clause (line 237), §12's pre-existing-flake
+clause (line 1118), §18's two clauses (lines 1784 and 1815), and §20's
+`effects::census_domain` clause (line 2241). Giving each a canonical row
+remains work for the next ledger pass, not this repair.
+
+### The second review's three dispositions
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-CANDIDATE-LABEL-RECURRENCE | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / reviews/2026-08-31-g2-gate-report.md:76 | the head declares no candidate exists -> sibling passages still label `50ed8c86`/`50a84acd` the candidate head -> a reader convenes the panel or reuses evidence against the baseline -> the checkpoint order is re-reversed in effect | fix_regression | docs-contract | PR80-CHECKPOINT-ORDER-REVERSED | Gate-report fifth revision's terminology pass; appended errata in both decision records and the `decisions/README.md` index fix; the acceptance grep over the seven paths whose every remaining "candidate" hit is a negation, the future sense, a quotation, the branch name, or the product sense | fixed |
+| PR80-OWED-LIST-DROPS-ARTIFACT-7 | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / decisions/2026-08-31-g2-checkpoint-promotion.md:195 | the third addendum lists artifacts 2, 3, 4, 5 and 8 as the owed captured set -> the gate report counts six uncaptured including artifact 7's scan output -> an operator completes the shorter list and cuts a candidate without artifact 7 -> the eight-artifact precondition is violated | fix_regression | docs-contract | PR80-CHECKPOINT-ORDER-REVERSED | The fourth addendum corrects the list to 2, 3, 4, 5, 7 and 8 and names the gate report's artifact table the single enumerator, authoritative over any restatement | fixed |
+| PR80-LEDGER-PROJECTION-UNPROVEN | P1 | ada79bd76c791a6faac18f850929fbbd8cd7b237 / reviews/FINDINGS.md:4056 | §38 claims 52 minus three = 49 from a named set in which only one id moves origin -> its carried/closed split contradicts its own 26-row enumeration -> it states four prose clauses and enumerates five -> a gate relying on §38 declares the ledger discharged without a reproducible accounting | fix_regression | docs-contract | PR80-LEDGER-AUDIT-NOT-FULL | This section's domain rules R1–R7, complete hand-ruled list, and corrected counts (197 = 94+77+17+7+2 at `e174d086`; 204 = 101+77+17+7+2 here), re-derivable by any implementation of the stated rules | fixed |
+
+Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md` (fourth
+addendum), `reviews/2026-08-31-g2-gate-report.md` (fifth revision),
+`decisions/2026-08-31-inertness-premise-behavioural.md` (erratum).
