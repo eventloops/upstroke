@@ -164,3 +164,33 @@ Newest first. **n** is the number of range commits the unit owns.
 | 64 | `eacdbda` | non-PR | 1 | **R** | refactor(engine): rewire test imports and fix facade doc |
 | 65 | `651c719` | non-PR | 1 | **R** | refactor(engine): split engine.rs into production module |
 | 66 | `df05503` | non-PR | 1 | **R** | refactor(engine): extract inline tests |
+
+## Addendum, 2026-08-31 — PR #80 and the capture unit extend the baseline map
+
+The map above remains the complete mechanical partition of the pre-assembly
+baseline `76b6a784..50ed8c86`: **418 commits in 66 first-parent units**. It is
+not rewritten to make later evidence look older than it is.
+
+PR #80's integration head `47dc9a35f6e6af59160ece49570d9934a4450dec`
+adds one first-parent unit owning seven range commits: the six evidence commits
+`50a84acd`, `8dff3e91`, `e174d086`, `ada79bd7`, `2ba66b6e`, and `bc67e7e1`,
+plus merge `47dc9a35`. The range through that merge is therefore **425 commits
+in 67 first-parent units**. That unit is class **S**, `n = 7`.
+
+The capture commit carrying this addendum advances the promotion head once more.
+It is one direct evidence unit, `n = 1`, assigned to class **R** until the fresh
+round-two panel reviews it. The final range is consequently **426 commits in 68
+first-parent units**:
+
+| Class | Units | Commits |
+|---|---:|---:|
+| **S** — slice pull request | 34 | 376 |
+| **B** — bridge pull request | 2 | 16 |
+| **M** — master-forward merge, verified | 2 | 2 |
+| **X** — authorised exact-`reviews/FINDINGS.md` exemption | 11 | 12 |
+| **R** — residue delegated to the panel | 19 | 20 |
+
+The unit counts sum to **68** and the commit counts sum to **426**. The older
+residue set remains 18 units / 19 commits; the one-unit increase is exactly this
+capture commit. No historical unit changes class, and no review is claimed in
+advance of the fresh panel.

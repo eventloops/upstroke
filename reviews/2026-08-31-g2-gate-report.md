@@ -101,19 +101,24 @@ discharge the gate, for two reasons that are not fixable by another Linux run:
    `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` — that exist precisely because a
    Linux-only green closed a platform question falsely.
 
-3. **No candidate has been cut.** The gate is a precondition of the cut, not a
-   property of the baseline, and this report is an input to it.
+3. **The candidate was cut before capture.** That violated the ordered
+   precondition and is recorded, not normalized away, in `reviews/FINDINGS.md`
+   §42. This capture closes the missing-form defect; it does not waive the
+   sequencing breach.
 
 And the gate's own pass rule requires a completed review with no open
-critical/high finding. **The panel's membership is settled and the panel has not
-convened.** The three seats are ratified by the owner in
+critical/high finding. **The panel's membership is settled. Round one ran at
+`47dc9a35`, returned OpenAI BLOCK, Anthropic PASS, and a non-conforming Google
+BLOCK/non-vote, and is therefore invalid as a panel.** The three seats are
+ratified by the owner in
 `decisions/2026-08-31-panel-seats.md` — `gpt-5.6-sol` at `max` via `codex exec`
 with login judged by output text; `claude-fable-5` at `max` with `--model`
 pinned on every invocation; `gemini-3.1-pro-high` via `/home/ubuntu/.local/bin/agy`
 by absolute path with `--model` pinned, counting only on `status: SUCCESS` plus
-the explicit verdict marker. No pre-authorized fallback: one repair attempt, then
-wait for the owner, and the panel never convenes partially. **No seat has run**,
-and no test result changes that.
+the explicit verdict marker. For round two the owner authorized two additional
+Google invocation repairs; one successful dry probe has been consumed and one
+remains. All three seats must reconvene fresh and blind at the advanced head;
+no test result substitutes for that panel.
 
 Nothing in this report is a claim that a reviewer reread the promotion diff.
 
@@ -124,24 +129,38 @@ its index and by a public-safe description of what it asks for.
 
 States are deliberately narrow. **Produced** means the artifact exists.
 **Oracles passed** means every in-suite test the artifact rests on executed and
-passed at this head, but the artifact's captured form — the table, log,
-transcript, diff or histogram it names — was not collected. **Owed** means
-neither.
+passed at this head. **Produced** additionally means the named table, log,
+transcript, diff or histogram exists in the hash-pinned capture directory.
+**Owed** means neither.
 
 | # | What the artifact is | State | What the run substantiates, and what it does not |
 |---|---|---|---|
 | 1 | The gate report | **Produced** | This file |
-| 2 | Host/container parity outputs | **Oracles passed (Linux)** | The parity oracles ran against the live daemon and passed — `real_docker_adapter_parsing_matches_the_host_table` (`src/runner/container/exec.rs:6653`) is the named host-versus-container comparison. **Not captured:** the parity *outputs*. **Not covered:** macOS and Windows |
-| 3 | Fault-injection evidence table for the G2 sites — event kill and error-return points, the sync-prefix barrier refusal cases, id-unread points, and residue-class evidence (synthetic per element, plus a sampling record with its observed-class histogram) | **Oracles passed (Linux)** | The kill-point, error-return, sync-prefix-barrier, id-unread and residue-class tests are inside the green suite, and the kill children they re-invoke as subprocesses ran with them. **Not captured:** the evidence *table*, and the sampling record's **observed-class histogram** — the suite asserts the sampler's premise, it does not emit a histogram. The sampler's own scheduling hazard is `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE`, repaired in PR7 |
-| 4 | Ref, worktree, snapshot, object, container and run-directory inventory before/after, with the husk census table | **Oracles passed (Linux)** | The husk-census and inventory oracles passed, including the Docker-backed container reclaim tests. **Not captured:** the before/after inventory and the husk census table, per shape, with the creator-error cases |
-| 5 | User-checkout inventory diff | **Oracles passed (Linux)** | The checkout-inventory oracles passed. **Not captured:** the diff itself |
+| 2 | Host/container parity outputs | **Produced (Linux)** | `02-host-container-parity.txt`, sha256 `ad31058f5a7f8b8ad7ffd04cc5990abff2b2355b5632990355159bf42d6f938c`; live Docker 29.7.2 plus every executed host/container parity and real-Docker oracle. macOS and Windows are the exact-head hosted capture below, not invented local output |
+| 3 | Fault-injection evidence table for the G2 sites — event kill and error-return points, the sync-prefix barrier refusal cases, id-unread points, and residue-class evidence (synthetic per element, plus a sampling record with its observed-class histogram) | **Produced (Linux)** | `03-fault-injection-evidence-table.txt`, sha256 `db581bd932a8d956fb58d15a72c3d87bf24a4a8dc191b887ab210935965d3bca`, contains all 70 site rows, named oracle outcomes, and both emitted observed-class histograms; the standalone histogram hashes are pinned in the manifest |
+| 4 | Ref, worktree, snapshot, object, container and run-directory inventory before/after, with the husk census table | **Produced (Linux)** | Normalized before/after inventories have identical sha256 `048271a07907c4d86f5ab16057de906c38e9df7072a10c5f9224e5dc20e3fe65`; their diff is empty. `04-inventory-husk-census.txt`, sha256 `a1fdf7a8cfdcbaa208553b1e4f5751b35cb1c376d4634817db2670fa5baa524f`, records group/residue tables and every husk/creator-error oracle |
+| 5 | User-checkout inventory diff | **Produced (Linux)** | `05-user-checkout-before.txt` and `05-user-checkout-after.txt` are byte-identical, sha256 `c33b71398e6e2112efe4696ed6ffcee297559a646f0d6c2acf9641dc9bd86c0f`; `05-user-checkout-inventory.diff` is the empty diff, sha256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
 | 6 | Docker-gated suite result with the environment noted | **Produced (Linux)** | This is the one artifact the run yields directly. `rc=0`, fresh compile, lib 1801 passed / 0 failed / 34 ignored, main 8 passed / 0 failed, example 0 tests; the `real_docker_*` tests exercised a live **Docker server 29.7.2**. Environment noted below. **Not covered:** macOS and Windows |
-| 7 | `clippy.toml`, `effects/allowlist.toml`, wrapper classification, `effect_sites.json`, allow-placement scan output | **Inputs pinned; scan passed** | All five inputs exist at this head and are hash-pinned below, and the allow-placement scan `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` (`src/effects/tests.rs:507`) passed in the green suite, as did `every_allowlist_entry_carries_its_justification_and_names_a_real_file` (`:898`). **Not captured:** the scan's printed output as a standalone artifact |
-| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Oracles passed (Linux)** | The runner-record, owner-record, intent-digest, image-id and refusal oracles passed. **Not captured:** the per-invocation boundary and image-id **log**, and the inspection-refusal and probe-refusal **transcripts**. These are the artifact, and the suite does not emit them |
+| 7 | `clippy.toml`, `effects/allowlist.toml`, wrapper classification, `effect_sites.json`, allow-placement scan output | **Produced (Linux)** | Inputs remain pinned below. `07-allow-placement-scan.txt`, sha256 `dfe7dbbde61c8690fe4de5579c87da3bc5a32a4249d8d468bb552633d1ebf308`, is the standalone scan output and includes its four input hashes |
+| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Produced (Linux)** | `08-runner-identity-refusal-transcripts.txt`, sha256 `1e16c27f6e520b84e4c88312a4bebad287fece83f5e08ed237b80b685b828485`, records the executed identity, boundary, digest and refusal witnesses from the instrumented suite |
+
+### Capture directory and manifest
+
+All side outputs live under
+`/home/ubuntu/tactus-artifacts/promotion/g2-captures/`. `SHA256SUMS` is the
+complete selected-file manifest and hashes to
+`96b9fec94b9bc0d40c069190ac332930c1d2f4e8749befaea3d4b36a775fcc55`.
+The capture anchor is `47dc9a35f6e6af59160ece49570d9934a4450dec`, tree
+`7f7b03017997cca503f2c28822d75d4f622d731e`. The capture commit changes only
+this gate report, the coverage-map addendum, and the append-only ledger row; it
+therefore leaves every tested source and configuration byte unchanged. The
+standalone latest-disposition projection is
+`10-ledger-projection-capture.txt`, sha256
+`a2ea0cd89e59c2e162d16caf5701a57dc38de592e34835bca83f3d801ab5ec8d`.
 
 ### Artifact 7 — the inputs, pinned
 
-Present at `50ed8c86`, sha256 truncated to 16 hex characters:
+Present at the capture anchor `47dc9a35`, sha256 truncated to 16 hex characters:
 
 | Path | sha256 (first 16) | bytes |
 |---|---|---|
@@ -158,11 +177,13 @@ as unchanged from its base, re-derived here rather than copied.
 
 ## The serialized gate run
 
-Run by root through the globally serialized build wrapper at the exact committed
-evidence head `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
+Run by root through the globally serialized build wrapper at exact capture
+anchor `47dc9a35f6e6af59160ece49570d9934a4450dec` with `--nocapture` so the
+machine-varying residue histograms and named oracle outcomes were durable:
 
 ```
-/home/ubuntu/bin/upstroke-build cargo test --all-targets --all-features
+RUST_TEST_NOCAPTURE=1 /home/ubuntu/bin/upstroke-build \
+  cargo test --all-targets --all-features -- --nocapture
 ```
 
 | Fact | Value |
@@ -174,6 +195,9 @@ evidence head `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
 | Example target | 0 tests |
 | Docker | live daemon, **Docker server 29.7.2**; the `real_docker_*` tests used it and passed |
 | Platform | Linux, this host only |
+
+The complete log is `06-serialized-full-suite.log`, sha256
+`462170d58b1e800322d23bc99b1b830f2b0bfef33c57b73655394f87ce05f055`.
 
 **On the 34 ignored.** They are `#[ignore]`-marked **subprocess entry points** —
 `*_kill_child`, `*_helper`, `*_child` functions that a parent test re-invokes as
@@ -189,8 +213,8 @@ makes its Docker result readable.
 
 ### What the run does, and does not, discharge
 
-**Discharged:** artifact 6 outright, on Linux. Artifact 7's scan result. The
-oracles beneath the other uncaptured rows in the authoritative artifact table.
+**Discharged:** artifacts 2 through 8 are now captured on Linux, including the
+standalone forms rather than only their oracles. Artifact 1 is this report.
 
 **Strengthened, not newly claimed:** the inertness proofs below were already
 structural — verified by reading the tree, not by running it. The green suite
@@ -201,21 +225,21 @@ compile necessarily evaluated.
 
 **Not discharged, and not dischargeable by another Linux run:**
 
-1. **The captured artifacts.** Six of the eight name a table, a log, a
-   transcript, a diff or a histogram. Those were not collected, and this report
-   does not claim them. An oracle passing is evidence *for* the artifact; it is
-   not the artifact.
-2. **macOS and Windows.** Hosted evidence, not produced here. The two platform
+1. **macOS and Windows.** Hosted evidence, not produced here. The two platform
    rows named in the verdict are the standing reason a Linux green is not a
    substitute.
-3. **The panel.** The gate's pass rule requires questions answered and no open
+2. **The panel.** The gate's pass rule requires questions answered and no open
    critical/high finding, and the checkpoint record requires a three-model panel
-   to attest the code and the audited ledger together. **The three seats are
-   ratified (`decisions/2026-08-31-panel-seats.md`) and no seat has run.** No
-   test result touches this.
+   to attest the code and the audited ledger together. Round one at `47dc9a35`
+   is durable but invalid because Google was a non-vote; OpenAI also returned
+   two High blockers. This capture closes those named evidence defects, but a
+   fresh blind three-seat round over the advanced head remains required.
 
-**Consequently the G2 gate is still not passed and no candidate has been cut;
-no part of this record should be read as saying otherwise.**
+**Consequently the captured-artifact obligation is discharged, but the G2 gate
+does not pass until the fresh panel returns three conforming votes with no open
+Critical or High finding.** The sequencing breach from cutting the candidate
+first remains recorded in `reviews/FINDINGS.md` §42; this capture does not waive
+or erase it.
 
 ## Inert by default — verified, not assumed
 
@@ -403,6 +427,21 @@ Bridge-triggered, at the baseline `50ed8c86`:
 **Pre-bridge CI is not cited as platform evidence anywhere in this record**, and
 must not be: the bridge changed the head, and a run that concluded before it
 speaks about a different commit.
+
+### Cross-platform capture at `47dc9a35`
+
+The capture anchor's hosted run `33434846757` completed successfully with every
+Linux, macOS and Windows test, lint and Rust-1.85 MSRV leaf plus the aggregate
+green. Policy run `33434846790` also completed successfully. The complete CI
+metadata and logs are captured as `09-hosted-ci-33434846757.json` (sha256
+`9aeca30f30f6564d330ffeaee7c4b665c0e028b0be54beb8f5594940f3d6f524`),
+`09-hosted-ci-33434846757.log` (sha256
+`c86dc1f734a09a844b0cf504debf008dfd7923fd1d626c0d0f6f2beeef9803fe`),
+and `09-hosted-policy-33434846790.json` (sha256
+`579b5c67706059a52d1a2fc963cb620ea2de8f1dd9dba8713ae4932caff86206`).
+These are the cross-platform capture; the local instrumented forms remain
+Linux-specific. The capture commit must receive its own hosted exact-head green
+board before round two convenes.
 
 **Custody of this claim.** These three results are recorded as supplied by root.
 `gh` on this host is unauthenticated, so assembly could not re-query them; the

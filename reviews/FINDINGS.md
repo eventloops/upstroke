@@ -4273,3 +4273,13 @@ current repair; it is not an operative enumerator. The artifact table in
 `reviews/2026-08-31-g2-gate-report.md` is the sole operative enumerator of
 artifact membership and capture state. This section introduces no new
 artifact-membership list.
+
+## 42. PR #18 G2 artifact-capture sequencing breach (2026-08-31)
+
+Append-only. The owner adjudicated panel round one at
+`47dc9a35f6e6af59160ece49570d9934a4450dec` and required this sequencing breach
+to remain visible even after its missing evidence was captured.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR18-G2-ARTIFACT-CAPTURE-AFTER-CANDIDATE-CUT | P1 | 47dc9a35f6e6af59160ece49570d9934a4450dec / `reviews/2026-08-31-g2-gate-report.md`, authoritative artifact table | the dated checkpoint decision requires all eight captured artifacts before a candidate is cut -> candidate assembly and PR #80 landing advance PR #18 to `47dc9a35` while artifacts 2, 3, 4, 5, 7 and 8 remain only oracle-passed or owed -> panel round one finds the missing captured forms as a High blocker -> the promotion cannot attest the checkpoint in the required order | fix_regression | evidence-integrity | PR80-CHECKPOINT-ORDER-REVERSED | The breach is not waived: this capture commit records the instrumented serialized run, produces and hash-pins all six missing forms, keeps the original round-one verdicts, and requires a fresh blind three-seat panel over the advanced head. Any missing capture, hash mismatch, later head movement, or non-conforming seat reopens the row. | fixed in this capture commit |
