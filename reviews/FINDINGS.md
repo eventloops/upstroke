@@ -3584,3 +3584,17 @@ The review explicitly preserved the owner-deferred
 The repaired exact head still requires the globally serialized full suite, fresh
 exact-head review, and hosted gates; this ledger append grants neither review nor
 merge authority.
+
+## 32. 2026-08-31 PR #64 successor slice 2 — emit scratch fixtures spend token authority
+
+This append-only section records the second successor slice under the owner's
+2026-08-30 scratch-tree authority decision and controlling addendum. Implementation
+head `6555870ef62bef5f8de5b598496783466646a092` is based directly on green
+integration `82874ef70dd4acf074cbf1453e28651d78af4db3`. The root-owned ledger
+append follows that implementation commit, so the final reviewed SHA is recorded
+in the PR body rather than self-referentially here. The old PR #64 branch remains
+historical input only and is not replayed or merged.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR64-CLEANUP-003-SCRATCH-PRECLEAN | P2 | 6555870ef62bef5f8de5b598496783466646a092 / src/engine/topology/emit/tests.rs:276 | an emit fixture derives a predictable process-and-counter root -> it recursively pre-cleans that root while discarding the result -> a recycled process identity or overlapping fixture can make another owner's tree reachable -> setup deletes content before proving exclusive ownership | pre_existing | correctness | PR64-CLEANUP-003-SCRATCH-PRECLEAN / slice-1 section 30 deferred this caller migration | Emit fixtures now acquire a previously nonexistent ULID-named root through ScratchTreeOwnership before any fallible run-tree construction; Arc clones share one non-Clone token owner; the last holder spends the token through remove_scratch_tree. Occupied-root, partial-construction, return, unwind, shared-lifetime, confirmed-absence, normal-failure, suppressed-failure, and Windows drop-order witnesses are live. The five required destructive mutations each kill only its assigned witness. No RemovePublicHusk call, ancestor-targeted production funnel, raw deletion, predictable root, pre-clean, forged proof, or discarded reclaim result remains in emit/tests.rs | fixed |
