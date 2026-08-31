@@ -2969,6 +2969,33 @@ pub(crate) mod scratch_tree {
         fs::remove_dir_all(root)
     }
 
+    /// How the guard reports a reclaim it could not perform.
+    ///
+    /// **Fallible, and that is the whole point.** This arm runs while the
+    /// thread is already unwinding, so anything that can panic here aborts the
+    /// process and destroys the diagnosis of whatever actually failed. `eprintln!`
+    /// can: `std::io::_eprint` panics on a write error — a closed or broken
+    /// stderr, a full pipe — and that panic is raised *during* the unwind.
+    /// `PR77-SCRATCH-UNWIND-REPORT-PANICS`. A reporter that returns its error
+    /// lets the caller decide, and on the unwinding path the decision is to
+    /// suppress it, explicitly and in writing.
+    type Reporter = fn(&str) -> io::Result<()>;
+
+    /// The real reporter: one line on stderr, with every failure returned
+    /// rather than raised.
+    ///
+    /// Written through the handle rather than through `eprintln!` for exactly
+    /// the reason above — the macro turns a write error into a panic, and this
+    /// returns it.
+    fn report_to_stderr(message: &str) -> io::Result<()> {
+        use std::io::Write as _;
+
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(message.as_bytes())?;
+        stderr.write_all(b"\n")?;
+        stderr.flush()
+    }
+
     /// Acquire a scratch tree under `parent`, named for `tag` and a fresh ULID.
     ///
     /// **Fail-closed.** The root is created with a non-recursive, exclusive
@@ -3008,6 +3035,7 @@ pub(crate) mod scratch_tree {
             Ok(()) => Ok(ScratchTree {
                 token: Some(ScratchTreeOwnership { root }),
                 remove: remove_tree,
+                report: report_to_stderr,
             }),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 Err(ScratchAcquireRefusal::Occupied { root })
@@ -3083,6 +3111,12 @@ pub(crate) mod scratch_tree {
         /// fails *during an unwind* — the one that must not raise a second panic
         /// — is reachable from a witness at all.
         remove: Remover,
+        /// [`report_to_stderr`] for every guard [`acquire`] or
+        /// [`ScratchTree::rearm`] returns. Injectable for the same reason: the
+        /// suppression of a *reporting* failure on the unwinding path is a
+        /// second thing that arm has to get right, and a witness cannot reach
+        /// it by breaking the real stderr.
+        report: Reporter,
     }
 
     impl ScratchTree {
@@ -3116,6 +3150,7 @@ pub(crate) mod scratch_tree {
             Self {
                 token: Some(token),
                 remove: remove_tree,
+                report: report_to_stderr,
             }
         }
 
@@ -3124,10 +3159,11 @@ pub(crate) mod scratch_tree {
         /// cannot be reached without a reclaim that fails, and arranging a real
         /// one on every platform is a worse trade than a seam no production
         /// build contains.
-        fn guarded_with(token: ScratchTreeOwnership, remove: Remover) -> Self {
+        fn guarded_with(token: ScratchTreeOwnership, remove: Remover, report: Reporter) -> Self {
             Self {
                 token: Some(token),
                 remove,
+                report,
             }
         }
     }
@@ -3153,14 +3189,30 @@ pub(crate) mod scratch_tree {
                         // whatever actually failed.
                         //
                         // Reported rather than swallowed: this arm is why the
-                        // result is matched at all. `let _ =` or `.ok()` would
-                        // read the same on this path and make a leaked tree
-                        // silent on *every* path, including the one below.
-                        eprintln!(
+                        // reclaim's result is matched at all. `let _ =` or
+                        // `.ok()` would read the same on this path and make a
+                        // leaked tree silent on *every* path, including the one
+                        // below.
+                        //
+                        // And the REPORT is fallible too, which is the second
+                        // thing this arm has to get right. `eprintln!` panics on
+                        // a write error, and a panic here is exactly the abort
+                        // the suppression exists to avoid, so the reporter
+                        // returns its error and this matches it. There is
+                        // genuinely nothing to do with it — the channel that
+                        // would carry a complaint is the one that just failed —
+                        // but it is matched rather than discarded, so a future
+                        // arm that *could* act has a place to be written.
+                        // `PR77-SCRATCH-UNWIND-REPORT-PANICS`.
+                        let message = format!(
                             "scratch tree {} was not reclaimed while unwinding: {}",
                             root.display(),
                             failure.source()
                         );
+                        match (self.report)(&message) {
+                            Ok(()) => {}
+                            Err(_reporting_failed) => {}
+                        }
                     } else {
                         panic!(
                             "scratch tree {} was not reclaimed: {}",
@@ -3238,7 +3290,7 @@ pub(crate) mod scratch_tree {
         use super::{
             DuplicationRefused, NoSecondToken, ScratchAcquireRefusal, ScratchReclaimFailure,
             ScratchTree, ScratchTreeOwnership, acquire, acquire_named, fs, io, proves_absent,
-            remove_scratch_tree, remove_scratch_tree_with,
+            remove_scratch_tree, remove_scratch_tree_with, report_to_stderr,
         };
         use std::path::Path;
 
@@ -3300,6 +3352,89 @@ pub(crate) mod scratch_tree {
             // parent being unusable.
             let free = acquire(parent.path(), "free").expect("a free name is acquired");
             assert!(free.path().starts_with(parent.path()));
+        }
+
+        /// The ULID is load-bearing: the **same tag** twice beneath one live
+        /// parent gets two distinct roots.
+        ///
+        /// `PR77-SCRATCH-ULID-WITNESS-ABSENT`. The name is `<tag>-<ULID>`, and
+        /// nothing measured that the second half varies — so replacing
+        /// `ulid::ulid()` with the process id, or with any constant, passed
+        /// every witness in this module. It must not: two holders on one box
+        /// colliding on a path is the hazard the whole token exists for, and a
+        /// tag-and-pid name is precisely the shape the replaced helper had.
+        ///
+        /// Three assertions kill that mutation independently. The second
+        /// `acquire` **succeeds** — under a constant suffix it would refuse the
+        /// still-live first root as `Occupied`; the two roots **differ**; and
+        /// each basename's suffix is **26 Crockford base32 characters**, which
+        /// a pid string is not.
+        #[test]
+        fn the_same_tag_twice_gets_two_distinct_ulid_named_roots() {
+            /// Crockford base32, the alphabet `crate::ulid` builds an id from.
+            /// Restated here because that constant is private to that module
+            /// and this witness may not widen its lease to publish it; the
+            /// length and membership below are what a pid or a constant fails.
+            const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+            /// The tag is fixed, so the whole of the variation under test is
+            /// what follows it.
+            const PREFIX: &str = "upstroke-scratch-twice-";
+
+            let parent = acquire(&temp_parent(), "same-tag").expect("a parent tree");
+
+            // BOTH LIVE AT ONCE. The first guard is still holding its root when
+            // the second acquisition runs, so a name that did not vary would be
+            // refused here rather than returning a second tree.
+            let first = acquire(parent.path(), "twice").expect("the first tree");
+            let second = acquire(parent.path(), "twice")
+                .expect("a second acquisition with the same tag must not collide with the first");
+
+            assert_ne!(
+                first.path(),
+                second.path(),
+                "one tag produced one root twice; a colliding name is the hazard the token \
+                 exists for"
+            );
+            assert_eq!(
+                read_dir_names(parent.path()).len(),
+                2,
+                "both roots must be present at once, or the second acquisition took the \
+                 first's name"
+            );
+
+            let mut suffixes = Vec::new();
+            for tree in [&first, &second] {
+                let name = tree
+                    .path()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .expect("an acquired root has a basename");
+                let suffix = name
+                    .strip_prefix(PREFIX)
+                    .unwrap_or_else(|| panic!("{name} is not `{PREFIX}<ULID>`"))
+                    .to_owned();
+                assert_eq!(
+                    suffix.len(),
+                    26,
+                    "a ULID is 26 characters; `{suffix}` is not one"
+                );
+                assert!(
+                    suffix.bytes().all(|byte| CROCKFORD.contains(&byte)),
+                    "`{suffix}` is not Crockford base32"
+                );
+                // The named mutation, refused by name as well as by shape.
+                assert_ne!(
+                    suffix,
+                    std::process::id().to_string(),
+                    "the varying half of the name is the process id, which every holder on \
+                     this box shares"
+                );
+                suffixes.push(suffix);
+            }
+            assert_ne!(
+                suffixes[0], suffixes[1],
+                "two acquisitions drew the same id: {suffixes:?}"
+            );
         }
 
         /// Witness 2 — an undecidable root refuses.
@@ -3489,7 +3624,11 @@ pub(crate) mod scratch_tree {
             let root = inner.path().to_path_buf();
 
             let payload = std::panic::catch_unwind(|| {
-                drop(ScratchTree::guarded_with(inner.disarm(), refuses));
+                drop(ScratchTree::guarded_with(
+                    inner.disarm(),
+                    refuses,
+                    report_to_stderr,
+                ));
             })
             .expect_err("a reclaim that did not happen must not return quietly");
             let message = payload
@@ -3515,6 +3654,65 @@ pub(crate) mod scratch_tree {
             assert!(proves_absent(&root));
         }
 
+        /// A **reporting** failure during an unwind is suppressed too.
+        ///
+        /// `PR77-SCRATCH-UNWIND-REPORT-PANICS`. The suppressed arm used
+        /// `eprintln!`, which panics when the write fails — a closed stderr, a
+        /// broken pipe — and that panic is raised while the thread is already
+        /// unwinding, so it aborts. The arm that exists to protect the
+        /// diagnosis destroyed it on exactly the hosts where stderr is not a
+        /// terminal.
+        ///
+        /// Both failures are injected here at once: the reclaim fails, and so
+        /// does the report of that failure. The witness is the process still
+        /// being alive to run the assertions — under a raising reporter this
+        /// test takes the whole binary with it and nothing after it reports.
+        /// The counter proves the reporter was actually reached, so a guard
+        /// that stopped reporting altogether is red rather than green.
+        #[test]
+        fn a_reporting_failure_while_already_unwinding_is_suppressed_too() {
+            thread_local! {
+                /// How many times this thread's injected reporter was called.
+                /// Per-thread, so a parallel harness never crosses two
+                /// witnesses.
+                static REPORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            }
+
+            /// Records the call, then fails the way a closed stderr does.
+            fn refuses_to_report(_message: &str) -> io::Result<()> {
+                REPORTS.with(|calls| calls.set(calls.get() + 1));
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected"))
+            }
+
+            let outer = acquire(&temp_parent(), "report-failure").expect("the outer tree");
+            let inner = acquire(outer.path(), "inner").expect("the inner tree");
+            let root = inner.path().to_path_buf();
+            REPORTS.with(std::cell::Cell::take);
+
+            let outcome = std::panic::catch_unwind(|| {
+                let _guard = ScratchTree::guarded_with(inner.disarm(), refuses, refuses_to_report);
+                panic!("the failure being diagnosed, which both suppressions preserve");
+            });
+            assert!(outcome.is_err(), "the fixture must actually unwind");
+            assert_eq!(
+                REPORTS.with(std::cell::Cell::get),
+                1,
+                "the guard did not reach the reporter, so this witness proves nothing about \
+                 what happens when the reporter fails"
+            );
+            assert!(
+                !proves_absent(&root),
+                "the injected remover performed nothing, so the tree is still there"
+            );
+
+            // Reached at all, which is the assertion: a raised reporting failure
+            // aborts, and no line below here executes.
+            let outer_root = outer.path().to_path_buf();
+            drop(outer);
+            assert!(proves_absent(&outer_root));
+            assert!(proves_absent(&root));
+        }
+
         /// A reclaim that fails **while the thread is already unwinding** is
         /// suppressed, not raised.
         ///
@@ -3531,7 +3729,7 @@ pub(crate) mod scratch_tree {
             let root = inner.path().to_path_buf();
 
             let outcome = std::panic::catch_unwind(|| {
-                let _guard = ScratchTree::guarded_with(inner.disarm(), refuses);
+                let _guard = ScratchTree::guarded_with(inner.disarm(), refuses, report_to_stderr);
                 panic!("the failure being diagnosed, which the suppressed arm preserves");
             });
             assert!(outcome.is_err(), "the fixture must actually unwind");

@@ -11,7 +11,7 @@ and the token classes are now **exactly two**:
 `PrivateHalfProof` is unchanged: same constructor, same twelve conjuncts, same
 fail-closed conjunct 12, same by-value spend in `remove_private_husk`. The
 second token is added, `cfg(test)`-only, and is not an engine effect: it takes
-no `RunDirSite`, adds no row to `effects/effect_sites.json`, and is censused
+no `RunDirSite`, adds no row to `effect_sites.json`, and is censused
 nowhere.
 
 The P5b deletion boundary is **rescoped in wording, unmoved in force**: it
@@ -105,6 +105,17 @@ the failing assertion's diagnosis with nothing. The result is matched in both
 arms; `let _ =` and `.ok()` are prohibited, because they read the same on the
 suppressed path and would make a leak silent on *every* path.
 
+**The report is fallible, and its failure is suppressed on the same path.** The
+first draft of that arm used `eprintln!`, which panics when the write fails — a
+closed stderr, a broken pipe — and that panic is raised while the thread is
+already unwinding, so it aborts: the arm written to protect the diagnosis
+destroyed it on exactly the hosts where stderr is not a terminal. That is
+`PR77-SCRATCH-UNWIND-REPORT-PANICS`. The reporter now returns `io::Result<()>`
+through the stderr handle rather than the macro, and the unwinding arm matches
+that result in both of its arms too — nothing to do with a reporting failure
+whose only channel is the one that just failed, but matched rather than
+discarded, and witnessed.
+
 **Disarming obliges a fallback.** `ScratchTree::disarm` hands the token over and
 consumes the guard. A witness that disarms in order to watch a reclaim fail must
 `ScratchTree::rearm` **before it asserts anything**: between the two, a failing
@@ -180,7 +191,7 @@ anywhere. No topology module gains a raw-delete allow. `PrivateHalfProof` is not
 forged, cloned, defaulted or reached by a new constructor. Conjunct 12 is not
 weakened, and no `Path::exists` absence oracle is introduced — every absence in
 the new code is observed through the same fail-closed predicate conjunct 12
-uses. The site inventory, its counts and `effects/effect_sites.json` are
+uses. The site inventory, its counts and `effect_sites.json` are
 untouched.
 
 **Deferred.** Migrating the existing `rundir::tests::scratch` helper and the
@@ -202,20 +213,31 @@ written against it.
 | 7 | a tree holding a published `committed.json` is reclaimed by the scratch token while the ownership proof retains it as `PossiblyCommitted` | `a_scratch_tree_holding_a_committed_record_is_reclaimed_while_the_proof_refuses_it` |
 | 8 | the allow-placement scan and the effect censuses are unchanged and green | `effects::tests` |
 
-Three more, for claims this record makes that the eight above do not reach:
+Five more, for claims this record makes that the eight above do not reach:
 
 | claim | where |
 |---|---|
 | the guard reclaims on an unwind as well as on a normal return | `a_guard_reclaims_on_an_unwind_as_well_as_on_a_normal_return` |
 | a reclaim failure on the normal path is raised, and the panic names the tree | `a_reclaim_failure_on_the_normal_path_is_raised` |
 | a reclaim failure while already unwinding is suppressed rather than aborting | `a_reclaim_failure_while_already_unwinding_is_suppressed` |
+| a **reporting** failure during that same unwind is suppressed too, and the reporter is reached | `a_reporting_failure_while_already_unwinding_is_suppressed_too` |
+| the same tag twice beneath one live parent gets two distinct ULID-named roots | `the_same_tag_twice_gets_two_distinct_ulid_named_roots` |
 
-The last of the three is witnessed by the process still being alive to run its
-assertions: measured, replacing the suppression with a raise produces `thread
+Two of the five are witnessed by the process still being alive to run their
+assertions: measured, replacing either suppression with a raise produces `thread
 caused non-unwinding panic. aborting.` and takes the whole test binary with it.
-The middle one exists because of a **measured surviving mutation** — with the
-`panic!` replaced by the `eprintln!` the suppressed arm uses, every other witness
-here stayed green.
+`a_reclaim_failure_on_the_normal_path_is_raised` exists because of a **measured
+surviving mutation** — with the `panic!` replaced by the `eprintln!` the
+suppressed arm then used, every other witness here stayed green.
+
+The last two are this record's own review findings rather than its author's
+mutations. `PR77-SCRATCH-ULID-WITNESS-ABSENT`: the name is `<tag>-<ULID>` and
+nothing measured that the second half varies, so replacing `ulid::ulid()` with
+the process id — the shape of the very helper this record replaces — passed
+every witness in the module. The new one refuses it three independent ways: the
+second acquisition of the same tag **succeeds** beneath a still-live first root
+(a constant suffix would be refused as `Occupied`), the two roots **differ**, and
+each suffix is 26 Crockford base32 characters, which a pid string is not.
 
 Every absence assertion in them goes through `scratch_tree::proves_absent`, which
 is conjunct 12's own predicate: only `NotFound` is proof. `Path::exists` is not
