@@ -3540,3 +3540,47 @@ under `decisions/2026-08-20-review-invalidation-scope.md`; both SHAs are recorde
 | PR73-LEXICAL-CLOSURE-001 | P2 | 0a28c1ab57ae07da151a96393c94f94b14205885 / src/agent/proc/test_support/readiness.rs:303 | a function-value alias of std::fs::remove_file is added inside the site-6 expected statement -> Clippy emits multiple matching diagnostics in that statement -> the single expectation suppresses all of them -> the six-site expectation count and lexical call census remain green | pre_existing | security-trust | whole-file allowance predates PR #72; per-site expectation placement is at 0a28c1ab57ae07da151a96393c94f94b14205885; comparison head 0f05b456fa226f9f83332aa88c152909d8cf850c | File-level deny plus six single-call expectations are a narrowed improvement; until hardening there is exactly one denied path per expected statement and no aliases or function values under an expectation; narrow the claim to site count and two pub GovernedAllow fields | deferred |
 | PR73-LEXER-DIVERGENCE-001 | P3 | 0a28c1ab57ae07da151a96393c94f94b14205885 / src/effects.rs:1096 | a Unicode XID identifier or macro name reaches the ASCII-only scanner -> word and macro_at do not consume the Rust token as one unit -> the scanner can refuse valid code or walk a macro body as source items -> the pinned whole-file test-module oracle is the current backstop | pre_existing | correctness | scanner origin predates PR #72; behavior is identical at comparison head 0f05b456fa226f9f83332aa88c152909d8cf850c | Pinned whole-file inventory catches the measured test-only invention; governed sources remain ASCII outside comments and strings; blanked-view ASCII census is queued; syn and proc-macro2 remain reserved; a third lexer-class recurrence triggers migration adjudication | deferred |
 | PR73-LINT-SEMANTICS-001 | P3 | 0a28c1ab57ae07da151a96393c94f94b14205885 / src/effects.rs:2868 | cfg_attr carries a governed lint level -> the direct-attribute reader ignores the conditional attribute -> its reported level can differ from rustc effective lint level -> every_allow or funnel-child census is the current refusing backstop | pre_existing | correctness | direct-attribute reader predates PR #72; identical blindness at comparison head 0f05b456fa226f9f83332aa88c152909d8cf850c | every_allow census, restatement refusal, and rustc fixture table cover the measured active-allow and inactive-deny cases; cfg_attr carrying a governed lint remains forbidden; reader remains direct-attribute-only | deferred |
+
+## 30. 2026-08-31 PR #64 successor slice 1 — token-carried scratch-tree authority
+
+This append-only section records the first successor slice implementing the owner's
+2026-08-30 two-token deletion-authority decision. Implementation head
+`24830622530ae3998771dcebc39d51811730af2e` is based on green integration
+`f7fe2c3be232ea6de98299b6500b6369648a344e`. `PrivateHalfProof` and its twelve
+fail-closed conjuncts remain unchanged. The new `ScratchTreeOwnership` exists only
+under `cfg(test)`, binds the exact root acquired by an exclusive create, and adds no
+production effect site or census row. The root-owned ledger append follows the
+implementation commit so its final commit is intentionally recorded outside this
+self-referential section.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR64-CLEANUP-003-SCRATCH-PRECLEAN | P2 | 24830622530ae3998771dcebc39d51811730af2e / src/rundir.rs:3612 | a test helper derives a predictable scratch path -> it discards the result of recursive pre-clean -> an occupied root can be deleted before the fixture establishes ownership -> another test or process loses content it owns | pre_existing | correctness | the helper predates PR #64 and is byte-identical at base f7fe2c3be232ea6de98299b6500b6369648a344e | ScratchTreeOwnership authority landed and is witnessed: acquire creates a ULID-named root with a non-recursive exclusive create, refuses occupied or undecidable roots, and never pre-cleans; occupied and undecidable mutation witnesses fail if pre-clean is restored. The legacy scratch helper is not migrated in this head; slice 2 moves its callers onto the new authority | deferred |
+| PR64-CLEANUP-003-P5B-SCOPE | P3 | 24830622530ae3998771dcebc39d51811730af2e / src/topology/effects.rs:1997 | the P5b identity says no path deletes the private half without qualification -> the test build gains a second deletion authority -> a reader treats the sentence as covering test-owned scratch trees -> either the sentence or the authorized mechanism appears to violate the other | introduced_by_feature | docs-contract | the unqualified sentence predates PR #64; the second test-only authority is introduced by this successor | The two leased boundary locations now state the run-lifecycle scope and name the sole test-build exception; conjunct 12 and PrivateHalfProof are unchanged. A committed-bearing scratch tree is retained as PossiblyCommitted by the private-half proof and reclaimed only by its scratch token | fixed |
+| PR64-CLEANUP-003-RECLAIM-SILENCE | P3 | 24830622530ae3998771dcebc39d51811730af2e / src/rundir.rs:3165 | a guard reclaim fails on a non-unwinding path -> failure is only printed -> the suite remains green while a tree leaks -> repeated failures can exhaust build-host inodes | introduced_by_feature | correctness | a measured implementation mutation replacing the normal-path panic with the unwind arm's report left every other witness green | The normal path raises and names the tree, while an already-unwinding path reports without double panic; dedicated witnesses cover normal failure, suppressed unwind failure, and reclaim on both normal return and unwind | fixed |
+
+The exact implementation full suite ran through the globally serialized build wrapper:
+library 1,787 passed with 34 ignored, CLI 8 passed, and the example target had no
+tests. The fresh exact-head independent review and hosted checks remain required;
+this section grants neither review nor merge authority.
+
+## 31. 2026-08-31 PR #77 exact-head review — bounded scratch-authority repair
+
+This append-only section records the sole independent review of exact head
+`7db77d92a7bc7a9d80bea788453acfbf90a0eaa3` and the same-implementor bounded
+repair at `aa7a8ff6cf4d31bf76827a2048a504c0693e3269`. It does not rewrite the
+slice-1 dispositions in section 30. The earlier Windows gate failure and these
+review findings belong to the same reviewed implementation lineage and count as
+one unsuccessful exact-head attempt under the standing convergence policy.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR77-SCRATCH-UNWIND-REPORT-PANICS | P2 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / src/rundir.rs:3159 | an original panic unwinds through the scratch guard -> reclaim fails -> the unwind arm invokes an infallible-printing macro -> stderr reporting fails and panics -> the destructor double-panics and aborts, losing the original diagnosis | introduced_by_feature | correctness | 24830622530ae3998771dcebc39d51811730af2e / PR64-CLEANUP-003-RECLAIM-SILENCE | Repair aa7a8ff uses a fallible reporter whose result is explicitly matched; a deterministic reporter-failure witness proves simultaneous reclaim and report failure remains suppressed during unwind, while the non-unwinding reclaim failure still panics | fixed |
+| PR77-SCRATCH-ULID-WITNESS-ABSENT | P2 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / src/rundir.rs:2991 | ULID generation is replaced by a process ID or constant -> existing fixtures use distinct tags or bypass public naming -> all prior witnesses remain green -> two acquisitions for the same tag can collide instead of producing fresh roots | introduced_by_feature | correctness | 24830622530ae3998771dcebc39d51811730af2e | Repair aa7a8ff adds a same-parent, same-tag witness that requires distinct roots and ULID-shaped basenames; the PID and constant destructive mutations fail only this new witness, proving it closes the prior evidence gap | fixed |
+| PR77-DECISION-EFFECT-SITES-PATH | P3 | 7db77d92a7bc7a9d80bea788453acfbf90a0eaa3 / decisions/2026-08-30-test-scratch-tree-ownership.md:14 | the decision cites effects/effect_sites.json -> that tracked path does not exist -> a maintainer cannot follow the claimed unchanged-inventory evidence to its authority file | introduced_by_feature | docs-contract | 24830622530ae3998771dcebc39d51811730af2e | Repair aa7a8ff corrects both references to the tracked root-level effect_sites.json; the artifact blob and its 70-total/14-RunDir census remain unchanged from the base | fixed |
+
+The review explicitly preserved the owner-deferred
+`PR64-CLEANUP-003-SCRATCH-PRECLEAN` slice-2 migration as non-blocking residue.
+The repaired exact head still requires the globally serialized full suite, fresh
+exact-head review, and hosted gates; this ledger append grants neither review nor
+merge authority.

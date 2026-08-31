@@ -1978,8 +1978,22 @@ pub enum RunDirSite {
     /// P5b: the atomic rename publishing the private commit record.
     ///
     /// The one deletion boundary: after this site returns, or when a read-only
-    /// stat after its error shows the record present, no path — creator or
-    /// census — deletes the private half.
+    /// stat after its error shows the record present, no **run-lifecycle** path
+    /// — creator or census — deletes the private half.
+    ///
+    /// "Run-lifecycle" is the scope the sentence always carried and now states:
+    /// every path that reaches a run directory *as a run directory*. There is
+    /// one exception and it is on none of them —
+    /// `rundir::scratch_tree::remove_scratch_tree`, which reclaims a tree a test
+    /// minted under a second token. That token binds a root that did not exist
+    /// before the token did, so nothing beneath it predates the token and a
+    /// `committed.json` inside it is a fixture the holder published rather than
+    /// a run's boundary. The funnel is `#[cfg(test)]`: it is absent from the
+    /// rlib, it takes no site here and adds none to `effect_sites.json`, it
+    /// cannot mint or weaken a `PrivateHalfProof`, and conjunct 12 of the
+    /// ownership proof is unmoved and still fail-closed.
+    /// `decisions/2026-08-30-test-scratch-tree-ownership.md` states the
+    /// authority model in its two-token form.
     PublishCommitRecord,
     /// P4: `plan.normalized.json`.
     WritePlan,

@@ -74,6 +74,29 @@
 //!   second constructor would buy nothing and would cost the field privacy six
 //!   compile-fail fixtures rest on.
 //!
+//! # The boundary's scope, stated
+//!
+//! The boundary is a rule about **run-lifecycle paths** — every path in this
+//! module, and every path a census takes: nothing that reaches a run directory
+//! *as a run directory* deletes a private half once `committed.json` exists.
+//! That is the scope the sentence has always had; it is written down here
+//! because the test build now carries the one thing outside it.
+//!
+//! `rundir::scratch_tree` reclaims a tree a **test** minted. Its token binds a
+//! root that did not exist before the token did — `acquire` creates it with a
+//! non-recursive exclusive create and refuses an occupied or undecidable one —
+//! so nothing beneath that root predates the token, and a `committed.json`
+//! found there is a fixture the holder published rather than a run's boundary.
+//! It is on none of the paths above: the module is `#[cfg(test)]`, it takes no
+//! `RunDirSite` and adds no row to `effect_sites.json`, it cannot mint or
+//! weaken a `PrivateHalfProof`, and it has no way to reach
+//! `remove_private_husk`. Conjunct 12 is unmoved and still fail-closed: the
+//! witness in `rundir::tests` named for a scratch tree holding a committed
+//! record shows one directory answered by both authorities — the proof retains
+//! it as `PossiblyCommitted`, and the scratch token reclaims it.
+//! `decisions/2026-08-30-test-scratch-tree-ownership.md` is the record, and
+//! states the completeness rule in its two-token form.
+//!
 //! # `RunPaths::create_hooked` is not used here
 //!
 //! It creates the five private skeleton directories **before** the owner
