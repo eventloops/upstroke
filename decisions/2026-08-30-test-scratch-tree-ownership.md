@@ -194,7 +194,7 @@ written against it.
 | # | claim | where |
 |---|---|---|
 | 1 | an occupied root refuses and the occupant keeps its bytes | `an_occupied_root_refuses_and_leaves_what_it_found` |
-| 2 | an undecidable root refuses, and an undecidable stat is not read as absence | `an_undecidable_root_refuses_without_claiming_it_was_occupied` |
+| 2 | an undecidable root refuses, and the refusal modifies nothing | `an_undecidable_root_refuses_without_claiming_it_was_occupied` |
 | 3 | reclaiming a root that is not there succeeds | `reclaiming_a_root_that_is_not_there_succeeds` |
 | 4 | a reclaim removes the token root and nothing outside it | `a_reclaim_removes_the_token_root_and_nothing_outside_it` |
 | 5 | an injected reclaim failure returns the error and the token | `an_injected_reclaim_failure_returns_the_token_with_the_error` |
@@ -219,10 +219,28 @@ here stayed green.
 
 Every absence assertion in them goes through `scratch_tree::proves_absent`, which
 is conjunct 12's own predicate: only `NotFound` is proof. `Path::exists` is not
-used, and witness 2 asserts the difference — under a path that is not a
-directory the stat returns `ENOTDIR`, `proves_absent` correctly declines to call
-that absence, and the parent's directory listing is what settles that nothing was
-created.
+used anywhere in the module.
+
+Witness 2 promises exactly two things — the acquisition **refuses**, and the
+refusal **modifies nothing** — and it reads the second from the parent's own
+directory listing, which every platform answers the same way. It deliberately
+makes no claim about how a stat *beneath* the refused root classifies: what a
+filesystem reports for a path under a file ancestor is platform-dependent, and
+asserting on it made the witness non-portable. That is
+`PR77-WIN-UNDECIDABLE-STAT-ORACLE`, validated by the CI arbiter — the Windows
+guest maps that stat to `NotFound`, so the assertion held on Linux and failed
+there. The finding is witness-and-prose only: the acquisition refuses and
+preserves the occupant on both platforms, and the production authority is
+unchanged.
+
+The predicate's classification is owned by
+`a_commit_record_stat_that_is_not_not_found_is_not_proof_of_absence`, which
+asserts it directly over every shape the stat can produce — `NotFound` as the
+one proof of absence, `PermissionDenied`/`Other`/`InvalidInput`/`TimedOut` as
+answers the filesystem declined to give, and a successful stat as presence — and
+then wires the two reachable shapes through the whole ownership proof. A witness
+about acquisition is the wrong place to re-derive it, and doing so is what
+introduced a platform dependency the classification test does not have.
 
 ## Inputs
 

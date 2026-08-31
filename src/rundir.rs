@@ -3309,6 +3309,13 @@ pub(crate) mod scratch_tree {
         /// `ERROR_PATH_NOT_FOUND` on Windows — and the classification does not
         /// depend on which: anything that is not `AlreadyExists` is an answer
         /// the acquisition cannot act on, so it refuses and touches nothing.
+        ///
+        /// What this promises is exactly that — the **acquisition's** refusal
+        /// and its non-modification. It makes no claim about how a stat
+        /// *beneath* the refused root classifies; that predicate is
+        /// `a_commit_record_stat_that_is_not_not_found_is_not_proof_of_absence`'s
+        /// subject, asserted there directly over every shape the stat can
+        /// produce.
         #[test]
         fn an_undecidable_root_refuses_without_claiming_it_was_occupied() {
             let parent = acquire(&temp_parent(), "undecidable").expect("a parent tree");
@@ -3338,16 +3345,13 @@ pub(crate) mod scratch_tree {
                 b"a file, not a directory",
                 "a refusal must not have written over what it found"
             );
-            // Nothing was created — asserted where the filesystem can answer,
-            // which is the parent's own listing rather than a stat under a path
-            // that is not a directory. `proves_absent` deliberately cannot help
-            // here and says so: that stat returns `ENOTDIR`, which is proof of
-            // nothing, and reading it as absence is exactly the fail-open
-            // answer this module refuses to give.
-            assert!(
-                !proves_absent(refusal.root()),
-                "an undecidable stat was reported as proof of absence"
-            );
+            // Nothing was created — read from the parent's own directory
+            // listing, which every platform answers the same way. A stat under
+            // the refused root is deliberately NOT the oracle here: what a
+            // filesystem reports for a path beneath a file ancestor is
+            // platform-dependent, and asserting on it made this witness
+            // non-portable (`PR77-WIN-UNDECIDABLE-STAT-ORACLE` — the Windows
+            // guest maps that stat to `NotFound`).
             assert_eq!(
                 read_dir_names(parent.path()),
                 ["a-file"],
