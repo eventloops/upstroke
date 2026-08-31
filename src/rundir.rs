@@ -2957,11 +2957,17 @@ pub(crate) mod scratch_tree {
     /// How a reclaim removes a tree.
     ///
     /// A function pointer rather than a hook site: a deterministic failure is
-    /// needed by exactly one witness, and giving the engine a registration
-    /// point for it would put a production seam in the tree for a test's
-    /// benefit. Production has one remover, [`remove_tree`], and
-    /// [`remove_scratch_tree`] is the only public way to reach it.
-    type Remover = fn(&Path) -> io::Result<()>;
+    /// needed by a few witnesses, and giving the engine a registration point
+    /// for it would put a production seam in the tree for a test's benefit.
+    /// Production has one remover, [`remove_tree`], and [`remove_scratch_tree`]
+    /// is the only way to reach it that does not name a remover.
+    ///
+    /// Crate-visible in the test build so that a witness outside this module —
+    /// `engine::topology::emit::tests`, whose fixtures own scratch trees of
+    /// their own — can watch a reclaim fail through the same funnel rather than
+    /// fabricating a failure of its own shape. The type is still `#[cfg(test)]`
+    /// and still absent from the rlib.
+    pub(crate) type Remover = fn(&Path) -> io::Result<()>;
 
     /// The real remover: the recursive deletion, under `src/rundir.rs`'s
     /// existing reviewed allowance for raw filesystem primitives.
@@ -3062,10 +3068,17 @@ pub(crate) mod scratch_tree {
 
     /// [`remove_scratch_tree`] over an injectable remover.
     ///
-    /// Private, for the reason [`acquire_named`] is: the seam exists so that
-    /// one witness can watch a reclaim fail deterministically, on every
-    /// platform, without arranging an unwritable directory.
-    fn remove_scratch_tree_with(
+    /// The seam exists so that a witness can watch a reclaim fail
+    /// deterministically, on every platform, without arranging an unwritable
+    /// directory — which a caller in a `TOPOLOGY_MODULE` could not arrange in
+    /// any case, `fs` mutation being denied there.
+    ///
+    /// Crate-visible rather than module-private, unlike [`acquire_named`]:
+    /// naming a *remover* cannot aim a reclaim at a path the caller chose, so
+    /// this widens no authority. The token still decides which root is removed,
+    /// it is still spent by value, and the only thing an outside caller gains
+    /// is the ability to make its own reclaim fail on purpose.
+    pub(crate) fn remove_scratch_tree_with(
         token: ScratchTreeOwnership,
         remove: Remover,
     ) -> Result<(), ScratchReclaimFailure> {
@@ -3154,11 +3167,18 @@ pub(crate) mod scratch_tree {
             }
         }
 
-        /// [`rearm`](Self::rearm) over an injectable remover, private for the
-        /// reason [`remove_scratch_tree_with`] is: the suppressed arm of `Drop`
-        /// cannot be reached without a reclaim that fails, and arranging a real
-        /// one on every platform is a worse trade than a seam no production
-        /// build contains.
+        /// [`rearm`](Self::rearm) over an injectable remover **and an
+        /// injectable reporter**.
+        ///
+        /// Module-private, unlike [`remove_scratch_tree_with`]: widening this
+        /// one would also hand out [`Reporter`], and control over *how a
+        /// reclaim failure is reported* is this module's to keep — the
+        /// suppressed arm of `Drop` is the only caller that has to get a
+        /// fallible report right on an unwinding thread. An outside witness
+        /// needs none of it: a failing reclaim is reachable through
+        /// [`remove_scratch_tree_with`] alone, and re-arming a guard over the
+        /// token that comes back is [`rearm`](Self::rearm)'s job. Like every
+        /// item here it is `#[cfg(test)]`, so no production build contains it.
         fn guarded_with(token: ScratchTreeOwnership, remove: Remover, report: Reporter) -> Self {
             Self {
                 token: Some(token),

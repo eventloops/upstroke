@@ -26,8 +26,10 @@
 //!   assertion below clears its ledger first and reads the sequence that
 //!   follows.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::io;
+use std::ops::Deref;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,12 +47,17 @@ use crate::ir::{
     Tier,
 };
 use crate::review::ReviewPlan;
+use crate::rundir::scratch_tree::{
+    Remover, ScratchReclaimFailure, ScratchTree, ScratchTreeOwnership, acquire, proves_absent,
+    remove_scratch_tree, remove_scratch_tree_with,
+};
 use crate::rundir::{
-    CommitRecord, CommitRecordPresence, RunDirClass, RunPaths, classify_run_dir,
-    commit_record_after_error, publish_commit_record, stage_commit_record,
+    CommitRecord, CommitRecordPresence, NoHooks, RunDirClass, RunDirHooks, RunPaths,
+    classify_run_dir, commit_record_after_error, publish_commit_record, stage_commit_record,
 };
 use crate::topology::effects::{
-    EffectSiteId, EventSite, HookHarness, HookPhase, InjectionMode, RunDirSite, SubEffectPoint,
+    EffectSiteId, EventSite, HookHarness, HookPhase, Injection, InjectionMode, RunDirSite,
+    SubEffectPoint,
 };
 use crate::topology::events::{
     AttemptNumber, BudgetExceeded4, CommitSha, Epoch, GenerationId, GitRef, IncarnationId,
@@ -87,18 +94,333 @@ fn gate_timeout(started: &RunStarted4) -> Duration {
         .timeout
 }
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
+// ---------------------------------------------------------------------------
+// The scratch tree these fixtures own
+// ---------------------------------------------------------------------------
 
-/// A run directory tree of this test's own, created through the `RunDir`
-/// funnels rather than with `create_dir_all`, which this module may not name.
+/// What a refused reclaim leaves behind.
 ///
-/// Numbered as well as named: several tests below want two independent runs.
-fn run_paths(tag: &str) -> RunPaths {
-    let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("upstroke-emit-{tag}-{}-{n}", std::process::id()));
-    let paths = RunPaths::with_private_root(&root, RUN_ID, &root);
-    paths.create().expect("the run directories");
-    paths
+/// **The token**, because a reclaim that did not happen returns it rather than
+/// dropping it ([`ScratchReclaimFailure::into_token`]): the tree is still there
+/// and somebody has to own it. A `Drop` cannot return anything, so it parks the
+/// token here and the witness that arranged the refusal re-arms a guard over it.
+///
+/// **The line it would otherwise have raised**, because on the unwinding path
+/// it may not raise at all, and a leak that is merely silent is the thing this
+/// arm exists to prevent.
+#[derive(Debug, Default)]
+struct Parked {
+    /// The token handed back, for the holder to reclaim with.
+    token: Option<ScratchTreeOwnership>,
+    /// What the reclaim failure was, whichever arm recorded it.
+    reported: Option<String>,
+}
+
+/// The slot itself, shared with whoever holds the [`Scratch`].
+type ParkedSlot = Arc<Mutex<Parked>>;
+
+/// What a reclaim did.
+enum Reclaimed {
+    /// The tree is gone and the token is spent.
+    Done,
+    /// The tree is still there. **Slice 1's own refusal**, carrying the token
+    /// it handed back and the error the filesystem — or the injected remover —
+    /// actually produced. Nothing here fabricates one: the only way to build
+    /// this variant is to be given a [`ScratchReclaimFailure`].
+    Refused(ScratchReclaimFailure),
+}
+
+/// How a [`Scratch`] spends its token.
+///
+/// A function pointer rather than a hook site, for the reason `scratch_tree`'s
+/// own [`Remover`] is one: two witnesses need a reclaim that fails, and giving
+/// the engine a registration point for a test's benefit would put a production
+/// seam in the tree.
+type Reclaim = fn(ScratchTreeOwnership) -> Reclaimed;
+
+/// The real reclaim, and the only one any fixture uses.
+///
+/// [`remove_scratch_tree`] is slice 1's test-only funnel: it takes the token
+/// **by value**, so the call spends it and it cannot authorise a second
+/// deletion, and it removes the token's own root rather than any path this file
+/// could name. `NotFound` is success — the tree is gone, which is what was
+/// asked for — and every other answer comes back carrying the token.
+fn spend(token: ScratchTreeOwnership) -> Reclaimed {
+    match remove_scratch_tree(token) {
+        Ok(()) => Reclaimed::Done,
+        Err(failure) => Reclaimed::Refused(failure),
+    }
+}
+
+/// A reclaim that refuses, deterministically and on every platform.
+///
+/// **The refusal is slice 1's, not this file's.** The reclaim goes through
+/// [`remove_scratch_tree_with`] — the same funnel [`remove_scratch_tree`] is,
+/// over the same by-value token — carrying a [`Remover`] that removes nothing
+/// and reports `PermissionDenied`. So the [`ScratchReclaimFailure`] the witness
+/// then unpacks is the one slice 1 built, from slice 1's own `NotFound`-only
+/// reading, and the token it carries is the token slice 1 handed back. An
+/// earlier revision fabricated that variant here; a hand-built refusal proves
+/// only that the hand that built it agreed with itself.
+///
+/// The remover is a plain `fn` item declared inside this one, so it is
+/// **stateless** — no captured environment, no cell, nothing a second call or a
+/// second thread could observe — and deterministic on every platform. Which is
+/// what it has to be: `src/engine/topology/**` is a `TOPOLOGY_MODULE`, so no
+/// raw `fs` call here can arrange an unwritable directory, and the shapes that
+/// fail without one — an open handle, the process's own working directory —
+/// fail on Windows and succeed on Linux. A witness that is a witness on one
+/// host is not one.
+fn refuses(token: ScratchTreeOwnership) -> Reclaimed {
+    /// Removes nothing, refuses always, and remembers nothing between calls.
+    const REFUSE: Remover = |_root| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    match remove_scratch_tree_with(token, REFUSE) {
+        Ok(()) => Reclaimed::Done,
+        Err(failure) => Reclaimed::Refused(failure),
+    }
+}
+
+/// The single owner of one scratch tree: one token, one reclaim, one `Drop`.
+struct OwnedTree {
+    /// The token's root, kept beside the token so a witness can still name the
+    /// tree after `Drop` has spent it. **A label, never a path a reclaim
+    /// names** — [`remove_scratch_tree`] removes the token's own root and takes
+    /// no path from this file at all.
+    root: PathBuf,
+    /// The run directories beneath that root.
+    paths: RunPaths,
+    /// **Exactly one token, and it is not `Clone`.** `Some` until `Drop` takes
+    /// it; there is no other state, and no second copy anywhere.
+    token: Option<ScratchTreeOwnership>,
+    /// [`spend`] everywhere except the two cleanup-failure witnesses.
+    reclaim: Reclaim,
+    /// Where a refused reclaim leaves the token it got back, and its reason.
+    parked: ParkedSlot,
+}
+
+impl Drop for OwnedTree {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            // Unreachable: nothing else takes the token. Returning is the safe
+            // direction regardless — a bookkeeping slip must not be the thing
+            // that aborts a run.
+            return;
+        };
+        match (self.reclaim)(token) {
+            Reclaimed::Done => {}
+            Reclaimed::Refused(failure) => {
+                // Both halves come off slice 1's own failure: the root it
+                // recorded when it built the refusal, and the error it was
+                // given. Only then is the token taken back out of it.
+                let message = format!(
+                    "scratch tree {} was not reclaimed: {}",
+                    failure.root().display(),
+                    failure.source()
+                );
+                let token = failure.into_token();
+                // The tree outlived its owner. Park the token **and the reason
+                // first**, before either arm below runs, so the holder has
+                // something to reclaim with and a record of why — whichever way
+                // this exits, and even though only one of the two arms can also
+                // raise.
+                {
+                    let mut parked = self
+                        .parked
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    parked.token = Some(token);
+                    parked.reported = Some(message.clone());
+                }
+                if std::thread::panicking() {
+                    // SUPPRESSED, and only here. A panic raised while the thread
+                    // is already unwinding aborts the process, which would
+                    // replace the failing assertion's report with nothing at all
+                    // — the leak would cost the diagnosis of whatever actually
+                    // failed.
+                    //
+                    // Recorded rather than swallowed: the line is parked above
+                    // and a witness reads it, so this arm is silent to the
+                    // console and not silent to the suite. `let _ =` on the
+                    // reclaim's outcome would read the same here and make a
+                    // leaked tree invisible on *every* path, the one below
+                    // included.
+                    //
+                    // That the record is a `String` assignment is the point.
+                    // Slice 1's own arm has to reason about a *fallible* report,
+                    // because `eprintln!` turns a write error — a closed stderr,
+                    // a full pipe — into a panic, and a panic here is exactly the
+                    // abort the suppression exists to avoid
+                    // (`PR77-SCRATCH-UNWIND-REPORT-PANICS`). This file may not
+                    // reach `io::Write` at all: `write_all` and `flush` are
+                    // effect denials in a `TOPOLOGY_MODULE`. The slot it uses
+                    // instead cannot fail, so the hazard is absent by
+                    // construction rather than handled.
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
+    }
+}
+
+/// A run-directory tree this file owns outright, reclaimed on both exits.
+///
+/// # The root is created, never found
+///
+/// [`acquire`] mints it with a non-recursive, exclusive `fs::create_dir` under
+/// a name carrying a fresh ULID, so the call succeeds only if nothing was
+/// there. **Nothing beneath the root predates the token**, which is what makes
+/// a recursive reclaim of it safe without any claim about its contents.
+///
+/// The helper this replaces built `temp_dir()/upstroke-emit-<tag>-<pid>-<n>`
+/// and created the run directories over whatever it found. `temp_dir()` is
+/// shared and a pid is recycled, so that name is reachable by another holder,
+/// and a fixture that pre-cleaned it deleted a tree it had no claim on. Nothing
+/// here reclaims to make room: an occupied root and an undecidable one are both
+/// refusals. `PR64-OWNERSHIP-001`.
+///
+/// # Shared, because two of these tests are two processes
+///
+/// `open_syncs_surviving_prefix_before_any_recovery_effect` and
+/// `open_sync_failure_refuses_resumably_with_no_fold_derived_effect` drop the
+/// first fixture and keep its paths — that drop is how they reach a *fresh
+/// process's* view of one run. So a handle is an `Arc` over one [`OwnedTree`]:
+/// cloning shares the tree and the **last** holder reclaims it. There is still
+/// exactly one [`ScratchTreeOwnership`] per tree; the token is not `Clone`, and
+/// only the `Arc` is.
+#[derive(Clone)]
+struct Scratch {
+    /// The one owner. `Arc::strong_count` is the holder count, and the tree
+    /// outlives every handle.
+    inner: Arc<OwnedTree>,
+}
+
+/// So every `paths.public`, `paths.events()` and `resume(&paths)` in this file
+/// reads exactly as it did before the guard existed.
+impl Deref for Scratch {
+    type Target = RunPaths;
+
+    fn deref(&self) -> &RunPaths {
+        &self.inner.paths
+    }
+}
+
+impl Scratch {
+    /// A tree with the run directories created in it.
+    fn acquire(tag: &str) -> Self {
+        let (scratch, created) = Self::acquire_hooked(tag, &mut NoHooks);
+        created.expect("the run directories");
+        scratch
+    }
+
+    /// [`acquire`](Self::acquire) with the creation observed, and its outcome
+    /// handed back rather than unwrapped.
+    fn acquire_hooked(tag: &str, hooks: &mut dyn RunDirHooks) -> (Self, Result<(), UpstrokeError>) {
+        Self::acquire_under(&std::env::temp_dir(), tag, spend, hooks)
+    }
+
+    /// A tree whose reclaim refuses — the two cleanup-failure witnesses, and
+    /// nothing else. Parented explicitly so those witnesses can nest it.
+    fn acquire_refusing_reclaim(parent: &Path, tag: &str) -> Self {
+        let (scratch, created) = Self::acquire_under(parent, tag, refuses, &mut NoHooks);
+        created.expect("the run directories");
+        scratch
+    }
+
+    /// The one acquisition path.
+    ///
+    /// **Ownership is taken before anything fallible runs.**
+    /// `RunPaths::create_hooked` creates the public half and then the private
+    /// one, so a refusal at the second leaves the first on disk — and a guard
+    /// built from the *return value* of that call does not exist on the very
+    /// path that leaks. Here the token is minted first, and the two statements
+    /// between [`ScratchTree::disarm`] and the armed guard are infallible, so
+    /// the tree is guarded again before the creation is even attempted.
+    /// `PR64-CONSTRUCT-002`.
+    fn acquire_under(
+        parent: &Path,
+        tag: &str,
+        reclaim: Reclaim,
+        hooks: &mut dyn RunDirHooks,
+    ) -> (Self, Result<(), UpstrokeError>) {
+        let tree = acquire(parent, tag)
+            .unwrap_or_else(|refusal| panic!("a scratch tree under {parent:?}: {refusal:?}"));
+        let root = tree.path().to_path_buf();
+        let token = tree.disarm();
+        let paths = RunPaths::with_private_root(&root, RUN_ID, &root);
+        let scratch = Self {
+            inner: Arc::new(OwnedTree {
+                root,
+                paths,
+                token: Some(token),
+                reclaim,
+                parked: ParkedSlot::default(),
+            }),
+        };
+        let created = scratch.inner.paths.create_hooked(hooks);
+        (scratch, created)
+    }
+
+    /// The token's root: the whole tree, above both halves.
+    fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    /// The slot a refused reclaim parks its returned token and reason in.
+    fn parked(&self) -> ParkedSlot {
+        Arc::clone(&self.inner.parked)
+    }
+
+    /// How many handles share this tree.
+    fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+}
+
+/// Absence, proved rather than assumed.
+///
+/// `Path::exists` answers `false` for "not there" **and** for every error a
+/// stat can return — a permission denial, an IO error, a Windows sharing
+/// violation — so an absence assertion written on it reports a path as gone on
+/// the evidence that the filesystem refused to answer. That is a leak spelled
+/// as a reclaim. This is conjunct 12's predicate, reached through slice 1's
+/// [`proves_absent`] so the two cannot drift: only `NotFound` is proof.
+#[must_use]
+fn confirmed_absent(path: &Path) -> bool {
+    proves_absent(path)
+}
+
+/// Presence, answered by the same stat rather than by a predicate that folds
+/// every error into `false`.
+///
+/// The `is_dir` and `is_file` assertions elsewhere in this file keep their own
+/// predicates deliberately: each claims a *shape*, and an error direction there
+/// fails the assertion it is written under, which is the safe way round. Only
+/// the absence direction had to move.
+#[must_use]
+fn confirmed_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// A `RunDirHooks` double that refuses one site at `Before`, so the primitive
+/// it guards never runs.
+///
+/// Local rather than armed on the shared [`HookHarness`] because
+/// `RunDir.CreatePrivateDir` exposes no [`SubEffectPoint`] and `HookHarness::arm`
+/// reaches only points — the shape `settle.rs` established. Refusing at
+/// `Before` means the directory is never created, so the partial-creation
+/// witness sees exactly the public half and nothing else.
+struct RefuseSite(EffectSiteId);
+
+impl RunDirHooks for RefuseSite {
+    fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        if site == self.0 && phase == HookPhase::Before {
+            Injection::Error
+        } else {
+            Injection::Proceed
+        }
+    }
 }
 
 /// A clock that does not move, so a committed line is a literal.
@@ -291,7 +613,6 @@ fn pool_body() -> TopologyEventBody {
 /// The whole of what one emit borrows, plus the harness the five families
 /// record into.
 struct Fixture {
-    paths: RunPaths,
     harness: Arc<Mutex<HookHarness>>,
     hooks: HarnessTopologyHooks,
     identity: RunIdentity,
@@ -301,6 +622,17 @@ struct Fixture {
     invocations: InvocationLedger,
     warnings: Vec<String>,
     clock: FixedClock,
+    /// **Last, and that is a guarantee rather than a layout accident.** A
+    /// struct's fields drop in *declaration* order, so this drops after `log` —
+    /// and `log` holds an open handle on `events.jsonl` inside this very tree.
+    /// Windows refuses to remove a directory while a handle beneath it is open,
+    /// so a `paths` declared first would turn every fixture drop on that host
+    /// into a failed reclaim, which [`OwnedTree`]'s `Drop` raises.
+    ///
+    /// The rule inverts for locals: a block drops its bindings in *reverse*
+    /// declaration order, so a [`Scratch`] bound before its `EventLog` is
+    /// likewise reclaimed after it.
+    paths: Scratch,
 }
 
 impl Fixture {
@@ -308,7 +640,7 @@ impl Fixture {
     /// the barrier exactly as P5 takes it ("a fresh run's `Event.OpenLog` at P5
     /// creates an empty log, so the barrier is trivially established").
     fn new(tag: &str) -> Self {
-        let paths = run_paths(tag);
+        let paths = Scratch::acquire(tag);
         let harness = Arc::new(Mutex::new(HookHarness::new()));
         let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness)).recording_durability();
         let mut warnings = Vec::new();
@@ -675,7 +1007,7 @@ fn open_sync_failure_refuses_resumably_with_no_fold_derived_effect() {
         "an effect survived the refusal: {during:?}"
     );
     assert!(
-        !paths.public.join("report.json").exists(),
+        confirmed_absent(&paths.public.join("report.json")),
         "a report was written from a barrier that did not hold"
     );
 
@@ -1136,7 +1468,7 @@ fn append_error_with_failed_prefix_sync_reports_undetermined_without_effects() {
         "a fold-derived effect ran: {:?}",
         fixture.non_event_sites()
     );
-    assert!(!fixture.paths.public.join("report.json").exists());
+    assert!(confirmed_absent(&fixture.paths.public.join("report.json")));
     assert!(failed.resumable());
 
     // The control: the scan can see a fold-derived effect when there is one.
@@ -1188,7 +1520,7 @@ fn append_error_never_triggers_cleanup_or_report_from_memory() {
     let ran = fixture.non_event_sites();
     assert!(ran.is_empty(), "the protocol performed an effect: {ran:?}");
     assert!(
-        !fixture.paths.public.join("report.json").exists(),
+        confirmed_absent(&fixture.paths.public.join("report.json")),
         "a report was written from the poisoned fold"
     );
     assert!(
@@ -1228,7 +1560,7 @@ fn append_error_never_triggers_cleanup_or_report_from_memory() {
         after.contains(&EffectSiteId::RunDir(RunDirSite::WriteReport)),
         "the scan is blind to the very site the protocol must not reach: {after:?}"
     );
-    assert!(fixture.paths.public.join("report.json").exists());
+    assert!(confirmed_present(&fixture.paths.public.join("report.json")));
 }
 
 /// `refusal_condition`: "any transition, retry, report, or cleanup attempted
@@ -1642,7 +1974,7 @@ fn the_harness_event_observer_reports_durability_as_well_as_sites() {
     );
 
     let mut recording = HarnessEventHooks::new(Arc::clone(&harness)).recording_durability();
-    let paths = run_paths("harness-durability");
+    let paths = Scratch::acquire("harness-durability");
     let mut warnings = Vec::new();
     let mut log = EventLog::open_hooked(
         EventSite::OpenLog,
@@ -1724,7 +2056,7 @@ fn the_harness_event_observer_reports_durability_as_well_as_sites() {
 #[test]
 fn the_harness_event_observer_can_ask_for_the_torn_written_shape() {
     fn append_through(shape: Option<WrittenShape>) -> (Vec<u8>, Vec<DurableRecord>) {
-        let paths = run_paths("written-shape");
+        let paths = Scratch::acquire("written-shape");
         let harness = Arc::new(Mutex::new(HookHarness::new()));
         let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness)).recording_durability();
         if let Some(shape) = shape {
@@ -1898,7 +2230,7 @@ fn the_production_emitter_reaches_the_append_error_protocol() {
     let ran = fixture.non_event_sites();
     assert!(ran.is_empty(), "the protocol performed an effect: {ran:?}");
     assert!(
-        !fixture.paths.public.join("report.json").exists(),
+        confirmed_absent(&fixture.paths.public.join("report.json")),
         "a report was written from the poisoned fold"
     );
     assert!(
@@ -1918,4 +2250,444 @@ fn the_production_emitter_reaches_the_append_error_protocol() {
         "the stable-prefix barrier did not run"
     );
     assert!(report.report.resumable());
+}
+
+// ---------------------------------------------------------------------------
+// The scratch guard itself
+//
+// Everything above owns a run-directory tree for the length of one test. These
+// measure that ownership: that a root is taken rather than found, that a
+// creation which fails part-way still leaves a guard over what it did create,
+// that both exits reclaim, that a reclaim which fails is reported on the normal
+// path and suppressed on the unwinding one, and that an absence claim is proof
+// rather than a stat that declined to answer.
+// ---------------------------------------------------------------------------
+
+/// The payload of a caught panic, as a string.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Two acquisitions under one tag get two roots, and neither touches the other.
+///
+/// The hazard this closes is the whole of `PR64-OWNERSHIP-001`. The replaced
+/// helper named its root `upstroke-emit-<tag>-<pid>-<n>` in the shared temp
+/// directory, so two holders — two processes, or one process whose pid was
+/// recycled — collided on a path; a fixture that resolved the collision by
+/// removing what it found deleted a tree it had no claim on.
+///
+/// Both halves are measured. **Distinct roots**: a cached or otherwise
+/// predictable root fails `assert_ne!`. **Nothing pre-cleaned**: the first tree
+/// is still live and still populated when the second acquisition runs, so a
+/// removal that made room for the second would take the first's run directories
+/// with it, and every later assertion here would fail.
+///
+/// The removal half has a second, stronger control that is not a test at all: a
+/// `TOPOLOGY_MODULE` may name no raw `fs` mutation, so `fs::remove_dir_all` in
+/// this file is a clippy `disallowed_methods` denial under `-D warnings` — a
+/// build failure, not a red test.
+#[test]
+fn two_scratches_with_one_tag_get_distinct_roots_and_neither_precleans_the_other() {
+    let first = Scratch::acquire("one-tag");
+    assert!(
+        confirmed_present(&first.public) && confirmed_present(&first.private),
+        "the first tree's run directories"
+    );
+
+    // BOTH LIVE AT ONCE. The first guard still holds its root while the second
+    // acquisition runs, so a name that did not vary would be refused here.
+    let second = Scratch::acquire("one-tag");
+
+    assert_ne!(
+        first.root(),
+        second.root(),
+        "one tag produced one root twice; colliding on a path another holder is \
+         using is the hazard the token exists for"
+    );
+    assert!(
+        confirmed_present(&first.public) && confirmed_present(&first.private),
+        "the second acquisition reclaimed the first holder's tree to make room"
+    );
+    assert!(
+        confirmed_present(&second.public) && confirmed_present(&second.private),
+        "the second tree's run directories"
+    );
+
+    let (first_root, second_root) = (first.root().to_path_buf(), second.root().to_path_buf());
+    drop(first);
+    assert!(
+        confirmed_absent(&first_root),
+        "the first holder's tree survived its only holder"
+    );
+    assert!(
+        confirmed_present(&second.public),
+        "reclaiming one tree took a sibling's with it"
+    );
+    drop(second);
+    assert!(
+        confirmed_absent(&second_root),
+        "the second holder's tree survived its only holder"
+    );
+}
+
+/// A creation that fails part-way still leaves a guard over what it created.
+///
+/// `PR64-CONSTRUCT-002`. `RunPaths::create_hooked` creates the public half at
+/// `RunDir.CreatePublicDir` and the private half at `RunDir.CreatePrivateDir`,
+/// so a refusal at the second returns `Err` with the first already on disk. A
+/// guard built from that call's return value never exists on this path, and the
+/// public half is left in the shared temp directory with nothing owning it.
+///
+/// The assertions run in the order the defect needs: the public half **is**
+/// there (so the creation really did get past P0 and the witness is not
+/// vacuous), the private half is **provably** absent, and after the guard drops
+/// the whole tree is gone.
+#[test]
+fn a_creation_that_fails_part_way_still_leaves_a_reclaiming_guard() {
+    let mut refusing = RefuseSite(EffectSiteId::RunDir(RunDirSite::CreatePrivateDir));
+    let (scratch, created) = Scratch::acquire_hooked("partial-creation", &mut refusing);
+
+    let error = created.expect_err("the private half was refused at `Before`");
+    assert!(
+        confirmed_present(&scratch.public),
+        "the refusal came before the public half was created, so this witness \
+         would pass over a creation that never started: {error}"
+    );
+    assert!(
+        confirmed_absent(&scratch.private),
+        "the site refused at `Before`, so its primitive must not have run"
+    );
+
+    let root = scratch.root().to_path_buf();
+    drop(scratch);
+    assert!(
+        confirmed_absent(&root),
+        "a creation that failed part-way leaked its public half: {error}"
+    );
+}
+
+/// The guard reclaims on an unwind as well as on a normal return.
+///
+/// A fixture that reclaimed at the end of its body leaks its tree on exactly
+/// the runs that matter — the failing ones — and a suite that leaks a directory
+/// per failing fixture is how a build box exhausts its inodes while `df` still
+/// reports free space.
+#[test]
+fn a_guard_reclaims_on_an_unwind_as_well_as_on_a_normal_return() {
+    let scratch = Scratch::acquire("normal-return");
+    let returned = scratch.root().to_path_buf();
+    assert!(
+        confirmed_present(&returned),
+        "the tree is there to begin with"
+    );
+    drop(scratch);
+    assert!(
+        confirmed_absent(&returned),
+        "a normal return left its tree behind"
+    );
+
+    let scratch = Scratch::acquire("unwound");
+    let unwound = scratch.root().to_path_buf();
+    assert!(
+        confirmed_present(&unwound),
+        "the tree is there to begin with"
+    );
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
+        let _held_across_the_panic = scratch;
+        panic!("a fixture failing the way a failing fixture fails");
+    }));
+    assert!(
+        outcome.is_err(),
+        "the closure panics, or nothing was measured"
+    );
+    assert!(
+        confirmed_absent(&unwound),
+        "a tree survived the unwind that dropped its guard"
+    );
+}
+
+/// A reclaim that did not happen is **raised** when the drop is a normal one.
+///
+/// `let _ =` on the reclaim's outcome reads exactly like this on the path below
+/// — and makes a leaked tree silent on every path, this one included. So the
+/// outcome is matched, and the message names the tree, because a panic that
+/// does not say which tree leaked is not a diagnosis.
+///
+/// **No assertion runs while a tree is unowned.** The witness is in three
+/// phases and the order is the whole safety argument: *measure* everything
+/// while the refused tree is still on disk, taking no assertion at all;
+/// *recover* the token slice 1 handed back and re-arm a guard over it, then
+/// release that guard and the outer one so nothing is left to leak; and only
+/// then *assert*, at a point where a failing assertion unwinds past nothing.
+/// The previous shape asserted with a live fallback and an `expect` ahead of
+/// it, which left two windows where a red assertion cost a directory.
+#[test]
+fn a_reclaim_failure_on_the_normal_path_is_reported() {
+    // ---- measure ---------------------------------------------------------
+    let outer = acquire(&std::env::temp_dir(), "reported-outer").expect("the outer tree");
+    let scratch = Scratch::acquire_refusing_reclaim(outer.path(), "reported");
+    let root = scratch.root().to_path_buf();
+    let parked = scratch.parked();
+
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| drop(scratch)));
+    let (returned, reported) = {
+        let mut parked = parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (parked.token.take(), parked.reported.take())
+    };
+    // The control for every claim below: a refusal that had removed the tree
+    // anyway would pass the message assertions and measure nothing.
+    let survived = confirmed_present(&root);
+
+    // ---- recover, then release -------------------------------------------
+    let fallback = returned.map(ScratchTree::rearm);
+    let recovered = fallback.is_some();
+    drop(fallback);
+    let reclaimed = confirmed_absent(&root);
+    drop(outer);
+
+    // ---- assert, owning nothing ------------------------------------------
+    assert!(
+        recovered,
+        "a refused reclaim must hand its token back for somebody to own the tree with"
+    );
+    assert!(
+        survived,
+        "the refusing remover removed the tree anyway, so nothing here was measured"
+    );
+    let message =
+        panic_message(&outcome.expect_err("a reclaim that did not happen must not return quietly"));
+    assert!(
+        message.contains("was not reclaimed"),
+        "the panic must say what happened: {message:?}"
+    );
+    assert!(
+        message.contains(&root.display().to_string()),
+        "the panic must name the tree that leaked: {message:?}"
+    );
+    assert_eq!(
+        reported.as_deref(),
+        Some(message.as_str()),
+        "the raised line and the parked record must be one report"
+    );
+    assert!(reclaimed, "the re-armed fallback did not reclaim the tree");
+}
+
+/// The same failure, while the thread is **already unwinding**, is suppressed.
+///
+/// A panic raised from a `Drop` that runs during an unwind aborts the process.
+/// That abort would replace the report of whatever actually failed with nothing
+/// at all, so this arm parks its record and does not raise — and the payload
+/// that comes back out must still be the closure's own, not the reclaim's.
+///
+/// Removing the `std::thread::panicking()` guard turns this test into a
+/// `SIGABRT`, which is a kill rather than a red assertion; that is the shape of
+/// the mutation and the reason the guard is there. Because an abort ends the
+/// process, that mutant is run against this test **alone**, and the rest of the
+/// file is run under the same mutant separately — an abort attributes to
+/// nothing if every other result died with it.
+///
+/// Same three phases as its sibling, and for the same reason: measure while the
+/// tree is still there, recover the token and release every guard, then assert
+/// owning nothing.
+#[test]
+fn a_reclaim_failure_while_already_unwinding_is_suppressed() {
+    /// The failure under test — the one whose diagnosis an abort would destroy.
+    const UNDER_TEST: &str = "the failure this unwind is carrying";
+
+    let outer = acquire(&std::env::temp_dir(), "suppressed-outer").expect("the outer tree");
+    let scratch = Scratch::acquire_refusing_reclaim(outer.path(), "suppressed");
+    let root = scratch.root().to_path_buf();
+    let parked = scratch.parked();
+
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
+        let _dropped_while_unwinding = scratch;
+        panic!("{UNDER_TEST}");
+    }));
+
+    let (returned, reported) = {
+        let mut parked = parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (parked.token.take(), parked.reported.take())
+    };
+    let survived = confirmed_present(&root);
+
+    // ---- recover, then release -------------------------------------------
+    let fallback = returned.map(ScratchTree::rearm);
+    let recovered = fallback.is_some();
+    drop(fallback);
+    let reclaimed = confirmed_absent(&root);
+    drop(outer);
+
+    // ---- assert, owning nothing ------------------------------------------
+    assert!(
+        recovered,
+        "a refused reclaim must hand its token back for somebody to own the tree with"
+    );
+    assert!(
+        survived,
+        "the refusing remover removed the tree anyway, so nothing here was measured"
+    );
+    let message = panic_message(&outcome.expect_err("the closure panics"));
+    assert_eq!(
+        message, UNDER_TEST,
+        "the suppressed arm replaced the failure under test with its own"
+    );
+    // Suppressed is not swallowed. This arm may not raise, so the record it
+    // parks instead is the whole of what keeps the leak visible.
+    let reported = reported.expect("the suppressed arm records what it may not raise");
+    assert!(
+        reported.contains("was not reclaimed") && reported.contains(&root.display().to_string()),
+        "the parked report must name the tree and what happened: {reported:?}"
+    );
+    assert!(reclaimed, "the re-armed fallback did not reclaim the tree");
+}
+
+/// A clone shares one tree, one owner and one token; the last holder reclaims.
+///
+/// This is the protocol `open_syncs_surviving_prefix_before_any_recovery_effect`
+/// and `open_sync_failure_refuses_resumably_with_no_fold_derived_effect` depend
+/// on: each keeps `fixture.paths` and drops the fixture, and the log they then
+/// reopen is the one in the tree that drop must not have taken.
+#[test]
+fn a_cloned_scratch_shares_one_tree_and_the_last_holder_reclaims_it() {
+    // The token is spent BY VALUE. This coercion does not typecheck against a
+    // signature that borrowed it — under which one token would authorise any
+    // number of deletions — so the refusal is the compiler's, on every build,
+    // rather than a sentence in a comment.
+    let _spends_by_value: fn(ScratchTreeOwnership) -> Result<(), ScratchReclaimFailure> =
+        remove_scratch_tree;
+
+    let first = Scratch::acquire("shared");
+    let root = first.root().to_path_buf();
+    let second = first.clone();
+
+    assert_eq!(
+        first.root(),
+        second.root(),
+        "a clone acquired a second tree instead of sharing one"
+    );
+    assert!(
+        std::ptr::eq(&*first, &*second),
+        "both handles must deref to one `RunPaths`, not to two copies of it"
+    );
+    assert_eq!(second.holders(), 2, "two handles, one owner");
+
+    // Exactly the fresh-process shape: the earlier holder goes, the tree stays.
+    drop(first);
+    assert_eq!(second.holders(), 1, "one handle left");
+    assert!(
+        confirmed_present(&second.public) && confirmed_present(&second.private),
+        "dropping one holder of a shared tree reclaimed it; the fresh-process \
+         tests read the log after exactly this drop"
+    );
+
+    drop(second);
+    assert!(
+        confirmed_absent(&root),
+        "the last holder did not reclaim the shared tree"
+    );
+}
+
+/// An absence claim is proof, not a stat that declined to answer.
+///
+/// `Path::exists` folds every stat error into `false`, so an absence assertion
+/// written on it passes on a permission denial, an IO error or a Windows
+/// sharing violation — reporting a tree as reclaimed on the evidence that the
+/// filesystem refused to say. [`confirmed_absent`] reads conjunct 12's
+/// predicate instead: only `NotFound` is proof.
+///
+/// The two disagree only where a stat *errors without being* `NotFound`, so
+/// that is what the third case arranges. An interior NUL is the one path shape
+/// both hosts refuse without touching the filesystem — measured as
+/// `InvalidInput` here and on the Windows guest — which is why it is used
+/// rather than a chmod this `TOPOLOGY_MODULE` may not perform or an
+/// under-a-file stat the Windows guest reports as `NotFound`
+/// (`PR77-WIN-UNDECIDABLE-STAT-ORACLE`).
+#[test]
+fn confirmed_absence_is_proof_rather_than_a_stat_that_declined_to_answer() {
+    let scratch = Scratch::acquire("confirmed-absence");
+
+    // Present, and therefore not absent.
+    assert!(
+        confirmed_present(&scratch.public),
+        "the public half is there"
+    );
+    assert!(
+        !confirmed_absent(&scratch.public),
+        "a directory that is there was reported as provably gone"
+    );
+
+    // Absent, provably: `NotFound` is the one answer that is proof.
+    let never_written = scratch.public.join("report.json");
+    assert!(
+        confirmed_absent(&never_written),
+        "a path that was never created is provably absent"
+    );
+    assert!(!confirmed_present(&never_written), "and is not present");
+
+    // UNDECIDABLE — the whole of the difference between the two predicates.
+    let undecidable = scratch.public.join("a\0b");
+    let kind = std::fs::symlink_metadata(&undecidable)
+        .err()
+        .map(|error| error.kind());
+    assert!(
+        matches!(kind, Some(kind) if kind != std::io::ErrorKind::NotFound),
+        "this witness needs a stat that errors without being `NotFound`; this \
+         host answered {kind:?}"
+    );
+    // The predicate this file may not use, shown answering the wrong way. It is
+    // the negative control, and the only appearance of `exists` here.
+    assert!(
+        !undecidable.exists(),
+        "`Path::exists` renders an undecidable stat as `false` — the reading \
+         this file replaced"
+    );
+    assert!(
+        !confirmed_absent(&undecidable),
+        "a stat that declined to answer was read as proof of absence, which is \
+         a leak spelled as a reclaim"
+    );
+    assert!(
+        !confirmed_present(&undecidable),
+        "and it is not proof of presence either"
+    );
+}
+
+/// A dropped fixture reclaims its tree, after `log`'s handle is closed.
+///
+/// `Fixture.paths` is declared **last**, and struct fields drop in declaration
+/// order, so the guard runs after `log` — which holds an open handle on
+/// `events.jsonl` inside the very tree being removed. Windows refuses to remove
+/// a directory while a handle beneath it is open, so the wrong field order
+/// turns every fixture drop on that host into a failed reclaim, which this
+/// file's `Drop` raises.
+///
+/// On Linux this passes under either order; it is the Windows leg of the matrix
+/// that measures it, which is stated rather than claimed.
+#[test]
+fn a_dropped_fixture_reclaims_its_tree_after_the_log_handle_is_closed() {
+    let mut fixture = Fixture::started("fixture-drop");
+    let root = fixture.paths.root().to_path_buf();
+    fixture
+        .emit(budget_body())
+        .expect("a second durable line, so the log handle has been written through");
+    assert!(
+        confirmed_present(&fixture.log_path()),
+        "the log is open inside the tree about to be reclaimed"
+    );
+
+    drop(fixture);
+    assert!(
+        confirmed_absent(&root),
+        "a fixture left its tree behind; on Windows this is what a `paths` \
+         declared before `log` costs"
+    );
 }
