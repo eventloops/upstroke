@@ -272,7 +272,29 @@ Every run-directory, answer and lock effect is issued inside a `funnel` call \
 naming one `EffectSiteId` (RunDir, Answer, Lock groups). The private-half \
 deletion funnel takes a `PrivateHalfProof` by value and no other constructor \
 exists. No public function returns a writable handle; `WorktreeLock`/`RunLock` \
-own their descriptors and release them on drop."""
+own their descriptors and release them on drop. \
+THE TEST REGION CARRIES ONE MORE RECURSIVE DELETION, and it is reviewed here \
+rather than left to the file-scope allow: `#[cfg(test)] pub(crate) mod \
+scratch_tree` reclaims a test's own scratch tree under a SECOND TOKEN, \
+`ScratchTreeOwnership`. That token is taken BY VALUE, is minted only by \
+`acquire`, and `acquire` CREATES the root it binds with a non-recursive \
+exclusive `fs::create_dir` -- so the token names a root that did not exist \
+before the token did, an occupied or undecidable root refuses without \
+pre-cleaning anything, the name carries a fresh ULID rather than a predictable \
+tag, and there is no path-taking removal a caller could aim at an ancestor. \
+`decisions/2026-08-30-test-scratch-tree-ownership.md` is the record and states \
+the completeness rule in its two-token form. \
+IT ADDS NO SITE. Reclaiming a test's scratch tree is not an engine effect, so \
+there is no `RunDirSite` variant, no `effect_sites.json` row and nothing \
+censused; the module is `#[cfg(test)]`, so it is in no production region and \
+not in the rlib at all -- which is why its `Clone`/`Copy`/`Default`/by-value \
+refusals are compiler-decided inside the crate rather than rlib fixtures \
+beside `PrivateHalfProof`'s. \
+AND IT CARRIES NO ATTRIBUTE OF ITS OWN. It is INLINE, so the file-scope allow \
+this row records IS its lint level by the module tree -- the placement \
+`PR72-PLACEMENT-001` and `decisions/2026-08-30-readiness-lint-placement.md` are \
+about from the other side, where an OUT-OF-LINE child inherited a level nobody \
+had written down."""
 
 [[funnel]]
 path = "src/interaction.rs"
