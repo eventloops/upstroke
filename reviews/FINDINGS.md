@@ -3884,3 +3884,52 @@ neither has to be taken on trust.
 Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md`,
 `reviews/2026-08-31-g2-gate-report.md`,
 `reviews/2026-08-31-g2-first-parent-coverage.md`.
+
+## 36. 2026-08-31 G2 checkpoint — the serialized suite result, and what it does not settle
+
+Append-only. This section records one measurement and changes **no disposition**
+in §35 or anywhere above it.
+
+Root ran the globally serialized suite at the exact committed candidate head
+`50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
+
+| Fact | Value |
+|---|---|
+| Command | `upstroke-build cargo test --all-targets --all-features` |
+| Exit status | `rc=0`, fresh compile |
+| Library | 1801 passed, 0 failed, 34 ignored |
+| Binary (`main`) | 8 passed, 0 failed |
+| Example | 0 tests |
+| Docker | live daemon, Docker server 29.7.2; the `real_docker_*` tests used it and passed |
+| Platform | Linux, this host only |
+
+§35 said of itself that it ran no suite and that no claim in it depended on a
+test result. That remains true of §35. This section is the separate measurement,
+recorded beside it rather than folded into it.
+
+**What it settles about the ledger: very little, and that is the honest reading.**
+
+- **No carried row fired.** 0 failed, so no §35 carried row was observed firing
+  on Linux in this run.
+- **That is not evidence of absence.** A green suite proves the tests passed, not
+  that they still detect — the standing lesson behind the withheld-mutation
+  catalogues in §4 class 4. None of the 52 carried rows is closed, narrowed, or
+  re-dated by this result, and none of their re-opening triggers fired.
+- **The platform-rated rows are untouched.** `PR7-MACOS-PROCESS-GROUP-FLAKE`,
+  `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` and `PR43-*` are macOS and Windows rows.
+  A Linux run cannot observe them, and a Linux green is exactly the false
+  closure `PR5-MACOS-CLIPPY-NEVER-RUN` was reopened for. Their rates stand as
+  recorded.
+- **The intermittent rows keep their rates.** One green run is one observation
+  against rates measured over many; §12's precedent is that a rate not recorded
+  when observed is a rate destroyed by the run that clears it. Nothing here
+  revises a rate in either direction.
+
+**The recurrence classes are unmoved.** §35's verdict — 2 of 18 mechanically
+guarded, 3 partial, 13 convention-only — is a statement about what artifacts
+exist, not about whether a run passed. A class leaves §4 by being guarded.
+
+**The `||` defect on line 156 is unrepaired**, deliberately, and this section
+does not touch it either.
+
+Companion record: `reviews/2026-08-31-g2-gate-report.md`, "The serialized gate run".

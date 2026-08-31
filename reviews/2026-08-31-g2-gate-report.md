@@ -16,12 +16,37 @@ report cites them only by stable internal reference
 - **`master` before the promotion:** `76b6a784ae5562ac044d6ff9a15b68397bd9b0e0`
 - **Range:** `76b6a784..50ed8c86` — **418 commits, 66 first-parent units**
 
+**Revision, 2026-08-31 (second).** This report was first committed at
+`50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9` with all six execution-dependent
+artifacts recorded as owed. Root has since run the globally serialized suite at
+that exact head. The verdict, the artifact table and the owed-work section below
+are **revised in place** to record that result — a gate report that still said
+"not run" after the run would be the stale artifact this file exists to prevent.
+What changed is confined to those three places plus the new "The serialized gate
+run" section; the inertness proofs, the bridge evidence and the CI evidence are
+untouched. Nothing is removed, and no artifact is upgraded past what the
+executing tests substantiate.
+
 ## Verdict
 
-**The G2 gate does not pass at this candidate.** Two of the eight required
-artifacts are producible on this host and are produced or pinned here; six
-require execution this host cannot perform, and they are recorded as owed rather
-than asserted.
+**The G2 gate does not pass at this candidate.** The serialized suite has now
+run green at the exact candidate head, including the Docker-gated tests against
+a live daemon, and that discharges more than assembly could. It does not
+discharge the gate, for two reasons that are not fixable by another Linux run:
+
+1. **The artifacts are captured evidence, not merely passing oracles.** Six of
+   the eight ask for a table, a transcript, a log, a diff or a histogram. Their
+   oracles executed and passed; the artifacts themselves were not captured. A
+   passing test is the ground the artifact stands on, not the artifact.
+2. **The run is Linux-only.** macOS and Windows are hosted evidence. This
+   repository carries two rows — `PR5-MACOS-CLIPPY-NEVER-RUN` and
+   `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` — that exist precisely because a
+   Linux-only green closed a platform question falsely.
+
+And the gate's own pass rule requires a completed review with no open
+critical/high finding. **No panel has been convened**: the three-model panel of
+`decisions/2026-08-25-checkpoint-merges.md` has not run, and its membership is
+not settled. That blocker is untouched by any test result.
 
 Nothing in this report is a claim that a reviewer reread the candidate diff.
 
@@ -30,16 +55,22 @@ Nothing in this report is a claim that a reviewer reread the candidate diff.
 The gate's `required_artifacts` list has eight entries. Each is named below by
 its index and by a public-safe description of what it asks for.
 
-| # | What the artifact is | State | Evidence, or what it is owed to |
+States are deliberately narrow. **Produced** means the artifact exists.
+**Oracles passed** means every in-suite test the artifact rests on executed and
+passed at this head, but the artifact's captured form — the table, log,
+transcript, diff or histogram it names — was not collected. **Owed** means
+neither.
+
+| # | What the artifact is | State | What the run substantiates, and what it does not |
 |---|---|---|---|
 | 1 | The gate report | **Produced** | This file |
-| 2 | Host/container parity outputs | **Owed** | Requires the Docker-gated suite. Not runnable as part of assembly; see "Docker" below |
-| 3 | Fault-injection evidence table for the G2 sites — event kill and error-return points, the sync-prefix barrier refusal cases, id-unread points, and residue-class evidence (synthetic per element, plus a sampling record with its observed-class histogram) | **Owed** | The globally serialized full suite, which root runs after this commit. The residue sampler's known scheduling hazard is `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE`, repaired in PR7 |
-| 4 | Ref, worktree, snapshot, object, container and run-directory inventory before/after, with the husk census table | **Owed** | The serialized full suite plus the Docker-gated suite |
-| 5 | User-checkout inventory diff | **Owed** | The serialized full suite |
-| 6 | Docker-gated suite result with the environment noted | **Owed** | A Docker run. Deterministic container names collide across concurrent worktrees on one daemon, so this must be run serially or it reports a defect that is not there |
-| 7 | `clippy.toml`, `effects/allowlist.toml`, wrapper classification, `effect_sites.json`, allow-placement scan output | **Inputs pinned; result owed** | All five inputs exist at this head and are hash-pinned below. The allow-placement scan is `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` (`src/effects/tests.rs:507`); its *passing* is owed to the serialized suite |
-| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Owed** | The serialized full suite plus the Docker-gated suite |
+| 2 | Host/container parity outputs | **Oracles passed (Linux)** | The parity oracles ran against the live daemon and passed — `real_docker_adapter_parsing_matches_the_host_table` (`src/runner/container/exec.rs:6653`) is the named host-versus-container comparison. **Not captured:** the parity *outputs*. **Not covered:** macOS and Windows |
+| 3 | Fault-injection evidence table for the G2 sites — event kill and error-return points, the sync-prefix barrier refusal cases, id-unread points, and residue-class evidence (synthetic per element, plus a sampling record with its observed-class histogram) | **Oracles passed (Linux)** | The kill-point, error-return, sync-prefix-barrier, id-unread and residue-class tests are inside the green suite, and the kill children they re-invoke as subprocesses ran with them. **Not captured:** the evidence *table*, and the sampling record's **observed-class histogram** — the suite asserts the sampler's premise, it does not emit a histogram. The sampler's own scheduling hazard is `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE`, repaired in PR7 |
+| 4 | Ref, worktree, snapshot, object, container and run-directory inventory before/after, with the husk census table | **Oracles passed (Linux)** | The husk-census and inventory oracles passed, including the Docker-backed container reclaim tests. **Not captured:** the before/after inventory and the husk census table, per shape, with the creator-error cases |
+| 5 | User-checkout inventory diff | **Oracles passed (Linux)** | The checkout-inventory oracles passed. **Not captured:** the diff itself |
+| 6 | Docker-gated suite result with the environment noted | **Produced (Linux)** | This is the one artifact the run yields directly. `rc=0`, fresh compile, lib 1801 passed / 0 failed / 34 ignored, main 8 passed / 0 failed, example 0 tests; the `real_docker_*` tests exercised a live **Docker server 29.7.2**. Environment noted below. **Not covered:** macOS and Windows |
+| 7 | `clippy.toml`, `effects/allowlist.toml`, wrapper classification, `effect_sites.json`, allow-placement scan output | **Inputs pinned; scan passed** | All five inputs exist at this head and are hash-pinned below, and the allow-placement scan `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` (`src/effects/tests.rs:507`) passed in the green suite, as did `every_allowlist_entry_carries_its_justification_and_names_a_real_file` (`:898`). **Not captured:** the scan's printed output as a standalone artifact |
+| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Oracles passed (Linux)** | The runner-record, owner-record, intent-digest, image-id and refusal oracles passed. **Not captured:** the per-invocation boundary and image-id **log**, and the inspection-refusal and probe-refusal **transcripts**. These are the artifact, and the suite does not emit them |
 
 ### Artifact 7 — the inputs, pinned
 
@@ -58,24 +89,65 @@ Present at `50ed8c86`, sha256 truncated to 16 hex characters:
 That is the same 70-total/14-`run_dir` census `reviews/FINDINGS.md` §31 records
 as unchanged from its base, re-derived here rather than copied.
 
-### Stop record — the six owed artifacts
+## The serialized gate run
 
-This host cannot truthfully produce artifacts 2, 3, 4, 5, 6 and 8. The reasons
-are specific, not general:
+Run by root through the globally serialized build wrapper at the exact committed
+candidate head `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
 
-1. **The full suite is globally serialized and root runs it after this commit.**
-   Assembly must not run it, so no artifact that depends on suite output can be
-   asserted here.
-2. **Docker-gated work needs a serial daemon.** Container names are
-   deterministic and one daemon is shared across worktrees, so a concurrent run
-   reports collisions as defects.
-3. **The macOS and Windows evidence is hosted evidence.** A Linux-local result
-   is not a substitute: `PR5-MACOS-CLIPPY-NEVER-RUN` and
-   `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` are both rows that exist because a
-   Linux-only green closed a platform question falsely.
+```
+/home/ubuntu/bin/upstroke-build cargo test --all-targets --all-features
+```
 
-**Consequently the candidate is not gate-passed, and no part of this record
-should be read as saying it is.**
+| Fact | Value |
+|---|---|
+| Exit status | `rc=0` |
+| Compile | fresh — not a cached-binary run |
+| Library target | **1801 passed, 0 failed, 34 ignored** |
+| Binary target (`main`) | **8 passed, 0 failed** |
+| Example target | 0 tests |
+| Docker | live daemon, **Docker server 29.7.2**; the `real_docker_*` tests used it and passed |
+| Platform | Linux, this host only |
+
+**On the 34 ignored.** They are `#[ignore]`-marked **subprocess entry points** —
+`*_kill_child`, `*_helper`, `*_child` functions that a parent test re-invokes as
+a child process — not skipped assertions. They ran, as children, under the
+parents that spawned them. This report does not enumerate the 34 by name against
+the run output, because root supplied counts rather than a list; the
+characterisation is from the `#[ignore]` sites in the tree.
+
+**Why serialization mattered.** Container names in this suite are deterministic
+and one daemon is shared across worktrees, so a concurrent run reports
+collisions as defects that are not there. This run was serialized, which is what
+makes its Docker result readable.
+
+### What the run does, and does not, discharge
+
+**Discharged:** artifact 6 outright, on Linux. Artifact 7's scan result. The
+oracles beneath artifacts 2, 3, 4, 5 and 8.
+
+**Strengthened, not newly claimed:** the inertness proofs below were already
+structural — verified by reading the tree, not by running it. The green suite
+adds that their guards execute and hold, including
+`max_parallel_above_one_is_refused_rather_than_read_past`
+(`src/config.rs:2949`) and the compile-time schema assertions, which a fresh
+compile necessarily evaluated.
+
+**Not discharged, and not dischargeable by another Linux run:**
+
+1. **The captured artifacts.** Six of the eight name a table, a log, a
+   transcript, a diff or a histogram. Those were not collected, and this report
+   does not claim them. An oracle passing is evidence *for* the artifact; it is
+   not the artifact.
+2. **macOS and Windows.** Hosted evidence, not produced here. The two platform
+   rows named in the verdict are the standing reason a Linux green is not a
+   substitute.
+3. **The panel.** The gate's pass rule requires questions answered and no open
+   critical/high finding, and the checkpoint record requires a three-model panel
+   to attest the code and the audited ledger together. **No panel has been
+   convened and its membership is not settled.** No test result touches this.
+
+**Consequently the candidate is still not gate-passed, and no part of this
+record should be read as saying it is.**
 
 ## Inert by default — verified, not assumed
 

@@ -86,3 +86,43 @@ before that moment arrived.
   **not** exempt-only and does not inherit any earlier head's review.
 - `2026-08-23-retire-app-attestation.md` — unchanged; the owner's merge remains
   the attestation.
+
+## Addendum, 2026-08-31 — the serialized suite ran green, and what that moved
+
+Appended rather than applied in place, per this folder's immutability rule. The
+table above stands as written; this section states what its rows 1 and 5 now
+read, and what did not move.
+
+Root ran the globally serialized suite at the exact committed candidate head
+`50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
+`upstroke-build cargo test --all-targets --all-features`, `rc=0`, fresh compile,
+library **1801 passed / 0 failed / 34 ignored**, binary **8 passed / 0 failed**,
+example 0 tests, with the `real_docker_*` tests exercising a live **Docker
+server 29.7.2**.
+
+**Obligation 5 moves, partly.** Artifact 6 — the Docker-gated suite result with
+its environment noted — is now **produced** on Linux. Artifact 7's allow-placement
+scan **passed**, so its result joins its pinned inputs. The oracles beneath
+artifacts 2, 3, 4, 5 and 8 all executed and passed.
+
+**Obligation 1 does not move, and this is the part worth being exact about.**
+The gate still does not pass. Six artifacts name a captured form — a table, a
+log, a transcript, a diff, an observed-class histogram — and none of those was
+collected. A passing oracle is evidence for an artifact; it is not the artifact.
+The run is also Linux-only, and macOS and Windows are hosted evidence this host
+does not produce.
+
+**Obligation 4 is entirely untouched.** The three-model panel has not been
+convened and **its membership is not settled**. The gate's own pass rule needs
+questions answered and no open critical/high finding, which is a review outcome;
+no suite result can supply it. This remains the blocking obligation.
+
+**Obligation 6 is strengthened, not re-derived.** The inertness proofs were
+structural — read from the tree, not run. A fresh compile necessarily evaluated
+the three compile-time schema assertions, and
+`max_parallel_above_one_is_refused_rather_than_read_past` passed with the rest.
+The schema-4 **visibility** conflict recorded in the gate report stands
+unchanged: `src/lib.rs:49` is `pub mod topology;`, the surface is **not**
+`pub(crate)`, and the condition is met behaviourally rather than by visibility.
+
+Evidence: `reviews/2026-08-31-g2-gate-report.md`, "The serialized gate run".

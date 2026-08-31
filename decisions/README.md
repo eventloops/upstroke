@@ -86,8 +86,9 @@ artifacts (§15); records promoted here are the durable subset.
   unmoved. Class C exception to the 2026-08-20 freeze, scoped to that field.
 - [2026-08-31 — the G2 checkpoint promotion candidate](2026-08-31-g2-checkpoint-promotion.md):
   reconciles `2026-08-25-checkpoint-merges.md` obligation by obligation and leaves it
-  controlling in full. The ledger audit and the recurrence review are discharged; the
-  panel, six of the eight gate artifacts, and the serialized suite are owed. Inertness is
+  controlling in full. The ledger audit and the recurrence review are discharged, and the
+  serialized suite ran green at the candidate head; the panel and the six captured gate
+  artifacts, plus macOS and Windows, remain owed. Inertness is
   verified by construction, no `0.2.0` tag is authorized, and rollback is
   `git revert -m 1 MERGE_OID` — deliberately a high bar, because re-promotion then
   requires reverting the revert.
