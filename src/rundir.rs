@@ -2962,12 +2962,15 @@ pub(crate) mod scratch_tree {
     /// Production has one remover, [`remove_tree`], and [`remove_scratch_tree`]
     /// is the only way to reach it that does not name a remover.
     ///
-    /// Crate-visible in the test build so that a witness outside this module —
-    /// `engine::topology::emit::tests`, whose fixtures own scratch trees of
-    /// their own — can watch a reclaim fail through the same funnel rather than
-    /// fabricating a failure of its own shape. The type is still `#[cfg(test)]`
-    /// and still absent from the rlib.
-    pub(crate) type Remover = fn(&Path) -> io::Result<()>;
+    /// **Module-private, and it stays that way.** A remover is an arbitrary
+    /// callback holding a reclaim's whole authority: it is handed the token's
+    /// root and decides what happens to it, so a crate-visible one could delete
+    /// an ancestor of the path it was given, ignore the path entirely and
+    /// delete something else, or return `Ok(())` having removed nothing — under
+    /// which last a caller's tree is reported reclaimed and silently leaks.
+    /// `PR78-SCRATCH-REMOVER-SEAM-AUTHORITY`. Outside witnesses get
+    /// [`refuse_to_reclaim`] instead, which names no path and cannot succeed.
+    type Remover = fn(&Path) -> io::Result<()>;
 
     /// The real remover: the recursive deletion, under `src/rundir.rs`'s
     /// existing reviewed allowance for raw filesystem primitives.
@@ -3073,12 +3076,12 @@ pub(crate) mod scratch_tree {
     /// directory — which a caller in a `TOPOLOGY_MODULE` could not arrange in
     /// any case, `fs` mutation being denied there.
     ///
-    /// Crate-visible rather than module-private, unlike [`acquire_named`]:
-    /// naming a *remover* cannot aim a reclaim at a path the caller chose, so
-    /// this widens no authority. The token still decides which root is removed,
-    /// it is still spent by value, and the only thing an outside caller gains
-    /// is the ability to make its own reclaim fail on purpose.
-    pub(crate) fn remove_scratch_tree_with(
+    /// **Private, for the reason [`acquire_named`] is**: it takes a [`Remover`],
+    /// and a caller that supplies one supplies the reclaim's whole authority.
+    /// The two are the same hazard from opposite ends — one lets a caller name
+    /// the path, the other lets it decide what naming the path means — and
+    /// neither is anything an outside witness needs.
+    fn remove_scratch_tree_with(
         token: ScratchTreeOwnership,
         remove: Remover,
     ) -> Result<(), ScratchReclaimFailure> {
@@ -3091,6 +3094,67 @@ pub(crate) mod scratch_tree {
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(ScratchReclaimFailure { token, source }),
         }
+    }
+
+    /// Refuse to reclaim a token's tree, deterministically and on every host.
+    ///
+    /// The one thing a witness outside this module may do to a reclaim, and
+    /// deliberately the smallest thing that suffices. It **cannot be aimed**:
+    /// there is no path parameter, and the root removed — or in this case not
+    /// removed — is the token's own. It **cannot be told what to do**: the
+    /// remover is a private `fn` item declared inside this one, stateless, with
+    /// no captured environment for a second call or a second thread to observe.
+    /// And it **cannot report success**: the return type is the failure itself,
+    /// so no caller can be handed an `Ok(())` for a tree that is still there.
+    ///
+    /// What comes back is the genuine [`ScratchReclaimFailure`] the private
+    /// funnel built, carrying the token it handed back — so a caller reclaims
+    /// with [`ScratchReclaimFailure::into_token`] and [`ScratchTree::rearm`],
+    /// exactly as it would after a real refusal. Nothing here is fabricated.
+    ///
+    /// `PR78-SCRATCH-REMOVER-SEAM-AUTHORITY`: this replaced a crate-visible
+    /// [`remove_scratch_tree_with`], under which any caller could pass a
+    /// remover that deleted an ancestor, ignored its argument, or returned
+    /// `Ok(())` having removed nothing.
+    pub(crate) fn refuse_to_reclaim(token: ScratchTreeOwnership) -> ScratchReclaimFailure {
+        /// Removes nothing, refuses always, remembers nothing between calls.
+        fn refuse(_root: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+
+        match remove_scratch_tree_with(token, refuse) {
+            Err(failure) => failure,
+            // Unreachable by construction: `refuse` returns `PermissionDenied`
+            // for every input, and the only error the funnel reads as success
+            // is `NotFound`.
+            Ok(()) => unreachable!("a refusing remover cannot reclaim a tree"),
+        }
+    }
+
+    /// Report a reclaim that did not happen, on this subsystem's own reporter.
+    ///
+    /// **Fallible, and every caller must decide.** The arm that needs this runs
+    /// while a thread is already unwinding, where a raised panic aborts the
+    /// process and destroys the diagnosis of whatever actually failed — so the
+    /// write error comes back rather than up, and suppressing it is a decision
+    /// the caller writes down. See [`report_to_stderr`], and
+    /// `PR77-SCRATCH-UNWIND-REPORT-PANICS`.
+    ///
+    /// It takes the failure rather than a message so that every report of a
+    /// lost tree has one shape and names the root the token bound. A caller
+    /// outside this module has no other way to reach the reporter, and cannot
+    /// substitute one of its own: [`Reporter`] is not exported.
+    ///
+    /// `PR78-EMIT-UNWIND-REPORT-LOST`: without this, a fixture whose unwinding
+    /// reclaim failed had nowhere to put its report except a slot that died
+    /// with it, so the leak was silent unless a witness happened to hold an
+    /// external handle on that slot.
+    pub(crate) fn report_reclaim_failure(failure: &ScratchReclaimFailure) -> io::Result<()> {
+        report_to_stderr(&format!(
+            "scratch tree {} was not reclaimed: {}",
+            failure.root().display(),
+            failure.source()
+        ))
     }
 
     /// Absence, proved rather than assumed.
@@ -3170,15 +3234,17 @@ pub(crate) mod scratch_tree {
         /// [`rearm`](Self::rearm) over an injectable remover **and an
         /// injectable reporter**.
         ///
-        /// Module-private, unlike [`remove_scratch_tree_with`]: widening this
-        /// one would also hand out [`Reporter`], and control over *how a
-        /// reclaim failure is reported* is this module's to keep — the
-        /// suppressed arm of `Drop` is the only caller that has to get a
-        /// fallible report right on an unwinding thread. An outside witness
-        /// needs none of it: a failing reclaim is reachable through
-        /// [`remove_scratch_tree_with`] alone, and re-arming a guard over the
-        /// token that comes back is [`rearm`](Self::rearm)'s job. Like every
-        /// item here it is `#[cfg(test)]`, so no production build contains it.
+        /// Module-private, for both reasons at once and one more:
+        /// [`remove_scratch_tree_with`]'s, because it takes a [`Remover`]; and
+        /// [`Reporter`]'s, because control over *how* a lost tree is reported
+        /// belongs here — the suppressed arm of `Drop` is the only caller that
+        /// has to get a fallible report right on an unwinding thread, and a
+        /// caller that could substitute a reporter could make that arm silent.
+        /// An outside witness needs neither: [`refuse_to_reclaim`] gives it a
+        /// failing reclaim it cannot aim, [`report_reclaim_failure`] gives it
+        /// the one report shape, and [`rearm`](Self::rearm) takes the token
+        /// back. Like every item here it is `#[cfg(test)]`, so no production
+        /// build contains it.
         fn guarded_with(token: ScratchTreeOwnership, remove: Remover, report: Reporter) -> Self {
             Self {
                 token: Some(token),

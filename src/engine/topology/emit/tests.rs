@@ -26,7 +26,6 @@
 //!   assertion below clears its ledger first and reads the sequence that
 //!   follows.
 
-use std::io;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -48,8 +47,8 @@ use crate::ir::{
 };
 use crate::review::ReviewPlan;
 use crate::rundir::scratch_tree::{
-    Remover, ScratchReclaimFailure, ScratchTree, ScratchTreeOwnership, acquire, proves_absent,
-    remove_scratch_tree, remove_scratch_tree_with,
+    ScratchReclaimFailure, ScratchTree, ScratchTreeOwnership, acquire, proves_absent,
+    refuse_to_reclaim, remove_scratch_tree, report_reclaim_failure,
 };
 use crate::rundir::{
     CommitRecord, CommitRecordPresence, NoHooks, RunDirClass, RunDirHooks, RunPaths,
@@ -105,15 +104,33 @@ fn gate_timeout(started: &RunStarted4) -> Duration {
 /// and somebody has to own it. A `Drop` cannot return anything, so it parks the
 /// token here and the witness that arranged the refusal re-arms a guard over it.
 ///
-/// **The line it would otherwise have raised**, because on the unwinding path
-/// it may not raise at all, and a leak that is merely silent is the thing this
-/// arm exists to prevent.
+/// **A copy of what the arm did with the report**, so that a witness can assert
+/// on it. This is an *extra* channel and never the only one: every fixture's
+/// report goes out through the scratch subsystem's reporter or is raised, and
+/// `PR78-EMIT-UNWIND-REPORT-LOST` is what it cost when this slot was the whole
+/// of it — an ordinary fixture holds no external handle on its own slot, so the
+/// slot died with the tree's owner and the leak was silent.
 #[derive(Debug, Default)]
 struct Parked {
     /// The token handed back, for the holder to reclaim with.
     token: Option<ScratchTreeOwnership>,
-    /// What the reclaim failure was, whichever arm recorded it.
-    reported: Option<String>,
+    /// What the arm that ran did with the report.
+    reported: Option<Report>,
+}
+
+/// What became of a lost tree's report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Report {
+    /// Raised, on the normal path, where a panic is the report.
+    Raised(String),
+    /// Handed to [`report_reclaim_failure`] on the unwinding path, where a
+    /// panic would abort the process — with what the reporter answered.
+    Reported {
+        /// The line the subsystem was asked to write.
+        message: String,
+        /// Whether it managed to. A `false` here is suppressed, not raised.
+        delivered: bool,
+    },
 }
 
 /// The slot itself, shared with whoever holds the [`Scratch`].
@@ -132,10 +149,12 @@ enum Reclaimed {
 
 /// How a [`Scratch`] spends its token.
 ///
-/// A function pointer rather than a hook site, for the reason `scratch_tree`'s
-/// own [`Remover`] is one: two witnesses need a reclaim that fails, and giving
-/// the engine a registration point for a test's benefit would put a production
-/// seam in the tree.
+/// A function pointer rather than a hook site: two witnesses need a reclaim
+/// that fails, and giving the engine a registration point for a test's benefit
+/// would put a production seam in the tree. It selects between the two whole
+/// operations `scratch_tree` exports — [`remove_scratch_tree`] and
+/// [`refuse_to_reclaim`] — and carries no path and no removal behaviour of its
+/// own, so it is a choice between funnels rather than a callback into one.
 type Reclaim = fn(ScratchTreeOwnership) -> Reclaimed;
 
 /// The real reclaim, and the only one any fixture uses.
@@ -154,31 +173,30 @@ fn spend(token: ScratchTreeOwnership) -> Reclaimed {
 
 /// A reclaim that refuses, deterministically and on every platform.
 ///
-/// **The refusal is slice 1's, not this file's.** The reclaim goes through
-/// [`remove_scratch_tree_with`] — the same funnel [`remove_scratch_tree`] is,
-/// over the same by-value token — carrying a [`Remover`] that removes nothing
-/// and reports `PermissionDenied`. So the [`ScratchReclaimFailure`] the witness
-/// then unpacks is the one slice 1 built, from slice 1's own `NotFound`-only
-/// reading, and the token it carries is the token slice 1 handed back. An
-/// earlier revision fabricated that variant here; a hand-built refusal proves
-/// only that the hand that built it agreed with itself.
+/// **The refusal is slice 1's, not this file's.** [`refuse_to_reclaim`] drives
+/// the same private funnel [`remove_scratch_tree`] does, over the same by-value
+/// token, with a remover that lives inside `scratch_tree` and never leaves it.
+/// So the [`ScratchReclaimFailure`] the witness unpacks is the one slice 1
+/// built, from slice 1's own `NotFound`-only reading, and the token it carries
+/// is the token slice 1 handed back. An earlier revision fabricated that
+/// variant here; a hand-built refusal proves only that the hand that built it
+/// agreed with itself.
 ///
-/// The remover is a plain `fn` item declared inside this one, so it is
-/// **stateless** — no captured environment, no cell, nothing a second call or a
-/// second thread could observe — and deterministic on every platform. Which is
-/// what it has to be: `src/engine/topology/**` is a `TOPOLOGY_MODULE`, so no
-/// raw `fs` call here can arrange an unwritable directory, and the shapes that
-/// fail without one — an open handle, the process's own working directory —
-/// fail on Windows and succeed on Linux. A witness that is a witness on one
-/// host is not one.
+/// **This file supplies no remover, and cannot.** `refuse_to_reclaim` takes no
+/// path and no callback and has no success case in its return type, so the only
+/// authority it hands over is the authority to fail. An earlier revision reached
+/// a crate-visible generic funnel instead, under which any caller's remover
+/// could have deleted an ancestor of the root it was given, ignored that root
+/// and deleted something else, or returned `Ok(())` having removed nothing —
+/// which last reports a live tree as reclaimed. `PR78-SCRATCH-REMOVER-SEAM-AUTHORITY`.
+///
+/// A deterministic refusal is what a witness has to have: `src/engine/topology/**`
+/// is a `TOPOLOGY_MODULE`, so no raw `fs` call here can arrange an unwritable
+/// directory, and the shapes that fail without one — an open handle, the
+/// process's own working directory — fail on Windows and succeed on Linux. A
+/// witness that is a witness on one host is not one.
 fn refuses(token: ScratchTreeOwnership) -> Reclaimed {
-    /// Removes nothing, refuses always, and remembers nothing between calls.
-    const REFUSE: Remover = |_root| Err(io::Error::from(io::ErrorKind::PermissionDenied));
-
-    match remove_scratch_tree_with(token, REFUSE) {
-        Ok(()) => Reclaimed::Done,
-        Err(failure) => Reclaimed::Refused(failure),
-    }
+    Reclaimed::Refused(refuse_to_reclaim(token))
 }
 
 /// The single owner of one scratch tree: one token, one reclaim, one `Drop`.
@@ -218,19 +236,43 @@ impl Drop for OwnedTree {
                     failure.root().display(),
                     failure.source()
                 );
+                // The report goes out FIRST, and on the unwinding path it goes
+                // out through the scratch subsystem's own fallible reporter —
+                // the one channel an ordinary fixture has. Nothing here depends
+                // on somebody holding a handle on the slot below.
+                let record = if std::thread::panicking() {
+                    // SUPPRESSED, and only here, and explicitly. The reporter
+                    // returns its write error rather than raising it, because
+                    // this runs while the thread is already unwinding and a
+                    // panic there aborts the process — which would replace the
+                    // diagnosis of whatever actually failed with nothing at all.
+                    // `PR77-SCRATCH-UNWIND-REPORT-PANICS`. There is genuinely
+                    // nothing to do with the error: the channel that would carry
+                    // a complaint is the one that just failed. It is matched
+                    // rather than discarded so that a future arm which *could*
+                    // act has a place to be written.
+                    let delivered = match report_reclaim_failure(&failure) {
+                        Ok(()) => true,
+                        Err(_reporting_failed) => false,
+                    };
+                    Report::Reported {
+                        message: message.clone(),
+                        delivered,
+                    }
+                } else {
+                    Report::Raised(message.clone())
+                };
                 let token = failure.into_token();
-                // The tree outlived its owner. Park the token **and the reason
-                // first**, before either arm below runs, so the holder has
-                // something to reclaim with and a record of why — whichever way
-                // this exits, and even though only one of the two arms can also
-                // raise.
+                // Then the token, and a copy of the record, for a witness that
+                // holds this slot. Both before either arm below runs, so the
+                // holder has something to reclaim with whichever way this exits.
                 {
                     let mut parked = self
                         .parked
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     parked.token = Some(token);
-                    parked.reported = Some(message.clone());
+                    parked.reported = Some(record);
                 }
                 if std::thread::panicking() {
                     // SUPPRESSED, and only here. A panic raised while the thread
@@ -239,23 +281,10 @@ impl Drop for OwnedTree {
                     // — the leak would cost the diagnosis of whatever actually
                     // failed.
                     //
-                    // Recorded rather than swallowed: the line is parked above
-                    // and a witness reads it, so this arm is silent to the
-                    // console and not silent to the suite. `let _ =` on the
-                    // reclaim's outcome would read the same here and make a
-                    // leaked tree invisible on *every* path, the one below
-                    // included.
-                    //
-                    // That the record is a `String` assignment is the point.
-                    // Slice 1's own arm has to reason about a *fallible* report,
-                    // because `eprintln!` turns a write error — a closed stderr,
-                    // a full pipe — into a panic, and a panic here is exactly the
-                    // abort the suppression exists to avoid
-                    // (`PR77-SCRATCH-UNWIND-REPORT-PANICS`). This file may not
-                    // reach `io::Write` at all: `write_all` and `flush` are
-                    // effect denials in a `TOPOLOGY_MODULE`. The slot it uses
-                    // instead cannot fail, so the hazard is absent by
-                    // construction rather than handled.
+                    // Already reported, above, on the subsystem's reporter.
+                    // `let _ =` on the reclaim's outcome would read the same
+                    // here and make a leaked tree invisible on *every* path,
+                    // the one below included; the match is why it cannot.
                 } else {
                     panic!("{message}");
                 }
@@ -2472,9 +2501,9 @@ fn a_reclaim_failure_on_the_normal_path_is_reported() {
         "the panic must name the tree that leaked: {message:?}"
     );
     assert_eq!(
-        reported.as_deref(),
-        Some(message.as_str()),
-        "the raised line and the parked record must be one report"
+        reported,
+        Some(Report::Raised(message.clone())),
+        "on the normal path the report IS the panic, and the record must say so"
     );
     assert!(reclaimed, "the re-armed fallback did not reclaim the tree");
 }
@@ -2540,14 +2569,80 @@ fn a_reclaim_failure_while_already_unwinding_is_suppressed() {
         message, UNDER_TEST,
         "the suppressed arm replaced the failure under test with its own"
     );
-    // Suppressed is not swallowed. This arm may not raise, so the record it
-    // parks instead is the whole of what keeps the leak visible.
-    let reported = reported.expect("the suppressed arm records what it may not raise");
+    // Suppressed is not swallowed. This arm may not raise, so it hands the
+    // line to the scratch subsystem's reporter instead — and the record says
+    // which arm ran and whether the write landed.
+    let Some(Report::Reported { message, delivered }) = reported else {
+        panic!("the unwinding arm must report through the subsystem: {reported:?}");
+    };
     assert!(
-        reported.contains("was not reclaimed") && reported.contains(&root.display().to_string()),
-        "the parked report must name the tree and what happened: {reported:?}"
+        delivered,
+        "the reporter refused a live stderr, so the suppression path was not measured"
+    );
+    assert!(
+        message.contains("was not reclaimed") && message.contains(&root.display().to_string()),
+        "the report must name the tree and what happened: {message:?}"
     );
     assert!(reclaimed, "the re-armed fallback did not reclaim the tree");
+}
+
+/// An **ordinary** fixture's unwinding reclaim failure still reports, with
+/// nobody holding its slot.
+///
+/// `PR78-EMIT-UNWIND-REPORT-LOST`. The suppressed arm used to put its line in
+/// the fixture's own [`ParkedSlot`] and nowhere else. Every `Scratch` owns that
+/// slot, and an ordinary fixture is the only thing holding it — so the slot died
+/// with the owner and the leak was silent. It read as covered because the two
+/// injected witnesses clone the slot out first, which is precisely the shape no
+/// real fixture has.
+///
+/// So this witness takes **no** `parked()` clone. What is left is the channel
+/// every fixture actually has: [`report_reclaim_failure`], the scratch
+/// subsystem's own fallible reporter. Three things are measured — the process
+/// did not abort, the payload that comes back is still the closure's own, and
+/// the refused tree really was left on disk for the outer guard to take. That
+/// the line reaches stderr is not assertable from here (redirecting fd 2 needs
+/// `unsafe`, and a subprocess needs `Command`, which a `TOPOLOGY_MODULE` may
+/// not name); its *delivery* is asserted next door by
+/// `a_reclaim_failure_while_already_unwinding_is_suppressed`, which reads the
+/// `Report::Reported { delivered }` this same arm records.
+///
+/// The outer tree is what reclaims here, and it has to be: the token comes back
+/// into a slot nobody is watching, which is the ordinary fixture's situation and
+/// the whole subject of the finding.
+#[test]
+fn an_unwinding_reclaim_failure_reports_with_no_observer_on_the_slot() {
+    /// The failure under test — the one an abort would erase.
+    const UNDER_TEST: &str = "the failure an unobserved fixture is carrying";
+
+    let outer = acquire(&std::env::temp_dir(), "unobserved-outer").expect("the outer tree");
+    let scratch = Scratch::acquire_refusing_reclaim(outer.path(), "unobserved");
+    let root = scratch.root().to_path_buf();
+
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
+        let _dropped_while_unwinding = scratch;
+        panic!("{UNDER_TEST}");
+    }));
+    // The control: a refusal that had removed the tree anyway would leave
+    // nothing for the arm under test to report.
+    let survived = confirmed_present(&root);
+
+    drop(outer);
+    let reclaimed = confirmed_absent(&root);
+
+    assert!(
+        survived,
+        "the refusing remover removed the tree anyway, so nothing here was measured"
+    );
+    let message = panic_message(&outcome.expect_err("the closure panics"));
+    assert_eq!(
+        message, UNDER_TEST,
+        "an unobserved fixture's reclaim failure replaced the failure under test"
+    );
+    assert!(
+        reclaimed,
+        "the outer guard did not take the tree its refused child left behind"
+    );
 }
 
 /// A clone shares one tree, one owner and one token; the last holder reclaims.
