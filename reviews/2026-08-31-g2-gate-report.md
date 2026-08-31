@@ -11,10 +11,40 @@ delta is stated. The private packet records are read but never reproduced: this
 report cites them only by stable internal reference
 (`cumulative_review_gates.gates[G2].<field>`).
 
-- **Candidate head:** `50ed8c86ec60164011bfd393066c4c3696d3865b`
+- **Pre-assembly baseline:** `50ed8c86ec60164011bfd393066c4c3696d3865b` — **not a cut candidate**; see "What `50ed8c86` is" below
 - **Branch:** `promotion/g2-candidate-assembly`
 - **`master` before the promotion:** `76b6a784ae5562ac044d6ff9a15b68397bd9b0e0`
 - **Range:** `76b6a784..50ed8c86` — **418 commits, 66 first-parent units**
+
+**Revision, 2026-08-31 (fourth).** The PR #80 review returned CHANGES_REQUIRED
+with four validated blockers, and all four were right. Two land on this file.
+**(2)** This report called `50ed8c86` the *candidate*, which reverses the
+ordering `decisions/2026-08-25-checkpoint-merges.md` fixes: the gate passes and
+the eight artifacts exist **before** a candidate is cut. `50ed8c86` is the
+**pre-assembly baseline**; no candidate has been cut. **(4)** The verdict said
+panel membership was unsettled while the same head adopted the three ratified
+seats — a current artifact cannot assert both. Both are corrected below. The
+other two blockers land on `reviews/FINDINGS.md` §38 and
+`reviews/2026-08-31-g2-first-parent-coverage.md`.
+
+## What `50ed8c86` is
+
+`50ed8c86` is the **green post-PR79 baseline this evidence is measured against**.
+It is not a candidate and this report does not treat it as one.
+
+`decisions/2026-08-25-checkpoint-merges.md` orders the sequence: the G2 gate
+passes on the cleaned tree, the eight artifacts exist, the full-ledger audit is
+done — **and then** the candidate is cut. That ordering is controlling and is
+**not narrowed here**. The evidence in this file, the coverage map, and the
+ledger audit are all *inputs* to that gate, produced on the baseline.
+
+**The candidate will be the integration landing head** — the head
+`codex/parallelism-design` carries once this evidence branch lands under the
+standing per-head ceremony and the outstanding artifacts and gates are complete.
+It does not exist yet, and nothing in this repository should be read as saying it
+does. The earlier framing — "the candidate is cut at `50ed8c86`" — was wrong in a
+way that mattered: the ledger audit itself was written *after* `50ed8c86`, so
+that commit could not have carried it.
 
 **Revision, 2026-08-31 (second).** This report was first committed at
 `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9` with all six execution-dependent
@@ -56,10 +86,19 @@ discharge the gate, for two reasons that are not fixable by another Linux run:
    `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` — that exist precisely because a
    Linux-only green closed a platform question falsely.
 
+3. **No candidate has been cut.** The gate is a precondition of the cut, not a
+   property of the baseline, and this report is an input to it.
+
 And the gate's own pass rule requires a completed review with no open
-critical/high finding. **No panel has been convened**: the three-model panel of
-`decisions/2026-08-25-checkpoint-merges.md` has not run, and its membership is
-not settled. That blocker is untouched by any test result.
+critical/high finding. **The panel's membership is settled and the panel has not
+convened.** The three seats are ratified by the owner in
+`decisions/2026-08-31-panel-seats.md` — `gpt-5.6-sol` at `max` via `codex exec`
+with login judged by output text; `claude-fable-5` at `max` with `--model`
+pinned on every invocation; `gemini-3.1-pro-high` via `/home/ubuntu/.local/bin/agy`
+by absolute path with `--model` pinned, counting only on `status: SUCCESS` plus
+the explicit verdict marker. No pre-authorized fallback: one repair attempt, then
+wait for the owner, and the panel never convenes partially. **No seat has run**,
+and no test result changes that.
 
 Nothing in this report is a claim that a reviewer reread the candidate diff.
 
@@ -105,7 +144,7 @@ as unchanged from its base, re-derived here rather than copied.
 ## The serialized gate run
 
 Run by root through the globally serialized build wrapper at the exact committed
-candidate head `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
+evidence head `50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9`:
 
 ```
 /home/ubuntu/bin/upstroke-build cargo test --all-targets --all-features
@@ -156,8 +195,9 @@ compile necessarily evaluated.
    substitute.
 3. **The panel.** The gate's pass rule requires questions answered and no open
    critical/high finding, and the checkpoint record requires a three-model panel
-   to attest the code and the audited ledger together. **No panel has been
-   convened and its membership is not settled.** No test result touches this.
+   to attest the code and the audited ledger together. **The three seats are
+   ratified (`decisions/2026-08-31-panel-seats.md`) and no seat has run.** No
+   test result touches this.
 
 **Consequently the candidate is still not gate-passed, and no part of this
 record should be read as saying it is.**

@@ -113,7 +113,9 @@ The run is also Linux-only, and macOS and Windows are hosted evidence this host
 does not produce.
 
 **Obligation 4 is entirely untouched.** The three-model panel has not been
-convened and **its membership is not settled**. The gate's own pass rule needs
+convened and **its membership is not settled**. *[Superseded by the third
+addendum below: membership was settled by ruling 2 at this same head. The panel
+still has not convened.]* The gate's own pass rule needs
 questions answered and no open critical/high finding, which is a review outcome;
 no suite result can supply it. This remains the blocking obligation.
 
@@ -156,3 +158,69 @@ seat has run. The panel convenes only after this branch lands and the PR #18
 body is rewritten, on a stable exact head, and any head movement afterwards
 invalidates the seats that already ran. Nothing in this addendum makes the gate
 pass.
+
+## Addendum, 2026-08-31 (third) — the PR #80 review, and two corrections to this record
+
+Appended, not applied in place. The sole fresh review of `e174d086` returned
+CHANGES_REQUIRED with four validated blockers. Two of them land on this record
+and both are correct.
+
+### Correction 1 — the checkpoint ordering was reversed, and is restored here
+
+The obligation table above says of row 1 *"the candidate is cut"* at
+`50ed8c86`, while the same record admits the gate has not passed and artifacts
+are missing. That reverses the order
+`decisions/2026-08-25-checkpoint-merges.md` fixes, and the review was right to
+call it a narrowing of an immutable decision without a successor ruling. It was
+not intended as one, and it is not one.
+
+**`50ed8c86` is the pre-assembly baseline, not the cut candidate.** No candidate
+has been cut. The controlling order stands exactly as written: the G2 gate
+passes on the cleaned tree, the eight artifacts exist, the full-ledger audit is
+complete — **and then** the candidate is cut.
+
+The review's sharpest point is the one to keep: **the ledger audit was written
+after `50ed8c86`, so that commit could not have carried it.** A commit cannot
+carry evidence that postdates it.
+
+**The candidate will be the integration landing head** — the head
+`codex/parallelism-design` carries after this evidence branch lands under the
+standing per-head ceremony and the outstanding artifacts and gates are complete.
+Rows 1, 2 and 5 of the table above are to be read with this correction: they
+describe evidence produced **on the baseline, toward** the cut, not a cut that
+has happened.
+
+**Still owed before any candidate can be cut**, stated plainly:
+
+- **Artifacts 2, 3, 4, 5 and 8** in their captured form — the parity outputs, the
+  fault-injection evidence table and its observed-class histogram, the
+  before/after inventory and husk census table, the user-checkout diff, and the
+  per-invocation boundary/image-id log with the inspection- and probe-refusal
+  transcripts. Their oracles pass; the artifacts do not exist.
+- **macOS and Windows evidence.** The serialized suite was Linux-only.
+- **The panel.** Three ratified seats, none of them run.
+- **This evidence branch landing**, and a fresh exact-head review of the landing
+  head.
+
+### Correction 2 — the panel text was stale at its own head
+
+This record's second addendum says the panel "has not been convened and **its
+membership is not settled**". The first half is still true; the second was
+already false when written, because the same commit adopted
+`2026-08-31-panel-seats.md`. **Membership is settled and ratified; no seat has
+run.** The gate report carries the same correction.
+
+### The other two blockers
+
+Recorded here for traceability; both are repaired outside this record.
+
+- **The full-ledger audit was not full.** §35 projected only §2's rows, leaving
+  live deferred rows elsewhere — including all four `PR73-*` rows and
+  `PR64-CLEANUP-003-SCRATCH-PRECLEAN` — uncounted. `reviews/FINDINGS.md` §38 now
+  projects **every canonical row in the ledger**. Obligation 2 above was
+  **overstated as discharged** and is discharged by §38, not by §35 alone.
+- **The coverage map invented an exemption.** It treated `decisions/`,
+  `proposals/`, `docs/`, root Markdown and ignore files as review-exempt, where
+  `2026-08-20-review-invalidation-scope.md` authorises **exactly**
+  `reviews/FINDINGS.md`. `reviews/2026-08-31-g2-first-parent-coverage.md` is
+  reclassified; residue rises from 7 units to **18**.

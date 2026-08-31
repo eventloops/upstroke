@@ -3981,3 +3981,151 @@ other 52 are.
 
 Companion records: `decisions/2026-08-31-inertness-premise-behavioural.md`,
 `reviews/2026-08-31-g2-gate-report.md` ("Inert by default" §4).
+
+## 38. 2026-08-31 PR #80 exact-head review — the full-ledger projection, completed
+
+Append-only. This section repairs the completeness defect the sole review of
+`e174d086efc71b8c837ed22e61f29f706ef9dacd` found in §35, and records that
+review's four dispositions. It rewrites no historical row.
+
+**§35's audit was not full, and the review was right.** §35 projected §2's 65
+logical rows and stopped there, while live deferred rows sat in other sections it
+never counted — including **all four `PR73-*` rows** (§29, lines 3539–3542) and
+**`PR64-CLEANUP-003-SCRATCH-PRECLEAN`** (§33, line 3617). §35's claim that
+"every live row" was categorized was therefore false, and the checkpoint
+record's obligation 2 was **overstated as discharged**. It is discharged here.
+
+The omission had teeth: `PR64-CLEANUP-003-SCRATCH-PRECLEAN` is the live sequence
+in which the predictable scratch helper meets another process's occupied root,
+recursively pre-cleans it before acquiring ownership, and deletes that process's
+content. An audit that does not count it is an audit that would let it through.
+
+### The canonical domain, stated before the counts
+
+**A canonical row is a markdown table row in this file whose first cell is a
+stable finding ID.** That domain is mechanically enumerable and is what the
+projection covers. Derived at this head:
+
+- **284** canonical row instances, over **197 distinct stable IDs**.
+- Physical lines carrying two logical rows are split on `||` (line 156), and
+  cells naming several IDs with `·` are expanded to one row each.
+- **Latest-disposition-wins**: for each ID, the instance at the greatest line
+  number is the live one. §35's own restatement table is excluded as a
+  restatement, not a source.
+
+**Completeness is asserted over this domain and no wider one.** Owner clauses
+that live in prose rather than a table row are *not* canonical rows; four exist
+and are named at the end of this section so they are not invisible.
+
+### The projection over all 197 canonical IDs
+
+| Terminal disposition | IDs |
+|---|---:|
+| **repaired** | 94 |
+| **carried** | 75 |
+| **settled** (§1, not re-raisable without new evidence) | 17 |
+| **closed, not owed** | 9 |
+| **struck** (withdrawn in place) | 2 |
+| **total** | **197** |
+
+94 + 75 + 17 + 9 + 2 = 197. **Every canonical ID has exactly one terminal
+disposition**, and the sum is the enumeration, not an estimate.
+
+Six IDs whose disposition cell carried no mechanical keyword were ruled by hand
+against their own prose and are listed for audit:
+`PR5D-PROOF-TESTS-COUNT` → closed ("recorded, no owner needed");
+`PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY` → closed (a terminology
+correction, disposition unchanged); and `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`,
+`PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`,
+`PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`,
+`PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` → carried.
+
+### The 75 carried rows, by origin
+
+| Originating section | Carried |
+|---|---:|
+| §2 | 49 |
+| §15 — the six that need adjudication | 6 |
+| §20 — PR7 S5 rounds 3 and 4 | 5 |
+| "The hardening rule" | 4 |
+| §29 — PR #73 owner adjudication | 4 |
+| §8 — PR5 lane D | 2 |
+| §24, §25, §27, §33, §37 — one each | 5 |
+| **total** | **75** |
+
+**Why §2 shows 49 here and 52 in §35.** §35 counted §2 rows; this projection
+counts *IDs*, and five §2 IDs have a later instance elsewhere that wins:
+`TASK-DISPATCHED-REGION-UNVALIDATED`, `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN`,
+`PR7-G2-W1-RETAINED-ARM-UNGUARDED` and `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` resolve
+to §26 (repaired), and `PR4-ADAPTER-RESOLVES-ON-THE-HOST` resolves to the
+hardening rule (carried, counted there). §35's 52 minus the three §2-carried IDs
+that move out is 49. The two figures are consistent; they count different things,
+and this one is the full-ledger figure.
+
+### The 26 carried rows §35 missed, each with venue, trigger and evidence
+
+| ID | Section | Line |
+|---|---|---|
+| `PR4-INVOCATION-CONSTRUCTIBLE` | §The hardening rule | L842 |
+| `PR4-CENSUS-COMMENT-ORACLE` | §The hardening rule | L843 |
+| `PR4-ADAPTER-RESOLVES-ON-THE-HOST` | §The hardening rule | L844 |
+| `PR4A-SPAWN-WITHOUT-AMBIENT` | §The hardening rule | L845 |
+| `PR5D-ROW-MAPPING-REFUSAL-UNFIXTURED` | §8 | L927 |
+| `PR5D-TOOLBOX-DISCARDS-CLIPPY-OUTPUT` | §8 | L929 |
+| `PR5-RUNDIR-030` | §15 | L1417 |
+| `PR5-EVENTS-020` | §15 | L1418 |
+| `PR5-WORKSPACE-068` | §15 | L1419 |
+| `PR5-WORKSPACE-070` | §15 | L1420 |
+| `PR5-EVENTS-051` | §15 | L1421 |
+| `PR5-WORKSPACE-003` | §15 | L1422 |
+| `PR7-R4-LOOP-004` | §20 | L2175 |
+| `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT` | §20 | L2207 |
+| `PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG` | §20 | L2209 |
+| `PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF` | §20 | L2211 |
+| `PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` | §20 | L2212 |
+| `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | §24 | L3430 |
+| `PR47-PUBLIC-PROCESS-API-REMOVED` | §25 | L3459 |
+| `CI-CFG-UNSHIPPED-UNIX-REGION` | §27 | L3494 |
+| `PR73-TARGET-INVENTORY-001` | §29 | L3539 |
+| `PR73-LEXICAL-CLOSURE-001` | §29 | L3540 |
+| `PR73-LEXER-DIVERGENCE-001` | §29 | L3541 |
+| `PR73-LINT-SEMANTICS-001` | §29 | L3542 |
+| `PR64-CLEANUP-003-SCRATCH-PRECLEAN` | §33 | L3617 |
+| `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | §37 | L3955 |
+
+Venue, trigger and required evidence for each, in §35's carried-row form:
+
+| Group | Rows | Venue / owner | `shrinks_when` | Re-opening trigger | Required evidence |
+|---|---|---|---|---|---|
+| **Hardening** | `PR4-INVOCATION-CONSTRUCTIBLE`, `PR4-CENSUS-COMMENT-ORACLE`, `PR4-ADAPTER-RESOLVES-ON-THE-HOST`, `PR4A-SPAWN-WITHOUT-AMBIENT` | the named implementer slice (PR5–PR7, PR7, PR7/PR12) | that slice lands the hardening | the named slice opens | a witness that fails without the hardening, plus a killed mutation. These strengthen a guarantee beyond the frozen packet, so they are **managed debt, not in-slice repairs** |
+| **PR5 lane D** | `PR5D-ROW-MAPPING-REFUSAL-UNFIXTURED`, `PR5D-TOOLBOX-DISCARDS-CLIPPY-OUTPUT` | PR6/PR7 implementer; project owner (box tooling) | the fixture becomes constructible; the toolbox stops discarding Clippy output | a slice opens the row-mapping fixture, or the build wrapper is changed | a red-first fixture for the refusal; for the toolbox, a wrapper that surfaces Clippy output — a box-side fix, not a tree fix |
+| **§15 adjudication** | `PR5-RUNDIR-030`, `PR5-EVENTS-020`, `PR5-WORKSPACE-068`, `PR5-WORKSPACE-070`, `PR5-EVENTS-051`, `PR5-WORKSPACE-003` | **project owner — G2** | each is adjudicated **narrowed assertion** or **equivalent mutant** | the G2 adjudication sitting | per entry, the decision between a real detection loss and a re-expressed-prose equivalent. `PR5-EVENTS-051` **SURVIVED** and is the one repair of 38 that did not take; `PR5-WORKSPACE-003` is **Windows-only** — Linux kills it, so it needs the guest |
+| **§20 PR7 rounds** | `PR7-R4-LOOP-004`, `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT`, `PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG`, `PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF`, `PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` | PR8/PR10 (closure); PR8+; project owner for the G2 erratum list | closure is implemented; the merge queue spawns a repair; the erratum is written | PR8 or PR10 opens, or the owner takes up the erratum list | a red-first witness on the arm plus a killed mutation. `PR7-R4-LOOP-004` additionally owes the **diagnostic**: an operator told "closure derives NotEnding" about a budget-stopped run is being told the wrong thing |
+| **Blocked** | `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | project owner | the packet reclassifies the pre-intent ephemeral commit | an owner packet decision | **Blocked, not deferrable by an implementer**: the packet and tests classify the commit as Git-owned R27 and require recovery to leave it. Deleting it contradicts an explicit contract |
+| **Accepted residual** | `PR47-PUBLIC-PROCESS-API-REMOVED` | project owner — a later compatibility-owned slice | that slice takes the compatibility question | a compatibility slice opens | the owner explicitly accepts the current wrapper behaviour for PR #47; **preserve as residue, not a gate blocker** |
+| **Platform scope** | `CI-CFG-UNSHIPPED-UNIX-REGION` | project owner — a platform-scope decision | a fourth Unix family is added to CI, or the region is removed | adding a BSD runner | a platform-scope decision, **not an in-slice oracle repair**. The census already requires the exact acknowledged set and fails if it changes |
+| **PR #73 deferred** | `PR73-TARGET-INVENTORY-001`, `PR73-LEXICAL-CLOSURE-001`, `PR73-LEXER-DIVERGENCE-001`, `PR73-LINT-SEMANTICS-001` | project owner — owner-adjudicated deferrals of 2026-08-30 | each named guard is widened: the walk covers workspace members; aliases under an expectation are forbidden; a blanked-view ASCII census lands; `cfg_attr` handling is added | a workspace member or path dependency is added; a third lexer-class recurrence; an inventory-pin edit | the recorded restriction becomes the trigger. All four are `pre_existing` and identical at comparison head `0f05b456`; each keeps its named backstop until repaired |
+| **Scratch pre-clean** | `PR64-CLEANUP-003-SCRATCH-PRECLEAN` | project owner — the bound **startup, recover and create migration** follow-up | that collision set receives an exact-base lease | the migration slice opens | occupied-root **preservation**, and **no pre-clean and no discarded cleanup result**. §32 marked this fixed by reusing the ID for a distinct emit helper; §33 corrected that to deferred, and it stays deferred here |
+| **Schema-4 write path** | `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED` | project owner — the PR12 activation slice | the activation slice lands, or a visibility narrowing is scheduled | PR12 opens, or a narrowing is scheduled | a write-side refusal with a red-first witness and a killed mutation, **plus** an accounting of the legacy funnel's unvalidated `RunStarted.schema` |
+
+### The four prose owner clauses, named so they are not invisible
+
+Outside the canonical row domain, four paragraphs carry an owner clause with no
+table row. They are **not** counted in the 197 and are listed so a later audit
+does not rediscover them as omissions: §3's dependency clause (line 237), §12's
+pre-existing-flake clause (line 1118), §18's two clauses (lines 1784, 1815), and
+§20's `effects::census_domain` clause (line 2241). Giving each a canonical row is
+work for the next ledger pass, not for this repair.
+
+### The PR #80 review's own four dispositions
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-LEDGER-AUDIT-NOT-FULL | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/FINDINGS.md:3633-3679 | §35 projects only §2's rows -> live deferred rows in other sections are never counted -> the audit claims every live row is categorized -> the checkpoint's obligation 2 is reported discharged while `PR64-CLEANUP-003-SCRATCH-PRECLEAN` and four `PR73-*` rows are untriaged -> the predictable scratch helper pre-cleans another process's occupied root and deletes its content | introduced_by_feature | correctness | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 / §35 | This section projects all 197 canonical IDs across the whole ledger — 94 repaired, 75 carried, 17 settled, 9 closed, 2 struck — with the domain stated before the counts and completeness asserted only over it. The 26 carried rows §35 missed each receive venue, trigger and required evidence | fixed |
+| PR80-CHECKPOINT-ORDER-REVERSED | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / decisions/2026-08-31-g2-checkpoint-promotion.md:11-23 | the record declares the candidate cut at `50ed8c86` -> the same record admits the gate has not passed and artifacts are missing -> the controlling order (gate and artifacts first, then the cut) is reversed -> an immutable decision is narrowed with no successor ruling; and the audit postdates `50ed8c86`, so that commit cannot carry it | introduced_by_feature | docs-contract | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 | `50ed8c86` is restated as the **pre-assembly baseline**, not a cut candidate; the candidate becomes the integration landing head after this evidence lands and the outstanding artifacts and gates complete. `2026-08-25-checkpoint-merges.md` remains controlling and unnarrowed; the third addendum and the gate report's "What `50ed8c86` is" carry the correction, and the owed artifacts are restated | fixed |
+| PR80-COVERAGE-EXEMPTION-INVENTED | P1 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/2026-08-31-g2-first-parent-coverage.md:30 | the map treats `decisions/`, `proposals/`, `docs/`, root Markdown and ignore files as review-exempt -> `2026-08-20-review-invalidation-scope.md` authorises exactly `reviews/FINDINGS.md` -> units with no recorded review are counted as covered -> `59a6830`, which changed a decision plus `reviews/README.md`, is reported mapped | introduced_by_feature | docs-contract | 50a84acd3ebf5f0ecffc35a7a5b4ea68960310f9 | The exemption class is withdrawn. Class **X** now requires the unit's whole diff to be exactly `reviews/FINDINGS.md`, verified per unit (11 units, 12 commits). Class **M** requires every delta file to be byte-identical to the merged-in parent **and** that parent to be an ancestor of `origin/master` (2 units). Residue rises from 7 units to **18 units / 19 commits**, including `59a6830`, three master-forward merges carrying merge-authored conflict resolution, and the 14 pre-PR-regime commits. Totals re-derived: 33 S + 2 B + 2 M + 11 X + 18 R = 66 units, 418 commits | fixed |
+| PR80-PANEL-TEXT-STALE | P2 | e174d086efc71b8c837ed22e61f29f706ef9dacd / reviews/2026-08-31-g2-gate-report.md:59-62 | the gate report says panel membership is unsettled -> the same head adopts `2026-08-31-panel-seats.md` -> a current gate artifact asserts two contradictory states -> a reader cannot tell which is live | introduced_by_feature | docs-contract | e174d086efc71b8c837ed22e61f29f706ef9dacd | The gate report now states that membership is **settled and ratified** and that **no seat has run**, naming the three seats with their invocation guards. The promotion record's second addendum carries an in-place supersession marker pointing at its third addendum. No other sentence claims membership is unsettled | fixed |
+
+Companion records: `reviews/2026-08-31-g2-first-parent-coverage.md`,
+`reviews/2026-08-31-g2-gate-report.md`,
+`decisions/2026-08-31-g2-checkpoint-promotion.md` (third addendum).
