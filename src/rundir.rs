@@ -3149,6 +3149,14 @@ pub(crate) mod scratch_tree {
     /// reclaim failed had nowhere to put its report except a slot that died
     /// with it, so the leak was silent unless a witness happened to hold an
     /// external handle on that slot.
+    ///
+    /// `PR78-EMIT-UNWIND-REPORT-ORACLE`: whether a line handed here actually
+    /// crosses the process's stderr is asserted from **outside** the process —
+    /// the delivery witnesses below spawn the emit no-observer test as a child
+    /// of this same binary and read its fd 2 — because every in-process record
+    /// of the answer is written by the arm under test, and a reporter rewritten
+    /// to format the message and return `Ok(())` without writing certifies
+    /// itself to exactly that record.
     pub(crate) fn report_reclaim_failure(failure: &ScratchReclaimFailure) -> io::Result<()> {
         report_to_stderr(&format!(
             "scratch tree {} was not reclaimed: {}",
@@ -3830,6 +3838,176 @@ pub(crate) mod scratch_tree {
             drop(outer);
             assert!(proves_absent(&outer_root));
             assert!(proves_absent(&root));
+        }
+
+        // -------------------------------------------------------------------
+        // Delivery of the unwinding report, observed from outside the process
+        //
+        // `PR78-EMIT-UNWIND-REPORT-ORACLE`. The emit fixtures' unwinding arm
+        // hands its line to `report_reclaim_failure`, and every in-process
+        // witness over that arm can read only the record the same branch
+        // writes — so a reporter rewritten to format the message and return
+        // `Ok(())` without touching stderr certified itself and stayed green
+        // while external reporting regressed to nothing. The observation
+        // cannot live beside those witnesses: `src/engine/topology/**` is a
+        // `TOPOLOGY_MODULE`, and watching fd 2 takes a subprocess, which
+        // takes `Command`, a denied effect there. This module is the
+        // reporter's home and carries the reviewed allowance, so the
+        // witnesses live here: each spawns one emit test out of this same
+        // binary as a child process and reads what actually crossed the
+        // child's own stderr, where no arm of the code under test can reach.
+        // -------------------------------------------------------------------
+
+        /// The emit no-observer witness, named the way the harness names it:
+        /// the child whose report crossing fd 2 is the whole subject.
+        const EMIT_NO_OBSERVER_TEST: &str = "engine::topology::emit::tests::\
+             an_unwinding_reclaim_failure_reports_with_no_observer_on_the_slot";
+
+        /// The emit unwind witness whose reclaims all succeed: the silence
+        /// control for the delivery witness.
+        const EMIT_SILENT_UNWIND_TEST: &str = "engine::topology::emit::tests::\
+             a_guard_reclaims_on_an_unwind_as_well_as_on_a_normal_return";
+
+        /// One test out of this same binary, run to completion as a child
+        /// process, with its stderr wired however the witness needs it.
+        ///
+        /// `RUST_TEST_NOCAPTURE` is scrubbed so the child's harness keeps its
+        /// default capture: the induced panic's hook output stays in the
+        /// harness's buffer, and the only bytes on the child's fd 2 are the
+        /// ones written through a real stderr handle — the channel under
+        /// observation.
+        fn one_test_as_a_child(name: &str, stderr: std::process::Stdio) -> std::process::Output {
+            std::process::Command::new(std::env::current_exe().expect("the test executable"))
+                .args(["--exact", name])
+                .env_remove("RUST_TEST_NOCAPTURE")
+                .stdout(std::process::Stdio::piped())
+                .stderr(stderr)
+                .output()
+                .expect("run one test as a child process")
+        }
+
+        /// The child's two streams, with "it passed" and "it really ran
+        /// `name`" already asserted.
+        ///
+        /// The second assertion is the vacuity guard: `--exact` with a name
+        /// that has drifted matches nothing, and a child that ran no test
+        /// exits 0 with exactly the silent stderr a delivery witness would
+        /// misread as an answer.
+        fn passed_child_streams(name: &str, output: &std::process::Output) -> (String, String) {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "the child test failed ({}):\n--- child stdout ---\n{stdout}\n\
+                 --- child stderr ---\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains(name),
+                "`--exact {name}` matched nothing — the name has drifted, so the child ran \
+                 no test at all:\n{stdout}"
+            );
+            (stdout, stderr)
+        }
+
+        /// The unobserved fixture's unwinding report reaches the process's
+        /// **real stderr** — asserted from outside the process.
+        ///
+        /// `PR78-EMIT-UNWIND-REPORT-ORACLE`, and this is the witness that
+        /// closes it: the child is the emit no-observer test itself, so the
+        /// whole production-equivalent chain runs — the fixture's unwinding
+        /// arm, [`super::report_reclaim_failure`], [`super::report_to_stderr`],
+        /// the write on the real handle — and the line is read back off the
+        /// child's actual fd 2. A reporter rewritten to format the message
+        /// and return `Ok(())` without writing, an arm that stops calling the
+        /// reporter, or a write moved off stderr each leave this channel
+        /// empty and read red here, whatever the child's own records say.
+        ///
+        /// The child passes on its own, and with the harness's capture
+        /// holding the induced panic's hook output, its fd 2 carries the
+        /// reporter's line and nothing besides. Exactly one reclaim is
+        /// refused in that child, so exactly one report may cross, and it
+        /// must name the tree acquired under the child's `unobserved` tag: a
+        /// line that appears without the failure, or twice, or for another
+        /// tree is a different defect and reads red rather than green.
+        #[test]
+        fn an_unobserved_unwind_report_reaches_the_process_stderr() {
+            let output = one_test_as_a_child(EMIT_NO_OBSERVER_TEST, std::process::Stdio::piped());
+            let (_stdout, stderr) = passed_child_streams(EMIT_NO_OBSERVER_TEST, &output);
+
+            assert_eq!(
+                stderr.matches("was not reclaimed").count(),
+                1,
+                "the child's one refused reclaim must put exactly one report on the real \
+                 stderr:\n--- child stderr ---\n{stderr}"
+            );
+            assert!(
+                stderr.contains("scratch tree "),
+                "the line is the reporter's own shape: {stderr:?}"
+            );
+            assert!(
+                stderr.contains("upstroke-scratch-unobserved-"),
+                "the line names the refused tree itself — the one acquired under the \
+                 child's `unobserved` tag: {stderr:?}"
+            );
+        }
+
+        /// A reclaim that succeeded reports nothing: the silence control.
+        ///
+        /// Without this, the delivery witness above could be green on ambient
+        /// noise — an arm that reported unconditionally, on success and
+        /// failure alike, would put its line on every child's stderr and
+        /// presence would stop meaning "the failure was reported". This child
+        /// runs the same unwinding drop path with reclaims that all succeed,
+        /// so its stderr must carry no report at all.
+        #[test]
+        fn a_successful_unwind_reclaim_reports_nothing_to_stderr() {
+            let output = one_test_as_a_child(EMIT_SILENT_UNWIND_TEST, std::process::Stdio::piped());
+            let (_stdout, stderr) = passed_child_streams(EMIT_SILENT_UNWIND_TEST, &output);
+
+            assert!(
+                !stderr.contains("was not reclaimed"),
+                "a reclaim that succeeded has nothing to report; a line here is ambient \
+                 noise:\n--- child stderr ---\n{stderr}"
+            );
+        }
+
+        /// A stderr with no space fails the **real** report, and the
+        /// suppression holds: the child neither aborts nor loses its panic.
+        ///
+        /// The reporter's failure arm was reachable before only through an
+        /// injected reporter. Here [`super::report_to_stderr`] itself fails:
+        /// the child's fd 2 is `/dev/full`, whose every write returns
+        /// `ENOSPC` — deterministically, with no timing, no signal handling,
+        /// and no seam. The child is the same no-observer test: its own
+        /// assertions prove the induced panic came back out unreplaced and
+        /// the outer guard still reclaimed, so a suppression rewritten to
+        /// raise — an abort, on an unwinding thread, measured as exactly that
+        /// on this tree — or to swap payloads is a failing child here.
+        ///
+        /// **Why a full device rather than a closed or read-only one, and why
+        /// only Linux.** A descriptor that cannot be written at all is not a
+        /// failing stderr to std: `handle_ebadf` in `std::io::stdio` defines
+        /// `EBADF` on the standard streams as ignorable success, so a child
+        /// given a read-only fd 2 makes both write syscalls, takes `EBADF` on
+        /// each — measured on this tree under strace — and its reporter still
+        /// returns `Ok`. The one portable-API way to make the real write
+        /// *return its error* is a device that accepts the descriptor and
+        /// refuses the bytes, and `/dev/full` is that device; the other hosts
+        /// have no equivalent reachable without new dependencies, so this
+        /// control runs on the Linux leg of the matrix and the suppression
+        /// logic it exercises is host-independent Rust either way.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_full_stderr_fails_the_real_report_and_the_suppression_holds() {
+            let full = fs::File::options()
+                .write(true)
+                .open("/dev/full")
+                .expect("open the always-ENOSPC device for writing");
+
+            let output =
+                one_test_as_a_child(EMIT_NO_OBSERVER_TEST, std::process::Stdio::from(full));
+            passed_child_streams(EMIT_NO_OBSERVER_TEST, &output);
         }
 
         /// Witness 6 — a spent token cannot authorise a second deletion, by API

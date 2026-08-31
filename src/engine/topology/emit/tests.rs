@@ -2571,7 +2571,10 @@ fn a_reclaim_failure_while_already_unwinding_is_suppressed() {
     );
     // Suppressed is not swallowed. This arm may not raise, so it hands the
     // line to the scratch subsystem's reporter instead — and the record says
-    // which arm ran and whether the write landed.
+    // which arm ran and whether the write landed. The record is the arm's own
+    // account of itself; that the line truly crosses stderr is asserted from
+    // outside the process, by `rundir::scratch_tree`'s delivery witnesses
+    // (`PR78-EMIT-UNWIND-REPORT-ORACLE`).
     let Some(Report::Reported { message, delivered }) = reported else {
         panic!("the unwinding arm must report through the subsystem: {reported:?}");
     };
@@ -2600,12 +2603,22 @@ fn a_reclaim_failure_while_already_unwinding_is_suppressed() {
 /// every fixture actually has: [`report_reclaim_failure`], the scratch
 /// subsystem's own fallible reporter. Three things are measured — the process
 /// did not abort, the payload that comes back is still the closure's own, and
-/// the refused tree really was left on disk for the outer guard to take. That
-/// the line reaches stderr is not assertable from here (redirecting fd 2 needs
-/// `unsafe`, and a subprocess needs `Command`, which a `TOPOLOGY_MODULE` may
-/// not name); its *delivery* is asserted next door by
-/// `a_reclaim_failure_while_already_unwinding_is_suppressed`, which reads the
-/// `Report::Reported { delivered }` this same arm records.
+/// the refused tree really was left on disk for the outer guard to take.
+///
+/// That the line reaches **stderr** is not assertable from here: redirecting
+/// fd 2 needs `unsafe`, and a subprocess needs `Command`, which a
+/// `TOPOLOGY_MODULE` may not name. Nor is it assertable from any branch of
+/// this file — the `Report::Reported { delivered }` record is written by the
+/// same arm whose behaviour is in question, so a reporter rewritten to format
+/// the line and return `Ok(())` without writing certifies itself and stays
+/// green (`PR78-EMIT-UNWIND-REPORT-ORACLE`). Delivery is therefore asserted
+/// from **outside the process**, by the reporter's own module:
+/// `rundir::scratch_tree`'s witness
+/// `an_unobserved_unwind_report_reaches_the_process_stderr` spawns exactly
+/// this test as a child of the test binary and reads the report off the
+/// child's actual fd 2 — with a silence control over a succeeding reclaim,
+/// and a full-stderr control (Linux-gated, `/dev/full`) that fails the real
+/// write and holds this same arm to its suppression.
 ///
 /// The outer tree is what reclaims here, and it has to be: the token comes back
 /// into a slot nobody is watching, which is the ordinary fixture's situation and
