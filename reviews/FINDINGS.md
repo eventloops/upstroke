@@ -4258,3 +4258,18 @@ remains work for the next ledger pass, not this repair.
 Companion records: `decisions/2026-08-31-g2-checkpoint-promotion.md` (fourth
 addendum), `reviews/2026-08-31-g2-gate-report.md` (fifth revision),
 `decisions/2026-08-31-inertness-premise-behavioural.md` (erratum).
+
+## 40. PR80 exact-head macOS sampler recurrence (2026-08-31)
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR80-MACOS-WORKSPACE-SAMPLER-COLD-PROBE-RECURRENCE | P2 | 2ba66b6e06fa40f9d9fe06dfd21e22517e14d2d6 / hosted run 33421539013, macOS job 99584874271, `workspace_manager::tests::sampled_git_child_kills_every_residue_classified_and_recovered` | the workspace-manager sampler measures a one-shot probe budget -> every scheduled kill lands after its child has completed -> all 32 observations are `Completed` and no killed-child residue is sampled -> the required macOS leg refuses the vacuous run | fix_regression | platform-correctness | PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE | The refusal is correct and the failed run remains durable evidence. The candidate's `src/` tree is byte-identical to the green `50ed8c86ec60164011bfd393066c4c3696d3865b` source tree (`f8d2b1c6dff093bd1b656d639fa33762e479b7f9`), so this evidence-only slice did not change the failed code. Owner: project owner; venue: post-promotion sampler-hardening work; shrinks when the workspace-manager sampler uses the established warm-up, median, actual-duration recalibration, and bounded-retry discipline and a controlled macOS repetition demonstrates that at least one kill lands without masking the vacuity oracle | deferred |
+
+## 41. PR80 artifact-enumerator reading rule (2026-08-31)
+
+The explicit artifact membership in the historical
+`PR80-OWED-LIST-DROPS-ARTIFACT-7` row in §39 records the defect and its then
+current repair; it is not an operative enumerator. The artifact table in
+`reviews/2026-08-31-g2-gate-report.md` is the sole operative enumerator of
+artifact membership and capture state. This section introduces no new
+artifact-membership list.

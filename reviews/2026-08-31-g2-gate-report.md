@@ -35,9 +35,9 @@ terminology. Every remaining current-status use of "candidate" for either sha
 in this report now reads **pre-assembly baseline** (`50ed8c86`) or **committed
 evidence head** (`50a84acd`); quotations and the future sense ("the candidate
 will be the integration landing head", "before a candidate is cut") are
-unchanged. The artifact table below remains the **single enumerator** of the
-owed captured set — six uncaptured: artifacts 2, 3, 4, 5, **7** and 8. The
-other two findings land on
+unchanged. The artifact table below remains the **sole enumerator** of the
+owed captured set; revisions and decision records refer to that table rather
+than restating its members. The other two findings land on
 `decisions/2026-08-31-g2-checkpoint-promotion.md` (fourth addendum) and
 `reviews/FINDINGS.md` §39.
 
@@ -190,7 +190,7 @@ makes its Docker result readable.
 ### What the run does, and does not, discharge
 
 **Discharged:** artifact 6 outright, on Linux. Artifact 7's scan result. The
-oracles beneath artifacts 2, 3, 4, 5 and 8.
+oracles beneath the other uncaptured rows in the authoritative artifact table.
 
 **Strengthened, not newly claimed:** the inertness proofs below were already
 structural — verified by reading the tree, not by running it. The green suite
@@ -414,7 +414,7 @@ purpose.
 
 - `decisions/2026-08-31-g2-checkpoint-promotion.md` — the obligation-by-obligation reconciliation
 - `reviews/2026-08-31-g2-first-parent-coverage.md` — the review coverage map for `76b6a784..50ed8c86`
-- `reviews/FINDINGS.md` §35 — the checkpoint full-ledger audit and the recurrence-class review
+- `reviews/FINDINGS.md` §§35, 38 and 39 — the complete checkpoint full-ledger audit and the recurrence-class review; §35 is the initial projection, §38 supplies the rows it omitted, and §39 supplies the reproducible corrected projection
 - `reviews/FINDINGS.md` §37 — `SCHEMA4-PUBLIC-WRITE-PATH-UNGATED`, the carried row for the public write path
 - `decisions/2026-08-31-inertness-premise-behavioural.md` — the ruling that corrected §4
 - `decisions/2026-08-31-panel-seats.md` — the three ratified panel seats

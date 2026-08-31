@@ -297,3 +297,14 @@ corrected, mechanically re-derivable projection — at `e174d086`: **197 ids =
 197 total and its 26-missed-rows table confirmed and its 75/9 split and 49
 corrected to 77/7 and 51. Obligation 2 is discharged by §35 and §38 **as
 corrected by §39**.
+
+## Fifth addendum — artifact membership has one operative enumerator
+
+The fourth addendum's captured-form list, including its line-268 restatement,
+was a corrective historical record, not an independent operator checklist.
+It is non-operative from this addendum forward. The artifact table in
+`reviews/2026-08-31-g2-gate-report.md` is the sole operative enumerator of
+artifact membership and capture state. Every decision, revision, PR body, and
+operator checklist refers to that table without restating its members. If any
+historical list in this record disagrees with the table, the historical list
+must not be used to cut or approve a candidate.
