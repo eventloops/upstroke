@@ -136,20 +136,20 @@ transcript, diff or histogram exists in the hash-pinned capture directory.
 | # | What the artifact is | State | What the run substantiates, and what it does not |
 |---|---|---|---|
 | 1 | The gate report | **Produced** | This file |
-| 2 | Host/container parity outputs | **Produced (Linux)** | `02-host-container-parity.txt`, sha256 `ad31058f5a7f8b8ad7ffd04cc5990abff2b2355b5632990355159bf42d6f938c`; live Docker 29.7.2 plus every executed host/container parity and real-Docker oracle. macOS and Windows are the exact-head hosted capture below, not invented local output |
+| 2 | Host/container parity outputs | **Produced (Linux)** | `02-host-container-parity.txt`, sha256 `5b9ae5b86c723e7a371c24bd9d06748ea06359ef041582879f49a4123cfd0f10`; five substantive host and container environment blocks plus both three-row adapter-parsing tables, emitted by the existing parity oracles. macOS and Windows are the exact-head hosted capture below, not invented local output |
 | 3 | Fault-injection evidence table for the G2 sites — event kill and error-return points, the sync-prefix barrier refusal cases, id-unread points, and residue-class evidence (synthetic per element, plus a sampling record with its observed-class histogram) | **Produced (Linux)** | `03-fault-injection-evidence-table.txt`, sha256 `db581bd932a8d956fb58d15a72c3d87bf24a4a8dc191b887ab210935965d3bca`, contains all 70 site rows, named oracle outcomes, and both emitted observed-class histograms; the standalone histogram hashes are pinned in the manifest |
 | 4 | Ref, worktree, snapshot, object, container and run-directory inventory before/after, with the husk census table | **Produced (Linux)** | Normalized before/after inventories have identical sha256 `048271a07907c4d86f5ab16057de906c38e9df7072a10c5f9224e5dc20e3fe65`; their diff is empty. `04-inventory-husk-census.txt`, sha256 `a1fdf7a8cfdcbaa208553b1e4f5751b35cb1c376d4634817db2670fa5baa524f`, records group/residue tables and every husk/creator-error oracle |
 | 5 | User-checkout inventory diff | **Produced (Linux)** | `05-user-checkout-before.txt` and `05-user-checkout-after.txt` are byte-identical, sha256 `c33b71398e6e2112efe4696ed6ffcee297559a646f0d6c2acf9641dc9bd86c0f`; `05-user-checkout-inventory.diff` is the empty diff, sha256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
 | 6 | Docker-gated suite result with the environment noted | **Produced (Linux)** | This is the one artifact the run yields directly. `rc=0`, fresh compile, lib 1801 passed / 0 failed / 34 ignored, main 8 passed / 0 failed, example 0 tests; the `real_docker_*` tests exercised a live **Docker server 29.7.2**. Environment noted below. **Not covered:** macOS and Windows |
 | 7 | `clippy.toml`, `effects/allowlist.toml`, wrapper classification, `effect_sites.json`, allow-placement scan output | **Produced (Linux)** | Inputs remain pinned below. `07-allow-placement-scan.txt`, sha256 `dfe7dbbde61c8690fe4de5579c87da3bc5a32a4249d8d468bb552633d1ebf308`, is the standalone scan output and includes its four input hashes |
-| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Produced (Linux)** | `08-runner-identity-refusal-transcripts.txt`, sha256 `1e16c27f6e520b84e4c88312a4bebad287fece83f5e08ed237b80b685b828485`, records the executed identity, boundary, digest and refusal witnesses from the instrumented suite |
+| 8 | Runner identity outputs — run-started/run-resumed runner records, owner-record and intent digests, the per-invocation boundary and image-id log from the fake runners, and the inspection-refusal and probe-refusal transcripts | **Produced (Linux)** | `08-runner-identity-refusal-transcripts.txt`, sha256 `ba85e3f88afe19c1688ffdb7cd0d2dde37521a35b536b7df76dfc724820f2980`, contains each named substantive payload class emitted by the existing durable-record, intent, fake-runner and refusal oracles |
 
 ### Capture directory and manifest
 
 All side outputs live under
 `/home/ubuntu/tactus-artifacts/promotion/g2-captures/`. `SHA256SUMS` is the
 complete selected-file manifest and hashes to
-`96b9fec94b9bc0d40c069190ac332930c1d2f4e8749befaea3d4b36a775fcc55`.
+`e2e1f5b58d4309291d452f1b1faa1fa556625888dfbdabc586bf2aa7c875db75`.
 The capture anchor is `47dc9a35f6e6af59160ece49570d9934a4450dec`, tree
 `7f7b03017997cca503f2c28822d75d4f622d731e`. The capture commit changes only
 this gate report, the coverage-map addendum, and the append-only ledger row; it
