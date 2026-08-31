@@ -3584,3 +3584,48 @@ The review explicitly preserved the owner-deferred
 The repaired exact head still requires the globally serialized full suite, fresh
 exact-head review, and hosted gates; this ledger append grants neither review nor
 merge authority.
+
+## 32. 2026-08-31 PR #64 successor slice 2 — emit scratch fixtures spend token authority
+
+This append-only section records the second successor slice under the owner's
+2026-08-30 scratch-tree authority decision and controlling addendum. Implementation
+head `6555870ef62bef5f8de5b598496783466646a092` is based directly on green
+integration `82874ef70dd4acf074cbf1453e28651d78af4db3`. The root-owned ledger
+append follows that implementation commit, so the final reviewed SHA is recorded
+in the PR body rather than self-referentially here. The old PR #64 branch remains
+historical input only and is not replayed or merged.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR64-CLEANUP-003-SCRATCH-PRECLEAN | P2 | 6555870ef62bef5f8de5b598496783466646a092 / src/engine/topology/emit/tests.rs:276 | an emit fixture derives a predictable process-and-counter root -> it recursively pre-cleans that root while discarding the result -> a recycled process identity or overlapping fixture can make another owner's tree reachable -> setup deletes content before proving exclusive ownership | pre_existing | correctness | PR64-CLEANUP-003-SCRATCH-PRECLEAN / slice-1 section 30 deferred this caller migration | Emit fixtures now acquire a previously nonexistent ULID-named root through ScratchTreeOwnership before any fallible run-tree construction; Arc clones share one non-Clone token owner; the last holder spends the token through remove_scratch_tree. Occupied-root, partial-construction, return, unwind, shared-lifetime, confirmed-absence, normal-failure, suppressed-failure, and Windows drop-order witnesses are live. The five required destructive mutations each kill only its assigned witness. No RemovePublicHusk call, ancestor-targeted production funnel, raw deletion, predictable root, pre-clean, forged proof, or discarded reclaim result remains in emit/tests.rs | fixed |
+
+## 33. 2026-08-31 PR #78 exact-head review — scratch-fixture authority correction
+
+This append-only correction records the sole review of exact head
+`17dbf7adbfaefc964ebdedbbcce200350d9ab72a` and the same-implementor repair
+`02b64604477c28b3ce24ed86a53cc5c81b916960`. It does not rewrite section 32:
+that section incorrectly reused the legacy pre-clean ID for a distinct emit-local
+helper. The original `rundir::tests::scratch` hazard remains deferred, while the
+emit helper's actual predictable-root and missing-reclamation defect is fixed under
+its own stable ID.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| PR78-EMIT-UNWIND-REPORT-LOST | P2 | 17dbf7adbfaefc964ebdedbbcce200350d9ab72a / src/engine/topology/emit/tests.rs:235 | an ordinary assertion panics -> the last Scratch holder drops -> real reclamation fails -> the failure is parked only in an OwnedTree-local slot -> field destruction drops the sole token and message -> the tree leaks while the original panic reports no cleanup failure | introduced_by_feature | correctness | 6555870ef62bef5f8de5b598496783466646a092 | Repair 02b6460 routes the unwind arm through the scratch subsystem's fallible reporter before touching the witness slot and explicitly suppresses reporter failure; a no-observer witness proves the report remains externally visible, while injected witnesses recover, rearm, release guards, and only then assert | fixed |
+| PR78-SCRATCH-REMOVER-SEAM-AUTHORITY | P2 | 17dbf7adbfaefc964ebdedbbcce200350d9ab72a / src/rundir.rs:3081 | any crate test receives a generic remover callback -> it ignores the token path or deletes an ancestor -> it returns success without deleting the token root -> the only token is consumed -> API construction no longer confines reclamation to the owned root | introduced_by_feature | security-trust | 6555870ef62bef5f8de5b598496783466646a092 | Repair 02b6460 keeps Remover, remove_scratch_tree_with, guarded_with, and Reporter module-private and exposes only a pathless refusal operation whose private stateless remover always returns PermissionDenied and whose return type has no success case | fixed |
+| PR78-LEDGER-PRECLEAN-FALSE-CLOSURE | P2 | 17dbf7adbfaefc964ebdedbbcce200350d9ab72a / reviews/FINDINGS.md:3600 | section 30 defers the predictable pre-clean in rundir tests -> section 32 attributes that sequence to the distinct emit helper -> the legacy helper remains byte-present -> the reused stable ID is marked fixed -> maintainers receive a false closure of a live deletion hazard | introduced_by_feature | docs-contract | PR64-CLEANUP-003-SCRATCH-PRECLEAN | This append-only section restores the original row to deferred and records the emit-local repair under PR64-EMIT-SCRATCH-PREDICTABLE-LEAK; the PR body uses the same corrected separation | fixed |
+| PR64-CLEANUP-003-SCRATCH-PRECLEAN | P2 | 17dbf7adbfaefc964ebdedbbcce200350d9ab72a / src/rundir.rs:3834 | rundir tests derive a predictable process root -> they discard recursive pre-clean failure -> an occupied root can contain another owner's data -> setup removes that data before acquiring token-carried authority | pre_existing | correctness | PR64-CLEANUP-003-SCRATCH-PRECLEAN | The slice-1 token authority and slice-2 emit migration do not change this legacy helper. It remains assigned to the separately bound startup, recover, and create migration follow-up; reopen when that collision set receives an exact-base lease, and require occupied-root preservation plus no pre-clean or discarded cleanup result | deferred |
+| PR64-EMIT-SCRATCH-PREDICTABLE-LEAK | P2 | 17dbf7adbfaefc964ebdedbbcce200350d9ab72a / src/engine/topology/emit/tests.rs:96 | an emit fixture derives a process-and-counter root without exclusive acquisition -> fixtures never reclaim the root -> process identity reuse or repeated runs encounter stale content -> tests fail as fresh-run assumptions collide and temporary trees accumulate | pre_existing | correctness | PR7-SCRATCH-FIXTURE-LEAK | Repair 02b6460 acquires a previously nonexistent ULID root before fallible construction, shares one non-Clone token through Arc, and spends it on final drop; 17 original tests retain names and semantics, 9 ownership and failure witnesses pass, and ten repetitions leave the observed temporary-entry count unchanged | fixed |
+
+## 34. 2026-08-31 PR #78 Fable convergence — external unwind-report oracle
+
+This append-only section records the fresh review of exact repaired head
+`4099d57b24c8b7d2dd44aeb3e3b24272eacf1a9c`. That review was the lane's
+second unsuccessful reviewed attempt, so the standing convergence policy froze
+the branch and prohibited another ordinary repair. Fable 5 authored the bounded
+convergence repair at `6a217865f978b5319007c55c269fb48e26823dc3` without
+reopening the settled scratch-deletion authority or widening the three-file lease.
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|---|
+| PR78-EMIT-UNWIND-REPORT-ORACLE | P2 | 4099d57b24c8b7d2dd44aeb3e3b24272eacf1a9c / src/engine/topology/emit/tests.rs:2575 | external stderr reporting is removed -> the unwinding arm sets its own delivered record -> the in-process observer and no-observer witnesses still pass -> a failed scratch reclaim again loses its cleanup report while the evidence claims the reporter is fixed | introduced_by_feature | correctness | PR78-EMIT-UNWIND-REPORT-LOST / repair 02b64604477c28b3ce24ed86a53cc5c81b916960 | Fable repair 6a21786 moves delivery observation outside the process: rundir scratch-tree witnesses spawn the exact emit test, capture its real fd 2, assert one correctly shaped report, assert silence for a successful unwind reclaim, and on Linux route fd 2 to /dev/full to prove a real write failure is suppressed without replacing the original panic. Five destructive mutations, including removing the stderr write and removing the reporter call, each turn the assigned oracle red and are absent from the committed tree | fixed |
