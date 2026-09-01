@@ -30,13 +30,17 @@ change. `proposals/README.md` remains as the public, citation-bearing index,
 and every stub keeps its path, title, and status block **verbatim** so that
 every existing citation still resolves.
 
-**Evidence that this is relocation, not deletion.** The private intake landed
-on the companion repository's default branch, at its commit
-`359953f54f6c1dd08b2d2d1b36b1a1635a72e26b`, before this record merged; all
-thirteen dated files there are blob-for-blob identical to the public
-originals at `0a25698` (verified by object ID, per file). And the standing
-caveat holds either way: relocation does not remove a file from public git
-history; the value is organizational and prospective.
+**Evidence that this is relocation, not deletion.** For the relocated set as
+a whole: Provenance: relocated to the private companion repository at its
+default-branch commit `359953f54f6c1dd08b2d2d1b36b1a1635a72e26b` on
+2026-09-01 — the sanctioned line form, used here for an outbound move. The
+owner verified, before this record merged, that all thirteen dated files
+there are blob-for-blob identical to the public originals at `0a25698`
+(by object ID, per file). That check is owner-verified external evidence: it
+is recorded here and is not independently inspectable from the public
+repository. And the standing caveat holds either way: relocation does not
+remove a file from public git history; the value is organizational and
+prospective.
 
 ## Why
 
@@ -48,8 +52,10 @@ history; the value is organizational and prospective.
 - The 2026-08-27 record kept the files in place because citations must keep
   resolving and history keeps them visible regardless. Both concerns remain
   true and both are honored by mechanism rather than by pin: the stubs keep
-  every citation resolving, the two content-relied-on files stay whole, and
-  the intake evidence above makes the move verifiable rather than asserted.
+  every citation resolving, the three retained files stay whole, and the
+  intake evidence above makes the move owner-verified rather than merely
+  asserted — recorded, though not independently inspectable from the public
+  repository.
 
 ## The rule
 
@@ -109,7 +115,8 @@ history; the value is organizational and prospective.
   — the filing rule this record leaves in force, and the keep-in-place pin it
   supersedes; carries the appended forward notice.
 - [2026-08-22 — the strategy layer lives outside the public repository](2026-08-22-strategy-record-private.md)
-  — the stub mechanism, the retained-content rule, and the no-private-references
-  rule, applied here unchanged; carries the appended forward notice.
+  — the stub mechanism and the retained-content rule, applied here; its
+  no-private-references rule, narrowed as this record's rule section states;
+  carries the appended forward notice.
 - [2026-08-24 — the PR3-layer freeze charter](2026-08-24-pr3-layer-freeze-charter.md)
   — the immutable record whose reliance keeps the G2 pass plan public in full.
