@@ -28,23 +28,27 @@ owner adopts the review's whole-package scope.
 
 ## Release-artifact consequence, disclosed
 
-`Cargo.toml` never excluded `infra/`, so every published crate to date
-packages the tree; from the first tag after this change, `cargo package` no
-longer includes it. This is a deliberate consequence of the ruling, not an
-oversight: the crate's contract is the engine, and the operator tree was
-shipping in it by default, not by design.
+`Cargo.toml` never excluded `infra/`, so a publish from any tree containing
+it would have packaged the tree by default — `cargo package --list` at this
+change's parent contains all 18 files. No *published* crate ever did:
+`upstroke 0.1.0` was published from `3d9cf38`, hours before the tree first
+reached master at `458d928`, and contains zero `infra/` paths. The exposure
+was prospective, not historical, and after this change it cannot occur: the
+crate's contract is the engine, and the operator tree was set to ship in it
+by default, not by design.
 
 ## Evidence that this is relocation, not deletion
 
-The private intake was verified against the public parent before this record
-landed: the companion repository's staged `infra/` tree ID equals the public
-parent's `infra/` tree ID `1293e4a71a6637d4d628aeeb5abc308ec7578a80` exactly —
-same names, same modes (executable bits restored after a workstation copy
-dropped them), same blobs. The owner merges the private intake before or
-together with the public removal. And the standing caveat holds: relocation
-does not remove the tree from public git history — it was introduced at
-`7923a912` and remains retrievable from every public head that contained it;
-the move is organizational and prospective.
+The private intake landed on the companion repository's default branch, at
+its commit `359953f54f6c1dd08b2d2d1b36b1a1635a72e26b` (the commit-naming form
+the 2026-08-22 `Provenance:` convention already sanctions), before this
+record merged; its `infra/` tree ID equals the public parent's `infra/` tree
+ID `1293e4a71a6637d4d628aeeb5abc308ec7578a80` exactly — same names, same
+modes (executable bits restored after a workstation copy dropped them), same
+blobs. And the standing caveat holds: relocation does not remove the tree
+from public git history — it was introduced at `7923a912` and remains
+retrievable from every public head that contained it; the move is
+organizational and prospective.
 
 ## Rejected
 
@@ -64,4 +68,7 @@ the move is organizational and prospective.
 - [2026-08-22 — the strategy layer lives outside the public repository](2026-08-22-strategy-record-private.md)
   — the public/private split mechanism and the keep-public floor this record
   leaves intact. (The stub mechanism is not needed here: after the CLAUDE.md
-  reconciliation, no public document cites an `infra/` path.)
+  reconciliation, the C1-checked citation surface — `CLAUDE.md` and
+  `CONTRIBUTING.md` — carries no `infra/` tree path; dated immutable records
+  and this record's own mentions remain valid as history, which a stub cannot
+  improve.)

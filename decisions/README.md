@@ -106,5 +106,6 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-09-01 — the build-box tree lives outside the public repository](2026-09-01-infra-private.md):
   the 18-file `infra/` tree relocates to the private companion repository —
   operator tooling, not engine contract; the 2026-08-22 keep-public floor is
-  untouched, the crate stops packaging the tree from the next tag, and the
-  private intake is verified byte-for-byte by tree ID before removal.
+  untouched, the next publish can no longer package the tree (no published
+  crate ever did), and the private intake landed on the companion default
+  branch, verified byte-for-byte by tree ID, before removal.
