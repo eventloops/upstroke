@@ -10,7 +10,8 @@ green head before merge. The reviewed SHA and a durable link to the verdict are 
 pull request; a new push means the recorded review no longer binds to the head — serious P1
 repairs get a fresh pass, `MUST` deviations and evidence-backed findings are fixed whatever their
 label, a repair-only delta after a single-reviewer pass that found no serious P1 is owner-verified
-and disclosed, anything wider is re-reviewed; the owner's merge is the attestation. See
+and disclosed, a conflict-free merge of `master` that leaves the diff byte-identical keeps the
+review, anything wider is re-reviewed; the owner's merge is the attestation. See
 [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
 emergency policy. Contributions from external forks remain provisional: the required checks are
 candidate-controlled, so a fork's entire diff — workflow edits included — is reviewed before merge.

@@ -165,3 +165,14 @@ invalidates, deliberately", read as *restarts the review sequence* — was narro
 delta, is now mergeable, disclosed in the pull-request body; a serious P1 repair still returns
 for a fresh pass, and a panel-reviewed candidate re-runs every seat on any head movement. See
 [2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).
+
+## 2026-09-01 — the exempt set is widened by successor record
+
+This record's rule that widening the exempt set takes a successor decision record is
+followed, not bypassed: `2026-09-01-clean-base-merge-keeps-review.md` adds one class to the
+set beside `reviews/FINDINGS.md`. A conflict-free merge of the base into a reviewed head
+keeps the review when the pull request's diff against its base is byte-identical before and
+after, CI is green on the merged head, and the candidate edits no workflow, gate script, or
+validator; both SHAs, both base SHAs and both diff hashes are recorded in the body. The
+binding rule stands: the merged head is a different tree, and the body says so. See
+[2026-09-01 — a clean merge of the base keeps the review](2026-09-01-clean-base-merge-keeps-review.md).

@@ -151,7 +151,11 @@ serious-P1 bar with MAINTAINING.md); anything wider is a new change and is
 re-reviewed; a push confined to `reviews/FINDINGS.md` keeps the review
 outright
 (`decisions/2026-08-20-review-invalidation-scope.md`) — record both SHAs and
-confirm the exempt-only diff yourself before merging. A completed
+confirm the exempt-only diff yourself before merging. A conflict-free merge
+of `master` that leaves the diff against `master` byte-identical, with CI
+green on the merged head, keeps it too
+(`decisions/2026-09-01-clean-base-merge-keeps-review.md`): record both
+SHAs, both base SHAs, and the diff hash before and after. A completed
 `CHANGES_REQUIRED` pass whose findings all landed as repairs or logged
 baggage is recorded as that verdict, never as a pass.
 Agents never merge to `master`: merging is the owner's act, and an agent

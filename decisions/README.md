@@ -55,7 +55,8 @@ artifacts (§15); records promoted here are the durable subset.
   reviews bind to the exact tree modulo an explicit exempt set — exactly
   `reviews/FINDINGS.md` to start; ancestor + exempt-only diff re-attests via owner
   dispatch, computed on the trusted side. Ends ledger edits discarding max-effort
-  reviews of unchanged code.
+  reviews of unchanged code. Exempt set widened 2026-09-01 by successor record
+  (clean base merge-ins), by notice on the record.
 - [2026-08-21 — slices land as pull requests into their integration branch](2026-08-21-stacked-slice-prs.md):
   slice PRs into `codex/parallelism-design` get CI, policy, and a single-reviewer
   review of each head; attestation stays master-only and happens once on #18's
@@ -127,4 +128,11 @@ artifacts (§15); records promoted here are the durable subset.
   whatever their label, everything else lands as `accepted-risk`/`deferred`
   rows swept before releases, at checkpoint merges, and on owner call. The
   2026-08-20 binding rule stands; its consequence is narrowed by appended
-  notice. #87's disclosed waiver is the precedent it replaces.
+  notice. #87's disclosed waiver is the precedent it replaces. Its exempt-set
+  statement is dated 2026-09-01 by notice on the record.
+- [2026-09-01 — a clean merge of the base into a reviewed head keeps the review](2026-09-01-clean-base-merge-keeps-review.md):
+  a conflict-free merge of the base that leaves the pull request's diff
+  byte-identical, with CI green on the merged head and no gate edited by the
+  candidate, is exempt from re-review; both SHAs, both base SHAs and both diff
+  hashes recorded. Widens the 2026-08-20 exempt set by successor record; panel
+  candidates outside.

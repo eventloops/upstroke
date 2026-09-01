@@ -103,3 +103,14 @@ and stays recorded as its own body states.
   — the checkpoint cadence that doubles as a cleanup point.
 - [2026-08-31 — the G2 panel's three seats](2026-08-31-panel-seats.md)
   — the every-seat re-run this record leaves outside the narrowing.
+
+## 2026-09-01 — the exempt set this record left unchanged is widened
+
+The first bullet under "What this narrows" says the exempt path set is
+exactly `reviews/FINDINGS.md`. Later the same day
+`2026-09-01-clean-base-merge-keeps-review.md` widened it by successor
+record: a conflict-free merge of the base that leaves the pull request's
+diff byte-identical, with CI green on the merged head, keeps the review.
+The lane this record defines is untouched; a clean merge-in is exempt, not
+owner-verified. See
+[2026-09-01 — a clean merge of the base keeps the review](2026-09-01-clean-base-merge-keeps-review.md).
