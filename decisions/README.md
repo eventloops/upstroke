@@ -46,6 +46,10 @@ artifacts (§15); records promoted here are the durable subset.
   schema-4 immutable candidates, exact-tree verification, crash-safe CAS
   integration, bounded human-gated repair tasks, and the shared worktree/runner
   boundary.
+- [2026-08-17 — reviewer effort levels and review fan-out width](2026-08-17-review-effort-and-fan-out.md):
+  `ultra` is `max` plus internal task delegation, not deeper reasoning; `max` for every
+  bounded review judgement, `ultra` only for a broad sweep of an unexamined surface; review
+  fan-out narrowed from six lenses to three, the single independent final confirmation kept.
 - [2026-08-20 — the automated review gate](2026-08-20-automated-review-gate.md):
   single reviewer every head, three-model panel once on the merge candidate; S9's
   remit moves to it. Stage 1 (comment-only) authorised; auto-merge is not, and the
@@ -89,6 +93,14 @@ artifacts (§15); records promoted here are the durable subset.
   feedback onto the durable record; the schema-4 brief becomes a fold over it,
   derived once and called by both the live loop and a replay. `SCHEMA_VERSION`
   unmoved. Class C exception to the 2026-08-20 freeze, scoped to that field.
+- [2026-08-30 — a per-site `#[expect]` may stand where a module-level allow did](2026-08-30-readiness-lint-placement.md):
+  a per-site `#[expect(<governed lint>, reason = …)]` may sit below module level in a file whose
+  `effects/allowlist.toml` row records the lint and the exact annotation count and which denies
+  the lint at module level; a per-site `#[allow]` and an unrecorded `#[expect]` stay refused.
+- [2026-08-30 — run-directory deletion authority is token-carried, and there are two tokens](2026-08-30-test-scratch-tree-ownership.md):
+  recursive deletion of a run-scoped tree stays token-carried, with exactly two token classes:
+  `rundir::PrivateHalfProof` (every build) and `rundir::scratch_tree::ScratchTreeOwnership`
+  (`cfg(test)` only); `PrivateHalfProof` is unchanged.
 - [2026-08-31 — the G2 checkpoint promotion candidate](2026-08-31-g2-checkpoint-promotion.md):
   reconciles `2026-08-25-checkpoint-merges.md` obligation by obligation and leaves it
   controlling in full. The ledger audit and the recurrence review are discharged, and the

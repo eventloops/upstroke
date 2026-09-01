@@ -34,12 +34,18 @@ handles capacity or questions.
 ## Where the project is
 
 **v0.1 is complete** and released as `0.1.0` — the sequential conductor works,
-end to end, against a real repository. **v0.2 is in progress**: parallel
-execution over isolated worktrees, a compare-and-swap merge queue, an optional
-container runner, capacity-driven routing, more adapters (Aider, task-master and
-other plan formats), notifiers, and `export-decisions`. The capacity engine
-currently ships **read-only** — `connect`, `capacity` and dry-run preview
-estimate and report; nothing routes on it yet.
+end to end, against a real repository. **v0.2 is in progress.** Its
+parallel-execution machinery (worktree-per-task isolation, the
+compare-and-swap merge queue, the optional container runner and the topology
+layer) reached master at the G2 checkpoint on 2026-09-01
+(`decisions/2026-08-31-g2-checkpoint-promotion.md`), inert by default: the
+v0.1 sequential path is unchanged and the schema-4 machinery engages only by
+explicit schema choice. `export-decisions` landed on 2026-08-11
+(`decisions/2026-08-11-export-decisions-schema.md`). Still to come:
+capacity-driven routing (the capacity engine ships **read-only**; `connect`,
+`capacity` and dry-run preview estimate and report, and nothing routes on it
+yet), more adapters (Aider, task-master and other plan formats), and
+notifiers. No `0.2.0` tag exists.
 
 The build order is `DESIGN.md` §21 and it is deliberate. Check where the
 project actually is before adding something out of sequence.
@@ -177,12 +183,15 @@ session has no standing to do it even when it runs on the owner's token.
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
 | `reviews/` | Review records, and the standing finding ledger once it lands |
 
-`src/` is one crate. On master it is `plan/`, `agent/` (Claude Code, Copilot,
-Codex adapters), and flat modules — `engine.rs`, `events.rs`, `review.rs`,
-`gates.rs`, `ladder.rs`, `route.rs`, `capacity.rs`, `rundir.rs`, `workspace.rs`
-among them. **Check the tree rather than this list**: the v0.2 topology work
-splits `engine.rs` into `engine/` and adds `topology/`, and it reaches master
-only when its pull request merges.
+`src/` is one crate. On master it is `plan/` (ingestion), `agent/` (the Claude
+Code, Copilot and Codex adapters, with `proc/` for subprocess handling),
+`engine/` (the conductor: coordinator, assembly, preflight, resume, report),
+`topology/` (the v0.2 execution topology: registry, effects, fold, leases,
+queue, schema, census), `runner/` (host and container execution), `events/`,
+`validate/`, `status/`, `effects/`, `connect/`, and flat modules: `review.rs`,
+`gates.rs`, `ladder.rs`, `route.rs`, `capacity.rs`, `rundir.rs`,
+`workspace.rs`, `workspace_manager.rs`, `export.rs` among them. **Check the
+tree rather than this list.**
 
 ## Traps that have already cost time
 
