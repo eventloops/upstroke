@@ -31,8 +31,9 @@ comfort) but the **embedder** — a platform shipping upstroke inside its own pr
 AGPL would have forced to the table. Apache-2.0 admits that buyer free of charge. The project
 chooses to be the default plumbing rather than to hold the toll, and moves its moat from the
 code to the mark: Apache-2.0 §6 grants no trademark rights, and the NOTICE file added with this
-record is the mechanism (§4(d)) by which attribution travels with every redistribution and
-derivative. The deeper commercial analysis stays in the private strategy record
+record is the mechanism (§4(d)) by which attribution must accompany the distributed derivative
+works that include it — a condition on distribution, not on private use, and one that binds
+only what actually ships alongside the file. The deeper commercial analysis stays in the private strategy record
 ([2026-08-22](2026-08-22-strategy-record-private.md)); this record retires its public licensing
 mechanism only.
 
@@ -54,7 +55,11 @@ mechanism only.
   archives ship the bare binary today. Under any licence they should carry `LICENSE`, `NOTICE`,
   and generated third-party attributions for the statically linked crates (`cargo-about` or
   equivalent), added inside the existing three assets so the release contract's exact-asset-set
-  check is untouched.
+  check is untouched. **The next release is gated on that follow-up**: until the archives carry
+  `LICENSE` and `NOTICE`, an archive would ship with no attribution in it at all, so no new
+  `v*` tag is authorized before that change lands. (Deferring the workflow edit while gating on
+  it is deliberate: the release path is high-blast-radius and deserves its own reviewed pull
+  request, and nothing else in this record is urgent enough to couple to it.)
 
 ## Rejected
 
@@ -72,12 +77,18 @@ mechanism only.
 
 ## Measured vs assumed
 
-**Measured**, by reading the tree and history at this record's head: every commit author is the
-owner (four personal emails) or the engine's own local run identities, so no outside copyright
-exists and the relicensing needs no consent beyond the owner's; the tree vendors no third-party
-code (the many "vendor" hits in `src/` are the product's cross-vendor review language); no
-inbound NOTICE obligations exist to propagate; the release workflow packages exactly the binary
-and nothing else into each archive.
+**Measured**, by reading the tree and history at this record's head: every commit author
+identity is the owner (four personal emails) or one of the engine's own local run identities;
+the tree vendors no third-party code (the many "vendor" hits in `src/` are the product's
+cross-vendor review language); no inbound NOTICE obligations exist to propagate; the release
+workflow packages exactly the binary and nothing else into each archive.
+
+**Attested rather than measured: chain of title.** Author identities and the absence of
+vendored trees are evidence, not proof — they establish neither line-level origin nor that
+nothing was ever committed under an owner or engine identity with someone else's rights
+attached. No stronger measurement exists in a git history. The owner's merge of this record is
+the attestation that the whole is theirs to relicense, on the same footing as every other
+owner's-merge attestation in this repository.
 
 **Assumed, and named as the bet:** the adoption benefit itself — that allowlist-frictionless
 licensing materially widens the top of the funnel for a tool whose first trial happens at work.

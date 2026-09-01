@@ -270,8 +270,8 @@ In plain terms, for the two things people usually want to know:
 
 - **Use it however you like.** Run it, modify it, embed it in something closed, ship it
   commercially — the licence permits all of it, and carries an express patent grant from every
-  contributor. Redistributions keep the LICENSE text and the attribution in NOTICE, so credit
-  travels with the code; that is the whole ask.
+  contributor. Redistribution's conditions are §4's: a copy of the licence, the NOTICE
+  attribution, existing notices retained, modified files marked. Credit travels with the code.
 - **The name is not part of the grant.** Apache-2.0 §6 licenses no trademarks. Use "upstroke"
   to refer to this project truthfully; don't use the name or branding to present a modified
   version as the original.
