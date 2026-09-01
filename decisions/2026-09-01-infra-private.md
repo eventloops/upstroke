@@ -73,3 +73,16 @@ organizational and prospective.
   `CONTRIBUTING.md` — carries no `infra/` tree path; dated immutable records
   and this record's own mentions remain valid as history, which a stub cannot
   improve.)
+
+## 2026-09-01 — the last living guidance retires; this record stays
+
+Appended by the pull request that removed `CLAUDE.md`'s "On the dedicated
+build box" section, the last living operating guidance about the box. The
+hazard that section guarded for the public tree — concurrent suites sharing
+an unset `CARGO_TARGET_DIR` pre-clean each other's live containers
+(`R5-SEAMS-006`) — is restated box-agnostically in `CLAUDE.md`'s traps
+section in the same change, so the documented mitigation outlives the
+section that carried it. Day-to-day operating guidance lives in the private
+archive's runbook. Nothing above is overturned: the record stays, immutable,
+as the history of the relocation; this notice records that its subject no
+longer has a living public surface.
