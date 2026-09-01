@@ -36,7 +36,7 @@
 //! No `commondir`, no `gitdir`, no `worktrees/`, no `config` section naming a
 //! remote, a URL or a credential helper. Those are the links back into the real
 //! repository the sentence above exists to cut. The census
-//! [`super::exec::tests::the_role_view_carries_no_link_back_into_the_repository`]
+//! [`tests::the_role_view_carries_no_engine_refs_and_no_link_back_into_the_repository`]
 //! asserts their absence by name rather than trusting this list.
 // Allowlist placement: the **funnel section** of `effects/allowlist.toml`. This
 // module is the body of `GitView::materialize`/`discard`, whose two methods are
