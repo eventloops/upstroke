@@ -34,11 +34,15 @@ carries the `136104b` post-merge finding and this record's own corrections.
 
 ## The verdict, verbatim
 
+Blockquoted from the reviewer's saved output byte-for-byte; its own link
+anchors — an ephemeral review-workdir path among them — are preserved as
+emitted, the PR #34 record's precedent.
+
 > One blocking finding:
 >
-> - **P2 — The recovery claim is still false at the exact commit graph.** The decision record says "this change's parent" contains all 18 files and every public head from `458d928` through that parent contains the exact tree. But head `136104b` has ordered parents `e329eea` and `fff6abd`; `e329eea:infra` is absent. Only the PR-base parent `fff6abd:infra` has tree `1293e4a7…`. Public head `26c6e6c`, chronologically between the stated endpoints, also has no `infra/`.
+> - **P2 — The recovery claim is still false at the exact commit graph.** [The decision record](/tmp/upstroke-review-136104bc/decisions/2026-09-01-infra-private.md:31) says “this change’s parent” contains all 18 files and every public head from `458d928` through that parent contains the exact tree. But [head `136104b`](https://github.com/eventloops/upstroke/commit/136104bc1de1f9eaa49d634994a6a50c0169ad33) has ordered parents `e329eea` and `fff6abd`; `e329eea:infra` is absent. Only the PR-base parent `fff6abd:infra` has tree `1293e4a7…`. Public head [`26c6e6c`](https://github.com/eventloops/upstroke/commit/26c6e6ccaf6292519f4a2530ce584a8d8ce636aa), chronologically between the stated endpoints, also has no `infra/`.
 >
->   Concrete failure: private archive is lost → operator follows "this change's parent" using ordinary `HEAD^1` or chooses another asserted-good public head → no `setup.sh` or guest templates exist → rebuild fails. The PR body's stronger "recoverable at any head" claim and INFRA-011's `fixed` disposition are therefore unsupported. Name `fff6abd…` explicitly and restrict the range to first-parent `master` snapshots, or provide one canonical recovery commit/command.
+>   Concrete failure: private archive is lost → operator follows “this change’s parent” using ordinary `HEAD^1` or chooses another asserted-good public head → no `setup.sh` or guest templates exist → rebuild fails. The PR body’s stronger “recoverable at any head” claim and INFRA-011’s `fixed` disposition are therefore unsupported. Name `fff6abd…` explicitly and restrict the range to first-parent `master` snapshots, or provide one canonical recovery commit/command.
 >
 > I verified that the 21-path diff and counts are correct, the private intake is on its default branch with the claimed tree ID, the package claim is true at `fff6abd`, and no Rust panic/error/path rule is implicated.
 >
