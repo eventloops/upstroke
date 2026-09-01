@@ -31,9 +31,10 @@ comfort) but the **embedder** — a platform shipping upstroke inside its own pr
 AGPL would have forced to the table. Apache-2.0 admits that buyer free of charge. The project
 chooses to be the default plumbing rather than to hold the toll, and moves its moat from the
 code to the mark: Apache-2.0 §6 grants no trademark rights, and the NOTICE file added with this
-record is the mechanism (§4(d)) by which attribution must accompany the distributed derivative
-works that include it — a condition on distribution, not on private use, and one that binds
-only what actually ships alongside the file. The deeper commercial analysis stays in the private strategy record
+record is the mechanism (§4(d)) by which any distributed derivative work of a Work that
+includes a NOTICE must reproduce its attribution notices — within a bundled NOTICE file,
+within its source or documentation, or within a display the work generates — a condition on
+distribution, not on private use. The deeper commercial analysis stays in the private strategy record
 ([2026-08-22](2026-08-22-strategy-record-private.md)); this record retires its public licensing
 mechanism only.
 
@@ -55,11 +56,13 @@ mechanism only.
   archives ship the bare binary today. Under any licence they should carry `LICENSE`, `NOTICE`,
   and generated third-party attributions for the statically linked crates (`cargo-about` or
   equivalent), added inside the existing three assets so the release contract's exact-asset-set
-  check is untouched. **The next release is gated on that follow-up**: until the archives carry
-  `LICENSE` and `NOTICE`, an archive would ship with no attribution in it at all, so no new
-  `v*` tag is authorized before that change lands. (Deferring the workflow edit while gating on
-  it is deliberate: the release path is high-blast-radius and deserves its own reviewed pull
-  request, and nothing else in this record is urgent enough to couple to it.)
+  check is untouched. **The next release is gated on that follow-up**, and the gate lives where
+  release authority lives: `MAINTAINING.md`'s release contract carries it as this record's
+  compressed edit — decisions are history, not living authority. The workflow does not yet
+  inspect archive contents, so until the follow-up lands the gate is owner-verified at tag
+  time, like the immutability readback the contract already requires. (Deferring the workflow
+  edit while gating on it is deliberate: the release path is high-blast-radius and deserves its
+  own reviewed pull request.)
 
 ## Rejected
 
