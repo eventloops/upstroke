@@ -19,12 +19,16 @@ this record.
 
 **Iteration history at earlier heads** (each verdict at its exact head):
 `0fbb2c2` — five findings (no decision record; crate delta denied; `~/bin`
-overbroad; relocation unevidenced; counts wrong). `68a50ec` — five findings
-(a ledger row cited a blob absent at its SHA, caught by the live validator;
-the crate-history repair inverted the publication timeline; intake staged,
-not landed; twenty for twenty-one paths; record overclaimed its reference
-cleanup). `136104b` — the one finding below. Each round's repairs are
-recorded in the pull request's finding ledger.
+overbroad; relocation unevidenced; counts wrong), repaired by `f70c226`.
+`f70c226` — five findings (a ledger row cited a blob absent at its SHA,
+caught by the live validator; the crate-history repair inverted the
+publication timeline; intake staged, not landed; twenty for twenty-one
+paths; record overclaimed its reference cleanup), repaired by `68a50ec`.
+`68a50ec` — two findings (the base had fallen behind master when #82 merged
+mid-cycle; the recovery claim pointed at `7923a912`, whose tree carried
+twelve files under the old names), repaired by `e329eea` plus the master
+merge that produced `136104b`. `136104b` — the one finding below. Each
+round's repairs are recorded in the pull request's finding ledger.
 
 ## The verdict, verbatim
 

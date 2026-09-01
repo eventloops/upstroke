@@ -98,6 +98,8 @@ The precise statements, each verified against the commit graph:
   to the private intake's. One-command recovery:
   `git checkout fff6abd9 -- infra/`.
 - The same exact tree is on every **first-parent `master` snapshot** from
-  `458d928` through `fff6abd` inclusive — no first-parent commit in that
-  range touches `infra/`. Claims about heads outside master's first-parent
-  line are withdrawn.
+  `458d928` through `fff6abd` inclusive — `458d928` introduced the tree in
+  exactly this form, and no later first-parent commit through `fff6abd`
+  touches `infra/` (verified: `git log --first-parent 458d928^..fff6abd --
+  infra/` returns only `458d928` itself). Claims about heads outside
+  master's first-parent line are withdrawn.
