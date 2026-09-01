@@ -46,8 +46,9 @@ record merged; its `infra/` tree ID equals the public parent's `infra/` tree
 ID `1293e4a71a6637d4d628aeeb5abc308ec7578a80` exactly — same names, same
 modes (executable bits restored after a workstation copy dropped them), same
 blobs. And the standing caveat holds: relocation does not remove the tree
-from public git history — it was introduced at `7923a912` and remains
-retrievable from every public head that contained it; the move is
+from public git history — the directory's lineage began at `7923a912` (then
+twelve files under the old names), and the exact 18-file tree removed here is
+on every public head from `458d928` through this change's parent; the move is
 organizational and prospective.
 
 ## Rejected
