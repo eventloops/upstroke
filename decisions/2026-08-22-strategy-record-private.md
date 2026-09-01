@@ -80,6 +80,9 @@ except three files retained in full under this record's own retained-content
 rule and the public-lifecycle rule: the Decided G2 pass plan (content relied
 on by `DESIGN.md` and the freeze charter), the council critique (a
 review-stage record), and the portfolio proposal whose sections that critique
-cites. The stub mechanism and the no-private-references rule of this record
-are unchanged and applied there. See
+cites. The stub mechanism of this record is applied there; its
+no-private-references rule is narrowed, not preserved: a relocated proposal's
+stub shares its filename with the private counterpart by construction, and
+the public index names and summarizes the relocated texts — pointers into
+the private repository remain forbidden. See
 [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

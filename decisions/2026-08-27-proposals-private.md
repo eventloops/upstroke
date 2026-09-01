@@ -59,5 +59,8 @@ Decided G2 pass plan (its content is relied on by `DESIGN.md` and the freeze
 charter), the council critique (a review-stage record; every stage after
 filing remains public), and the portfolio proposal it critiques (the retained
 critique cites its sections by number). This record's filing rule is
-unchanged and remains in force.
+unchanged and remains in force. Its no-private-references discipline is
+narrowed for relocated proposals: their stubs share filenames with the
+private counterparts by construction, and the public index names and
+summarizes them; pointers into the private repository remain forbidden.
 See [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

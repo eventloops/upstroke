@@ -16,8 +16,10 @@ rule; and the
 that critique reviews, because the retained critique cites its sections by
 number throughout — the retained-content rule applies transitively to
 whatever a retained public record relies on. The ten relocated files carry no
-content-level public citation: the one record naming them is a review
-coverage manifest, satisfied by path resolution. This record supersedes the
+content-level public citation that *uses* their content: the one record
+naming them is a review coverage manifest, satisfied by path resolution, and
+the folder index's summaries are not a reliance but the deliberate public
+replacement (the rule below). This record supersedes the
 2026-08-27 pin that the already-public
 proposals stay where they are, and narrows 2026-08-22's "engine proposals
 stay public" clause to match the filing rule in force since 2026-08-27: the
@@ -53,8 +55,21 @@ history; the value is organizational and prospective.
 
 - The stub is the permanent public form of a relocated proposal: the original
   H1 and status block byte-for-byte, plus the pointer to this record — never
-  the content, and never a path or name inside the private repository (the
-  2026-08-22 rule, unchanged).
+  the content. **The 2026-08-22 no-private-references rule is narrowed here,
+  and honestly:** a relocated proposal's private counterpart shares its
+  public filename by construction — that identity is what keeps citations
+  resolving — and the index deliberately names and summarizes every relocated
+  proposal, so the exact private paths are derivable from public material.
+  What remains forbidden is pointing beyond the public tree: no link, path,
+  or commit into the private repository appears anywhere public except a
+  sanctioned `Provenance:` line.
+- **An index summary is not content reliance.** The index's one-line
+  summaries are the deliberate public replacement for the relocated texts —
+  the record of what each argued — not a use of their content. The transitive
+  retention rule counts citations that *use* content (a charter assigning
+  scope, a critique citing sections by number), not descriptions that replace
+  it; verifying a summary beyond the index is exactly the activity that moved
+  private, reachable through history or the archive.
 - **A stub's status block is a frozen snapshot as of relocation.** The living
   status is tracked with the private text; lifecycle movement surfaces
   publicly the way the filing rule already provides — a decision record that
