@@ -6,3 +6,14 @@ plan.normalized.json
 # ignored -- only the per-machine layer and the backups /doctor writes.
 .claude/settings.local.json
 .claude/settings.local.json.doctor-backup
+
+# The observed-class histogram half of the residue-class evidence record: a
+# property of the machine that ran the kill sampling, emitted on every test run
+# (`PR5-CONF-004`). The declarations half, `effects/residue-classes.json`, IS
+# checked in and IS compared byte-for-byte.
+/effects/residue-histogram.json
+
+# The T-ATTEMPT half of the observed-class histogram: the same machine-varying
+# record as the line above, for the two capture commands `git add` and
+# `write-tree`, written by the topology sampler on every test run.
+/effects/attempt-residue-histogram.json

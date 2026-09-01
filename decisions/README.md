@@ -68,3 +68,38 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+- [2026-08-24 — the PR3-layer freeze: charter, adjudication, and the G2 pass](2026-08-24-pr3-layer-freeze-charter.md): three
+  deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
+  blessed as a disclosed deviation; the pass over the layer runs before PR8.
+- [2026-08-25 — `CommandSpec.program` stays `String`](2026-08-25-commandspec-program-stays-string.md):
+  closes `PR4-PROGRAM-PATH-NOT-UNICODE` as not reproducible in production. Every production
+  route puts a bare CLI name in the field, so `DESIGN.md:222` is unchanged and the W4 widening
+  is withdrawn; the boundary stays path-capable, and `CODING_STANDARDS.md` §1's known-conflict
+  block retires on its own motion.
+- [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
+  `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
+  v0.2 completion, rather than once at the end.
+- [2026-08-26 — the retry brief survives a crash](2026-08-26-durable-retry-feedback.md):
+  `FailureRecord` gains one additive `#[serde(default)] detail`, carrying §11.4's
+  feedback onto the durable record; the schema-4 brief becomes a fold over it,
+  derived once and called by both the live loop and a replay. `SCHEMA_VERSION`
+  unmoved. Class C exception to the 2026-08-20 freeze, scoped to that field.
+- [2026-08-31 — the G2 checkpoint promotion candidate](2026-08-31-g2-checkpoint-promotion.md):
+  reconciles `2026-08-25-checkpoint-merges.md` obligation by obligation and leaves it
+  controlling in full. The ledger audit and the recurrence review are discharged, and the
+  serialized suite ran green at the committed evidence head; the panel and the six captured gate
+  artifacts, plus macOS and Windows, remain owed. Inertness is
+  verified by construction, no `0.2.0` tag is authorized, and rollback is
+  `git revert -m 1 MERGE_OID` — deliberately a high bar, because re-promotion then
+  requires reverting the revert. A fourth addendum records the step-1 collision
+  ruling, includes artifact 7 in the owed captured set, and binds this record to
+  correction by appended erratum.
+- [2026-08-31 — the inertness premise is behavioural](2026-08-31-inertness-premise-behavioural.md):
+  the G2 inertness condition is behavioural and holds at the pre-assembly baseline; the
+  `pub(crate)` visibility form is retired as false and unachievable. A library consumer can
+  WRITE schema-4 state through the checked funnel, carried as a ledger row for the PR12
+  activation slice. No visibility change to the code is authorized.
+- [2026-08-31 — the G2 panel's three seats](2026-08-31-panel-seats.md): one seat per family —
+  `gpt-5.6-sol` at max, `claude-fable-5` at max explicitly pinned, `gemini-3.1-pro-high` via
+  `agy` by absolute path — each with its invocation guard. No pre-authorized fallback: one
+  repair, then wait; the panel never convenes partially.

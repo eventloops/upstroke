@@ -31,6 +31,15 @@
 //! macOS, where there is no unprivileged descendant-containment primitive.
 //! Within the host-runner contract, run ownership cannot be handed to a resume
 //! -- or appear suspended -- while an isolated agent group is running.
+// PROCESS FUNNEL: this module is in the **funnel section** of
+// `effects/allowlist.toml`. Its effectful entries take ProcessSite by value;
+// `runner::host` constructs commands and passes both Spawn and Terminate sites
+// into this supervision boundary. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
@@ -40,7 +49,138 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::topology::effects::ProcessSite;
+
 use crate::error::UpstrokeError;
+use crate::topology::effects::{Injection, InjectionMode, SubEffectPoint};
+
+/// The parent-side containment steps of one spawn, told to whoever is watching.
+///
+/// `decisions.effect_site_inventory.containment_sub_effects`: "the process
+/// funnel exposes hook points for platform containment steps, each a
+/// Topology/Shared site with documented residue and recovery". PR3 declared the
+/// eight points ([`SubEffectPoint`]); PR4 makes them execute, and this is the
+/// interface through which they do.
+///
+/// Production passes [`NoHooks`], which answers [`Injection::Proceed`] to
+/// everything and costs a virtual call per containment step. The ST-07 subset
+/// passes [`crate::runner::HarnessHooks`], which records into PR3's
+/// `HookHarness` and returns whatever the suite armed.
+pub trait SpawnHooks {
+    /// The funnel reached `point`. The answer says what it must do there.
+    fn point(&mut self, point: SubEffectPoint) -> Injection;
+
+    /// The funnel reached `point`, at the coordinate that mode's fault belongs
+    /// at.
+    ///
+    /// A point whose two modes fire at two coordinates cannot be consulted
+    /// once. `Spawn.AmbientJobJoined` is the one:
+    /// `containment_sub_effects` gives it an error contract — "failure refuses
+    /// the write command" — which stands *in place of* establishing the job, so
+    /// it is consulted **before** the join; and it gives it the kill claim "a
+    /// coordinator kill after any of these leaves no host process (the ambient
+    /// handle closes …)", which is only true **after** the join, because before
+    /// it there is no handle to close.
+    ///
+    /// The default answers with [`Self::point`], so an observer that does not
+    /// distinguish modes behaves exactly as it did.
+    fn point_mode(&mut self, point: SubEffectPoint, mode: InjectionMode) -> Injection {
+        let _ = mode;
+        self.point(point)
+    }
+
+    /// The funnel created a child and has not yet contained it.
+    ///
+    /// Called between `CreateProcess`/`fork` and the next containment step, so
+    /// an observer that is about to inject a kill can record the identity that
+    /// must not survive the coordinator. The Windows stub test needs the pid
+    /// *and* the creation time, because Windows reuses pids, and only the
+    /// funnel knows the pid before it dies.
+    fn child_created(&mut self, _pid: u32) {}
+}
+
+/// What production passes: nothing is armed and nothing is recorded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHooks;
+
+impl SpawnHooks for NoHooks {
+    fn point(&mut self, _point: SubEffectPoint) -> Injection {
+        Injection::Proceed
+    }
+}
+
+/// Do what a hook answered.
+///
+/// [`Injection::Kill`] aborts. Not `panic!` and not `std::process::exit`:
+/// the whole claim under test is that a coordinator which dies **without
+/// running any cleanup** still leaves no host process, and both of those run
+/// destructors — including the one that closes the very job handle whose
+/// close-on-death is the mechanism.
+fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), UpstrokeError> {
+    match injection {
+        Injection::Proceed => Ok(()),
+        Injection::Kill => std::process::abort(),
+        Injection::Error => Err(UpstrokeError::Refused {
+            message: format!(
+                "the process funnel was made to fail at its `{point}` containment step"
+            ),
+        }),
+    }
+}
+
+/// What a **memoised** one-shot establishment reports to a caller.
+///
+/// A `OnceLock` holding a `Result` has exactly two arms and one of them is not
+/// otherwise reachable in a test: the coordinator joins one ambient job for its
+/// whole life, so a process that memoised a success can never observe a failure
+/// and a process that memoised a failure never got a coordinator. Every ambient
+/// failure this suite can build is the *injected* one, which fires strictly
+/// before the memo is consulted — so `Err(_) => Ok(())` here left the whole
+/// suite green while a Windows coordinator whose `CreateJobObjectW` failed
+/// carried on into `run`/`resume` with no ambient kill-on-close job at all: the
+/// degraded mode `crash_reconstruction` forbids ("no degraded mode; deferred")
+/// and `expected_failures_refusals[1]` requires a startup refusal for
+/// (`PR5-CORRECTNESS-010`).
+///
+/// Generic and platform-independent **so that arm can be executed on any
+/// machine**. The value it decides about is Windows-only; the decision is not,
+/// and a decision only one platform can test is a decision one platform never
+/// tests.
+///
+/// # Errors
+///
+/// The memoised diagnostic, verbatim — the caller renders it into the refusal,
+/// so a *fresh* message here would name something that did not happen.
+// Unix has no ambient job and therefore no production caller; the test below is
+// the only one there, and running it there is the point. `dead_code` is not a
+// governed lint (`effects::GOVERNED_LINTS`), so this is outside the
+// allow-placement scan rather than an exception to it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn memoised_outcome<T>(memo: &Result<T, String>) -> Result<(), String> {
+    match memo {
+        Ok(_) => Ok(()),
+        Err(message) => Err(message.clone()),
+    }
+}
+
+/// [`apply`] for the funnel steps whose only declared mode is `Kill`.
+///
+/// `SubEffectPoint::modes` gives every containment point except
+/// `AmbientJobJoined` kill mode alone, because the packet gives only the
+/// ambient join an error contract to return through ("failure refuses the
+/// write command"). An `Error` here can therefore only come from a hand-written
+/// observer, and it is surfaced as a spawn failure rather than silently
+/// ignored.
+#[cfg(windows)]
+fn apply_io(injection: Injection, point: SubEffectPoint) -> std::io::Result<()> {
+    match injection {
+        Injection::Proceed => Ok(()),
+        Injection::Kill => std::process::abort(),
+        Injection::Error => Err(std::io::Error::other(format!(
+            "the process funnel was made to fail at its `{point}` containment step"
+        ))),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
@@ -76,15 +216,17 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+    fn spawn(command: &mut Command, hooks: &mut dyn SpawnHooks) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
-            let (child, job) = windows_job::spawn_suspended_in_job(command)?;
+            let (child, job) = windows_job::spawn_suspended_in_job(command, hooks)?;
             Ok(Self { child, job })
         }
         #[cfg(not(windows))]
         {
-            command.spawn().map(|child| Self { child })
+            let child = command.spawn()?;
+            hooks.child_created(child.id());
+            Ok(Self { child })
         }
     }
 
@@ -116,24 +258,63 @@ impl DerefMut for ProcessTree {
     }
 }
 
-/// Run `command`, writing `stdin_data` to the child's stdin, with a hard
-/// wall-clock timeout. On timeout the child's owned process group is killed and
-/// the partial output captured so far is returned with `timed_out = true`
-/// (§14: timeout is an attempt failure with the partial transcript as feedback).
-pub fn run_with_timeout(
+/// Run `command` through the site-authoritative process funnel, with its
+/// containment sub-effect points observable.
+///
+/// `spawn_site` and `terminate_site` are validated before any process effect;
+/// timeout and output-limit cleanup carry the validated termination site into
+/// the platform primitive. `stdin_data` is bytes because a
+/// [`crate::runner::CommandSpec`] carries bytes.
+///
+/// # Errors
+///
+/// Spawn failure, supervision failure, or a fault the observer injected.
+pub fn run_with_timeout_at(
+    spawn_site: ProcessSite,
+    terminate_site: ProcessSite,
     command: Command,
-    stdin_data: &str,
+    stdin_data: &[u8],
     timeout: Duration,
+    hooks: &mut dyn SpawnHooks,
 ) -> Result<ProcessOutput, UpstrokeError> {
-    run_with_timeout_and_limit(command, stdin_data, timeout, OUTPUT_LIMIT_BYTES)
+    validate_process_sites(spawn_site, terminate_site)?;
+    run_with_timeout_and_limit(
+        spawn_site,
+        terminate_site,
+        command,
+        stdin_data,
+        timeout,
+        OUTPUT_LIMIT_BYTES,
+        hooks,
+    )
+}
+
+fn validate_process_sites(
+    spawn_site: ProcessSite,
+    terminate_site: ProcessSite,
+) -> Result<(), UpstrokeError> {
+    match (spawn_site, terminate_site) {
+        (ProcessSite::Spawn, ProcessSite::Terminate) => Ok(()),
+        _ => Err(UpstrokeError::Agent {
+            message: format!(
+                "process funnel requires (Process.Spawn, Process.Terminate), got ({}, {})",
+                spawn_site.name(),
+                terminate_site.name()
+            ),
+        }),
+    }
 }
 
 fn run_with_timeout_and_limit(
+    spawn_site: ProcessSite,
+    terminate_site: ProcessSite,
     mut command: Command,
-    stdin_data: &str,
+    stdin_data: &[u8],
     timeout: Duration,
     output_limit: usize,
+    hooks: &mut dyn SpawnHooks,
 ) -> Result<ProcessOutput, UpstrokeError> {
+    validate_process_sites(spawn_site, terminate_site)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -144,29 +325,82 @@ fn run_with_timeout_and_limit(
     // waits for this registration rather than terminating Upstroke first and
     // orphaning the new process group.
     #[cfg(unix)]
-    let mut termination = termination::Supervisor::begin()?;
+    let mut termination = termination::Supervisor::begin(terminate_site)?;
+    // `Spawn.ReaperStarted`: "fork of the per-invocation reaper, which takes
+    // its shared cleanup hold R28". `begin` returning Ok is exactly that
+    // having happened, and nothing else in this function can have happened
+    // yet.
+    #[cfg(unix)]
+    apply(
+        hooks.point(SubEffectPoint::ReaperStarted),
+        SubEffectPoint::ReaperStarted,
+    )?;
     #[cfg(unix)]
     termination.prepare(&mut command);
 
     let started = Instant::now();
-    let mut child = ProcessTree::spawn(&mut command).map_err(|e| UpstrokeError::Agent {
+    let mut child = ProcessTree::spawn(&mut command, hooks).map_err(|e| UpstrokeError::Agent {
         message: format!(
             "failed to spawn `{}`: {e}",
             command.get_program().to_string_lossy()
         ),
     })?;
+    // `Spawn.PreExecPgidAndRegister`. Two coordinates, and they are not the
+    // same one:
+    //
+    // * The **operation** is in the forked child before `exec` — `setpgid(0,0)`
+    //   and the reaper registration, in `termination::Supervisor::prepare`'s
+    //   `pre_exec` closure. That is where the packet puts it ("in the child
+    //   before exec") and where it is.
+    // * The **injection** is here, parent-side, immediately after `spawn`
+    //   returns `Ok`. This point's only declared mode is `Kill`
+    //   (`SubEffectPoint::modes`), a kill is a *coordinator* death, and the
+    //   packet's claim for it — "a coordinator kill after any of these leaves a
+    //   group the reaper settles while holding R28" — is true only once the
+    //   child exists and its group does. A kill delivered inside the forked
+    //   child would end the fork, not the coordinator, and would leave no group
+    //   at all. An observer hook cannot run there in any case: after `fork` in a
+    //   multithreaded process only async-signal-safe calls are permitted, and
+    //   every real observer locks and allocates. The packet contemplates
+    //   exactly this: "these are parent-side **or** pre-exec points the harness
+    //   controls".
+    //
+    // Fired unconditionally, because `spawn` returning `Ok` *is* the evidence
+    // the closure ran: `std` reports a `pre_exec` error through the child's
+    // CLOEXEC status pipe and returns `Err`. The kernel oracle
+    // (`child_leads_its_own_group`) is a second, independent witness and lives
+    // in the tests — as a guard here it could only ever produce a false
+    // negative, silently dropping the point for a child that left its own group
+    // after `exec` (DESIGN.md:398-402 puts such a process outside host
+    // guarantees; it does not make it invisible).
+    #[cfg(unix)]
+    apply(
+        hooks.point(SubEffectPoint::PreExecPgidAndRegister),
+        SubEffectPoint::PreExecPgidAndRegister,
+    )?;
+    // `Spawn.Exec`: `Command::spawn` reports a failed `execvp` through its own
+    // CLOEXEC status pipe and returns `Err`, so reaching here is the exec
+    // having succeeded.
+    #[cfg(unix)]
+    apply(hooks.point(SubEffectPoint::Exec), SubEffectPoint::Exec)?;
     #[cfg(unix)]
     if let Err(error) = termination.register(child.id()) {
         // Drop the pre-exec reaper first: it still has an anchor pinning this
         // child's group identity and will kill every member before returning.
         drop(termination);
-        kill_tree(&mut child)?;
+        kill_tree(terminate_site, &mut child)?;
         return Err(error);
     }
+    // `Spawn.Registered`: "parent-side registration".
+    #[cfg(unix)]
+    apply(
+        hooks.point(SubEffectPoint::Registered),
+        SubEffectPoint::Registered,
+    )?;
 
     // Feed stdin from its own thread: the child may not read stdin until it
     // has written output, and this thread must not block the pipe drains.
-    let stdin_bytes = stdin_data.as_bytes().to_vec();
+    let stdin_bytes = stdin_data.to_vec();
     let stdin_handle = child.stdin.take();
     let stdin_thread = thread::spawn(move || {
         if let Some(mut pipe) = stdin_handle {
@@ -249,17 +483,17 @@ fn run_with_timeout_and_limit(
             Ok(None) => {
                 if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
                     output_limited = true;
-                    kill_tree(&mut child)?;
+                    kill_tree(terminate_site, &mut child)?;
                     break None;
                 } else if started.elapsed() >= timeout {
                     timed_out = true;
-                    kill_tree(&mut child)?;
+                    kill_tree(terminate_site, &mut child)?;
                     break None;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                kill_tree(&mut child)?;
+                kill_tree(terminate_site, &mut child)?;
                 return Err(UpstrokeError::Agent {
                     message: format!("waiting on agent process: {e}"),
                 });
@@ -306,7 +540,8 @@ fn drain_limit_exceeded(stdout: &Option<Drain>, stderr: &Option<Drain>) -> bool 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep
 /// running, and keep the pipes open.
-fn kill_tree(child: &mut ProcessTree) -> Result<(), UpstrokeError> {
+fn kill_tree(terminate_site: ProcessSite, child: &mut ProcessTree) -> Result<(), UpstrokeError> {
+    debug_assert_eq!(terminate_site, ProcessSite::Terminate);
     #[cfg(windows)]
     {
         let cleanup = child.job.terminate_and_wait();
@@ -330,6 +565,222 @@ fn kill_tree(child: &mut ProcessTree) -> Result<(), UpstrokeError> {
     }
 }
 
+/// Whether `pid` leads its own Unix process group.
+///
+/// The independent witness that `Spawn.PreExecPgidAndRegister`'s operation ran
+/// in the forked child. Asks the kernel, not this crate: `getpgid(pid) == pid`
+/// is true exactly when the pre-exec closure's `setpgid(0, 0)` ran. A child
+/// that has exited but not been reaped still answers, because its pid is
+/// pinned by the zombie.
+///
+/// Test-only on purpose: as a production guard it could only ever *withhold*
+/// the point, never add information (see the comment at the injection
+/// coordinate).
+#[cfg(all(unix, test))]
+pub(crate) fn child_leads_its_own_group(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `getpgid` reads process-table state for a pid this process owns
+    // as a child and has not reaped; it borrows nothing.
+    let pgid = unsafe { libc::getpgid(pid) };
+    pgid == pid
+}
+
+/// Join the coordinator's ambient kill-on-close Job Object (INV-18).
+///
+/// > on Windows every host child is a member of the coordinator's ambient
+/// > kill-on-close Job Object from creation
+///
+/// enforced by "ambient job joined at write-command startup (refusal
+/// otherwise)". Idempotent: the job is a process-wide singleton established
+/// once and held for the life of the process, because a handle that is ever
+/// closed deliberately would terminate every member — including, since the
+/// coordinator joins it too, the coordinator.
+///
+/// This closes the window the private per-invocation job cannot: between
+/// `CreateProcess` and `AssignProcessToJobObject` the child belongs to no
+/// private job, so a coordinator killed in that window used to leave a
+/// suspended stub with no owner. A child created by an ambient-job member is a
+/// member at creation, so there is no such window.
+///
+/// On Unix this does nothing and says so: containment there is the isolated
+/// process group and the per-invocation reaper, and the packet declares
+/// `AmbientJobJoined` a Windows point
+/// (`decisions.effect_site_inventory.containment_sub_effects`). The hook is not
+/// consulted here either — recording a Windows containment point as executed
+/// on a Unix host would let a Linux CI cell claim Windows coverage.
+///
+/// # Errors
+///
+/// [`UpstrokeError::Refused`] with a diagnostic when the job cannot be created
+/// or joined. The caller refuses the write command before any effect.
+#[cfg(windows)]
+pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
+    join_ambient_job_with(hooks, windows_job::join_ambient)
+}
+
+/// [`join_ambient_job`] over an explicit join step.
+///
+/// The parameter exists because the real one cannot fail twice: `join_ambient`
+/// memoises its answer in a process-wide `OnceLock` — it must, since the
+/// coordinator joins exactly one ambient job for its whole life — so a test
+/// binary that has ever joined successfully can never again observe a failure,
+/// and one that observes a failure can never join. The suite's only ambient
+/// failure was therefore the *injected* one, which fires **before** this step
+/// and so proves nothing about what this function does with a real error: the
+/// call could be `let _ = windows_job::join_ambient();` and every test would
+/// still pass while `run` and `resume` dispatched with no ambient job at all.
+///
+/// # Errors
+///
+/// [`UpstrokeError::Refused`] carrying `join`'s own diagnostic.
+#[cfg(windows)]
+fn join_ambient_job_with(
+    hooks: &mut dyn SpawnHooks,
+    join: impl FnOnce() -> Result<(), String>,
+) -> Result<(), UpstrokeError> {
+    // The error-return coordinate is *before* the join: the point's error
+    // contract is "failure refuses the write command", so an injected failure
+    // stands in place of establishing the job rather than following a job that
+    // was in fact established. A refusal here leaves no ambient job, no child,
+    // and nothing to reclaim.
+    apply(
+        hooks.point_mode(SubEffectPoint::AmbientJobJoined, InjectionMode::ErrorReturn),
+        SubEffectPoint::AmbientJobJoined,
+    )
+    .map_err(|_| UpstrokeError::Refused {
+        message: AMBIENT_REFUSAL_PREFIX.to_owned() + AMBIENT_REFUSAL_SIMULATED,
+    })?;
+    join().map_err(|message| UpstrokeError::Refused {
+        message: format!("{AMBIENT_REFUSAL_PREFIX}{message}. No process was spawned"),
+    })?;
+    // The kill coordinate is *after* it, because that is where the point's own
+    // claim is true: "a coordinator kill after any of these leaves no host
+    // process (the ambient handle closes and the kernel terminates the stub or
+    // tree)". Injected before the join there would be no handle to close, and
+    // the observation would sit on the wrong side of the sub-effect it names.
+    apply(
+        hooks.point_mode(SubEffectPoint::AmbientJobJoined, InjectionMode::Kill),
+        SubEffectPoint::AmbientJobJoined,
+    )
+}
+
+/// See the Windows implementation. On Unix this is a no-op that returns `Ok`.
+///
+/// # Errors
+///
+/// Never on Unix.
+#[cfg(not(windows))]
+pub fn join_ambient_job(_hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
+    Ok(())
+}
+
+/// The opening words of every ambient-job refusal, so a caller and a test can
+/// recognise one without matching on a whole sentence.
+pub const AMBIENT_REFUSAL_PREFIX: &str = concat!(
+    "cannot start a write command: on Windows every child must be a member of ",
+    "the coordinator's ambient kill-on-close Job Object from creation ",
+    "(INV-18), and "
+);
+
+/// The tail of the refusal an injected join failure produces.
+pub const AMBIENT_REFUSAL_SIMULATED: &str = concat!(
+    "the ambient Job Object could not be established (simulated failure). ",
+    "No process was spawned"
+);
+
+/// Whether the process `pid` created at `creation_time` is still running.
+///
+/// The pid alone is not an identity — Windows reuses pids — so both halves are
+/// checked, and "running" is `WaitForSingleObject` timing out rather than an
+/// exit code, because a job-terminated process's exit code is not ours to
+/// predict. A pid that cannot be opened, or that opens onto a process created
+/// at another time, is not this process.
+#[cfg(windows)]
+#[must_use]
+pub fn process_alive(pid: u32, creation_time: u64) -> bool {
+    windows_job::process_alive(pid, creation_time)
+}
+
+/// When the process `pid` was created, as a raw FILETIME, or `None` if it
+/// cannot be opened.
+#[cfg(windows)]
+#[must_use]
+pub fn process_creation_time(pid: u32) -> Option<u64> {
+    windows_job::process_creation_time(pid)
+}
+
+/// Whether this process has joined its ambient Job Object.
+#[cfg(windows)]
+#[must_use]
+pub fn ambient_job_established() -> bool {
+    windows_job::ambient_established()
+}
+
+/// Whether `pid` is a member of this process's ambient Job Object, or `None`
+/// when there is no ambient job or the process cannot be opened.
+///
+/// INV-18's claim, asked of the kernel: "every host child is a member of the
+/// coordinator's ambient kill-on-close Job Object from creation".
+#[cfg(windows)]
+#[must_use]
+pub fn child_in_ambient_job(pid: u32) -> Option<bool> {
+    windows_job::ambient_contains(pid)
+}
+
+/// Memoise an ambient establishment **failure**, before anything has joined.
+///
+/// Test-only, and it spends this process's one ambient cell — so it belongs
+/// only in a subprocess helper. It exists because the failure it plants is the
+/// one no machine can produce on demand: `CreateJobObjectW` and
+/// `AssignProcessToJobObject` succeed on a working Windows host, and the memo
+/// means a process only ever sees one answer. Returns whether the cell was
+/// still free.
+#[cfg(all(windows, test))]
+pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
+    windows_job::poison_ambient_for_tests(message)
+}
+
+/// Arm this process's cleanup reapers to kill the coordinator's labeled
+/// containers when the coordinator dies, or disarm them with `None`.
+///
+/// `decisions.admission_and_leases.permits.os_matrix`, in full:
+///
+/// > Linux and macOS (`cfg(unix)`): the cleanup reaper survives coordinator
+/// > death, settles the dead coordinator's process groups while holding R28,
+/// > and **additionally kills the dead coordinator's labeled containers**,
+/// > closing the orphan window; Windows: **no reaper**; … containers are
+/// > reclaimed at the **next write-command start** (orphan window until then;
+/// > documented; a portable watchdog is deferred).
+///
+/// So this is a **no-op on Windows**, and that is the documented half rather
+/// than an omission: [`crate::runner::container::orphan_window`] is the value
+/// that says so and `runner::container::tests::windows_orphan_window_documented`
+/// is what asserts the platform and the code agree.
+///
+/// The scope is read **before** the fork, by every reaper started after this
+/// call: a reaper already running keeps the scope it was started with, because
+/// it is a `fork`-only child that cannot be handed anything afterwards.
+///
+/// # Errors
+///
+/// Whatever building the argument vectors returns — on Unix, a scope whose
+/// rendered strings carry an interior NUL.
+pub fn set_container_reclaim_scope(
+    scope: Option<&crate::runner::container::census::ReaperContainerScope>,
+) -> Result<(), UpstrokeError> {
+    #[cfg(unix)]
+    {
+        termination::set_container_reclaim_scope(scope)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = scope;
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod windows_job {
     use std::io;
@@ -341,19 +792,28 @@ mod windows_job {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
         QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        CREATE_SUSPENDED, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenThread,
+        PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, THREAD_SUSPEND_RESUME,
+        WaitForSingleObject,
     };
+
+    use super::{SpawnHooks, SubEffectPoint, apply_io};
 
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -364,46 +824,129 @@ mod windows_job {
         handle: HANDLE,
     }
 
+    /// The real `CreateJobObjectW`, as [`Job::create`] passes it.
+    fn real_create_job() -> HANDLE {
+        // SAFETY: null security attributes and name request an unnamed,
+        // non-inheritable job owned solely by this process.
+        unsafe {
+            windows_sys::Win32::System::JobObjects::CreateJobObjectW(ptr::null(), ptr::null())
+        }
+    }
+
+    /// The real `SetInformationJobObject`, as [`Job::create`] passes it.
+    fn real_configure_job(
+        handle: HANDLE,
+        limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        size: u32,
+    ) -> i32 {
+        // SAFETY: `limits` has exactly the layout and lifetime required by
+        // JobObjectExtendedLimitInformation; `handle` is live.
+        unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                ptr::from_ref(limits).cast(),
+                size,
+            )
+        }
+    }
+
+    /// The real `TerminateJobObject`, as [`Job::terminate_and_wait`] passes it.
+    fn real_terminate_job(handle: HANDLE) -> i32 {
+        // SAFETY: the handle remains live for this call and the requested exit
+        // code has no semantic meaning outside this private job.
+        unsafe { TerminateJobObject(handle, 1) }
+    }
+
+    /// The real `QueryInformationJobObject`, as the accounting callers pass it.
+    fn real_query_accounting(
+        handle: HANDLE,
+        accounting: &mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    ) -> i32 {
+        // SAFETY: the output buffer is correctly typed and sized and the
+        // optional returned-length pointer is not needed.
+        #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
+        unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectBasicAccountingInformation,
+                ptr::from_mut(accounting).cast(),
+                u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .expect("job accounting structure fits in u32"),
+                ptr::null_mut(),
+            )
+        }
+    }
+
     impl Job {
         fn create() -> io::Result<Self> {
-            // SAFETY: null security attributes and name request an unnamed,
-            // non-inheritable job owned solely by this process.
-            let handle = unsafe {
-                windows_sys::Win32::System::JobObjects::CreateJobObjectW(ptr::null(), ptr::null())
-            };
+            Self::create_with(real_create_job, real_configure_job)
+        }
+
+        /// [`Job::create`] over the two Win32 calls it makes.
+        ///
+        /// The same reason `create_ambient` takes its assignment call: on a
+        /// working machine `CreateJobObjectW` and `SetInformationJobObject`
+        /// always succeed, so both failure branches are unreachable in every
+        /// real test and either could be inverted with the whole suite green —
+        /// while `crash_reconstruction`'s "if the ambient job cannot be
+        /// **created** or joined the write command refuses at startup" and
+        /// INV-18's "refusal before any effect if the ambient job cannot be
+        /// established" silently stopped holding. The join had a seam; these
+        /// two did not, which made the guarantee asserted for one third of the
+        /// sentence that states it.
+        ///
+        /// `configure` is handed the limit structure rather than a raw
+        /// pointer, so a test can also read what is being asked for:
+        /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the whole fail-safe, and a
+        /// job configured with any other flag would still return success here.
+        fn create_with(
+            create: impl FnOnce() -> HANDLE,
+            configure: impl FnOnce(HANDLE, &JOBOBJECT_EXTENDED_LIMIT_INFORMATION, u32) -> i32,
+        ) -> io::Result<Self> {
+            let handle = create();
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
             let job = Self { handle };
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            // SAFETY: `limits` has exactly the layout and lifetime required by
-            // JobObjectExtendedLimitInformation; `job.handle` is live.
             #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job.handle,
-                    JobObjectExtendedLimitInformation,
-                    ptr::from_ref(&limits).cast(),
-                    u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-                        .expect("job information structure fits in u32"),
-                )
-            };
-            if configured == 0 {
+            let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("job information structure fits in u32");
+            if configure(job.handle, &limits, size) == 0 {
+                // `job` drops here, closing the handle: an unconfigured job is
+                // not a job this process may keep.
                 return Err(io::Error::last_os_error());
             }
             Ok(job)
         }
 
         pub(super) fn terminate_and_wait(&self) -> io::Result<()> {
-            // SAFETY: the handle remains live for this call and the requested
-            // exit code has no semantic meaning outside this private job.
-            if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+            self.terminate_and_wait_with(real_terminate_job, real_query_accounting)
+        }
+
+        /// [`Job::terminate_and_wait`] over the Win32 calls it makes.
+        ///
+        /// DESIGN.md:402 — "Direct-child success and timeout both terminate
+        /// and **boundedly observe that job empty**". Both halves of that
+        /// sentence are unobservable from outside on a working machine: a real
+        /// job empties immediately, so an implementation that skipped the
+        /// observation entirely, and one that observed without a bound, both
+        /// return promptly and leave nothing behind for a test to see. The
+        /// accounting seam is what makes "observe" and "bounded" separate
+        /// facts.
+        pub(super) fn terminate_and_wait_with(
+            &self,
+            terminate: impl FnOnce(HANDLE) -> i32,
+            query: impl Fn(HANDLE, &mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION) -> i32,
+        ) -> io::Result<()> {
+            if terminate(self.handle) == 0 {
                 return Err(io::Error::last_os_error());
             }
             let deadline = Instant::now() + CLEANUP_TIMEOUT;
             loop {
-                if self.active_processes()? == 0 {
+                if self.active_processes_with(&query)? == 0 {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -416,25 +959,36 @@ mod windows_job {
             }
         }
 
-        fn active_processes(&self) -> io::Result<u32> {
+        /// How many processes the job still holds, over the Win32 call that
+        /// answers.
+        ///
+        /// R22's release is "released on exit, timeout kill, cancel, or
+        /// shutdown (private Job Object / process group)", and this is the only
+        /// thing that reports whether the release happened. A query error read
+        /// as "empty" would report a job settled while it still held a live
+        /// member, so the error branch is the accounting, not an aside — and it
+        /// is unreachable without a seam.
+        pub(super) fn active_processes_with(
+            &self,
+            query: impl Fn(HANDLE, &mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION) -> i32,
+        ) -> io::Result<u32> {
             let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-            // SAFETY: the output buffer is correctly typed and sized and the
-            // optional returned-length pointer is not needed.
-            #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
-            let queried = unsafe {
-                QueryInformationJobObject(
-                    self.handle,
-                    JobObjectBasicAccountingInformation,
-                    ptr::from_mut(&mut accounting).cast(),
-                    u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
-                        .expect("job accounting structure fits in u32"),
-                    ptr::null_mut(),
-                )
-            };
-            if queried == 0 {
+            if query(self.handle, &mut accounting) == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(accounting.ActiveProcesses)
+        }
+
+        /// Whether `pid` is a member of **this** job, asked of the kernel.
+        ///
+        /// The Windows counterpart of `child_leads_its_own_group`, and
+        /// test-only for the same reason: an independent oracle for the
+        /// private job's identity, not a production guard. `IsProcessInJob`
+        /// answers from the process table, so it cannot agree with a spawn path
+        /// that never assigned anything.
+        #[cfg(test)]
+        pub(super) fn contains(&self, pid: u32) -> Option<bool> {
+            job_contains(self.handle, pid)
         }
     }
 
@@ -447,22 +1001,104 @@ mod windows_job {
         }
     }
 
-    pub(super) fn spawn_suspended_in_job(command: &mut Command) -> io::Result<(Child, Job)> {
+    pub(super) fn spawn_suspended_in_job(
+        command: &mut Command,
+        hooks: &mut dyn SpawnHooks,
+    ) -> io::Result<(Child, Job)> {
+        spawn_suspended_in_job_with(command, hooks, real_assign_to_job, resume_only_thread)
+    }
+
+    /// The real `AssignProcessToJobObject`, as [`spawn_suspended_in_job`]
+    /// passes it.
+    pub(super) fn real_assign_to_job(job: HANDLE, process: HANDLE) -> i32 {
+        // SAFETY: `Child` owns a live process handle and `job` is live; both
+        // are process-wide kernel object references, not borrowed memory.
+        unsafe { AssignProcessToJobObject(job, process) }
+    }
+
+    /// Whether `pid` is a member of the job `job`, asked of the kernel.
+    ///
+    /// See [`Job::contains`]; this is the same query for a handle a test
+    /// captured through the assignment seam rather than for a live [`Job`],
+    /// because constructing a second `Job` over the same handle would close it
+    /// on drop.
+    #[cfg(test)]
+    pub(super) fn job_contains(job: HANDLE, pid: u32) -> Option<bool> {
+        let process = OpenHandle::open(pid)?;
+        let mut member = 0;
+        // SAFETY: both handles are live and `member` is a writable BOOL.
+        let queried = unsafe { IsProcessInJob(process.0, job, &raw mut member) };
+        if queried == 0 {
+            return None;
+        }
+        Some(member != 0)
+    }
+
+    /// [`spawn_suspended_in_job`] over the two Win32 steps that come after
+    /// creation.
+    ///
+    /// Both always succeed on a working machine, so the two cleanup branches
+    /// that follow them — terminate the private job, kill the child, wait for
+    /// it — are unreachable in every real test, and R22's "created as an
+    /// ambient-job member, so a coordinator death at any spawn sub-step incl.
+    /// the create-suspended prefix terminates it" was asserted for the ambient
+    /// job and not for the spawn path's own recovery.
+    ///
+    /// `assign` is also what makes the `PrivateJobAssigned` coordinate
+    /// checkable: it hands a test the private job's handle at the instant the
+    /// assignment is made, so the hook can be measured against the operation it
+    /// is named for rather than against the other hooks.
+    pub(super) fn spawn_suspended_in_job_with(
+        command: &mut Command,
+        hooks: &mut dyn SpawnHooks,
+        assign: impl FnOnce(HANDLE, HANDLE) -> i32,
+        resume: impl FnOnce(u32) -> io::Result<()>,
+    ) -> io::Result<(Child, Job)> {
         let job = Job::create()?;
         command.creation_flags(CREATE_SUSPENDED);
         let mut child = command.spawn()?;
-        // SAFETY: `Child` owns a live process handle. The primary thread is
-        // still suspended, so candidate code cannot create an escaping child
-        // between process creation and assignment to the job.
-        let assigned =
-            unsafe { AssignProcessToJobObject(job.handle, child.as_raw_handle() as HANDLE) };
+        hooks.child_created(child.id());
+        // `Spawn.CreatedSuspended`: "the child is already an ambient-job
+        // member". This is the window the ambient job exists to close -- a
+        // coordinator killed here leaves a suspended process that no private
+        // job owns -- so it is where the kill injection goes.
+        if let Err(error) = apply_io(
+            hooks.point(SubEffectPoint::CreatedSuspended),
+            SubEffectPoint::CreatedSuspended,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        // The primary thread is still suspended, so candidate code cannot
+        // create an escaping child between process creation and assignment to
+        // the job.
+        let assigned = assign(job.handle, child.as_raw_handle() as HANDLE);
         if assigned == 0 {
             let error = io::Error::last_os_error();
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
-        if let Err(error) = resume_only_thread(child.id()) {
+        if let Err(error) = apply_io(
+            hooks.point(SubEffectPoint::PrivateJobAssigned),
+            SubEffectPoint::PrivateJobAssigned,
+        ) {
+            let _ = job.terminate_and_wait();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = resume(child.id()) {
+            let _ = job.terminate_and_wait();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = apply_io(
+            hooks.point(SubEffectPoint::Resumed),
+            SubEffectPoint::Resumed,
+        ) {
             let _ = job.terminate_and_wait();
             let _ = child.kill();
             let _ = child.wait();
@@ -471,7 +1107,239 @@ mod windows_job {
         Ok((child, job))
     }
 
-    fn resume_only_thread(process_id: u32) -> io::Result<()> {
+    /// The coordinator's ambient kill-on-close Job Object.
+    ///
+    /// A process-wide singleton, and never dropped: `OnceLock` in a `static`
+    /// has no destructor, so the handle survives to process exit. That is the
+    /// requirement, not an accident -- the coordinator is itself a member, so
+    /// closing this handle terminates the coordinator.
+    static AMBIENT: OnceLock<Result<AmbientJob, String>> = OnceLock::new();
+
+    /// The ambient job's handle, held for the life of the process.
+    ///
+    /// A separate type from [`Job`] and not merely a second value of it,
+    /// because the two have opposite ownership rules. `Job` is owned by the
+    /// thread supervising one invocation and its `Drop` is load-bearing --
+    /// closing it is how a timeout settles the tree. This one is shared by
+    /// every thread and must never be closed, so it has no `Drop` at all.
+    #[derive(Debug)]
+    struct AmbientJob(HANDLE);
+
+    // SAFETY: a Windows `HANDLE` is a process-wide reference to a kernel
+    // object, not a pointer into this process's memory. The only calls made on
+    // this one -- `AssignProcessToJobObject` and `IsProcessInJob` -- are
+    // thread-safe, the value is never mutated after the `OnceLock` is set, and
+    // it is never closed.
+    unsafe impl Send for AmbientJob {}
+    // SAFETY: as above.
+    unsafe impl Sync for AmbientJob {}
+
+    /// Create the ambient job and put this process in it, once.
+    ///
+    /// The memo is decided by [`super::memoised_outcome`] rather than by a
+    /// `match` here, because that arm is unreachable in this process once
+    /// either answer has been taken. See its documentation.
+    pub(super) fn join_ambient() -> Result<(), String> {
+        super::memoised_outcome(AMBIENT.get_or_init(|| {
+            // SAFETY: `GetCurrentProcess` is the documented pseudo-handle for
+            // this process and the job handle is live. Windows 8 and later
+            // nest jobs, so an existing job (cargo's, a CI runner's, an
+            // OpenSSH session's) is a parent of this one rather than a
+            // conflict.
+            create_ambient(|job, process| unsafe { AssignProcessToJobObject(job, process) })
+        }))
+    }
+
+    /// Memoise an ambient **failure** before anything has joined, so a test
+    /// process can carry a real one through [`join_ambient`].
+    ///
+    /// Spends the process's one ambient cell, so it belongs only in a
+    /// subprocess helper. Returns whether the cell was still free.
+    #[cfg(test)]
+    pub(super) fn poison_ambient_for_tests(message: &str) -> bool {
+        AMBIENT.set(Err(message.to_owned())).is_ok()
+    }
+
+    /// The body of [`join_ambient`], over the assignment call it makes.
+    ///
+    /// `assign` is a parameter for one reason: `AssignProcessToJobObject`
+    /// returns a Win32 `BOOL`, where **zero is failure and every other value
+    /// — including `-1` — is success**, and on a working machine it always
+    /// returns success. So the branch that reads it is unreachable in every
+    /// real test, and `if joined == 0` could be `if joined == -1` with the
+    /// whole suite green while `crash_reconstruction`'s "if the ambient job
+    /// cannot be created or joined the write command refuses at startup"
+    /// silently stopped holding.
+    ///
+    /// Not memoised, and it does not touch [`AMBIENT`]: a test may call this
+    /// with a refusing `assign` without spending the process's one ambient
+    /// job.
+    fn create_ambient(assign: impl Fn(HANDLE, HANDLE) -> i32) -> Result<AmbientJob, String> {
+        create_ambient_with(Job::create, assign)
+    }
+
+    /// [`create_ambient`] over the job it creates as well as the assignment.
+    ///
+    /// `crash_reconstruction` names two failures and this slice's contract
+    /// names them together — "ambient job cannot be **created** or joined
+    /// (Windows) → write command refuses at startup with a diagnostic". The
+    /// join half had a seam and the creation half did not, so the branch that
+    /// turns a failed `CreateJobObjectW` or `SetInformationJobObject` into a
+    /// refusal was unreachable: `create_ambient` could have returned a disabled
+    /// job and continued, and the whole suite would have stayed green while the
+    /// coordinator ran with no ambient job at all.
+    fn create_ambient_with(
+        make_job: impl FnOnce() -> io::Result<Job>,
+        assign: impl Fn(HANDLE, HANDLE) -> i32,
+    ) -> Result<AmbientJob, String> {
+        let job = make_job().map_err(|error| format!("it could not be created ({error})"))?;
+        // SAFETY: `GetCurrentProcess` is the documented pseudo-handle for this
+        // process and the job handle is live.
+        let joined = assign(job.handle, unsafe { GetCurrentProcess() });
+        if joined == 0 {
+            // `job` drops here, closing the handle: a kill-on-close job
+            // with no members terminates nothing.
+            return Err(format!(
+                "this process could not join it ({})",
+                io::Error::last_os_error()
+            ));
+        }
+        // Joined. From here the handle must outlive every `Drop` in this
+        // process, because closing it terminates this process.
+        let job = std::mem::ManuallyDrop::new(job);
+        Ok(AmbientJob(job.handle))
+    }
+
+    /// Whether the ambient job has been established in this process.
+    pub(super) fn ambient_established() -> bool {
+        matches!(AMBIENT.get(), Some(Ok(_)))
+    }
+
+    /// Whether `pid` is a member of this process's ambient job.
+    ///
+    /// `None` when no ambient job has been established, or the process cannot
+    /// be opened. The kernel answers, so this is an oracle independent of the
+    /// spawn path it checks.
+    pub(super) fn ambient_contains(pid: u32) -> Option<bool> {
+        let Some(Ok(job)) = AMBIENT.get() else {
+            return None;
+        };
+        let process = OpenHandle::open(pid)?;
+        let mut member = 0;
+        // SAFETY: both handles are live and `member` is a writable BOOL.
+        let queried = unsafe { IsProcessInJob(process.0, job.0, &raw mut member) };
+        if queried == 0 {
+            return None;
+        }
+        Some(member != 0)
+    }
+
+    /// A borrowed process handle with query and synchronise rights.
+    struct OpenHandle(HANDLE);
+
+    impl OpenHandle {
+        fn open(pid: u32) -> Option<Self> {
+            // SAFETY: no borrowed inputs; a failure returns null.
+            let handle =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+
+    impl Drop for OpenHandle {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns the handle it opened.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn creation_time(handle: HANDLE) -> Option<u64> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: four correctly typed writable output structures and a live
+        // handle with PROCESS_QUERY_LIMITED_INFORMATION.
+        let queried = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if queried == 0 {
+            return None;
+        }
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    pub(super) fn process_creation_time(pid: u32) -> Option<u64> {
+        let handle = OpenHandle::open(pid)?;
+        creation_time(handle.0)
+    }
+
+    pub(super) fn process_alive(pid: u32, expected_creation_time: u64) -> bool {
+        let Some(handle) = OpenHandle::open(pid) else {
+            return false;
+        };
+        if creation_time(handle.0) != Some(expected_creation_time) {
+            // The pid was reused: whatever is running under it now is not the
+            // process the caller asked about.
+            return false;
+        }
+        // SAFETY: the handle carries SYNCHRONIZE. A process object is signaled
+        // exactly when the process has terminated, which is a stronger answer
+        // than an exit code a job termination chooses for us.
+        unsafe { WaitForSingleObject(handle.0, 0) == WAIT_TIMEOUT }
+    }
+
+    pub(super) fn resume_only_thread(process_id: u32) -> io::Result<()> {
+        let thread_handle = primary_thread(process_id)?;
+        // SAFETY: this handle has THREAD_SUSPEND_RESUME access and identifies
+        // the primary thread created suspended by `Command::spawn`.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// How many outstanding suspends the child's primary thread carries.
+    ///
+    /// The Windows counterpart of `child_leads_its_own_group`: an oracle for
+    /// "is this child still suspended" that asks the kernel rather than the
+    /// crate, so the `CreatedSuspended`, `PrivateJobAssigned` and `Resumed`
+    /// coordinates can be measured against the operations they name instead of
+    /// against each other. `SuspendThread` returns the count *before* its own
+    /// increment and the matching `ResumeThread` puts it back, so the
+    /// observation leaves the child exactly as it found it.
+    ///
+    /// Test-only, like the Unix one and for the same reason: as a production
+    /// guard it could only ever withhold a point it cannot add information to.
+    #[cfg(test)]
+    pub(super) fn primary_thread_suspend_count(process_id: u32) -> io::Result<u32> {
+        use windows_sys::Win32::System::Threading::SuspendThread;
+
+        let thread_handle = primary_thread(process_id)?;
+        // SAFETY: the handle carries THREAD_SUSPEND_RESUME and names a live
+        // thread; the immediately following resume restores the count.
+        let previous = unsafe { SuspendThread(thread_handle.0) };
+        if previous == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above; this undoes the suspend just taken.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(previous)
+    }
+
+    /// A suspend/resume handle on `process_id`'s primary thread.
+    fn primary_thread(process_id: u32) -> io::Result<Snapshot> {
         // CREATE_SUSPENDED prevents the process from creating another thread,
         // so the one owned thread in this system snapshot is necessarily its
         // primary thread.
@@ -509,13 +1377,7 @@ mod windows_job {
         if thread_handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let thread_handle = Snapshot(thread_handle);
-        // SAFETY: this handle has THREAD_SUSPEND_RESUME access and identifies
-        // the primary thread created suspended by `Command::spawn`.
-        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        Ok(Snapshot(thread_handle))
     }
 
     struct Snapshot(HANDLE);
@@ -524,6 +1386,232 @@ mod windows_job {
         fn drop(&mut self) {
             // SAFETY: this wrapper uniquely owns its snapshot/thread handle.
             let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `AssignProcessToJobObject` answers with a Win32 `BOOL`: **zero is
+        /// failure and every other value is success**, `-1` included.
+        ///
+        /// Every real assignment on a working machine succeeds, so the branch
+        /// that reads this value is unreachable in an ordinary test and
+        /// `if joined == 0` could become `if joined == -1` with the suite
+        /// green — while an actual refusal (an outer job with UI restrictions,
+        /// a job the process may not join) was read as success and startup
+        /// returned `Ok` holding an ambient job with no members. The
+        /// coordinator would then take workspace effects and spawn children
+        /// that no ambient job owns, which is the whole of INV-18's host
+        /// portion.
+        ///
+        /// The expected mapping is Win32's, written here, not read from the
+        /// code under test.
+        #[test]
+        fn the_ambient_join_reads_a_win32_bool_the_way_win32_defines_one() {
+            let refused =
+                create_ambient(|_, _| 0).expect_err("a zero BOOL is a refused assignment");
+            assert!(
+                refused.contains("could not join"),
+                "the diagnostic must name the join: {refused}"
+            );
+
+            // Every other value is success. Each of these creates a real job
+            // object this process is deliberately *not* a member of; the
+            // handle is left open exactly as the real ambient one is, and a
+            // kill-on-close job with no members terminates nothing.
+            for value in [1_i32, -1, i32::MIN, i32::MAX] {
+                let job = create_ambient(move |_, _| value)
+                    .unwrap_or_else(|error| panic!("BOOL {value} is success, not: {error}"));
+                assert!(!job.0.is_null(), "BOOL {value} produced no job handle");
+            }
+        }
+
+        /// The other two thirds of the sentence the join test covers.
+        ///
+        /// `expected_failures_refusals[1]` is "ambient job cannot be
+        /// **created** or joined (Windows) → write command refuses at startup
+        /// with a diagnostic", and INV-18's host portion is "refusal before any
+        /// effect if the ambient job cannot be **established**". Establishing
+        /// is three Win32 calls, not one: `CreateJobObjectW`,
+        /// `SetInformationJobObject`, `AssignProcessToJobObject`. Only the last
+        /// had a seam, so the first two could each have been ignored — an
+        /// ambient job that was never created, or one created without
+        /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and therefore with no fail-safe
+        /// at all — with the suite green.
+        ///
+        /// Both failures are unreachable on a working machine, which is why
+        /// they need the seam rather than a fixture.
+        #[test]
+        fn the_ambient_job_refuses_when_it_cannot_be_created_or_configured() {
+            use std::cell::Cell;
+
+            // A job that cannot be created is not configured and not joined.
+            let configured = Cell::new(false);
+            let refused = create_ambient_with(
+                || {
+                    Job::create_with(ptr::null_mut, |_, _, _| {
+                        configured.set(true);
+                        1
+                    })
+                },
+                |_, _| panic!("a job that was never created must not be joined"),
+            )
+            .expect_err("a job that cannot be created is not an ambient job");
+            assert!(
+                !configured.get(),
+                "an uncreated job was handed to SetInformationJobObject"
+            );
+            assert!(
+                refused.contains("could not be created"),
+                "the diagnostic must name creation: {refused}"
+            );
+
+            // A job that cannot be configured is refused, not kept: without
+            // KILL_ON_JOB_CLOSE the ambient job terminates nothing on
+            // coordinator death, which is the whole of INV-18's host portion.
+            let refused = create_ambient_with(
+                || Job::create_with(real_create_job, |_, _, _| 0),
+                |_, _| panic!("an unconfigured job must not be joined"),
+            )
+            .expect_err("an unconfigured job is not an ambient job");
+            assert!(
+                refused.contains("could not be created"),
+                "the diagnostic must name establishment: {refused}"
+            );
+        }
+
+        /// What `SetInformationJobObject` is actually asked for.
+        ///
+        /// `KILL_ON_JOB_CLOSE` is the mechanism DESIGN.md:402 names — "abrupt
+        /// conductor death closes its non-inheritable handle and lets the
+        /// kernel terminate ordinary descendants" — and a job configured with
+        /// any other limit flag would still return success. The expected flag
+        /// and the expected structure size are Win32's, written here rather
+        /// than read back from the call under test.
+        #[test]
+        fn every_job_this_module_creates_is_configured_to_kill_on_close() {
+            use std::cell::Cell;
+
+            let seen = Cell::new(None);
+            let job = Job::create_with(real_create_job, |handle, limits, size| {
+                seen.set(Some((limits.BasicLimitInformation.LimitFlags, size)));
+                real_configure_job(handle, limits, size)
+            })
+            .expect("create a job the ordinary way");
+            assert!(!job.handle.is_null());
+            let (flags, size) = seen.get().expect("the configuration call was made");
+            assert_eq!(
+                flags, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                "the kill-on-close fail-safe is the limit this job exists for"
+            );
+            assert_eq!(
+                size,
+                u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).expect("fits"),
+                "the extended limit structure is declared at its own size"
+            );
+        }
+
+        /// An accounting error is an error, never an empty job.
+        ///
+        /// R22 releases the host process "on exit, timeout kill, cancel, or
+        /// shutdown (private Job Object / process group)", and
+        /// `QueryInformationJobObject` is the only thing that reports whether
+        /// that release happened. Reading a failed query as zero would report a
+        /// job settled while it still held a live member — the accounting
+        /// saying "released" over a resource that is not.
+        #[test]
+        fn a_failed_accounting_query_is_never_read_as_an_empty_job() {
+            let job = Job::create().expect("create a job");
+            let error = job
+                .active_processes_with(|_, _| 0)
+                .expect_err("a zero BOOL from QueryInformationJobObject is a failure");
+            assert!(
+                !format!("{error}").is_empty(),
+                "the OS's reason must survive"
+            );
+            // And a query that answers is believed, whatever it answers.
+            for reported in [0_u32, 1, 7] {
+                let observed = job
+                    .active_processes_with(move |_, accounting| {
+                        accounting.ActiveProcesses = reported;
+                        1
+                    })
+                    .expect("a successful query is not an error");
+                assert_eq!(observed, reported);
+            }
+        }
+
+        /// Cleanup **observes** the job empty; it does not assume it.
+        ///
+        /// DESIGN.md:402 — "Direct-child success and timeout both terminate and
+        /// boundedly observe that job empty". A real job empties by the first
+        /// query, so an implementation that skipped the loop entirely is
+        /// indistinguishable from this one on any real tree. The accounting
+        /// responses here are chosen, not observed: 1, 1, 0.
+        #[test]
+        fn cleanup_polls_the_accounting_until_the_job_is_empty() {
+            use std::cell::Cell;
+
+            let job = Job::create().expect("create a job");
+            let terminated = Cell::new(false);
+            let answers = Cell::new(0_usize);
+            job.terminate_and_wait_with(
+                |_| {
+                    terminated.set(true);
+                    1
+                },
+                |_, accounting| {
+                    let index = answers.get();
+                    answers.set(index + 1);
+                    accounting.ActiveProcesses = if index < 2 { 1 } else { 0 };
+                    1
+                },
+            )
+            .expect("cleanup completes once the job reports empty");
+            assert!(terminated.get(), "the job was never terminated");
+            assert_eq!(
+                answers.get(),
+                3,
+                "cleanup returned before the accounting said zero, or kept asking after it did"
+            );
+        }
+
+        /// And the observation is **bounded**.
+        ///
+        /// A job that never reports empty must produce a diagnostic within the
+        /// documented two seconds rather than pinning a supervisor thread for
+        /// the life of the process. The bound is asserted from outside, on a
+        /// worker thread, so an unbounded loop fails this test with a named
+        /// message instead of hanging the whole binary.
+        #[test]
+        fn cleanup_gives_up_on_a_job_that_never_empties() {
+            use std::sync::mpsc;
+
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let job = Job::create().expect("create a job");
+                let outcome = job
+                    .terminate_and_wait_with(
+                        |_| 1,
+                        |_, accounting| {
+                            accounting.ActiveProcesses = 1;
+                            1
+                        },
+                    )
+                    .map_err(|error| (error.kind(), error.to_string()));
+                let _ = sender.send(outcome);
+            });
+            let outcome = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("cleanup must be bounded: it never returned");
+            let (kind, message) = outcome.expect_err("a job that never empties is not settled");
+            assert_eq!(kind, io::ErrorKind::TimedOut, "{message}");
+            assert!(
+                message.contains("2 seconds"),
+                "the diagnostic must name its bound: {message}"
+            );
         }
     }
 }
@@ -567,12 +1655,14 @@ fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
 /// while it is nonzero.
 #[cfg(unix)]
 mod termination {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
     use crate::error::UpstrokeError;
+    use crate::topology::effects::ProcessSite;
 
     static PENDING_TERMINATION: AtomicI32 = AtomicI32::new(0);
     static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -736,14 +1826,26 @@ mod termination {
         state: Arc<Mutex<State>>,
         phase: Phase,
         reaper: Reaper,
+        terminate_site: ProcessSite,
     }
 
     impl Supervisor {
-        pub(super) fn begin() -> Result<Self, UpstrokeError> {
-            Self::begin_with_state(shared_state()?)
+        pub(super) fn begin(terminate_site: ProcessSite) -> Result<Self, UpstrokeError> {
+            if terminate_site != ProcessSite::Terminate {
+                return Err(UpstrokeError::Agent {
+                    message: format!(
+                        "process termination requires Process.Terminate, got {}",
+                        terminate_site.name()
+                    ),
+                });
+            }
+            Self::begin_with_state(shared_state()?, terminate_site)
         }
 
-        fn begin_with_state(state: Arc<Mutex<State>>) -> Result<Self, UpstrokeError> {
+        fn begin_with_state(
+            state: Arc<Mutex<State>>,
+            terminate_site: ProcessSite,
+        ) -> Result<Self, UpstrokeError> {
             claim_launch(&state)?;
             let reaper = match spawn_reaper() {
                 Ok(reaper) => reaper,
@@ -756,6 +1858,7 @@ mod termination {
                 state,
                 phase: Phase::Spawning,
                 reaper,
+                terminate_site,
             })
         }
 
@@ -800,6 +1903,14 @@ mod termination {
         }
 
         pub(super) fn finish(&mut self) -> Result<(), UpstrokeError> {
+            if self.terminate_site != ProcessSite::Terminate {
+                return Err(UpstrokeError::Agent {
+                    message: format!(
+                        "process termination requires Process.Terminate, got {}",
+                        self.terminate_site.name()
+                    ),
+                });
+            }
             let Phase::Group(pgid) = self.phase else {
                 return Ok(());
             };
@@ -855,6 +1966,22 @@ mod termination {
             drop(locked);
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// The process groups the parent supervisor currently has registered.
+    ///
+    /// Test-only, and an oracle rather than a guard: `Spawn.Registered` is
+    /// "parent-side registration", and the only way to ask whether that
+    /// happened before the point fired is to read the state it writes.
+    #[cfg(test)]
+    pub(super) fn registered_groups() -> Vec<i32> {
+        let Ok(state) = shared_state() else {
+            return Vec::new();
+        };
+        let locked = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locked.groups.iter().map(|group| group.pgid).collect()
     }
 
     fn release_launch(state: &Arc<Mutex<State>>) {
@@ -1465,6 +2592,11 @@ mod termination {
         }
         let open_max = libc::c_int::try_from(open_max)
             .map_err(|_| "Unix open-file descriptor ceiling exceeds c_int".to_owned())?;
+        // Rendered BEFORE the fork, like `cleanup_paths` above and for the same
+        // reason: the reaper may not allocate. `None` is the ordinary state of
+        // every run today — nothing selects a container Runner until PR12 — and
+        // costs the reaper nothing at all.
+        let containers = container_scope_for_a_new_reaper();
         let command = create_cloexec_pipe()
             .map_err(|error| format!("creating Unix cleanup-reaper command pipe: {error}"))?;
         let ack = match create_cloexec_pipe() {
@@ -1505,7 +2637,14 @@ mod termination {
             if !lock_cleanup_paths(&cleanup_paths) {
                 unsafe { libc::_exit(1) };
             }
-            reaper_loop(parent, command[0], ack[1], open_max, cleanup_delay_ms);
+            reaper_loop(
+                parent,
+                command[0],
+                ack[1],
+                open_max,
+                cleanup_delay_ms,
+                containers.as_ref(),
+            );
         }
 
         // Close the parent's race with the child-side setpgid. Either call may
@@ -1615,6 +2754,7 @@ mod termination {
         ack_fd: libc::c_int,
         open_max: libc::c_int,
         cleanup_delay_ms: u64,
+        containers: Option<&ReaperContainers>,
     ) -> ! {
         let mut pgid = 0_i32;
         let mut anchor = 0_i32;
@@ -1638,29 +2778,21 @@ mod termination {
                 if last_errno_is_interrupted() {
                     continue;
                 }
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if unsafe { libc::getppid() } != parent {
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 let mut frame = [0_u8; 5];
                 if !read_raw_exact(command_fd, &mut frame) {
-                    if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                    }
+                    settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                     unsafe { libc::_exit(0) };
                 }
                 let requested = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
@@ -1690,9 +2822,7 @@ mod termination {
                     _ => false,
                 };
                 if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
-                    if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                    }
+                    settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                     unsafe { libc::_exit(0) };
                 }
             }
@@ -3006,6 +4136,456 @@ mod termination {
         true
     }
 
+    // -----------------------------------------------------------------------
+    // The container half of the orphan window — ST-16 (d)
+    // -----------------------------------------------------------------------
+
+    /// The `docker` argument vectors, rendered before any fork.
+    ///
+    /// A reaper is a `fork`-only child of a multithreaded process: after the
+    /// fork it may call only async-signal-safe functions, so it can neither
+    /// format a filter nor allocate an argv. Every byte it will ever need is
+    /// therefore built here, on the parent side, exactly as `spawn_reaper`'s
+    /// `cleanup_paths` are — and a `CString`'s buffer does not move when the
+    /// struct that owns it does, so the pointer array stays valid.
+    struct ReaperContainers {
+        program: std::ffi::CString,
+        /// Kept alive for the pointers in `ps_argv`.
+        _ps: Vec<std::ffi::CString>,
+        /// NULL-terminated `argv` for `docker ps …`.
+        ps_argv: Vec<*const libc::c_char>,
+    }
+
+    /// The scope every reaper started from now on inherits, or `None`.
+    ///
+    /// A reaper already running keeps the scope it was forked with; there is no
+    /// channel for handing one a new one, and inventing a wire frame for it
+    /// would put a variable-length message into a protocol whose frames are five
+    /// bytes.
+    static CONTAINER_SCOPE: OnceLock<
+        Mutex<Option<crate::runner::container::census::ReaperContainerScope>>,
+    > = OnceLock::new();
+
+    /// The fixed listing buffer. A `--no-trunc` id is 64 bytes plus a newline,
+    /// so this is **126 containers per listing** — and a reaper cannot grow a
+    /// buffer, so the number of *rounds* is what has to be unbounded. It was
+    /// `8`, which made the buffer size a silent ceiling of 126 x 8 = **1,008
+    /// containers**: a coordinator dying with 1,009 of them left one behind and
+    /// reported the same success it reports on a clean machine.
+    const REAPER_PS_BUFFER: usize = 8192;
+
+    /// The ceiling on one `docker` invocation, in 10 ms ticks.
+    ///
+    /// `determinism` forbids sleeps in tests and this is not one: it is the
+    /// fail-safe that keeps a wedged daemon from holding R28 — the shared
+    /// cleanup hold the next coordinator waits on — for ever. A reaper that
+    /// waited without a bound would convert "docker is hung" into "no run on
+    /// this machine can ever start again".
+    const REAPER_DOCKER_TICKS: usize = 3_000;
+
+    /// Arm or disarm the container scope. See
+    /// [`super::set_container_reclaim_scope`].
+    pub(super) fn set_container_reclaim_scope(
+        scope: Option<&crate::runner::container::census::ReaperContainerScope>,
+    ) -> Result<(), UpstrokeError> {
+        // Rendered here so a scope that cannot be turned into argv is refused
+        // by the caller that set it, rather than silently doing nothing inside
+        // a reaper that has no error channel.
+        if let Some(scope) = scope {
+            render_container_argv(scope)?;
+        }
+        let mut held = CONTAINER_SCOPE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *held = scope.cloned();
+        Ok(())
+    }
+
+    /// The absolute program the reaper will `execv`, resolved **before** the
+    /// fork.
+    ///
+    /// **`execv` does not search `PATH`. Only `execvp` does** — and `execvp` is
+    /// not on the POSIX async-signal-safe list, so a reaper (a `fork`-only child
+    /// of a multithreaded process) may not call it. A bare `docker` handed to
+    /// `execv` therefore resolves against nothing at all: the listing child
+    /// `_exit(127)`s, the pipe carries no bytes, and the reaper reports exactly
+    /// the same success it reports on a clean machine. Measured, not reasoned —
+    /// it is what shipped, and the only fixture used an absolute stub.
+    ///
+    /// So the search happens here, on the parent side, in ordinary code with an
+    /// error channel: the same discipline that renders every other byte the
+    /// reaper needs before the fork. `execvp`'s own rule is mirrored exactly —
+    /// a name containing a `/` is a path and is used verbatim (that is what
+    /// `execv` already does correctly); a name with no `/` is searched for on
+    /// `PATH`, and one `PATH` cannot resolve is **refused** rather than handed
+    /// to a child that has no way to say so.
+    ///
+    /// [`crate::util::find_program`] is the resolver deliberately: it is the
+    /// one `runner::container::DockerCli::available` asks when it decides the
+    /// runtime is present, so the reaper execs the binary the rest of the engine
+    /// means by `docker`.
+    fn resolve_reaper_program(program: &std::path::Path) -> Result<PathBuf, UpstrokeError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        if program.as_os_str().as_bytes().contains(&b'/') {
+            return Ok(program.to_path_buf());
+        }
+        let refused = |why: &str| UpstrokeError::Refused {
+            message: format!(
+                "the Unix reaper's container scope names the program `{}`, which {why}; a reaper \
+                 is a fork-only child restricted to async-signal-safe calls, so it must be handed \
+                 an already-resolved path — `execv` does not search `PATH` and `execvp` is not \
+                 async-signal-safe — and a scope whose program cannot be resolved is refused here \
+                 rather than silently reclaiming nothing",
+                program.display()
+            ),
+        };
+        let name = program.to_str().ok_or_else(|| {
+            refused("carries no separator and is not UTF-8, so it cannot be looked up on `PATH`")
+        })?;
+        crate::util::find_program(name)
+            .ok_or_else(|| refused("carries no separator and is not on this process's `PATH`"))
+    }
+
+    /// The argument vectors for `scope`, or why they cannot be built.
+    fn render_container_argv(
+        scope: &crate::runner::container::census::ReaperContainerScope,
+    ) -> Result<ReaperContainers, UpstrokeError> {
+        let nul = |value: &str| UpstrokeError::Refused {
+            message: format!(
+                "the Unix reaper's container scope renders `{value}`, which carries an interior \
+                 NUL and cannot be an argument to `{}`",
+                scope.program().display()
+            ),
+        };
+        let resolved = resolve_reaper_program(scope.program())?;
+        let program = std::ffi::CString::new(resolved.as_os_str().as_encoded_bytes())
+            .map_err(|_| nul(&resolved.to_string_lossy()))?;
+        let mut ps = Vec::new();
+        for (index, argument) in scope.list_argv().into_iter().enumerate() {
+            // `argv[0]` is the resolved path too, so the program the child execs
+            // and the program it reports itself as are one string in every one
+            // of the three invocations — `ps` here, `kill` and `rm` from
+            // `containers.program` directly.
+            let argument = if index == 0 {
+                resolved.to_string_lossy().into_owned()
+            } else {
+                argument
+            };
+            ps.push(std::ffi::CString::new(argument.clone()).map_err(|_| nul(&argument))?);
+        }
+        let mut ps_argv: Vec<*const libc::c_char> =
+            ps.iter().map(|argument| argument.as_ptr()).collect();
+        ps_argv.push(std::ptr::null());
+        Ok(ReaperContainers {
+            program,
+            _ps: ps,
+            ps_argv,
+        })
+    }
+
+    /// What a reaper about to be forked should carry.
+    fn container_scope_for_a_new_reaper() -> Option<ReaperContainers> {
+        let scope = CONTAINER_SCOPE
+            .get()?
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        render_container_argv(&scope).ok()
+    }
+
+    /// Kill and remove every labeled container of the dead coordinator.
+    ///
+    /// `T-CONTAINER.resume_action`: "on Unix the cleanup reaper performs
+    /// **kill/rm** earlier when the coordinator dies". Only kill and rm: the
+    /// Git view and the intent record are removed by the next write command's
+    /// census, which is why every step of `runner::container::reclaim` is
+    /// idempotent and tolerant of already-gone.
+    ///
+    /// Every call here is async-signal-safe: `fork`, `execv`, `pipe`, `dup2`,
+    /// `open`, `close`, `poll`, `read`, `waitpid`, `kill`, `_exit`.
+    fn reclaim_labeled_containers(containers: &ReaperContainers) {
+        // Two fixed buffers and no round counter. The loop ends on one of three
+        // conditions, and none of them is a container count:
+        //
+        // 1. the listing is **empty** — everything this selector names is gone;
+        // 2. the listing is **byte-identical to the previous round's** — the
+        //    runtime answered with exactly what it answered before, so the
+        //    `kill`/`rm` of that round removed nothing and another round would
+        //    repeat it. This is the real form of the guard the round count was
+        //    standing in for ("a runtime that keeps reporting the same
+        //    container cannot hold R28 for ever"), and it is both tighter (it
+        //    fires on the second round rather than the eighth) and not a
+        //    ceiling on how much work a healthy runtime may be given;
+        // 3. no complete id was parsed out of a non-empty listing.
+        //
+        // Termination without a count: the selector names one **dead**
+        // incarnation, so nothing can add to the set while this runs — the only
+        // process that creates containers under that incarnation label is the
+        // coordinator that died. The set is therefore finite and non-growing,
+        // each round either shrinks it or answers identically, and every
+        // `docker` invocation inside a round is itself bounded by
+        // [`REAPER_DOCKER_TICKS`].
+        //
+        // Stopping on (2) is not a silent give-up: what it leaves behind is a
+        // labeled container the runtime will not remove, and that is exactly
+        // the residue the **next write command's census** is required to refuse
+        // over — `refusal_condition`'s "a dead owner's or dead incarnation's
+        // labeled container that cannot be observed terminated blocks
+        // admission". The reaper closes the window early; the census is what
+        // makes failing to close it loud.
+        let mut buffer = [0_u8; REAPER_PS_BUFFER];
+        let mut previous = [0_u8; REAPER_PS_BUFFER];
+        let mut previous_filled = usize::MAX;
+        loop {
+            let filled = list_labeled_containers(containers, &mut buffer);
+            if filled == 0 {
+                return;
+            }
+            if filled == previous_filled && buffer[..filled] == previous[..filled] {
+                return;
+            }
+            previous[..filled].copy_from_slice(&buffer[..filled]);
+            previous_filled = filled;
+            let mut settled = 0_usize;
+            let mut start = 0_usize;
+            for index in 0..filled {
+                if buffer[index] != b'\n' {
+                    continue;
+                }
+                // NUL-terminate the id where it lies. Nothing is allocated and
+                // nothing is copied; the buffer is this frame's own.
+                buffer[index] = 0;
+                if index > start {
+                    let id = buffer[start..].as_ptr().cast::<libc::c_char>();
+                    let kill: [*const libc::c_char; 4] = [
+                        containers.program.as_ptr(),
+                        c"kill".as_ptr(),
+                        id,
+                        std::ptr::null(),
+                    ];
+                    spawn_docker(containers.program.as_ptr(), kill.as_ptr());
+                    // `--volumes`, exactly as `DockerCli::remove` issues it
+                    // (`PR6-ACCT-006`). An image declaring `VOLUME` gets one
+                    // **anonymous** volume per container, and `docker rm`
+                    // without this leaves one behind for every container the
+                    // reaper removes: measured, 29 leaked from a single run of
+                    // this suite through the ordinary path before
+                    // `PR6A-ANONYMOUS-VOLUMES-LEAK` put the flag there. Those
+                    // volumes are R26 — created by `docker create` as part of
+                    // the container, referable by nothing else — and once the
+                    // reaper has removed the container the following
+                    // intent-only census has no handle on them at all, so this
+                    // is the *only* point at which they can be reclaimed.
+                    // `--volumes` removes anonymous volumes and **never a named
+                    // one**, so it cannot touch R20 (measured on docker 29.7.2:
+                    // a mounted named volume survives `rm --force --volumes`).
+                    let remove: [*const libc::c_char; 6] = [
+                        containers.program.as_ptr(),
+                        c"rm".as_ptr(),
+                        c"--force".as_ptr(),
+                        c"--volumes".as_ptr(),
+                        id,
+                        std::ptr::null(),
+                    ];
+                    spawn_docker(containers.program.as_ptr(), remove.as_ptr());
+                    settled = settled.saturating_add(1);
+                }
+                start = index + 1;
+            }
+            if settled == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Run `docker ps …` and read its ids into `buffer`, returning how many
+    /// bytes arrived.
+    fn list_labeled_containers(containers: &ReaperContainers, buffer: &mut [u8]) -> usize {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return 0;
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            close_fd(fds[0]);
+            close_fd(fds[1]);
+            return 0;
+        }
+        if pid == 0 {
+            unsafe {
+                // The reaper closed every inherited descriptor including 0, 1
+                // and 2, so `pipe` may well have handed back fd 0 and fd 1
+                // themselves. Move the write end onto stdout only when it is
+                // not already there, and never close the descriptor that IS
+                // stdout: doing so leaves `docker ps` writing to a closed fd,
+                // the listing empty, and nothing reclaimed — with the reaper
+                // reporting exactly the same success it reports on a clean
+                // machine. Measured, not reasoned: it is what happened.
+                if fds[1] != 1 && libc::dup2(fds[1], 1) < 0 {
+                    libc::_exit(127);
+                }
+                if fds[0] != 1 {
+                    close_fd(fds[0]);
+                }
+                if fds[1] != 1 {
+                    close_fd(fds[1]);
+                }
+                quiet_standard_descriptors();
+                libc::execv(containers.program.as_ptr(), containers.ps_argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        close_fd(fds[1]);
+        let filled = read_bounded(fds[0], buffer);
+        close_fd(fds[0]);
+        reap_bounded(pid);
+        filled
+    }
+
+    /// `docker <verb> <id>`, output discarded, bounded.
+    fn spawn_docker(program: *const libc::c_char, argv: *const *const libc::c_char) {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return;
+        }
+        if pid == 0 {
+            unsafe {
+                quiet_standard_descriptors();
+                libc::execv(program, argv);
+                libc::_exit(127);
+            }
+        }
+        reap_bounded(pid);
+    }
+
+    /// Give the exec'd `docker` real standard descriptors.
+    ///
+    /// The reaper closed every inherited descriptor including 0, 1 and 2, so
+    /// without this a `docker` that opened a file would be handed **fd 1 or fd
+    /// 2** for it and would then write its output or its diagnostics into that
+    /// file. `/dev/null` on whichever of the three is still free is the
+    /// cheapest way to make the numbers mean what they mean.
+    ///
+    /// A descriptor that is **already** open is left alone, which is what keeps
+    /// this from undoing the listing child's pipe on fd 1.
+    unsafe fn quiet_standard_descriptors() {
+        unsafe {
+            // In this order: `open` returns the lowest free descriptor, so
+            // filling 0 first is what lets 1 and 2 land where they are asked
+            // for without a `dup2` at all.
+            ensure_standard_descriptor(0, libc::O_RDONLY);
+            ensure_standard_descriptor(1, libc::O_WRONLY);
+            ensure_standard_descriptor(2, libc::O_WRONLY);
+        }
+    }
+
+    /// Open `/dev/null` onto `target` unless something is already there.
+    unsafe fn ensure_standard_descriptor(target: libc::c_int, flags: libc::c_int) {
+        unsafe {
+            if libc::fcntl(target, libc::F_GETFD) != -1 {
+                return;
+            }
+            let opened = libc::open(c"/dev/null".as_ptr(), flags);
+            if opened < 0 {
+                return;
+            }
+            if opened != target {
+                let _ = libc::dup2(opened, target);
+                close_fd(opened);
+            }
+        }
+    }
+
+    /// Read until EOF, the buffer is full, or the ceiling is reached.
+    fn read_bounded(fd: libc::c_int, buffer: &mut [u8]) -> usize {
+        let mut used = 0_usize;
+        let mut ticks = 0_usize;
+        while used < buffer.len() {
+            let mut waiting = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut waiting, 1, 10) };
+            if ready < 0 {
+                if last_errno_is_interrupted() {
+                    continue;
+                }
+                return used;
+            }
+            if ready == 0 {
+                ticks = ticks.saturating_add(1);
+                if ticks >= REAPER_DOCKER_TICKS {
+                    return used;
+                }
+                continue;
+            }
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    buffer.as_mut_ptr().add(used).cast(),
+                    buffer.len() - used,
+                )
+            };
+            if read > 0 {
+                used += read as usize;
+            } else if read < 0 && last_errno_is_interrupted() {
+                continue;
+            } else {
+                return used;
+            }
+        }
+        used
+    }
+
+    /// Wait for one `docker`, and kill it rather than hold R28 for ever.
+    fn reap_bounded(pid: libc::pid_t) {
+        for _ in 0..REAPER_DOCKER_TICKS {
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if waited == pid {
+                return;
+            }
+            if waited < 0 && !last_errno_is_interrupted() {
+                return;
+            }
+            raw_sleep_10ms();
+        }
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        loop {
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            if waited == pid || (waited < 0 && !last_errno_is_interrupted()) {
+                return;
+            }
+        }
+    }
+
+    /// What a reaper does when its **coordinator has died**: settle the group,
+    /// then close the container half of the orphan window.
+    ///
+    /// Separate from the [`REAPER_CLEANUP`] path on purpose, and this is the
+    /// distinction the whole extension turns on. `REAPER_CLEANUP` and
+    /// [`REAPER_CANCEL`] are the **live** coordinator asking for its invocation
+    /// to be settled; killing its labeled containers there would kill the
+    /// containers of a coordinator that is still spending through them, which is
+    /// `authoritative_state`'s "a live incarnation's containers must not be
+    /// touched" — the opposite of what this exists for.
+    fn settle_after_coordinator_death(
+        pgid: i32,
+        anchor: libc::pid_t,
+        cleanup_delay_ms: u64,
+        containers: Option<&ReaperContainers>,
+    ) {
+        if pgid > 0 {
+            cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+        }
+        if let Some(containers) = containers {
+            reclaim_labeled_containers(containers);
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -3013,6 +4593,67 @@ mod termination {
         use std::time::Instant;
 
         static REAPED_CHILD_STOP: AtomicBool = AtomicBool::new(false);
+
+        /// R28 is a **shared** hold, and one run has more than one reaper.
+        ///
+        /// `resource_accounting.rows[R28].resource` — "a surviving Unix cleanup
+        /// reaper's shared `cleanup.lock` hold (**one per reaper**; a reaper
+        /// may outlive the coordinator while it settles its process groups)".
+        /// Narrowing this `flock` to `LOCK_EX` would let the first reaper of a
+        /// run take the hold and refuse every later one — the second concurrent
+        /// invocation failing to start at all — and nothing observed it,
+        /// because no test ran two overlapping invocations and inspected their
+        /// holds.
+        ///
+        /// `flock` holds belong to the open file description, so two calls here
+        /// are exactly two independent holders, which is what a second reaper
+        /// is. The expected behaviour is `flock(2)`'s, not this function's:
+        /// shared holds coexist and both exclude the exclusive side.
+        #[test]
+        fn the_reapers_cleanup_hold_is_shared_between_overlapping_invocations() {
+            use std::os::unix::ffi::OsStrExt;
+
+            let path = std::env::temp_dir().join(format!(
+                "upstroke-r28-shared-{}-{}.lock",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            std::fs::write(&path, b"").expect("create a cleanup lease file");
+            let target = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .expect("a temporary path without a null byte");
+            let held = std::slice::from_ref(&target);
+
+            assert!(
+                lock_cleanup_paths(held),
+                "the first invocation's reaper could not take R28 at all"
+            );
+            assert!(
+                lock_cleanup_paths(held),
+                "a second overlapping invocation's reaper was refused the shared hold: \
+                 R28 is `one per reaper`, not one per run"
+            );
+
+            // And both holds still exclude the next coordinator, which is the
+            // other half of R28: `observed (never owned or reset) by the next
+            // coordinator … through the exclusive cleanup probe`.
+            // SAFETY: a null-terminated path this test created; a failure
+            // returns a negative descriptor.
+            let fd = unsafe { libc::open(target.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            assert!(fd >= 0, "reopening the lease file");
+            // SAFETY: `fd` is live and owned here until it is closed.
+            let exclusive = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            let errno = last_errno();
+            close_fd(fd);
+            let _ = std::fs::remove_file(&path);
+            assert_ne!(
+                exclusive, 0,
+                "the exclusive side was granted while two reapers held R28"
+            );
+            assert!(
+                errno == libc::EWOULDBLOCK || errno == libc::EAGAIN,
+                "the exclusive probe failed for an unrelated reason: {errno}"
+            );
+        }
 
         #[test]
         fn reaper_distinguishes_a_probe_pulse_from_a_stable_parent_resume() {
@@ -3343,6 +4984,312 @@ mod termination {
             }
             assert_eq!(observed, Some(false));
         }
+
+        /// The program handed to `execv` is **always absolute**, and a bare name
+        /// `PATH` cannot resolve is refused where there is still an error channel.
+        ///
+        /// `execv` does not search `PATH`; only `execvp` does, and `execvp` is not
+        /// async-signal-safe, so a reaper may not call it. The production spelling
+        /// is `runner::container::DOCKER_PROGRAM` — the bare name `docker`
+        /// — so a reaper handed that name unresolved lists nothing, reclaims
+        /// nothing, and reports success.
+        ///
+        /// Second field held constant: the private root and the incarnation are the
+        /// same in every cell, so the only thing that moves is the **spelling of
+        /// the program** — bare-and-resolvable, bare-and-absent, and a path.
+        #[test]
+        fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork() {
+            use crate::runner::container::census::ReaperContainerScope;
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::path::Path;
+
+            const ROOT: &str = "/srv/upstroke-reaper-resolve/private";
+            const INCARNATION: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
+
+            fn scope(program: &str) -> ReaperContainerScope {
+                ReaperContainerScope::new(program, Path::new(ROOT), INCARNATION)
+                    .expect("a well-formed scope")
+            }
+            fn execd(rendered: &ReaperContainers) -> std::path::PathBuf {
+                std::path::PathBuf::from(OsStr::from_bytes(rendered.program.as_bytes()))
+            }
+
+            // (1) A bare name that `PATH` resolves. `git` rather than `docker`
+            // because the property is about resolution and every machine that
+            // builds this repository has git; `util::find_program_resolves_real_
+            // tools_and_misses_fake_ones` is where that is already relied on.
+            let rendered = render_container_argv(&scope("git")).expect("git is on PATH");
+            let program = execd(&rendered);
+            assert!(
+                program.is_absolute(),
+                "`execv` was handed `{}`, which it will not search `PATH` for",
+                program.display()
+            );
+            assert!(
+                program.is_file(),
+                "`{}` is not a file on this machine",
+                program.display()
+            );
+            assert_eq!(
+                program.file_name(),
+                Some(OsStr::new("git")),
+                "the resolution found something other than the program it was asked for: {}",
+                program.display()
+            );
+            // `argv[0]` is the resolved path too, so the string the child execs and
+            // the string it reports itself as cannot drift apart.
+            let argv0 = unsafe { std::ffi::CStr::from_ptr(rendered.ps_argv[0]) };
+            assert_eq!(argv0.to_bytes(), program.as_os_str().as_bytes());
+
+            // (2) A bare name `PATH` cannot resolve is refused, while there is
+            // still somewhere to report it: a reaper has no error channel.
+            let absent = scope("upstroke-definitely-not-a-real-docker");
+            let message = match render_container_argv(&absent) {
+                Ok(_) => panic!("an unresolvable bare program was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                message.contains("PATH")
+                    && message.contains("upstroke-definitely-not-a-real-docker"),
+                "{message}"
+            );
+            // And the refusal reaches the caller that arms the reaper, which is the
+            // only place with an error channel. Nothing is installed on this path,
+            // so no other test in this process inherits a scope.
+            assert!(
+                set_container_reclaim_scope(Some(&absent)).is_err(),
+                "arming accepted a scope whose program cannot be executed"
+            );
+
+            // (3) A name carrying a separator is a path and is used verbatim —
+            // exactly `execvp`'s own rule, and what `execv` already does correctly.
+            let rendered = render_container_argv(&scope("/usr/bin/docker")).expect("a path");
+            assert_eq!(execd(&rendered), Path::new("/usr/bin/docker"));
+            let rendered = render_container_argv(&scope("./docker")).expect("a relative path");
+            assert_eq!(execd(&rendered), Path::new("./docker"));
+        }
+
+        /// A scratch directory, a recording `docker` stub, and the rendered
+        /// argument vectors that name it.
+        fn reaper_stub(tag: &str, script: &str) -> (std::path::PathBuf, ReaperContainers) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!(
+                "upstroke-reaper-rounds-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let stub = dir.join("docker-stub");
+            std::fs::write(&stub, script).expect("write the stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub executable");
+            // The stub finds its own scratch directory through `dirname $0`,
+            // so nothing about this fixture depends on process-wide state and
+            // two of these may run concurrently.
+            let scope = crate::runner::container::census::ReaperContainerScope::new(
+                &stub,
+                std::path::Path::new("/srv/upstroke-reaper-rounds/private"),
+                "01KZTAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("a scope");
+            let rendered = render_container_argv(&scope).expect("argv");
+            (dir, rendered)
+        }
+
+        /// Every line of the stub's log whose first word is `verb`, in order.
+        fn logged(dir: &std::path::Path, verb: &str) -> Vec<String> {
+            std::fs::read_to_string(dir.join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.split_whitespace().next() == Some(verb))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The reaper performs **as many rounds as the machine needs**, not a
+        /// fixed number of them.
+        ///
+        /// The listing buffer is fixed at [`REAPER_PS_BUFFER`] and a
+        /// `--no-trunc` id is 65 bytes with its newline, so one listing holds
+        /// **126** ids. A round count of 8 therefore made the reaper's reach a
+        /// silent **1,008** containers: a coordinator dying with 1,009 left one
+        /// behind and the reaper reported the same success it reports on a
+        /// clean machine. Twelve rounds is more than eight and few enough to
+        /// run in a fraction of a second; what it measures is that the count is
+        /// gone, not that the count is twelve.
+        ///
+        /// Second field held constant: exactly one container is listed in every
+        /// round, so the number of ids per listing cannot be what ends the
+        /// loop — only the number of rounds moves.
+        #[test]
+        fn the_reaper_performs_as_many_rounds_as_the_machine_needs() {
+            const ROUNDS: usize = 12;
+            let (dir, rendered) = reaper_stub(
+                "unbounded",
+                &format!(
+                    "#!/bin/sh\n\
+                     d=$(dirname \"$0\")\n\
+                     printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                     case \"$1\" in\n\
+                     ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                     echo \"$n\" > \"$d/round\"; \
+                     [ \"$n\" -gt {ROUNDS} ] || printf '%064d\\n' \"$n\" ;;\n\
+                     esac\n\
+                     exit 0\n"
+                ),
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
+                .collect();
+            // The expected ids come from the stub's own rule, written out here
+            // rather than read back from what the reaper did.
+            let expected: std::collections::BTreeSet<String> =
+                (1..=ROUNDS).map(|n| format!("{n:064}")).collect();
+            assert_eq!(
+                killed,
+                expected,
+                "the reaper stopped early: it killed {} of {ROUNDS}",
+                killed.len()
+            );
+            assert_eq!(removed, expected, "kill and rm did not settle the same set");
+            assert!(
+                logged(&dir, "ps").len() > ROUNDS,
+                "{} listings for {ROUNDS} rounds plus the empty one that ends the loop",
+                logged(&dir, "ps").len()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A listing **larger than the buffer** is not silently truncated: the
+        /// ids that did not fit are settled by a later round.
+        ///
+        /// This is the other half of the 126 x 8 arithmetic, and the two are a
+        /// product: a fixture that varied only the number of rounds would not
+        /// notice a buffer that dropped what it could not hold, and one that
+        /// varied only the number of ids would not notice a round count. 130 is
+        /// the smallest number that crosses the boundary — 130 x 65 = 8,450
+        /// bytes into an 8,192-byte buffer — so the first listing is cut inside
+        /// an id, which is the case a parser is most likely to get wrong.
+        ///
+        /// Second field held constant: the stub removes exactly what it is
+        /// told to remove and invents nothing, so the only thing that moves
+        /// between rounds is how much of the set is left.
+        #[test]
+        fn the_reaper_settles_more_containers_than_one_listing_holds() {
+            const CONTAINERS: usize = 130;
+            let (dir, rendered) = reaper_stub(
+                "over-buffer",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) ls \"$d/ids\" 2>/dev/null ;;\n\
+                 rm) rm -f \"$d/ids/$4\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+            std::fs::create_dir_all(dir.join("ids")).expect("the id set");
+            let expected: std::collections::BTreeSet<String> = (1..=CONTAINERS)
+                .map(|n| format!("{n:064}"))
+                .inspect(|id| std::fs::write(dir.join("ids").join(id), "").expect("an id"))
+                .collect();
+            assert_eq!(expected.len(), CONTAINERS);
+            const {
+                assert!(
+                    CONTAINERS * 65 > REAPER_PS_BUFFER,
+                    "the fixture must not fit in one listing"
+                );
+            }
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
+                .collect();
+            assert_eq!(
+                killed,
+                expected,
+                "{} of {CONTAINERS} containers were killed; the ids past the end of the first \
+                 listing were dropped rather than settled by a later round",
+                killed.len()
+            );
+            assert_eq!(removed, expected);
+            assert_eq!(
+                std::fs::read_dir(dir.join("ids"))
+                    .expect("the id set")
+                    .count(),
+                0,
+                "the stub still holds containers the reaper never removed"
+            );
+            assert!(
+                logged(&dir, "ps").len() >= 3,
+                "one listing cannot hold 130 ids"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A runtime that keeps answering with the **same listing** ends the
+        /// loop on the second round, and does not repeat for ever.
+        ///
+        /// This is the guard the round count used to be, in its real form. The
+        /// reaper holds R28 — the shared cleanup hold the next coordinator waits
+        /// on — so a loop that could not end would turn "docker is wedged" into
+        /// "no run on this machine can ever start again".
+        ///
+        /// Second field held constant: the id set, which never changes; only
+        /// the number of times the reaper is willing to ask about it moves.
+        #[test]
+        fn a_runtime_that_keeps_answering_the_same_listing_ends_the_loop() {
+            // The stub answers with the same two ids twice and then with
+            // nothing. The third listing is what makes this fixture finite: an
+            // implementation with **no** no-progress guard still terminates
+            // here, and is caught by the counts rather than by a hang, because
+            // a test that measures a missing bound by hanging measures nothing.
+            let (dir, rendered) = reaper_stub(
+                "no-progress",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo \"$n\" > \"$d/round\"; \
+                 [ \"$n\" -gt 2 ] || { printf '%064d\\n' 1; printf '%064d\\n' 2; } ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            // Two listings: the first is acted on, the second is recognised as
+            // the same answer and ends the loop **there** — the third listing,
+            // which the stub is willing to answer, is never asked for. Each
+            // container was attempted exactly once, so nothing is retried
+            // against a runtime that has already refused to remove it.
+            assert_eq!(
+                logged(&dir, "ps").len(),
+                2,
+                "a repeated listing was acted on again: {:?}",
+                logged(&dir, "ps")
+            );
+            assert_eq!(logged(&dir, "kill").len(), 2, "{:?}", logged(&dir, "kill"));
+            assert_eq!(logged(&dir, "rm").len(), 2, "{:?}", logged(&dir, "rm"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -3413,8 +5360,94 @@ impl Drain {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
+
+    /// Test-only convenience entry. Production passes both sites explicitly.
+    pub(crate) fn run_with_timeout(
+        command: Command,
+        stdin_data: &str,
+        timeout: Duration,
+    ) -> Result<ProcessOutput, UpstrokeError> {
+        run_with_timeout_at(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            command,
+            stdin_data.as_bytes(),
+            timeout,
+            &mut NoHooks,
+        )
+    }
+
+    // **Out of line, in `proc/test_support/readiness.rs`.** The primitives are
+    // ~440 lines of protocol that three modules' fixtures depend on, and they
+    // were the only thing in this file with no relationship to subprocess
+    // supervision. Moving them gives them their own module doc and their own
+    // stated lint level -- a Rust lint level is scoped by the module tree
+    // rather than by the file, so an out-of-line child inherits this file's
+    // `#![allow]` unless it says otherwise, which is `PR6-LANEF-004`.
+    //
+    // The path does not change: this declaration keeps
+    // `crate::agent::proc::test_support::readiness` resolving exactly as it
+    // did, for `workspace`, `rundir` and the witnesses below.
+    //
+    // **Declared without a `#[cfg(test)]` of its own**, because it inherits one:
+    // `test_support` above carries it, so the file is compiled only under
+    // `cfg(test)` and `effects::census_domain` resolves it as a whole-file test
+    // module through that inline ancestry rather than through an attribute
+    // written here.
+    pub(crate) mod readiness;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+
+    use super::test_support::readiness;
+    use super::test_support::run_with_timeout;
+    use super::*;
+
+    /// A memoised establishment failure is reported to **every** later caller.
+    ///
+    /// `crash_reconstruction`: "if the ambient job cannot be created or joined
+    /// the write command refuses at startup with a diagnostic before any
+    /// workspace effect (**no degraded mode**; deferred)". The memo makes the
+    /// first caller's answer every caller's answer, so an arm that turned a
+    /// remembered failure back into success is a degraded mode that no later
+    /// call can escape (`PR5-CORRECTNESS-010`).
+    ///
+    /// Runs on every platform, deliberately. The value is Windows-only; the
+    /// decision about it is not, and before this the only machine that could
+    /// have executed the failing arm was one where the arm was unreachable —
+    /// a process that memoised a failure never got a coordinator to observe it
+    /// with.
+    #[test]
+    fn a_memoised_establishment_failure_reaches_every_later_caller() {
+        // The success arm, so this is not a test that only ever says "Err".
+        assert_eq!(memoised_outcome::<()>(&Ok(())), Ok(()));
+
+        // The failure arm, and the diagnostic is the memo's own: the caller
+        // renders it into the operator-facing refusal, so a fresh or empty
+        // message would name something that did not happen.
+        for message in [
+            "it could not be created (Access is denied. (os error 5))",
+            "it could not be configured (os error 87)",
+            "AssignProcessToJobObject refused",
+        ] {
+            assert_eq!(
+                memoised_outcome::<()>(&Err(message.to_owned())),
+                Err(message.to_owned()),
+                "a remembered failure must come back as that failure"
+            );
+        }
+
+        // And it is stable: the *second* caller gets the same answer as the
+        // first, which is the whole of what a memo promises.
+        let memo: Result<(), String> = Err("it could not be created".to_owned());
+        assert_eq!(memoised_outcome(&memo), memoised_outcome(&memo));
+        assert!(memoised_outcome(&memo).is_err());
+    }
 
     // Windows-first-class: exercise the supervisor through cmd.exe, which is
     // always present there; use sh on everything else.
@@ -3441,19 +5474,97 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "subprocess helper"]
-    fn excessive_output_helper() {
-        if std::env::var_os("UPSTROKE_EXCESSIVE_OUTPUT_HELPER").is_none() {
-            return;
-        }
-        let chunk = [b'x'; 4096];
-        let mut stdout = std::io::stdout().lock();
-        loop {
-            stdout
-                .write_all(&chunk)
-                .expect("write deterministic excessive output");
+    fn invalid_process_site_pairs_fail_before_spawn_in_release_code() {
+        for (spawn, terminate) in [
+            (ProcessSite::Spawn, ProcessSite::Spawn),
+            (ProcessSite::Terminate, ProcessSite::Terminate),
+            (ProcessSite::Terminate, ProcessSite::Spawn),
+        ] {
+            let error = run_with_timeout_at(
+                spawn,
+                terminate,
+                Command::new("upstroke-site-validation-must-not-spawn"),
+                b"",
+                Duration::from_secs(1),
+                &mut NoHooks,
+            )
+            .expect_err("an invalid Process-site pair must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("process funnel requires"), "{message}");
+            assert!(!message.contains("failed to spawn"), "{message}");
         }
     }
+
+    /// Writes `UPSTROKE_EXCESSIVE_OUTPUT_HELPER` bytes to stdout, then exits.
+    ///
+    /// **Bounded, and the bound is the point.** This used to be `loop { write }`,
+    /// which is harmless while the funnel bounds capture: the parent stops
+    /// reading at the allowance, the child blocks on a full pipe, and the tree
+    /// is killed long before any budget matters. But the test that exists to
+    /// catch an *unbounded* allowance —
+    /// [`crate::runner::host::tests::the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does`]
+    /// — then had no failure mode except memory exhaustion. Measured under
+    /// `PR4-CORRECTNESS-004`'s own mutation (`OUTPUT_LIMIT_BYTES` ->
+    /// `usize::MAX`): the parent captured until the OOM killer took the whole
+    /// test binary, so the witness arrived as `signal: 9` attributed to an
+    /// unrelated test, with 900-odd tests never run and no `test result:` line
+    /// at all. A witness that destroys the evidence it is producing is not a
+    /// witness.
+    ///
+    /// A finite budget several times the real allowance keeps both readings.
+    /// A funnel that bounds correctly still kills a child blocked on a full
+    /// pipe well before the budget is written, so nothing about the passing
+    /// case changes; a funnel that does not bound captures a large but
+    /// survivable amount, the child exits 0, and the assertion that fails is
+    /// `output_limited`, by name.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn excessive_output_helper() {
+        let Some(budget) = std::env::var_os("UPSTROKE_EXCESSIVE_OUTPUT_HELPER") else {
+            return;
+        };
+        let budget: usize = budget
+            .to_string_lossy()
+            .parse()
+            .expect("the helper's byte budget");
+        let chunk = [b'x'; 4096];
+        // Which stream, because the allowance is **per stream** and every
+        // fixture used to fill only one of them: a check that never looked at
+        // stderr was indistinguishable from this one.
+        let on_stderr = std::env::var_os("UPSTROKE_EXCESSIVE_OUTPUT_STREAM")
+            .is_some_and(|stream| stream == "stderr");
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        let mut written = 0_usize;
+        while written < budget {
+            let sink: &mut dyn Write = if on_stderr { &mut stderr } else { &mut stdout };
+            sink.write_all(&chunk)
+                .expect("write deterministic excessive output");
+            written += chunk.len();
+        }
+        // Written the budget, and still alive.
+        //
+        // The budget alone is not enough: 64 MiB crosses a pipe in well under
+        // a second, so a child that exited here would often be *gone* before
+        // the supervisor acted on the allowance, and the funnel would report
+        // `code: Some(0)` with the limit observed during the final drain —
+        // a real behaviour, but not the one the two callers assert. Staying
+        // alive keeps "an output-limited tree is terminated, not exited" true
+        // for a funnel that bounds, while a funnel that does *not* bound still
+        // reaches this line with a bounded amount captured and then exits, so
+        // its witness is an assertion rather than an OOM.
+        thread::sleep(Duration::from_secs(15));
+    }
+
+    /// What this module's output-limit test gives the helper: comfortably more
+    /// than the allowance under test, and small enough to hold in memory if
+    /// the allowance stops working.
+    ///
+    /// `runner::host`'s test declares its own, deliberately: a budget below
+    /// the allowance it is testing makes that test's own `output_limited`
+    /// assertion fail, so each budget is checked by the test that sets it and
+    /// there is nothing for a shared constant to keep in step.
+    const EXCESSIVE_OUTPUT_BUDGET: usize = 64 * 1024 * 1024;
 
     #[test]
     fn excessive_output_is_bounded_and_terminates_the_tree() {
@@ -3461,11 +5572,22 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["excessive_output_helper", "--ignored", "--nocapture"])
-            .env("UPSTROKE_EXCESSIVE_OUTPUT_HELPER", "1");
+            .env(
+                "UPSTROKE_EXCESSIVE_OUTPUT_HELPER",
+                EXCESSIVE_OUTPUT_BUDGET.to_string(),
+            );
 
         let started = Instant::now();
-        let out = run_with_timeout_and_limit(command, "", Duration::from_secs(30), TEST_LIMIT)
-            .expect("supervise noisy child");
+        let out = run_with_timeout_and_limit(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            command,
+            b"",
+            Duration::from_secs(30),
+            TEST_LIMIT,
+            &mut NoHooks,
+        )
+        .expect("supervise noisy child");
         assert!(out.output_limited, "supervised output: {out:?}");
         assert!(!out.timed_out);
         assert!(out.code.is_none());
@@ -3475,6 +5597,270 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "output-limited child was not terminated promptly: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// The allowance is **per stream**, and stderr is a stream.
+    ///
+    /// Every output-limit fixture in this suite filled stdout, so a check that
+    /// never looked at stderr behaved exactly like this one: an agent that
+    /// writes its diagnostics to stderr — which is where a CLI writes them —
+    /// could fill memory without ever tripping the bound.
+    /// `invariants_preserved[0]` is "output capture … unchanged", and the
+    /// bounded half of that is what this asks about.
+    #[test]
+    fn the_output_allowance_bounds_stderr_as_well_as_stdout() {
+        const TEST_LIMIT: usize = 64 * 1024;
+
+        // The negative control first: a small writer on the same stream is not
+        // limited, so `output_limited` below is the size and not the stream.
+        let small = run_with_timeout_and_limit(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            shell("echo problem 1>&2"),
+            b"",
+            Duration::from_secs(60),
+            TEST_LIMIT,
+            &mut NoHooks,
+        )
+        .expect("supervise a modest stderr writer");
+        assert!(
+            !small.output_limited,
+            "a small writer was limited: {small:?}"
+        );
+        assert!(
+            small.stderr.contains("problem"),
+            "the control fixture wrote nothing to stderr: {small:?}"
+        );
+
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["excessive_output_helper", "--ignored", "--nocapture"])
+            .env(
+                "UPSTROKE_EXCESSIVE_OUTPUT_HELPER",
+                EXCESSIVE_OUTPUT_BUDGET.to_string(),
+            )
+            .env("UPSTROKE_EXCESSIVE_OUTPUT_STREAM", "stderr");
+        let started = Instant::now();
+        let out = run_with_timeout_and_limit(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            command,
+            b"",
+            Duration::from_secs(60),
+            TEST_LIMIT,
+            &mut NoHooks,
+        )
+        .expect("supervise a noisy stderr child");
+        assert!(
+            out.output_limited,
+            "a stderr-only producer was never bounded: {out:?}"
+        );
+        // `output_limited` alone is **not** the property, and measuring it
+        // alone let the first version of this test pass under the mutation it
+        // exists for: the final drain sets that flag from `stderr_limited`
+        // whatever the supervisor did, so a limit check that never looked at
+        // stderr still reported the overrun — after letting the child run to
+        // completion. The property is that the tree is *terminated* at the
+        // allowance, which is an exit code that is not the child's and a
+        // return that does not wait for it.
+        assert!(
+            out.code.is_none(),
+            "the stderr-limited child exited on its own terms rather than \
+             being terminated: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stderr-limited tree was not terminated promptly: {:?}",
+            started.elapsed()
+        );
+        assert!(!out.timed_out, "{out:?}");
+        assert!(out.stderr.len() <= TEST_LIMIT, "{}", out.stderr.len());
+        assert!(
+            !out.stdout.contains("xxxx"),
+            "the stderr fixture wrote its payload to stdout, so the bound this \
+             test observed was stdout's after all"
+        );
+    }
+
+    /// Stdin is **bytes**, and arrives byte for byte.
+    ///
+    /// `CommandSpec { … stdin: Vec<u8> }` (DESIGN.md:222) is a byte field, and
+    /// every stdin fixture in this suite is valid UTF-8 text — so a lossy
+    /// conversion on the way to the child changes nothing any of them can see,
+    /// while an agent handed binary input on stdin would silently receive
+    /// `U+FFFD` where its bytes used to be.
+    ///
+    /// The child reports what it received in hex, so the comparison is against
+    /// the bytes this test wrote and not against a string round trip.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn stdin_hex_helper() {
+        if std::env::var_os("UPSTROKE_STDIN_HEX").is_none() {
+            return;
+        }
+        let mut received = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut received)
+            .expect("read stdin");
+        let mut hex = String::new();
+        for byte in &received {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        print!("<{hex}>");
+        let _ = std::io::stdout().flush();
+    }
+
+    #[test]
+    fn stdin_reaches_the_child_byte_for_byte() {
+        // Not valid UTF-8: a lone 0x80 continuation, a 0xff that no encoding
+        // produces, and a NUL — every one of which `from_utf8_lossy` replaces.
+        let payload: Vec<u8> = vec![0x00, 0x80, 0xff, 0x0a, 0x41];
+        assert_ne!(
+            String::from_utf8_lossy(&payload).as_bytes(),
+            payload.as_slice(),
+            "the fixture must be bytes a lossy conversion would change, or the \
+             mutation this test exists for is invisible to it too"
+        );
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["stdin_hex_helper", "--ignored", "--nocapture"])
+            .env("UPSTROKE_STDIN_HEX", "1");
+        let out = run_with_timeout_at(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            command,
+            &payload,
+            Duration::from_secs(60),
+            &mut NoHooks,
+        )
+        .expect("supervise the stdin helper");
+        let expected: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(
+            out.stdout.contains(&format!("<{expected}>")),
+            "the child did not receive the bytes this test wrote: {} (wanted {expected})",
+            out.stdout
+        );
+    }
+
+    /// A timed-out attempt keeps the transcript it produced.
+    ///
+    /// §14 makes the partial transcript the retry's feedback, and
+    /// `invariants_preserved[0]` keeps "output capture … unchanged". The one
+    /// timing-out fixture in this suite is `sleep 30`, which writes nothing
+    /// before it is killed — so discarding the whole transcript on timeout was
+    /// a no-op on every fixture that reaches the branch.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn timeout_transcript_helper() {
+        if std::env::var_os("UPSTROKE_TIMEOUT_TRANSCRIPT").is_none() {
+            return;
+        }
+        print!("OUT-BEFORE-TIMEOUT");
+        let _ = std::io::stdout().flush();
+        eprint!("ERR-BEFORE-TIMEOUT");
+        let _ = std::io::stderr().flush();
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_timed_out_child_keeps_the_transcript_it_had_already_written() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["timeout_transcript_helper", "--ignored", "--nocapture"])
+            .env("UPSTROKE_TIMEOUT_TRANSCRIPT", "1");
+        let out = run_with_timeout(command, "", Duration::from_secs(3))
+            .expect("supervise the transcript helper");
+        assert!(out.timed_out, "{out:?}");
+        assert!(
+            out.stdout.contains("OUT-BEFORE-TIMEOUT"),
+            "the timed-out child's stdout was discarded: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("ERR-BEFORE-TIMEOUT"),
+            "the timed-out child's stderr was discarded: {:?}",
+            out.stderr
+        );
+    }
+
+    /// The reaper knows the group **before** the parent registers it, because
+    /// the child registered it before `exec`.
+    ///
+    /// `crash_reconstruction`: "Host, Unix: private process groups plus the
+    /// per-invocation cleanup reaper **registered pre-exec inside the child**
+    /// … leave no unregistered prefix". The existing pre-exec witness asks the
+    /// kernel `getpgid(pid) == pid`, which proves `setpgid(0, 0)` ran and says
+    /// nothing about the registration beside it — so moving the registration
+    /// out of the `pre_exec` closure and into the parent's `register` left
+    /// every test passing while re-opening the window the design closes: a
+    /// coordinator SIGKILLed between `spawn` returning and parent-side
+    /// registration leaves a running group no reaper will settle.
+    ///
+    /// The oracle is that window itself. The supervisor is dropped in exactly
+    /// that state — child spawned, parent registration never performed — and
+    /// the group has to be settled anyway. Everything the reaper can know here
+    /// it learned from the child.
+    #[cfg(unix)]
+    #[test]
+    // `try_wait` in the loop and `kill` + `wait` in the fallback do settle the
+    // child on every path; the lint does not model `try_wait`.
+    #[allow(clippy::zombie_processes)]
+    fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        supervisor.prepare(&mut command);
+        let mut child = command
+            .spawn()
+            .expect("spawn a child that outlives the parent's window");
+        let pid = child.id();
+        assert!(
+            child_leads_its_own_group(pid),
+            "the pre-exec closure did not run at all, so this witnesses nothing"
+        );
+
+        // Not registered by the parent: this is the prefix the packet says
+        // must not exist unregistered. Dropping here is the coordinator dying
+        // in that window, and `Drop` in the `Spawning` phase cancels the
+        // reaper — which settles whatever the reaper knows about.
+        drop(supervisor);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut settled = None;
+        while Instant::now() < deadline {
+            match child.try_wait().expect("poll the child") {
+                Some(status) => {
+                    settled = Some(status);
+                    break;
+                }
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let reaped_before_the_deadline = settled.is_some();
+        if settled.is_none() {
+            // Do not leak a 60-second sleeper into the rest of the suite when
+            // this fails.
+            let _ = child.kill();
+            settled = child.wait().ok();
+        }
+        assert!(
+            reaped_before_the_deadline,
+            "the child's group outlived a cancelled reaper: nothing registered it, so the \
+             registration is not happening in the child before exec"
+        );
+        let status = settled.expect("the child could not be waited on at all");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the group was settled by something other than the reaper: {status:?}"
         );
     }
 
@@ -3536,6 +5922,585 @@ mod tests {
             !leaked,
             "the timed-out process group's background grandchild survived"
         );
+    }
+
+    /// Whether every writer of `fd`'s pipe is gone, asked of the kernel and
+    /// answered now.
+    ///
+    /// A dead process holds no descriptors, so an immediate `EOF` from a
+    /// non-blocking read is exactly "nothing that inherited this pipe is still
+    /// running" — and unlike `kill(pid, 0)` it is not answered `Ok` by a
+    /// zombie waiting for its reparented reaper. `EAGAIN` is the other answer:
+    /// somebody still holds the write end.
+    ///
+    /// **Bytes are not an answer, so they are drained rather than counted.**
+    /// `read` returns how many bytes it moved, and this used to compare that
+    /// against zero: one byte of anything on the child's stderr — a shell
+    /// diagnostic, a linker warning, a locale complaint, none of which this
+    /// fixture controls on every platform — then reads as "a writer is still
+    /// there" for as long as the byte sits in the pipe, which is forever. EOF
+    /// is a property of the pipe once it is empty, so emptying it first is
+    /// what makes this question the one the caller means.
+    #[cfg(unix)]
+    fn every_pipe_writer_is_gone(fd: libc::c_int) -> bool {
+        let mut buffer = [0_u8; 256];
+        loop {
+            // SAFETY: `fd` is a live non-blocking read end owned by this test
+            // and `buffer` is a writable buffer of the length passed.
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            match read {
+                // EOF: no descriptor for the write end exists anywhere.
+                0 => return true,
+                // Somebody wrote. Not an answer either way — drain and re-ask.
+                1.. => (),
+                // `EAGAIN` (a writer holds it) or `EINTR` (ask again later).
+                _ => return false,
+            }
+        }
+    }
+
+    /// `kill_tree` settles the child's whole **group**, and does it before it
+    /// returns.
+    ///
+    /// This is the one path on Unix that reaches `kill_tree`, and no test drove
+    /// it: the explicit `kill(-pgid, SIGKILL)` could be deleted outright and
+    /// the suite stayed green, because everywhere the funnel *is* exercised the
+    /// per-invocation reaper settles the same group and either mechanism alone
+    /// satisfies every assertion. Nothing here starts a reaper, so `kill_tree`
+    /// is the only thing that can settle this group — which is what tells the
+    /// two apart.
+    ///
+    /// The oracle is `kill_tree`'s own doc comment turned into a question:
+    /// "the real agent process would survive, keep running, and **keep the
+    /// pipes open**". A group member that outlived the call still holds the
+    /// inherited stderr, so the read end is not at EOF.
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_settles_the_whole_unix_group_before_it_returns() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let scratch = std::env::temp_dir().join(format!(
+            "upstroke-kill-tree-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let ready = scratch.join("ready");
+        // Staged and renamed, not written in place. The waiter below polls for
+        // the path, and a path that is created and then filled is observable
+        // before the state it stands for (CODING_STANDARDS.md §12).
+        let mut command = shell(
+            "sh -c 'printf \"ready\\n\" > \"$UPSTROKE_READY.publishing\"; \
+             mv \"$UPSTROKE_READY.publishing\" \"$UPSTROKE_READY\"; sleep 60' & sleep 60",
+        );
+        command
+            .env("UPSTROKE_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        // SAFETY: the closure calls one async-signal-safe syscall. The group is
+        // what `kill_tree` targets, so the fixture must have one of its own.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut tree =
+            ProcessTree::spawn(&mut command, &mut NoHooks).expect("spawn a group leader");
+        let pgid = i32::try_from(tree.child.id()).expect("pid fits");
+        let stderr = tree.child.stderr.take().expect("piped stderr");
+        let fd = stderr.as_raw_fd();
+        // SAFETY: `fd` is owned by `stderr`, which outlives this call.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        // Producer-aware: the direct child is the only liveness fact a file
+        // signal has, and a fixture whose `sh` never started would otherwise
+        // have spent the whole bound before saying so.
+        let published = readiness::await_signal(&ready, &mut tree.child, Duration::from_secs(10))
+            .or_fail("the grandchild never started");
+        assert_eq!(
+            published,
+            ["ready"],
+            "the marker became visible with its content, not before it"
+        );
+        assert!(
+            !every_pipe_writer_is_gone(fd),
+            "the fixture holds no pipe, so this test would pass vacuously"
+        );
+
+        kill_tree(ProcessSite::Terminate, &mut tree).expect("settle the group");
+        // Bounded rather than instantaneous, and the bound is the kernel's:
+        // `kill(-pgid, SIGKILL)` returns as soon as the signals are queued, so
+        // a member can still be tearing down when this line runs. What the
+        // bound cannot absorb is a member that was never signalled — the
+        // fixture's survivors sleep for a minute.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut settled = every_pipe_writer_is_gone(fd);
+        while !settled && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            settled = every_pipe_writer_is_gone(fd);
+        }
+        // SAFETY: a negative pid names the group; this is cleanup for the
+        // failing case and a no-op for the passing one.
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        }
+        drop(stderr);
+        drop(tree);
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            settled,
+            "kill_tree returned while a member of the child's process group was still \
+             running and still holding its pipes: only the direct child was killed"
+        );
+    }
+
+    /// A direct child that exits successfully does not leave its group behind.
+    ///
+    /// `successful_direct_exit_still_kills_detached_group_members` plants a
+    /// detached grandchild and then sleeps 1.3 s before looking, so a
+    /// settlement that happened *after* the supervisor returned would still
+    /// pass it. This one asks inside the supervisor's own window: the
+    /// grandchild writes to the inherited stdout after a second, and the
+    /// funnel's post-exit drain grace is two, so a grandchild that outlived the
+    /// return lands in the transcript the caller is given.
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_direct_exit_settles_its_group_before_the_transcript_is_collected() {
+        let out = run_with_timeout(
+            shell("sh -c 'sleep 1; printf ESCAPED' & exit 0"),
+            "",
+            Duration::from_secs(30),
+        )
+        .expect("spawn shell");
+        assert_eq!(out.code, Some(0), "{out:?}");
+        assert!(
+            !out.stdout.contains("ESCAPED"),
+            "a grandchild outlived the successful direct child and wrote into its \
+             transcript: {}",
+            out.stdout
+        );
+    }
+
+    /// Every Unix containment point, measured against the operation it is named
+    /// for rather than against the other points.
+    ///
+    /// The Unix half of the same gap: `containment_sub_effects` says "ST-07
+    /// evidence executes each point **on its platform**", and the suite checked
+    /// that these four exist, are declared Unix, and fire in the packet's order
+    /// relative to each other — never that the thing each one is named for had
+    /// happened. `ReaperStarted` says the per-invocation reaper is forked *and
+    /// holding R28*; `PreExecPgidAndRegister` says the child leads its own
+    /// group; `Registered` says the parent has it. Each could move to the wrong
+    /// side of its own operation and stay green.
+    ///
+    /// The oracles are outside this crate wherever one exists: `getpgid` for
+    /// the group (`child_leads_its_own_group`, already the pattern for one
+    /// point and now for all of them) and `flock` for the hold — R28's own
+    /// primitive, asked from the coordinator while the reaper owns it.
+    #[cfg(unix)]
+    #[test]
+    fn every_unix_containment_point_is_measured_against_its_own_operation() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Row {
+            point: SubEffectPoint,
+            /// Whether the child exists yet, from `child_created`.
+            child_known: bool,
+            /// `getpgid(pid) == pid`, or `None` before there is a pid.
+            leads_own_group: Option<bool>,
+            /// How many times this child's pgid appears in parent state.
+            registered: usize,
+            /// Whether an exclusive probe of R28 is refused right now.
+            cleanup_hold_taken: bool,
+        }
+
+        #[derive(Clone)]
+        struct Observer {
+            pid: Arc<Mutex<Option<u32>>>,
+            rows: Arc<Mutex<Vec<Row>>>,
+            cleanup: std::ffi::CString,
+        }
+
+        impl Observer {
+            /// Whether somebody holds R28 shared, asked with R28's own
+            /// primitive from a descriptor this test opened.
+            fn hold_taken(&self) -> bool {
+                // SAFETY: a null-terminated path this test built; a failure
+                // returns a negative descriptor.
+                let fd =
+                    unsafe { libc::open(self.cleanup.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    return false;
+                }
+                // SAFETY: `fd` is live and owned here until the close below.
+                unsafe {
+                    let free = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0;
+                    if free {
+                        let _ = libc::flock(fd, libc::LOCK_UN);
+                    }
+                    let _ = libc::close(fd);
+                    !free
+                }
+            }
+        }
+
+        impl SpawnHooks for Observer {
+            fn child_created(&mut self, pid: u32) {
+                *self.pid.lock().expect("pid") = Some(pid);
+            }
+
+            fn point(&mut self, point: SubEffectPoint) -> Injection {
+                let pid = *self.pid.lock().expect("pid");
+                let pgid = pid.and_then(|pid| i32::try_from(pid).ok());
+                let row = Row {
+                    point,
+                    child_known: pid.is_some(),
+                    leads_own_group: pid.map(child_leads_its_own_group),
+                    registered: pgid.map_or(0, |pgid| {
+                        termination::registered_groups()
+                            .iter()
+                            .filter(|group| **group == pgid)
+                            .count()
+                    }),
+                    cleanup_hold_taken: self.hold_taken(),
+                };
+                self.rows.lock().expect("rows").push(row);
+                Injection::Proceed
+            }
+        }
+
+        // A run directory with a live cleanup lease, so the reaper has an R28
+        // to take. Without one `lock_cleanup_paths` is handed an empty list and
+        // the hold this test is about does not exist.
+        let public = std::env::temp_dir().join(format!(
+            "upstroke-r28-points-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        std::fs::create_dir_all(&public).expect("run directory");
+        let lock = crate::rundir::RunLock::acquire(&public).expect("take the run lock");
+        let scope = lock.enter_cleanup_scope();
+        let paths = crate::rundir::active_cleanup_lease_paths();
+        assert_eq!(
+            paths.len(),
+            1,
+            "exactly one cleanup lease is active: {paths:?}"
+        );
+        let cleanup =
+            std::ffi::CString::new(paths[0].as_os_str().as_bytes()).expect("path without a null");
+
+        let observer = Observer {
+            pid: Arc::new(Mutex::new(None)),
+            rows: Arc::new(Mutex::new(Vec::new())),
+            cleanup,
+        };
+        assert!(
+            !observer.hold_taken(),
+            "R28 is already held before the reaper exists, so this test proves nothing"
+        );
+        let mut hooks = observer.clone();
+        let output = run_with_timeout_at(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            shell("exit 0"),
+            b"",
+            Duration::from_secs(30),
+            &mut hooks,
+        )
+        .expect("run through the funnel");
+        assert_eq!(output.code, Some(0), "{output:?}");
+        drop(scope);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&public);
+
+        let observed = observer.rows.lock().expect("rows");
+        let expected = vec![
+            Row {
+                point: SubEffectPoint::ReaperStarted,
+                child_known: false,
+                leads_own_group: None,
+                registered: 0,
+                cleanup_hold_taken: true,
+            },
+            Row {
+                point: SubEffectPoint::PreExecPgidAndRegister,
+                child_known: true,
+                leads_own_group: Some(true),
+                registered: 0,
+                cleanup_hold_taken: true,
+            },
+            Row {
+                point: SubEffectPoint::Exec,
+                child_known: true,
+                leads_own_group: Some(true),
+                registered: 0,
+                cleanup_hold_taken: true,
+            },
+            Row {
+                point: SubEffectPoint::Registered,
+                child_known: true,
+                leads_own_group: Some(true),
+                registered: 1,
+                cleanup_hold_taken: true,
+            },
+        ];
+        assert_eq!(
+            *observed, expected,
+            "a containment point no longer sits at the coordinate it names"
+        );
+    }
+
+    /// Where the four Unix containment points are compiled in.
+    ///
+    /// `os_matrix` states the invariant for **all** Unix — "Linux and macOS
+    /// (`cfg(unix)`): the cleanup reaper survives coordinator death, settles
+    /// the dead coordinator's process groups while holding R28" — not for
+    /// Linux. Narrowing any of these gates to `target_os = "linux"` would take
+    /// macOS out of the containment contract, and no test on this box or on the
+    /// Windows guest would notice: the emission would simply stop existing on a
+    /// platform neither of them is. CI does run `macos-latest`, so this is an
+    /// ordinary coverage gap rather than an unmeasurable one, and a census
+    /// closes it without a macOS machine.
+    ///
+    /// The reaper's own `target_os` gates are a different thing and stay: the
+    /// group scanner reads `/proc` on Linux and asks `/bin/ps` on macOS, which
+    /// is two implementations of one behaviour, not one platform dropped.
+    #[cfg(unix)]
+    #[test]
+    fn every_unix_containment_point_is_gated_on_unix_and_not_on_one_unix() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent/proc.rs"),
+        )
+        .expect("read the funnel's own source");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut gates: Vec<(&str, &str)> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            const CALL: &str = "hooks.point(SubEffectPoint::";
+            let Some(at) = line.find(CALL) else {
+                continue;
+            };
+            let Some(point) = line[at + CALL.len()..].split(')').next() else {
+                continue;
+            };
+            // The nearest preceding attribute is the gate this emission is
+            // compiled behind.
+            let gate = lines[..index]
+                .iter()
+                .rev()
+                .find(|earlier| earlier.trim_start().starts_with("#[cfg("))
+                .map(|earlier| earlier.trim())
+                .unwrap_or("<none>");
+            gates.push((point, gate));
+        }
+
+        let expected = vec![
+            ("ReaperStarted", "#[cfg(unix)]"),
+            ("PreExecPgidAndRegister", "#[cfg(unix)]"),
+            ("Exec", "#[cfg(unix)]"),
+            ("Registered", "#[cfg(unix)]"),
+        ];
+        let unix_gates: Vec<(&str, &str)> = gates
+            .into_iter()
+            .filter(|(point, _)| {
+                matches!(
+                    *point,
+                    "ReaperStarted" | "PreExecPgidAndRegister" | "Exec" | "Registered"
+                )
+            })
+            .collect();
+        assert_eq!(
+            unix_gates, expected,
+            "a Unix containment point is compiled behind something other than \
+             `cfg(unix)`; `os_matrix` says Linux **and macOS**"
+        );
+    }
+
+    /// A disposable coordinator that leaves a non-`exec` fork holding the
+    /// reaper's command pipe, then is hard-killed.
+    ///
+    /// The fork is the whole fixture: descriptors survive `fork` whether or not
+    /// they are `CLOEXEC`, so this process's death closes no write end and the
+    /// reaper never sees EOF. What it does see is reparenting.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)]
+    fn unix_reaper_reparent_helper() {
+        if std::env::var_os("UPSTROKE_UNIX_REPARENT").is_none() {
+            return;
+        }
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
+        let agent =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_AGENT").expect("agent path"));
+        let mut supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 120"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        supervisor.prepare(&mut command);
+        let child = command.spawn().expect("spawn an agent in its own group");
+        supervisor
+            .register(child.id())
+            .expect("register the agent group");
+        std::fs::write(&agent, child.id().to_string()).expect("record the agent pid");
+        // SAFETY: the forked child calls only `sleep` and `_exit`, both
+        // async-signal-safe, and never returns to the Rust runtime.
+        let forked = unsafe { libc::fork() };
+        if forked == 0 {
+            unsafe {
+                libc::sleep(120);
+                libc::_exit(0);
+            }
+        }
+        std::fs::write(&ready, forked.to_string()).expect("announce the pipe holder");
+        thread::sleep(Duration::from_secs(120));
+        // Unreachable in the fixture: the parent hard-kills this process.
+        std::mem::forget(supervisor);
+    }
+
+    /// The reaper settles its group on **reparenting**, without waiting for the
+    /// command pipe to close.
+    ///
+    /// `os_matrix`'s Unix half is stated for macOS as much as Linux, and on
+    /// Darwin an exec-racing descendant can retain a pipe writer, so EOF is not
+    /// a trustworthy parent-liveness signal — which is why `reaper_loop` polls
+    /// `getppid()` at all. That check is invisible in every ordinary test
+    /// because the coordinator's death closes the pipe too. Here a fork that
+    /// never execs holds the write end open, so EOF never arrives and the
+    /// reparenting check is the only thing that can settle the group.
+    #[cfg(unix)]
+    #[test]
+    fn the_reaper_settles_its_group_on_reparenting_without_waiting_for_pipe_eof() {
+        fn alive(pid: i32) -> bool {
+            // SAFETY: signal 0 performs no delivery; it only asks whether the
+            // pid can be signalled.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+        fn read_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never carried a pid",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let scratch = std::env::temp_dir().join(format!(
+            "upstroke-reparent-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let ready = scratch.join("ready");
+        let agent = scratch.join("agent");
+        let mut coordinator = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["unix_reaper_reparent_helper", "--ignored", "--nocapture"])
+            .env("UPSTROKE_UNIX_REPARENT", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_AGENT", &agent)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a disposable coordinator");
+        let holder = read_pid(&ready, Duration::from_secs(20));
+        let agent_pid = read_pid(&agent, Duration::from_secs(20));
+        assert!(alive(agent_pid), "the agent never started");
+
+        coordinator
+            .kill()
+            .expect("hard-kill the disposable coordinator");
+        coordinator.wait().expect("reap the disposable coordinator");
+        assert!(
+            alive(holder),
+            "the pipe holder died with its parent, so no EOF was withheld and \
+             this test would pass without the reparenting check"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive(agent_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let settled = !alive(agent_pid);
+        // SAFETY: cleanup for the failing case, a no-op for the passing one.
+        unsafe {
+            let _ = libc::kill(holder, libc::SIGKILL);
+            let _ = libc::kill(agent_pid, libc::SIGKILL);
+            let _ = libc::kill(-agent_pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            settled,
+            "the reaper waited for a pipe EOF that a surviving fork will never \
+             deliver: on Darwin that is an agent group nothing settles"
+        );
+    }
+
+    /// A **real** ambient-job failure refuses the write command.
+    ///
+    /// `crash_reconstruction`: "if the ambient job cannot be created or joined
+    /// the write command refuses at startup with a diagnostic before any
+    /// workspace effect (no degraded mode; deferred)". The suite's other
+    /// ambient failure is the harness injection, and that fires *before* this
+    /// step — so the branch that carries a real `join_ambient` error was
+    /// unwitnessed, and deleting it (`let _ = windows_job::join_ambient();`)
+    /// left `run` and `resume` dispatching with no ambient job while every
+    /// test stayed green.
+    ///
+    /// The two failures are told apart by their wording, which is the point:
+    /// an injected failure must not be able to stand in for the real one.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_ambient_join_failure_refuses_the_write_command() {
+        let error = join_ambient_job_with(&mut NoHooks, || {
+            Err("it could not be created (simulated OS failure)".to_owned())
+        })
+        .expect_err("a failed ambient join must refuse the write command");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(AMBIENT_REFUSAL_PREFIX),
+            "the refusal must carry the diagnostic: {message}"
+        );
+        assert!(
+            message.contains("simulated OS failure"),
+            "the OS's own reason must survive into the refusal: {message}"
+        );
+        assert!(
+            message.contains("No process was spawned"),
+            "the refusal must say nothing was started: {message}"
+        );
+        assert!(
+            !message.contains(AMBIENT_REFUSAL_SIMULATED),
+            "a real failure was reported as the injected one: {message}"
+        );
+        assert!(
+            matches!(error, UpstrokeError::Refused { .. }),
+            "a refusal, not an agent error: {error:?}"
+        );
+
+        // And a join that succeeds is not turned into a refusal.
+        join_ambient_job_with(&mut NoHooks, || Ok(())).expect("a successful ambient join proceeds");
     }
 
     #[cfg(windows)]
@@ -3677,6 +6642,512 @@ mod tests {
             !leaked,
             "kill-on-close did not terminate the owned descendant"
         );
+    }
+
+    /// `{pid} {creation_time}` for this process.
+    ///
+    /// A pid alone is not an identity — Windows reuses them — so a test that
+    /// asks "is it gone" by pid could be answered by an unrelated process that
+    /// inherited the number.
+    #[cfg(windows)]
+    fn windows_self_identity() -> String {
+        let pid = std::process::id();
+        let created = process_creation_time(pid).expect("this process has a creation time");
+        format!("{pid} {created}")
+    }
+
+    #[cfg(windows)]
+    fn read_windows_identity(path: &std::path::Path, timeout: Duration) -> (u32, u64) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let mut fields = text.split_whitespace();
+                if let (Some(pid), Some(created)) = (fields.next(), fields.next()) {
+                    if let (Ok(pid), Ok(created)) = (pid.parse(), created.parse()) {
+                        return (pid, created);
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never carried a process identity",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A grandchild that reports the moment it outlives the process Upstroke
+    /// waits on.
+    ///
+    /// It announces its own identity, then polls for the direct child's death
+    /// and writes `ESCAPED` to the **inherited stderr** only after observing it
+    /// gone three times 30 ms apart. `TerminateJobObject` ends every member of
+    /// the job at once, so a contained grandchild cannot survive that 90 ms
+    /// window; one whose parent alone was killed survives the whole drain grace
+    /// and is captured. stderr rather than stdout because the output-limit
+    /// fixture deliberately fills stdout past the point where the drain stops
+    /// retaining what it reads.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn windows_escape_watcher_helper() {
+        use std::io::Write;
+
+        if std::env::var_os("UPSTROKE_WINDOWS_WATCHER").is_none() {
+            return;
+        }
+        let ready = std::env::var_os("UPSTROKE_READY").expect("ready path");
+        let parent: u32 = std::env::var("UPSTROKE_PARENT_PID")
+            .expect("parent pid")
+            .parse()
+            .expect("parent pid");
+        let created: u64 = std::env::var("UPSTROKE_PARENT_CREATED")
+            .expect("parent creation time")
+            .parse()
+            .expect("parent creation time");
+        std::fs::write(ready, windows_self_identity()).expect("announce the watcher");
+        let mut gone = 0_u8;
+        for _ in 0..2000 {
+            if process_alive(parent, created) {
+                gone = 0;
+            } else {
+                gone += 1;
+            }
+            if gone >= 3 {
+                eprint!("ESCAPED");
+                let _ = std::io::stderr().flush();
+                // Long enough that a bounded wait for termination cannot be
+                // satisfied by this process simply finishing.
+                thread::sleep(Duration::from_secs(90));
+                return;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    /// The direct child of the two Windows escape fixtures: start the watcher,
+    /// wait for it, then either fill stdout or wait to be timed out.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)]
+    fn windows_escape_parent_helper() {
+        use std::io::Write;
+
+        if std::env::var_os("UPSTROKE_WINDOWS_ESCAPE_PARENT").is_none() {
+            return;
+        }
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
+        let pid = std::process::id();
+        let created = process_creation_time(pid).expect("own creation time");
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args(["windows_escape_watcher_helper", "--ignored", "--nocapture"])
+            .env("UPSTROKE_WINDOWS_WATCHER", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_PARENT_PID", pid.to_string())
+            .env("UPSTROKE_PARENT_CREATED", created.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the escape watcher");
+        wait_for_marker(&ready, Duration::from_secs(20));
+        if std::env::var_os("UPSTROKE_MODE").is_some_and(|mode| mode == "flood") {
+            let block = vec![b'x'; 8192];
+            let mut out = std::io::stdout();
+            while out.write_all(&block).is_ok() && out.flush().is_ok() {}
+            return;
+        }
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Whether `pid` is *still* running after a bounded wait.
+    ///
+    /// The supervisor drops its `ProcessTree` before it returns, so by the time
+    /// a caller can look, termination is under way by one route or another and
+    /// a process in the middle of its exit path can still answer "alive" for a
+    /// few milliseconds. The bound absorbs that and nothing else: an escaped
+    /// grandchild in these fixtures outlives it by ninety seconds.
+    ///
+    /// This is the secondary witness. The primary one is the `ESCAPED` sentinel
+    /// in the captured transcript, which is exact and unbounded — a contained
+    /// grandchild never writes it at all.
+    #[cfg(windows)]
+    fn still_running_after(pid: u32, created: u64, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        while process_alive(pid, created) {
+            if Instant::now() >= deadline {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    fn windows_escape_command(ready: &std::path::Path, mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["windows_escape_parent_helper", "--ignored", "--nocapture"])
+            .env("UPSTROKE_WINDOWS_ESCAPE_PARENT", "1")
+            .env("UPSTROKE_READY", ready)
+            .env("UPSTROKE_MODE", mode);
+        command
+    }
+
+    /// `kill_tree` settles the whole job **before it returns**, and the job it
+    /// settles is this invocation's own.
+    ///
+    /// Both properties are invisible through the funnel, and for the same
+    /// reason: `ProcessTree` is dropped inside the supervisor, and
+    /// `KILL_ON_JOB_CLOSE` then terminates every descendant with no help from
+    /// any code under test. So both a cleanup that never terminated the job and
+    /// a cleanup that terminated only the direct child by pid look, from
+    /// outside, exactly like this one. Here the tree is still alive at the
+    /// assertion — the handle is open and the fail-safe has not fired — so
+    /// whatever settled the grandchild was `kill_tree` itself.
+    ///
+    /// The private job's separate identity is the other half: DESIGN.md:402's
+    /// "private per-invocation jobs scope timeouts" is a claim about *which*
+    /// job, and the coordinator is a member of the ambient one. A tree that
+    /// carried the ambient handle instead would answer this query the other
+    /// way — and would terminate the coordinator on the next timeout.
+    #[cfg(windows)]
+    #[test]
+    fn kill_tree_observes_the_windows_job_empty_before_it_returns() {
+        let scratch = windows_tree_scratch("kill-tree");
+        let ready = scratch.join("ready");
+        let mut command = windows_escape_command(&ready, "sleep");
+        command.stdin(Stdio::null());
+        let mut tree = ProcessTree::spawn(&mut command, &mut NoHooks).expect("spawn a tree");
+        let (pid, created) = read_windows_identity(&ready, Duration::from_secs(30));
+        assert!(process_alive(pid, created), "the grandchild never ran");
+        assert_eq!(
+            tree.job.contains(tree.child.id()),
+            Some(true),
+            "the direct child is not in the job that owns its tree"
+        );
+        // Read the answer before acting on it. If the coordinator really is a
+        // member, *closing* this handle terminates this process — so a plain
+        // `assert_eq!` would unwind, drop the job, and take the report with it:
+        // the run ends with `running 1 test` and no result line, which reads
+        // like infrastructure rather than like this assertion. Leak the handle
+        // instead, and fail in words.
+        if tree.job.contains(std::process::id()) != Some(false) {
+            std::mem::forget(tree);
+            let _ = std::fs::remove_dir_all(&scratch);
+            panic!(
+                "the coordinator is a member of the per-invocation job: a timeout \
+                 on one invocation would terminate the coordinator and every other \
+                 invocation with it"
+            );
+        }
+
+        kill_tree(ProcessSite::Terminate, &mut tree).expect("settle the tree");
+        // Bounded rather than instantaneous: a job the kernel has already
+        // emptied can still be running the last of its exit paths when this
+        // line does. What the bound cannot absorb is a member that was never
+        // terminated — the fixture's grandchild outlives it by a minute either
+        // way. `tree` is still alive throughout, so KILL_ON_JOB_CLOSE has not
+        // fired and cannot be what settled anything.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut escaped = process_alive(pid, created);
+        while escaped && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            escaped = process_alive(pid, created);
+        }
+        let in_job = tree.job.contains(pid);
+        drop(tree);
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !escaped,
+            "kill_tree returned while a member of the job was still running \
+             (grandchild in this job: {in_job:?}): the job was never observed empty"
+        );
+    }
+
+    /// The Windows timeout path, watched from the grandchild.
+    ///
+    /// `timeout_kills_the_process_tree_quickly` reaches this branch on Windows
+    /// but only ever asks about the direct child; the test that looks for the
+    /// grandchild is `#[cfg(unix)]`. This is its Windows sibling.
+    #[cfg(windows)]
+    #[test]
+    fn timeout_kills_a_windows_grandchild_before_it_can_escape() {
+        let scratch = windows_tree_scratch("timeout-escape");
+        let ready = scratch.join("ready");
+        let output = run_with_timeout(
+            windows_escape_command(&ready, "sleep"),
+            "",
+            Duration::from_secs(3),
+        )
+        .expect("supervise the tree");
+        let (pid, created) = read_windows_identity(&ready, Duration::from_secs(30));
+        let escaped = still_running_after(pid, created, Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(output.timed_out, "{output:?}");
+        assert!(
+            !output.stderr.contains("ESCAPED"),
+            "a Windows grandchild outlived its timed-out tree: {}",
+            output.stderr
+        );
+        assert!(
+            !escaped,
+            "the grandchild was still running when the supervisor returned"
+        );
+    }
+
+    /// And the output-limit path settles the same tree the same way.
+    ///
+    /// `invariants_preserved[0]` is "process supervision, timeout, output
+    /// capture … unchanged (host contract: ordinary descendants only)": the
+    /// allowance branch is not a lesser kind of termination. Its fixture fills
+    /// **stdout**, so the escape sentinel goes to stderr, which keeps its own
+    /// allowance and therefore keeps retaining.
+    #[cfg(windows)]
+    #[test]
+    fn the_output_limit_path_settles_a_windows_grandchild_too() {
+        let scratch = windows_tree_scratch("limit-escape");
+        let ready = scratch.join("ready");
+        let output = run_with_timeout_and_limit(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
+            windows_escape_command(&ready, "flood"),
+            b"",
+            Duration::from_secs(60),
+            64 * 1024,
+            &mut NoHooks,
+        )
+        .expect("supervise the tree");
+        let (pid, created) = read_windows_identity(&ready, Duration::from_secs(30));
+        let escaped = still_running_after(pid, created, Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(output.output_limited, "{output:?}");
+        assert!(
+            !output.stderr.contains("ESCAPED"),
+            "a Windows grandchild outlived an output-limited tree: {}",
+            output.stderr
+        );
+        assert!(
+            !escaped,
+            "the grandchild was still running when the supervisor returned"
+        );
+    }
+
+    /// Every Windows containment point, measured against the operation it is
+    /// named for rather than against the other points.
+    ///
+    /// `containment_sub_effects` says "ST-07 evidence executes each point **on
+    /// its platform**", and the three per-spawn Windows points make claims the
+    /// suite could only check by name and relative order: `CreatedSuspended`
+    /// says the child exists and is not yet in the private job,
+    /// `PrivateJobAssigned` says it is in the private job and *still
+    /// suspended*, `Resumed` says it is not. Each could be moved to the wrong
+    /// side of its own operation and stay green.
+    ///
+    /// The oracles are the kernel's, following `child_leads_its_own_group`:
+    /// `SuspendThread`'s returned count for suspension, `IsProcessInJob` for
+    /// membership — the membership question asked of a handle captured through
+    /// the assignment seam, so a hook that fires before the assignment has no
+    /// handle to ask about. The child's first instruction is a third,
+    /// end-to-end witness: a suspended process cannot write it in any amount of
+    /// time, so the two pre-resume points sample it after a grace rather than
+    /// instantaneously.
+    ///
+    /// The expected table is transcribed from that sentence, not read back.
+    #[cfg(windows)]
+    #[test]
+    fn every_windows_containment_point_is_measured_against_its_own_operation() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Row {
+            point: SubEffectPoint,
+            suspended: bool,
+            assignment_made: bool,
+            in_private_job: Option<bool>,
+            /// `None` at `Resumed`: after the resume the child is free to run,
+            /// so neither answer would mean anything.
+            first_instruction_ran: Option<bool>,
+        }
+
+        struct Shared {
+            pid: Option<u32>,
+            job: Option<HANDLE>,
+            first_instruction: std::path::PathBuf,
+            rows: Vec<Row>,
+        }
+
+        struct Observer(Rc<RefCell<Shared>>);
+
+        impl SpawnHooks for Observer {
+            fn child_created(&mut self, pid: u32) {
+                self.0.borrow_mut().pid = Some(pid);
+            }
+
+            fn point(&mut self, point: SubEffectPoint) -> Injection {
+                if point != SubEffectPoint::Resumed {
+                    // Turn absence-at-an-instant into an observation: a running
+                    // child writes its first instruction in milliseconds.
+                    thread::sleep(Duration::from_millis(250));
+                }
+                let mut shared = self.0.borrow_mut();
+                let pid = shared.pid.expect("the child exists at every point");
+                let job = shared.job;
+                let suspended = windows_job::primary_thread_suspend_count(pid)
+                    .expect("read the child's suspend count")
+                    > 0;
+                let first_instruction_ran = if point == SubEffectPoint::Resumed {
+                    None
+                } else {
+                    Some(shared.first_instruction.exists())
+                };
+                let row = Row {
+                    point,
+                    suspended,
+                    assignment_made: job.is_some(),
+                    in_private_job: job.and_then(|job| windows_job::job_contains(job, pid)),
+                    first_instruction_ran,
+                };
+                shared.rows.push(row);
+                Injection::Proceed
+            }
+        }
+
+        let scratch = windows_tree_scratch("point-coordinates");
+        let ready = scratch.join("ready");
+        let marker = scratch.join("marker");
+        let shared = Rc::new(RefCell::new(Shared {
+            pid: None,
+            job: None,
+            first_instruction: ready.clone(),
+            rows: Vec::new(),
+        }));
+        let mut command = windows_descendant_command(&ready, &marker);
+        let mut hooks = Observer(Rc::clone(&shared));
+        let assign_shared = Rc::clone(&shared);
+        let (mut child, job) = windows_job::spawn_suspended_in_job_with(
+            &mut command,
+            &mut hooks,
+            move |job, process| {
+                assign_shared.borrow_mut().job = Some(job);
+                windows_job::real_assign_to_job(job, process)
+            },
+            windows_job::resume_only_thread,
+        )
+        .expect("spawn a suspended child");
+
+        // The positive control: the absences above were suspension, not a
+        // helper that never runs.
+        wait_for_marker(&ready, Duration::from_secs(20));
+        let _ = job.terminate_and_wait();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        let observed = &shared.borrow().rows;
+        let expected = vec![
+            Row {
+                point: SubEffectPoint::CreatedSuspended,
+                suspended: true,
+                assignment_made: false,
+                in_private_job: None,
+                first_instruction_ran: Some(false),
+            },
+            Row {
+                point: SubEffectPoint::PrivateJobAssigned,
+                suspended: true,
+                assignment_made: true,
+                in_private_job: Some(true),
+                first_instruction_ran: Some(false),
+            },
+            Row {
+                point: SubEffectPoint::Resumed,
+                suspended: false,
+                assignment_made: true,
+                in_private_job: Some(true),
+                first_instruction_ran: None,
+            },
+        ];
+        assert_eq!(
+            *observed, expected,
+            "a containment point no longer sits at the coordinate it names"
+        );
+    }
+
+    /// The two spawn steps that can fail after the child exists leave nothing
+    /// behind.
+    ///
+    /// R22: "created as an ambient-job member, so a coordinator death at any
+    /// spawn sub-step **incl. the create-suspended prefix** terminates it".
+    /// Neither `AssignProcessToJobObject` nor `ResumeThread` fails on a working
+    /// machine, so both recovery branches — terminate the private job, kill the
+    /// child, wait for it — were unreachable, and either could have returned
+    /// the error while leaving a suspended stub that nothing owns.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_spawn_that_fails_after_creation_leaves_no_suspended_stub() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Capture(Rc<RefCell<Option<(u32, u64)>>>);
+
+        impl SpawnHooks for Capture {
+            fn point(&mut self, _point: SubEffectPoint) -> Injection {
+                Injection::Proceed
+            }
+
+            fn child_created(&mut self, pid: u32) {
+                let created = process_creation_time(pid).expect("the child has a creation time");
+                *self.0.borrow_mut() = Some((pid, created));
+            }
+        }
+
+        for (step, assign, resume) in [
+            (
+                "private-job assignment",
+                None,
+                None::<fn(u32) -> std::io::Result<()>>,
+            ),
+            (
+                "resume",
+                Some(windows_job::real_assign_to_job as fn(_, _) -> i32),
+                Some(|_| Err(std::io::Error::other("simulated resume failure"))),
+            ),
+        ] {
+            let scratch = windows_tree_scratch("spawn-failure");
+            let ready = scratch.join("ready");
+            let marker = scratch.join("marker");
+            let seen = Rc::new(RefCell::new(None));
+            let mut hooks = Capture(Rc::clone(&seen));
+            let mut command = windows_descendant_command(&ready, &marker);
+            let error = windows_job::spawn_suspended_in_job_with(
+                &mut command,
+                &mut hooks,
+                move |job, process| assign.map_or(0, |assign| assign(job, process)),
+                move |pid| resume.map_or_else(|| windows_job::resume_only_thread(pid), |r| r(pid)),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a failed {step} must be a spawn failure"));
+            let (pid, created) = seen
+                .borrow()
+                .unwrap_or_else(|| panic!("the child was created before the {step}"));
+            let alive = process_alive(pid, created);
+            let ran = ready.exists();
+            let _ = std::fs::remove_dir_all(&scratch);
+            assert!(
+                !alive,
+                "a suspended stub outlived the failed {step} ({error}): pid {pid} is still running"
+            );
+            assert!(
+                !ran,
+                "the child executed although the {step} it was waiting behind failed"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4241,6 +7712,32 @@ mod tests {
         false
     }
 
+    /// Wait until the supervised worker has written its marker at least once.
+    ///
+    /// **Why this exists.** Every stop test sends its signal to the whole
+    /// process group immediately after spawn, and then reads the marker. If the
+    /// worker has not yet created it, the group is already stopped, the file can
+    /// never appear, and the first read fails `ENOENT` — for ever, not flakily.
+    /// `wait_for_stop` cannot cover this: it observes the *helper*, and says
+    /// nothing about whether the worker ever ran.
+    ///
+    /// Measured on PR6: `agent::proc::tests::uncatchable_sigstop_covers_the_isolated_tree`
+    /// failed on `macos-latest` with *"progress before signal 17: No such file
+    /// or directory"* on a tree whose suite had grown to 1243 macOS tests. The
+    /// race is PR4-era and pre-existing; it surfaced when the runner got busier.
+    /// A test that passes because a spawn usually wins a race is not a test.
+    #[cfg(unix)]
+    fn wait_for_first_progress(marker: &std::path::Path, context: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if marker.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the supervised worker never recorded progress before {context}");
+    }
+
     #[cfg(unix)]
     fn settled_progress_after_stop(marker: &std::path::Path, context: &str) -> String {
         // A process-group snapshot can report every member stopped while a
@@ -4475,6 +7972,7 @@ mod tests {
     fn assert_stop_covers_the_isolated_tree(signal: libc::c_int, tag: &str) {
         let mut helper = spawn_signal_helper(tag, true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, &format!("signal {signal}"));
         assert_eq!(unsafe { libc::kill(-pid, signal) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -4521,6 +8019,7 @@ mod tests {
     fn terminal_suspend_and_continue_cover_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "suspend interval");
         // SAFETY: `pid` is the id of the helper's dedicated process group, so
         // this models terminal foreground-group job control without touching
         // the surrounding test runner.
@@ -4562,6 +8061,7 @@ mod tests {
     fn an_inherited_blocked_sigcont_still_releases_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control-cont-blocked", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "blocked SIGCONT");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -4631,6 +8131,7 @@ mod tests {
     fn an_ignored_sighup_does_not_wake_a_suspended_tree() {
         let mut helper = spawn_signal_helper("job-control-nohup", true, true);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "ignored SIGHUP");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -4721,5 +8222,1064 @@ mod tests {
         let cmd = Command::new("upstroke-definitely-not-a-real-binary");
         let err = run_with_timeout(cmd, "", Duration::from_secs(1)).expect_err("must fail");
         assert!(err.to_string().contains("failed to spawn"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ST-16 (d) — the Unix reaper kills the dead coordinator's containers
+    // -----------------------------------------------------------------------
+
+    /// A disposable coordinator that arms the container scope, starts one
+    /// supervised agent, and then waits to be killed.
+    ///
+    /// A subprocess, because the claim is about what survives a coordinator's
+    /// death and this test process must survive to assert it. The `docker` the
+    /// scope names is a **recording stub**, so the argument vectors the reaper
+    /// actually execs are readable afterwards and the assertion is on a
+    /// sequence rather than on "a container went away".
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)]
+    fn unix_reaper_container_helper() {
+        if std::env::var_os("UPSTROKE_REAPER_CONTAINERS").is_none() {
+            return;
+        }
+        let stub = std::path::PathBuf::from(std::env::var_os("UPSTROKE_STUB").expect("stub path"));
+        let root = std::path::PathBuf::from(std::env::var_os("UPSTROKE_ROOT").expect("root"));
+        let incarnation = std::env::var("UPSTROKE_INCARNATION").expect("incarnation");
+        let agent =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_AGENT").expect("agent path"));
+
+        let scope =
+            crate::runner::container::census::ReaperContainerScope::new(stub, &root, &incarnation)
+                .expect("a scope");
+        super::set_container_reclaim_scope(Some(&scope)).expect("arm the reaper");
+
+        let mut supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 120"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        supervisor.prepare(&mut command);
+        let child = command.spawn().expect("spawn an agent in its own group");
+        supervisor
+            .register(child.id())
+            .expect("register the agent group");
+        std::fs::write(&agent, child.id().to_string()).expect("record the agent pid");
+        if std::env::var_os("UPSTROKE_REAPER_CONTAINERS_CLEAN_EXIT").is_some() {
+            // The **live**-coordinator half: the invocation is settled the
+            // ordinary way and this process exits without dying.
+            drop(supervisor);
+            return;
+        }
+        thread::sleep(Duration::from_secs(120));
+        std::mem::forget(supervisor);
+    }
+
+    /// The Unix reaper kills the dead coordinator's labeled containers.
+    ///
+    /// ST-16 (d), and `os_matrix`: "the cleanup reaper survives coordinator
+    /// death, settles the dead coordinator's process groups **while holding
+    /// R28**, and **additionally kills the dead coordinator's labeled
+    /// containers**, closing the orphan window".
+    ///
+    /// Four claims, each separately droppable, and each asserted:
+    ///
+    /// 1. the selector names **both** `upstroke.private_root` and
+    ///    `upstroke.incarnation`, with two distinct values — a reaper that
+    ///    filtered on the private root alone would kill every container of every
+    ///    run under `<R>`, including a **live** coordinator's, which is exactly
+    ///    what `authoritative_state` forbids;
+    /// 2. the order is `ps` → `kill` → `rm --force`, taken from the stub's own
+    ///    ordered log;
+    /// 3. R28 is **still held** while the kill is in flight — the stub blocks
+    ///    inside `kill` and the reaper is observed alive there, so a reaper that
+    ///    released its hold and then reclaimed would fail;
+    /// 4. the agent group is settled too, so the container half did not replace
+    ///    the process half.
+    ///
+    /// **Second field held constant**: the fixture is run twice with the same
+    /// scope, the same stub and the same agent — the only thing that moves is
+    /// whether the coordinator **dies** or exits cleanly. On a clean exit the
+    /// stub is never invoked at all, which is the assertion that keeps a reaper
+    /// from killing a live coordinator's containers on the ordinary settle path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_reaper_kills_labeled_containers() {
+        const CONTAINER_ID: &str =
+            "c0ffee0000000000000000000000000000000000000000000000000000000001";
+        const PRIVATE_ROOT: &str = "/srv/upstroke-reaper-fixture/private";
+        const INCARNATION: &str = "01KZTAAAAAAAAAAAAAAAAAAAAA";
+
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "upstroke-reaper-containers-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            dir
+        }
+        fn alive(pid: i32) -> bool {
+            // SAFETY: signal 0 performs no delivery.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+        fn read_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never carried a pid",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if path.exists() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        // {program spelling} x {coordinator dies}. The **bare** cell is the
+        // production shape — `runner::container::DOCKER_PROGRAM` is the bare
+        // name `docker` — and here it is resolvable *only* through `PATH`: the
+        // stub is written into a scratch directory prepended to the
+        // coordinator's `PATH`, and nothing of that name exists in the working
+        // directory the coordinator inherits. `execv` does not search `PATH`,
+        // so this is the cell that dies when the resolution before the fork
+        // goes away; the path-spelled cell is what keeps a repair that resolved
+        // bare names from breaking the spelling that already worked.
+        //
+        // The fourth cell, {bare} x {lives}, is deliberately absent: on the
+        // clean-exit path the reaper execs nothing at all, so the spelling
+        // cannot discriminate there and the cell would assert the same absent
+        // log as the one beside it.
+        const STUB_NAME: &str = "upstroke-reaper-docker-stub";
+        for (bare, coordinator_dies) in [(true, true), (false, true), (false, false)] {
+            let cell = match (bare, coordinator_dies) {
+                (true, true) => "bare-dies",
+                (false, true) => "path-dies",
+                _ => "path-lives",
+            };
+            let dir = scratch(cell);
+            let stub = dir.join(STUB_NAME);
+            let log = dir.join("argv.log");
+            // A recording `docker`. It reports one container the first time it
+            // is listed and nothing once that container has been removed, which
+            // is what ends the reaper's bounded round loop. `kill` blocks so the
+            // R28 assertion has a window to observe.
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\n\
+                     printf '%s\\n' \"$*\" >> \"$UPSTROKE_STUB_DIR/argv.log\"\n\
+                     case \"$1\" in\n\
+                     ps) [ -f \"$UPSTROKE_STUB_DIR/removed\" ] || printf '%s\\n' '{CONTAINER_ID}' ;;\n\
+                     kill) : > \"$UPSTROKE_STUB_DIR/killing\"; sleep 1 ;;\n\
+                     rm) : > \"$UPSTROKE_STUB_DIR/removed\" ;;\n\
+                     esac\n\
+                     exit 0\n"
+                )
+                .replace("{CONTAINER_ID}", CONTAINER_ID),
+            )
+            .expect("write the stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the stub executable");
+            }
+
+            let agent_path = dir.join("agent");
+            let reaper_path = dir.join("reaper");
+            let named: std::path::PathBuf = if bare {
+                std::path::PathBuf::from(STUB_NAME)
+            } else {
+                stub.clone()
+            };
+            let mut coordinator = Command::new(std::env::current_exe().expect("test executable"));
+            coordinator
+                .args(["unix_reaper_container_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_REAPER_CONTAINERS", "1")
+                .env("UPSTROKE_STUB", &named)
+                .env("UPSTROKE_STUB_DIR", &dir)
+                .env("UPSTROKE_ROOT", PRIVATE_ROOT)
+                .env("UPSTROKE_INCARNATION", INCARNATION)
+                .env("UPSTROKE_AGENT", &agent_path)
+                .env("UPSTROKE_TEST_REAPER_PID_PATH", &reaper_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if bare {
+                // Only through `PATH`: the scratch directory first, the
+                // inherited entries after it so the stub's own `sleep` still
+                // resolves.
+                let inherited = std::env::var_os("PATH").unwrap_or_default();
+                let mut search = vec![dir.clone()];
+                search.extend(std::env::split_paths(&inherited));
+                coordinator.env(
+                    "PATH",
+                    std::env::join_paths(search).expect("a synthetic PATH"),
+                );
+            }
+            if !coordinator_dies {
+                coordinator.env("UPSTROKE_REAPER_CONTAINERS_CLEAN_EXIT", "1");
+            }
+            let mut coordinator = coordinator.spawn().expect("spawn a disposable coordinator");
+
+            let agent_pid = read_pid(&agent_path, Duration::from_secs(30));
+            let reaper_pid = read_pid(&reaper_path, Duration::from_secs(30));
+
+            if !coordinator_dies {
+                // The live half: the coordinator settles its invocation and
+                // exits. Nothing may have been killed on its behalf.
+                coordinator.wait().expect("reap the coordinator");
+                thread::sleep(Duration::from_millis(500));
+                assert!(
+                    !log.exists(),
+                    "the reaper reclaimed a LIVE coordinator's containers on the ordinary \
+                     settle path: {:?}",
+                    std::fs::read_to_string(&log)
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+
+            assert!(alive(agent_pid), "the agent never started");
+            coordinator.kill().expect("hard-kill the coordinator");
+            coordinator.wait().expect("reap the coordinator");
+
+            // (3) R28 is still held while the container kill is in flight.
+            assert!(
+                wait_for(&dir.join("killing"), Duration::from_secs(30)),
+                "[{cell}] the reaper never issued a container kill"
+            );
+            assert!(
+                alive(reaper_pid),
+                "the reaper exited — releasing its shared cleanup hold — before the container \
+                 kill it was in the middle of returned"
+            );
+
+            // (2) The order, from the stub's own ordered log.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let lines = loop {
+                let lines: Vec<String> = std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                if lines.len() >= 3 || Instant::now() >= deadline {
+                    break lines;
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                lines.len() >= 3,
+                "[{cell}] the reaper's docker log is {lines:#?}"
+            );
+            assert!(lines[0].starts_with("ps "), "{lines:#?}");
+            assert_eq!(lines[1], format!("kill {CONTAINER_ID}"), "{lines:#?}");
+            // The removal the reaper **actually executed**, against the
+            // declaration in `ReaperContainerScope::remove_argv` rather than
+            // against a literal repeated here (`PR6-ACCT-006`). The fork side
+            // builds its argv from `c"…"` literals that nothing can read back
+            // at runtime, so without this comparison the declaration and the
+            // behaviour are two self-consistent halves with nothing crossing
+            // them — the shape `PR6E-005` measured on the view path. `argv[0]`
+            // is dropped because the stub logs the arguments only.
+            //
+            // `--volumes` is what makes it the same removal `DockerCli::remove`
+            // issues: the reaper is the *only* thing that removes a dead
+            // coordinator's containers on Unix, and an `rm` without it leaks
+            // one anonymous volume per container into a state no later census
+            // can discover, the container being gone and nothing else referring
+            // to the volume.
+            let declared = crate::runner::container::census::ReaperContainerScope::new(
+                "docker",
+                std::path::Path::new(PRIVATE_ROOT),
+                INCARNATION,
+            )
+            .expect("a scope")
+            .remove_argv(CONTAINER_ID);
+            assert_eq!(lines[2], declared[1..].join(" "), "{lines:#?}");
+
+            // (1) Both filters, two distinct values.
+            let filters: Vec<&str> = lines[0]
+                .split_whitespace()
+                .filter(|word| word.starts_with("label="))
+                .collect();
+            assert_eq!(
+                filters.len(),
+                2,
+                "the reaper's selector is `{}`; a filter on the private root alone names every \
+                 container of every run under it, including a live coordinator's",
+                lines[0]
+            );
+            assert!(
+                filters
+                    .iter()
+                    .any(|filter| *filter == format!("label=upstroke.private_root={PRIVATE_ROOT}"))
+            );
+            assert!(
+                filters
+                    .iter()
+                    .any(|filter| *filter == format!("label=upstroke.incarnation={INCARNATION}"))
+            );
+            assert_eq!(
+                filters
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                2,
+                "two filters carrying one value is one filter"
+            );
+
+            // (4) The process half still happened.
+            let settled_by = Instant::now() + Duration::from_secs(30);
+            while alive(agent_pid) && Instant::now() < settled_by {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let settled = !alive(agent_pid);
+            // SAFETY: cleanup for the failing case, a no-op for the passing one.
+            unsafe {
+                let _ = libc::kill(agent_pid, libc::SIGKILL);
+                let _ = libc::kill(-agent_pid, libc::SIGKILL);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                settled,
+                "the container half replaced the process half: the agent group survived"
+            );
+        }
+    }
+
+    // =======================================================================
+    // CODING_STANDARDS.md §12 readiness protocols
+    //
+    // The primitives live in `test_support::readiness` because several fixtures
+    // in three modules had each re-derived them; these are their witnesses, and
+    // each one names the subcase it covers. No claim about a bound is made from
+    // wall-clock coincidence: what is asserted is which outcome ended a wait and
+    // whether the producer was still alive when it did, and where an
+    // interleaving is the subject it is *arranged* through a handshake rather
+    // than raced for.
+    // =======================================================================
+
+    /// Where [`readiness_producer_helper`] takes its role from.
+    const READINESS_ROLE: &str = "UPSTROKE_READINESS_ROLE";
+
+    /// Where [`readiness_producer_helper`] publishes, when its role publishes.
+    const READINESS_SIGNAL: &str = "UPSTROKE_READINESS_SIGNAL";
+
+    /// A scratch directory for one readiness fixture, removed when it ends
+    /// however it ends.
+    ///
+    /// §12 asks for "unique temporary directories with RAII cleanup", and the
+    /// difference shows up on the failing path rather than the passing one: a
+    /// trailing `remove_dir_all` is the line a panicking assertion skips, and
+    /// these fixtures publish 64 KiB payloads sixteen at a time.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "upstroke-readiness-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            std::fs::create_dir_all(&dir).expect("readiness scratch directory");
+            Self(dir)
+        }
+    }
+
+    impl Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The producer half of the readiness tests.
+    ///
+    /// One helper and five roles, because what these tests vary is the
+    /// producer's behaviour and nothing else. §12's bound has to tell three
+    /// producers apart — one that is alive and silent, one that is already
+    /// gone, and one that is merely slow — and a helper per case would let them
+    /// drift into differing in something other than the case.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn readiness_producer_helper() {
+        let Some(role) = std::env::var_os(READINESS_ROLE) else {
+            return;
+        };
+        // Longer than any bound these tests set, and finite, so a helper
+        // abandoned by a failing parent cannot outlive the suite.
+        const ALIVE: Duration = Duration::from_secs(120);
+        // Long enough to be observed as "not yet", short enough that a healthy
+        // producer still lands well inside a generous bound.
+        const SLOW: Duration = Duration::from_millis(200);
+        let signal = || {
+            PathBuf::from(std::env::var_os(READINESS_SIGNAL).expect("the signal path to publish"))
+        };
+        match role.to_string_lossy().as_ref() {
+            // Alive, and publishes nothing at all: only the bound can end a
+            // wait on this one.
+            "silent" => thread::sleep(ALIVE),
+            // Gone at once, having published nothing. §12's fast path.
+            "dead" => {}
+            // Healthy but slow. A bound that ended either of these waits would
+            // be timing a producer that was fine.
+            "signal-after" => {
+                thread::sleep(SLOW);
+                readiness::publish(&signal(), &["published"]).expect("publish the signal");
+                thread::sleep(ALIVE);
+            }
+            "line-after" => {
+                thread::sleep(SLOW);
+                println!("held");
+                std::io::stdout().flush().expect("frame the line");
+                thread::sleep(ALIVE);
+            }
+            // Frames records as fast as it can, none of them the wanted one.
+            // The waiter's `recv_timeout` never has to block against this, so
+            // it is the producer that finds out whether the deadline is
+            // checked on the noise path or only on the idle one.
+            "noise" => {
+                // Block-buffered, deliberately. `println!` goes through a
+                // `LineWriter` and pays a syscall per record, which is slower
+                // than a waiter draining the channel -- so the channel keeps
+                // emptying and the deadline never has to be checked on the
+                // noise arm at all. Batching the records is what makes this
+                // producer actually outrun its reader, which is the condition
+                // the arm exists for.
+                let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout());
+                let record = "not-the-line\n".repeat(512);
+                loop {
+                    if out.write_all(record.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+            other => panic!("unknown readiness producer role `{other}`"),
+        }
+        std::process::exit(0);
+    }
+
+    /// Spawn [`readiness_producer_helper`] in `role`, adopted by the RAII
+    /// producer so it is terminated, reaped and its reader joined on every path.
+    fn readiness_producer(role: &str, signal: Option<&Path>, stdout: Stdio) -> readiness::Producer {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "agent::proc::tests::readiness_producer_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(READINESS_ROLE, role)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        if let Some(signal) = signal {
+            command.env(READINESS_SIGNAL, signal);
+        }
+        readiness::Producer::adopt(command.spawn().expect("spawn the readiness producer"))
+    }
+
+    /// **Partial writes.** A truncated record is refused rather than read as a
+    /// short whole one, and a field the framing cannot carry is refused at the
+    /// producer.
+    ///
+    /// §12: "a partial record MUST NOT be readable as a whole one … an
+    /// unterminated final record is a truncated write and MUST fail rather than
+    /// yield a short value". The first block is the positive control, and it is
+    /// what every hand-rolled reader in this crate did: `str::lines` hands the
+    /// truncated tail back as a value, and a path is exactly the payload for
+    /// which a short value still looks like a plausible one.
+    #[test]
+    fn a_partial_record_is_refused_rather_than_read_as_a_short_one() {
+        let scratch = Scratch::new("partial");
+        let signal = scratch.join("signal");
+
+        let torn = "/tmp/upstroke-snapsho";
+        std::fs::write(&signal, torn).expect("plant a truncated write");
+        assert_eq!(
+            std::fs::read_to_string(&signal)
+                .expect("read the truncated write")
+                .lines()
+                .next(),
+            Some(torn),
+            "the control is sharp: `lines` yields a truncated tail as a whole field, so a \
+             reader built on it cannot tell this from a complete record"
+        );
+        let error = readiness::read_published(&signal).expect_err("a partial record is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+        assert!(error.to_string().contains("truncated write"), "{error}");
+
+        // The same fields, framed and published, read back whole.
+        readiness::publish(&signal, &["/tmp/upstroke-snapshot", "cafe"]).expect("publish");
+        assert_eq!(
+            readiness::read_published(&signal).expect("a whole record reads"),
+            ["/tmp/upstroke-snapshot", "cafe"]
+        );
+
+        // And the payload is kept inside what the framing can carry, at the
+        // producer — the only place it can still be told apart from two fields.
+        let error = readiness::publish(&signal, &["two\nfields"])
+            .expect_err("a field carrying the delimiter is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(
+            readiness::read_published(&signal).expect("the refused publish changed nothing"),
+            ["/tmp/upstroke-snapshot", "cafe"]
+        );
+    }
+
+    /// **A live but silent producer.** The bound ends the wait, and the
+    /// producer is still running when it does.
+    ///
+    /// §12: "the bound MUST bound a producer that has wedged rather than time
+    /// one that is healthy … the fast path is a producer that fails and closes
+    /// its channel; the bound is for the one that stays alive and silent."
+    ///
+    /// The pipe half is the one that could not be written before these
+    /// primitives existed. Three waits in `src/rundir.rs` checked their
+    /// deadline only after a blocking `read_line` returned, so against this
+    /// producer the read blocked and the deadline was never reached at all —
+    /// the bound was unreachable in exactly the case it was written for.
+    #[test]
+    fn a_live_but_silent_producer_ends_the_wait_at_the_bound() {
+        // Small and caller-supplied. A producer that publishes nothing can only
+        // ever reach its bound, so nothing here depends on machine speed.
+        const BOUND: Duration = Duration::from_millis(250);
+        let scratch = Scratch::new("silent");
+        let signal = scratch.join("signal");
+
+        let mut producer = readiness_producer("silent", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
+            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
+        }
+        assert!(
+            elapsed >= BOUND,
+            "the wait ended before its own bound: {elapsed:?}"
+        );
+        assert!(
+            producer.alive(),
+            "the producer must still be running: a wait that only ever ends once its producer \
+             has died is not bounding the live-silent case at all"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("silent", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
+            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
+        }
+        assert!(
+            elapsed >= BOUND,
+            "the wait ended before its own bound: {elapsed:?}"
+        );
+        assert!(
+            producer.alive(),
+            "the producer is still holding the pipe open, which is the case a deadline checked \
+             after `read_line` returns can never reach"
+        );
+    }
+
+    /// **A flooding producer is stopped by the output allowance.**
+    ///
+    /// The sibling above bounds an *idle* channel, where `recv_timeout` blocks
+    /// and its own timeout does the work. This is the other producer: one that
+    /// frames records faster than the waiter drains them, so the channel is
+    /// never empty and no timeout ever fires. What ends this wait is the byte
+    /// bound on the reader — `OUTPUT_LIMIT_BYTES`, this module's own per-stream
+    /// allowance — and the assertion names it, because a wait that ended at the
+    /// clock instead would mean the reader had gone on growing.
+    ///
+    /// The bound is deliberately generous so the clock cannot be the answer:
+    /// under a reader with no byte bound this test does not fail late, it fails
+    /// *differently*, reporting `TimedOut` thirty seconds later.
+    #[test]
+    fn a_flooding_producer_is_stopped_by_the_output_allowance() {
+        const GENEROUS: Duration = Duration::from_secs(30);
+        let mut producer = readiness_producer("noise", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", GENEROUS);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::Torn(why) => assert!(
+                why.contains("output allowance"),
+                "the allowance must be what it names: {why}"
+            ),
+            other => panic!(
+                "a flooding producer must be stopped by the output allowance, not by {other:?}"
+            ),
+        }
+        assert!(
+            elapsed < GENEROUS,
+            "the allowance ended the wait, not the deadline: {elapsed:?}"
+        );
+    }
+
+    /// **A dead producer.** The wait ends on the producer's death rather than
+    /// on the clock, and says so.
+    ///
+    /// §12's fast path. The bound is set far past anything this suite could
+    /// spend, so the claim is that the wait does not wait it out: a waiter that
+    /// only watched its signal would report "nothing published in five
+    /// minutes", which is the clock talking rather than the death.
+    #[test]
+    fn a_dead_producer_ends_the_wait_without_spending_the_bound() {
+        const BOUND: Duration = Duration::from_secs(300);
+        let scratch = Scratch::new("dead");
+        let signal = scratch.join("signal");
+
+        let mut producer = readiness_producer("dead", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::ProducerGone(why) => assert!(
+                why.contains("without publishing"),
+                "the report must name the death, not the clock: {why}"
+            ),
+            other => panic!("a producer that exited without publishing is not {other:?}"),
+        }
+        assert!(
+            elapsed < BOUND,
+            "the wait spent its whole bound: {elapsed:?}"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("dead", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::ProducerGone(why) => assert!(
+                why.contains("closed its channel"),
+                "a closed channel is the pipe's own fast path: {why}"
+            ),
+            other => panic!("a producer that closed its channel is not {other:?}"),
+        }
+        assert!(
+            elapsed < BOUND,
+            "the wait spent its whole bound: {elapsed:?}"
+        );
+    }
+
+    /// **Effective deadlines.** The bound is the caller's, it bounds the wait
+    /// rather than the producer, and it does not time a producer that is merely
+    /// slow.
+    ///
+    /// §12: "a deadline short enough to expire on a loaded runner has become
+    /// the signal itself, which is the failure this rule exists to prevent."
+    /// Two claims, and the second is the one that keeps the first honest — a
+    /// wait that always returned at its bound would satisfy the timing half and
+    /// still be useless.
+    #[test]
+    fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_producer() {
+        let scratch = Scratch::new("deadline");
+
+        // Two bounds against one silent producer: each wait ends at the value
+        // its caller passed, and the longer bound spends longer.
+        let silent = scratch.join("never");
+        let mut producer = readiness_producer("silent", Some(&silent), Stdio::null());
+        let mut spent = Vec::new();
+        for bound in [Duration::from_millis(120), Duration::from_millis(480)] {
+            let started = Instant::now();
+            match readiness::await_signal(&silent, producer.child(), bound) {
+                readiness::Waited::TimedOut(reported) => assert_eq!(reported, bound),
+                other => panic!("a silent producer must time the wait out, not give {other:?}"),
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= bound,
+                "ended before its own bound: {elapsed:?} < {bound:?}"
+            );
+            spent.push(elapsed);
+        }
+        assert!(
+            spent[1] > spent[0],
+            "the wait spends the bound it was given, not one of its own: {spent:?}"
+        );
+        drop(producer);
+
+        // And a producer that is slow but fine is not timed out, at the bound
+        // `src/rundir.rs`'s waits already use.
+        const GENEROUS: Duration = Duration::from_secs(30);
+        let signal = scratch.join("eventually");
+        let mut producer = readiness_producer("signal-after", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), GENEROUS);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            waited.or_fail("the slow producer published and was still refused"),
+            ["published"]
+        );
+        assert!(
+            elapsed < GENEROUS,
+            "the wait returned when the signal landed, not at its bound: {elapsed:?}"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("line-after", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", GENEROUS);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            waited.or_fail("the slow producer framed its line and was still refused"),
+            ["held"]
+        );
+        assert!(
+            elapsed < GENEROUS,
+            "the wait returned when the line landed, not at its bound: {elapsed:?}"
+        );
+    }
+
+    /// **Publication before notification, decided rather than raced.**
+    ///
+    /// §12: "a readiness signal MUST be published only after the state it
+    /// announces is complete and observable by the waiter", and "a file's
+    /// existence is a readiness signal only if the file is published
+    /// atomically."
+    ///
+    /// Both halves are observed at one *arranged* instant — the point at which
+    /// the record's bytes are entirely written and the publication has not yet
+    /// been committed. A producer that reaches that point hands the observer a
+    /// turn and waits for it back, so which of the two runs first is decided by
+    /// the handshake and not by the scheduler. Nothing here sleeps, spins or
+    /// polls, and the test would fail identically on a machine with one core or
+    /// a hundred.
+    ///
+    /// The unsound form is run through the same observer first and MUST be
+    /// caught, so an observer looking in the wrong place cannot pass the sound
+    /// half by seeing nothing.
+    #[test]
+    fn a_signal_is_visible_only_after_the_state_it_announces() {
+        let scratch = Scratch::new("ordering");
+        // Large enough that a reader catching it half-written sees that it did.
+        let payload = "x".repeat(64 * 1024);
+
+        // The unsound form: creation and content are separate events, so at the
+        // arranged instant the name exists and does not yet carry the payload.
+        let unsound = scratch.join("in-place");
+        let observed = at_the_uncommitted_instant(&unsound, &payload, |signal, content| {
+            let mut file = std::fs::File::create(signal).expect("create the signal in place");
+            handshake();
+            file.write_all(content.as_bytes()).expect("fill it after");
+        });
+        assert!(
+            observed.existed,
+            "the control is sharp only if the unsound form's name is observable before its \
+             content: it was not, so the sound half below proves nothing"
+        );
+        assert_ne!(
+            observed.content.as_deref(),
+            Some(payload.as_str()),
+            "the name existed and already carried the whole payload, so this control never \
+             modelled the split it exists to model"
+        );
+
+        // The sound form, at the same arranged instant: the record is entirely
+        // written and the name does not exist. That *is* atomic publication,
+        // and it is asserted rather than sampled.
+        let sound = scratch.join("published");
+        let observed = at_the_uncommitted_instant(&sound, &payload, |signal, content| {
+            readiness::publish_between(signal, &[content], &mut || handshake()).expect("publish");
+        });
+        assert!(
+            !observed.existed,
+            "the signal name existed while its publication was still uncommitted, which is the \
+             whole of what atomic publication rules out"
+        );
+
+        // And once committed it carries the record whole.
+        assert_eq!(
+            readiness::read_published(&sound).expect("the published record reads"),
+            [payload.as_str()]
+        );
+    }
+
+    /// What the observer saw at the arranged instant.
+    struct Observation {
+        existed: bool,
+        content: Option<String>,
+    }
+
+    /// A one-shot handshake: the producer hands the observer a turn and blocks
+    /// until it is given back.
+    struct Handshake {
+        reached: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    impl Handshake {
+        fn hand_over(&self) {
+            self.reached.send(()).expect("hand the observer its turn");
+            self.resume.recv().expect("wait for the turn back");
+        }
+    }
+
+    thread_local! {
+        /// The handshake the producer closure running on this thread should use.
+        static HANDSHAKE: std::cell::RefCell<Option<Handshake>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Use this thread's handshake at the point the producer has reached.
+    fn handshake() {
+        HANDSHAKE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("a producer runs inside an arranged instant")
+                .hand_over();
+        });
+    }
+
+    /// Run `produce` on another thread and observe `signal` at the exact
+    /// instant the producer has written its record and not yet committed it.
+    ///
+    /// The producer blocks there until the observation is taken, so the
+    /// interleaving is decided by this function rather than by the scheduler.
+    fn at_the_uncommitted_instant(
+        signal: &Path,
+        payload: &str,
+        produce: fn(&Path, &str),
+    ) -> Observation {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let producing = signal.to_path_buf();
+        let content = payload.to_owned();
+        let producer = thread::spawn(move || {
+            HANDSHAKE.with(|slot| {
+                *slot.borrow_mut() = Some(Handshake {
+                    reached: reached_tx,
+                    resume: resume_rx,
+                });
+            });
+            produce(&producing, &content);
+        });
+
+        reached_rx
+            .recv()
+            .expect("the producer reaches its uncommitted instant");
+        let observation = Observation {
+            existed: signal.exists(),
+            content: std::fs::read_to_string(signal).ok(),
+        };
+        resume_tx.send(()).expect("give the producer its turn back");
+        producer.join().expect("the producer thread");
+        observation
+    }
+
+    /// **Cleanup, including the branch that has something to clean.** A
+    /// publication leaves no staging residue; a refused one leaves no claim;
+    /// and a publication that fails *after* staging removes the file it made.
+    ///
+    /// The last is the branch a refusal cannot reach — the framing check runs
+    /// before anything is created, so it exercises "there was nothing to clean
+    /// up" rather than the cleanup. Failing the rename after the record is
+    /// staged is what reaches the real one, and the staging name being unique
+    /// to the call is what makes removing it safe to do unconditionally.
+    #[test]
+    fn a_publication_that_fails_after_staging_removes_what_it_made() {
+        let scratch = Scratch::new("cleanup");
+        let signal = scratch.join("signal");
+
+        readiness::publish(&signal, &["field"]).expect("publish");
+        assert!(signal.exists(), "the signal is published");
+        assert_eq!(staging_residue(&scratch), 0, "the rename spends the stage");
+
+        // A refused publish creates nothing at all: the framing check runs
+        // before the staging write.
+        let refused = scratch.join("refused");
+        readiness::publish(&refused, &["two\nfields"]).expect_err("refused");
+        assert!(
+            !refused.exists(),
+            "a refused publish must not create the name: an empty signal is still a claim"
+        );
+        assert_eq!(staging_residue(&scratch), 0, "nor a staging file");
+
+        // THE POST-STAGING FAILURE. At the seam the record is fully staged;
+        // putting a directory in the signal's place makes the rename that
+        // follows fail on every platform this ships on, which is the only
+        // reachable way to arrive at the cleanup with a file to remove.
+        let blocked = scratch.join("blocked");
+        let mut seam = || {
+            assert_eq!(
+                staging_residue(&scratch),
+                1,
+                "the record is staged at the seam, so the cleanup below has something to do"
+            );
+            std::fs::create_dir(&blocked).expect("block the rename");
+        };
+        let error = readiness::publish_between(&blocked, &["field"], &mut seam)
+            .expect_err("a rename onto a directory cannot succeed");
+        assert!(
+            blocked.is_dir(),
+            "the publication did not overwrite what blocked it: {error}"
+        );
+        assert_eq!(
+            staging_residue(&scratch),
+            0,
+            "the staging file the failed publication created was removed by it"
+        );
+
+        // The marker form: an empty published file reads as no fields rather
+        // than as a truncated record, and it is unambiguous because `publish`
+        // renames — a partial record is never given this name.
+        let marker = scratch.join("marker");
+        readiness::publish_marker(&marker).expect("publish a marker");
+        assert!(
+            readiness::read_published(&marker)
+                .expect("a marker reads")
+                .is_empty(),
+            "a marker announces state it has nothing to say about"
+        );
+
+        // Republishing replaces the record whole, and stages under a name of
+        // its own rather than a shared one.
+        readiness::publish(&signal, &["second"]).expect("republish");
+        assert_eq!(
+            readiness::read_published(&signal).expect("read back"),
+            ["second"]
+        );
+        assert_eq!(staging_residue(&scratch), 0, "and leaves nothing behind");
+    }
+
+    /// How many staging files are sitting in `dir`.
+    fn staging_residue(dir: &Path) -> usize {
+        staging_names(dir).len()
+    }
+
+    /// **Ownership-safe staging.** Concurrent publications of one signal do not
+    /// share a staging name, so neither can consume or delete the other's.
+    ///
+    /// A fixed `<signal>.publishing` made this a real collision rather than a
+    /// theoretical one: two publishers interleave in one file, and the failure
+    /// path of either removes whatever is there — by then possibly the other's
+    /// staged record.
+    ///
+    /// The overlap is *arranged*, not hoped for. Every publisher stops at the
+    /// seam and waits on a barrier for all the others, so at the instant each
+    /// one looks, all eight records are provably staged at once. A machine that
+    /// never ran two of these threads together would deadlock the barrier
+    /// rather than pass the test vacuously.
+    #[test]
+    fn concurrent_publications_do_not_share_a_staging_name() {
+        const PUBLISHERS: usize = 8;
+        let scratch = Scratch::new("staging");
+        let signal = scratch.join("contended");
+        let all_staged = std::sync::Barrier::new(PUBLISHERS);
+
+        let seen: Vec<Vec<String>> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..PUBLISHERS)
+                .map(|which| {
+                    let signal = &signal;
+                    let root: &Path = &scratch;
+                    let all_staged = &all_staged;
+                    scope.spawn(move || {
+                        let mut staged_now = Vec::new();
+                        let mut seam = || {
+                            // Every publisher is here, with its record written
+                            // and its publication uncommitted.
+                            all_staged.wait();
+                            staged_now = staging_names(root);
+                            // And nobody commits until everybody has looked. A
+                            // publisher that renamed first would empty its
+                            // staging name out from under a slower one's
+                            // listing, which is a race in the *observation*
+                            // rather than in what is being observed.
+                            all_staged.wait();
+                        };
+                        readiness::publish_between(
+                            signal,
+                            &[&format!("publisher-{which}")],
+                            &mut seam,
+                        )
+                        .expect("publish");
+                        staged_now
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a publisher"))
+                .collect()
+        });
+
+        // Eight publications staged at once, under eight names.
+        for (which, staged_now) in seen.iter().enumerate() {
+            assert_eq!(
+                staged_now.len(),
+                PUBLISHERS,
+                "publisher {which} saw {} staged record(s) where all {PUBLISHERS} were staged: \
+                 {staged_now:?}",
+                staged_now.len()
+            );
+        }
+        let distinct: std::collections::BTreeSet<&str> =
+            seen.iter().flatten().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            PUBLISHERS,
+            "{PUBLISHERS} concurrent publications must hold {PUBLISHERS} staging names, not \
+             {}: a shared name is one file two publishers are writing: {distinct:?}",
+            distinct.len()
+        );
+        assert_eq!(
+            staging_residue(&scratch),
+            0,
+            "and every publication spent its own stage"
+        );
+        // One of them is the published record, whole, and it is a value
+        // somebody actually sent rather than a splice of two.
+        let published = readiness::read_published(&signal).expect("a whole record survives");
+        let [only] = published.as_slice() else {
+            panic!("the contended signal carries one field, not {published:?}")
+        };
+        assert!(
+            (0..PUBLISHERS).any(|which| only == &format!("publisher-{which}")),
+            "the surviving record is not one anybody published: {only}"
+        );
+    }
+
+    /// The staging names currently sitting in `dir`.
+    fn staging_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("the scratch directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".publishing"))
+            .collect()
     }
 }

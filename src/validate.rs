@@ -1,18 +1,24 @@
 //! `upstroke validate`: parse → config → graph checks → routing preview →
 //! rendered report. No execution of anything.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
 
-use std::collections::BTreeMap;
+mod graph;
+mod render;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent;
 use crate::capacity;
 use crate::config::{self, Config};
-use crate::error::{UpstrokeError, ValidationErrors};
+use crate::error::UpstrokeError;
 use crate::gates::{self, ShellGate};
-use crate::ir::{Plan, Task, TaskId};
+use crate::ir::Plan;
 use crate::plan::{self, Parsed};
-use crate::review::{self, PassBinding, ReviewPlan};
+use crate::review;
 use crate::route::{self, ResolvedChain};
 
 #[derive(Debug, Clone)]
@@ -26,6 +32,14 @@ pub struct ValidateOptions {
     pub config_root: PathBuf,
     /// Pools file override for tests; `None` discovers `~/.upstroke/pools.toml`.
     pub pools_path: Option<PathBuf>,
+    /// Which reading of `[engine]`'s ceilings applies (see
+    /// [`config::EngineLimits`]). `Fresh` for `upstroke validate` and for a run
+    /// about to be created; a resume passes the reading its own recorded schema
+    /// selects.
+    ///
+    /// Carried here rather than decided inside `analyze` because only the
+    /// caller knows which it is, and the difference is a refusal.
+    pub engine_limits: config::EngineLimits,
 }
 
 #[derive(Debug)]
@@ -67,22 +81,94 @@ pub struct Analysis {
     pub warnings: Vec<String>,
 }
 
+/// Every file an [`Analysis`] is derived from, captured at one instant.
+///
+/// The set has to be *complete* to be worth anything. A capture that covers the
+/// config but not the plan, or the plan but not the files the gate derivation
+/// reads, licenses exactly the confusion it was introduced to rule out: a caller
+/// compares equal captures, concludes nothing moved, and adopts an analysis that
+/// depended on something outside the comparison. So this names all of them, and
+/// [`analyze_captured`] parses out of it rather than beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedInputs {
+    plan: config::FileSnapshot,
+    config: config::CapturedConfig,
+    /// The worktree files the gate derivation looks at when `[[gates]]` does not
+    /// spell the gates out: `Cargo.toml`, `go.mod`, and `package.json` beside
+    /// the repo root, which are what [`crate::gates::derive`] consults and the
+    /// whole of what it consults. Captured here so that a change to one of them
+    /// is a change to this analysis's inputs and not an unobserved edit —
+    /// keep this list in step with `gates::derive` itself.
+    gate_inputs: Vec<config::FileSnapshot>,
+}
+
+/// The gate derivation's inputs, relative to the repo root — see
+/// [`CapturedInputs::gate_inputs`].
+const GATE_DERIVATION_INPUTS: &[&str] = &["Cargo.toml", "go.mod", "package.json"];
+
+impl CapturedInputs {
+    /// Capture what an [`analyze`] with these options reads.
+    #[must_use]
+    pub fn capture(opts: &ValidateOptions) -> Self {
+        Self {
+            plan: config::snapshot_file(&opts.plan_path, true),
+            config: config::CapturedConfig::capture(
+                opts.config_path.as_deref(),
+                &opts.config_root,
+                opts.pools_path.as_deref(),
+            ),
+            gate_inputs: GATE_DERIVATION_INPUTS
+                .iter()
+                .map(|name| config::snapshot_file(&opts.config_root.join(name), false))
+                .collect(),
+        }
+    }
+
+    /// Every captured file, in a stable order, for a caller that has to name
+    /// them in a message.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        std::iter::once(&self.plan)
+            .chain(self.config.files())
+            .chain(&self.gate_inputs)
+            .map(|file| file.path().to_path_buf())
+            .collect()
+    }
+}
+
 pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, UpstrokeError> {
-    let raw = fs::read_to_string(&opts.plan_path).map_err(|source| UpstrokeError::Io {
-        path: opts.plan_path.clone(),
-        source,
+    analyze_captured(&CapturedInputs::capture(opts), opts)
+}
+
+/// [`analyze`], out of bytes that were captured earlier.
+///
+/// The plan, the repo config and the pools file are parsed from `captured` and
+/// from nowhere else, so the analysis this returns is bound to those exact
+/// bytes: a caller holding the same `CapturedInputs` can prove what was
+/// validated by comparing it against the filesystem, and a file that changed and
+/// changed back cannot slip between the check and the answer, because there is
+/// only one read.
+///
+/// The one input still read from the filesystem here is the gate derivation's:
+/// [`crate::gates::derive`] takes a directory, and the three files it looks at
+/// are captured but not consumed. A caller that needs the derivation pinned runs
+/// this where the worktree cannot move — see the engine's pre-flight, which
+/// takes its answer under the worktree lease.
+pub fn analyze_captured(
+    captured: &CapturedInputs,
+    opts: &ValidateOptions,
+) -> Result<Analysis, UpstrokeError> {
+    // Named off the capture rather than off `opts`, so an error cannot report a
+    // path other than the one that was actually read.
+    let raw = captured.plan.text()?.ok_or_else(|| UpstrokeError::Io {
+        path: captured.plan.path().to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "plan not found"),
     })?;
     let Parsed {
         plan,
         warnings: mut all_warnings,
     } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
-    let config = config::load(
-        opts.config_path.as_deref(),
-        &opts.config_root,
-        opts.pools_path.as_deref(),
-        &mut all_warnings,
-    )?;
-    check_graph(&plan, &mut all_warnings)?;
+    let config = config::load_captured(&captured.config, opts.engine_limits, &mut all_warnings)?;
+    graph::check_graph(&plan, &mut all_warnings)?;
     let config_path = || {
         opts.config_path
             .clone()
@@ -190,7 +276,7 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
         .enumerate()
         .map(|(index, (task, chain))| {
             let second = reviews.second_opinion.get(index).and_then(Option::as_ref);
-            to_row(task, chain.clone(), second)
+            render::to_row(task, chain.clone(), second)
         })
         .collect();
     let (observations, run_id) = latest_run_observations(
@@ -201,104 +287,14 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
     Ok(Report {
         rows,
         warnings,
-        strategy: strategy_echo(&analysis.config),
-        capacity: capacity_echo(&analysis.config, &observations, run_id.as_deref()),
-        review: review_echo(&reviews),
-        effort: effort_echo(&analysis.config),
+        strategy: render::strategy_echo(&analysis.config),
+        capacity: render::capacity_echo(&analysis.config, &observations, run_id.as_deref()),
+        review: render::review_echo(&reviews),
+        effort: render::effort_echo(&analysis.config),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
-}
-
-/// Who judges the work (§11.2–§11.3), for the preview.
-///
-/// Resolved against the adapters this build ships, not against binaries found
-/// on PATH: `validate` and `--dry-run` execute nothing (§18), so they cannot
-/// probe. Pre-flight is where a named reviewer has to prove it can actually
-/// run — and where a missing one either warns or refuses. The line says so,
-/// because a preview that reads as a promise is worse than one that reads as a
-/// plan.
-fn review_echo(plan: &ReviewPlan) -> String {
-    let Some(primary) = &plan.primary else {
-        return "review: disabled ([routing] review = { enabled = false })".to_owned();
-    };
-    #[expect(
-        clippy::expect_used,
-        reason = "resolve() sets a timeout on every plan it returns"
-    )]
-    let mut line = format!(
-        "review: {} ({}s independent timeout per pass)",
-        primary.describe(),
-        plan.pass_timeout_secs
-            .expect("freshly resolved review plans always record their timeout")
-    );
-    match &plan.alternative {
-        Some(alt) => line.push_str(&format!(
-            " (tasks it implements itself would be reviewed by {} instead, if installed)",
-            alt.describe()
-        )),
-        None => line.push_str(" (no cross-family reviewer exists in this build)"),
-    }
-    let demanded = plan.second_opinion.iter().flatten().count();
-    if demanded > 0 {
-        line.push_str(&format!(
-            "; {demanded} task(s) also require a second opinion, which pre-flight refuses to \
-             start without"
-        ));
-    }
-    line
-}
-
-/// §13's capacity block, for a command that executes nothing.
-///
-/// `validate` and `--dry-run` **do not probe** (§18): every figure here comes
-/// from files — the pools file, and the latest run's event log in this
-/// repository. That is a real distinction rather than a technicality, and the
-/// block says which side of it each line is on, because `upstroke capacity` shows
-/// strictly more by being allowed to spawn the vendors' CLIs.
-///
-/// The same reason the review line says "if installed": a preview that reads as
-/// a promise is worse than one that reads as a plan.
-fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) -> String {
-    use std::fmt::Write as _;
-
-    if cfg.pools.is_empty() {
-        return "capacity: not connected — run `upstroke connect` to write ~/.upstroke/pools.toml"
-            .to_owned();
-    }
-    let estimates = capacity::estimate(&cfg.pools, obs);
-    let mut out = format!("capacity: {} pool(s) connected\n", cfg.pools.len());
-    for (pool, estimate) in cfg.pools.iter().zip(&estimates) {
-        let _ = writeln!(out, "  {}", pool.describe());
-        let _ = writeln!(out, "    {}", estimate.describe());
-        for note in &estimate.notes {
-            let _ = writeln!(out, "    - {note}");
-        }
-    }
-    match run {
-        Some(run_id) => {
-            let _ = writeln!(
-                out,
-                "  self-metered draw is folded from run {run_id}, the latest in this repository"
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "  no run in this repository yet, so nothing has been self-metered"
-            );
-        }
-    }
-    for line in capacity::strategy_preview(&cfg.strategy.mode, &estimates) {
-        let _ = writeln!(out, "  {line}");
-    }
-    let _ = write!(
-        out,
-        "  this preview reads files only and never probes (§18) — `upstroke capacity` asks the \
-         installed CLIs as well"
-    );
-    out
 }
 
 /// §13's observations, without executing anything: fold the latest run in this
@@ -341,273 +337,14 @@ fn latest_run_observations(
     }
 }
 
-/// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
-/// broken plan reports everything in one run. On a clean graph, artifact
-/// wiring that contradicts the dependency order is surfaced as warnings.
-fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {
-    let mut problems = Vec::new();
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for task in &plan.tasks {
-        *seen.entry(task.id.as_str()).or_insert(0) += 1;
-    }
-    for (id, count) in &seen {
-        if *count > 1 {
-            problems.push(format!("duplicate task id `{id}` ({count} tasks share it)"));
-        }
-    }
-    for task in &plan.tasks {
-        for dep in &task.depends_on {
-            if !seen.contains_key(dep.as_str()) {
-                problems.push(format!("task `{}` depends on unknown id `{dep}`", task.id));
-            }
-        }
-    }
-    // Cycle detection only makes sense on a graph whose edges all resolve.
-    if problems.is_empty() {
-        if let Some(cycle) = find_cycle(plan) {
-            problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
-        }
-    }
-    if !problems.is_empty() {
-        return Err(UpstrokeError::Validation(ValidationErrors(problems)));
-    }
-    check_artifact_wiring(plan, warnings);
-    Ok(())
-}
-
-/// A task that `needs` an artifact should depend — directly or transitively —
-/// on its producer, or execution order cannot guarantee the artifact exists.
-/// The plan is frozen (§5), so this warns rather than inventing edges.
-fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
-    let index = index_by_id(plan);
-    for task in &plan.tasks {
-        for needed in &task.artifacts_in {
-            let producer = plan
-                .artifacts
-                .iter()
-                .find(|a| a.id == *needed)
-                .and_then(|a| a.produced_by.as_ref());
-            // Unknown producers already warned during parsing.
-            let Some(producer) = producer else { continue };
-            if *producer != task.id && !depends_transitively(&index, &task.id, producer) {
-                warnings.push(format!(
-                    "task `{}` needs artifact `{needed}` produced by `{producer}` but does not \
-                     depend on it (directly or transitively)",
-                    task.id
-                ));
-            }
-        }
-    }
-}
-
-/// Id → task, built once per pass and shared by the graph checks.
-fn index_by_id(plan: &Plan) -> BTreeMap<&str, &Task> {
-    plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect()
-}
-
-fn depends_transitively(index: &BTreeMap<&str, &Task>, from: &TaskId, target: &TaskId) -> bool {
-    let mut queue: Vec<&TaskId> = index
-        .get(from.as_str())
-        .map(|t| t.depends_on.iter().collect())
-        .unwrap_or_default();
-    let mut visited: Vec<&str> = Vec::new();
-    while let Some(dep) = queue.pop() {
-        if dep == target {
-            return true;
-        }
-        if visited.contains(&dep.as_str()) {
-            continue;
-        }
-        visited.push(dep.as_str());
-        if let Some(task) = index.get(dep.as_str()) {
-            queue.extend(task.depends_on.iter());
-        }
-    }
-    false
-}
-
-fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
-    const WHITE: u8 = 0;
-    const GRAY: u8 = 1;
-    const BLACK: u8 = 2;
-
-    let index: BTreeMap<&str, usize> = plan
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.id.as_str(), i))
-        .collect();
-
-    fn dfs(
-        current: usize,
-        plan: &Plan,
-        index: &BTreeMap<&str, usize>,
-        color: &mut [u8],
-        stack: &mut Vec<usize>,
-    ) -> Option<Vec<String>> {
-        color[current] = GRAY;
-        stack.push(current);
-        for dep in &plan.tasks[current].depends_on {
-            let Some(&next) = index.get(dep.as_str()) else {
-                continue;
-            };
-            if color[next] == GRAY {
-                let from = stack.iter().position(|&i| i == next).unwrap_or(0);
-                let mut cycle: Vec<String> = stack[from..]
-                    .iter()
-                    .map(|&i| plan.tasks[i].id.to_string())
-                    .collect();
-                cycle.push(plan.tasks[next].id.to_string());
-                return Some(cycle);
-            }
-            if color[next] == WHITE {
-                if let Some(cycle) = dfs(next, plan, index, color, stack) {
-                    return Some(cycle);
-                }
-            }
-        }
-        stack.pop();
-        color[current] = BLACK;
-        None
-    }
-
-    let mut color = vec![WHITE; plan.tasks.len()];
-    let mut stack = Vec::new();
-    for start in 0..plan.tasks.len() {
-        if color[start] == WHITE {
-            if let Some(cycle) = dfs(start, plan, &index, &mut color, &mut stack) {
-                return Some(cycle);
-            }
-        }
-    }
-    None
-}
-
-fn to_row(task: &Task, resolved: ResolvedChain, second_opinion: Option<&PassBinding>) -> Row {
-    let deps = if task.depends_on.is_empty() {
-        "-".to_owned()
-    } else {
-        task.depends_on
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let mut chain = resolved
-        .rungs
-        .iter()
-        .map(|rung| {
-            let binding_tag = if rung.binding.pinned {
-                "pin"
-            } else {
-                "preview"
-            };
-            format!(
-                "{}({})={}/{}({binding_tag})",
-                rung.tier, rung.source, rung.binding.agent, rung.binding.model
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" -> ");
-    for note in &resolved.notes {
-        chain.push_str(&format!(" [{note}]"));
-    }
-    // §11.3: a second reviewer is a per-task routing decision like any other,
-    // so it belongs in the column that shows what this task's paths bought it.
-    if let Some(binding) = second_opinion {
-        chain.push_str(&format!(" [second opinion: {}]", binding.describe()));
-    }
-    Row {
-        id: task.id.to_string(),
-        kind: task.kind.to_string(),
-        deps,
-        chain,
-    }
-}
-
-fn strategy_echo(cfg: &Config) -> String {
-    let mut line = format!("strategy: {}", cfg.strategy.mode);
-    if let Some(threshold) = cfg.strategy.spend_down_after {
-        line.push_str(&format!(" (spend_down_after={threshold})"));
-    }
-    line.push_str(if cfg.strategy.from_config {
-        " [from config; parsed, not acted on]"
-    } else {
-        " [derived default]"
-    });
-    line
-}
-
-fn effort_echo(cfg: &Config) -> String {
-    let policy = cfg.resolved_effort_policy();
-    let resolved = [policy.small, policy.mid, policy.frontier];
-    let implementation = if resolved.iter().all(|effort| *effort == resolved[0]) {
-        resolved[0].to_string()
-    } else {
-        format!(
-            "by tier (small={}, mid={}, frontier={})",
-            resolved[0], resolved[1], resolved[2]
-        )
-    };
-    let review = if cfg.review_enabled {
-        policy.review.to_string()
-    } else {
-        "disabled".to_owned()
-    };
-    format!("effort: implementation={implementation}, review={review}")
-}
-
 impl Report {
+    /// The rendered preview.
+    ///
+    /// The surface stays here — it is the one every caller names, and the one
+    /// `effects/wrappers.toml` classifies under this module — while the table
+    /// it produces is `render::report`.
     pub fn render(&self) -> String {
-        let id_width = column_width("id", self.rows.iter().map(|r| r.id.as_str()));
-        let kind_width = column_width("kind", self.rows.iter().map(|r| r.kind.as_str()));
-        let deps_width = column_width("deps", self.rows.iter().map(|r| r.deps.as_str()));
-
-        let mut out = String::new();
-        out.push_str(&format!(
-            "{:<id_width$}  {:<kind_width$}  {:<deps_width$}  chain\n",
-            "id", "kind", "deps"
-        ));
-        out.push_str(&format!(
-            "{:-<id_width$}  {:-<kind_width$}  {:-<deps_width$}  -----\n",
-            "", "", ""
-        ));
-        for row in &self.rows {
-            out.push_str(&format!(
-                "{:<id_width$}  {:<kind_width$}  {:<deps_width$}  {}\n",
-                row.id, row.kind, row.deps, row.chain
-            ));
-        }
-        out.push('\n');
-        if !self.warnings.is_empty() {
-            out.push_str("warnings:\n");
-            for warning in &self.warnings {
-                out.push_str(&format!("  - {warning}\n"));
-            }
-        }
-        if self.gates.is_empty() {
-            out.push_str("gates: none\n");
-        } else {
-            out.push_str(&format!(
-                "gates: {} [{}]\n",
-                self.gates.join(", "),
-                if self.gates_from_config {
-                    "from config"
-                } else {
-                    "derived"
-                }
-            ));
-        }
-        out.push_str(&self.review);
-        out.push('\n');
-        out.push_str(&self.effort);
-        out.push('\n');
-        out.push_str(&self.strategy);
-        out.push('\n');
-        out.push_str(&self.capacity);
-        out.push('\n');
-        out.push_str(&format!("ok: {} tasks, no cycles\n", self.plan.tasks.len()));
-        out
+        render::report(self)
     }
 
     pub fn write_normalized_json(&self, path: &Path) -> Result<(), UpstrokeError> {
@@ -619,10 +356,6 @@ impl Report {
             source,
         })
     }
-}
-
-fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
-    values.map(str::len).fold(header.len(), usize::max)
 }
 
 #[cfg(test)]
@@ -639,6 +372,7 @@ mod tests {
             plan_path: PathBuf::from(plan),
             config_path: None,
             config_root: hermetic_root,
+            engine_limits: config::EngineLimits::Fresh,
             pools_path: Some({
                 // A real, empty pools file: an explicit `--pools` that does not
                 // exist is a hard error, and `None` would reach for the
@@ -662,6 +396,113 @@ mod tests {
                 .clone()
             }),
         }
+    }
+
+    /// A scratch repo root of its own, so a test that rewrites its inputs
+    /// cannot be read half-written by another running beside it.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("upstroke-validate-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch root");
+        dir
+    }
+
+    /// [`opts`], rooted in `root` rather than in the shared hermetic directory.
+    fn opts_in(root: &Path, plan: &str) -> ValidateOptions {
+        let mut opts = opts(plan);
+        opts.config_root = root.to_path_buf();
+        opts
+    }
+
+    #[test]
+    fn the_captured_set_names_every_file_an_analysis_reads() {
+        // Completeness is the property, and it is the one an incomplete capture
+        // silently loses: a caller comparing two equal captures concludes
+        // nothing moved, so anything outside the comparison is free to move.
+        // The plan, the repo config, the pools file, and the three worktree
+        // files the gate derivation consults are the whole set.
+        let root = scratch_root("capturedset");
+        let plan = root.join("plan.md");
+        fs::write(&plan, "## One\n<!-- upstroke: id=t1 depends= -->\n").expect("plan");
+        let mut options = opts_in(&root, plan.to_str().expect("utf-8 path"));
+        options.config_path = Some(root.join("upstroke.toml"));
+
+        let captured = CapturedInputs::capture(&options);
+        let mut expected = vec![plan, root.join("upstroke.toml")];
+        expected.push(options.pools_path.clone().expect("the fixture pools file"));
+        expected.extend(GATE_DERIVATION_INPUTS.iter().map(|name| root.join(name)));
+        assert_eq!(captured.paths(), expected);
+    }
+
+    #[test]
+    fn an_analysis_is_parsed_out_of_the_captured_plan_not_a_second_read_of_it() {
+        // The plan is an input like any other, and it was the one an earlier
+        // capture left out. Same interleaving as the config's: capture, let the
+        // file become something else for exactly as long as the parse takes,
+        // restore it. What comes back has to describe the captured plan.
+        let root = scratch_root("capturedplan");
+        let plan = root.join("plan.md");
+        fs::write(&plan, "## One\n<!-- upstroke: id=t1 depends= -->\n").expect("captured plan");
+        let options = opts_in(&root, plan.to_str().expect("utf-8 path"));
+        let captured = CapturedInputs::capture(&options);
+
+        fs::write(
+            &plan,
+            "## One\n<!-- upstroke: id=t1 depends= -->\n\
+             ## Two\n<!-- upstroke: id=t2 depends=t1 -->\n",
+        )
+        .expect("the transient plan");
+        let analysis = analyze_captured(&captured, &options).expect("the captured plan analyses");
+        assert_eq!(
+            analysis
+                .plan
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["t1"],
+            "the transient plan was parsed in place of the captured one"
+        );
+
+        fs::write(&plan, "## One\n<!-- upstroke: id=t1 depends= -->\n").expect("restored");
+        assert_eq!(
+            CapturedInputs::capture(&options),
+            captured,
+            "and the excursion leaves no trace for a confirmation to find"
+        );
+    }
+
+    #[test]
+    fn a_gate_derivation_input_is_part_of_the_captured_set() {
+        // `gates::derive` takes a directory, so these three are captured rather
+        // than consumed — which makes it worth proving they are genuinely
+        // inputs, and that a change to one of them is a change the capture sees.
+        let root = scratch_root("capturedgates");
+        let plan = root.join("plan.md");
+        fs::write(&plan, "## One\n<!-- upstroke: id=t1 depends= -->\n").expect("plan");
+        let options = opts_in(&root, plan.to_str().expect("utf-8 path"));
+
+        let bare = CapturedInputs::capture(&options);
+        let analysis = analyze_captured(&bare, &options).expect("analysis");
+        assert!(
+            analysis.gates.is_empty(),
+            "a repo of no recognised shape derives no gates: {:?}",
+            analysis.gates
+        );
+
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("a rust repo now");
+        let shaped = CapturedInputs::capture(&options);
+        assert_ne!(shaped, bare, "the capture must see the worktree change");
+        let analysis = analyze_captured(&shaped, &options).expect("analysis");
+        assert_eq!(
+            analysis
+                .gates
+                .iter()
+                .map(|g| g.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["check".to_owned(), "test".to_owned()],
+            "and the change is one the derivation acts on"
+        );
     }
 
     #[test]

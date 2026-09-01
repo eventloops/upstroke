@@ -1,6 +1,28 @@
 //! Workspace (DESIGN.md §6): the engine owns git. Agents edit files; only the
 //! engine stages, commits, branches, and rolls back (invariant 1). Every git
 //! operation is a subprocess of the system `git` binary — no library binding.
+//!
+//! # LEGACY-EFFECT
+//!
+//! `decisions.effect_site_inventory.mechanism` puts this module in the **frozen
+//! legacy section** of `effects/allowlist.toml` by name: "legacy modules frozen
+//! at PR5 (… legacy branch/checkout/commit operations in src/workspace.rs …)
+//! each carrying a LEGACY-EFFECT justification". The justification is that
+//! sentence's own: these are the schema-1..3 engine's Git operations, they are
+//! reached only by legacy paths, and `invariants_preserved[1]` requires their
+//! behaviour to be untouched by this slice. The schema-4 primitives —
+//! execution root, detached worktrees with intents, exact snapshots, engine
+//! refs, and the Git-object creation contexts — live behind typed funnels in
+//! [`crate::workspace_manager`] instead, and nothing here calls them.
+//!
+//! The section "may only shrink after PR5 (the test compares against the frozen
+//! list)", so this attribute is a ceiling rather than a licence.
+
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -28,6 +50,31 @@ pub struct CapturedCandidate {
     pub tree_oid: String,
     pub diff: String,
 }
+
+/// The fixed arguments of a reviewable diff, before its two revisions.
+///
+/// **Shared because there are now two callers and one meaning.** Schemas 1–3
+/// capture the diff from the task workspace ([`Workspace::capture_candidate`]);
+/// the schema-4 driver captures a tree and asks
+/// [`crate::workspace_manager::WorkspaceManager::candidate_diff`] for the diff
+/// of that tree against its parent. Both produce the text a reviewer judges and
+/// `classify::diff_failure` reads, so both must be the *same* text.
+///
+/// Every flag is load-bearing and each one defends against operator config
+/// rather than against Git's defaults. A configured `diff.external`
+/// (difftastic and friends) replaces the output wholesale; `color.ui` injects
+/// escape codes; `textconv` substitutes a rendered form for the bytes. Any of
+/// those corrupts every downstream check that reads the diff — and
+/// `capture_diff_is_immune_to_user_diff_config` is the test that says so.
+pub(crate) const REVIEW_DIFF_FLAGS: &[&str] = &[
+    "-c",
+    "color.ui=false",
+    "diff",
+    "--binary",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+];
 
 impl Workspace {
     /// Open an existing git worktree, normalizing to its top level. Running
@@ -535,18 +582,9 @@ impl Workspace {
         }
         self.git_with_private_hooks(&["add", "-A"])?;
         let tree_oid = self.staged_tree_oid()?;
-        let diff = self.git(&[
-            "-c",
-            "color.ui=false",
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            &parent_oid,
-            &tree_oid,
-            "--",
-        ])?;
+        let mut argv: Vec<&str> = REVIEW_DIFF_FLAGS.to_vec();
+        argv.extend([parent_oid.as_str(), tree_oid.as_str(), "--"]);
+        let diff = self.git(&argv)?;
         let observed_branch_ref = self.current_branch_ref()?;
         let observed_parent = self.head_sha_full()?;
         if observed_branch_ref != branch_ref || observed_parent != parent_oid {
@@ -1747,6 +1785,9 @@ impl Drop for GateWorkspace {
 mod tests {
     use super::*;
     use std::env;
+    use std::time::Duration;
+
+    use crate::agent::proc::test_support::readiness;
 
     fn temp_repo(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("upstroke-ws-{tag}-{}", std::process::id()));
@@ -2963,11 +3004,23 @@ mod tests {
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
-        fs::write(
-            &ready,
-            snapshot.workspace().root().to_string_lossy().as_bytes(),
-        )
-        .expect("publish snapshot path");
+        // The snapshot's *identifier*, not its path. CODING_STANDARDS.md §12:
+        // "a path is not safely a line: an ancestor may contain the delimiter,
+        // or bytes that are not text at all. Send an identifier the receiver can
+        // rejoin to a root it already knows." The parent supplied `store`, and
+        // `create_in_store_inner` puts every snapshot at `<store>/worktrees/
+        // <name>`, so the name is all the parent is missing -- and unlike the
+        // path it is `upstroke-gates-<pid>-<ulid>`, which no ancestor can spoil.
+        let root = snapshot.workspace().root().to_path_buf();
+        let name = root
+            .file_name()
+            .expect("a snapshot root is a directory in the store")
+            .to_str()
+            .expect("the store names snapshots with an ASCII identifier");
+        // Published last, and atomically. This used to be `fs::write` straight
+        // to `ready`, which creates the name and then fills it -- so the parent,
+        // which polls for the path and then reads it, could read nothing.
+        readiness::publish(&ready, &[name]).expect("publish the snapshot identity");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
     }
@@ -2985,25 +3038,34 @@ mod tests {
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
-        let mut owner = Command::new(env::current_exe().expect("test executable"))
-            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
-            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
-            .env("UPSTROKE_REPO", &repo)
-            .env("UPSTROKE_SNAPSHOT_STORE", &store)
-            .env("UPSTROKE_READY", &ready)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn disposable snapshot owner");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "snapshot owner never published readiness");
-        let snapshot_path = PathBuf::from(
-            String::from_utf8(fs::read(&ready).expect("read snapshot path"))
-                .expect("test temp path is UTF-8"),
+        // Adopted, so a panicking assertion anywhere below still terminates and
+        // reaps this child rather than leaving it to sleep out its thirty
+        // seconds holding a registered worktree.
+        let mut owner = readiness::Producer::adopt(
+            Command::new(env::current_exe().expect("test executable"))
+                .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_SNAPSHOT_OWNER", "1")
+                .env("UPSTROKE_REPO", &repo)
+                .env("UPSTROKE_SNAPSHOT_STORE", &store)
+                .env("UPSTROKE_READY", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn disposable snapshot owner"),
         );
+        // Producer-aware, and the bound is the one this test already used. The
+        // wait it replaces polled only for the path, so an owner that died
+        // before publishing -- a failed `Workspace::open`, a store the helper
+        // could not create -- was reported fifteen seconds later as a producer
+        // that had never published, which is the clock talking rather than the
+        // death (CODING_STANDARDS.md §12).
+        let published = readiness::await_signal(&ready, owner.child(), Duration::from_secs(15))
+            .or_fail("the snapshot owner never published readiness");
+        let [name] = published.as_slice() else {
+            panic!("the readiness record is one field, not {published:?}")
+        };
+        // Rejoined to the root the parent already knew.
+        let snapshot_path = store.join("worktrees").join(name);
         assert!(snapshot_path.exists(), "snapshot was not materialized");
         assert_ne!(
             workspace
@@ -3013,8 +3075,8 @@ mod tests {
             "helper did not register a linked worktree"
         );
 
-        owner.kill().expect("hard-kill snapshot owner");
-        owner.wait().expect("reap snapshot owner");
+        owner.child().kill().expect("hard-kill snapshot owner");
+        owner.child().wait().expect("reap snapshot owner");
         assert!(
             snapshot_path.exists(),
             "hard kill unexpectedly ran the snapshot destructor"

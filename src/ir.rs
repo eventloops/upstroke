@@ -527,4 +527,43 @@ mod tests {
             "a CRLF checkout must not look like a changed plan"
         );
     }
+
+    #[test]
+    fn task_kind_all_lists_every_variant_exactly_once_in_order() {
+        // The compile-time canary: no wildcard arm, so an eighth TaskKind
+        // variant refuses to build until it is placed in this chain — and
+        // the walk below then refuses to pass until `ALL` carries it too.
+        fn successor(kind: TaskKind) -> Option<TaskKind> {
+            match kind {
+                TaskKind::Design => Some(TaskKind::Implement),
+                TaskKind::Implement => Some(TaskKind::Fix),
+                TaskKind::Fix => Some(TaskKind::Refactor),
+                TaskKind::Refactor => Some(TaskKind::Test),
+                TaskKind::Test => Some(TaskKind::Docs),
+                TaskKind::Docs => Some(TaskKind::Chore),
+                TaskKind::Chore => None,
+            }
+        }
+
+        let mut expected = vec![TaskKind::Design];
+        while let Some(next) = successor(*expected.last().expect("seeded non-empty")) {
+            expected.push(next);
+            if expected.len() > TaskKind::ALL.len() {
+                break; // a cycle in `successor` must fail the assert, not hang the test
+            }
+        }
+        assert_eq!(
+            expected,
+            TaskKind::ALL,
+            "TaskKind::ALL must list every variant, in declaration order"
+        );
+
+        // The other hand-kept lists agree with the enum: Display -> parse
+        // round-trips, and serde's derived name is the string Display prints.
+        for kind in TaskKind::ALL {
+            assert_eq!(TaskKind::parse(&kind.to_string()), Some(kind));
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, format!("\"{kind}\""));
+        }
+    }
 }

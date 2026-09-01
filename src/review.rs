@@ -36,6 +36,10 @@
 //! a commit. It goes to an `Unblock` question instead. Nothing here should make
 //! that harder to add — which is why a lens is an enum with behaviour hanging
 //! off it rather than a bool.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -44,12 +48,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::{AgentAdapter, TaskRun, proc};
+use crate::agent::{AgentAdapter, TaskRun};
 use crate::catalog::{self, Family};
 use crate::config::Config;
 use crate::error::UpstrokeError;
 use crate::ir::{Effort, OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
 use crate::route::ResolvedChain;
+use crate::runner::invocation::InvocationId;
+use crate::runner::{AgentId, Runner};
 use crate::util;
 
 /// Largest complete diff one review pass accepts. Silently omitting files is
@@ -301,26 +307,67 @@ impl ReviewPlan {
         ))
     }
 
-    /// The ordered passes for one task, given the binding the implementer is
-    /// actually running on.
-    ///
-    /// Two rules meet here, and the order matters:
-    ///
-    /// 1. A task with a configured second opinion keeps its primary reviewer
-    ///    **unrebound**. Rebinding it would let both passes resolve to the same
-    ///    different-family model, and Anthropic-written code would lose its
-    ///    Anthropic review entirely — strictly worse than the self-review the
-    ///    rebind exists to prevent.
-    /// 2. Otherwise the primary rebinds when it would be the *same model* that
-    ///    wrote the code. Exact `(agent, model)` equality, not family
-    ///    similarity: `claude-sonnet-5` reviewed by `claude-opus-5` is a
-    ///    genuine second look, and rebinding it would spend cross-vendor
-    ///    capacity on half the tasks in a run for no verification gain.
+    /// The ordered passes for the task at `index`. See [`passes_for`].
     pub fn passes_for(&self, index: usize, implementer: &PassBinding) -> Vec<ReviewPass> {
-        let Some(primary) = self.primary.clone() else {
+        passes_for(ReviewBindings::of_plan(self, index), implementer)
+    }
+}
+
+/// The three bindings pass selection actually reads, for one task.
+///
+/// **Ask for what you read.** [`passes_for`] consumes exactly `primary`,
+/// `alternative` and this task's `second_opinion` — never the enabled flag, the
+/// timeout, or the other tasks' entries. Naming that as a type is what lets one
+/// rule serve two shapes: a schema-3 [`ReviewPlan`] indexed by task position,
+/// and a schema-4 [`crate::topology::registry::FrozenTaskSpec`] that resolved
+/// its own second opinion at freeze time. The alternative was a driver-side
+/// re-derivation of the rebind rule, and `wrong_internal_assumption` is 48.3%
+/// of this project's classified findings — a second implementation of a rule
+/// with two interacting cases is exactly the shape that produces them.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewBindings<'a> {
+    /// The reviewer configured for every task in the run.
+    pub primary: Option<&'a PassBinding>,
+    /// The anti-self-review fallback, where the run retained one.
+    pub alternative: Option<&'a PassBinding>,
+    /// This task's §11.3 second opinion, where its paths asked for one.
+    pub second_opinion: Option<&'a PassBinding>,
+}
+
+impl<'a> ReviewBindings<'a> {
+    /// The run-level plan's answer for the task at `index`.
+    #[must_use]
+    pub fn of_plan(plan: &'a ReviewPlan, index: usize) -> Self {
+        Self {
+            primary: plan.primary.as_ref(),
+            alternative: plan.alternative.as_ref(),
+            second_opinion: plan.second_opinion.get(index).and_then(Option::as_ref),
+        }
+    }
+}
+
+/// The ordered passes for one task, given the binding the implementer is
+/// actually running on.
+///
+/// Two rules meet here, and the order matters:
+///
+/// 1. A task with a configured second opinion keeps its primary reviewer
+///    **unrebound**. Rebinding it would let both passes resolve to the same
+///    different-family model, and Anthropic-written code would lose its
+///    Anthropic review entirely — strictly worse than the self-review the
+///    rebind exists to prevent.
+/// 2. Otherwise the primary rebinds when it would be the *same model* that
+///    wrote the code. Exact `(agent, model)` equality, not family similarity:
+///    `claude-sonnet-5` reviewed by `claude-opus-5` is a genuine second look,
+///    and rebinding it would spend cross-vendor capacity on half the tasks in a
+///    run for no verification gain.
+#[must_use]
+pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Vec<ReviewPass> {
+    {
+        let Some(primary) = bindings.primary.cloned() else {
             return Vec::new();
         };
-        if let Some(second) = self.second_opinion.get(index).and_then(Option::as_ref) {
+        if let Some(second) = bindings.second_opinion {
             return vec![
                 ReviewPass {
                     lens: Lens::Acceptance,
@@ -332,7 +379,7 @@ impl ReviewPlan {
                 },
             ];
         }
-        let binding = match &self.alternative {
+        let binding = match bindings.alternative {
             Some(alt) if primary == *implementer => alt.clone(),
             _ => primary,
         };
@@ -341,6 +388,33 @@ impl ReviewPlan {
             binding,
         }]
     }
+}
+
+/// The lenses one task's frozen plan **obliges**, in the order it obliges them.
+///
+/// [`passes_for`]'s answer, projected to its lenses — not a second reading of
+/// its two rules. The projection is exact because the obligation is
+/// **invariant in the implementer**: the rebind of rule 2 chooses *which
+/// binding* applies the acceptance lens and never whether that lens runs, and
+/// rule 1 turns on a configured second opinion rather than on who wrote the
+/// code. So the set of lenses a record owes can be asked without knowing what
+/// ran, which is what lets the fold ask it —
+/// [`crate::events::AttemptRecord`] carries the passes and not the binding
+/// that produced them.
+///
+/// The stand-in implementer is `primary` for that reason: any value gives the
+/// same lenses, and using one that is certainly present keeps the call total.
+/// [`the_obliged_lenses_do_not_depend_on_who_implemented`] measures the
+/// invariance rather than asserting it here.
+#[must_use]
+pub fn obliged_lenses(bindings: ReviewBindings<'_>) -> Vec<Lens> {
+    let Some(primary) = bindings.primary.cloned() else {
+        return Vec::new();
+    };
+    passes_for(bindings, &primary)
+        .into_iter()
+        .map(|pass| pass.lens)
+        .collect()
 }
 
 /// Resolve every task's review passes (§11.2, §11.3).
@@ -463,13 +537,49 @@ pub fn plan_for(
     Ok(resolved)
 }
 
+/// What a review pass reads about the task under review.
+///
+/// **Three fields, and [`ReviewCx`] used to take a whole `ir::Task` to reach
+/// them.** `materialize_prompt` — the only thing in this module's review path
+/// that touches the task at all — quotes the title, the body and the acceptance
+/// criteria, and nothing else.
+///
+/// The wider field could not be shared. The schema-4 driver holds a
+/// `FrozenTaskSpec` from the frozen registry and no `ir::Task` anywhere:
+/// synthesising one would mean inventing an id, a kind and a dependency list
+/// the reviewer never reads, and a conversion that fabricates fields is free to
+/// drift from the plan it claims to represent. Asking for what is read removes
+/// the question — the same narrowing `OpenGeneration` made for the rebuild
+/// family, and for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewSubject<'a> {
+    /// The task's one-line title.
+    pub title: &'a str,
+    /// Its body, which may be empty.
+    pub body: &'a str,
+    /// Its acceptance criteria, which may be empty.
+    pub acceptance: &'a [String],
+}
+
+impl<'a> ReviewSubject<'a> {
+    /// The subject of a legacy plan's task.
+    #[must_use]
+    pub fn of(task: &'a Task) -> Self {
+        Self {
+            title: &task.title,
+            body: &task.body,
+            acceptance: &task.acceptance,
+        }
+    }
+}
+
 pub struct ReviewCx<'a> {
     pub adapter: &'a dyn AgentAdapter,
     pub profile: WorkerProfile,
     /// Which pass this is (§11.5). Decides the prompt preamble and the names of
     /// this review's artifacts on disk.
     pub lens: Lens,
-    pub task: &'a Task,
+    pub task: ReviewSubject<'a>,
     pub diff: &'a str,
     /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
@@ -492,6 +602,25 @@ pub struct ReviewCx<'a> {
     /// evidence for its own retry.
     pub stem: String,
     pub timeout: Duration,
+}
+
+/// The two identities one review pass can spend.
+///
+/// Two, because the packet's role set has two members for a review —
+/// `decisions.admission_and_leases.permits.invocation_identity`: "role in
+/// {worker, gate(n), **review_pass(n)**, **review_reask(n)**}". A pass that
+/// answers unparseably earns exactly one re-ask, and that re-ask is a second
+/// process with its own identity rather than a second run of the first.
+///
+/// Built by the caller rather than here, because which *form* they take is the
+/// caller's: a task's review is the attempt form and an integration
+/// transaction's is the sequence form (which has no worker).
+#[derive(Debug, Clone)]
+pub struct ReviewInvocations {
+    /// The verdict.
+    pub pass: InvocationId,
+    /// The one format-only re-ask, if the verdict could not be parsed.
+    pub reask: InvocationId,
 }
 
 /// What a review attempt produced. A reviewer that could not run at all is
@@ -568,7 +697,19 @@ fn unavailable_after_error(
     }
 }
 
-pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, UpstrokeError> {
+/// Run one review pass through `runner`.
+///
+/// # Errors
+///
+/// Only what makes the *evidence* unusable — an oversized or opaque diff. A
+/// reviewer that could not run is [`ReviewResult::Unavailable`], not an error:
+/// the engine has to tell "the code is wrong" from "the judge was
+/// unavailable".
+pub fn run_review(
+    cx: &ReviewCx<'_>,
+    runner: &dyn Runner,
+    invocations: &ReviewInvocations,
+) -> Result<ReviewOutcome, UpstrokeError> {
     // Validate the complete evidence before permission files are written or an
     // adapter can build/spawn a model command. An incomplete review is no
     // review, so large tasks fail closed rather than losing early paths.
@@ -648,19 +789,39 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, UpstrokeError> {
                 transcript: last_path,
             });
         }
-        let output =
-            match proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), remaining) {
-                Ok(output) => output,
-                Err(error) => {
-                    return Ok(unavailable_after_error(
-                        "review process failed",
-                        error,
-                        cost,
-                        invocation - 1,
-                        last_path,
-                    ));
-                }
-            };
+        // A reviewer is an agent CLI, so it is slotted and `host-v1` gives it
+        // its agent's credential location (`ExecutionRole::Review`). The
+        // workspace is the read-only candidate snapshot the caller resolved,
+        // and it is the runner that puts the process there — the adapter no
+        // longer can.
+        //
+        // The prompt still arrives the way the adapter says: `stdin_payload`
+        // is delivery policy (a CLI that takes the prompt as an argument
+        // returns nothing here), and the spec is what carries those bytes to
+        // the child.
+        let request = crate::runner::review_request(
+            command.stdin(cx.adapter.stdin_payload(&task_run).as_bytes().to_vec()),
+            task_run.workspace.clone(),
+            AgentId::new(cx.adapter.id()),
+            remaining,
+            if invocation == 1 {
+                invocations.pass.clone()
+            } else {
+                invocations.reask.clone()
+            },
+        );
+        let output = match runner.run(&request) {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(unavailable_after_error(
+                    "review process failed",
+                    error,
+                    cost,
+                    invocation - 1,
+                    last_path,
+                ));
+            }
+        };
 
         last_path = if invocation == 1 {
             transcript.clone()
@@ -782,7 +943,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
         );
     } else {
         prompt.push_str("Acceptance criteria (every one must hold):\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(prompt, "- {item}");
         }
         prompt.push('\n');
@@ -972,6 +1133,38 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ir::{TaskId, TaskKind};
+    use crate::runner::host::HostRunner;
+    use crate::runner::invocation::AttemptRole;
+    use crate::runner::{ExecutionRole, RunnerRequest};
+    use crate::topology::events::AttemptNumber;
+    use crate::topology::registry::TaskKey;
+
+    /// The boundary these tests run on: the real host one, because a review
+    /// test that mocked the runner would stop proving that a review is a
+    /// process.
+    fn host() -> HostRunner {
+        HostRunner::new()
+    }
+
+    /// One review pass's two identities, in the legacy engine's own scope —
+    /// task 0, attempt 1, pass 0. Written here rather than taken from a
+    /// generator so the test names what it is asserting about.
+    fn review_ids() -> ReviewInvocations {
+        ReviewInvocations {
+            pass: InvocationId::legacy_attempt(
+                TaskKey(0),
+                AttemptNumber(1),
+                AttemptRole::ReviewPass(0),
+                0,
+            ),
+            reask: InvocationId::legacy_attempt(
+                TaskKey(0),
+                AttemptNumber(1),
+                AttemptRole::ReviewReask(0),
+                0,
+            ),
+        }
+    }
 
     /// Any adapter contact is a test failure. Used to prove evidence-size
     /// refusal happens before permission materialization, command build, or
@@ -983,11 +1176,11 @@ mod tests {
             "never-invoked"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
+        fn probe(&self, _runner: &dyn Runner) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("oversized review must refuse before probing")
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
+        fn build(&self, _run: &TaskRun) -> Result<crate::runner::CommandSpec, UpstrokeError> {
             panic!("oversized review must refuse before command build")
         }
 
@@ -1026,30 +1219,34 @@ mod tests {
             "deadline-test"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
+        fn probe(&self, _runner: &dyn Runner) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("direct review test does not probe")
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
+        fn build(&self, _run: &TaskRun) -> Result<crate::runner::CommandSpec, UpstrokeError> {
             use std::sync::atomic::Ordering;
 
             let invocation = self.builds.fetch_add(1, Ordering::SeqCst);
+            // 0.4 and 0.75 of `verdict_reask_uses_the_remaining_pass_deadline`'s
+            // 3s budget. The ratios are what the test is about and they are
+            // unchanged; only the absolute scale moved, and it moved because
+            // 0.4 of *one* second left 599ms for a process spawn. See that
+            // test for the measurement.
             let (marker, delay_ms) = if invocation == 0 {
-                ("first-unparseable", "400")
+                ("first-unparseable", "1200")
             } else {
-                ("second-valid", "750")
+                ("second-valid", "2250")
             };
-            let mut command = std::process::Command::new(
-                std::env::current_exe().expect("current test executable"),
-            );
-            command.args([
-                "--exact",
-                "review::tests::review_deadline_helper",
-                "--nocapture",
-            ]);
-            command.env("UPSTROKE_REVIEW_DEADLINE_HELPER", marker);
-            command.env("UPSTROKE_REVIEW_DEADLINE_MS", delay_ms);
-            Ok(command)
+            Ok(crate::runner::CommandSpec::new(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .to_string_lossy(),
+            )
+            .arg("--exact")
+            .arg("review::tests::review_deadline_helper")
+            .arg("--nocapture")
+            .env("UPSTROKE_REVIEW_DEADLINE_HELPER", marker)
+            .env("UPSTROKE_REVIEW_DEADLINE_MS", delay_ms))
         }
 
         fn parse(
@@ -1099,29 +1296,28 @@ mod tests {
             "unavailable-test"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
+        fn probe(&self, _runner: &dyn Runner) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("direct review test does not probe")
         }
 
-        fn build(&self, run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
+        fn build(&self, run: &TaskRun) -> Result<crate::runner::CommandSpec, UpstrokeError> {
             match self.stage {
                 UnavailableStage::Build => Err(UpstrokeError::Agent {
                     message: "scripted review build failure".to_owned(),
                 }),
-                UnavailableStage::Spawn => Ok(std::process::Command::new(
-                    run.workspace.join("missing-reviewer-executable"),
+                UnavailableStage::Spawn => Ok(crate::runner::CommandSpec::new(
+                    run.workspace
+                        .join("missing-reviewer-executable")
+                        .to_string_lossy(),
                 )),
-                UnavailableStage::Transcript => {
-                    let mut command = std::process::Command::new(
-                        std::env::current_exe().expect("current test executable"),
-                    );
-                    command.args([
-                        "--exact",
-                        "review::tests::review_deadline_helper",
-                        "--nocapture",
-                    ]);
-                    Ok(command)
-                }
+                UnavailableStage::Transcript => Ok(crate::runner::CommandSpec::new(
+                    std::env::current_exe()
+                        .expect("current test executable")
+                        .to_string_lossy(),
+                )
+                .arg("--exact")
+                .arg("review::tests::review_deadline_helper")
+                .arg("--nocapture")),
                 UnavailableStage::Permissions => {
                     panic!("permission failure must stop before command build")
                 }
@@ -1231,7 +1427,7 @@ mod tests {
                 adapter: &adapter,
                 profile: profile_for("unavailable-test", "test-model", "review", Effort::High),
                 lens: Lens::Acceptance,
-                task: &task,
+                task: ReviewSubject::of(&task),
                 diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
                 artifacts: &[],
                 decisions: &[],
@@ -1242,7 +1438,8 @@ mod tests {
                 timeout: Duration::from_secs(60),
             };
 
-            let outcome = run_review(&cx).expect("infrastructure failure is a review outcome");
+            let outcome = run_review(&cx, &host(), &review_ids())
+                .expect("infrastructure failure is a review outcome");
             if matches!(stage, UnavailableStage::Transcript) {
                 assert_eq!(outcome.invocations, 1, "the reviewer already completed");
                 assert_eq!(outcome.cost_usd, Some(0.25), "reported spend is retained");
@@ -1409,7 +1606,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1447,7 +1644,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &decisions,
@@ -1494,7 +1691,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
             decisions: &[],
@@ -1534,7 +1731,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &broad,
             artifacts: &[],
             decisions: &[],
@@ -1558,7 +1755,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &huge,
             artifacts: &[],
             decisions: &[],
@@ -1568,7 +1765,8 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let error = run_review(&cx).expect_err("oversized review must fail closed");
+        let error =
+            run_review(&cx, &host(), &review_ids()).expect_err("oversized review must fail closed");
         let message = error.to_string();
         assert!(message.contains("complete-review limit"), "{message}");
         assert!(message.contains("smaller complete diff"), "{message}");
@@ -1584,7 +1782,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: opaque,
             artifacts: &[],
             decisions: &[],
@@ -1594,7 +1792,8 @@ mod tests {
             stem: "00-t1-opaque".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let error = run_review(&cx).expect_err("opaque review must fail closed");
+        let error =
+            run_review(&cx, &host(), &review_ids()).expect_err("opaque review must fail closed");
         assert!(error.to_string().contains("opaque binary"), "{error}");
     }
 
@@ -1608,7 +1807,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: gitlink,
             artifacts: &[],
             decisions: &[],
@@ -1618,8 +1817,84 @@ mod tests {
             stem: "00-t1-gitlink".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let error = run_review(&cx).expect_err("a gitlink hash is not reviewable content");
+        let error = run_review(&cx, &host(), &review_ids())
+            .expect_err("a gitlink hash is not reviewable content");
         assert!(error.to_string().contains("gitlink"), "{error}");
+    }
+
+    /// A runner that writes down which identity each review process carried.
+    struct RecordingRunner {
+        inner: HostRunner,
+        seen: std::sync::Mutex<Vec<(ExecutionRole, String)>>,
+    }
+
+    impl Runner for RecordingRunner {
+        fn run(
+            &self,
+            request: &RunnerRequest,
+        ) -> Result<crate::agent::ProcessOutput, UpstrokeError> {
+            self.seen
+                .lock()
+                .expect("recorder")
+                .push((request.role.clone(), request.invocation.render()));
+            Runner::run(&self.inner, request)
+        }
+    }
+
+    /// The re-ask is a second process with the packet's *other* review role.
+    ///
+    /// `decisions.admission_and_leases.permits.invocation_identity` gives a
+    /// review two role members — "{worker, gate(n), **review_pass(n)**,
+    /// **review_reask(n)**}" — so the one format-only re-ask a pass is allowed
+    /// carries `review_reask(n)`, not a second run of `review_pass(n)`. The
+    /// expected values are written from that sentence.
+    #[test]
+    fn the_one_format_reask_is_its_own_invocation_not_a_second_run_of_the_first() {
+        let root = std::env::temp_dir().join(format!(
+            "upstroke-review-reask-identity-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("review scratch");
+        let task = task();
+        let adapter = DeadlineAdapter::new();
+        let cx = ReviewCx {
+            adapter: &adapter,
+            profile: profile_for("deadline-test", "test-model", "review", Effort::High),
+            lens: Lens::Acceptance,
+            task: ReviewSubject::of(&task),
+            diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
+            artifacts: &[],
+            decisions: &[],
+            workspace: Path::new("."),
+            settings_dir: &root,
+            reviews_dir: &root,
+            stem: "reask-identity".to_owned(),
+            // Generous, so the pass really performs both invocations rather
+            // than running out of clock the way the deadline test wants it to.
+            timeout: Duration::from_secs(30),
+        };
+        let runner = RecordingRunner {
+            inner: HostRunner::new(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = run_review(&cx, &runner, &review_ids()).expect("review result");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(outcome.invocations, 2, "the format re-ask was attempted");
+
+        let seen = runner.seen.lock().expect("recorder").clone();
+        assert_eq!(
+            seen,
+            vec![
+                (ExecutionRole::Review, "k0.g0.a1.review_pass0.o0".to_owned()),
+                (
+                    ExecutionRole::Review,
+                    "k0.g0.a1.review_reask0.o0".to_owned()
+                ),
+            ],
+            "the verdict and its one re-ask are two processes with two \
+             identities, and both are review-role processes"
+        );
     }
 
     #[test]
@@ -1633,7 +1908,7 @@ mod tests {
             adapter: &adapter,
             profile: profile_for("deadline-test", "test-model", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1641,10 +1916,27 @@ mod tests {
             settings_dir: &root,
             reviews_dir: &root,
             stem: "deadline".to_owned(),
-            timeout: Duration::from_millis(1000),
+            // Three seconds, not one, and the two child delays scale with it
+            // (1200ms and 2250ms — the same 0.4 and 0.75 of the budget).
+            //
+            // The property under test is a ratio: the first invocation fits,
+            // and the re-ask does *not* fit in what the first one left. At one
+            // second that held with 599ms of slack for a process spawn —
+            // measured on an idle box, invocation 1 takes 401ms of the 1000ms
+            // — and a saturated machine eats 599ms spawning a test binary
+            // easily. When it does, the first invocation exhausts the whole
+            // budget, `run_review` returns before invocation 2, and this test
+            // fails with `invocations: 1` while asserting exactly the right
+            // thing. Observed twice under load and 41 times green idle.
+            //
+            // Scaling the clock is not weakening the assertion: the same
+            // re-ask still must not fit. Witnessed by mutation — giving the
+            // re-ask `cx.timeout` instead of the remaining budget still fails
+            // this test at the 3s scale, exactly as it did at 1s.
+            timeout: Duration::from_millis(3000),
         };
 
-        let outcome = run_review(&cx).expect("review result");
+        let outcome = run_review(&cx, &host(), &review_ids()).expect("review result");
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(outcome.invocations, 2, "the format re-ask was attempted");
         assert!(
@@ -1655,7 +1947,8 @@ mod tests {
                     ..
                 }
             ),
-            "a fresh one-second clock would let the 750ms re-ask pass; the shared deadline must not"
+            "a fresh three-second clock would let the 2250ms re-ask pass; the shared deadline \
+             must not"
         );
     }
 
@@ -1670,7 +1963,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
             decisions: &[],
@@ -2107,7 +2400,7 @@ mod tests {
                 Effort::High,
             ),
             lens: Lens::SecondOpinion,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -2154,6 +2447,83 @@ mod tests {
         assert!(
             !allow.contains("Bash"),
             "reviewers run nothing, not even gates: {allow}"
+        );
+    }
+
+    /// **The obliged lenses do not depend on who implemented the change.**
+    ///
+    /// [`obliged_lenses`] hands `passes_for` the primary binding as a stand-in
+    /// implementer, and the whole of why that is sound is that the answer does
+    /// not vary in that argument: rule 2 rebinds *who applies* the acceptance
+    /// lens and never *whether it runs*, and rule 1 turns on a configured
+    /// second opinion rather than on the author. Measured over the cross
+    /// product rather than argued, because the fold now judges a candidate's
+    /// success against this answer without having the implementer's binding to
+    /// hand.
+    ///
+    /// The implementers include the primary itself — which triggers the rebind
+    /// — and the alternative, so the case that would differ if the claim were
+    /// wrong is in the grid rather than adjacent to it.
+    #[test]
+    fn the_obliged_lenses_do_not_depend_on_who_implemented() {
+        let primary = PassBinding::new("claude-code", "claude-opus-5");
+        let alternative = PassBinding::new("copilot", "gpt-5.6");
+        let second = PassBinding::new("codex", "gpt-5.6-codex");
+        let implementers = [
+            PassBinding::new("claude-code", "claude-sonnet-5"),
+            primary.clone(),
+            alternative.clone(),
+            second.clone(),
+            PassBinding::new("", ""),
+        ];
+
+        let configurations = [
+            ("nothing configured", None, None, None),
+            ("primary alone", Some(&primary), None, None),
+            (
+                "primary and alternative",
+                Some(&primary),
+                Some(&alternative),
+                None,
+            ),
+            ("primary and second", Some(&primary), None, Some(&second)),
+            (
+                "all three",
+                Some(&primary),
+                Some(&alternative),
+                Some(&second),
+            ),
+            // No primary is `None ⟺ review disabled`, and nothing else can
+            // resurrect a pass — not even a configured second opinion.
+            ("second alone", None, None, Some(&second)),
+        ];
+
+        let mut arities: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for (label, primary, alternative, second_opinion) in configurations {
+            let bindings = ReviewBindings {
+                primary,
+                alternative,
+                second_opinion,
+            };
+            let obliged = obliged_lenses(bindings);
+            arities.insert(obliged.len());
+            for implementer in &implementers {
+                let ran: Vec<Lens> = passes_for(bindings, implementer)
+                    .into_iter()
+                    .map(|pass| pass.lens)
+                    .collect();
+                assert_eq!(
+                    ran,
+                    obliged,
+                    "{label}: `{}` implementing changes the lenses the plan obliges",
+                    implementer.describe()
+                );
+            }
+        }
+        assert_eq!(
+            arities,
+            [0_usize, 1, 2].into_iter().collect(),
+            "the grid does not reach all three arities, so the invariance is untested at one of them"
         );
     }
 }

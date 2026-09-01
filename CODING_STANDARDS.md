@@ -5,7 +5,7 @@ production code, tests, examples, build support, and code-generation inputs. It 
 project-specific: official Rust guidance is the foundation, while upstroke's product invariants,
 failure modes, and supported platforms determine the stricter rules.
 
-Last reconciled with the sources listed below: 2026-08-27.
+Last reconciled with the sources listed below: 2026-08-28.
 
 ## 1. Authority and scope
 
@@ -33,13 +33,39 @@ touches compliant. Unrelated debt should be recorded rather than hidden inside a
 scope expansion, unless it creates an immediate correctness or security risk; deferring such a
 risk requires an explicit owner and rationale.
 
-### Known conflicts at adoption
+### Retired conflict: `CommandSpec.program`
 
-`DESIGN.md:222` freezes `CommandSpec.program` as `String`, while §8 requires paths to use
-OS-native path types. This conflict is unresolved and is tracked as the open owner question
-`PR4-PROGRAM-PATH-NOT-UNICODE` in the parallelism workstream's `reviews/FINDINGS.md`. Its decision
-venue is workstream W4, in the G2 pass over PR3's layer. Until that ruling, the frozen design
-governs this one field; the exception is recorded rather than treated as precedent for other paths.
+Adoption recorded an unresolved conflict here: `DESIGN.md:222` freezes `CommandSpec.program` as
+`String`, while §8 requires paths to use OS-native path types. That entry called the conflict
+unresolved, named `PR4-PROGRAM-PATH-NOT-UNICODE` an open owner question, and gave workstream W4,
+in the G2 pass over PR3's layer, as its decision venue. **None of those three claims still holds.**
+`decisions/2026-08-25-commandspec-program-stays-string.md` closes the finding as not reproducible
+in production, leaves `DESIGN.md:222` unchanged, and **withdraws the W4 widening**, so no
+compressed spec edit is owed at any workstream. The block is retired in place rather than deleted,
+because a reader who met the earlier wording needs to be told which part of it stopped being true.
+
+**The closure is scoped to the routes this repository takes, and is not a claim about the type.**
+Every constructor here puts a bare CLI name in the field — which §8 does not govern and a `String`
+represents exactly — so the conflict has no reachable instance today. The boundary stays
+path-capable by contract, and §8 governs this field the moment a path-valued input exists. Adding
+a path-valued adapter or configuration input therefore reopens the question on its own merits
+rather than inheriting this closure.
+
+**One question on the same seam is still open, and the closure above does not reach it.**
+`PR40-PROGRAM-PUBLIC-ADAPTER-SEAM`, in the parallelism workstream's `reviews/FINDINGS.md`, asks
+whether the public `AgentAdapter` trait — which a crate outside this repository may implement — may
+carry a path in that field at all. It is accepted as real and deferred by owner disposition of
+2026-08-29, held by the project owner, and **that row is where its venue is recorded**: its owner
+column reads *"project owner, carried by G2 W4"* and its disposition says *"Revisit at G2 W4"*.
+The two records do not conflict.
+`decisions/2026-08-25-commandspec-program-stays-string.md` withdrew the **original PR4 widening**
+mandate and nothing else, so it leaves that workstream free to take a later, distinct question.
+
+**The representation decision itself remains pending, and this standard makes no part of it.**
+Whether the public seam may carry a path, and in what type, is decided at that venue and recorded
+there. §1 reports where the question sits; it selects nothing. The field's rule here is unchanged
+and remains the one the retirement above states — every route this repository takes puts a bare
+name in the field, and §8 governs it the moment a path-valued input exists.
 
 ## 2. Automated baseline
 
@@ -58,6 +84,27 @@ bash .github/scripts/test-docs-consistency.sh
 
 Run all eight commands from the repository root. `CLAUDE.md`'s Gates section records the known
 root-invocation trap and the extra `jq` prerequisite for the release-record fixture.
+`CLAUDE.md`, `CONTRIBUTING.md` and `.github/pull_request_template.md` each list all eight
+verbatim, and this section is the normative statement all three follow. CI splits the eight
+across its jobs — `lint` runs `cargo fmt`, `cargo clippy` and the four Bash gates, `test` runs
+`cargo test`, `msrv` runs the locked `check`, and `lint (windows)` and `lint (macos)` run Clippy
+again on their own platforms — and `upstroke-ci` aggregates every leg.
+
+**No gate checks that those copies agree.** `test-docs-consistency.sh` names that claim among
+the ones it withdrew deliberately: it asserts nothing about which cargo commands CI runs, whether
+CI executes them, or which commands the documents list, because a text checker cannot separate a
+command that is present from one that runs. What it does pin is the `test-*.sh` half of the
+inventory — the set of gate scripts in the tree equals the set the `lint` job invokes, and
+`CLAUDE.md`'s count of them equals the tree. Keeping the cargo half in step is a review duty, and
+Appendix A records it as review-only.
+
+These eight commands run on one operating system, which bounds what they can establish about a
+`cfg` region compiled only for another target. Parsing and formatting still reach an inactive
+inline block — `cfg` stripping happens after parsing, and rustfmt formats disabled source — so a
+syntax error or a formatting violation inside one fails the baseline on any host. Nothing past
+that does: a stripped block is never type-checked, its lint attributes are never evaluated, and
+its behaviour is never run. CI carries the other platforms; §11 states which leg evidences which
+kind of platform-gated claim.
 
 The project uses Rust edition 2024 and has an MSRV of 1.85.0. Code and dependencies MUST remain
 compatible with both the MSRV and the current stable toolchain. A green baseline is necessary,
@@ -72,21 +119,26 @@ Lint policy:
   diffable authority. A crate-root `#![allow]` or `#![deny]` does not change policy.
 - Prefer `#[expect(lint, reason = "…")]` to `#[allow]`. An expectation that stops firing becomes a
   warning, so a suppression that outlives its cause removes itself from review instead of
-  surviving unnoticed.
+  surviving unnoticed. That self-retirement needs a leg that both compiles the annotated region
+  and promotes warnings to errors. §11 governs which legs those are for platform-gated code; an
+  expectation in a region no such leg compiles does not operate at all — it suppresses nothing and
+  cannot become the warning that retires it.
 - Add targeted lints only after the repository is clean under them and the lint is available on
   the MSRV. Do not enable Clippy's `pedantic`, `nursery`, or `restriction` groups wholesale;
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
 - Do not rewrite clear code merely to satisfy a stylistic lint. Configure or narrowly suppress
   the lint, with rationale, when its premise does not hold.
-- A `clippy.toml` denylist, when present, is effect-funnel enforcement rather than style. Every
+- The `clippy.toml` denylist is effect-funnel enforcement rather than style. Every
   denied path MUST resolve under a Clippy CI leg that compiles the platform where the symbol
   exists. An unresolved denial enforces nothing; Clippy reports it only as a bare configuration
   warning, and `-D warnings` does not promote that warning.
 - A denylist MUST have a resolution census run by a named gate. The census links the probe against
   every dependency needed to resolve its paths, enumerates the declared platform exceptions, and
   injects a misspelled control that it must detect. These requirements attach to `disallowed-*`
-  entries: `clippy.toml` carries only the `allow-*-in-tests` booleans today, and the census
-  activates in the same change that introduces the first denied path.
+  entries, and they are active: `clippy.toml` carries 102 denied paths — 95 methods, 3 types
+  and 4 macros — beside the `allow-*-in-tests` booleans, and the census is
+  `effects::tests` in `src/effects/tests.rs`, which resolves every denied path
+  against a linked probe and injects a misspelled control it must detect.
 
 ## 3. Rust-native design principles
 
@@ -129,8 +181,8 @@ The following rules cut across every section:
 Wall-clock time, monotonic time, environment variables, and randomness are effects under rule 4.
 Production reads of them live in a deliberately small set of boundary modules, and decision logic
 receives values or injected capabilities instead of asking the machine. A change that adds a read
-site outside the existing set MUST say why the funnel cannot serve it; the future `clippy.toml`
-denylist pins the funnel once its platform legs and census exist.
+site outside the existing set MUST say why the funnel cannot serve it; the `clippy.toml` denylist
+pins the funnel, with its platform legs and census in place.
 
 Deadlines, timeouts, and elapsed measurements use `Instant`. `SystemTime` appears only where a
 recorded timestamp or a minted identifier needs wall-clock meaning. The two are never compared,
@@ -397,6 +449,33 @@ permission, executable-suffix, process-tree, rename, or locking assumptions in s
 Platform code is not verified by compiling it on another OS alone: behaviour needs native CI
 coverage.
 
+Evidence is platform-gated in the same way the code is. A test, a lint attribute, or a suppression
+that covers a `cfg` region is evidenced only by a leg that compiles that region, and each kind of
+claim needs the leg that evaluates it:
+
+- A **Clippy** lint attribute is evidenced only by a Clippy leg for that platform. A native test
+  leg and a native MSRV `check` leg do compile the region, but they do not run Clippy over it, so
+  they pass while a Clippy leg for the same platform fails.
+- A **rustc** lint attribute is not so limited: any leg that compiles the region evaluates it, so a
+  denied rustc lint does fail a native `test` or `check` leg on that platform. Its expectation
+  needs one thing more, because `unfulfilled_lint_expectations` is warn-by-default and so retires
+  a suppression only where warnings are promoted to errors. `ci.yml` sets `RUSTFLAGS: -D warnings`
+  at workflow scope, so today that is every leg — which means narrowing it to a single job would
+  silently take the self-retirement guarantee with it.
+- An `#[expect]` inside a region that no such leg compiles is inert in both directions. It
+  suppresses nothing, and it cannot become the warning that retires it. It reads as enforcement
+  and is not.
+- Cross-compilation is evidence, not a native run, and it carries its own blind spot: a path that
+  resolves for the host may not resolve for the target, which Clippy reports as a bare
+  configuration warning that `-D warnings` does not promote.
+
+A change that adds platform-gated code, tests, or annotations MUST name the leg that evaluates
+them. Every supported target has one today: `ci.yml` runs a Clippy leg on each of the three —
+`lint`, `lint (windows)` and `lint (macos)` — beside `test` and `msrv` matrices that compile all
+three natively, and the `upstroke-ci` aggregate fails unless every one of them succeeds. Adding a
+platform, or gating code to a target no leg covers, leaves a claim unevidenced; that is recorded
+in Appendix A as an uncovered platform rather than left to be inferred from a green baseline.
+
 ## 12. Tests
 
 Tests are executable evidence of a contract. New behaviour and bug fixes MUST include tests at the
@@ -419,13 +498,82 @@ Tests MUST be deterministic and hermetic by default:
 - inject or control clocks, randomness, environment, capacity observations, and process responses;
 - do not depend on network access, ambient credentials, user configuration, PATH contents, test
   execution order, or an installed vendor CLI unless the test is explicitly an integration test;
-- do not use sleeping as synchronization; signal the state the test needs to observe;
+- do not use sleeping as synchronization; signal the state the test needs to observe, under the
+  readiness rules below;
 - do not silently return success when a prerequisite is absent. Either provide the dependency,
   classify the test outside the default suite, or fail with a useful diagnostic;
 - state the reason in the attribute when a test is disabled (`#[ignore = "…"]`); a bare
   `#[ignore]` is a parking space, not a classification;
 - assert externally meaningful state and side effects, not an implementation copied into the
   test as its own oracle.
+
+### Readiness protocols
+
+A readiness signal is a claim about state, and a waiter is entitled to assert everything the claim
+names. The producer's ordering is what makes that claim true, so these rules bind the helper as
+much as the test:
+
+- A readiness signal MUST be published only after the state it announces is complete and
+  observable by the waiter. Publish it last, not alongside the work it describes.
+- **A file's existence is a readiness signal only if the file is published atomically.** Creation
+  and content are otherwise separate events, so a waiter polling for a path that is created and
+  then written can open it and read nothing. Two forms are sound: an empty marker created after
+  the state it announces, where there is nothing to read; and a file staged elsewhere and moved
+  into place by atomic rename under §8, where the name and its contents become visible together,
+  so a waiter may await the path and then read it. What is unsound is a path created in place and
+  written afterwards, because its existence is observable before the state it stands for.
+- A partial record MUST NOT be readable as a whole one. A record delimited by a terminator — a
+  newline on a pipe — is complete only once the terminator arrives; an unterminated final record
+  is a truncated write and MUST fail rather than yield a short value.
+- Keep the payload inside what the framing can carry. A path is not safely a line: an ancestor may
+  contain the delimiter, or bytes that are not text at all. Send an identifier the receiver can
+  rejoin to a root it already knows.
+- The wait MUST be bounded, and the bound MUST bound a producer that has wedged rather than time
+  one that is healthy. A deadline short enough to expire on a loaded runner has become the signal
+  itself, which is the failure this rule exists to prevent. The fast path is a producer that fails
+  and closes its channel; the bound is for the one that stays alive and silent.
+
+### Flakes
+
+A test that fails intermittently is a fact about the repository, and it is handled by measurement
+rather than by adjective. "Occasionally" and "flaky under load" are not records.
+
+When a test is observed failing without a change that explains it:
+
+- **Measure a rate before naming it a flake.** Record a numerator over a denominator of observed
+  runs — "one failure in 31 full-suite runs" — with the platform, the head, and the assertion
+  that failed. One failure and no denominator is an observation, not a rate.
+- **Establish provenance, and do not mistake nondeterminism for it.** Re-running the failed job at
+  the same commit is cheap and worth doing, but one byte-identical tree producing both outcomes
+  shows only that the failure is nondeterministic. It does not show where the nondeterminism came
+  from: a change that introduces a race produces exactly that signature. Provenance needs one of
+  two things — the same failure reproduced on a base or prior head that predates the change, or a
+  causal argument, made from what the diff actually touches, that it cannot reach the behaviour.
+  With neither, a newly observed intermittent failure is a candidate regression and is triaged as
+  one. "It passed on re-run" MUST NOT be the reason a change merges.
+- **Fingerprint an occurrence by platform and by the assertion or error it produced**, not by test
+  name alone. One name can cover several causes, and one cause can surface under several names, so
+  match on the failing assertion, together with the error code where the failure carries one — a
+  panicked assertion has a message and a location and no code, and is fingerprinted by those.
+- **Name an owner and state the consequence**, so a later red is triaged instead of re-diagnosed:
+  which fingerprint, and that a failure matching it is this flake until proven otherwise. A red
+  that does not match the recorded fingerprint is a regression until someone shows otherwise.
+- **The classification is provisional, and a cause retires it.** A failure with an identified
+  mechanism on a supported platform is a defect at whatever rate it occurs, triaged by repairing
+  that mechanism rather than by re-running. A rate does not settle the category; it is what makes
+  the category arguable.
+- **Preserve the evidence a rate is made of.** A harness that overwrites one output path each run
+  loses the auditable fingerprint and diagnostic provenance of every occurrence but the last,
+  because the next run destroys the failure the previous one caught. A rate can still be measured
+  if outcomes and diagnostics are retained separately — a numerator and denominator kept durably
+  outside that path carry the arithmetic — but occurrences that can no longer be re-examined are
+  not evidence that any of them matched the recorded fingerprint. Write per-run output: that is
+  the preferred form, because it keeps each occurrence's outcome and diagnostic together. Quote
+  the diagnostic — the message, and the error code when the failure has one — rather than the
+  bare fact of a failure.
+
+A red that recurs with no rate, no owner, and no stated consequence trains reviewers to discount
+CI, which costs more than the test does.
 
 ### Instruments and censuses
 
@@ -540,9 +688,13 @@ Reviewers and authors should be able to answer yes to each applicable item:
 - [ ] No production panic path handles data, environment, persistence, process, or scheduling.
 - [ ] Filesystem publication and concurrent arbitration use the required atomic semantics.
 - [ ] External commands check both process and protocol outcomes and clean up descendants.
-- [ ] Platform assumptions are isolated and tested natively.
+- [ ] Platform assumptions are isolated and tested natively, and platform-gated code, tests, and
+      annotations name the leg that evaluates them.
 - [ ] Untrusted input is bounded and validated before it gains authority; secrets stay redacted.
 - [ ] Tests force the important failure/interleaving and do not depend on ambient machine state.
+- [ ] Readiness signals follow their state, cannot be read partially, and every wait is bounded.
+- [ ] An intermittent failure carries a measured rate, established provenance, a fingerprint, an
+      owner, and a re-run-or-repair rule.
 - [ ] Source instruments scan their complete claimed domain and their injected controls fail.
 - [ ] Public behaviour, persisted formats, events, and documentation change together.
 - [ ] New abstraction and dependencies have a demonstrated purpose and do not widen capability.
@@ -579,20 +731,23 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 
 | Rule area | Mechanism | Enforcement status |
 |---|---|---|
-| §1 authority, precedence, and known conflicts | Pull-request review; `test-docs-consistency.sh` for the document relationships it explicitly enumerates | Review-only unless the named Bash fixture contains the claim |
+| §1 authority, precedence, and retired conflicts | Pull-request review. `test-docs-consistency.sh` enumerates exactly four claims, and they are about other documents: C1, that two fixed classes of backticked name in `CLAUDE.md` and `CONTRIBUTING.md` resolve at this head or are qualified in a window around each occurrence — a path under one of ten enumerated directory prefixes (`src`, `infra`, `.github`, `acceptance`, `decisions`, `proposals`, `reviews`, `examples`, `fixtures`, `docs`), and a bare `.md`, `.toml` or `.lock` filename at the root — plus one named stale-cross-reference sentence; a name outside those two patterns is never extracted and is not checked at all; C2, the msrv job's toolchain against `Cargo.toml`; C3, the gate inventory and count; C4, the workflow trigger contract | **Review-only.** That gate never opens this document, so no §1 claim is automated by it — precedence, the same-change reconciliation duty, and the retirement of the `CommandSpec.program` conflict are all read by a human |
 | §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
-| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: `clippy.toml` holds only test-allowance booleans; automated only after denied paths, their platform Clippy legs, and the census land |
+| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | **Active.** 102 denied paths, the census in `src/effects/tests.rs`, and Clippy legs on all three platforms — `lint`, `lint (windows)` and `lint (macos)`. A path this host cannot resolve is caught by the census, not by `-D warnings` |
+| §2 baseline command list | Pull-request review; `ci.yml` is where the eight commands actually run, split across its `lint`, `test` and `msrv` jobs | **Review-only, and deliberately so.** `test-docs-consistency.sh` withdrew this claim in round 5 of its own review: it asserts nothing about which cargo commands CI runs, whether CI executes them, or which commands the documents list. Its C3 pins the `test-*.sh` inventory both directions and `CLAUDE.md`'s count of it; nothing pins the four cargo commands, or the agreement of §2 with `CONTRIBUTING.md`, `CLAUDE.md`, and `.github/pull_request_template.md` |
 | §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only, and the ambient-authority funnel is review-enforced until denylist entries pin it |
-| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; context quality and error taxonomy stay review-only |
-| §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
+| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated on all three platforms' Clippy legs, with `#[expect]` marking each documented §7 exception — the platform-coverage row below names the legs; before `lint (macos)` landed, `#[cfg(target_os = "macos")]` code was compiled by no Clippy job at all; context quality and error taxonomy stay review-only |
+| §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; the active effect denylist | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
 | §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
 | §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn` denied via `[lints]`, native tests; Miri or sanitizer only when a named leg exists; `undocumented_unsafe_blocks` pending its ratchet commit | Partly automated; safety proofs and tool triggers require review |
+| §11 platform coverage of lint claims | A Clippy leg per supported platform — `lint`, `lint (windows)` and `lint (macos)` — beside the `test` and `msrv` matrices, which compile all three natively and, under the workflow-wide `RUSTFLAGS: -D warnings`, evidence rustc lints and their expectations on all three but never Clippy's; `upstroke-ci` aggregates every leg | **Covered on all three supported targets.** A Clippy lint or expectation in a `#[cfg(windows)]` or `#[cfg(target_os = "macos")]` region is evaluated on its own platform: `lint (windows)` evaluates the three `#[expect(clippy::expect_used)]` annotations in `src/agent/proc.rs`'s `windows_job`, and `lint (macos)` is what holds that file's `#[cfg(target_os = "macos")]` regions — the macOS arm of `create_cloexec_pipe` among them — to the denied panic lints. Each of the two added legs repaired a real hole: before them those regions were compiled by the `test` and `msrv` matrices but by no Clippy job, so the annotations suppressed nothing and could not self-retire, and a green baseline did not reveal it. Two effective `cfg` predicates are compiled by no CI runner, and `src/effects/tests.rs`'s `NO_CI_RUNNER_COMPILES` records exactly those two: `not(any(unix, windows))` and `all(unix, not(any(target_os = "linux", target_os = "macos")))`. Both are deliberate unsupported-target regions — else-arms that keep the crate compiling on a target family this project does not ship — so their bodies stay outside the denylist's and the panic lints' reach on every job CI runs. That is disclosure rather than coverage, and it is held exact: the structural `cfg` census asserts that the set of effective predicates no runner compiles equals this recorded set, so a newly uncovered region fails the census instead of passing unnoticed. A region gated to a target no Clippy leg covers is uncovered and is recorded as such here |
 | §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, oracle quality, `#[ignore]` reasons, and the periodic mutation pass require review |
-| §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists; `print_stdout`/`print_stderr` deny output outside the named modules | Otherwise review-only; doctests are not run by the baseline |
-| §14 security and trust boundaries | behavioural/security tests; effect denylist once active; pull-request review | Review-only where no named test or denial is cited |
+| §12 readiness protocols and flake records | Pull-request review; the standing finding ledger `reviews/FINDINGS.md` for a carried flake's rate, owner, and consequence, and a dated `reviews/` record for a single unexplained failure | Review-only, and not automatable as stated. No gate detects a readiness signal published before the state it announces — the test passes whenever the race is won — and no single CI attempt can establish a failure rate, which is measured across repeated runs of one head |
+| §13 documentation | `test-docs-consistency.sh` for C1's path-existence and stale-cross-reference checks over `CLAUDE.md` and `CONTRIBUTING.md` and C3's gate count — no other document is read, and no §13 rule is among its four claims; rustdoc/compiler where a compiled example target exists; `print_stdout`/`print_stderr` deny output outside the named modules | Partly automated, and narrowly. Whether rustdoc states a contract, whether `# Errors`/`# Panics`/`# Safety` are present where applicable, and the duty to update user and design documentation in the same pull request are review-only; doctests are not run by the baseline |
+| §14 security and trust boundaries | behavioural/security tests; the active effect denylist; pull-request review | Review-only where no named test or denial is cited |
 | §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review; SHA-pinned actions (review-verified); `cargo deny` once its configuration lands | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
-| Contribution, PR, and release policy | `test-pr-policy.sh`, `test-pr-ledger-evidence.sh`, and `test-release-record.sh` | Automated by the lint job |
+| Contribution, PR, and release policy | The artifact is read by a validator in the workflow that owns it: `pr-policy.yml` runs `validate-pr-body.sh` (title grammar, the six required sections, the canonical ledger header and separator, and each row's nine fields) and `validate-pr-ledger-evidence.sh` on every pull-request event; `release.yml` runs `validate-release-record.sh` on a release tag. The `lint` job runs the three fixture suites — `test-pr-policy.sh`, `test-pr-ledger-evidence.sh`, `test-release-record.sh` | **Automated only where a validator reads the artifact.** The `lint` job's three gates are positive controls proving those validators detect a violation; they read no pull request and are not the enforcement. The lifecycle duties no validator can read — the review's independence, whether a push from the reviewed head was exempt-only, and conversation resolution — are review-only |
 
 Application rules:
 

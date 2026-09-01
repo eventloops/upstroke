@@ -21,8 +21,13 @@
 //!   nothing. `--force` still carries the operator's own keys across, because
 //!   `profile`, `monthly_allowance` and `endpoint` are things discovery cannot
 //!   supply and replacing the file must not quietly delete.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
-use std::fmt::Write as _;
+mod render;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -131,7 +136,13 @@ pub fn run_with<'a>(
         // Probe first: §14 already treats a missing or broken binary as a
         // refusal to start, and discovery on a CLI that cannot even report its
         // version would be reading tea leaves.
-        let discovered = adapter.probe().and_then(|caps| adapter.discover(&caps));
+        // Its own host Runner, for the reason `capacity` states: `connect`
+        // drives no run, so there is no run's boundary to borrow, and it is
+        // not a coordinator so its children are outside INV-18's ambient job.
+        let runner = crate::runner::host::HostRunner::new();
+        let discovered = adapter
+            .probe(&runner)
+            .and_then(|caps| adapter.discover(&runner, &caps));
         match discovered {
             Ok(discovery) => {
                 // D1's cross-check, at the moment the roster's provenance is
@@ -169,7 +180,7 @@ pub fn run_with<'a>(
         }
     }
 
-    let content = render(&agents);
+    let content = render::pools_file(&agents);
     let existing = existing_text;
     // Two comparisons, because two different questions are being asked.
     //
@@ -228,7 +239,7 @@ fn settings_of(text: &str) -> Vec<String> {
 
 /// A line with any comment removed, whole-line or trailing.
 ///
-/// Trailing matters because this module writes one: `render_pool` decorates
+/// Trailing matters because `connect` writes one: `render::pool_section` decorates
 /// `reserve` with `# headroom kept for your own interactive sessions`, so the
 /// single line an operator is most likely to tidy is the one a whole-line-only
 /// filter would treat as a changed setting. `#` inside a quoted value is not a
@@ -365,144 +376,13 @@ fn default_pool_name(agent: &str) -> &str {
     agent
 }
 
-/// Render the pools file: §17's shape, plus a header saying who wrote it, when,
-/// and where the model roster came from.
-fn render(agents: &[AgentReport]) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# Written by `upstroke connect` v{} on {}.\n\
-         #\n\
-         # Pools are user-level (§17): they describe YOUR subscriptions, not this repo. The file\n\
-         # is hand-editable and `upstroke connect` will not overwrite your edits without --force.\n\
-         #\n\
-         # Model roster provenance: catalog {}, the static capability table shipped with this\n\
-         # binary. Neither agent CLI offers non-interactive model enumeration as of this writing,\n\
-         # so nothing here was cross-checked against what your installed CLI actually accepts.\n\
-         #\n\
-         # `profile` selects between several accounts on one vendor (§13). It is parsed, shown by\n\
-         # `upstroke capacity`, and acted on by nothing in v0.1 — add it when v0.2 wires it up.",
-        env!("CARGO_PKG_VERSION"),
-        util::rfc3339_utc_now(),
-        env!("CARGO_PKG_VERSION"),
-    );
-
-    for report in agents {
-        out.push('\n');
-        match (&report.outcome, &report.pool) {
-            (Ok(discovery), Some(pool)) => {
-                let _ = writeln!(out, "# {}: {}", report.agent, discovery.auth);
-                for note in &discovery.notes {
-                    let _ = writeln!(out, "#   {note}");
-                }
-                if discovery.shape.is_none() {
-                    let _ = writeln!(
-                        out,
-                        "#   kind below is a default, not something detected — change it if your \
-                         plan differs"
-                    );
-                }
-                out.push_str(&render_pool(pool));
-            }
-            _ => {
-                let _ = writeln!(
-                    out,
-                    "# {}: not usable on this machine, so no pool was written for it.",
-                    report.agent
-                );
-            }
-        }
-    }
-    out
-}
-
-fn render_pool(pool: &Pool) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "[pools.{}]", pool.name);
-    let _ = writeln!(out, "kind = \"{}\"", pool.kind);
-    let _ = writeln!(out, "agent = \"{}\"", pool.agent);
-    if let Some(window) = pool.window {
-        let _ = writeln!(
-            out,
-            "window = \"{}\"",
-            crate::capacity::render_duration(window)
-        );
-    }
-    if pool.weekly {
-        let _ = writeln!(out, "weekly = true");
-    }
-    let sources: Vec<String> = pool.sources.iter().map(|s| format!("\"{s}\"")).collect();
-    let _ = writeln!(out, "sources = [{}]", sources.join(", "));
-    let _ = writeln!(out, "safety_margin = {:.2}", pool.safety_margin);
-    let _ = writeln!(
-        out,
-        "reserve = {:.2}                     # headroom kept for your own interactive sessions",
-        pool.reserve
-    );
-    // The operator's own keys, written back out. `connect` never invents any of
-    // these — it cannot discover which account, how large an allowance is, or
-    // where a local model lives — but once one is in the file it has to survive
-    // being rewritten, or `--force` would delete exactly what the refusal it
-    // overrides existed to protect.
-    if let Some(profile) = &pool.profile {
-        let _ = writeln!(out, "profile = \"{profile}\"");
-    }
-    if let crate::capacity::Allowance::Units(units) = pool.monthly_allowance {
-        let _ = writeln!(out, "monthly_allowance = {units}");
-    }
-    if let Some(endpoint) = &pool.endpoint {
-        let _ = writeln!(out, "endpoint = \"{endpoint}\"");
-    }
-    out
-}
-
 /// What the CLI prints.
+///
+/// The body is `render::report`. This name stays here because it is the one
+/// `main` calls and the one `effects/wrappers.toml` classifies, and moving it
+/// would change a public path and a census anchor rather than a file boundary.
 pub fn render_report(report: &ConnectReport) -> String {
-    let mut out = String::new();
-    for agent in &report.agents {
-        match (&agent.outcome, &agent.pool) {
-            (Ok(discovery), Some(pool)) => {
-                let _ = writeln!(
-                    out,
-                    "{}: {} — pool `{}` [{}]",
-                    agent.agent, discovery.auth, pool.name, pool.kind
-                );
-                for note in &discovery.notes {
-                    let _ = writeln!(out, "  {note}");
-                }
-            }
-            (Err(error), _) => {
-                let _ = writeln!(out, "{}: skipped — {error}", agent.agent);
-            }
-            (Ok(_), None) => {}
-        }
-    }
-    for warning in &report.warnings {
-        let _ = writeln!(out, "warning: {warning}");
-    }
-    match report.outcome {
-        Wrote::Written => {
-            let _ = writeln!(out, "wrote {}", report.path.display());
-        }
-        Wrote::Unchanged => {
-            let _ = writeln!(out, "unchanged: {}", report.path.display());
-        }
-        Wrote::Refused => {
-            let _ = writeln!(
-                out,
-                "{} already exists and differs from what connect would write. That file is \
-                 hand-editable (§17), so it is not overwritten silently.\n\nWhat connect would \
-                 write:\n{}\nRe-run with --force to replace it.",
-                report.path.display(),
-                indent(&report.content)
-            );
-        }
-    }
-    out
-}
-
-fn indent(text: &str) -> String {
-    text.lines().map(|line| format!("  {line}\n")).collect()
+    render::report(report)
 }
 
 /// A refusal to clobber is not an error the operator can fix by retrying, and
@@ -518,8 +398,8 @@ mod tests {
     use super::*;
     use crate::agent::{AgentAdapter, AuthState, Caps, ProcessOutput, TaskRun};
     use crate::ir::Outcome;
+    use crate::runner::CommandSpec;
     use std::path::Path;
-    use std::process::Command;
 
     /// A scripted stand-in, so these tests run on a machine with no agent CLI
     /// installed at all.
@@ -533,7 +413,7 @@ mod tests {
             self.id
         }
 
-        fn probe(&self) -> Result<Caps, UpstrokeError> {
+        fn probe(&self, _runner: &dyn crate::runner::Runner) -> Result<Caps, UpstrokeError> {
             if self.discovery.is_none() {
                 return Err(UpstrokeError::Agent {
                     message: "binary not found on PATH".to_owned(),
@@ -550,7 +430,7 @@ mod tests {
             })
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<Command, UpstrokeError> {
+        fn build(&self, _run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
             unreachable!("connect never spawns an attempt")
         }
 
@@ -558,7 +438,11 @@ mod tests {
             unreachable!("connect never parses an attempt")
         }
 
-        fn discover(&self, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
+        fn discover(
+            &self,
+            _runner: &dyn crate::runner::Runner,
+            _caps: &Caps,
+        ) -> Result<Discovery, UpstrokeError> {
             self.discovery.clone().ok_or_else(|| UpstrokeError::Agent {
                 message: "binary not found on PATH".to_owned(),
             })
@@ -879,12 +763,13 @@ mod tests {
         // §13's discovery is a claim about a real CLI, so it is checked against
         // one where the machine has it — and skipped cleanly where it does not,
         // which is the shape every other binary-touching test here takes.
-        let Ok(caps) = crate::agent::claude::ClaudeCodeAdapter.probe() else {
+        let runner = crate::runner::host::HostRunner::new();
+        let Ok(caps) = crate::agent::claude::ClaudeCodeAdapter.probe(&runner) else {
             eprintln!("skipped: no claude on PATH");
             return;
         };
         let discovery = crate::agent::claude::ClaudeCodeAdapter
-            .discover(&caps)
+            .discover(&runner, &caps)
             .expect("discovery never fails on a CLI that probes");
         // Whatever it answers, it must be one of the three states and it must
         // explain itself — including when the answer is "could not tell".

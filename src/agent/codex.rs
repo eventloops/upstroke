@@ -86,22 +86,28 @@
 //!
 //! Surface captured from `codex --help`, `codex exec --help` and
 //! `codex exec resume --help` at 0.147.0, and verified by running it.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::bin::{self, Invocation};
-use super::proc::{self, ProcessOutput};
-use super::{AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
+use super::proc::ProcessOutput;
+use super::{
+    AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited,
+    probe_request,
+};
 use crate::capacity::PoolKind;
 use crate::catalog;
 use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::runner::{CommandSpec, Runner};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "codex";
@@ -127,6 +133,50 @@ const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
 const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config"];
 const REQUIRED_RESUME_FLAGS: [&str; 4] = ["--json", "--model", "-c", "--config"];
 
+/// Which of this adapter's pre-flight processes each identity is.
+///
+/// Named rather than counted, for the reason [`super::probe_request`] gives —
+/// and this is the adapter that made the reason concrete. Binary resolution
+/// here used to *spawn*, once per PATH candidate, and to cache the answer, so
+/// the second `probe()` in one process performed none of those spawns; a
+/// counter would have renumbered every capability step on the second call, and
+/// two pre-flights of one machine would have minted different identities for
+/// the same work.
+///
+/// **That variable-length step is gone** — the adapter names its CLI and the
+/// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so every process
+/// this adapter starts is now a fixed, named step. The table below is
+/// therefore the whole domain, which is what
+/// `every_preflight_process_has_its_own_ordinal` asserts.
+mod probe_ordinal {
+    pub const VERSION: u32 = 0;
+    pub const EXEC_HELP: u32 = 1;
+    pub const RESUME_HELP: u32 = 2;
+    /// The six strict-config parser probes: two surfaces x
+    /// {unknown-key control, xhigh, max}. `CONFIG_BASE + surface * 3 + step`.
+    pub const CONFIG_BASE: u32 = 3;
+    pub const CONFIG_PER_SURFACE: u32 = 3;
+    pub const PROBE_MODELS: u32 = 9;
+    pub const LOGIN_STATUS: u32 = 10;
+    pub const DISCOVER_MODELS: u32 = 11;
+    /// Every fixed ordinal above, for the uniqueness assertion.
+    #[cfg(test)]
+    pub const ALL: [u32; 12] = [
+        VERSION,
+        EXEC_HELP,
+        RESUME_HELP,
+        CONFIG_BASE,
+        CONFIG_BASE + 1,
+        CONFIG_BASE + 2,
+        CONFIG_BASE + CONFIG_PER_SURFACE,
+        CONFIG_BASE + CONFIG_PER_SURFACE + 1,
+        CONFIG_BASE + CONFIG_PER_SURFACE + 2,
+        PROBE_MODELS,
+        LOGIN_STATUS,
+        DISCOVER_MODELS,
+    ];
+}
+
 #[derive(Debug, Deserialize)]
 struct DebugModels {
     models: Vec<DebugModel>,
@@ -151,13 +201,16 @@ impl AgentAdapter for CodexAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self) -> Result<Caps, UpstrokeError> {
-        let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["--version".to_owned()]),
-            "",
-            PROBE_TIMEOUT,
-        )?;
+    fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["--version".to_owned()])?,
+                probe_ordinal::VERSION,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         if out.output_limited {
             return Err(UpstrokeError::Agent {
                 message: format!(
@@ -186,30 +239,33 @@ impl AgentAdapter for CodexAdapter {
         // Fresh and resumed attempts are different CLI surfaces. Both carry
         // the reasoning override, so both must prove `--config` before spend;
         // only fresh attempts carry the sandbox.
-        let fresh_help = proc::run_with_timeout(
-            invocation.command(&["exec".to_owned(), "--help".to_owned()]),
-            "",
+        let fresh_help = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["exec".to_owned(), "--help".to_owned()])?,
+            probe_ordinal::EXEC_HELP,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let fresh_help = checked_help(&invocation.display(), "exec", &fresh_help)?;
-        let resume_help = proc::run_with_timeout(
-            invocation.command(&["exec".to_owned(), "resume".to_owned(), "--help".to_owned()]),
-            "",
+        let resume_help = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["exec".to_owned(), "resume".to_owned(), "--help".to_owned()])?,
+            probe_ordinal::RESUME_HELP,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let resume_help = checked_help(&invocation.display(), "exec resume", &resume_help)?;
         validate_probe_contract(&version, &fresh_help, &resume_help)?;
-        validate_effort_config_key(&invocation, &version)?;
+        validate_effort_config_key(runner, &invocation, &version)?;
 
         // The strict local parser above proves the exact key and the two role
         // policy values. The CLI's local catalog is separate zero-spend
         // evidence for each model × effort pair, so require every known Codex
         // model to expose every shared effort level before a run can start.
-        let models = proc::run_with_timeout(
-            invocation.command(&["debug".to_owned(), "models".to_owned()]),
-            "",
+        let models = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["debug".to_owned(), "models".to_owned()])?,
+            probe_ordinal::PROBE_MODELS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let models = checked_model_catalog(&invocation.display(), &models)?;
         let parsed = parse_debug_models(&models)?;
         validate_model_efforts(&version, &parsed)?;
@@ -235,17 +291,22 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<Command, UpstrokeError> {
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
         if let Some(refusal) = edit_refusal(&run.profile) {
             return Err(refusal);
         }
-        let invocation = locate()?;
-        let mut cmd = invocation.command(&build_args(run));
         // The working root comes from the process, not from `-C`: `exec resume`
         // has no `-C`, and one mechanism that works for both shapes beats two
-        // that have to agree.
-        cmd.current_dir(&run.workspace);
-        Ok(cmd)
+        // that have to agree. It is now the *runner's* cwd
+        // (`RunnerRequest.workspace`) rather than one this adapter set, which
+        // is DESIGN.md:118's split and changes nothing about the mechanism.
+        //
+        // `cli()` names the CLI and the runner decides which file that is, so
+        // `build` performs no lookup of any kind and sends exactly the program
+        // string `probe` certified. `build` being data-only used to force a
+        // second, non-spawning resolution path beside the probing one; there is
+        // now one path, and it is a function of its argument.
+        cli().spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
@@ -261,19 +322,23 @@ impl AgentAdapter for CodexAdapter {
     /// documents no such query; here the honest answer is a real one, so
     /// `upstroke connect` writes a pool an operator can trust rather than a
     /// shrug.
-    fn discover(&self, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
-        let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["login".to_owned(), "status".to_owned()]),
-            "",
-            PROBE_TIMEOUT,
-        )?;
+    fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["login".to_owned(), "status".to_owned()])?,
+                probe_ordinal::LOGIN_STATUS,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         let mut discovery = parse_login_status(&out);
-        let models = proc::run_with_timeout(
-            invocation.command(&["debug".to_owned(), "models".to_owned()]),
-            "",
+        let models = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["debug".to_owned(), "models".to_owned()])?,
+            probe_ordinal::DISCOVER_MODELS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let models = checked_model_catalog(&invocation.display(), &models)?;
         discovery.models = parse_debug_models(&models)?
             .models
@@ -395,6 +460,15 @@ impl ConfigProbeSurface {
             Self::Resume => "exec resume",
         }
     }
+
+    /// Which surface this is, so its three parser probes get their own block
+    /// of invocation ordinals.
+    const fn index(self) -> u32 {
+        match self {
+            Self::Fresh => 0,
+            Self::Resume => 1,
+        }
+    }
 }
 
 /// A unique empty directory whose child path is guaranteed not to exist.
@@ -431,14 +505,21 @@ impl Drop for MissingOutputSchema {
     }
 }
 
-fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<(), UpstrokeError> {
+fn validate_effort_config_key(
+    runner: &dyn Runner,
+    invocation: &Invocation,
+    version: &str,
+) -> Result<(), UpstrokeError> {
     let schema = MissingOutputSchema::create()?;
     for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+        let base = probe_ordinal::CONFIG_BASE + surface.index() * probe_ordinal::CONFIG_PER_SURFACE;
         let control = run_config_parser_probe(
+            runner,
             invocation,
             surface,
             &format!("{CONFIG_PROBE_UNKNOWN_KEY}=true"),
             &schema.path,
+            base,
         )?;
         validate_unknown_config_control(version, surface, &control)?;
 
@@ -446,9 +527,16 @@ fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<
         // feature introduced. Model catalogs validate the remaining shared
         // values separately; accepting either assignment here proves the exact
         // key, while checking both catches a provider-side enum regression.
-        for effort in [Effort::XHigh, Effort::Max] {
+        for (step, effort) in [Effort::XHigh, Effort::Max].into_iter().enumerate() {
             let assignment = format!("model_reasoning_effort={}", effort_flag(effort));
-            let output = run_config_parser_probe(invocation, surface, &assignment, &schema.path)?;
+            let output = run_config_parser_probe(
+                runner,
+                invocation,
+                surface,
+                &assignment,
+                &schema.path,
+                base + 1 + u32::try_from(step).unwrap_or(u32::MAX),
+            )?;
             validate_effort_config_probe(version, surface, effort, &output)?;
         }
     }
@@ -456,16 +544,19 @@ fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<
 }
 
 fn run_config_parser_probe(
+    runner: &dyn Runner,
     invocation: &Invocation,
     surface: ConfigProbeSurface,
     assignment: &str,
     schema_path: &std::path::Path,
+    ordinal: u32,
 ) -> Result<ProcessOutput, UpstrokeError> {
-    proc::run_with_timeout(
-        invocation.command(&config_probe_args(surface, assignment, schema_path)),
-        "",
+    runner.run(&probe_request(
+        ADAPTER_ID,
+        invocation.spec(&config_probe_args(surface, assignment, schema_path))?,
+        ordinal,
         PROBE_TIMEOUT,
-    )
+    )?)
 }
 
 fn config_probe_args(
@@ -962,44 +1053,29 @@ fn parse_login_status(out: &ProcessOutput) -> Discovery {
 }
 
 // ---------------------------------------------------------------------------
-// Binary discovery — npm ships this as codex.cmd on Windows, which
-// CreateProcess cannot exec directly; `super::bin` owns the mechanics.
+// The CLI this adapter names, and what to tell an operator whose boundary
+// does not have it. `super::bin` owns the mechanics.
 // ---------------------------------------------------------------------------
 
-fn candidate_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["codex.exe", "codex.cmd", "codex.bat"]
-    } else {
-        &["codex"]
-    }
-}
+/// This CLI, as the boundary that will execute it names it.
+///
+/// One name, not a platform-dependent candidate list. This adapter used to
+/// resolve the name against the coordinator host's `PATH`, spawning once per
+/// candidate to skip a Windows Store package payload that is visible to a
+/// filesystem lookup but returns access denied when spawned. Both halves were
+/// answers to a question an adapter may not ask: the boundary that executes
+/// the CLI is the thing that knows which file the name is, and with a
+/// container runner it is not this machine's filesystem at all
+/// (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`). Skipping an unspawnable candidate is
+/// now the job of whatever resolves the name; so is `PATHEXT`.
+const CLI: &str = "codex";
 
-static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
+/// What to tell an operator whose boundary has no `codex`.
+const INSTALL_HINT: &str = "Install the OpenAI Codex CLI there (`npm install -g @openai/codex`), or select a different \
+     agent.";
 
-fn locate() -> Result<Invocation, UpstrokeError> {
-    bin::locate_with(
-        candidate_names(),
-        &RESOLVED,
-        |candidate| {
-            // Windows Store can put a package payload on PATH that is visible
-            // to filesystem lookup but returns access denied when spawned.
-            // Test each candidate before caching it so a later npm shim in the
-            // real PATH order can still win.
-            proc::run_with_timeout(
-                candidate.command(&["--version".to_owned()]),
-                "",
-                PROBE_TIMEOUT,
-            )
-            .is_ok_and(|output| !output.timed_out && output.code == Some(0))
-        },
-        |tried| {
-            format!(
-                "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex \
-                 CLI (`npm install -g @openai/codex`) or adjust PATH",
-                tried.join(", ")
-            )
-        },
-    )
+fn cli() -> Invocation {
+    Invocation::named(CLI)
 }
 
 /// Registry entry, so `by_id("codex")` resolves without this module being
@@ -1012,6 +1088,8 @@ impl AdapterSource for CodexAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::ir::WorkerProfile;
 
@@ -1478,9 +1556,13 @@ mod tests {
 {"type":"item.completed","item":{"id":"item_0","type":"command_execution"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hi"}}
 {"type":"turn.completed","usage":{"input_tokens":27707,"cached_input_tokens":22016,"cache_write_input_tokens":0,"output_tokens":102,"reasoning_output_tokens":0}}"#;
-        let outcome = parse_output(&output(0, stdout, "some tracing noise"));
+        let out = output(0, stdout, "some tracing noise");
+        let outcome = parse_output(&out);
 
         assert_eq!(outcome.status, OutcomeStatus::Completed);
+        // What the supervisor measured, carried through unchanged: see the
+        // same assertion in the Claude adapter for why it is asserted at all.
+        assert_eq!(outcome.duration, out.duration);
         assert_eq!(
             outcome.session_id.as_deref(),
             Some("019ff122-4d61-7323-a217-843ddfe5932c"),
@@ -1584,15 +1666,343 @@ mod tests {
         assert!(!odd.notes.is_empty());
     }
 
+    /// A Runner that records every request and answers each config-probe
+    /// surface the way a working `codex` does.
+    ///
+    /// The answers are what let the sequence *complete*: a validator that
+    /// refuses stops the walk, and a walk that stops after one process cannot
+    /// say anything about the identities of the other five.
+    /// A boundary that answers every one of this adapter's pre-flight
+    /// processes, and records each request.
+    ///
+    /// It answers by **argument**, never by program: what the CLI is called at
+    /// the boundary is the boundary's business, and a fixture that keyed on the
+    /// program string would be asserting the adapter's answer against itself.
+    struct RecordingRunner {
+        seen: std::sync::Mutex<Vec<crate::runner::RunnerRequest>>,
+    }
+
+    impl RecordingRunner {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn programs(&self) -> Vec<String> {
+            self.seen()
+                .iter()
+                .map(|request| request.command.program.clone())
+                .collect()
+        }
+
+        fn seen(&self) -> Vec<crate::runner::RunnerRequest> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn identities(&self) -> Vec<String> {
+            self.seen()
+                .iter()
+                .map(|request| request.invocation.render())
+                .collect()
+        }
+    }
+
+    impl Runner for RecordingRunner {
+        fn run(
+            &self,
+            request: &crate::runner::RunnerRequest,
+        ) -> Result<ProcessOutput, UpstrokeError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            let args = request.command.args.join(" ");
+            if args.contains(CONFIG_PROBE_UNKNOWN_KEY) {
+                // The control: the strict parser rejects the unknown key
+                // *before* the local missing-schema guard.
+                return Ok(output(
+                    2,
+                    "",
+                    &format!("error: unknown key `{CONFIG_PROBE_UNKNOWN_KEY}` in -c override"),
+                ));
+            }
+            if args.contains("model_reasoning_effort=") {
+                // The key is accepted, and the run then stops on the schema
+                // file that deliberately does not exist.
+                return Ok(output(
+                    2,
+                    "",
+                    &format!("error: output schema `{CONFIG_PROBE_SCHEMA_FILE}` does not exist"),
+                ));
+            }
+            if args.contains("--version") {
+                return Ok(output(0, "codex-cli 0.9.9\n", ""));
+            }
+            if args == "exec --help" {
+                return Ok(output(0, "--json --sandbox --model -c, --config", ""));
+            }
+            if args == "exec resume --help" {
+                return Ok(output(0, "--json --model -c, --config", ""));
+            }
+            if args == "debug models" {
+                // Every model the catalog knows, each advertising every
+                // effort. Derived from the catalog rather than written out:
+                // nothing here asserts *which* models exist, so the catalog is
+                // an input to this fixture and the oracle for nothing.
+                let models: Vec<_> = catalog::known_models(ADAPTER_ID)
+                    .into_iter()
+                    .map(|slug| {
+                        json!({
+                            "slug": slug,
+                            "supported_reasoning_levels": Effort::ALL
+                                .into_iter()
+                                .map(|effort| json!({ "effort": effort.to_string() }))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                return Ok(output(0, &json!({ "models": models }).to_string(), ""));
+            }
+            if args == "login status" {
+                return Ok(output(0, "Logged in using ChatGPT\n", ""));
+            }
+            Ok(output(0, "", ""))
+        }
+    }
+
+    /// The six strict-config parser probes really are six identities.
+    ///
+    /// `decisions.admission_and_leases.permits.invocation_identity`:
+    /// `InvocationId` is "unique **per process**", and `invariants[19]`
+    /// (INV-20) requires every Runner process to carry one. Two processes
+    /// sharing an identity collide in the invocation ledger and in every
+    /// invocation-derived containment scope.
+    ///
+    /// `every_preflight_process_has_its_own_ordinal` asserts the *table*
+    /// `probe_ordinal::ALL`, which is hand-written and contains only the
+    /// **declared** ordinals. These six are **computed** — `CONFIG_BASE +
+    /// surface.index() * CONFIG_PER_SURFACE + step` — so a `ConfigProbeSurface::
+    /// Resume` whose `index()` returned `Fresh`'s left the six processes
+    /// carrying three identities with the whole suite green
+    /// (`PR5-CORRECTNESS-008`). The repair is to stop asking the table and
+    /// start asking the requests.
+    ///
+    /// The invocation is built with [`Invocation::at`] rather than named, so
+    /// this drives the six config probes over an absolute program without
+    /// depending on what this machine has installed.
+    #[test]
+    fn the_six_config_parser_probes_are_six_distinct_identities() {
+        let runner = RecordingRunner::new();
+        let invocation = Invocation::at(if cfg!(windows) {
+            r"C:\nowhere\codex.cmd"
+        } else {
+            "/nowhere/codex"
+        });
+        validate_effort_config_key(&runner, &invocation, "0.9.9")
+            .expect("the scripted CLI satisfies every strict-config validator");
+
+        let identities = runner.identities();
+        assert_eq!(
+            identities.len(),
+            6,
+            "two surfaces x {{control, xhigh, max}}: {identities:?}"
+        );
+        let distinct: BTreeSet<&String> = identities.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            6,
+            "six processes carrying {} identities: {identities:?}",
+            distinct.len()
+        );
+        // And they are the probe form naming this agent, so a "distinct" set
+        // cannot be six values of some other shape.
+        assert!(
+            identities
+                .iter()
+                .all(|id| id.starts_with("p.agent-codex.o")),
+            "{identities:?}"
+        );
+
+        // The two surfaces are really two: the resumed one carries `resume`
+        // and the fresh one does not, so the six requests are six *different*
+        // processes and not one repeated six times.
+        let resumed = runner
+            .seen()
+            .iter()
+            .filter(|request| request.command.args.iter().any(|arg| arg == "resume"))
+            .count();
+        assert_eq!(resumed, 3, "three of the six probe the resumed surface");
+
+        // No computed ordinal may land on a declared one, which is the other
+        // way this block can collide.
+        let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
+        let computed: BTreeSet<u32> = identities
+            .iter()
+            .map(|id| {
+                id.rsplit_once(".o")
+                    .and_then(|(_, ordinal)| ordinal.parse::<u32>().ok())
+                    .expect("a probe identity ends in its ordinal")
+            })
+            .collect();
+        assert_eq!(computed.len(), 6);
+        assert!(
+            computed.iter().all(|ordinal| declared.contains(ordinal)),
+            "the six computed ordinals must be the six the table reserves: \
+             computed {computed:?}, declared {declared:?}"
+        );
+    }
+
+    /// The twelve declared ordinals are **exactly** the processes this
+    /// adapter's pre-flight starts — no thirteenth, and none outside the table.
+    ///
+    /// This replaces `every_binary_resolution_candidate_carries_its_own_identity`,
+    /// and the property it carries is the one that mattered: *no process this
+    /// adapter starts takes an identity the table does not enumerate.* That
+    /// test could only assert it of the variable-length block separately,
+    /// because binary resolution spawned once per unbounded PATH candidate and
+    /// no table could speak for it. The adapter now names its CLI and the
+    /// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so the
+    /// variable-length block is gone and the claim can be made over the whole
+    /// domain at once, against the requests rather than against the table.
+    ///
+    /// Both entry points, because `probe` and `discover` are separately
+    /// droppable and each has its own ordinals: ten and two.
+    #[test]
+    fn preflight_starts_exactly_the_processes_the_ordinal_table_declares() {
+        let runner = RecordingRunner::new();
+        let caps = CodexAdapter
+            .probe(&runner)
+            .expect("the scripted boundary satisfies every pre-flight validator");
+        assert_eq!(runner.identities().len(), 10, "probe's ten processes");
+        CodexAdapter
+            .discover(&runner, &caps)
+            .expect("the scripted boundary answers discovery too");
+
+        let identities = runner.identities();
+        assert_eq!(
+            identities.len(),
+            12,
+            "probe's ten and discovery's two: {identities:?}"
+        );
+        let distinct: BTreeSet<&String> = identities.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            identities.len(),
+            "two pre-flight processes shared one identity: {identities:?}"
+        );
+
+        // Every ordinal actually used is one the table declares. The table is
+        // the expected value here and the requests are the result, which is
+        // the direction that catches a step taking an ordinal nobody reserved.
+        let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
+        let used: BTreeSet<u32> = identities
+            .iter()
+            .map(|id| {
+                id.rsplit_once(".o")
+                    .and_then(|(_, ordinal)| ordinal.parse().ok())
+                    .expect("a probe identity ends in its ordinal")
+            })
+            .collect();
+        assert_eq!(
+            used, declared,
+            "the ordinals pre-flight used and the ordinals the table declares differ"
+        );
+    }
+
+    /// Every pre-flight process this adapter starts names the CLI and nothing
+    /// this machine contributed — over the whole pre-flight, not one call.
+    ///
+    /// The second field this holds constant is **the boundary**: the same
+    /// adapter is driven against two boundaries in one process, in both
+    /// orders, and each must be asked the identical program string. A
+    /// resolution memoised in a process-wide cell — which is what this adapter
+    /// had — is invisible to any test that constructs one runner, and would
+    /// hand the second boundary the first one's answer.
+    #[test]
+    fn every_preflight_process_names_the_cli_at_whichever_boundary_is_asked() {
+        let first = RecordingRunner::new();
+        let second = RecordingRunner::new();
+        let caps = CodexAdapter.probe(&first).expect("first boundary");
+        CodexAdapter
+            .discover(&first, &caps)
+            .expect("first boundary discovery");
+        let caps = CodexAdapter.probe(&second).expect("second boundary");
+        CodexAdapter
+            .discover(&second, &caps)
+            .expect("second boundary discovery");
+
+        // `codex`, written here rather than read from `CLI`: a constant
+        // compared against itself proves nothing.
+        let programs = first.programs();
+        assert_eq!(programs.len(), 12);
+        assert!(
+            programs.iter().all(|program| program == "codex"),
+            "a pre-flight process carried something other than the bare CLI name: {programs:?}"
+        );
+        assert_eq!(
+            programs,
+            second.programs(),
+            "the second boundary in this process was asked something different from the first"
+        );
+    }
+
+    /// Every pre-flight process of this adapter carries its own identity.
+    ///
+    /// `decisions.admission_and_leases.permits.invocation_identity` says
+    /// "unique **per process**", and this adapter runs 12 of them, so the
+    /// ordinals it fixes must be 12 distinct values. The expected count is
+    /// written here from the steps the adapter performs, not read from the
+    /// table under test — a table that lost an entry would otherwise agree
+    /// with itself.
+    #[test]
+    fn every_preflight_process_has_its_own_ordinal() {
+        use std::collections::BTreeSet;
+
+        let ordinals: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
+        assert_eq!(
+            ordinals.len(),
+            12,
+            "`--version`, two `--help` surfaces, six strict-config parser probes, `debug models`, `login status`, and discovery's `debug models` — 12 processes, 12 identities"
+        );
+        assert_eq!(probe_ordinal::ALL.len(), 12);
+
+        // And they really do render as 12 distinct identities of the packet's
+        // third form, which is the property the ordinals exist for.
+        let ids: BTreeSet<String> = probe_ordinal::ALL
+            .into_iter()
+            .map(|ordinal| {
+                crate::runner::InvocationId::probe(
+                    crate::runner::ProbeTarget::Agent(crate::runner::AgentId::new(ADAPTER_ID)),
+                    ordinal,
+                )
+                .expect("the adapter id survives an invocation identity")
+                .render()
+            })
+            .collect();
+        assert_eq!(ids.len(), 12);
+        assert!(
+            ids.iter().all(|id| id.starts_with("p.agent-codex.o")),
+            "the probe form, naming this agent: {ids:?}"
+        );
+    }
     // Runs only where the real CLI exists; deterministic contract fixtures do
     // the compatibility proof, while this catches local help/catalog drift.
     #[test]
     fn probe_against_real_binary_when_present() {
-        if locate().is_err() {
+        // The host runner's boundary *is* this machine, so what gates this is
+        // whether this machine has the CLI — asked of `util::find_program`
+        // rather than of the adapter, which no longer knows.
+        if crate::util::find_program(CLI).is_none() {
             eprintln!("codex not on PATH; skipping live probe");
             return;
         }
-        let caps = CodexAdapter.probe().expect("probe should succeed");
+        let caps = CodexAdapter
+            .probe(&crate::runner::host::HostRunner::new())
+            .expect("probe should succeed");
         assert!(caps.json_output);
         assert!(caps.session_resume);
         assert!(caps.model_list);

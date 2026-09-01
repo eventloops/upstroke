@@ -9,3 +9,211 @@
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-print-in-tests = true
+
+# The rustc-resolved effect denylist.
+#
+# `decisions.effect_site_inventory.mechanism` (1): "enforcement is rustc-resolved
+# rather than lexical: clippy.toml disallowed-methods, disallowed-types, and
+# disallowed-macros lists (rustc HIR resolution: aliases, re-exports, function
+# values, method calls, and macro-expanded code in this crate resolve to the same
+# DefId) name every effect primitive the crate can reach".
+#
+# Measured on this toolchain (clippy 0.1.97), and the reason the enforcement is
+# not lexical: a renamed import (`use std::fs::write as w`), a re-export
+# (`pub use std::fs::write`) and a function value (`let f = std::fs::write::<_,_>`)
+# each report as `std::fs::write` and each is denied. `effects::tests::
+# every_declared_effect_denial_refuses_for_the_reason_it_declares` compiles one
+# fixture per shape and asserts the emitted lint set, so that claim is executed
+# rather than believed.
+#
+# WHERE AN ALLOW MAY LIVE. Only as a module-level attribute in a file listed in
+# `effects/allowlist.toml`, enforced by `effects::tests::
+# every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`.
+#
+# THE ONE THING THIS FILE CANNOT TELL YOU. A path that does not resolve is a
+# denial that enforces nothing, and clippy reports it as a bare `warning:` that
+# `-D warnings` does NOT escalate (measured). `effects::tests::
+# every_denied_path_this_host_can_resolve_does_resolve` runs clippy-driver over a
+# probe with this file and fails on any such notice, with a positive control so a
+# vacuous run is impossible.
+
+disallowed-methods = [
+    # -- std::fs free functions -------------------------------------------
+    # "std::fs write/create/remove_file/remove_dir/remove_dir_all/rename/copy/
+    #  hard_link/set_permissions/create_dir/create_dir_all/DirBuilder"
+    { path = "std::fs::write", reason = "UPSTROKE-EFFECT R21/R18: write through a funnel that takes a site (rundir::write_plan, workspace_manager::write_intent, events::log)" },
+    { path = "std::fs::remove_file", reason = "UPSTROKE-EFFECT: deletion is a funnel with a containment check; a private half needs a PrivateHalfProof" },
+    { path = "std::fs::remove_dir", reason = "UPSTROKE-EFFECT: deletion is a funnel with a containment check" },
+    { path = "std::fs::remove_dir_all", reason = "UPSTROKE-EFFECT: deletion is a funnel with a containment check; a private half needs a PrivateHalfProof" },
+    { path = "std::fs::rename", reason = "UPSTROKE-EFFECT: publication is a funnel site (RunDir.Publish*, Answer.PublishRename)" },
+    { path = "std::fs::copy", reason = "UPSTROKE-EFFECT: a copy is not a publication; publication renames" },
+    { path = "std::fs::hard_link", reason = "UPSTROKE-EFFECT: creates a second name for a file outside any row" },
+    { path = "std::fs::set_permissions", reason = "UPSTROKE-EFFECT: mutates a path nothing accounts for" },
+    { path = "std::fs::create_dir", reason = "UPSTROKE-EFFECT R18/R21: directory creation is a funnel site" },
+    { path = "std::fs::create_dir_all", reason = "UPSTROKE-EFFECT R18/R21: directory creation is a funnel site" },
+    { path = "std::fs::soft_link", reason = "UPSTROKE-EFFECT: symlink creation; the slice refuses reparse points on its chains" },
+
+    # -- std::fs::File ----------------------------------------------------
+    # "File::create/create_new/options/set_len/sync_data/sync_all"
+    { path = "std::fs::File::create", reason = "UPSTROKE-EFFECT: creates and truncates; Event.OpenLog is the funnel for the log" },
+    { path = "std::fs::File::create_new", reason = "UPSTROKE-EFFECT: creates" },
+    { path = "std::fs::File::options", reason = "UPSTROKE-EFFECT: hands out an OpenOptions, which is itself denied" },
+    { path = "std::fs::File::set_len", reason = "UPSTROKE-EFFECT: truncation; Event.OpenLog.TruncateTornTail is the funnel's own point" },
+    { path = "std::fs::File::sync_data", reason = "UPSTROKE-EFFECT: the durability barrier; Event.OpenLog.SyncPrefix and the append points are where it is observed" },
+    { path = "std::fs::File::sync_all", reason = "UPSTROKE-EFFECT: the durability barrier" },
+
+    # -- io::Write on files ----------------------------------------------
+    # "io::Write::write_all/flush on files". Every byte-emitting method of the
+    # trait, not only the two the sentence names: `write`, `write_vectored` and
+    # `write_fmt` reach the same primitive, and `write_fmt` is what `write!` and
+    # `writeln!` expand to -- which is the macro-expansion case the mechanism
+    # sentence says must resolve to the same DefId. `std::fmt::Write::write_fmt`
+    # is a different DefId, so a `write!(formatter, ..)` in a Display impl is
+    # untouched by this entry.
+    { path = "std::io::Write::write_all", reason = "UPSTROKE-EFFECT: the Event funnel owns the only write path to the log" },
+    { path = "std::io::Write::write", reason = "UPSTROKE-EFFECT: same primitive as write_all, one call short" },
+    { path = "std::io::Write::write_vectored", reason = "UPSTROKE-EFFECT: same primitive as write_all" },
+    { path = "std::io::Write::write_fmt", reason = "UPSTROKE-EFFECT: what write!/writeln! expand to on a file" },
+    { path = "std::io::Write::flush", reason = "UPSTROKE-EFFECT: the flush the append points observe" },
+
+    # -- symlink creation on both platforms -------------------------------
+    { path = "std::os::unix::fs::symlink", reason = "UPSTROKE-EFFECT: symlink creation", allow-invalid = true },
+    { path = "std::os::windows::fs::symlink_file", reason = "UPSTROKE-EFFECT: symlink creation", allow-invalid = true },
+    { path = "std::os::windows::fs::symlink_dir", reason = "UPSTROKE-EFFECT: symlink creation", allow-invalid = true },
+
+    # -- std::process::Command's effectful methods ------------------------
+    # The type is denied too; these are the calls that actually start a process.
+    { path = "std::process::Command::spawn", reason = "UPSTROKE-EFFECT R22: process start goes through the Runner (Process.Spawn)" },
+    { path = "std::process::Command::output", reason = "UPSTROKE-EFFECT R22: process start goes through the Runner (Process.Spawn)" },
+    { path = "std::process::Command::status", reason = "UPSTROKE-EFFECT R22: process start goes through the Runner (Process.Spawn)" },
+
+    # -- libc ---------------------------------------------------------------
+    # "libc fork/kill/setpgid/setsid/flock/fcntl/exec*" -- and every other libc
+    # effect primitive this crate actually reaches, because `claim_scope` makes
+    # exhaustiveness "the disallowed list is complete for the primitives the
+    # crate uses", not "the list repeats the sentence". The classification of
+    # every `libc::` item in the tree, effect and non-effect with the reason, is
+    # `effects/wrappers.toml`'s `[libc]` section.
+    { path = "libc::fork", reason = "UPSTROKE-EFFECT R22: Spawn.ReaperStarted and the pre-exec points are the funnel's" },
+    { path = "libc::kill", reason = "UPSTROKE-EFFECT R22: signalling a process or group" },
+    { path = "libc::setpgid", reason = "UPSTROKE-EFFECT R22: Spawn.PreExecPgidAndRegister" },
+    { path = "libc::setsid", reason = "UPSTROKE-EFFECT R22: session leadership" },
+    { path = "libc::flock", reason = "UPSTROKE-EFFECT R17/R28: lock acquisition is Lock.Acquire*/ObserveCleanupHold" },
+    { path = "libc::fcntl", reason = "UPSTROKE-EFFECT R17: F_SETLK is the run lock; F_SETFL mutates an open description" },
+    { path = "libc::execv", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::execve", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::execvp", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::execl", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::execle", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::execlp", reason = "UPSTROKE-EFFECT R22: Spawn.Exec" },
+    { path = "libc::open", reason = "UPSTROKE-EFFECT: opens and can create a path" },
+    { path = "libc::close", reason = "UPSTROKE-EFFECT R17/R28: closing the descriptor releases the hold" },
+    { path = "libc::dup2", reason = "UPSTROKE-EFFECT R22/R26: rewrites the process's descriptor table; the Unix reaper puts a pipe on the listing child's stdout with it before exec (os_matrix's 'kills the dead coordinator's labeled containers')" },
+    { path = "libc::write", reason = "UPSTROKE-EFFECT: writes bytes to a descriptor" },
+    { path = "libc::unlink", reason = "UPSTROKE-EFFECT: deletion" },
+    { path = "libc::rmdir", reason = "UPSTROKE-EFFECT: deletion" },
+    { path = "libc::mkfifo", reason = "UPSTROKE-EFFECT: creates a path" },
+    { path = "libc::mkdtemp", reason = "UPSTROKE-EFFECT: creates a directory" },
+    { path = "libc::pipe", reason = "UPSTROKE-EFFECT: creates descriptors" },
+    { path = "libc::pipe2", reason = "UPSTROKE-EFFECT: creates descriptors", allow-invalid = true },
+    { path = "libc::waitpid", reason = "UPSTROKE-EFFECT R22: reaps a child, changing process-table state" },
+    { path = "libc::waitid", reason = "UPSTROKE-EFFECT R22: reaps a child, changing process-table state" },
+    { path = "libc::signal", reason = "UPSTROKE-EFFECT: process-wide disposition" },
+    { path = "libc::sigaction", reason = "UPSTROKE-EFFECT: process-wide disposition" },
+    { path = "libc::sigprocmask", reason = "UPSTROKE-EFFECT: process-wide mask" },
+    { path = "libc::pthread_sigmask", reason = "UPSTROKE-EFFECT: thread mask" },
+    { path = "libc::setrlimit", reason = "UPSTROKE-EFFECT: process-wide limit" },
+    { path = "libc::raise", reason = "UPSTROKE-EFFECT: signals this process" },
+    { path = "libc::_exit", reason = "UPSTROKE-EFFECT: terminates the process without unwinding" },
+    { path = "libc::syscall", reason = "UPSTROKE-EFFECT: an arbitrary kernel call; close_range and getdents64 reach the kernel through it" },
+
+    # -- windows_sys: process, job, and the file locks ----------------------
+    # "windows_sys process, job, and LockFileEx/UnlockFileEx functions".
+    # Unresolvable on a Unix host: clippy silently ignores a path whose crate is
+    # not linked (measured -- not even the unreachable-path warning fires), so
+    # these are enforced by the msvc-target clippy run and cross-checked against
+    # the tree's own Windows source by
+    # `effects::tests::every_platform_conditional_denial_names_something_real`.
+    { path = "windows_sys::Win32::Storage::FileSystem::LockFileEx", reason = "UPSTROKE-EFFECT R17/R25: lock acquisition is Lock.Acquire*" },
+    { path = "windows_sys::Win32::Storage::FileSystem::UnlockFileEx", reason = "UPSTROKE-EFFECT R17: lock release is Lock.Release" },
+    { path = "windows_sys::Win32::System::Threading::CreateProcessW", reason = "UPSTROKE-EFFECT R22: Spawn.CreatedSuspended" },
+    { path = "windows_sys::Win32::System::Threading::OpenProcess", reason = "UPSTROKE-EFFECT R22: takes a handle on another process" },
+    { path = "windows_sys::Win32::System::Threading::TerminateProcess", reason = "UPSTROKE-EFFECT R22: kills a process" },
+    { path = "windows_sys::Win32::System::Threading::ResumeThread", reason = "UPSTROKE-EFFECT R22: Spawn.Resumed" },
+    { path = "windows_sys::Win32::System::Threading::SuspendThread", reason = "UPSTROKE-EFFECT R22: suspends a thread of another process" },
+    { path = "windows_sys::Win32::System::JobObjects::CreateJobObjectW", reason = "UPSTROKE-EFFECT R22: the ambient and private job objects" },
+    { path = "windows_sys::Win32::System::JobObjects::OpenJobObjectW", reason = "UPSTROKE-EFFECT R22: takes a handle on a job object" },
+    { path = "windows_sys::Win32::System::JobObjects::AssignProcessToJobObject", reason = "UPSTROKE-EFFECT R22: Spawn.PrivateJobAssigned and Spawn.AmbientJobJoined" },
+    { path = "windows_sys::Win32::System::JobObjects::SetInformationJobObject", reason = "UPSTROKE-EFFECT R22: kill-on-close is set here" },
+    { path = "windows_sys::Win32::System::JobObjects::TerminateJobObject", reason = "UPSTROKE-EFFECT R22: kills a whole job" },
+
+    # -- crate-internal effectful wrappers ----------------------------------
+    # `mechanism` (3): "every pubfn of a legacy or shared module is classified
+    # effectful or effect-free by review; effectful wrappers are added to the
+    # disallowed list themselves, so a topology module cannot reach an effect
+    # through a legacy wrapper while legacy modules keep calling them under their
+    # module allow". The classification is `effects/wrappers.toml`; every row it
+    # marks `effectful` and not `funnel` appears here, asserted by
+    # `effects::tests::every_effectful_wrapper_is_on_the_disallowed_list`.
+    #
+    # `EventLog::open`/`EventLog::append` are deliberately absent: `mechanism`
+    # classifies them "as the Event funnel (site-taking) rather than as
+    # wrappers".
+    { path = "upstroke::util::fsync_file", reason = "UPSTROKE-WRAPPER R21/R18: the file half of the durability barrier; the ledger entry beside it belongs to a site-taking funnel" },
+    { path = "upstroke::util::fsync_dir", reason = "UPSTROKE-WRAPPER R21/R18: the directory half of the durability barrier; the ledger entry beside it belongs to a site-taking funnel" },
+    { path = "upstroke::util::write_text", reason = "UPSTROKE-WRAPPER: wraps std::fs::write; a topology write goes through a site-taking funnel" },
+    { path = "upstroke::util::write_json", reason = "UPSTROKE-WRAPPER: the mechanism sentence's own example; wraps std::fs::write" },
+    { path = "upstroke::interaction::write_question", reason = "UPSTROKE-WRAPPER: delegates to rundir::write_question_payload; call the funnel and pass the site" },
+    { path = "upstroke::interaction::write_answer", reason = "UPSTROKE-WRAPPER: delegates to the Answer.StageWrite/PublishRename funnels" },
+    { path = "upstroke::workspace::Workspace::run_git_with_private_hooks", reason = "UPSTROKE-WRAPPER: the legacy engine's git subprocess; schema-4 Git goes through workspace_manager's funnels" },
+    { path = "upstroke::workspace::Workspace::branch_exists", reason = "UPSTROKE-WRAPPER: legacy git subprocess; Ref.* is the schema-4 path" },
+    { path = "upstroke::workspace::Workspace::current_branch_ref", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
+    { path = "upstroke::workspace::Workspace::parent_sha", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
+    { path = "upstroke::workspace::Workspace::prepared_commit_matches", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
+    { path = "upstroke::workspace::Workspace::prepared_pin_target", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
+    { path = "upstroke::workspace::Workspace::ensure_run_exclusions", reason = "UPSTROKE-WRAPPER: writes the run-exclusion file and creates its directory outside any RunDir site" },
+    { path = "upstroke::gates::run_all", reason = "UPSTROKE-WRAPPER: writes gate logs with fs::write outside any RunDir site" },
+    { path = "upstroke::review::run_review", reason = "UPSTROKE-WRAPPER: writes review transcripts through util::write_text" },
+    { path = "upstroke::answer::answer", reason = "UPSTROKE-WRAPPER: creates the answers directory before staging" },
+    { path = "upstroke::connect::run_with", reason = "UPSTROKE-WRAPPER: creates a directory and writes the operator's upstroke.toml" },
+
+    # -- docker invocation helpers ------------------------------------------
+    # `mechanism` (1) names "docker invocation helpers" in its own enumeration,
+    # and these are them: the four effectful operations of the container-runtime
+    # seam and the two of the Git-view seam. Every one is a PRIMITIVE of a
+    # `ContainerSite`, so its only legitimate caller is the Container funnel
+    # `src/runner/container.rs`, which is in the funnel section of
+    # `effects/allowlist.toml`.
+    #
+    # Rust module privacy cannot make this a compile error: an item private to
+    # `runner::container` is visible to every module a lane adds beside it
+    # (`runner::container::census`, `::exec`, ...), so a token, a sealed trait
+    # or a private constructor would all be reachable from a sibling. Denying
+    # the primitives makes it a BUILD error instead -- the same mechanism the
+    # packet chose, and a reviewed artifact at every gate.
+    { path = "upstroke::runner::container::runtime::ContainerRuntime::create", reason = "UPSTROKE-EFFECT R26: container creation is Container.Create; the funnel verifies the reported image id against the record before Container.Start" },
+    { path = "upstroke::runner::container::runtime::ContainerRuntime::start", reason = "UPSTROKE-EFFECT R26: Container.Start, and it is reachable only after Container.WriteIntent" },
+    { path = "upstroke::runner::container::runtime::ContainerRuntime::stop", reason = "UPSTROKE-EFFECT R26: Container.Stop -- completion's docker stop and reclaim's docker kill" },
+    { path = "upstroke::runner::container::runtime::ContainerRuntime::remove", reason = "UPSTROKE-EFFECT R26: Container.Remove" },
+    { path = "upstroke::runner::container::GitView::materialize", reason = "UPSTROKE-EFFECT R19: the disposable Git view is Container.MountGitView" },
+    { path = "upstroke::runner::container::GitView::discard", reason = "UPSTROKE-EFFECT R19: Container.UnmountGitView" },
+]
+
+disallowed-types = [
+    { path = "std::fs::OpenOptions", reason = "UPSTROKE-EFFECT: the general door to a writable handle; funnels never return one" },
+    { path = "std::fs::DirBuilder", reason = "UPSTROKE-EFFECT R18/R21: directory creation is a funnel site" },
+    { path = "std::process::Command", reason = "UPSTROKE-EFFECT R22: process start goes through the Runner (Process.Spawn)" },
+]
+
+# The macros that reach an external effect and that no method entry can catch,
+# because the primitive they reach is inside std (`std::io::_print`) rather than
+# in this crate. `write!`/`writeln!` are NOT here: they expand to
+# `std::io::Write::write_fmt`, which is a disallowed method above and is precise
+# about the receiver -- listing the macros would deny every `write!(f, ..)` in a
+# Display impl, which is not an effect.
+disallowed-macros = [
+    { path = "std::print", reason = "UPSTROKE-EFFECT: the process's own stdout; a headless engine reports through the CLI surface, not from inside a funnel" },
+    { path = "std::println", reason = "UPSTROKE-EFFECT: the process's own stdout" },
+    { path = "std::eprint", reason = "UPSTROKE-EFFECT: the process's own stderr" },
+    { path = "std::eprintln", reason = "UPSTROKE-EFFECT: the process's own stderr" },
+]
