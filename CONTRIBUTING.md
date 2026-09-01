@@ -54,7 +54,7 @@ pull request is your acceptance, and it applies to every contribution you make t
 2. **You grant a licence.** You grant Cameron Lambert (the "Maintainer") a perpetual, worldwide,
    non-exclusive, royalty-free, irrevocable licence to reproduce, modify, distribute and
    sublicense your contribution, **including the right to license it under terms other than the
-   AGPL**, such as a commercial licence.
+   Apache License**.
 
 3. **You grant a patent licence.** You grant the Maintainer and all recipients of the software a
    perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent licence covering your
@@ -68,13 +68,14 @@ pull request is your acceptance, and it applies to every contribution you make t
 
 ### Why this exists
 
-upstroke is released under the AGPL, which some organisations cannot use — a policy prohibition, or
-a product they need to keep closed. Being able to offer those users a commercial licence is part
-of how the project intends to sustain itself. That is only possible if one party can license the
-whole codebase, which is what clause 2 preserves.
+Licences are not forever: this project began under the AGPL and was relicensed to Apache-2.0
+([the 2026-09-01 decision](decisions/2026-09-01-relicense-apache-2.md)). A move like that is
+only ever cheap while one party can license the whole codebase, which is what clause 2
+preserves as outside contributions arrive — a future change, such as a licence exception or a
+newer licence version, should not require tracking down every past contributor.
 
-The trade is explicit and worth stating plainly: your contribution may end up in a commercially
-licensed copy of upstroke. Everything you contribute also remains available to everyone under the
-AGPL, permanently — that cannot be taken back. If clause 2 isn't acceptable to you, say so in the
-PR; a change can often be reworked as a suggestion instead, and that's a perfectly good way to
-contribute.
+The trade is explicit and worth stating plainly: your contribution may later be offered under
+terms you did not choose. Everything you contribute also remains available to everyone under
+the Apache License 2.0, permanently — that cannot be taken back. If clause 2 isn't acceptable
+to you, say so in the PR; a change can often be reworked as a suggestion instead, and that's a
+perfectly good way to contribute.
