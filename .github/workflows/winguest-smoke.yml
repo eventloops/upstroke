@@ -1,11 +1,12 @@
 # Proof-of-concept for the self-hosted Windows leg: the real checkout and the
-# real test command, on an ephemeral winguest-ci runner. Dispatched by hand on
-# this scratch branch only; never merged. The measurement is this job's wall
+# real test command, on an ephemeral winguest-ci runner. Triggered by a draft PR from
+# this scratch branch only (dispatch needs the file on master); never merged. The measurement is this job's wall
 # clock against the windows-latest baseline (median ~12.5 min, tail ~21 min).
 name: winguest smoke
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [master]
 
 jobs:
   test-winguest:
