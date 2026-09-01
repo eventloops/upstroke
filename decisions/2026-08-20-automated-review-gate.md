@@ -279,3 +279,14 @@ build it in the engine instead.**
   divides this record against.
 - [2026-08-20 — what invalidates a frontier review](2026-08-20-review-invalidation-scope.md)
   — the invalidation semantics §9 classes as boundary; written the same day.
+
+## 2026-09-01 — the every-head cadence is narrowed
+
+The scheduling rule's first half — a single reviewer on every head — was
+narrowed on 2026-09-01: one full pass per pull request remains the norm, a
+serious P1 repair returns for a fresh pass, and a repair-only delta may
+instead be owner-verified and disclosed in the pull-request body. The
+post-review repair commits §1 measured are exactly the deltas the narrowing
+governs. §5's conditions on any automated return, and the panel cadence —
+exactly once, on the merge candidate — are untouched. See
+[2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).

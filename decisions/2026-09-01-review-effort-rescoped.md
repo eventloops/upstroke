@@ -14,8 +14,8 @@ owner-called sweeps.
 
 Measured cost of iterate-until-clean on documentation-weight changes: nine
 review passes on #83; five non-converging passes on the stopped #25 gate
-experiment; two passes plus a deliberately stopped third on #87, a two-file
-documentation change — each iteration paying a full three-OS CI matrix
+experiment; one completed pass plus a deliberately stopped second on #87, a
+two-file documentation change — each iteration paying a full three-OS CI matrix
 (roughly sixteen minutes, the Windows leg dominant) and a frontier review
 of ten to forty minutes. The loop was built to protect engine code and was
 pricing documentation and engine changes identically. The owner ruled the
@@ -31,8 +31,15 @@ protect.
   containing no serious P1 is now mergeable, disclosed. The exempt path set
   (exactly `reviews/FINDINGS.md`) is unchanged. A dated forward notice is
   appended to that record in the same change.
-- `2026-08-20-automated-review-gate.md` §5 is untouched: no automated
-  process merges, and reviewers hold no attesting credential.
+- `2026-08-20-automated-review-gate.md`'s scheduling rule — a single
+  reviewer on every head — narrows the same way; its §5 conditions on any
+  automated return (no automated process merges, reviewers hold no
+  attesting credential) and its panel cadence are untouched. A dated
+  forward notice is appended there in the same change.
+- `2026-08-21-stacked-slice-prs.md`'s per-head review of slice pull
+  requests narrows identically; gates, the merge-commit rule, and the
+  attestation cadence are unchanged. A dated forward notice is appended
+  there in the same change.
 - The ledger schema and its validators are untouched: `accepted-risk` and
   `deferred` were already canonical dispositions.
 

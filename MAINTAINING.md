@@ -29,7 +29,10 @@ contract itself.
    Accepted findings block nothing and oblige no further pass. A push that repairs reviewed
    findings means the recorded pass no longer binds to the head — never claim it does — but the
    merge may proceed once the owner has read the repair delta (`git diff <reviewed> <head>`)
-   against the findings and disclosed that verification in the body. One path is exempt from even
+   against the findings and disclosed that verification in the body. The verification confirms
+   the delta contains those repairs and nothing else: a delta that adds any new behavior, or that
+   touches workflows, gate scripts, or validators — never a repair — returns to step 3 for a
+   fresh pass. One path is exempt from even
    that, decided in `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff
    from the reviewed head lies inside `reviews/FINDINGS.md` — record both SHAs and confirm the
    exempt-only diff with `git diff --stat <reviewed> <head>`. Feature ideas discovered during
@@ -45,13 +48,14 @@ contract itself.
    owner's diff-read against the findings, or an explicit owner waiver citing its authorizing
    record.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. The merge is the
-   owner's attestation that the review recorded in the PR is real and that the reviewed SHA is the
-   head being merged. Do not push or force-push directly to `master`. Delete the source branch
-   after merge.
+   owner's attestation that the review evidence recorded in the PR is real and that the merged
+   head is accounted for exactly as step 7 requires: reviewed directly, or separated from the
+   reviewed SHA only by exempt or owner-verified repair-only deltas. Do not push or force-push
+   directly to `master`. Delete the source branch after merge.
 
 Slices of a long-running design land as pull requests **into** their integration branch
 (today `codex/parallelism-design`): they receive `upstroke-ci`, `upstroke-pr-policy`, and a
-single-reviewer frontier review of each head. The integration branch's own pull request into
+single-reviewer frontier review of each head, triaged per step 6. The integration branch's own pull request into
 `master` is reviewed once more, on the head that merges, after its last update from `master`.
 Merge commits only on and into the integration branch — a rewrite orphans every ledger row bound
 to a replaced SHA. Decided in `decisions/2026-08-21-stacked-slice-prs.md`.
@@ -152,8 +156,9 @@ workflow using `GITHUB_TOKEN` as the same GitHub Actions app, so a pull request 
 branch — can edit `ci.yml`, `pr-policy.yml`, or the validators they run and still produce green
 `upstroke-ci` and `upstroke-pr-policy` contexts. Those checks are required for feedback and for
 catching honest mistakes; they are not the security boundary. The boundary is that only the owner
-merges, after an independent review of the exact head, and that the diff the owner reviews includes
-any change to the gates themselves.
+merges, after an independent review recorded per steps 5–7 — any delta from the reviewed head
+exempt or owner-verified repair-only, and a delta touching the gates never a repair — and that the
+diff the owner reviews includes any change to the gates themselves.
 
 That is the boundary the retired App check enforced in practice. Its attestation workflow required
 the evidence comment to be owner-authored, and the build box and every agent session act on the

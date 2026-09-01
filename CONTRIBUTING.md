@@ -8,8 +8,9 @@ Every change enters `master` through the same path: open a draft pull request ea
 deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
 green head before merge. The reviewed SHA and a durable link to the verdict are recorded in the
 pull request; a new push means the recorded review no longer binds to the head — serious P1
-repairs get a fresh pass, other deltas are owner-verified and disclosed; the owner's merge is the
-attestation. See [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
+repairs get a fresh pass, repair-only deltas are owner-verified and disclosed, anything wider is
+re-reviewed; the owner's merge is the attestation. See
+[`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
 emergency policy. Contributions from external forks remain provisional: the required checks are
 candidate-controlled, so a fork's entire diff — workflow edits included — is reviewed before merge.
 
