@@ -70,6 +70,7 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+  Obligation narrowed 2026-09-01, by notice on the record.
 - [2026-08-24 — the PR3-layer freeze: charter, adjudication, and the G2 pass](2026-08-24-pr3-layer-freeze-charter.md): three
   deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
   blessed as a disclosed deviation; the pass over the layer runs before PR8.
@@ -80,7 +81,8 @@ artifacts (§15); records promoted here are the durable subset.
   block retires on its own motion.
 - [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
   `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
-  v0.2 completion, rather than once at the end.
+  v0.2 completion, rather than once at the end. Per-head slice ceremony narrowed and
+  the checkpoint made a baggage sweep 2026-09-01, by notice on the record.
 - [2026-08-26 — the retry brief survives a crash](2026-08-26-durable-retry-feedback.md):
   `FailureRecord` gains one additive `#[serde(default)] detail`, carrying §11.4's
   feedback onto the durable record; the schema-4 brief becomes a fold over it,
@@ -119,9 +121,10 @@ artifacts (§15); records promoted here are the durable subset.
   reliance and the public-lifecycle rule, applied transitively). Supersedes
   the 2026-08-27 keep-in-place pin; filing rules unchanged; dated forward
   notices appended to both prior records.
-- [2026-09-01 — review effort is re-scoped: serious P1s block, the rest is logged baggage](2026-09-01-review-effort-rescoped.md):
-  one full frontier pass per pull request stays the norm; only findings
-  meeting the serious-P1 bar block and re-review, everything else lands as
-  `accepted-risk`/`deferred` rows swept before releases, at checkpoint
-  merges, and on owner call. The 2026-08-20 binding rule stands; its
-  consequence is narrowed by appended notice. First exercised on #87.
+- [2026-09-01 — review effort is re-scoped: serious P1s block, the rest is fixed or logged as baggage](2026-09-01-review-effort-rescoped.md):
+  one full frontier pass per pull request stays the norm; serious P1s block
+  and re-review, `MUST` deviations and evidence-backed findings block
+  whatever their label, everything else lands as `accepted-risk`/`deferred`
+  rows swept before releases, at checkpoint merges, and on owner call. The
+  2026-08-20 binding rule stands; its consequence is narrowed by appended
+  notice. #87's disclosed waiver is the precedent it replaces.

@@ -71,3 +71,13 @@ attestation rule (`2026-08-23-retire-app-attestation.md`) are unchanged.
 - **Checkpoint merge without the ledger audit.** Rejected: it would move
   untriaged debt onto master, violating the rule the audit generalises —
   a measurement taken and not triaged is worse than one never taken.
+
+## 2026-09-01 — the per-head slice ceremony it left unchanged is narrowed
+
+This record changed nothing about the per-head slice ceremony, and still does not. The ceremony
+itself was narrowed on 2026-09-01, by notice on `2026-08-21-stacked-slice-prs.md`: serious P1
+repairs re-review, repair-only deltas below that bar may be owner-verified and disclosed. The
+checkpoint candidate is untouched, the panel attesting it on the head that merges with every
+seat re-run on any head movement, and each checkpoint merge is now also a designated sweep of
+accepted baggage. See
+[2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).

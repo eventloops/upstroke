@@ -22,25 +22,34 @@ contract itself.
    effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Upstroke
    owns this supervision natively, allow at least 90 minutes **per frontier review pass** and use
    the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
-6. Triage every finding against the serious-P1 bar defined under "Finding triage and cleanup
-   points". A serious P1 must be fixed, and the repaired head returns to step 3 for a fresh pass.
-   Every other finding is fixed at the author's discretion or accepted as logged baggage: a ledger
-   row with a stable id, an honest failure sequence, and disposition `accepted-risk` or `deferred`.
-   Accepted findings block nothing and oblige no further pass. A push that repairs reviewed
-   non-serious findings means the recorded pass no longer binds to the head — never claim it does — but the
-   merge may proceed once the owner has read the repair delta (`git diff <reviewed> <head>`)
-   against the findings and disclosed that verification in the body. The verification confirms
-   the delta contains those repairs and nothing else: a delta that adds any new behavior, or that
-   touches workflows, gate scripts, or validators — never a repair — returns to step 3 for a
-   fresh pass. One path is exempt from even
-   that, decided in `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff
-   from the reviewed head lies inside `reviews/FINDINGS.md` — record both SHAs and confirm the
-   exempt-only diff with `git diff --stat <reviewed> <head>`. Feature ideas discovered during
-   review belong in the design or a follow-up. Re-scoped in
+6. Triage every finding under "Finding triage and cleanup points". Three classes block the merge.
+   A serious P1 must be fixed, and the repaired head returns to step 3 for a fresh pass. A `MUST`
+   deviation in materially touched code, and a finding carrying a failing test, reproduction, or
+   mutation witness, are fixed whatever their label, under the two rules that outrank the bar,
+   and their repair delta is verified below like any other repair unless the finding is also a
+   serious P1. Every other finding is fixed at the author's discretion or accepted as logged
+   baggage: a ledger row with a stable id, an honest failure sequence, and disposition
+   `accepted-risk` or `deferred`. Accepted findings block nothing and oblige no further pass. A
+   completed pass containing no serious P1 is the pull request's full pass whatever its verdict
+   line says, once every finding is triaged; step 7 records that verdict as written. A push that
+   repairs reviewed non-serious findings means the recorded pass no longer binds to the head —
+   never claim it does — but the merge may proceed once the owner has read the repair delta
+   (`git diff <reviewed> <head>`) against the findings and disclosed that verification in the
+   body. The verification confirms the delta contains those repairs and nothing else: a delta
+   that adds any new behavior, or that touches workflows, gate scripts, or validators — never a
+   repair — returns to step 3 for a fresh pass. One path is exempt from even that, decided in
+   `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff from the
+   reviewed head lies inside `reviews/FINDINGS.md` — record both SHAs and confirm the
+   exempt-only diff with `git diff --stat <reviewed> <head>`. The owner-verified lane is for
+   single-reviewer passes only: a panel-reviewed merge candidate re-runs every seat on any head
+   movement, a repair included (`decisions/2026-08-31-panel-seats.md`). Feature ideas discovered
+   during review belong in the design or a follow-up. Re-scoped in
    `decisions/2026-09-01-review-effort-rescoped.md`.
-7. Once a review passes, record it in the PR body's Review evidence section: implementation and
-   reviewer models and effort, the full reviewed head SHA, transport and wall-clock limit, and a
-   durable link to the verdict. Re-run `.github/scripts/validate-pr-body.sh` from the default
+7. Once the pass is triaged, record it in the PR body's Review evidence section: implementation
+   and reviewer models and effort, the full reviewed head SHA, transport and wall-clock limit,
+   and a durable link to the verdict as written. A `CHANGES_REQUIRED` whose findings all landed
+   as repairs or logged baggage is recorded as exactly that, each finding with its disposition,
+   never as a pass. Re-run `.github/scripts/validate-pr-body.sh` from the default
    branch against the live title and body — `upstroke-pr-policy` ran the candidate's copy. Editing
    the title or body afterwards changes what was reviewed: re-check the body, and if the ledger
    changed in substance beyond recording the reviewed findings and their dispositions, review
@@ -58,6 +67,9 @@ Slices of a long-running design land as pull requests **into** their integration
 (today `codex/parallelism-design`): they receive `upstroke-ci`, `upstroke-pr-policy`, and a
 single-reviewer frontier review of each head, triaged per step 6. The integration branch's own pull request into
 `master` is reviewed once more, on the head that merges, after its last update from `master`.
+That rule is not narrowed: the checkpoint panel convenes on that head, and any movement after a
+seat has run re-runs every seat (`decisions/2026-08-31-panel-seats.md`), so step 6's
+owner-verified lane does not apply to it.
 Merge commits only on and into the integration branch — a rewrite orphans every ledger row bound
 to a replaced SHA. Decided in `decisions/2026-08-21-stacked-slice-prs.md`.
 
@@ -125,17 +137,21 @@ reaches at least one of:
 - a legal or licensing defect.
 
 The severity label a reviewer assigns does not decide this; the owner classifies, and a P1 whose
-failure needs speculative preconditions is reclassified down with a ledger row saying why.
+failure needs speculative preconditions is reclassified down with a ledger row saying why. A
+finding that does not meet the bar is non-serious in the rest of this document, whether or not
+one of the two rules below still requires its repair.
 
-Two standing rules outrank the bar. A finding that shows materially touched code deviating from
+Two standing rules outrank the bar and block the merge whatever the label; their repairs are
+verified as step 6 says. A finding that shows materially touched code deviating from
 a `MUST` in `CODING_STANDARDS.md` or the controlling design is never baggage: the code is fixed,
 or the standard itself is amended by explicit, reviewed change — the standard's own deviation
 rule. And evidence outranks severity where it exists: a finding carrying a failing test,
 reproduction, or mutation witness blocks until repaired, whatever its label —
 `decisions/2026-08-20-automated-review-gate.md` §3's adjudication routing, preserved.
 
-Everything below the bar is baggage the project deliberately carries: rows stay in their PR
-ledgers, and findings that outlive their PR belong in `reviews/FINDINGS.md`. Baggage is swept,
+Everything below the bar and outside those two rules is baggage the project deliberately
+carries: rows stay in their PR ledgers, and findings that outlive their PR belong in
+`reviews/FINDINGS.md`. Baggage is swept,
 not forgotten, at three designated points: before any release tag or crates.io publish, where
 every open `accepted-risk` and `deferred` row is re-triaged and the release notes name what
 ships open; at each integration checkpoint merge (`decisions/2026-08-25-checkpoint-merges.md`);

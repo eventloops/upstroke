@@ -291,5 +291,6 @@ narrowing governs. §3's adjudication routing is untouched: a finding
 carrying a failing test, reproduction, or mutation witness still blocks,
 whatever its severity — the narrowing governs how many passes run, never
 what evidence blocks. §5's conditions on any automated return, and the
-panel cadence — exactly once, on the merge candidate — are untouched. See
+panel cadence — exactly once, on the merge candidate, every seat re-run on
+any head movement (`2026-08-31-panel-seats.md`) — are untouched. See
 [2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).

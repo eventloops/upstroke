@@ -140,15 +140,19 @@ exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
 **A new push means the review no longer binds to the head.** A serious P1
-repair returns for a fresh pass; a non-serious repair-only delta — the
-reviewed findings' fixes and nothing else, never a gate change — is owner-verified
-against the findings and disclosed in the body
-(`decisions/2026-09-01-review-effort-rescoped.md`, which defines the
+repair returns for a fresh pass; a `MUST` deviation in materially touched
+code and a finding carrying a failing test, reproduction, or mutation
+witness are fixed before merge whatever their label; a non-serious
+repair-only delta — the reviewed findings' fixes and nothing else, never a
+gate change — is owner-verified against the findings and disclosed in the
+body (`decisions/2026-09-01-review-effort-rescoped.md`, which defines the
 serious-P1 bar with MAINTAINING.md); anything wider is a new change and is
 re-reviewed; a push confined to `reviews/FINDINGS.md` keeps the review
 outright
 (`decisions/2026-08-20-review-invalidation-scope.md`) — record both SHAs and
-confirm the exempt-only diff yourself before merging.
+confirm the exempt-only diff yourself before merging. A completed
+`CHANGES_REQUIRED` pass whose findings all landed as repairs or logged
+baggage is recorded as that verdict, never as a pass.
 Agents never merge to `master`: merging is the owner's act, and an agent
 session has no standing to do it even when it runs on the owner's token.
 
