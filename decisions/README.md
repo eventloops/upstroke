@@ -49,7 +49,8 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-20 — the automated review gate](2026-08-20-automated-review-gate.md):
   single reviewer every head, three-model panel once on the merge candidate; S9's
   remit moves to it. Stage 1 (comment-only) authorised; auto-merge is not, and the
-  reviewer's credential separation is advisory, not enforced.
+  reviewer's credential separation is advisory, not enforced. Every-head cadence
+  narrowed 2026-09-01, by notice on the record.
 - [2026-08-20 — what invalidates a frontier review](2026-08-20-review-invalidation-scope.md):
   reviews bind to the exact tree modulo an explicit exempt set — exactly
   `reviews/FINDINGS.md` to start; ancestor + exempt-only diff re-attests via owner
@@ -58,7 +59,8 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-21 — slices land as pull requests into their integration branch](2026-08-21-stacked-slice-prs.md):
   slice PRs into `codex/parallelism-design` get CI, policy, and a single-reviewer
   review of each head; attestation stays master-only and happens once on #18's
-  merge candidate. Merge commits only — a rewrite orphans ledger rows.
+  merge candidate. Merge commits only — a rewrite orphans ledger rows. Per-head
+  consequence narrowed 2026-09-01, by notice on the record.
 - [2026-08-22 — the strategy layer lives outside the public repository](2026-08-22-strategy-record-private.md):
   competitive analysis, kill criteria, positioning and the commercial path are
   maintained privately; `DESIGN.md` keeps stubs plus the engineering consequences;
@@ -68,6 +70,7 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+  Obligation narrowed 2026-09-01, by notice on the record.
 - [2026-08-24 — the PR3-layer freeze: charter, adjudication, and the G2 pass](2026-08-24-pr3-layer-freeze-charter.md): three
   deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
   blessed as a disclosed deviation; the pass over the layer runs before PR8.
@@ -78,7 +81,8 @@ artifacts (§15); records promoted here are the durable subset.
   block retires on its own motion.
 - [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
   `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
-  v0.2 completion, rather than once at the end.
+  v0.2 completion, rather than once at the end. Per-head slice ceremony narrowed and
+  the checkpoint made a baggage sweep 2026-09-01, by notice on the record.
 - [2026-08-26 — the retry brief survives a crash](2026-08-26-durable-retry-feedback.md):
   `FailureRecord` gains one additive `#[serde(default)] detail`, carrying §11.4's
   feedback onto the durable record; the schema-4 brief becomes a fold over it,
@@ -117,3 +121,10 @@ artifacts (§15); records promoted here are the durable subset.
   reliance and the public-lifecycle rule, applied transitively). Supersedes
   the 2026-08-27 keep-in-place pin; filing rules unchanged; dated forward
   notices appended to both prior records.
+- [2026-09-01 — review effort is re-scoped: serious P1s block, the rest is fixed or logged as baggage](2026-09-01-review-effort-rescoped.md):
+  one full frontier pass per pull request stays the norm; serious P1s block
+  and re-review, `MUST` deviations and evidence-backed findings block
+  whatever their label, everything else lands as `accepted-risk`/`deferred`
+  rows swept before releases, at checkpoint merges, and on owner call. The
+  2026-08-20 binding rule stands; its consequence is narrowed by appended
+  notice. #87's disclosed waiver is the precedent it replaces.

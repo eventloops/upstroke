@@ -155,3 +155,13 @@ ruling ever changes what a *pending* review would conclude.
 - `reviews/FINDINGS.md` — the authority rule this record leans on, and the file whose binding
   it changes.
 - MAINTAINING.md steps 5–7 — refined by the workflow PR that implements this record.
+
+## 2026-09-01 — the consequence of invalidation is narrowed
+
+This record's binding rule stands: a push means the recorded pass reviewed a different head,
+and the exempt set remains exactly `reviews/FINDINGS.md`. Its consequence — "everything else
+invalidates, deliberately", read as *restarts the review sequence* — was narrowed on
+2026-09-01: a single-reviewer pass that found no serious P1, plus an owner-verified repair-only
+delta, is now mergeable, disclosed in the pull-request body; a serious P1 repair still returns
+for a fresh pass, and a panel-reviewed candidate re-runs every seat on any head movement. See
+[2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).

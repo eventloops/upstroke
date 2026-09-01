@@ -73,3 +73,15 @@ owner-side settings change this record recommends but cannot make.
 - [2026-08-20 — what invalidates a frontier review](2026-08-20-review-invalidation-scope.md)
   — the ancestry-based rules that make rewriting the integration branch costly.
 - MAINTAINING.md — the paragraph after step 8, added with this record.
+
+## 2026-09-01 — the per-head consequence is narrowed
+
+Slice pull requests keep their gates and their review; the iterate-until-
+clean consequence of "a single-reviewer frontier review of each head"
+narrows exactly as it does on `master`: serious P1 repairs re-review,
+repair-only deltas may be owner-verified and disclosed
+([2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md)).
+The integration branch's own merge candidate is outside the narrowing: the
+panel attests it on the head that merges, every seat re-run on any head
+movement (`2026-08-31-panel-seats.md`). The merge-commit rule and the
+attestation cadence are unchanged.

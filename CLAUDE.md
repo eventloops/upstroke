@@ -139,16 +139,21 @@ evidence, Risk and rollback, Review finding ledger — and the ledger must use t
 exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
-**A new push invalidates the review and restarts the sequence** — review the
-new head — with one exception: a push whose entire diff from the reviewed head
-is confined to `reviews/FINDINGS.md` (not yet on master; it arrives with the
-parallelism slice) keeps the review; record both SHAs in the PR's review
-evidence and confirm the exempt-only diff yourself before merging
-(`decisions/2026-08-20-review-invalidation-scope.md`). The exemption is about
-the path, not about the file already existing: a push that only *adds*
-`reviews/FINDINGS.md` -- it arrives with the parallelism slice -- is itself
-exempt-only, which is how that standing ledger can land without costing the
-review it is meant to record. Everything else invalidates, deliberately.
+**A new push means the review no longer binds to the head.** A serious P1
+repair returns for a fresh pass; a `MUST` deviation in materially touched
+code and a finding carrying a failing test, reproduction, or mutation
+witness are fixed before merge whatever their label; a repair-only delta
+after a single-reviewer pass that found no serious P1 — the reviewed
+findings' fixes and nothing else, never a gate change — is owner-verified
+against the findings and disclosed in the
+body (`decisions/2026-09-01-review-effort-rescoped.md`, which defines the
+serious-P1 bar with MAINTAINING.md); anything wider is a new change and is
+re-reviewed; a push confined to `reviews/FINDINGS.md` keeps the review
+outright
+(`decisions/2026-08-20-review-invalidation-scope.md`) — record both SHAs and
+confirm the exempt-only diff yourself before merging. A completed
+`CHANGES_REQUIRED` pass whose findings all landed as repairs or logged
+baggage is recorded as that verdict, never as a pass.
 Agents never merge to `master`: merging is the owner's act, and an agent
 session has no standing to do it even when it runs on the owner's token.
 
