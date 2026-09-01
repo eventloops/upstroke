@@ -173,27 +173,6 @@ among them. **Check the tree rather than this list**: the v0.2 topology work
 splits `engine.rs` into `engine/` and adds `topology/`, and it reaches master
 only when its pull request merges.
 
-## On the dedicated build box
-
-If you are on the build box rather than a workstation: the provisioning tree
-and its operations guide moved to the private archive on 2026-09-01
-(`decisions/2026-09-01-infra-private.md`). The command wrappers —
-`upstroke-build` among them — live in `~/bin` on the box itself; the gate
-runner and service assets live elsewhere in the operator home. The rules
-below are the whole public contract.
-The rule that matters most:
-
-**Use `upstroke-build`, never set `CARGO_TARGET_DIR` yourself.**
-
-```bash
-upstroke-build cargo test --all-targets --all-features
-```
-
-sccache keys on the target directory, not the source path. One target dir per
-worktree is an unbounded set of paths, so no two worktrees ever share a cache
-entry. `upstroke-build` allocates from a bounded slot pool: full isolation between
-concurrent builds, repeating paths, cache hits.
-
 ## Traps that have already cost time
 
 **Exit codes and output disagree.** `codex login status` prints "Not logged in"
