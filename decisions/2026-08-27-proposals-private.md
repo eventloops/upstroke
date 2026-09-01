@@ -49,3 +49,12 @@ its own window.
   here cites SHAs, and the crate is published. Rewriting breaks the citations
   that make the ledger auditable, in order to hide documents that are already
   public.
+
+## 2026-09-01 — the keep-in-place pin is superseded
+
+The verdict above that the proposals already public stay where they are was
+superseded on 2026-09-01: the dated files were reduced to stubs in place, full
+texts relocated to the private companion repository — except the Decided G2
+pass plan, which stays in full because `DESIGN.md` and the freeze charter rely
+on its content. This record's filing rule is unchanged and remains in force.
+See [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

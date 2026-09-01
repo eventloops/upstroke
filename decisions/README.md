@@ -104,6 +104,8 @@ artifacts (§15); records promoted here are the durable subset.
   `agy` by absolute path — each with its invocation guard. No pre-authorized fallback: one
   repair, then wait; the panel never convenes partially.
 - [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md):
-  the thirteen dated `proposals/` files become stubs in place, full texts to the
-  private archive; supersedes the 2026-08-27 keep-in-place pin. Filing rules
-  unchanged; every citation resolves via the stubs and the folder index.
+  twelve of the thirteen dated `proposals/` files become verbatim-header stubs
+  in place, full texts to the private archive; the Decided G2 pass plan stays
+  whole (`DESIGN.md` and the freeze charter rely on its content). Supersedes
+  the 2026-08-27 keep-in-place pin; filing rules unchanged; dated forward
+  notices appended to both prior records.
