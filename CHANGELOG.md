@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Relicensed to Apache-2.0 with a NOTICE file; `0.1.0` and earlier stay under the AGPL-3.0-only
-  terms they shipped with (`decisions/2026-09-01-relicense-apache-2.md`).
+- Relicensed to Apache-2.0 with a NOTICE file; earlier releases keep the terms recorded in their
+  own tagged metadata and source notices (`decisions/2026-09-01-relicense-apache-2.md`).
 - The G2 checkpoint: the v0.2 parallel-execution machinery (worktree-per-task isolation, the
   compare-and-swap merge queue, the optional container runner, the topology layer) merged to
   master inert by default. The v0.1 sequential path is unchanged and schema-4 state engages only

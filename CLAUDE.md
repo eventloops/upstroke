@@ -40,8 +40,9 @@ compare-and-swap merge queue, the optional container runner and the topology
 layer) reached master at the G2 checkpoint on 2026-09-01
 (`decisions/2026-08-31-g2-checkpoint-promotion.md`), inert by default: the
 v0.1 sequential path is unchanged and the schema-4 machinery engages only by
-explicit schema choice. `export-decisions` landed on 2026-08-11
-(`decisions/2026-08-11-export-decisions-schema.md`). Still to come:
+explicit schema choice. `export-decisions` was decided on 2026-08-11 and
+landed on 2026-08-12 (`decisions/2026-08-11-export-decisions-schema.md`).
+Still to come:
 capacity-driven routing (the capacity engine ships **read-only**; `connect`,
 `capacity` and dry-run preview estimate and report, and nothing routes on it
 yet), more adapters (Aider, task-master and other plan formats), and
