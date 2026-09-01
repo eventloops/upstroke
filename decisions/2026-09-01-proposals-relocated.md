@@ -15,11 +15,14 @@ rule; and the
 [portfolio proposal](../proposals/2026-08-13-v0.5-portfolio-coordination.md)
 that critique reviews, because the retained critique cites its sections by
 number throughout — the retained-content rule applies transitively to
-whatever a retained public record relies on. The ten relocated files carry no
-content-level public citation that *uses* their content: the one record
-naming them is a review coverage manifest, satisfied by path resolution, and
-the folder index's summaries are not a reliance but the deliberate public
-replacement (the rule below). This record supersedes the
+whatever a retained public record relies on. Among the current tree's living
+and immutable documents, the ten relocated files carry no content-level
+citation that *uses* their content: the one such record naming them is a
+review coverage manifest, satisfied by path resolution; the folder index's
+summaries are not a reliance but the deliberate public replacement; and
+SHA-bound pull-request artifacts that cite a proposal at an exact head are
+outside the criterion by rule below — their citations resolve through the
+head they bind. This record supersedes the
 2026-08-27 pin that the already-public
 proposals stay where they are, and narrows 2026-08-22's "engine proposals
 stay public" clause to match the filing rule in force since 2026-08-27: the
@@ -31,10 +34,11 @@ and every stub keeps its path, title, and status block **verbatim** so that
 every existing citation still resolves.
 
 **Evidence that this is relocation, not deletion.** For the relocated set as
-a whole: Provenance: relocated to the private companion repository at its
-default-branch commit `359953f54f6c1dd08b2d2d1b36b1a1635a72e26b` on
-2026-09-01 — the sanctioned line form, used here for an outbound move. The
-owner verified, before this record merged, that all thirteen dated files
+a whole, the sanctioned line form, used here for an outbound move:
+
+Provenance: relocated to the private companion repository, default-branch commit `359953f54f6c1dd08b2d2d1b36b1a1635a72e26b`, 2026-09-01.
+
+The owner verified, before this record merged, that all thirteen dated files
 there are blob-for-blob identical to the public originals at `0a25698`
 (by object ID, per file). That check is owner-verified external evidence: it
 is recorded here and is not independently inspectable from the public
@@ -66,9 +70,17 @@ prospective.
   public filename by construction — that identity is what keeps citations
   resolving — and the index deliberately names and summarizes every relocated
   proposal, so the exact private paths are derivable from public material.
-  What remains forbidden is pointing beyond the public tree: no link, path,
-  or commit into the private repository appears anywhere public except a
-  sanctioned `Provenance:` line.
+  What remains forbidden is pointing at private *documents*: nothing public
+  references a private document the reader cannot reach through its public
+  stub — no links into the private repository, and no naming of private-only
+  files. The private repository's existence, its folder layout, and intake
+  commit identifiers carried in `Provenance:` statements or in the records
+  and pull-request bodies that quote them are referenceable — they are
+  structure and evidence, not documents. And SHA-bound pull-request
+  artifacts — review comments, bodies, and dated review records citing a
+  proposal at an exact head — are outside the retention criterion: their
+  citations bind the tree at that head and stay verifiable through it, so a
+  path-level stub cannot break them.
 - **An index summary is not content reliance.** The index's one-line
   summaries are the deliberate public replacement for the relocated texts —
   the record of what each argued — not a use of their content. The transitive
