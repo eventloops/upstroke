@@ -96,10 +96,14 @@ overlay-per-job loop, and the guest provisioning that reproduces the image.
 
 ## Obligations
 
-1. The host loop runs continuously under a token with repository
-   *Administration: write* held on the build box; without a listening runner
-   the job queues and `upstroke-ci` cannot settle. Until it does, the owner
-   mints configs by hand.
+1. The host loop runs continuously — the `winguest-ci` systemd unit on the
+   build box — under a dedicated fine-grained token scoped to this one
+   repository with *Administration: write*, the permission a just-in-time
+   registration needs. The token is readable by the loop alone and is
+   deliberately not the box's shared token, which every agent session there
+   inherits and which must never be able to edit branch protection. Without
+   a listening runner the job queues and `upstroke-ci` cannot settle; the
+   token's expiry is therefore a dated obligation of its own.
 2. Re-curation of the golden image is a deliberate act — shut both guests down,
    boot the base, change, shut down, recreate the overlays — recorded when it
    happens, and due whenever the repository's `stable` expectations move.
