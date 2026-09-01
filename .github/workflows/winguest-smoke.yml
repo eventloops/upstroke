@@ -1,0 +1,26 @@
+# Proof-of-concept for the self-hosted Windows leg: the real checkout and the
+# real test command, on an ephemeral winguest-ci runner. Dispatched by hand on
+# this scratch branch only; never merged. The measurement is this job's wall
+# clock against the windows-latest baseline (median ~12.5 min, tail ~21 min).
+name: winguest smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-winguest:
+    name: test (winguest)
+    runs-on: [self-hosted, windows, winguest]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke CI"
+
+      - run: cargo test --all-targets --all-features
