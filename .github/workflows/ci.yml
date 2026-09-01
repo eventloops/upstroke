@@ -62,6 +62,24 @@ jobs:
           git config --global user.email "ci@upstroke.local"
           git config --global user.name "upstroke CI"
 
+      # Defender's real-time scan sits on every file the suite creates and
+      # every git.exe it spawns, and a per-module profile of the Windows job
+      # (run 33533228348) puts 63% of its 623 s harness in the two modules
+      # that do exactly that. The exclusions cover the checkout, the runner's
+      # temp root and the process temp root, for this job's runner only.
+      #
+      # One step for three legs, deliberately: pwsh is on every hosted runner
+      # and the body is a no-op off Windows, which keeps the platform-default
+      # shell the workflow contract requires on each leg. A refusal is a
+      # warning annotation, not a red job -- the measurement must be readable
+      # either way.
+      - name: Exclude the workspace from Defender real-time scanning
+        run: >-
+          pwsh -NoProfile -Command "if ([Environment]::OSVersion.Platform -eq 'Win32NT') {
+          try { Add-MpPreference -ErrorAction Stop -ExclusionPath '${{ github.workspace }}',
+          '${{ runner.temp }}', ([IO.Path]::GetTempPath()) }
+          catch { Write-Host '::warning::Defender exclusion not applied' } }"
+
       - run: cargo test --all-targets --all-features
 
   msrv:
