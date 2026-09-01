@@ -266,19 +266,8 @@ dedicated OS account or VM for untrusted input until that boundary ships.
 
 **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-In plain terms, for the two things people usually want to know:
-
-- **Use it however you like.** Run it, modify it, embed it in something closed, ship it
-  commercially — the licence permits all of it, and carries an express patent grant from every
-  contributor. Redistribution asks little: a copy of the licence always, and §4's notice,
-  attribution, and modified-file conditions in the cases where §4 applies them.
-- **The name is not part of the grant.** Apache-2.0 §6 licenses no trademarks. Use "upstroke"
-  to refer to this project truthfully; don't use the name or branding to present a modified
-  version as the original.
-
-Versions up to and including 0.1.0 were published under the GNU AGPL v3 and remain so; the
-relicensing applies from [the 2026-09-01 decision](decisions/2026-09-01-relicense-apache-2.md)
-forward.
+**The name is not part of the grant** — see Apache-2.0 §6. Use "upstroke" to refer to this
+project; don't use the name or branding to present a modified version as the original.
 
 Contributions are welcome under the CLA and workflow in [CONTRIBUTING.md](CONTRIBUTING.md).
 Rust changes follow the project's [coding standards](CODING_STANDARDS.md).

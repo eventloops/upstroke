@@ -30,11 +30,10 @@ internal-use enterprise (internal use triggers nothing; such a buyer pays only f
 comfort) but the **embedder** — a platform shipping upstroke inside its own product, which the
 AGPL would have forced to the table. Apache-2.0 admits that buyer free of charge. The project
 chooses to be the default plumbing rather than to hold the toll, and moves its moat from the
-code to the mark: Apache-2.0 §6 grants no trademark rights, and the NOTICE file added with this
-record is the mechanism (§4(d)) by which any distributed derivative work of a Work that
-includes a NOTICE must reproduce its attribution notices — within a bundled NOTICE file,
-within its source or documentation, or within a display the work generates — a condition on
-distribution, not on private use. The deeper commercial analysis stays in the private strategy record
+code to the mark: Apache-2.0 reserves trade names and trademarks (§6), and the NOTICE file
+added with this record is what carries the project's attribution under §4(d). The licence
+itself, not this record, states what either section requires.
+The deeper commercial analysis stays in the private strategy record
 ([2026-08-22](2026-08-22-strategy-record-private.md)); this record retires its public licensing
 mechanism only.
 
