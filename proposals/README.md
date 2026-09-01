@@ -53,6 +53,16 @@ The contract that keeps this folder safe:
   filed, and a critique does not make it authoritative. A proposal may be
   revised while in council; note material revisions under the status block
   rather than silently rewriting.
+- **Relocation stubs carry frozen metadata, deliberately.** The two rules
+  above — `Target:` as the living estimate, and revisions noted under the
+  status block — bind full-text files only: the private filings and the three
+  retained files. A relocated proposal's public stub is a snapshot as of
+  2026-09-01 and is never edited; its living metadata moves with the private
+  text. The one public surface for a relocated proposal's lifecycle is the
+  mechanism that already settles every proposal: a `decisions/` record citing
+  it. Between filings and verdicts, a stub's metadata is knowingly stale —
+  that cost is accepted and recorded in
+  [the relocation decision](../decisions/2026-09-01-proposals-relocated.md).
 - **Critiques live beside their proposal** as
   `<proposal-stem>-critique-<family>.md` (family = model family per DESIGN.md
   §11.3 — the council's seat identity). Critiques are dated records of what a
