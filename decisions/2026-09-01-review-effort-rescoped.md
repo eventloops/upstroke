@@ -110,7 +110,8 @@ The first bullet under "What this narrows" says the exempt path set is
 exactly `reviews/FINDINGS.md`. Later the same day
 `2026-09-01-clean-base-merge-keeps-review.md` widened it by successor
 record: a conflict-free merge of the base that leaves the pull request's
-diff byte-identical, with CI green on the merged head, keeps the review.
+diff byte-identical keeps the review, with CI green on the merged head and
+no gate edited by the candidate.
 The lane this record defines is untouched; a clean merge-in is exempt, not
 owner-verified. See
 [2026-09-01 — a clean merge of the base keeps the review](2026-09-01-clean-base-merge-keeps-review.md).

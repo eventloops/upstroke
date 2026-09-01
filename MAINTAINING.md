@@ -46,7 +46,10 @@ contract itself.
    base that leaves `git diff <base>...<head>` byte-identical, with CI green on the merged head
    and the pull request itself touching no workflow, gate script, or validator
    (`decisions/2026-09-01-clean-base-merge-keeps-review.md`): record both SHAs, both base SHAs,
-   and the diff hash before and after. The owner-verified lane is for
+   and the diff hash before and after, recomputed by the owner from a default-branch checkout
+   with each `git diff` checked for success, since an empty-input hash is never accepted; the
+   reviewed SHA verified an ancestor of the merged head, and the merge commit's second parent
+   verified equal to the new base tip. The owner-verified lane is for
    single-reviewer passes only: a panel-reviewed merge candidate re-runs every seat on any head
    movement, a repair included (`decisions/2026-08-31-panel-seats.md`). Feature ideas discovered
    during review belong in the design or a follow-up. Re-scoped in

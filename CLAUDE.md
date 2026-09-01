@@ -152,10 +152,12 @@ re-reviewed; a push confined to `reviews/FINDINGS.md` keeps the review
 outright
 (`decisions/2026-08-20-review-invalidation-scope.md`) — record both SHAs and
 confirm the exempt-only diff yourself before merging. A conflict-free merge
-of `master` that leaves the diff against `master` byte-identical, with CI
-green on the merged head, keeps it too
+of `master` that leaves the diff against `master` byte-identical keeps it
+too, when CI is green on the merged head and the pull request edits no
+workflow, gate script, or validator
 (`decisions/2026-09-01-clean-base-merge-keeps-review.md`): record both
-SHAs, both base SHAs, and the diff hash before and after. A completed
+SHAs, both base SHAs, and the diff hash before and after, recomputed from
+a default-branch checkout; a failed `git diff` is not a hash. A completed
 `CHANGES_REQUIRED` pass whose findings all landed as repairs or logged
 baggage is recorded as that verdict, never as a pass.
 Agents never merge to `master`: merging is the owner's act, and an agent

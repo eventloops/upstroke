@@ -3,11 +3,17 @@
 **Verdict.** A merge commit that brings the pull request's base into a
 reviewed head keeps the recorded review when all four hold: git reported no
 conflict; the pull request's diff against its base is byte-identical before
-and after (`git diff <base>...<head> | sha256sum`, both hashes recorded in
-the body); CI is green on the merged head; and the pull request itself
-edits no workflow, gate script, or validator. The body records the reviewed
-SHA, the merged head, the old and new base SHAs, and both diff hashes. A
-merge-in that fails any condition is a new head under
+and after, shown by the hash of `git diff <old-base>...<reviewed>` equal to
+the hash of `git diff <new-base>...<merged>`, each diff command checked for
+success, since a failed command emits nothing and the empty-input hash is
+never accepted; CI is green on the merged head; and the pull request itself
+edits no workflow, gate script, or validator. The owner recomputes both
+hashes on the trusted side, from a default-branch checkout, after verifying
+that the reviewed SHA is an ancestor of the merged head and that the merge
+commit's second parent is the new base tip; the body records the reviewed
+SHA, the merged head, the old and new base SHAs, and both hashes in the
+template's evidence field. A merge-in that fails any condition is a new
+head under
 `2026-09-01-review-effort-rescoped.md`. Panel-reviewed merge candidates are
 outside this record: `2026-08-21-stacked-slice-prs.md` reviews them on the
 head that merges, after the last update from `master`, and
@@ -53,7 +59,8 @@ ruled the trade on 2026-09-01: a conflict-free merge-in is exempt.
 - **Exempting any merge-in, conflicts included.** A conflict resolution is
   authored content nobody reviewed.
 - **Exempting a merge-in that changes the diff.** One drifted hunk means the
-  reviewed text and the merged text differ; the hash rule fails closed.
+  reviewed text and the merged text differ; unequal hashes refuse the
+  exemption, and a hash that could not be computed is no hash.
 
 ## Cross-references
 
