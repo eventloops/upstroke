@@ -33,8 +33,8 @@ Passing review evidence URL:
 
 - [ ] `upstroke-ci` and `upstroke-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the reviewed head recorded above
-- [ ] Every serious P1 is fixed; every other finding carries a ledger row (`fixed`, `rejected`, `deferred`, or `accepted-risk`)
-- [ ] `Reviewed head SHA` above is the head being merged, or the delta to it is exempt-only or a repair-only delta owner-verified and disclosed
+- [ ] Every serious P1 is fixed and its repaired head received a fresh pass; every other finding carries a ledger row (`fixed`, `rejected`, `deferred`, or `accepted-risk`)
+- [ ] `Reviewed head SHA` above is the head being merged, or the delta to it is exempt-only or a non-serious repair-only delta owner-verified and disclosed
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback

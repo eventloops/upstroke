@@ -3,7 +3,10 @@
 **Verdict.** One full frontier review pass per pull request remains the norm.
 Only findings meeting the serious-P1 bar (`MAINTAINING.md`, "Finding triage
 and cleanup points") block a merge and oblige a re-review of the repaired
-head. Every other finding is fixed at the author's discretion or logged with
+head. Two standing rules outrank the bar and are preserved, not narrowed: a
+`MUST` deviation in materially touched code is never baggage, and a finding
+carrying a failing test, reproduction, or mutation witness blocks whatever
+its label. Every other finding is fixed at the author's discretion or logged with
 disposition `accepted-risk` or `deferred`; the merge then proceeds on the
 stale pass plus the owner's verification of the repair delta, disclosed in
 the pull-request body. Accepted baggage is swept at designated cleanup
@@ -15,9 +18,11 @@ owner-called sweeps.
 Measured cost of iterate-until-clean on documentation-weight changes: nine
 review passes on #83; five non-converging passes on the stopped #25 gate
 experiment; one completed pass plus a deliberately stopped second on #87, a
-two-file documentation change — each iteration paying a full three-OS CI matrix
-(roughly sixteen minutes, the Windows leg dominant) and a frontier review
-of ten to forty minutes. The loop was built to protect engine code and was
+two-file documentation change. Every pushed head paid a full three-OS CI
+matrix (roughly sixteen minutes, the Windows leg dominant) and every pass a
+frontier review of ten to forty minutes; #83's ninth pass alone re-reviewed
+a body-only repair on an already-green head, with no new matrix. The loop
+was built to protect engine code and was
 pricing documentation and engine changes identically. The owner ruled the
 trade on 2026-09-01: development speed is part of what the process must
 protect.
@@ -32,10 +37,12 @@ protect.
   (exactly `reviews/FINDINGS.md`) is unchanged. A dated forward notice is
   appended to that record in the same change.
 - `2026-08-20-automated-review-gate.md`'s scheduling rule — a single
-  reviewer on every head — narrows the same way; its §5 conditions on any
-  automated return (no automated process merges, reviewers hold no
-  attesting credential) and its panel cadence are untouched. A dated
-  forward notice is appended there in the same change.
+  reviewer on every head — narrows the same way; its §3 adjudication
+  routing (a failing test, reproduction, or mutation witness blocks,
+  whatever the severity), its §5 conditions on any automated return (no
+  automated process merges, reviewers hold no attesting credential), and
+  its panel cadence are untouched. A dated forward notice is appended
+  there in the same change.
 - `2026-08-21-stacked-slice-prs.md`'s per-head review of slice pull
   requests narrows identically; gates, the merge-commit rule, and the
   attestation cadence are unchanged. A dated forward notice is appended

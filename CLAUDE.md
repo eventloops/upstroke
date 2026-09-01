@@ -140,8 +140,8 @@ exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
 **A new push means the review no longer binds to the head.** A serious P1
-repair returns for a fresh pass; a repair-only delta — the reviewed
-findings' fixes and nothing else, never a gate change — is owner-verified
+repair returns for a fresh pass; a non-serious repair-only delta — the
+reviewed findings' fixes and nothing else, never a gate change — is owner-verified
 against the findings and disclosed in the body
 (`decisions/2026-09-01-review-effort-rescoped.md`, which defines the
 serious-P1 bar with MAINTAINING.md); anything wider is a new change and is

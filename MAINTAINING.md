@@ -27,7 +27,7 @@ contract itself.
    Every other finding is fixed at the author's discretion or accepted as logged baggage: a ledger
    row with a stable id, an honest failure sequence, and disposition `accepted-risk` or `deferred`.
    Accepted findings block nothing and oblige no further pass. A push that repairs reviewed
-   findings means the recorded pass no longer binds to the head — never claim it does — but the
+   non-serious findings means the recorded pass no longer binds to the head — never claim it does — but the
    merge may proceed once the owner has read the repair delta (`git diff <reviewed> <head>`)
    against the findings and disclosed that verification in the body. The verification confirms
    the delta contains those repairs and nothing else: a delta that adds any new behavior, or that
@@ -43,10 +43,11 @@ contract itself.
    durable link to the verdict. Re-run `.github/scripts/validate-pr-body.sh` from the default
    branch against the live title and body — `upstroke-pr-policy` ran the candidate's copy. Editing
    the title or body afterwards changes what was reviewed: re-check the body, and if the ledger
-   changed in substance, review again. When the merged head differs from the reviewed head, the
-   evidence section lists the delta commits and states what verified each: a fresh pass, the
-   owner's diff-read against the findings, or an explicit owner waiver citing its authorizing
-   record.
+   changed in substance beyond recording the reviewed findings and their dispositions, review
+   again — the rows a review's own findings require are its output, not new material for it.
+   When the merged head differs from the reviewed head, the evidence section lists the delta
+   commits and states what verified each: a fresh pass for a serious P1 repair, or the owner's
+   diff-read for a non-serious repair-only delta.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. The merge is the
    owner's attestation that the review evidence recorded in the PR is real and that the merged
    head is accounted for exactly as step 7 requires: reviewed directly, or separated from the
@@ -125,6 +126,13 @@ reaches at least one of:
 
 The severity label a reviewer assigns does not decide this; the owner classifies, and a P1 whose
 failure needs speculative preconditions is reclassified down with a ledger row saying why.
+
+Two standing rules outrank the bar. A finding that shows materially touched code deviating from
+a `MUST` in `CODING_STANDARDS.md` or the controlling design is never baggage: the code is fixed,
+or the standard itself is amended by explicit, reviewed change — the standard's own deviation
+rule. And evidence outranks severity where it exists: a finding carrying a failing test,
+reproduction, or mutation witness blocks until repaired, whatever its label —
+`decisions/2026-08-20-automated-review-gate.md` §3's adjudication routing, preserved.
 
 Everything below the bar is baggage the project deliberately carries: rows stay in their PR
 ledgers, and findings that outlive their PR belong in `reviews/FINDINGS.md`. Baggage is swept,
