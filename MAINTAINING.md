@@ -15,36 +15,71 @@ contract itself.
    - `upstroke-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
      it is not a trusted merge boundary because a pull request can edit both workflow and validator.
    - `upstroke-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
-4. If the branch is behind `master`, update it and wait for both gates again.
+4. If the branch is behind `master`, update it and wait for both gates again. After the review,
+   a merge of `master` that leaves the pull request's diff byte-identical keeps it; step 6 says how.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent
    frontier-class reviewer at `max` effort. AI-assisted implementation should use a frontier-class
    implementation model at `xhigh` effort or higher. Record the implementation and review model,
    effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Upstroke
    owns this supervision natively, allow at least 90 minutes **per frontier review pass** and use
    the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
-6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
-   head. Feature ideas discovered during review belong in the design or a follow-up unless they are
-   required for the current change to be correct. One exception, decided in
-   `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff from the reviewed
-   head lies inside the exempt path set (exactly `reviews/FINDINGS.md`) does not invalidate the
-   review — record both SHAs in the PR's review evidence and confirm the exempt-only diff yourself
-   with `git diff --stat <reviewed> <head>` before merging. Everything else invalidates,
-   deliberately.
-7. Once a review passes, record it in the PR body's Review evidence section: implementation and
-   reviewer models and effort, the full reviewed head SHA, transport and wall-clock limit, and a
-   durable link to the verdict. Re-run `.github/scripts/validate-pr-body.sh` from the default
+6. Triage every finding under "Finding triage and cleanup points". Three classes block the merge.
+   A serious P1 must be fixed, and the repaired head returns to step 3 for a fresh pass. A `MUST`
+   deviation in materially touched code, and a finding carrying a failing test, reproduction, or
+   mutation witness, are fixed whatever their label, under the two rules that outrank the bar,
+   and their repair delta is verified below like any other repair unless the finding is also a
+   serious P1. Every other finding is fixed at the author's discretion or accepted as logged
+   baggage: a ledger row with a stable id, an honest failure sequence, and disposition
+   `accepted-risk` or `deferred`. Accepted findings block nothing and oblige no further pass. A
+   completed pass containing no serious P1 is the pull request's full pass whatever its verdict
+   line says, once every finding is triaged; step 7 records that verdict as written. A push that
+   repairs reviewed non-serious findings, after a pass that found no serious P1, means the
+   recorded pass no longer binds to the head —
+   never claim it does — but the merge may proceed once the owner has read the repair delta
+   (`git diff <reviewed> <head>`) against the findings and disclosed that verification in the
+   body. The verification confirms the delta contains those repairs and nothing else: a delta
+   that adds any new behavior, or that touches workflows, gate scripts, or validators — never a
+   repair — returns to step 3 for a fresh pass. Two deltas are exempt from even that. A push
+   whose entire diff from the reviewed head lies inside `reviews/FINDINGS.md`
+   (`decisions/2026-08-20-review-invalidation-scope.md`): record both SHAs and confirm the
+   exempt-only diff with `git diff --stat <reviewed> <head>`. And a conflict-free merge of the
+   base that leaves `git diff <base>...<head>` byte-identical, with CI green on the merged head
+   and the pull request itself touching no workflow, gate script, or validator
+   (`decisions/2026-09-01-clean-base-merge-keeps-review.md`): record both SHAs, both base SHAs,
+   and the diff hash before and after, recomputed by the owner from a default-branch checkout
+   with each `git diff` checked for success, since an empty-input hash is never accepted; the
+   reviewed SHA verified an ancestor of the merged head, and the merge commit's second parent
+   verified equal to the new base tip. The owner-verified lane is for
+   single-reviewer passes only: a panel-reviewed merge candidate re-runs every seat on any head
+   movement, a repair included (`decisions/2026-08-31-panel-seats.md`). Feature ideas discovered
+   during review belong in the design or a follow-up. Re-scoped in
+   `decisions/2026-09-01-review-effort-rescoped.md`.
+7. Once the pass is triaged, record it in the PR body's Review evidence section: implementation
+   and reviewer models and effort, the full reviewed head SHA, transport and wall-clock limit,
+   and a durable link to the verdict as written. A `CHANGES_REQUIRED` whose findings all landed
+   as repairs or logged baggage is recorded as exactly that, each finding with its disposition,
+   never as a pass. Re-run `.github/scripts/validate-pr-body.sh` from the default
    branch against the live title and body — `upstroke-pr-policy` ran the candidate's copy. Editing
    the title or body afterwards changes what was reviewed: re-check the body, and if the ledger
-   changed in substance, review again.
+   changed in substance beyond recording the reviewed findings and their dispositions, review
+   again — the rows a review's own findings require are its output, not new material for it.
+   When the merged head differs from the reviewed head, the evidence section lists the delta
+   commits and states what verified each: a fresh pass for a serious P1 repair, or the owner's
+   diff-read for a non-serious repair-only delta.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. The merge is the
-   owner's attestation that the review recorded in the PR is real and that the reviewed SHA is the
-   head being merged. Do not push or force-push directly to `master`. Delete the source branch
-   after merge.
+   owner's attestation that the review evidence recorded in the PR is real and that the merged
+   head is accounted for exactly as step 7 requires: reviewed directly, or separated from the
+   reviewed SHA only by exempt or owner-verified repair-only deltas. Do not push or force-push
+   directly to `master`. Delete the source branch after merge.
 
 Slices of a long-running design land as pull requests **into** their integration branch
 (today `codex/parallelism-design`): they receive `upstroke-ci`, `upstroke-pr-policy`, and a
-single-reviewer frontier review of each head. The integration branch's own pull request into
+single-reviewer frontier review, triaged per step 6; a repair head follows step 6's lane, so every
+merged head is accounted for exactly as step 7 requires. The integration branch's own pull request into
 `master` is reviewed once more, on the head that merges, after its last update from `master`.
+That rule is not narrowed: the checkpoint panel convenes on that head, and any movement after a
+seat has run re-runs every seat (`decisions/2026-08-31-panel-seats.md`), so step 6's
+owner-verified lane does not apply to it.
 Merge commits only on and into the integration branch — a rewrite orphans every ledger row bound
 to a replaced SHA. Decided in `decisions/2026-08-21-stacked-slice-prs.md`.
 
@@ -73,7 +108,8 @@ finding a stable id and retain one ledger row in the pull request with:
   deterministic test is infeasible and the documented guard/pitfall that prevents false claims.
 
 Provenance explains where a defect came from; it does not make a defect less real. Fix bounded
-pre-existing defects exposed by the changed path. A genuinely architectural or unrelated defect
+pre-existing defects exposed by the changed path, or accept them with a logged row — the
+serious-P1 bar decides which, and a serious P1 is never accepted. A genuinely architectural or unrelated defect
 may move to a critical follow-up only when the current PR documents the limitation honestly and
 does not claim the missing guarantee. Every code defect fixed in the PR gets a regression test
 that fails on the first-bad shape. If the same failure is found again, link the old id and treat the
@@ -97,6 +133,44 @@ ledger to its current tracked name; do not preserve a stale claim by adding a no
 explicit deterministic invariant may remain prose rather than a backticked identifier, but its
 wording must say what enforces it.
 
+### Finding triage and cleanup points
+
+A finding is a **serious P1** when its failure sequence is concrete on the current head and
+reaches at least one of:
+
+- a `DESIGN.md` §4 invariant;
+- the trust boundary, the merge or release machinery, or any gate change that misstates what the
+  gate enforces (`security-trust`);
+- durable state: the event log, replay, or anything that makes a recorded run unreproducible or
+  corrupt;
+- loss or corruption of data in a user repository — the engine owns git;
+- a legal or licensing defect.
+
+The severity label a reviewer assigns does not decide this; the owner classifies, and a P1 whose
+failure needs speculative preconditions is reclassified down with a ledger row saying why. A
+finding that does not meet the bar is non-serious in the rest of this document, whether or not
+one of the two rules below still requires its repair.
+
+Two standing rules outrank the bar and block the merge whatever the label; their repairs are
+verified as step 6 says. A finding that shows materially touched code deviating from
+a `MUST` in `CODING_STANDARDS.md` or the controlling design is never baggage: the code is fixed,
+or the standard itself is amended by explicit, reviewed change — the standard's own deviation
+rule. And evidence outranks severity where it exists: a finding carrying a failing test,
+reproduction, or mutation witness blocks until repaired, whatever its label —
+`decisions/2026-08-20-automated-review-gate.md` §3's adjudication routing, preserved. Either
+may be `rejected` only by a row showing the evidence is not valid: a `MUST` the code does not
+breach, or a witness that does not reproduce on the head.
+
+Everything below the bar and outside those two rules is baggage the project deliberately
+carries: rows stay in their PR ledgers, and findings that outlive their PR belong in
+`reviews/FINDINGS.md`. Baggage is swept,
+not forgotten, at three designated points: before any release tag or crates.io publish, where
+every open `accepted-risk` and `deferred` row is re-triaged and the release notes name what
+ships open; at each integration checkpoint merge (`decisions/2026-08-25-checkpoint-merges.md`);
+and at owner-called sweeps. A sweep fixes a row, re-accepts it dated, or converts it to a
+tracked follow-up; a row re-accepted twice carries the owner's dated note saying why it stays.
+Decided in `decisions/2026-09-01-review-effort-rescoped.md`.
+
 ## Enforced repository rules
 
 The default-branch ruleset must:
@@ -118,8 +192,9 @@ workflow using `GITHUB_TOKEN` as the same GitHub Actions app, so a pull request 
 branch — can edit `ci.yml`, `pr-policy.yml`, or the validators they run and still produce green
 `upstroke-ci` and `upstroke-pr-policy` contexts. Those checks are required for feedback and for
 catching honest mistakes; they are not the security boundary. The boundary is that only the owner
-merges, after an independent review of the exact head, and that the diff the owner reviews includes
-any change to the gates themselves.
+merges, after an independent review recorded per steps 5–7 — any delta from the reviewed head
+exempt or owner-verified repair-only, and a delta touching the gates never a repair — and that the
+diff the owner reviews includes any change to the gates themselves.
 
 That is the boundary the retired App check enforced in practice. Its attestation workflow required
 the evidence comment to be owner-authored, and the build box and every agent session act on the

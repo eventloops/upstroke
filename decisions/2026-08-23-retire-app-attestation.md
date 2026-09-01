@@ -83,3 +83,15 @@ secret under a `master`-only branch policy, its check bound in the ruleset by in
 id. The retired workflows remain in history at `3d9cf38` if their shape is wanted again;
 `frontier-review.yml` had the correct form — dispatch-triggered, checked out at
 `github.sha`, never at the pull-request head.
+
+## 2026-09-01 — the review obligation this record kept is narrowed
+
+The obligation kept unchanged above, that every head that merges is reviewed by an independent
+frontier model first, was narrowed on 2026-09-01: one full pass per pull request remains the
+norm, a serious P1 repair returns for a fresh pass, and a repair-only delta below that bar may
+instead be owner-verified against the findings and disclosed in the pull-request body, so the
+merged head may sit above the reviewed SHA by such deltas. The reviewed SHA and the durable
+verdict link are still recorded, the owner's merge is still the attestation, now of that delta
+accounting too, and the scheduling rule left to the 2026-08-20 record narrows by that record's
+own notice. The panel cadence and §5's bar for any automated return are untouched. See
+[2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).

@@ -7,8 +7,13 @@ project currently is.
 Every change enters `master` through the same path: open a draft pull request early, wait for the
 deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
 green head before merge. The reviewed SHA and a durable link to the verdict are recorded in the
-pull request; a new push invalidates the review and restarts the sequence; the owner's merge is the
-attestation. See [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
+pull request; a new push means the recorded review no longer binds to the head — serious P1
+repairs get a fresh pass, `MUST` deviations and evidence-backed findings are fixed whatever their
+label, a repair-only delta after a single-reviewer pass that found no serious P1 is owner-verified
+and disclosed, a conflict-free merge of `master` that leaves the diff byte-identical keeps the
+review when CI is green on the merged head and the pull request edits no gate, anything wider is
+re-reviewed; the owner's merge is the attestation. See
+[`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
 emergency policy. Contributions from external forks remain provisional: the required checks are
 candidate-controlled, so a fork's entire diff — workflow edits included — is reviewed before merge.
 

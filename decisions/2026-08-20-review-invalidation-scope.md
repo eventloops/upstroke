@@ -155,3 +155,24 @@ ruling ever changes what a *pending* review would conclude.
 - `reviews/FINDINGS.md` — the authority rule this record leans on, and the file whose binding
   it changes.
 - MAINTAINING.md steps 5–7 — refined by the workflow PR that implements this record.
+
+## 2026-09-01 — the consequence of invalidation is narrowed
+
+This record's binding rule stands: a push means the recorded pass reviewed a different head,
+and the exempt set remains exactly `reviews/FINDINGS.md`. Its consequence — "everything else
+invalidates, deliberately", read as *restarts the review sequence* — was narrowed on
+2026-09-01: a single-reviewer pass that found no serious P1, plus an owner-verified repair-only
+delta, is now mergeable, disclosed in the pull-request body; a serious P1 repair still returns
+for a fresh pass, and a panel-reviewed candidate re-runs every seat on any head movement. See
+[2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).
+
+## 2026-09-01 — the exempt set is widened by successor record
+
+This record's rule that widening the exempt set takes a successor decision record is
+followed, not bypassed: `2026-09-01-clean-base-merge-keeps-review.md` adds one class to the
+set beside `reviews/FINDINGS.md`. A conflict-free merge of the base into a reviewed head
+keeps the review when the pull request's diff against its base is byte-identical before and
+after, CI is green on the merged head, and the candidate edits no workflow, gate script, or
+validator; both SHAs, both base SHAs and both diff hashes are recorded in the body. The
+binding rule stands: the merged head is a different tree, and the body says so. See
+[2026-09-01 — a clean merge of the base keeps the review](2026-09-01-clean-base-merge-keeps-review.md).
