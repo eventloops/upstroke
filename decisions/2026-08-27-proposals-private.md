@@ -49,3 +49,18 @@ its own window.
   here cites SHAs, and the crate is published. Rewriting breaks the citations
   that make the ledger auditable, in order to hide documents that are already
   public.
+
+## 2026-09-01 — the keep-in-place pin is superseded
+
+The verdict above that the proposals already public stay where they are was
+superseded on 2026-09-01: the dated proposal files were reduced to stubs in
+place, full texts relocated to the private companion repository — except the
+Decided G2 pass plan (its content is relied on by `DESIGN.md` and the freeze
+charter), the council critique (a review-stage record; every stage after
+filing remains public), and the portfolio proposal it critiques (the retained
+critique cites its sections by number). This record's filing rule is
+unchanged and remains in force. Its no-private-references discipline is
+narrowed for relocated proposals: their stubs share filenames with the
+private counterparts by construction, and the public index names and
+summarizes them; pointers into the private repository remain forbidden.
+See [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

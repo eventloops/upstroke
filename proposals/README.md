@@ -7,12 +7,23 @@ proposal  →  council critique  →  decision record  →  implementation  → 
 (private)    (files beside it)     (decisions/)        (commits/PRs)     (reviews/)
 ```
 
-**Closed to new filings since 2026-08-27.** Proposals are now filed in the
-private companion repository, engine mechanisms included — see
-[the decision](../decisions/2026-08-27-proposals-private.md). The proposals
-below stay here: decision records cite them as inputs and those citations must
-keep resolving. The first stage of the lifecycle happens privately; every later
-stage is unchanged and public.
+**Closed to new filings since 2026-08-27; relocated on 2026-09-01.** Proposals
+are filed in the private companion repository, engine mechanisms included — see
+[the filing decision](../decisions/2026-08-27-proposals-private.md) and
+[the relocation decision](../decisions/2026-09-01-proposals-relocated.md).
+Ten of the thirteen dated files below are stubs: each keeps its path,
+title, and status block verbatim — a frozen snapshot as of relocation, with
+lifecycle movement surfacing through `decisions/` records as the filing rule
+already provides — so that decision-record citations keep resolving, and this
+index carries each proposal's one-line summary. Three files are retained in
+full: the Decided [G2 pass plan](2026-08-24-v0.2-g2-pr3-layer-pass.md), whose
+ten workstreams and exit criteria `DESIGN.md` and the freeze charter rely on
+as content; the
+[portfolio critique](2026-08-13-v0.5-portfolio-coordination-critique-claude.md),
+a review-stage record; and the
+[portfolio proposal](2026-08-13-v0.5-portfolio-coordination.md) whose
+sections that critique cites by number. The first stage of the lifecycle
+happens privately; every later stage is unchanged and public.
 
 The rest of this file describes the conventions those filings follow, which the
 private folder inherited unchanged.
@@ -42,6 +53,16 @@ The contract that keeps this folder safe:
   filed, and a critique does not make it authoritative. A proposal may be
   revised while in council; note material revisions under the status block
   rather than silently rewriting.
+- **Relocation stubs carry frozen metadata, deliberately.** The two rules
+  above — `Target:` as the living estimate, and revisions noted under the
+  status block — bind full-text files only: the private filings and the three
+  retained files. A relocated proposal's public stub is a snapshot as of
+  2026-09-01 and is never edited; its living metadata moves with the private
+  text. The one public surface for a relocated proposal's lifecycle is the
+  mechanism that already settles every proposal: a `decisions/` record citing
+  it. Between filings and verdicts, a stub's metadata is knowingly stale —
+  that cost is accepted and recorded in
+  [the relocation decision](../decisions/2026-09-01-proposals-relocated.md).
 - **Critiques live beside their proposal** as
   `<proposal-stem>-critique-<family>.md` (family = model family per DESIGN.md
   §11.3 — the council's seat identity). Critiques are dated records of what a

@@ -109,3 +109,11 @@ artifacts (§15); records promoted here are the durable subset.
   untouched, the next publish can no longer package the tree (no published
   crate ever did), and the private intake landed on the companion default
   branch, verified byte-for-byte by tree ID, before removal.
+- [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md):
+  ten of the thirteen dated `proposals/` files become verbatim-header stubs
+  in place — frozen snapshots as of relocation — full texts to the private
+  archive, intake verified blob-for-blob; the Decided G2 pass plan, the
+  portfolio critique, and the portfolio proposal it cites stay whole (content
+  reliance and the public-lifecycle rule, applied transitively). Supersedes
+  the 2026-08-27 keep-in-place pin; filing rules unchanged; dated forward
+  notices appended to both prior records.
