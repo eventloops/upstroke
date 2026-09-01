@@ -103,3 +103,7 @@ artifacts (§15); records promoted here are the durable subset.
   `gpt-5.6-sol` at max, `claude-fable-5` at max explicitly pinned, `gemini-3.1-pro-high` via
   `agy` by absolute path — each with its invocation guard. No pre-authorized fallback: one
   repair, then wait; the panel never convenes partially.
+- [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md):
+  the thirteen dated `proposals/` files become stubs in place, full texts to the
+  private archive; supersedes the 2026-08-27 keep-in-place pin. Filing rules
+  unchanged; every citation resolves via the stubs and the folder index.
