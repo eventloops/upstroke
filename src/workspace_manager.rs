@@ -1056,18 +1056,22 @@ pub struct WorkspaceManager {
 ///
 /// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
 /// so the first attempt succeeds — and the retry is not compiled in there. The bound
-/// is deliberate: a handle that survives all `ATTEMPTS` attempts is not a closing
-/// process, and the **last attempt's** error is returned rather than masked. It is not
-/// necessarily the first attempt's — a permanent ACL denial and a closing handle both
-/// answer error 5, and only exhausting the attempts tells them apart.
+/// is deliberate: a handle that survives all `ATTEMPTS` attempts is treated as a lock
+/// rather than a closing process, and the **last attempt's** error is returned rather
+/// than masked. It is not necessarily the first attempt's — a permanent ACL denial and
+/// a closing handle both answer error 5. Exhausting the attempts does **not** tell those
+/// two apart, and nothing available here can: it bounds how long the ambiguity is
+/// tolerated before the caller is told, which is the only decision this function is in
+/// a position to make.
 ///
-/// `ATTEMPTS * STEP` is how long this loop *sleeps*, and not a deadline. A loaded
-/// machine stretches its wall clock well past that, which is the direction to be
+/// The loop sleeps *between* attempts and not after the last, so it sleeps
+/// `(ATTEMPTS - 1) * STEP` — and that is time spent **sleeping**, not a deadline. A
+/// loaded machine stretches its wall clock well past that, which is the direction to be
 /// wrong in: a machine too busy to schedule this loop is equally too busy to let a
 /// dying process close its handles, so a wall-clock bound would shrink the tolerance
 /// exactly when the condition it tolerates lasts longest, and report a lock that is
-/// not one. Nothing may read `ATTEMPTS * STEP` as elapsed time — a test did, and
-/// became a flake on a starved runner.
+/// not one. Nothing may read the budget as elapsed time — a test did, and became a
+/// flake on a starved runner.
 ///
 /// **This is not `runner::container::racing_removal`, and the two must not be merged.**
 /// That one resolves a *handoff*: two threads racing on one path, where the loser needs
@@ -4783,24 +4787,81 @@ mod tests {
     ///
     /// That half is held by a **handshake rather than a timer**, and the
     /// difference is a measured failure rather than a preference. It first held
-    /// the file for five seconds and read the margin over `ATTEMPTS * STEP` — 39
-    /// sleeps of 25ms, so under a second — as decisive. It is not.
-    /// `ATTEMPTS * STEP` bounds how long the loop *sleeps*, not how long it
-    /// takes, and on a starved scheduler every wake queues behind the runnable
-    /// threads ahead of it. Measured on a 4-vCPU Windows guest at
-    /// `--test-threads=16`, the loop outlived the five seconds: the holder woke,
-    /// dropped the file, and a late attempt succeeded — so the control that
-    /// exists to prove a held worktree is *reported* watched it get removed
-    /// instead. Holding until the assertion has run takes the wall clock out of
-    /// the oracle.
+    /// the file for five seconds and read the margin over the retry budget — 39
+    /// sleeps of 25ms, so under a second — as decisive. It is not. Those five
+    /// seconds had to cover *everything* between the handle opening and the last
+    /// retry attempt, and on a starved scheduler two separate stretches can eat
+    /// them: the loop's own wall clock, since `STEP` bounds sleeping rather than
+    /// elapsed time and every wake queues behind the runnable threads ahead of
+    /// it; and the gap before removal even begins, since this thread must also
+    /// be scheduled between `ready.recv()` and the call. Observed once on a
+    /// 4-vCPU Windows guest at `--test-threads=16`: the holder released, a late
+    /// attempt succeeded, and the control that exists to prove a held worktree
+    /// is *reported* watched it get removed instead.
+    ///
+    /// **Which stretch consumed the margin was not measured.** Raising `STEP`
+    /// reproduces the first one deterministically, but no per-attempt timing was
+    /// captured from the original occurrence, so nothing here claims the loop
+    /// itself outlived the timer. The handshake settles both, because it takes
+    /// the wall clock out of the oracle entirely rather than budgeting it.
+    ///
+    /// A handshake alone would deadlock on the one regression this control is
+    /// for, which is why `FAIL_SAFE` exists below: if the retry ever became
+    /// unbounded, removal would never return, the sender would never drop, and
+    /// the holder would wait behind a test that is itself waiting for removal —
+    /// a hang to the CI job timeout in place of a failure. The timer version
+    /// caught that case by accident; the fail-safe catches it on purpose, and
+    /// reports it as the unbounded retry it is.
     #[cfg(windows)]
     #[test]
     fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         use std::os::windows::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
 
         use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        /// How long the held case waits for the handshake before releasing anyway.
+        ///
+        /// This is not the oracle and must never decide the test. It exists so an
+        /// unbounded retry is *reported here* rather than hanging until CI kills
+        /// the job with no verdict at all.
+        ///
+        /// **Sized from measurement, because the first guess was wrong.** Two
+        /// minutes looked like a hundred times the loop's nominal budget and it
+        /// fired anyway, on a full-suite run of a loaded guest — which is
+        /// `CODING_STANDARDS.md` §12's own warning, that a bound short enough to
+        /// expire on a loaded runner has become the signal itself. Measured
+        /// instead, with the whole suite running: the locked case's
+        /// `remove_worktree` returns in **1.0s** unpinned and **6.5–7.6s** pinned
+        /// to 4 CPUs at `--test-threads=16`. Ten minutes is some seventy-five
+        /// times the worst of those, and still well inside the CI job timeout, so
+        /// it bounds a loop that has *wedged* rather than one that is merely slow.
+        const FAIL_SAFE: std::time::Duration = std::time::Duration::from_secs(600);
+
+        /// Releases the handshake and joins the holder — while unwinding, too.
+        ///
+        /// Dropping a `JoinHandle` only detaches its thread. Without this guard a
+        /// failing assertion left `Fixture::drop` — a single best-effort
+        /// `remove_dir_all` that ignores its result — racing a handle that had not
+        /// closed yet, so a failed run could leave its scratch worktree behind.
+        /// Declared *after* the fixture, so it drops *before* it.
+        struct Holder {
+            release: Option<mpsc::Sender<()>>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                // Disconnect before joining, always: the holder blocks on this
+                // sender, so joining first is the deadlock.
+                drop(self.release.take());
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
 
         // `Some(d)`: a process whose last handle closes `d` after the removal
         // starts, which is the window the retry exists to cross. `None`: one that
@@ -4823,14 +4884,17 @@ mod tests {
 
             // A file inside the worktree, held open with the sharing mode a running
             // process has. Opened on another thread so the handle outlives this
-            // statement and drops on a timer -- exactly the shape of a process that
-            // has exited while its last handle is still closing.
+            // statement -- exactly the shape of a process that has exited while its
+            // last handle is still closing. The closing case releases it on a
+            // timer; the held case releases it only when `Holder` is dropped.
             let target = fixture.manager.execution_root().join(slot.relative());
             let held = target.join("held-by-the-dying-child");
             fs::write(&held, b"bytes the child had open").expect("plant the file");
             let (opened, ready) = mpsc::channel();
             let (release, released) = mpsc::channel::<()>();
-            let holder = std::thread::spawn(move || {
+            let fail_safe_fired = Arc::new(AtomicBool::new(false));
+            let fired = Arc::clone(&fail_safe_fired);
+            let handle = std::thread::spawn(move || {
                 // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
                 // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
                 // block one -- the first version of this test removed the worktree
@@ -4845,24 +4909,55 @@ mod tests {
                 opened.send(()).expect("announce the handle is held");
                 match hold {
                     Some(hold) => std::thread::sleep(hold),
-                    // Held until the main thread drops its sender, which it does
-                    // only once the assertion has run: the control proves the
-                    // retry is bounded, and a timer would only ever prove the
-                    // loop is shorter than that timer. `recv` also returns when a
-                    // *panicking* main thread drops the sender while unwinding,
-                    // so a failing assertion releases the handle rather than
-                    // leaving the tree locked against the fixture's own cleanup.
+                    // Held until `Holder` drops the sender, which happens only
+                    // once the assertions have run -- and during unwinding, so a
+                    // failing assertion releases the handle rather than leaving
+                    // the tree locked against the fixture's own cleanup. A timer
+                    // here could only ever prove the loop is shorter than that
+                    // timer, which is the assumption that made this test a flake.
+                    //
+                    // `Disconnected` is that release. `Timeout` is the fail-safe,
+                    // and reaching it means removal never returned -- recorded
+                    // rather than acted on, so the assertion below can name the
+                    // unbounded retry instead of whatever the freed handle then
+                    // allowed to succeed.
                     None => {
-                        let _ = released.recv();
+                        if let Err(mpsc::RecvTimeoutError::Timeout) =
+                            released.recv_timeout(FAIL_SAFE)
+                        {
+                            fired.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
                 drop(file);
             });
+            // After `fixture`, so it drops before it. Nothing below may `join`
+            // this thread by hand: the guard owns both halves precisely so the
+            // disconnect-then-join order holds on every path out of the loop.
+            let _holder = Holder {
+                release: Some(release),
+                handle: Some(handle),
+            };
             ready
                 .recv()
                 .expect("the handle is held before removal is attempted");
 
+            let started = std::time::Instant::now();
             let outcome = fixture.manager.remove_worktree(&mut NoHooks, &slot);
+            let took = started.elapsed();
+            // Read before the outcome is interpreted, so the diagnostic names the
+            // real fault. A fired fail-safe means removal did not return within
+            // `FAIL_SAFE` -- an unbounded retry, which is the hang this control
+            // exists to catch -- and without this the `Ok` that the freed handle
+            // then permitted would be reported in its place. The elapsed time is
+            // quoted because it is the number that says whether the budget or the
+            // fail-safe is the thing that needs changing.
+            assert!(
+                !fail_safe_fired.load(Ordering::SeqCst),
+                "the fail-safe released the handle after {FAIL_SAFE:?} and removal then returned \
+                 in {took:?} as {}: the retry is unbounded rather than budgeted",
+                if outcome.is_ok() { "Ok" } else { "Err" }
+            );
             if expected_removal {
                 outcome.expect("removal retries across the closing handle");
                 assert!(
@@ -4892,9 +4987,11 @@ mod tests {
                 // error at all, including a containment refusal raised before
                 // removal is ever attempted -- which would prove nothing about
                 // the bound the test is named for.
-                let code = match &error {
-                    UpstrokeError::Io { source, .. } => source.raw_os_error(),
-                    _ => None,
+                let (io_path, code) = match &error {
+                    UpstrokeError::Io { path, source } => {
+                        (Some(path.as_path()), source.raw_os_error())
+                    }
+                    _ => (None, None),
                 };
                 assert!(
                     matches!(
@@ -4903,15 +5000,24 @@ mod tests {
                             if code == ERROR_SHARING_VIOLATION as i32
                                 || code == ERROR_ACCESS_DENIED as i32
                     ),
-                    "the refusal must be the handle the loop exhausted its budget against, \
-                     not an earlier failure: {}",
+                    "the refusal must be the kernel's answer about the held handle: {}",
+                    refusal_of(&error)
+                );
+                // ...and it must have come from the removal itself. The code alone
+                // cannot say so: `revalidate_removal` reports its own `Io` failures
+                // -- an unreadable `.git/worktrees` answers error 5 too -- before
+                // the funnel is entered, leaving the target on disk, so both
+                // assertions above would hold without the loop ever running. Only
+                // `remove_tree_once_handles_close`'s error names the contained
+                // worktree, and `same_path` compares directories rather than
+                // spellings, which is what the earlier path cannot match.
+                assert!(
+                    io_path.is_some_and(|path| crate::util::same_path(path, &target)),
+                    "the refusal must name the worktree the loop failed to remove, so that it is \
+                     the budget being reported and not an earlier step: {}",
                     refusal_of(&error)
                 );
             }
-            // Before the join, and load-bearing: the held case's holder blocks on
-            // this sender disconnecting, so joining first would deadlock.
-            drop(release);
-            let _ = holder.join();
         }
     }
 
