@@ -62,7 +62,12 @@ jobs:
           git config --global user.email "ci@upstroke.local"
           git config --global user.name "upstroke CI"
 
-      - run: cargo test --all-targets --all-features
+      # Eight libtest threads on every leg, chosen by measurement rather than
+      # left to the one-per-vCPU default. The Windows harness spends most of
+      # its time blocked on spawned git children and worktree churn, and the
+      # winguest sweep at the 4-vCPU CI shape (2026-09-01) put 8 threads at
+      # -18% with the remaining oversubscription worth under 10% more.
+      - run: cargo test --all-targets --all-features -- --test-threads=8
 
   msrv:
     name: msrv (Rust 1.85, ${{ matrix.os }})

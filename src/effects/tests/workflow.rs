@@ -1362,7 +1362,7 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  `test-docs-consistency.sh` as a mutation that gate's withdrawn claim could \
                  not kill.",
         job: Some("test"),
-        anchor: "      - run: cargo test --all-targets --all-features\n",
+        anchor: "      - run: cargo test --all-targets --all-features -- --test-threads=8\n",
         replacement: "",
         refused_as: "test-job-command",
     },
@@ -1627,12 +1627,13 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  heredoc is the form that defeats any reading anchored to `echo` or to a \
                  single line, and the job it lands in is the one that runs these fixtures.",
         job: Some("test"),
-        anchor: "      - run: cargo test --all-targets --all-features\n",
+        anchor: "      - run: cargo test --all-targets --all-features -- --test-threads=8\n",
         replacement: "      - run: |\n\
                       \x20         cat >> \"$GITHUB_ENV\" <<'EOF'\n\
                       \x20         RUSTFLAGS=-A warnings\n\
                       \x20         EOF\n\
-                      \x20     - run: cargo test --all-targets --all-features\n",
+                      \x20     - run: cargo test --all-targets --all-features \
+                      -- --test-threads=8\n",
         refused_as: "rustflags-persisted",
     },
     WorkflowEscape {

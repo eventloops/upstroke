@@ -29,7 +29,12 @@ pub(super) const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 pub(super) const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features -- -D warnings";
 
 /// The command that executes this file's fixtures, character for character.
-pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
+///
+/// The trailing `--test-threads=8` is part of the pin. The thread count is a
+/// measured choice (the winguest sweep at the 4-vCPU CI shape, 2026-09-01), and
+/// a leg that drops it back to the platform default of one thread per vCPU is
+/// a slower leg nobody decided on.
+pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features -- --test-threads=8";
 
 /// The job that holds this crate to the floor it publishes, and the command it
 /// must run -- character for character, for `--locked`'s sake.
