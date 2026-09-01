@@ -1,18 +1,24 @@
 # 2026-09-01 — the filed proposals relocate to the private archive
 
-**Verdict.** Eleven of the thirteen dated files in `proposals/` — eleven
-proposals, all filed on or before 2026-08-22 — are replaced in place by
-stubs; their full texts move to the private companion repository's
-`proposals/` folder. Two files stay public in full, for two different
-reasons: the Decided
+**Verdict.** Ten of the thirteen dated files in `proposals/` — ten proposals,
+all filed on or before 2026-08-22 — are replaced in place by stubs; their
+full texts move to the private companion repository's `proposals/` folder.
+Three files stay public in full, for three connected reasons: the Decided
 [G2 pass plan](../proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md), because
 `DESIGN.md` and the freeze charter rely on its ten workstreams and exit
 criteria as *content* (2026-08-22's retained-content rule at file
-granularity); and the
+granularity); the
 [council critique](../proposals/2026-08-13-v0.5-portfolio-coordination-critique-claude.md),
 because a critique is a review-stage record — the folder contract's rule that
 every lifecycle stage after filing stays public applies to it, not the filing
-rule. This record supersedes the 2026-08-27 pin that the already-public
+rule; and the
+[portfolio proposal](../proposals/2026-08-13-v0.5-portfolio-coordination.md)
+that critique reviews, because the retained critique cites its sections by
+number throughout — the retained-content rule applies transitively to
+whatever a retained public record relies on. The ten relocated files carry no
+content-level public citation: the one record naming them is a review
+coverage manifest, satisfied by path resolution. This record supersedes the
+2026-08-27 pin that the already-public
 proposals stay where they are, and narrows 2026-08-22's "engine proposals
 stay public" clause to match the filing rule in force since 2026-08-27: the
 *first* stage of the design lifecycle is private end-to-end, and every later
@@ -55,9 +61,11 @@ history; the value is organizational and prospective.
   cites the proposal. A stub is not updated to track private status, and the
   byte-for-byte rule binds at relocation time, once.
 - A file whose content — not merely whose path — is relied on by a living
-  authority or an immutable record is not stubbed; nor is any record of a
-  lifecycle stage after filing (critiques included). Today that is exactly
-  the Decided G2 pass plan and the portfolio critique.
+  authority, an immutable record, or a retained public record is not stubbed;
+  nor is any record of a lifecycle stage after filing (critiques included).
+  The rule is transitive and terminates: today it retains exactly the Decided
+  G2 pass plan, the portfolio critique, and the portfolio proposal whose
+  sections that critique cites.
 - `proposals/README.md` stays, closed to new filings, as the index; its
   per-file summaries are the public record of what each proposal argued.
 - Filing rules are otherwise unchanged from 2026-08-27: new proposals are
@@ -73,9 +81,10 @@ history; the value is organizational and prospective.
 - **Stubbing all thirteen.** A stub of the G2 pass plan leaves `DESIGN.md`'s
   "the pass's ten workstreams and exit criteria are planned [there]" pointing
   at an empty file while the freeze charter — immutable — assigns the pass's
-  scope to it; and a stub of the critique removes a review-stage record the
-  folder contract promises stays public. Content reliance and the lifecycle
-  rule beat uniformity.
+  scope to it; a stub of the critique removes a review-stage record the
+  folder contract promises stays public; and a stub of the portfolio proposal
+  strands the retained critique's section-by-number citations. Content
+  reliance and the lifecycle rule beat uniformity, transitively.
 - **Leaving the files in place.** The 2026-08-27 status quo, overruled by the
   owner's presentation preference above.
 

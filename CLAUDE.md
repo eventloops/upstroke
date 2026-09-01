@@ -58,10 +58,10 @@ engine mechanisms included
 `proposals/` are relocation stubs since 2026-09-01
 (`decisions/2026-09-01-proposals-relocated.md`): each keeps its path, title,
 and status block verbatim so decision-record citations resolve — except the
-Decided G2 pass plan and the council critique, which stay in full (content
-reliance and the public-lifecycle rule, respectively). Read
-`proposals/README.md` before touching those. Decisions stay public and still
-name their inputs.
+Decided G2 pass plan, the council critique, and the portfolio proposal it
+cites, which stay in full (content reliance and the public-lifecycle rule).
+Read `proposals/README.md` before touching those. Decisions stay public and
+still name their inputs.
 
 ## Gates
 

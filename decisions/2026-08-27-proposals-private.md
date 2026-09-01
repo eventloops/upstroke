@@ -55,8 +55,9 @@ its own window.
 The verdict above that the proposals already public stay where they are was
 superseded on 2026-09-01: the dated proposal files were reduced to stubs in
 place, full texts relocated to the private companion repository — except the
-Decided G2 pass plan, which stays in full because `DESIGN.md` and the freeze
-charter rely on its content, and the council critique, which stays in full
-because critiques are review-stage records and every stage after filing
-remains public. This record's filing rule is unchanged and remains in force.
+Decided G2 pass plan (its content is relied on by `DESIGN.md` and the freeze
+charter), the council critique (a review-stage record; every stage after
+filing remains public), and the portfolio proposal it critiques (the retained
+critique cites its sections by number). This record's filing rule is
+unchanged and remains in force.
 See [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).
