@@ -142,9 +142,10 @@ locally against your body before pushing.
 **A new push means the review no longer binds to the head.** A serious P1
 repair returns for a fresh pass; a `MUST` deviation in materially touched
 code and a finding carrying a failing test, reproduction, or mutation
-witness are fixed before merge whatever their label; a non-serious
-repair-only delta — the reviewed findings' fixes and nothing else, never a
-gate change — is owner-verified against the findings and disclosed in the
+witness are fixed before merge whatever their label; a repair-only delta
+after a single-reviewer pass that found no serious P1 — the reviewed
+findings' fixes and nothing else, never a gate change — is owner-verified
+against the findings and disclosed in the
 body (`decisions/2026-09-01-review-effort-rescoped.md`, which defines the
 serious-P1 bar with MAINTAINING.md); anything wider is a new change and is
 re-reviewed; a push confined to `reviews/FINDINGS.md` keeps the review

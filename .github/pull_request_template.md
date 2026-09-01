@@ -33,7 +33,7 @@ Durable review verdict URL (the verdict as written):
 
 - [ ] `upstroke-ci` and `upstroke-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the reviewed head recorded above
-- [ ] Every serious P1 is fixed and its repaired head received a fresh pass; every `MUST` deviation in materially touched code and every finding carrying a failing test, reproduction, or mutation witness is `fixed` or `rejected` with the row saying why, never `accepted-risk` or `deferred`; every other finding carries a ledger row (`fixed`, `rejected`, `deferred`, or `accepted-risk`)
+- [ ] Every serious P1 is fixed and its repaired head received a fresh pass; every `MUST` deviation in materially touched code and every finding carrying a failing test, reproduction, or mutation witness is `fixed`, or `rejected` only by a row showing the evidence is not valid (a `MUST` the code does not breach, a witness that does not reproduce on the head), never `accepted-risk` or `deferred`; every other finding carries a ledger row (`fixed`, `rejected`, `deferred`, or `accepted-risk`)
 - [ ] `Reviewed head SHA` above is the head being merged, or the delta to it is exempt-only or a non-serious repair-only delta owner-verified and disclosed (single-reviewer passes only: a panel-reviewed candidate re-runs every seat on any head movement)
 - [ ] Every review conversation is resolved
 

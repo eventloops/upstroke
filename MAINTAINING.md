@@ -32,7 +32,8 @@ contract itself.
    `accepted-risk` or `deferred`. Accepted findings block nothing and oblige no further pass. A
    completed pass containing no serious P1 is the pull request's full pass whatever its verdict
    line says, once every finding is triaged; step 7 records that verdict as written. A push that
-   repairs reviewed non-serious findings means the recorded pass no longer binds to the head —
+   repairs reviewed non-serious findings, after a pass that found no serious P1, means the
+   recorded pass no longer binds to the head —
    never claim it does — but the merge may proceed once the owner has read the repair delta
    (`git diff <reviewed> <head>`) against the findings and disclosed that verification in the
    body. The verification confirms the delta contains those repairs and nothing else: a delta
@@ -65,7 +66,8 @@ contract itself.
 
 Slices of a long-running design land as pull requests **into** their integration branch
 (today `codex/parallelism-design`): they receive `upstroke-ci`, `upstroke-pr-policy`, and a
-single-reviewer frontier review of each head, triaged per step 6. The integration branch's own pull request into
+single-reviewer frontier review, triaged per step 6; a repair head follows step 6's lane, so every
+merged head is accounted for exactly as step 7 requires. The integration branch's own pull request into
 `master` is reviewed once more, on the head that merges, after its last update from `master`.
 That rule is not narrowed: the checkpoint panel convenes on that head, and any movement after a
 seat has run re-runs every seat (`decisions/2026-08-31-panel-seats.md`), so step 6's
@@ -147,7 +149,9 @@ a `MUST` in `CODING_STANDARDS.md` or the controlling design is never baggage: th
 or the standard itself is amended by explicit, reviewed change — the standard's own deviation
 rule. And evidence outranks severity where it exists: a finding carrying a failing test,
 reproduction, or mutation witness blocks until repaired, whatever its label —
-`decisions/2026-08-20-automated-review-gate.md` §3's adjudication routing, preserved.
+`decisions/2026-08-20-automated-review-gate.md` §3's adjudication routing, preserved. Either
+may be `rejected` only by a row showing the evidence is not valid: a `MUST` the code does not
+breach, or a witness that does not reproduce on the head.
 
 Everything below the bar and outside those two rules is baggage the project deliberately
 carries: rows stay in their PR ledgers, and findings that outlive their PR belong in

@@ -161,6 +161,7 @@ ruling ever changes what a *pending* review would conclude.
 This record's binding rule stands: a push means the recorded pass reviewed a different head,
 and the exempt set remains exactly `reviews/FINDINGS.md`. Its consequence — "everything else
 invalidates, deliberately", read as *restarts the review sequence* — was narrowed on
-2026-09-01: a stale pass plus an owner-verified repair delta containing no serious P1 is now
-mergeable, disclosed in the pull-request body. See
+2026-09-01: a single-reviewer pass that found no serious P1, plus an owner-verified repair-only
+delta, is now mergeable, disclosed in the pull-request body; a serious P1 repair still returns
+for a fresh pass, and a panel-reviewed candidate re-runs every seat on any head movement. See
 [2026-09-01 — review effort is re-scoped](2026-09-01-review-effort-rescoped.md).
