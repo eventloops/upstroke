@@ -7,7 +7,7 @@
 
 [![CI](https://github.com/eventloops/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/eventloops/upstroke/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/upstroke.svg)](https://crates.io/crates/upstroke)
-[![license](https://img.shields.io/crates/l/upstroke.svg)](LICENSE)
+[![license](https://img.shields.io/github/license/eventloops/upstroke.svg)](LICENSE)
 
 A headless orchestration engine for AI coding agents. A frontier model and you design a piece
 of work together; `upstroke` then executes that plan unattended — normalizing it into a dependency
@@ -264,21 +264,10 @@ dedicated OS account or VM for untrusted input until that boundary ships.
 
 ## Licence
 
-**GNU AGPL v3 only** — see [LICENSE](LICENSE).
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-In plain terms, for the two things people usually want to know:
+**The name is not part of the grant** — see Apache-2.0 §6. Use "upstroke" to refer to this
+project; don't use the name or branding to present a modified version as the original.
 
-- **Running it costs you nothing and obliges you to nothing.** The AGPL's obligations attach to
-  *distributing* the software or *offering a modified version to others over a network*. Using
-  upstroke on your own machine — including at work, including on proprietary code — triggers
-  neither. Nothing links into your code: upstroke is a separate process that shells out to other
-  separate processes, so your repository is not a derivative work of it.
-- **Building on it means sharing back.** Fork it, modify it, sell it if you like — but the source
-  stays open under the same licence, including if you offer it to others as a hosted service.
-
-If that doesn't suit — an internal policy that prohibits AGPL, or a product you need to keep
-closed — a **commercial licence** is available. Open an issue or get in touch.
-
-Contributions are welcome under the CLA and workflow in [CONTRIBUTING.md](CONTRIBUTING.md), which
-keeps that dual-licensing possible. Rust changes follow the project's
-[coding standards](CODING_STANDARDS.md).
+Contributions are welcome under the CLA and workflow in [CONTRIBUTING.md](CONTRIBUTING.md).
+Rust changes follow the project's [coding standards](CODING_STANDARDS.md).

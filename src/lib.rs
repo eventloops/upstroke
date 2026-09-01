@@ -1,18 +1,12 @@
 //! upstroke — headless orchestration engine for AI coding agents.
 //!
-//! Copyright (C) 2026 Cameron Lambert
+//! Copyright 2026 Cameron Lambert
+//! SPDX-License-Identifier: Apache-2.0
 //!
-//! This program is free software: you can redistribute it and/or modify it
-//! under the terms of the GNU Affero General Public License as published by
-//! the Free Software Foundation, version 3 of the License. It is distributed
-//! WITHOUT ANY WARRANTY; without
-//! even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
-//! PURPOSE. See the GNU Affero General Public License for more details. You
-//! should have received a copy of the License along with this program; if
-//! not, see <https://www.gnu.org/licenses/>.
-//!
-//! Commercial licences are available for use that the AGPL does not permit —
-//! see README.md.
+//! Licensed under the Apache License, Version 2.0. Distributed on an "AS IS"
+//! basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND; see the LICENSE and
+//! NOTICE files at the repository root, or
+//! <http://www.apache.org/licenses/LICENSE-2.0>.
 //!
 //! v0.1 scope (DESIGN.md §21, steps 1–10): parse an annotated markdown plan
 //! into the IR, resolve a routing chain per task, and execute it sequentially —

@@ -136,3 +136,8 @@ artifacts (§15); records promoted here are the durable subset.
   candidate, is exempt from re-review; both SHAs, both base SHAs and both diff
   hashes recorded. Widens the 2026-08-20 exempt set by successor record; panel
   candidates outside.
+- [2026-09-01 — relicense to Apache-2.0, with a NOTICE file](2026-09-01-relicense-apache-2.md):
+  adoption-first at zero market share; AGPL-3.0-only and the commercial-licence offer retire
+  together, releases through 0.1.0 stay AGPL, the CLA stays for relicensing agility, and the
+  moat moves from the code to the mark. Owed follow-up: LICENSE/NOTICE/third-party attributions
+  inside the release archives.

@@ -281,6 +281,13 @@ attestation and each local archive against its attested digest. The GitHub relea
 the irreversible crates.io publish. Create releases from an already merged mainline commit; branch
 protection does not make arbitrary tags safe by itself.
 
+The next release is additionally gated by [the 2026-09-01 relicensing
+decision](decisions/2026-09-01-relicense-apache-2.md): each archive must carry `LICENSE`, `NOTICE`,
+and generated third-party attributions before any new `v*` tag is created. The workflow does not
+yet inspect archive contents — enforcement arrives with that archive change itself — so until it
+does, verify this gate at tag time the way the immutability setting is verified: by reading the
+archives back, not by assuming them.
+
 Release `v0.1.0` predates repository release immutability and remains the sole legacy exception. Do
 not rerun, replace, or delete its assets. Its preserved GitHub asset digests are:
 

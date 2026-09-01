@@ -1,7 +1,8 @@
 // upstroke — headless orchestration engine for AI coding agents.
-// Copyright (C) 2026 Cameron Lambert. Licensed under the GNU AGPL v3 only;
-// see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
-// available for use the AGPL does not permit — see README.md.
+// Copyright 2026 Cameron Lambert
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0; see LICENSE and NOTICE, or
+// <http://www.apache.org/licenses/LICENSE-2.0>.
 // LEGACY-EFFECT: this module is in the **frozen legacy section** of
 // `effects/allowlist.toml`, which carries its justification and the condition
 // under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
