@@ -22,20 +22,28 @@ contract itself.
    effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Upstroke
    owns this supervision natively, allow at least 90 minutes **per frontier review pass** and use
    the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
-6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
-   head. Feature ideas discovered during review belong in the design or a follow-up unless they are
-   required for the current change to be correct. One exception, decided in
-   `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff from the reviewed
-   head lies inside the exempt path set (exactly `reviews/FINDINGS.md`) does not invalidate the
-   review — record both SHAs in the PR's review evidence and confirm the exempt-only diff yourself
-   with `git diff --stat <reviewed> <head>` before merging. Everything else invalidates,
-   deliberately.
+6. Triage every finding against the serious-P1 bar defined under "Finding triage and cleanup
+   points". A serious P1 must be fixed, and the repaired head returns to step 3 for a fresh pass.
+   Every other finding is fixed at the author's discretion or accepted as logged baggage: a ledger
+   row with a stable id, an honest failure sequence, and disposition `accepted-risk` or `deferred`.
+   Accepted findings block nothing and oblige no further pass. A push that repairs reviewed
+   findings means the recorded pass no longer binds to the head — never claim it does — but the
+   merge may proceed once the owner has read the repair delta (`git diff <reviewed> <head>`)
+   against the findings and disclosed that verification in the body. One path is exempt from even
+   that, decided in `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff
+   from the reviewed head lies inside `reviews/FINDINGS.md` — record both SHAs and confirm the
+   exempt-only diff with `git diff --stat <reviewed> <head>`. Feature ideas discovered during
+   review belong in the design or a follow-up. Re-scoped in
+   `decisions/2026-09-01-review-effort-rescoped.md`.
 7. Once a review passes, record it in the PR body's Review evidence section: implementation and
    reviewer models and effort, the full reviewed head SHA, transport and wall-clock limit, and a
    durable link to the verdict. Re-run `.github/scripts/validate-pr-body.sh` from the default
    branch against the live title and body — `upstroke-pr-policy` ran the candidate's copy. Editing
    the title or body afterwards changes what was reviewed: re-check the body, and if the ledger
-   changed in substance, review again.
+   changed in substance, review again. When the merged head differs from the reviewed head, the
+   evidence section lists the delta commits and states what verified each: a fresh pass, the
+   owner's diff-read against the findings, or an explicit owner waiver citing its authorizing
+   record.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. The merge is the
    owner's attestation that the review recorded in the PR is real and that the reviewed SHA is the
    head being merged. Do not push or force-push directly to `master`. Delete the source branch
@@ -73,7 +81,8 @@ finding a stable id and retain one ledger row in the pull request with:
   deterministic test is infeasible and the documented guard/pitfall that prevents false claims.
 
 Provenance explains where a defect came from; it does not make a defect less real. Fix bounded
-pre-existing defects exposed by the changed path. A genuinely architectural or unrelated defect
+pre-existing defects exposed by the changed path, or accept them with a logged row — the
+serious-P1 bar decides which, and a serious P1 is never accepted. A genuinely architectural or unrelated defect
 may move to a critical follow-up only when the current PR documents the limitation honestly and
 does not claim the missing guarantee. Every code defect fixed in the PR gets a regression test
 that fails on the first-bad shape. If the same failure is found again, link the old id and treat the
@@ -96,6 +105,31 @@ identity: bind the row to the first integrated PR commit and record the pre-comm
 ledger to its current tracked name; do not preserve a stale claim by adding a no-op alias test. An
 explicit deterministic invariant may remain prose rather than a backticked identifier, but its
 wording must say what enforces it.
+
+### Finding triage and cleanup points
+
+A finding is a **serious P1** when its failure sequence is concrete on the current head and
+reaches at least one of:
+
+- a `DESIGN.md` §4 invariant;
+- the trust boundary, the merge or release machinery, or any gate change that misstates what the
+  gate enforces (`security-trust`);
+- durable state: the event log, replay, or anything that makes a recorded run unreproducible or
+  corrupt;
+- loss or corruption of data in a user repository — the engine owns git;
+- a legal or licensing defect.
+
+The severity label a reviewer assigns does not decide this; the owner classifies, and a P1 whose
+failure needs speculative preconditions is reclassified down with a ledger row saying why.
+
+Everything below the bar is baggage the project deliberately carries: rows stay in their PR
+ledgers, and findings that outlive their PR belong in `reviews/FINDINGS.md`. Baggage is swept,
+not forgotten, at three designated points: before any release tag or crates.io publish, where
+every open `accepted-risk` and `deferred` row is re-triaged and the release notes name what
+ships open; at each integration checkpoint merge (`decisions/2026-08-25-checkpoint-merges.md`);
+and at owner-called sweeps. A sweep fixes a row, re-accepts it dated, or converts it to a
+tracked follow-up; a row re-accepted twice carries the owner's dated note saying why it stays.
+Decided in `decisions/2026-09-01-review-effort-rescoped.md`.
 
 ## Enforced repository rules
 

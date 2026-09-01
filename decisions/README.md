@@ -117,3 +117,9 @@ artifacts (§15); records promoted here are the durable subset.
   reliance and the public-lifecycle rule, applied transitively). Supersedes
   the 2026-08-27 keep-in-place pin; filing rules unchanged; dated forward
   notices appended to both prior records.
+- [2026-09-01 — review effort is re-scoped: serious P1s block, the rest is logged baggage](2026-09-01-review-effort-rescoped.md):
+  one full frontier pass per pull request stays the norm; only findings
+  meeting the serious-P1 bar block and re-review, everything else lands as
+  `accepted-risk`/`deferred` rows swept before releases, at checkpoint
+  merges, and on owner call. The 2026-08-20 binding rule stands; its
+  consequence is narrowed by appended notice. First exercised on #87.
