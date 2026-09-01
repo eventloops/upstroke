@@ -70,3 +70,19 @@ public regardless, so secrecy buys nothing there.
   this record keeps public.
 - [2026-08-20 — the automated review gate](2026-08-20-automated-review-gate.md) — the
   self-hosted-runner rule that makes a private repository expensive.
+
+## 2026-09-01 — the "engine proposals stay public" clause is narrowed
+
+The rule above that engine proposals stay public under `proposals/` was
+narrowed on 2026-09-01: filing has been private since 2026-08-27, and the
+already-filed proposals were reduced to stubs in place, full texts relocated —
+except three files retained in full under this record's own retained-content
+rule and the public-lifecycle rule: the Decided G2 pass plan (content relied
+on by `DESIGN.md` and the freeze charter), the council critique (a
+review-stage record), and the portfolio proposal whose sections that critique
+cites. The stub mechanism of this record is applied there; its
+no-private-references rule is narrowed, not preserved: a relocated proposal's
+stub shares its filename with the private counterpart by construction, and
+the public index names and summarizes the relocated texts — pointers into
+the private repository remain forbidden. See
+[2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

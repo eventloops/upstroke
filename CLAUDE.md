@@ -54,10 +54,14 @@ before adding a record.
 
 **New proposals are filed privately**, in a private companion repository,
 engine mechanisms included
-(`decisions/2026-08-27-proposals-private.md`). The proposals already in
-`proposals/` stay there because decision records cite them as inputs; read
-`proposals/README.md` before touching those. Decisions stay public and still
-name their inputs.
+(`decisions/2026-08-27-proposals-private.md`). The dated proposals in
+`proposals/` are relocation stubs since 2026-09-01
+(`decisions/2026-09-01-proposals-relocated.md`): each keeps its path, title,
+and status block verbatim so decision-record citations resolve — except the
+Decided G2 pass plan, the council critique, and the portfolio proposal it
+cites, which stay in full (content reliance and the public-lifecycle rule).
+Read `proposals/README.md` before touching those. Decisions stay public and
+still name their inputs.
 
 ## Gates
 
@@ -171,9 +175,12 @@ only when its pull request merges.
 
 ## On the dedicated build box
 
-If you are on the build box rather than a workstation, read `infra/README.md`
-(it arrives with the build-box provisioning pull request; until that merges the
-rules below are the whole contract).
+If you are on the build box rather than a workstation: the provisioning tree
+and its operations guide moved to the private archive on 2026-09-01
+(`decisions/2026-09-01-infra-private.md`). The command wrappers —
+`upstroke-build` among them — live in `~/bin` on the box itself; the gate
+runner and service assets live elsewhere in the operator home. The rules
+below are the whole public contract.
 The rule that matters most:
 
 **Use `upstroke-build`, never set `CARGO_TARGET_DIR` yourself.**
