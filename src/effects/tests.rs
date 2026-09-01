@@ -4017,6 +4017,19 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
             "fn file_level_lint_state(",
             "fn names_lint(",
             "mod lint_levels",
+            // `PR57-FINAL-002`. Every part of the structural parser
+            // `PR57-FINAL-001` added is a census-only helper and each one is
+            // named here: a helper that drifts above the `#[cfg(test)]` cut is
+            // a shipped surface added for a test to call, which is the finding
+            // this file already carries once.
+            "struct Applied {",
+            "enum Truth {",
+            "fn evaluate(",
+            "fn read_attribute(",
+            "fn resolve(",
+            "fn split_call(",
+            "fn split_top_level(",
+            "fn mentions(",
         ] {
             if !whole.contains(needle) {
                 wrong.push(format!("`{needle}` is not in src/effects.rs at all"));
@@ -4056,6 +4069,79 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
         "the lint reader's module is `pub`, which is the surface this repair removed"
     );
 
+    // **Every item the module exposes at all, as a set.** `PR57-FINAL-002`
+    // asks whether a census-only helper became callable from outside; a needle
+    // per helper answers it only for the helpers somebody remembered to name.
+    // This reads the module's own text and compares what is visible for
+    // equality, so a *new* helper that arrives `pub(crate)` fails without
+    // having to be listed, and any `pub` at all fails twice — once here and
+    // once against `upstroke::effects`, which gains no surface from a
+    // `#[cfg(test)]` module and must gain none from this repair.
+    //
+    // Read from the blanked text: a doc comment saying `pub` is spaces by then,
+    // which is what `PR4-CENSUS-COMMENT-ORACLE` is about, and the blanking
+    // preserves the line structure this walks.
+    let blanked = blank_comments_and_strings(&source);
+    let braces = blanked
+        .find("mod lint_levels {")
+        .map(|at| at + "mod lint_levels ".len())
+        .expect("the reader's module is in this file");
+    let close = crate::effects::matching(blanked.as_bytes(), braces, b'{', b'}')
+        .expect("the reader's module closes");
+    // Whitespace inside a declaration is normalised, so the needles say what is
+    // visible rather than how rustfmt happened to space it.
+    let squeeze = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible: BTreeSet<String> = blanked[braces + 1..close]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub"))
+        .map(squeeze)
+        .collect();
+    assert_eq!(
+        visible,
+        [
+            "pub(crate) struct Resolution {",
+            "pub(crate) level: Option<&'static str>,",
+            "pub(crate) refused_downgrade: bool,",
+            "pub(crate) ambiguous: bool,",
+            "pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {",
+            "pub(crate) fn file_level_lint_state(source: &str, lint: &str) \
+             -> Option<&'static str> {",
+        ]
+        .into_iter()
+        .map(squeeze)
+        .collect::<BTreeSet<String>>(),
+        "the lint reader's visible surface moved. The two functions and the answer type are \
+         what `effects::tests` and `runner::container::tests` call; everything else the module \
+         holds is a helper and stays private"
+    );
+
+    // **`PR74-GOVERNED-LINT-TOKEN-001`'s tokeniser is private.** Its helpers
+    // cannot be `#[cfg(test)]` the way the level reader's are: `governed_allows`
+    // is a `pub fn` OF THE PRODUCTION REGION and calls them, so a gated helper
+    // would not compile. The claim that is available is the other half of
+    // `PR72-API-001` — they add no name to `upstroke::effects` — and it is read
+    // structurally rather than promised. `matching` is in the list as the
+    // precedent: the class is "private structural helper of this file", and it
+    // had one before this repair added three.
+    for helper in [
+        "fn calls_named",
+        "fn identifier_token",
+        "fn skip_blank",
+        "fn matching",
+    ] {
+        assert!(
+            blank_comments_and_strings(&source).contains(helper),
+            "`{helper}` is not in src/effects.rs at all, so the claim below is vacuous"
+        );
+        for visibility in ["pub ", "pub(crate) ", "pub(super) ", "pub(in "] {
+            assert!(
+                !blank_comments_and_strings(&source).contains(&format!("{visibility}{helper}")),
+                "`{helper}` is declared `{visibility}`, which puts a scan nothing outside this                  file runs on the crate's surface"
+            );
+        }
+    }
+
     // The instrument still answers where it is used, so narrowing it did not
     // narrow it out of existence — under both spellings of a line ending.
     for prologue in [
@@ -4074,6 +4160,52 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
             "{prologue:?}"
         );
     }
+}
+
+/// Compile one prologue under this repository's own `clippy.toml` and report
+/// whether it built, plus every diagnostic that carries a code, as `(level, code)`.
+///
+/// Shared by the two file-level-lint-reader tests so both are measured by the
+/// same oracle: the reader is never its own authority for what rustc does.
+fn compile_prologue_probe(dir: &Path, tag: &str, source: &str) -> (bool, Vec<(String, String)>) {
+    let file = dir.join(format!("{tag}.rs"));
+    fs::write(&file, source).expect("the fixture");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).expect("an output directory");
+    let output = std::process::Command::new(clippy_driver())
+        .env("CLIPPY_CONF_DIR", repo_root())
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "lib",
+            "--emit=metadata",
+            "--error-format=json",
+        ])
+        .arg("--out-dir")
+        .arg(&out)
+        .arg(&file)
+        .output()
+        .expect("clippy-driver runs; the lint gate uses the same binary");
+    let mut diagnostics = Vec::new();
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(code) = value
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let level = value
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        diagnostics.push((level.to_owned(), code.to_owned()));
+    }
+    (output.status.success(), diagnostics)
 }
 
 /// **The file-level lint reader answers what rustc does**, on a table rustc
@@ -4111,55 +4243,18 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
     const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
     const LINT: &str = "clippy::disallowed_methods";
 
-    /// Compile one prologue and return whether it built, plus every diagnostic
-    /// that carries a code, as `(level, code)`.
-    fn compile(dir: &Path, tag: &str, source: &str) -> (bool, Vec<(String, String)>) {
-        let file = dir.join(format!("{tag}.rs"));
-        fs::write(&file, source).expect("the fixture");
-        let out = dir.join("out");
-        fs::create_dir_all(&out).expect("an output directory");
-        let output = std::process::Command::new(clippy_driver())
-            .env("CLIPPY_CONF_DIR", repo_root())
-            .args([
-                "--edition",
-                "2024",
-                "--crate-type",
-                "lib",
-                "--emit=metadata",
-                "--error-format=json",
-            ])
-            .arg("--out-dir")
-            .arg(&out)
-            .arg(&file)
-            .output()
-            .expect("clippy-driver runs; the lint gate uses the same binary");
-        let mut diagnostics = Vec::new();
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(code) = value
-                .get("code")
-                .and_then(|code| code.get("code"))
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            let level = value
-                .get("level")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            diagnostics.push((level.to_owned(), code.to_owned()));
-        }
-        (output.status.success(), diagnostics)
-    }
-
     /// What the compiler must have done, if the reader's answer is right.
     ///
     /// `(the crate builds, the levels at which the lint fired, E0453 present)`.
     /// The one hand-written sentence in this test, and every arm of it is
     /// reached by a row below.
     fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "no prologue in this table is conditional, so nothing here may read as a refusal; \
+             the conditional shapes are in \
+             `the_file_level_lint_reader_refuses_a_condition_it_cannot_prove`"
+        );
         if resolution.refused_downgrade {
             // Not a level: the prologue is rejected and the lint never runs.
             return (false, Vec::new(), true);
@@ -4244,7 +4339,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
     for (tag, prologue) in table {
         let source = format!("{prologue}{BODY}");
         let resolution = file_level_lint_resolution(&source, LINT);
-        let (built, diagnostics) = compile(&scratch, tag, &source);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
         let fired: Vec<String> = diagnostics
             .iter()
             .filter(|(_, code)| code == LINT)
@@ -4294,6 +4389,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         Resolution {
             level: Some("allow"),
             refused_downgrade: false,
+            ambiguous: false,
         },
         "deny then allow is effectively allow"
     );
@@ -4305,6 +4401,7 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         Resolution {
             level: Some("forbid"),
             refused_downgrade: true,
+            ambiguous: false,
         },
         "a forbid cannot be weakened; the attempt is E0453 and not a level"
     );
@@ -4339,6 +4436,1869 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
         restated.is_empty(),
         "the ordered reading is exercised by fixtures only while this holds: {restated:#?}"
     );
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **The file-level lint reader refuses a condition it cannot prove**, and the
+/// compiler decides which conditions those are.
+///
+/// `PR57-FINAL-001`. The reader read an inner attribute by stripping a level
+/// keyword off the front of it, so it understood exactly one shape:
+/// `#![deny(L)]` written literally at the top of the file. Everything else it
+/// answered `None` to — which is the loud direction for a lone `#![cfg_attr(P,
+/// deny(L))]` and the **silent** one for the shape that matters:
+///
+/// ```text
+/// #![deny(clippy::disallowed_methods)]
+/// #![cfg_attr(windows, allow(clippy::disallowed_methods))]
+/// ```
+///
+/// The second attribute is invisible to a front-of-string strip, so the reader
+/// answered `deny` — and on Windows that file allows the lint. Two censuses act
+/// on that answer. `every_allow_of_a_governed_lint_is_module_level_and_in_the_
+/// allowlist` admits a per-site `#[expect]` only in a file that DENIES the lint
+/// at module level, so the expectation "narrows a denial" that is not there;
+/// and `runner::container::tests::every_child_module_of_the_container_funnel_
+/// states_its_own_lint_level` reports the module as having closed
+/// `PR6-LANEF-004` on every target when it has closed it on all but one.
+///
+/// # The rule this pins
+///
+/// A `deny` or `forbid` counts only when it is **unconditional** at module top
+/// level, or when its condition is proven true on every supported target. The
+/// reader proves exactly two things — `all()` is true everywhere and `any()` is
+/// false everywhere, and `not`/`all`/`any` compose over those — and models no
+/// target list at all, because a list is a place to be wrong and being wrong
+/// here means reporting a module as guarded on a target where it is not. Every
+/// other predicate is a **refusal**: `ambiguous`, with no level. Wrongly red is
+/// allowed; wrongly green is not.
+///
+/// # How it is measured
+///
+/// Section (1) is the same clippy-driver oracle
+/// [`the_file_level_lint_reader_answers_what_rustc_does`] uses, restricted to
+/// conditions that resolve the same way on ubuntu, macos and windows — so a row
+/// here means the same thing on all three CI legs. `PR72-WIN-EOL-003`'s sibling
+/// hazard, a fixture whose *meaning* is platform-shaped, is why `windows` and
+/// `unix` appear nowhere in that table.
+///
+/// Section (2) is the slip attempt, and it is measured on whichever host runs
+/// it: the condition is chosen to be true here and unprovable everywhere, so
+/// clippy-driver really does let a `std::fs::write` through a prologue that
+/// opens with `#![deny]`. Its mirror, the same shape under a condition false on
+/// this host, really does refuse it. **One reader answer covers both compiler
+/// behaviours**, which is the whole argument for refusing rather than picking.
+#[test]
+fn the_file_level_lint_reader_refuses_a_condition_it_cannot_prove() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    /// The same body the sibling oracle uses: one denied path, so any level
+    /// that does not suppress a `disallowed_methods` diagnostic produces one.
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    /// What the compiler must have done, if the reader's answer is right.
+    ///
+    /// `(the crate builds, the levels at which the lint fired, E0453 present)`.
+    /// A refusal predicts nothing — that is what makes it a refusal — so the
+    /// rows driven through here are the ones the reader answers.
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "a refusal predicts no compiler behaviour and must not be driven through this bridge"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("conditional-levels");
+
+    // -----------------------------------------------------------------
+    // (1) The conditions that resolve identically on every CI leg.
+    //
+    // Every row is a prologue and nothing here says what it means: the reader
+    // is asked, its answer is turned into a prediction, and clippy-driver is
+    // the verdict. `all()` is the empty conjunction and is true; `any()` is the
+    // empty disjunction and is false. Both are stable across targets, which is
+    // what lets a table assert them on ubuntu, macos and windows alike.
+    // -----------------------------------------------------------------
+    let table: &[(&str, &str)] = &[
+        // Inactive on every target: the deny is not there, and a reader that
+        // counted it would report a guarded module with an unguarded build.
+        (
+            "cfg_attr_any_deny",
+            "#![cfg_attr(any(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_not_all_deny",
+            "#![cfg_attr(not(all()), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_any_forbid",
+            "#![cfg_attr(any(), forbid(clippy::disallowed_methods))]\n",
+        ),
+        // Active on every target: the deny IS there, and a reader that ignored
+        // every conditional would report an unguarded module that is guarded.
+        // This is the half a blanket "refuse all `cfg_attr`" rule gets wrong.
+        (
+            "cfg_attr_all_deny",
+            "#![cfg_attr(all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_all_forbid",
+            "#![cfg_attr(all(), forbid(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_not_any_deny",
+            "#![cfg_attr(not(any()), deny(clippy::disallowed_methods))]\n",
+        ),
+        // Nesting, both ways round. A `cfg_attr` may carry another, and the
+        // condition of the pair is the conjunction: one inactive level anywhere
+        // in the chain and the attribute is not applied.
+        (
+            "nested_all_all_deny",
+            "#![cfg_attr(all(), cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_all_any_deny",
+            "#![cfg_attr(all(), cfg_attr(any(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_any_all_deny",
+            "#![cfg_attr(any(), cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        // A `cfg_attr` applies EVERY attribute after its condition, not just
+        // the first. A reader that took `terms[1]` and stopped would miss this
+        // deny entirely.
+        (
+            "cfg_attr_two_attributes",
+            "#![cfg_attr(all(), allow(dead_code), deny(clippy::disallowed_methods))]\n",
+        ),
+        // Ordering still decides, and a conditional takes its place in the
+        // order. An inactive allow after a deny leaves the deny standing; an
+        // active one replaces it, and the effect really does slip through.
+        (
+            "deny_then_inactive_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "deny_then_active_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(all(), allow(clippy::disallowed_methods))]\n",
+        ),
+        // `forbid` is sticky against a conditional too: the weakening that is
+        // actually applied is `E0453` and the crate does not build, and the one
+        // that is not applied is not a weakening at all.
+        (
+            "forbid_then_active_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(all(), allow(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "forbid_then_inactive_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        ),
+    ];
+
+    let mut observed_shapes: BTreeSet<(bool, Vec<String>, bool)> = BTreeSet::new();
+    for (tag, prologue) in table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+        observed_shapes.insert((built, fired, rejected));
+
+        // The same prologue with the line endings the Windows guest gives it.
+        assert_eq!(
+            file_level_lint_resolution(&source.replace('\n', "\r\n"), LINT),
+            resolution,
+            "`{tag}` reads differently under CRLF"
+        );
+    }
+
+    // The table reaches all four compiler behaviours — clean, warned, errored
+    // and rejected outright — so a reader collapsed to one answer cannot pass
+    // it, and neither can one that refuses every conditional it sees.
+    assert!(
+        observed_shapes.len() >= 4,
+        "the conditional fixtures produced only {} distinct compiler outcomes: {observed_shapes:?}",
+        observed_shapes.len()
+    );
+
+    // -----------------------------------------------------------------
+    // (2) The slip attempt, measured on this host.
+    //
+    // `HOST_TRUE` holds on whichever CI leg is running and is unprovable to the
+    // reader on all of them; `HOST_FALSE` is its complement. The prologue is
+    // the one a reviewer reads as a denial in both cases.
+    // -----------------------------------------------------------------
+    let (host_true, host_false) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
+    for (tag, condition, effect_slipped) in [
+        ("slip_here", host_true, true),
+        ("slip_elsewhere", host_false, false),
+    ] {
+        let source = format!(
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr({condition}, allow(clippy::disallowed_methods))]\n{BODY}"
+        );
+        let resolution = file_level_lint_resolution(&source, LINT);
+        assert_eq!(
+            resolution,
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{tag}` — a prologue whose denial is undone on some supported target must be a \
+             refusal, not a level"
+        );
+
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let errored = diagnostics
+            .iter()
+            .any(|(level, code)| level == "error" && code == LINT);
+        assert_eq!(
+            (built, errored),
+            (effect_slipped, !effect_slipped),
+            "`{tag}` — `#![cfg_attr({condition}, allow(..))]` after a deny did not behave as this \
+             host requires: built={built} diagnostics={diagnostics:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) Every other predicate is a refusal, and refusing is not the same as
+    // reading nothing. These cannot be compiled portably — that is exactly why
+    // the reader may not guess at them — so the claim asserted is the reader's,
+    // and it is asserted as a value.
+    // -----------------------------------------------------------------
+    const REFUSED: &[(&str, &str)] = &[
+        (
+            "target_family",
+            "#![cfg_attr(windows, deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "target_family_negated",
+            "#![cfg_attr(not(unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "target_os",
+            "#![cfg_attr(target_os = \"linux\", deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_test",
+            "#![cfg_attr(test, deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "not_cfg_test",
+            "#![cfg_attr(not(test), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "feature",
+            "#![cfg_attr(feature = \"strict\", deny(clippy::disallowed_methods))]\n",
+        ),
+        // A disjunction the reader could be tempted to call exhaustive. It is
+        // not exhaustive to a reader that models no target list, and the tree
+        // does not gain one for this.
+        (
+            "any_of_two_families",
+            "#![cfg_attr(any(windows, unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        // One unprovable term anywhere in the chain refuses the whole of it.
+        (
+            "all_with_one_unprovable",
+            "#![cfg_attr(all(all(), unix), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "nested_outer_unprovable",
+            "#![cfg_attr(unix, cfg_attr(all(), deny(clippy::disallowed_methods)))]\n",
+        ),
+        (
+            "nested_inner_unprovable",
+            "#![cfg_attr(all(), cfg_attr(unix, deny(clippy::disallowed_methods)))]\n",
+        ),
+        // THE ONE THIS REPAIR IS NAMED FOR: a denial undone on one target.
+        (
+            "deny_then_conditional_allow",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        ),
+        // And the same against a forbid. Whether this file is `E0453` or a
+        // clean forbid depends on the target, so it is neither a level nor a
+        // refused downgrade: it is a refusal.
+        (
+            "forbid_then_conditional_allow",
+            "#![forbid(clippy::disallowed_methods)]\n\
+             #![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        ),
+        // An attribute this reader does not understand, that names the lint.
+        // Silence about it would be a reader guessing, and the guess it would
+        // make is that nothing is stated. Three ways to be unreadable, because
+        // they leave the parser at three different points: brackets that never
+        // close, a head that is not a level and is not `cfg_attr`, and one of
+        // those nested inside a condition that IS proven.
+        (
+            "unreadable_brackets",
+            "#![cfg_attr(all(), deny(clippy::disallowed_methods)]\n",
+        ),
+        // `allowance` begins with `allow` and is not it. The reader this
+        // replaced stripped level keywords off the front of an attribute and
+        // had to carry a comment about exactly this word; a structural reader
+        // sees a call named `allowance`, does not know it, and refuses because
+        // it names the lint.
+        (
+            "head_that_is_not_a_level",
+            "#![allowance(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "unreadable_under_a_proven_condition",
+            "#![cfg_attr(all(), lint_group(deny(clippy::disallowed_methods)))]\n",
+        ),
+    ];
+    for (tag, prologue) in REFUSED {
+        let source = format!("{prologue}{BODY}");
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            assert_eq!(
+                file_level_lint_resolution(&spelling, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` must be a refusal"
+            );
+            // The census-facing answer is the one that matters, and it is the
+            // fail-closed one: no per-site `#[expect]` is admitted against it,
+            // and no child module reads as having stated its own level.
+            assert_eq!(
+                crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                None,
+                "`{tag}` reached a census as a level"
+            );
+            assert!(
+                !file_level_denies(&spelling, LINT),
+                "`{tag}` read as a denial"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (4) A refusal is not the only way to be silent, and the two are
+    // distinguished. An inherited allow — a child module that states nothing
+    // and takes its level from the module tree above it, which is
+    // `PR6-LANEF-004` itself — reads as nothing STATED and is not a refusal;
+    // the reader never reaches for the parent it cannot see.
+    // -----------------------------------------------------------------
+    let inheriting = format!("//! A child module of a funnel that allows the lint.\n{BODY}");
+    assert_eq!(
+        file_level_lint_resolution(&inheriting, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: false,
+        },
+        "a module that states nothing states nothing; it does not state its ancestor's allow"
+    );
+    // And an unrelated conditional attribute is not about this lint at all.
+    // `src/engine/assembly.rs` and `src/engine/topology.rs` both open with one.
+    let unrelated = format!("#![cfg_attr(not(test), allow(dead_code))]\n{BODY}");
+    assert_eq!(
+        file_level_lint_resolution(&unrelated, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: false,
+        },
+        "a conditional attribute naming another lint is not an ambiguity about this one"
+    );
+    // Two files in this tree really do carry that prologue, so the claim above
+    // is about the tree and not only about a fixture.
+    for path in ["src/engine/assembly.rs", "src/engine/topology.rs"] {
+        let source = fs::read_to_string(repo_root().join(path)).expect("an engine module");
+        for lint in USED_GOVERNED_LINTS {
+            assert!(
+                !file_level_lint_resolution(&source, lint).ambiguous,
+                "{path} reads as a refusal for `{lint}`, so this repair turned a green tree red"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (5) The other reader fails closed in the other direction, so nothing
+    // slips between them. `governed_allows` finds an `allow`/`expect` at any
+    // depth, conditional or not — so a conditional allow still has to be in
+    // `effects/allowlist.toml`, and cannot hide from the placement census by
+    // wearing a `cfg_attr`.
+    // -----------------------------------------------------------------
+    for prologue in [
+        "#![cfg_attr(any(), allow(clippy::disallowed_methods))]\n",
+        "#![cfg_attr(windows, allow(clippy::disallowed_methods))]\n",
+        "#![cfg_attr(all(), cfg_attr(all(), allow(clippy::disallowed_methods)))]\n",
+    ] {
+        let found = governed_allows(&format!("{prologue}{BODY}"));
+        assert_eq!(
+            found.len(),
+            1,
+            "a conditional allow is invisible to the placement census: {prologue:?}"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "{prologue:?}");
+        assert!(found[0].inner, "{prologue:?}");
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **Both governed-lint readers consume tokens**, and a raw identifier is the
+/// identifier it spells.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-001`. Two readers decide whether a file has
+/// allowed a governed lint, and both decided it by looking at bytes rather than
+/// at tokens:
+///
+/// * [`governed_allows`] found the keyword and then required the **very next
+///   byte** to be `(`. Rust does not: `#![allow /* why */ (clippy::…)]` and the
+///   same attribute with a newline before its parenthesis are ordinary
+///   attributes, and both were invisible to the placement census — so a file
+///   could allow a governed lint with no `effects/allowlist.toml` row and
+///   nothing would say so.
+/// * [`normalize_lint`] took the last `::` segment verbatim, so
+///   `clippy::r#disallowed_methods` was not `clippy::disallowed_methods`. A raw
+///   identifier is the same identifier to rustc — it exists so a keyword can be
+///   used as a name and applies to any identifier at all — so that spelling is
+///   the governed lint, allowed or denied, and neither reader saw it.
+///
+/// The consequence is the one `PR57-FINAL-001` was about, reached by a
+/// different route: a prologue that denies the lint and then takes it back in a
+/// spelling the reader cannot see reads as a denial. Section (1) compiles both
+/// such prologues and they **build clean** — the denied `std::fs::write` really
+/// does slip.
+///
+/// # Nothing here is asserted from a rule
+///
+/// Section (1) is the same `clippy-driver` oracle
+/// [`the_file_level_lint_reader_answers_what_rustc_does`] uses, so the claim
+/// "this spelling means that" is the compiler's and not this file's. Section
+/// (2) drives the placement reader over the same spellings; section (3) is the
+/// negative half, where a near-miss must NOT be taken for the lint; section (4)
+/// is the fail-closed arm.
+#[test]
+fn the_governed_lint_readers_consume_tokens_and_normalise_raw_identifiers() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    /// What the compiler must have done, if the reader's answer is right.
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every spelling in this table is one rustc accepts, so refusing it is not the \
+             fail-closed answer -- it is the reader still unable to read a token"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("lint-tokens");
+
+    // -----------------------------------------------------------------
+    // (1) Every spelling, measured. A row says only how it is written; the
+    // compiler says what it means and the reader has to agree.
+    // -----------------------------------------------------------------
+    let table: &[(&str, &str)] = &[
+        // The lint path, raw. `r#` on the lint segment, on the tool segment,
+        // and on a bare unqualified name.
+        (
+            "raw_lint_segment_allow",
+            "#![allow(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "raw_lint_segment_deny",
+            "#![deny(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "raw_tool_segment_allow",
+            "#![allow(r#clippy::disallowed_methods)]\n",
+        ),
+        ("raw_bare_lint_allow", "#![allow(r#disallowed_methods)]\n"),
+        // The attribute's own name, raw.
+        (
+            "raw_attribute_name_allow",
+            "#![r#allow(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "raw_attribute_name_deny",
+            "#![r#deny(clippy::disallowed_methods)]\n",
+        ),
+        // The delimiter, not adjacent. A comment is blanked to spaces before
+        // either reader sees it, so this row and the next are the same claim
+        // written the two ways a file actually carries it.
+        (
+            "comment_before_delimiter",
+            "#![allow /* why not */ (clippy::disallowed_methods)]\n",
+        ),
+        (
+            "newline_before_delimiter",
+            "#![allow\n    (clippy::disallowed_methods)]\n",
+        ),
+        (
+            "comment_before_delimiter_deny",
+            "#![deny /* why */ (clippy::disallowed_methods)]\n",
+        ),
+        // The conditional forms, which is where the two repairs meet.
+        (
+            "cfg_attr_comment_before_delimiter",
+            "#![cfg_attr /* c */ (all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_raw_lint",
+            "#![cfg_attr(all(), deny(clippy::r#disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_raw_inner_level",
+            "#![cfg_attr(all(), r#deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "raw_cfg_attr_name",
+            "#![r#cfg_attr(all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        // A raw identifier in the CONDITION. `r#all` is `all`, so this is the
+        // proven-true predicate and the deny counts.
+        (
+            "raw_cfg_predicate",
+            "#![cfg_attr(r#all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        // **THE TWO SLIPS.** A denial taken back in a spelling the reader could
+        // not see. Both build clean, so the effect is not denied at all.
+        (
+            "slip_by_raw_identifier",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![allow(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "slip_by_comment_before_delimiter",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![allow /* taken back */ (clippy::disallowed_methods)]\n",
+        ),
+    ];
+
+    let mut observed_shapes: BTreeSet<(bool, Vec<String>, bool)> = BTreeSet::new();
+    for (tag, prologue) in table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+        observed_shapes.insert((built, fired, rejected));
+
+        assert_eq!(
+            file_level_lint_resolution(&source.replace('\n', "\r\n"), LINT),
+            resolution,
+            "`{tag}` reads differently under CRLF"
+        );
+    }
+    assert!(
+        observed_shapes.len() >= 2,
+        "every spelling produced the same compiler outcome, so the table cannot separate a \
+         reader that sees them from one that does not: {observed_shapes:?}"
+    );
+
+    // -----------------------------------------------------------------
+    // (2) The placement reader sees them too, and REFUSES them where the
+    // census refuses. `mechanism` (2) permits an allowance "only as
+    // module-level attributes in files listed in effects/allowlist.toml", and
+    // `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`
+    // enforces both halves off this scan: an allow it cannot see is an allow
+    // that needs no row and may sit anywhere at all.
+    // -----------------------------------------------------------------
+    for (tag, attribute) in [
+        ("raw_lint_segment", "allow(clippy::r#disallowed_methods)"),
+        ("raw_tool_segment", "allow(r#clippy::disallowed_methods)"),
+        ("raw_bare_lint", "allow(r#disallowed_methods)"),
+        ("raw_attribute_name", "r#allow(clippy::disallowed_methods)"),
+        (
+            "comment_before_delimiter",
+            "allow /* why */ (clippy::disallowed_methods)",
+        ),
+        (
+            "newline_before_delimiter",
+            "allow\n    (clippy::disallowed_methods)",
+        ),
+        (
+            "raw_expect",
+            "r#expect(clippy::r#disallowed_methods, reason = \"r\")",
+        ),
+        (
+            "conditional_raw",
+            "cfg_attr(windows, allow(clippy::r#disallowed_methods))",
+        ),
+    ] {
+        // Module level: the scan must find it, so the file needs a row.
+        let inner = format!("#![{attribute}]\n{BODY}");
+        let found = governed_allows(&inner);
+        assert_eq!(
+            found.len(),
+            1,
+            "`{tag}` at module level is invisible to the placement census, so a file may allow \
+             a governed lint with no {ALLOWLIST_TOML} row"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "`{tag}`");
+        assert!(found[0].inner && found[0].module_level, "`{tag}`");
+
+        // Below module level: found, and reported as NOT module level, which is
+        // the value the census refuses on.
+        let on_a_function = format!("#[{attribute}]\npub fn reaches() {{}}\n{BODY}");
+        let found = governed_allows(&on_a_function);
+        assert_eq!(found.len(), 1, "`{tag}` on a function is invisible");
+        assert!(
+            !found[0].module_level,
+            "`{tag}` on a function reads as module-level, so the placement rule admits it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) The negative half. A near-miss is not the lint, and a spelling that
+    // only looks like one governs nothing — otherwise section (2) would be
+    // satisfied by a reader that answered "yes" to everything.
+    // -----------------------------------------------------------------
+    for (tag, source) in [
+        // A longer name that ends in the lint's, and one that begins with it.
+        (
+            "longer_name",
+            "#![allow(clippy::disallowed_methods_extra)]\n",
+        ),
+        (
+            "prefixed_name",
+            "#![allow(clippy::not_disallowed_methods)]\n",
+        ),
+        // `r#` is a prefix of the token, not a substring of it.
+        ("double_r", "#![allow(clippy::rr#disallowed_methods)]\n"),
+        // A different governed lint is a different lint.
+        ("another_governed", "#![allow(clippy::disallowed_types)]\n"),
+        // The keyword is part of a longer identifier.
+        (
+            "keyword_inside_a_word",
+            "#![allowance(clippy::disallowed_methods)]\n",
+        ),
+        // And the two decoys the blanking exists for, in the token reader's
+        // own terms: a raw spelling in prose and in a string literal.
+        (
+            "raw_in_prose",
+            "//! `#![allow(clippy::r#disallowed_methods)]`\n",
+        ),
+        (
+            "raw_in_a_string",
+            "pub const S: &str = \"#![allow(clippy::r#disallowed_methods)]\";\n",
+        ),
+    ] {
+        let found = governed_allows(&format!("{source}{BODY}"));
+        assert!(
+            found
+                .iter()
+                .all(|allow| !allow.lints.iter().any(|lint| lint == "disallowed_methods")),
+            "`{tag}` was taken for an allow of `disallowed_methods`: {found:#?}"
+        );
+    }
+    // The near-misses are near: the reader answers `None` for them and `Some`
+    // for the real thing, so section (3) is not passing because the fixtures
+    // are unreadable.
+    assert_eq!(
+        normalize_lint("clippy::r#disallowed_methods"),
+        Some("disallowed_methods")
+    );
+    assert_eq!(
+        normalize_lint("r#disallowed_methods"),
+        Some("disallowed_methods")
+    );
+    assert_eq!(normalize_lint("clippy::disallowed_methods_extra"), None);
+    assert_eq!(normalize_lint("clippy::rr#disallowed_methods"), None);
+    assert_eq!(normalize_lint("r#"), None);
+
+    // -----------------------------------------------------------------
+    // (4) Fail closed on syntax neither reader can resolve. An `allow(` whose
+    // parenthesis never closes is not a file that compiles, and the answer that
+    // matters is that it is not silently read as carrying no allowance.
+    // -----------------------------------------------------------------
+    let unbalanced = format!("#![allow(clippy::disallowed_methods]\n{BODY}");
+    let found = governed_allows(&unbalanced);
+    assert_eq!(
+        found.len(),
+        1,
+        "an unresolvable `allow(` was dropped rather than reported: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+    // The level reader refuses it rather than answering a level.
+    assert_eq!(
+        file_level_lint_resolution(&unbalanced, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: true,
+        },
+        "an unresolvable attribute must be a refusal"
+    );
+    // And a raw identifier that is not one refuses too.
+    assert_eq!(
+        file_level_lint_resolution(&format!("#![r#(clippy::disallowed_methods)]\n{BODY}"), LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: true,
+        },
+        "`r#` opening no identifier must be a refusal"
+    );
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// `rustfmt`, the binary the `cargo fmt` gate runs.
+fn rustfmt_binary() -> PathBuf {
+    let sysroot = std::process::Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .expect("rustc runs; it built this test");
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned());
+    let name = if cfg!(windows) {
+        "rustfmt.exe"
+    } else {
+        "rustfmt"
+    };
+    let in_sysroot = sysroot.join("bin").join(name);
+    if in_sysroot.is_file() {
+        return in_sysroot;
+    }
+    PathBuf::from(name)
+}
+
+/// **Both readers separate tokens the way the lexer does.**
+///
+/// `PR74-GOVERNED-LINT-TOKEN-002` and `PR74-GOVERNED-LINT-TOKEN-003`, two more
+/// places where this file assumed bytes where Rust has tokens. The previous
+/// repair taught the readers to consume an identifier whole; it left two
+/// adjacency assumptions standing.
+///
+/// **The introducer is three tokens, not three bytes.** `#`, an optional `!`
+/// and `[` may be separated by anything the lexer calls whitespace, comments
+/// included. `# ! [allow(…)]`, `#/* why */![allow(…)]` and the same across line
+/// breaks are ordinary attributes -- each one measured below, each one
+/// suppressing the lint -- and both readers required the bytes to be adjacent.
+///
+/// **Rust's whitespace is not `char::is_whitespace`.** The lexer uses
+/// `Pattern_White_Space`, and the two sets disagree in BOTH directions, which
+/// is why the predicate is written out rather than borrowed:
+///
+/// * `U+200E` and `U+200F` are Rust whitespace and are **not** `White_Space`.
+///   A reader using `char::is_whitespace` refuses a separator the compiler
+///   accepts -- and `#![allow\u{200E}(clippy::disallowed_methods)]` compiles
+///   and suppresses.
+/// * `U+00A0`, `U+1680`, `U+2000`, `U+2003`, `U+202F`, `U+205F` and `U+3000`
+///   are `White_Space` and are **not** Rust whitespace. A reader using
+///   `char::is_whitespace` walks over a byte rustc refuses to compile, and
+///   reports a level for a file that has none.
+///
+/// Section (5) is why neither is merely theoretical: `rustfmt` normalises both
+/// shapes away, but under a `rustfmt::skip` -- an ordinary attribute this
+/// repository's gates do not forbid -- it preserves them exactly. Measured by
+/// running the same `rustfmt` binary the `cargo fmt` gate runs.
+#[test]
+fn the_governed_lint_readers_separate_tokens_the_way_the_lexer_does() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every shape in this table is one rustc accepts, so a refusal here is not the \
+             fail-closed answer -- it is the reader still unable to separate two tokens"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    /// Ask the compiler, and hold the reader to the answer.
+    fn measured(scratch: &Path, tag: &str, prologue: &str, body: &str, lint: &str) {
+        let source = format!("{prologue}{body}");
+        let resolution = file_level_lint_resolution(&source, lint);
+        let (built, diagnostics) = compile_prologue_probe(scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == lint)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+    }
+
+    let scratch = scratch_dir("lexer-separators");
+
+    // -----------------------------------------------------------------
+    // (1) The introducer, separated every way the lexer allows.
+    // -----------------------------------------------------------------
+    for (tag, prologue) in [
+        ("introducer_plain", format!("#![allow({LINT})]\n")),
+        (
+            "introducer_space_after_hash",
+            format!("# ![allow({LINT})]\n"),
+        ),
+        (
+            "introducer_space_before_bracket",
+            format!("#! [allow({LINT})]\n"),
+        ),
+        ("introducer_space_both", format!("# ! [allow({LINT})]\n")),
+        (
+            "introducer_comment_after_hash",
+            format!("#/* why */![allow({LINT})]\n"),
+        ),
+        (
+            "introducer_comment_before_bracket",
+            format!("#!/* why */[allow({LINT})]\n"),
+        ),
+        ("introducer_newlines", format!("#\n!\n[allow({LINT})]\n")),
+        (
+            "introducer_line_comment",
+            format!("#\n// why\n!\n// and why\n[allow({LINT})]\n"),
+        ),
+        // Denied, so the direction that fails loudly is exercised too.
+        ("introducer_split_deny", format!("# ! [deny({LINT})]\n")),
+        // **THE SLIP.** A denial taken back through a separated introducer.
+        (
+            "slip_by_split_introducer",
+            format!("#![deny({LINT})]\n# ! [allow({LINT})]\n"),
+        ),
+    ] {
+        measured(&scratch, tag, &prologue, BODY, LINT);
+    }
+
+    // -----------------------------------------------------------------
+    // (2) Every separator the lexer accepts, between `allow` and its `(`.
+    // `Pattern_White_Space` in full. A reader built on `char::is_whitespace`
+    // refuses the last four and fails this table.
+    // -----------------------------------------------------------------
+    const ACCEPTED: [(&str, &str); 11] = [
+        ("tab", "\u{0009}"),
+        ("line_feed", "\u{000A}"),
+        ("vertical_tab", "\u{000B}"),
+        ("form_feed", "\u{000C}"),
+        ("carriage_return", "\u{000D}"),
+        ("space", "\u{0020}"),
+        ("next_line", "\u{0085}"),
+        ("left_to_right_mark", "\u{200E}"),
+        ("right_to_left_mark", "\u{200F}"),
+        ("line_separator", "\u{2028}"),
+        ("paragraph_separator", "\u{2029}"),
+    ];
+    for (name, separator) in ACCEPTED {
+        measured(
+            &scratch,
+            &format!("accepted_{name}"),
+            &format!("#![allow{separator}({LINT})]\n"),
+            BODY,
+            LINT,
+        );
+        // And in the introducer, which is the same separator logic reused.
+        measured(
+            &scratch,
+            &format!("accepted_introducer_{name}"),
+            &format!("#{separator}!{separator}[allow({LINT})]\n"),
+            BODY,
+            LINT,
+        );
+    }
+    // The same separator INSIDE the lint list, which is the third place two
+    // tokens meet and the one `str::trim` gets wrong on its own. A path may be
+    // spaced around its `::` for the same reason.
+    for (tag, prologue) in [
+        ("entry_leading_mark", format!("#![allow(\u{200E}{LINT})]\n")),
+        (
+            "entry_trailing_mark",
+            format!("#![allow({LINT}\u{200E})]\n"),
+        ),
+        (
+            "entry_both_marks",
+            format!("#![allow(\u{200E}{LINT}\u{200E})]\n"),
+        ),
+        (
+            "path_spaced_around_its_colons",
+            "#![allow(clippy :: disallowed_methods)]\n".to_owned(),
+        ),
+        (
+            "entry_marks_on_a_deny",
+            format!("#![deny(\u{200E}{LINT}\u{200E})]\n"),
+        ),
+    ] {
+        measured(&scratch, tag, &prologue, BODY, LINT);
+    }
+
+    // The slip again, through the separator that survives formatting.
+    measured(
+        &scratch,
+        "slip_by_left_to_right_mark",
+        &format!("#![deny({LINT})]\n#![allow\u{200E}({LINT})]\n"),
+        BODY,
+        LINT,
+    );
+
+    // -----------------------------------------------------------------
+    // (3) Every separator the lexer REFUSES. These are `White_Space` and are
+    // not Rust whitespace, so a reader that skipped them would report a level
+    // for a file that does not compile. The reader must refuse instead —
+    // nearby non-whitespace Unicode is a shape it cannot read, not a gap it
+    // may step over.
+    // -----------------------------------------------------------------
+    const REFUSED: [(&str, &str); 9] = [
+        ("no_break_space", "\u{00A0}"),
+        ("ogham_space_mark", "\u{1680}"),
+        ("en_quad", "\u{2000}"),
+        ("em_space", "\u{2003}"),
+        ("narrow_no_break_space", "\u{202F}"),
+        ("medium_mathematical_space", "\u{205F}"),
+        ("ideographic_space", "\u{3000}"),
+        ("zero_width_space", "\u{200B}"),
+        ("zero_width_non_joiner", "\u{200C}"),
+    ];
+    for (name, separator) in REFUSED {
+        for (where_it_sits, source) in [
+            (
+                "before the delimiter",
+                format!("#![allow{separator}({LINT})]\n{BODY}"),
+            ),
+            (
+                "inside the lint list",
+                format!("#![allow({separator}{LINT})]\n{BODY}"),
+            ),
+        ] {
+            let tag = format!("{name} {where_it_sits}");
+            let (built, _) = compile_prologue_probe(
+                &scratch,
+                &format!("refused_{name}_{}", where_it_sits.replace(' ', "_")),
+                &source,
+            );
+            assert!(
+                !built,
+                "`{tag}` compiles, so it belongs in the accepted table and not this one"
+            );
+            assert_eq!(
+                file_level_lint_resolution(&source, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` was stepped over as though it were whitespace"
+            );
+            for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+                assert_eq!(
+                    crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                    None,
+                    "`{tag}` reached a census as a level"
+                );
+            }
+        }
+        let source = format!("#![allow{separator}({LINT})]\n{BODY}");
+        // The compiler refuses the file outright, which is what makes skipping
+        // the character wrong rather than merely generous.
+        let (built, _) = compile_prologue_probe(&scratch, &format!("refused_{name}"), &source);
+        assert!(
+            !built,
+            "`{name}` compiles, so it belongs in the accepted table and not this one"
+        );
+        assert_eq!(
+            file_level_lint_resolution(&source, LINT),
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{name}` was stepped over as though it were whitespace"
+        );
+        // Never a level, under either spelling of a line ending.
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            assert_eq!(
+                crate::effects::lint_levels::file_level_lint_state(&spelling, LINT),
+                None,
+                "`{name}` reached a census as a level"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // (4) Placement and offsets are preserved. The introducer parser moved,
+    // and everything computed from the `#` — the line number, inner vs outer,
+    // module-level vs not — must be exactly what it was.
+    // -----------------------------------------------------------------
+    for (tag, source, wants_line, wants_inner, wants_module_level) in [
+        (
+            "inner_module_level_after_a_doc_comment",
+            format!("//! docs\n\n# ! [allow({LINT})]\n{BODY}"),
+            3,
+            true,
+            true,
+        ),
+        (
+            "inner_module_level_after_another_attribute",
+            format!("#![deny(clippy::disallowed_types)]\n#!/* c */[allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+        (
+            "inner_after_an_item_is_not_module_level",
+            format!("{BODY}# ! [allow({LINT})]\n"),
+            2,
+            true,
+            false,
+        ),
+        (
+            "outer_on_a_module_is_module_level",
+            format!("#  [allow({LINT})]\nmod inner {{}}\n"),
+            1,
+            false,
+            true,
+        ),
+        (
+            "outer_on_a_function_is_not_module_level",
+            format!("#  [allow({LINT})]\npub fn reaches() {{}}\n"),
+            1,
+            false,
+            false,
+        ),
+        (
+            "separator_before_the_bracket_keeps_the_line",
+            format!("// one\n// two\n#\u{200E}!\u{200E}[allow({LINT})]\n{BODY}"),
+            3,
+            true,
+            true,
+        ),
+        // **The attribute BEFORE it is separated too.** Deciding module level
+        // means stepping over everything that precedes the attribute, so a
+        // reader that can classify a separated introducer but cannot skip one
+        // still gets this wrong -- and the wrong answer is `false`, which the
+        // placement census refuses on.
+        (
+            "after_a_separated_attribute",
+            format!("# ! [deny(clippy::disallowed_types)]\n#![allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+        (
+            "after_a_mark_separated_attribute",
+            format!(
+                "#\u{200E}!\u{200E}[deny(clippy::disallowed_types)]\n#![allow({LINT})]\n{BODY}"
+            ),
+            2,
+            true,
+            true,
+        ),
+        // The introducer spans lines, so the reported line is the `#`'s and not
+        // the bracket's. Two different numbers, and only one of them is where a
+        // reviewer will look.
+        (
+            "introducer_across_lines_reports_the_hash_line",
+            format!("//! docs\n#\n!\n[allow({LINT})]\n{BODY}"),
+            2,
+            true,
+            true,
+        ),
+    ] {
+        let found = governed_allows(&source);
+        assert_eq!(found.len(), 1, "`{tag}` was not found at all: {found:#?}");
+        assert_eq!(found[0].line, wants_line, "`{tag}` line");
+        assert_eq!(found[0].inner, wants_inner, "`{tag}` inner");
+        assert_eq!(
+            found[0].module_level, wants_module_level,
+            "`{tag}` module_level"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "`{tag}` lints");
+    }
+
+    // **A `#` that opens no attribute is not an attribute**, and getting that
+    // wrong is not merely a spurious row. `r#type` is a raw identifier -- its
+    // `#` is followed by an identifier rather than by `!` or `[` -- and an
+    // opener that accepted it would run on to the next bracket group in the
+    // file, which is the REAL attribute below: one finding at the wrong line,
+    // reported as not module-level, and the attribute that matters skipped
+    // entirely because the scan resumes past it.
+    let raw_identifier_then_attribute = format!(
+        "pub fn first() {{ let r#type = 1; let _ = r#type; }}\n         #[allow({LINT})]\n         mod inner {{}}\n"
+    );
+    let found = governed_allows(&raw_identifier_then_attribute);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        found[0].line, 2,
+        "the finding is not the real attribute: {found:#?}"
+    );
+    assert!(!found[0].inner, "{found:#?}");
+    assert!(
+        found[0].module_level,
+        "the real module-level attribute was lost to a `#` that opens nothing: {found:#?}"
+    );
+
+    // An outer separated introducer really does govern the module it precedes:
+    // the denied call inside builds clean under it, so `module_level` above is
+    // a claim about a live attribute rather than about a fixture.
+    let (built, _) = compile_prologue_probe(
+        &scratch,
+        "outer_split_governs_its_module",
+        &format!(
+            "#![deny({LINT})]\n#  [allow({LINT})]\nmod inner {{ {} }}\n",
+            BODY.trim()
+        ),
+    );
+    assert!(
+        built,
+        "a separated outer introducer did not govern its module, so the placement fixture above \
+         is not measuring an attribute"
+    );
+
+    // -----------------------------------------------------------------
+    // (5) Formatting is not a defence. `rustfmt` normalises both shapes away —
+    // and under a `rustfmt::skip`, which nothing in this repository forbids, it
+    // preserves them byte for byte. Run against the same binary `cargo fmt`
+    // uses, so this is what the gate actually does rather than a claim about it.
+    // -----------------------------------------------------------------
+    let formatted = |name: &str, text: &str| -> String {
+        let file = scratch.join(format!("{name}.rs"));
+        fs::write(&file, text).expect("the fixture");
+        let out = std::process::Command::new(rustfmt_binary())
+            .args(["--edition", "2024"])
+            .arg(&file)
+            .output()
+            .expect("rustfmt runs; the fmt gate uses the same binary");
+        assert!(out.status.success(), "rustfmt refused `{name}`");
+        fs::read_to_string(&file).expect("the formatted fixture")
+    };
+    for (name, shape) in [
+        (
+            "lrm",
+            format!("#![allow\u{200E}({LINT})]\npub fn go() {{}}\n"),
+        ),
+        ("split", format!("# ! [allow({LINT})]\npub fn go() {{}}\n")),
+    ] {
+        let plain = formatted(&format!("fmt_plain_{name}"), &shape);
+        assert_eq!(
+            plain,
+            format!("#![allow({LINT})]\npub fn go() {{}}\n"),
+            "`{name}` — rustfmt no longer normalises this shape, so section (5) is stale"
+        );
+        let skipped = format!("#![rustfmt::skip]\n{shape}");
+        assert_eq!(
+            formatted(&format!("fmt_skipped_{name}"), &skipped),
+            skipped,
+            "`{name}` — under `rustfmt::skip` the shape must survive formatting untouched; that \
+             is why the readers cannot lean on the fmt gate to remove it"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **A lint name is what the compiler resolves it to, and nothing else.**
+///
+/// `PR74-GOV-001` and `PR74-GOV-002`. `normalize_lint` decided which lint an
+/// attribute entry names by taking the last `::` segment and looking it up.
+/// That is wrong in both directions at once.
+///
+/// **It dropped a live alias.** `clippy::disallowed_method` -- singular -- is a
+/// RENAMED lint that clippy still resolves: an allow of it suppresses
+/// `clippy::disallowed_methods` and a deny of it makes the build fail, with a
+/// `renamed_and_removed_lints` warning beside it. The reader answered `None`,
+/// so a file could allow a governed lint in that spelling with no
+/// `effects/allowlist.toml` row and no census would see it. `clippy::\
+/// disallowed_type` is the same for `disallowed_types`.
+///
+/// **It accepted names the compiler does not.** Any path ending in a governed
+/// name normalised to that lint, so `rustdoc::disallowed_methods`,
+/// `rustc::disallowed_methods` and `clippy::extra::disallowed_methods` -- none
+/// of which govern the lint, all of which compile -- read as the governed lint.
+/// The wrongly-green shape is the review's: a file with a REAL allow and a FAKE
+/// deny after it
+///
+/// ```text
+/// #![allow(clippy::disallowed_methods)]
+/// #![deny(rustdoc::disallowed_methods)]
+/// ```
+///
+/// compiles clean with the lint SUPPRESSED, and the reader called it a denial.
+/// Both censuses act on that: one admits a per-site `#[expect]` against a
+/// denial that is not there, and the other reports `PR6-LANEF-004` closed.
+///
+/// # What is accepted now
+///
+/// A bare governed name, or exactly `clippy::<name>` where `<name>` is a
+/// governed lint or one of the two measured aliases. Two segments at most, and
+/// the first must be `clippy`. Everything else refuses: extra segments and
+/// foreign namespaces are not skipped, because "this attribute says nothing
+/// about that lint" is false for text that plainly names it.
+///
+/// # Measured on both toolchains this repository supports
+///
+/// Every row below is compiled by `clippy-driver`. The alias rows were also
+/// measured by hand against the MSRV toolchain -- clippy 0.1.85, the 1.85.0
+/// pin CI runs -- and against stable clippy 0.1.97, with identical results, so
+/// the canonicalisation is not a stable-only behaviour. The MSRV leg runs here
+/// too when that toolchain is installed, and says so when it is not.
+#[test]
+fn the_governed_lint_reader_canonicalises_aliases_and_refuses_foreign_namespaces() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every spelling in this table is one the compiler resolves, so a refusal is not \
+             the fail-closed answer here -- it is the reader failing to canonicalise"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("lint-aliases");
+
+    // -----------------------------------------------------------------
+    // (1) The alias resolves, in both directions, and so does every accepted
+    // spelling of every governed lint this slice uses.
+    // -----------------------------------------------------------------
+    let mut table: Vec<(String, String)> = vec![
+        (
+            "alias_allow".to_owned(),
+            "#![allow(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        (
+            "alias_deny".to_owned(),
+            "#![deny(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        (
+            "alias_forbid".to_owned(),
+            "#![forbid(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        // The alias and the canonical name are ONE lint, so ordering across the
+        // two spellings still decides: a deny taken back by an alias-spelled
+        // allow is an allow.
+        (
+            "deny_then_alias_allow".to_owned(),
+            format!("#![deny({LINT})]\n#![allow(clippy::disallowed_method)]\n"),
+        ),
+        (
+            "alias_deny_then_allow".to_owned(),
+            format!("#![deny(clippy::disallowed_method)]\n#![allow({LINT})]\n"),
+        ),
+    ];
+    for spelling in ["disallowed_methods", "clippy::disallowed_methods"] {
+        table.push((
+            format!("accepted_{}", spelling.replace("::", "_")),
+            format!("#![allow({spelling})]\n"),
+        ));
+    }
+    for (tag, prologue) in &table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+    }
+
+    // The other governed lint with an alias, asked about itself.
+    for (tag, prologue, lint) in [
+        (
+            "types_alias_allow",
+            "#![allow(clippy::disallowed_type)]\n",
+            "clippy::disallowed_types",
+        ),
+        (
+            "types_alias_deny",
+            "#![deny(clippy::disallowed_type)]\n",
+            "clippy::disallowed_types",
+        ),
+    ] {
+        assert_eq!(
+            crate::effects::lint_levels::file_level_lint_state(prologue, lint),
+            Some(if tag.ends_with("allow") {
+                "allow"
+            } else {
+                "deny"
+            }),
+            "`{tag}` — `clippy::disallowed_type` is a live rename of `{lint}`"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (2) `normalize_lint` is the bridge, and it answers about NAMES rather
+    // than about files. Stated as values, both directions, so a reader that
+    // simply matched more would fail the second half.
+    // -----------------------------------------------------------------
+    for accepted in [
+        "disallowed_methods",
+        "clippy::disallowed_methods",
+        "clippy::disallowed_method",
+        " clippy :: disallowed_method ",
+        "clippy::r#disallowed_method",
+    ] {
+        assert_eq!(
+            normalize_lint(accepted),
+            Some("disallowed_methods"),
+            "`{accepted}` is a spelling the compiler resolves to this lint"
+        );
+    }
+    assert_eq!(
+        normalize_lint("clippy::disallowed_type"),
+        Some("disallowed_types")
+    );
+    for refused in [
+        // Foreign namespaces. Each compiles and none governs the lint.
+        "rustdoc::disallowed_methods",
+        "rustc::disallowed_methods",
+        // An extra segment under the right tool is still not the lint.
+        "clippy::extra::disallowed_methods",
+        "clippy::disallowed_methods::extra",
+        // An unknown tool is `E0710` and does not compile at all.
+        "foo::disallowed_methods",
+        "foo::bar::disallowed_methods",
+        // The alias only exists tool-qualified: bare `disallowed_method` is
+        // `unknown_lints` and governs nothing.
+        "disallowed_method",
+        "disallowed_type",
+        // And there is no `disallowed_macro` rename at all — measured
+        // `unknown_lints`, not `renamed_and_removed_lints`.
+        "clippy::disallowed_macro",
+        "disallowed_macro",
+    ] {
+        assert_eq!(
+            normalize_lint(refused),
+            None,
+            "`{refused}` is not a spelling the compiler resolves to a governed lint"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) A foreign namespace REFUSES, loudly, rather than being skipped —
+    // and the compiler is asked what each one really does.
+    // -----------------------------------------------------------------
+    for (tag, entry, compiles) in [
+        ("rustdoc_namespace", "rustdoc::disallowed_methods", true),
+        ("rustc_namespace", "rustc::disallowed_methods", true),
+        ("extra_segment", "clippy::extra::disallowed_methods", true),
+        ("unknown_tool", "foo::disallowed_methods", false),
+    ] {
+        // What it does on its own: it does not deny, so the lint still fires
+        // (or the file does not build at all).
+        let alone = format!("#![deny({entry})]\n{BODY}");
+        let (built, diagnostics) =
+            compile_prologue_probe(&scratch, &format!("alone_{tag}"), &alone);
+        assert_eq!(
+            built, compiles,
+            "`{tag}` — build expectation wrong: {diagnostics:?}"
+        );
+        if compiles {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|(level, code)| level == "warning" && code == LINT),
+                "`{tag}` denied the lint after all, so it is not a foreign namespace: \
+                 {diagnostics:?}"
+            );
+        }
+        // And the reader refuses it rather than reading a level from it.
+        for spelling in [alone.clone(), alone.replace('\n', "\r\n")] {
+            assert_eq!(
+                file_level_lint_resolution(&spelling, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` was read as a level instead of refused"
+            );
+        }
+    }
+
+    // An attribute this reader cannot resolve is a refusal, and it is no less
+    // about the lint for naming it in the spelling clippy renamed. Without the
+    // aliases in `mentions`, these read as "this attribute says nothing about
+    // that lint" — which is the reassuring answer and the false one.
+    for (tag, prologue) in [
+        (
+            "alias_under_an_unknown_head",
+            "#![allowance(clippy::disallowed_method)]\n",
+        ),
+        (
+            "alias_under_a_nested_unknown_head",
+            "#![cfg_attr(all(), lint_group(deny(clippy::disallowed_method)))]\n",
+        ),
+    ] {
+        let source = format!("{prologue}{BODY}");
+        assert_eq!(
+            file_level_lint_resolution(&source, LINT),
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{tag}` — an unreadable attribute naming the lint by its alias must refuse"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (4) **The review's shape.** A real allow, then a fake deny. The compiler
+    // suppresses the lint — the file ALLOWS it — and the reader must never
+    // answer `deny`, which is what both censuses act on.
+    // -----------------------------------------------------------------
+    for (tag, fake) in [
+        ("fake_deny_rustdoc", "rustdoc::disallowed_methods"),
+        (
+            "fake_deny_extra_segment",
+            "clippy::extra::disallowed_methods",
+        ),
+    ] {
+        let source = format!("#![allow({LINT})]\n#![deny({fake})]\n{BODY}");
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        assert!(built, "`{tag}` did not build: {diagnostics:?}");
+        assert!(
+            !diagnostics.iter().any(|(_, code)| code == LINT),
+            "`{tag}` — the lint fired, so the real allow did not stand and this fixture is not \
+             the shape it claims: {diagnostics:?}"
+        );
+        let resolution = file_level_lint_resolution(&source, LINT);
+        assert_ne!(
+            resolution.level,
+            Some("deny"),
+            "`{tag}` — a file the compiler compiles CLEAN, with the lint allowed, read as a \
+             denial. That is the wrongly-green answer both censuses act on."
+        );
+        assert!(
+            resolution.ambiguous,
+            "`{tag}` — a fake deny naming the lint must refuse loudly, not be skipped: \
+             {resolution:?}"
+        );
+        assert!(!file_level_denies(&source, LINT), "`{tag}`");
+    }
+
+    // -----------------------------------------------------------------
+    // (5) The placement half. An alias-spelled allow must be VISIBLE to the
+    // allowlist census — otherwise it is an allowance with no row — and a
+    // foreign-namespace one must not be, because it allows nothing.
+    // -----------------------------------------------------------------
+    let found = governed_allows(&format!("#![allow(clippy::disallowed_method)]\n{BODY}"));
+    assert_eq!(
+        found.len(),
+        1,
+        "an alias-spelled allow is invisible to the placement census, so a file may allow a \
+         governed lint with no {ALLOWLIST_TOML} row: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+    assert!(found[0].module_level && found[0].inner);
+    for silent in [
+        "rustdoc::disallowed_methods",
+        "clippy::extra::disallowed_methods",
+        "disallowed_method",
+    ] {
+        let found = governed_allows(&format!("#![allow({silent})]\n{BODY}"));
+        assert!(
+            found.iter().all(|allow| allow.lints.is_empty()),
+            "`{silent}` allows nothing the compiler recognises, so it is not a governed \
+             allowance: {found:#?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (6) The MSRV leg. The alias is not a stable-only behaviour: the same
+    // fixture is compiled by the 1.85.0 toolchain CI pins whenever it is
+    // installed, and the absence is reported rather than passed over.
+    // -----------------------------------------------------------------
+    let msrv = std::process::Command::new("rustup")
+        .args(["run", "1.85.0", "rustc", "--print", "sysroot"])
+        .output();
+    let msrv_driver = msrv.ok().filter(|out| out.status.success()).map(|out| {
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .join("bin")
+            .join(if cfg!(windows) {
+                "clippy-driver.exe"
+            } else {
+                "clippy-driver"
+            })
+    });
+    match msrv_driver.filter(|path| path.is_file()) {
+        Some(driver) => {
+            let file = scratch.join("msrv_alias.rs");
+            fs::write(
+                &file,
+                format!("#![deny(clippy::disallowed_method)]\n{BODY}"),
+            )
+            .expect("the fixture");
+            let out = scratch.join("msrv-out");
+            fs::create_dir_all(&out).expect("an output directory");
+            let output = std::process::Command::new(&driver)
+                .env("CLIPPY_CONF_DIR", repo_root())
+                .args([
+                    "--edition",
+                    "2024",
+                    "--crate-type",
+                    "lib",
+                    "--emit=metadata",
+                    "--error-format=json",
+                ])
+                .arg("--out-dir")
+                .arg(&out)
+                .arg(&file)
+                .output()
+                .expect("the MSRV clippy-driver runs");
+            assert!(
+                !output.status.success(),
+                "on the MSRV toolchain a deny of `clippy::disallowed_method` did not fail the \
+                 build, so the alias is stable-only and the canonicalisation must say so"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("clippy::disallowed_methods"),
+                "the MSRV toolchain did not resolve the alias to the canonical lint"
+            );
+        }
+        None => {
+            // Loud, not silent: the claim above is measured on stable here, and
+            // the MSRV leg is evidence this host can add when the toolchain is
+            // present. CI's `test` job installs `stable` only.
+            eprintln!(
+                "note: the 1.85.0 toolchain is not installed, so the MSRV leg of \
+                 `the_governed_lint_reader_canonicalises_aliases_and_refuses_foreign_namespaces` \
+                 did not run; the alias claim is measured on the available toolchain only"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **A bare-spelled level is counted, and the envelope in which the compilers
+/// agree with that reading is pinned.** `PR74-GOV-003`, recorded as a residual
+/// here rather than repaired, and this test is the executable record.
+///
+/// The counted reading is inherited: `names_lint` has answered "the bare
+/// spelling is the lint" since `0519514`, before this slice, and
+/// `runner::container::tests` pins the same answer over the same fixture. The
+/// convergence adjudication of 2026-08-30 measured where that reading is the
+/// compiled truth, on both toolchains this repository supports — stable
+/// clippy 0.1.97 and the 1.85.0 pin's 0.1.85 — and the answer is an envelope,
+/// not a yes:
+///
+/// * **At one scope, the two compilers agree with the reading everywhere.**
+///   `#![deny(disallowed_methods)]` uncontested denies on both; a qualified
+///   deny taken back by a bare allow in the same prologue is an allow on both.
+///   Every same-scope row in the tables above therefore reads identically
+///   under either toolchain, which is what lets those tables run on any host.
+/// * **Beneath an ancestor, the pin disagrees.** A child module whose prologue
+///   writes the bare deny under a parent that allows the lint DENIES on
+///   stable and **inherits the allow on 1.85** — the bare spelling cannot
+///   override an ancestor there, while `clippy::disallowed_methods`,
+///   `clippy::r#disallowed_methods` and the `clippy::disallowed_method` rename
+///   all override on both. The file-scoped reader cannot see an ancestor, so
+///   for exactly the files the funnel census reads — nested children — its
+///   `deny` over-claims on the MSRV toolchain.
+///
+/// # Why this is a pinned residual and not a repair
+///
+/// The spelling cannot enter the tree while today's gates run:
+/// `renamed_and_removed_lints` fires beside every bare governed spelling, and
+/// the lint gate runs stable clippy with `-D warnings`, so the divergent
+/// prologue is refused at the door. Both halves of that seal are asserted
+/// below, per toolchain, because the residual is non-blocking only while they
+/// hold. Narrowing the reader instead — counting only the spellings that
+/// override on both toolchains, refusing the rest as it already refuses a
+/// foreign namespace — flips the `runner::container::tests` fixture that pins
+/// the inherited answer, which is outside this slice's write set. The
+/// narrowing therefore needs one lease adjudication and lands as one
+/// coordinated change or not at all; this test is what keeps the two files
+/// honest in the meantime, in both directions: it goes red if the reader
+/// stops counting the bare spelling without that adjudication, and it goes
+/// red if a toolchain change moves the envelope it documents.
+#[test]
+fn the_bare_lint_spelling_is_counted_and_its_toolchain_envelope_is_pinned() {
+    use crate::effects::lint_levels::file_level_lint_resolution;
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+    const RENAMED: &str = "renamed_and_removed_lints";
+
+    // -----------------------------------------------------------------
+    // (1) The inherited reading, stated as values. The bare spelling is
+    // counted by the level reader and seen by the placement scan — the same
+    // pair of answers `runner::container::tests` builds its census on.
+    // -----------------------------------------------------------------
+    let child = format!("#![deny(disallowed_methods)]\n{BODY}");
+    let same_scope =
+        format!("#![deny(clippy::disallowed_methods)]\n#![allow(disallowed_methods)]\n{BODY}");
+    for (tag, source, level) in [
+        ("bare_deny", &child, "deny"),
+        (
+            "bare_raw_deny",
+            &format!("#![deny(r#disallowed_methods)]\n{BODY}"),
+            "deny",
+        ),
+        ("qualified_deny_then_bare_allow", &same_scope, "allow"),
+    ] {
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            let resolution = file_level_lint_resolution(&spelling, LINT);
+            assert_eq!(
+                (resolution.level, resolution.ambiguous),
+                (Some(level), false),
+                "`{tag}` — the inherited counted reading changed. If that is deliberate, it is \
+                 the coordinated narrowing this test's doc describes: re-adjudicate the lease, \
+                 flip the `runner::container::tests` fixture that pins the same answer, and \
+                 re-measure the envelope below."
+            );
+        }
+    }
+    let found = governed_allows(&format!("#![allow(disallowed_methods)]\n{BODY}"));
+    assert_eq!(
+        found.len(),
+        1,
+        "a bare-spelled allow left the placement census: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+
+    // -----------------------------------------------------------------
+    // (2) The envelope, measured per toolchain rather than on whichever
+    // toolchain happens to host the suite. Each leg locates its own
+    // `clippy-driver` and is loud when it cannot; the ambient driver decides
+    // nothing here, so the answers cannot drift with the host.
+    // -----------------------------------------------------------------
+    fn toolchain_driver(toolchain: &str) -> Option<PathBuf> {
+        let sysroot = std::process::Command::new("rustup")
+            .args(["run", toolchain, "rustc", "--print", "sysroot"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let driver = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned())
+            .join("bin")
+            .join(if cfg!(windows) {
+                "clippy-driver.exe"
+            } else {
+                "clippy-driver"
+            });
+        driver.is_file().then_some(driver)
+    }
+
+    /// Run `driver` over `root`. `(built, diagnostic codes by level)`.
+    fn drive(driver: &Path, dir: &Path, tag: &str, root: &Path) -> (bool, Vec<(String, String)>) {
+        let out = dir.join(format!("{tag}-out"));
+        fs::create_dir_all(&out).expect("an output directory");
+        let output = std::process::Command::new(driver)
+            .env("CLIPPY_CONF_DIR", repo_root())
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--emit=metadata",
+                "--error-format=json",
+            ])
+            .arg("--out-dir")
+            .arg(&out)
+            .arg(root)
+            .output()
+            .expect("clippy-driver runs; the lint gate uses the same binary");
+        let mut diagnostics = Vec::new();
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(code) = value
+                .get("code")
+                .and_then(|code| code.get("code"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let level = value
+                .get("level")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            diagnostics.push((level.to_owned(), code.to_owned()));
+        }
+        (output.status.success(), diagnostics)
+    }
+
+    /// Compile `child` as `mod {tag}_child;` beneath a parent whose prologue
+    /// allows the lint — the shape of every file the funnel census reads.
+    fn compile_pair(
+        driver: &Path,
+        dir: &Path,
+        tag: &str,
+        child: &str,
+    ) -> (bool, Vec<(String, String)>) {
+        let parent = dir.join(format!("{tag}.rs"));
+        fs::write(
+            &parent,
+            format!("#![allow(clippy::disallowed_methods)]\nmod {tag}_child;\n"),
+        )
+        .expect("the parent fixture");
+        fs::write(dir.join(format!("{tag}_child.rs")), child).expect("the child fixture");
+        drive(driver, dir, tag, &parent)
+    }
+
+    /// Compile `source` as its own crate root — the shape every table above
+    /// drives, which is why this leg is measured at root and nowhere else.
+    fn compile_single(
+        driver: &Path,
+        dir: &Path,
+        tag: &str,
+        source: &str,
+    ) -> (bool, Vec<(String, String)>) {
+        let root = dir.join(format!("{tag}.rs"));
+        fs::write(&root, source).expect("the fixture");
+        drive(driver, dir, tag, &root)
+    }
+
+    let scratch = scratch_dir("bare-spelling-envelope");
+    // (toolchain, the child's bare deny holds beneath the ancestor allow)
+    for (toolchain, overrides) in [("stable", true), ("1.85.0", false)] {
+        let Some(driver) = toolchain_driver(toolchain) else {
+            // Loud, not silent: CI's `test` job installs `stable` only, so the
+            // MSRV half of the envelope is evidence a host adds by having the
+            // pin installed, exactly as the alias test's MSRV leg does.
+            eprintln!(
+                "note: the {toolchain} toolchain is not installed, so that half of the \
+                 envelope in `the_bare_lint_spelling_is_counted_and_its_toolchain_envelope_\
+                 is_pinned` did not run"
+            );
+            continue;
+        };
+        let tag = format!("nested_{}", toolchain.replace('.', "_"));
+        let (built, diagnostics) = compile_pair(&driver, &scratch, &tag, &child);
+        let fired = diagnostics.iter().any(|(_, code)| code == LINT);
+        assert_eq!(
+            (built, fired),
+            (!overrides, overrides),
+            "on {toolchain}, a child's bare deny beneath an ancestor allow no longer \
+             behaves as measured on 2026-08-30 — the envelope this residual was accepted \
+             under has moved, so it must be re-adjudicated: {diagnostics:?}"
+        );
+        // The seal that keeps the residual non-blocking: the spelling cannot
+        // pass the stable `-D warnings` lint gate, because the rename warning
+        // fires beside it — on both toolchains, contested or not.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(level, code)| level == "warning" && code == RENAMED),
+            "on {toolchain}, no `{RENAMED}` fired beside the bare spelling, so the gate \
+             seal this residual relies on is gone: {diagnostics:?}"
+        );
+        // And the same-scope half, at crate root: the flip the in-suite tables
+        // rely on reads identically under both toolchains, so those tables
+        // hold on any host.
+        let tag = format!("same_scope_{}", toolchain.replace('.', "_"));
+        let (built, diagnostics) = compile_single(&driver, &scratch, &tag, &same_scope);
+        assert!(
+            built && !diagnostics.iter().any(|(_, code)| code == LINT),
+            "on {toolchain}, a same-scope bare allow no longer takes back the qualified \
+             deny, so the same-scope rows are host-relative after all: {diagnostics:?}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&scratch);
 }

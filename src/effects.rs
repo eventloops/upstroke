@@ -147,13 +147,81 @@ pub const USED_GOVERNED_LINTS: &[&str] = &[
     "clippy::disallowed_macros",
 ];
 
+/// Renamed clippy lints that a governed one still answers to.
+///
+/// `PR74-GOV-001`. A rename is not a spelling variant a reader may ignore:
+/// clippy still RESOLVES these, so an allow of one suppresses the governed lint
+/// and a deny of one fails the build. Measured on both toolchains this
+/// repository supports -- stable clippy 0.1.97 and the 1.85.0 pin's clippy
+/// 0.1.85 -- with identical results: `#![allow(clippy::disallowed_method)]`
+/// emits `renamed_and_removed_lints` and suppresses, and
+/// `#![deny(clippy::disallowed_method)]` emits it and errors.
+///
+/// **Only these two, and only tool-qualified.** Measured in the same run:
+/// `clippy::disallowed_macro` is `unknown_lints` and governs nothing -- there
+/// is no such rename -- and the bare `disallowed_method` without the `clippy::`
+/// segment is `unknown_lints` too. A list that guessed at either would report
+/// an allowance where the compiler sees none.
+const GOVERNED_LINT_ALIASES: &[(&str, &str)] = &[
+    ("disallowed_method", "disallowed_methods"),
+    ("disallowed_type", "disallowed_types"),
+];
+
 /// The bare lint name an attribute entry refers to, if it is governed.
 ///
 /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
 /// `clippy::too_many_arguments` is not governed and answers `None`.
+///
+/// **And `clippy::r#disallowed_methods` is the same lint too.** `PR74-GOVERNED\
+/// -LINT-TOKEN-001`: this took the last `::` segment verbatim, so a raw
+/// identifier -- which rustc accepts anywhere an identifier goes, and means the
+/// identifier it spells -- was a different name here and the lint went
+/// unrecognised in both readers. Measured: `#![allow(clippy::r#disallowed_\
+/// methods)]` suppresses the lint, and this answered `None` for it.
+///
+/// The segment must be a whole identifier and nothing else. `disallowed_\
+/// methods_extra` is a different lint, `rr#disallowed_methods` opens no raw
+/// identifier, and a segment with anything trailing it is not a lint name this
+/// reader will guess at.
 #[must_use]
 pub fn normalize_lint(entry: &str) -> Option<&'static str> {
-    let bare = entry.trim().rsplit("::").next()?.trim();
+    // **The whole path, and only the shapes the compiler resolves.**
+    //
+    // Taking `rsplit("::").next()` and validating that alone left the leading
+    // segments unread, so `allow(\u{00A0}clippy::disallowed_methods)` -- a file
+    // rustc REFUSES, because U+00A0 is not Rust whitespace -- normalised to the
+    // governed lint. `PR74-GOV-002` is the larger half of the same mistake: ANY
+    // path ending in a governed name was that lint, and
+    // `rustdoc::disallowed_methods`, `rustc::disallowed_methods` and
+    // `clippy::extra::disallowed_methods` all compile while governing nothing.
+    // The wrongly-green shape is a real allow followed by a FAKE deny --
+    // measured, the file compiles CLEAN with the lint suppressed, and the
+    // reader called it a denial, which is what the two censuses act on.
+    //
+    // So: a bare governed name, or exactly `clippy::<name>`. Two segments at
+    // most and the first must be `clippy`. Anything else answers `None`, and
+    // an entry that names the lint without normalising to it is a REFUSAL
+    // rather than silence -- `read_attribute` is where that happens, so a
+    // foreign namespace is loud instead of skipped.
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in trim_rust(entry).split("::") {
+        let segment = trim_rust(segment);
+        let (name, end) = identifier_token(segment, 0)?;
+        if end != segment.len() {
+            return None;
+        }
+        segments.push(name);
+    }
+    let bare = match segments.as_slice() {
+        [name] => *name,
+        // The aliases are tool-qualified only, which is why the mapping lives
+        // in this arm rather than above the match.
+        ["clippy", name] => GOVERNED_LINT_ALIASES
+            .iter()
+            .find(|(alias, _)| alias == name)
+            .map_or(*name, |(_, canonical)| *canonical),
+        _ => return None,
+    };
     GOVERNED_LINTS.iter().copied().find(|name| *name == bare)
 }
 
@@ -683,63 +751,46 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] != b'#' {
-            i += 1;
-            continue;
-        }
-        let inner = bytes.get(i + 1) == Some(&b'!');
-        let open = if inner { i + 2 } else { i + 1 };
-        if bytes.get(open) != Some(&b'[') {
-            i += 1;
-            continue;
-        }
-        let Some(close) = matching(bytes, open, b'[', b']') else {
+        let Some(opener) = attribute_opener(&blanked, i) else {
             i += 1;
             continue;
         };
-        let attribute = &blanked[open + 1..close];
+        let Some(close) = matching(bytes, opener.open, b'[', b']') else {
+            i += 1;
+            continue;
+        };
+        let attribute = &blanked[opener.open + 1..close];
         let mut lints = Vec::new();
         let mut written = Vec::new();
         let mut keywords: Vec<&'static str> = Vec::new();
         let mut reasoned = false;
         for keyword in ["allow", "expect"] {
-            let mut at = 0;
-            while let Some(hit) = attribute[at..].find(keyword) {
-                let start = at + hit;
-                let after = start + keyword.len();
-                let is_word_start = start == 0
-                    || !attribute.as_bytes()[start - 1].is_ascii_alphanumeric()
-                        && attribute.as_bytes()[start - 1] != b'_';
-                if is_word_start && attribute.as_bytes().get(after) == Some(&b'(') {
-                    if let Some(end) = matching(attribute.as_bytes(), after, b'(', b')') {
-                        let before = lints.len();
-                        for entry in attribute[after + 1..end].split(',') {
-                            let entry = entry.trim();
-                            if entry.is_empty() {
-                                continue;
-                            }
-                            if entry.starts_with("reason") {
-                                reasoned = true;
-                                continue;
-                            }
-                            written.push(entry.to_owned());
-                            if let Some(name) = normalize_lint(entry) {
-                                lints.push(name.to_owned());
-                            }
-                        }
-                        if lints.len() > before && !keywords.contains(&keyword) {
-                            keywords.push(keyword);
-                        }
+            for group in calls_named(attribute, keyword) {
+                let before = lints.len();
+                for entry in group.split(',') {
+                    let entry = trim_rust(entry);
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    if entry.starts_with("reason") {
+                        reasoned = true;
+                        continue;
+                    }
+                    written.push(entry.to_owned());
+                    if let Some(name) = normalize_lint(entry) {
+                        lints.push(name.to_owned());
                     }
                 }
-                at = after;
+                if lints.len() > before && !keywords.contains(&keyword) {
+                    keywords.push(keyword);
+                }
             }
         }
         if !lints.is_empty() {
             found.push(GovernedAllow {
                 line: blanked[..i].matches('\n').count() + 1,
-                inner,
-                module_level: is_module_level(&blanked, i, close, inner),
+                inner: opener.inner,
+                module_level: is_module_level(&blanked, i, close, opener.inner),
                 lints,
                 written,
                 keywords,
@@ -749,6 +800,209 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         i = close + 1;
     }
     found
+}
+
+/// The contents of every `keyword(…)` call in `text`, left to right.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-001`. This used to be a substring search that
+/// required the **very next byte** after the keyword to be `(`. Rust requires
+/// no such thing: `allow (…)`, `allow /* why */ (…)` and the same across a line
+/// break are ordinary attributes, and every one of them was invisible to
+/// [`governed_allows`] -- so a file could allow a governed lint with no
+/// `effects/allowlist.toml` row and no census would say so.
+///
+/// So the scan walks **tokens**. An identifier is read whole, which is also
+/// what makes `allowance(…)` a call named `allowance` rather than a hit on
+/// `allow` -- the old code needed a hand-written word-boundary test for that,
+/// and this needs none. A raw identifier is the identifier it spells, so
+/// `r#allow(…)` is found here exactly as `allow(…)` is.
+///
+/// **Fail closed.** A `keyword(` whose parenthesis never closes cannot be
+/// resolved, and the rest of the attribute is taken as its contents rather than
+/// dropped: an allowance nobody can parse is not an allowance nobody has. Such
+/// a file does not compile, so the arm is unreachable from a green tree -- it
+/// exists so that the unreadable case is loud instead of absent.
+fn calls_named<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut groups = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some((name, after)) = identifier_token(text, at) else {
+            at += 1;
+            continue;
+        };
+        at = after;
+        if name != keyword {
+            continue;
+        }
+        let open = skip_blank(text, after);
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        let close = matching(bytes, open, b'(', b')').unwrap_or(bytes.len());
+        groups.push(&text[open + 1..close]);
+        at = close.saturating_add(1).max(open + 1);
+    }
+    groups
+}
+
+/// The identifier token at `at`, normalised, and the index just past it.
+///
+/// A raw identifier is the identifier it spells -- `r#allow` is `allow` and
+/// `r#disallowed_methods` is `disallowed_methods`, measured against
+/// `clippy-driver` rather than assumed -- so the `r#` is consumed here instead
+/// of being left for a comparison downstream to trip over.
+///
+/// `None` when `at` does not open an identifier at all, `r#` included: `r#`
+/// followed by nothing an identifier may start with is not a token, and a
+/// caller that cannot tokenise an attribute treats it as unreadable rather than
+/// as saying nothing. ASCII, like every other scan in this file; a lint name is
+/// ASCII and a non-ASCII head answers `None`, which is the closed direction.
+fn identifier_token(text: &str, at: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    let start = if bytes.get(at) == Some(&b'r') && bytes.get(at + 1) == Some(&b'#') {
+        at + 2
+    } else {
+        at
+    };
+    if !bytes
+        .get(start)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    Some((&text[start..end], end))
+}
+
+/// Whether `character` is whitespace **to the Rust lexer**.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-003`. This is `Pattern_White_Space`, the set
+/// rustc's own lexer uses, and it is written out because it is NOT
+/// `char::is_whitespace` -- the two disagree in both directions, and each
+/// disagreement is a defect in one of the two possible flavours. Measured
+/// against `clippy-driver`, and the table lives in
+/// `effects::tests::the_governed_lint_readers_separate_tokens_the_way_the_\
+/// lexer_does`:
+///
+/// * `U+200E` and `U+200F` are Rust whitespace and are **not** `White_Space`.
+///   `char::is_whitespace` refuses a separator the compiler accepts, so a
+///   prologue that really does allow the lint reads as unreadable -- and
+///   `U+200E` is the one that survives `rustfmt` under a `rustfmt::skip`.
+/// * `U+00A0`, `U+1680`, `U+2000`, `U+2003`, `U+202F`, `U+205F`, `U+3000` are
+///   `White_Space` and are **not** Rust whitespace. `char::is_whitespace` steps
+///   over a character rustc refuses to compile, and the reader reports a level
+///   for a file that has none. That is the wrongly-green direction.
+const fn is_rust_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// The first index at or after `at` that is not Rust whitespace.
+///
+/// Advances by **characters**, because a separator need not be one byte:
+/// stepping a byte at a time would land inside `U+200E` and slice a panic out
+/// of the next `&text[..]`. Comments are already spaces by the time either
+/// reader runs, so between them this is the whole of what may separate two
+/// tokens -- an attribute's name from its delimiter, or the three tokens of an
+/// introducer.
+///
+/// An index that is past the end or inside a character is returned unchanged:
+/// a caller that has lost the boundary gets no progress rather than a panic.
+fn skip_blank(text: &str, mut at: usize) -> usize {
+    loop {
+        if at >= text.len() || !text.is_char_boundary(at) {
+            return at;
+        }
+        let Some(character) = text[at..].chars().next() else {
+            return at;
+        };
+        if !is_rust_whitespace(character) {
+            return at;
+        }
+        at += character.len_utf8();
+    }
+}
+
+/// `text` without the Rust whitespace at either end.
+///
+/// `str::trim` is `char::is_whitespace`, which is the wrong set here for both
+/// of the reasons [`is_rust_whitespace`] gives.
+fn trim_rust(text: &str) -> &str {
+    let start = skip_blank(text, 0);
+    let mut end = text.len();
+    while end > start {
+        let Some(character) = text[start..end].chars().next_back() else {
+            break;
+        };
+        if !is_rust_whitespace(character) {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    &text[start..end]
+}
+
+/// One attribute introducer: the `#`, an optional `!`, and the `[`.
+struct AttributeOpener {
+    /// `#![…]` rather than `#[…]`.
+    inner: bool,
+    /// The index of the opening bracket itself.
+    open: usize,
+}
+
+/// The attribute introducer beginning at `at`, if one does.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-002`. `#`, `!` and `[` are three TOKENS and Rust
+/// puts no adjacency requirement on them: `# ! [allow(…)]`,
+/// `#/* why */![allow(…)]` and the same across line breaks are ordinary
+/// attributes, each measured and each suppressing the lint. Both readers
+/// required the bytes to be adjacent, so a denial taken back through a
+/// separated introducer read as a denial, and an allowance written that way was
+/// invisible to the placement census.
+///
+/// `at` is the `#` and stays the `#`: the returned `open` is the bracket's own
+/// index, so a caller's line number, byte offsets and placement decision are
+/// computed from exactly the positions they always were.
+///
+/// **Fail closed.** `None` whenever what follows is not an introducer, which is
+/// also what keeps `r#allow` from being read as one -- the `#` there is
+/// followed by an identifier rather than by `!` or `[`.
+fn attribute_opener(text: &str, at: usize) -> Option<AttributeOpener> {
+    let bytes = text.as_bytes();
+    if bytes.get(at) != Some(&b'#') {
+        return None;
+    }
+    let mut cursor = skip_blank(text, at + 1);
+    let inner = bytes.get(cursor) == Some(&b'!');
+    if inner {
+        cursor = skip_blank(text, cursor + 1);
+    }
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    Some(AttributeOpener {
+        inner,
+        open: cursor,
+    })
 }
 
 /// The index of the bracket closing the one at `open`, or `None`.
@@ -776,36 +1030,46 @@ fn matching(bytes: &[u8], open: usize, opener: u8, closer: u8) -> Option<usize> 
 /// exists to refuse.
 fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> bool {
     if inner {
-        // Nothing but whitespace and other attributes may precede it.
-        let mut prefix = &blanked[..hash];
+        // Nothing but whitespace and complete attributes may precede it.
+        //
+        // Walked FORWARDS from the first byte. The backward walk this replaced
+        // searched for a literal `#![` or `#[`, which is the adjacency
+        // assumption `PR74-GOVERNED-LINT-TOKEN-002` is about, and it trimmed
+        // with `str::trim_end`, whose whitespace is not the lexer's. Forwards,
+        // the same [`attribute_opener`] both readers use decides what an
+        // attribute is, so all three agree by construction.
+        let mut at = 0;
         loop {
-            let trimmed = prefix.trim_end();
-            if trimmed.ends_with(']') {
-                let Some(open) = trimmed.rfind("#![").or_else(|| trimmed.rfind("#[")) else {
-                    return false;
-                };
-                prefix = &trimmed[..open];
-                continue;
+            at = skip_blank(blanked, at);
+            if at >= hash {
+                return at == hash;
             }
-            return trimmed.is_empty();
+            let Some(opener) = attribute_opener(blanked, at) else {
+                return false;
+            };
+            let Some(end) = matching(blanked.as_bytes(), opener.open, b'[', b']') else {
+                return false;
+            };
+            at = end + 1;
         }
     }
     // Outer: skip further attributes and whitespace, then require `mod`.
-    let mut rest = &blanked[close + 1..];
+    let mut at = close + 1;
     loop {
-        rest = rest.trim_start();
+        at = skip_blank(blanked, at);
+        let rest = &blanked[at.min(blanked.len())..];
         if rest.starts_with('#') {
-            let Some(open) = rest.find('[') else {
+            let Some(opener) = attribute_opener(blanked, at) else {
                 return false;
             };
-            let Some(end) = matching(rest.as_bytes(), open, b'[', b']') else {
+            let Some(end) = matching(blanked.as_bytes(), opener.open, b'[', b']') else {
                 return false;
             };
-            rest = &rest[end + 1..];
+            at = end + 1;
             continue;
         }
         for visibility in ["pub(crate)", "pub(super)", "pub", ""] {
-            let candidate = rest.strip_prefix(visibility).unwrap_or(rest).trim_start();
+            let candidate = trim_rust(rest.strip_prefix(visibility).unwrap_or(rest));
             if candidate.starts_with("mod ") {
                 return true;
             }
@@ -2809,6 +3073,17 @@ pub(crate) mod lint_levels {
         /// the file failing to build, and a reader that folded it into a level
         /// would report a governance state for a file that has none.
         pub(crate) refused_downgrade: bool,
+        /// The prologue says something about this lint that the reader cannot
+        /// resolve to one answer for every supported target — a `cfg_attr`
+        /// whose condition names a target, a feature or `test`, or an
+        /// attribute shape the reader does not understand.
+        ///
+        /// It is a **refusal**, not a level: `level` is `None` whenever it is
+        /// set, so every census that asks "has this module closed the hole"
+        /// is told no. The field exists so a test can tell a prologue that
+        /// says nothing apart from one that says something unprovable; a
+        /// census does not need to, because both must be loud.
+        pub(crate) ambiguous: bool,
     }
 
     /// [`Resolution`] for `lint` over `source`'s file-module prologue.
@@ -2864,70 +3139,350 @@ pub(crate) mod lint_levels {
     ///
     /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
     /// [`super::normalize_lint`] is the bridge, as it is everywhere else here.
+    ///
+    /// # Structural, because a prefix match is not a parser
+    ///
+    /// `PR57-FINAL-001`. This used to read an attribute by stripping a level
+    /// keyword off the front of it, so it understood one shape — `deny(L)`
+    /// written literally — and was blind to every attribute that wraps one.
+    /// `#![cfg_attr(P, deny(L))]` read as stating nothing, which is loud and
+    /// merely wrong; but a prologue that DENIES the lint and then takes it back
+    ///
+    /// ```text
+    /// #![deny(clippy::disallowed_methods)]
+    /// #![cfg_attr(windows, allow(clippy::disallowed_methods))]
+    /// ```
+    ///
+    /// read as `deny`, and on Windows that file allows the lint. Both censuses
+    /// that consult this reader act on `deny`:
+    /// `effects::tests::every_allow_of_a_governed_lint_is_module_level_and_in_    /// the_allowlist` admits a per-site `#[expect]` only where the lint is
+    /// denied at module level, and
+    /// `runner::container::tests::every_child_module_of_the_container_funnel_    /// states_its_own_lint_level` reads a denial as `PR6-LANEF-004` closed.
+    ///
+    /// So attributes are now **parsed**: `cfg_attr` is unwrapped to any depth,
+    /// every attribute after its predicate is applied and not just the first,
+    /// and each level carries the condition it was written under.
+    ///
+    /// # What counts, and what refuses
+    ///
+    /// A level counts only when it is unconditional at module top level, or
+    /// when its condition is proven true on every supported target. [`Truth`]
+    /// proves exactly two — `all()` is true everywhere and `any()` is false
+    /// everywhere — and composes `all`/`any`/`not` over them, modelling no
+    /// target list of its own.
+    ///
+    /// Everything else **refuses**: a condition naming a target, a feature or
+    /// `test`; an attribute shape that is not understood and names the lint;
+    /// brackets that do not close. A refusal sets [`Resolution::ambiguous`] and
+    /// carries **no level at all**, so a census asking whether the module
+    /// closed the hole is told no. Wrongly red is allowed here and wrongly
+    /// green is not: the reverse hands a reviewer a guard that is not on every
+    /// target, which is the one failure this reader exists to prevent.
+    ///
+    /// One counted spelling is wider than the pin. A **bare** governed name is
+    /// read as the lint — [`names_lint`]'s inherited reading — and beneath an
+    /// ancestor the 1.85.0 toolchain does not honour a bare override while
+    /// stable does. `PR74-GOV-003` records that envelope as a pinned residual
+    /// rather than a repair: `tests::the_bare_lint_spelling_is_counted_and_\
+    /// its_toolchain_envelope_is_pinned` measures both toolchains, asserts the
+    /// gate seal that keeps the residual non-blocking, and states the
+    /// coordinated change a narrowing requires.
+    ///
+    /// Measured, not argued —
+    /// `effects::tests::the_file_level_lint_reader_refuses_a_condition_it_    /// cannot_prove` drives the provable conditions through `clippy-driver`
+    /// against a body that reaches `std::fs::write`, and compiles the slip
+    /// attempt itself on whichever host runs it.
     #[must_use]
     pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {
-        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
         let blanked = super::blank_comments_and_strings(source);
         let bytes = blanked.as_bytes();
-        let mut resolution = Resolution {
-            level: None,
-            refused_downgrade: false,
-        };
+        let mut applied: Vec<Applied> = Vec::new();
+        let mut readable = true;
         let mut at = 0;
-        while at < bytes.len() {
-            if bytes[at].is_ascii_whitespace() {
-                at += 1;
-                continue;
+        loop {
+            at = super::skip_blank(&blanked, at);
+            if at >= bytes.len() {
+                break;
             }
-            // The prologue ends at the first token that is not an inner attribute.
-            if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
-                return resolution;
-            }
-            let open = at + 2;
-            if bytes.get(open) != Some(&b'[') {
-                return resolution;
-            }
-            let Some(close) = super::matching(bytes, open, b'[', b']') else {
-                return resolution;
+            // The prologue ends at the first token that is not an inner
+            // attribute. Which bytes are one is `super::attribute_opener`'s
+            // answer, the same one the placement scan gets, so the two readers
+            // cannot disagree about where an attribute begins.
+            let Some(opener) = super::attribute_opener(&blanked, at) else {
+                break;
             };
-            let attribute = blanked[open + 1..close].trim();
-            for level in LEVELS {
-                let Some(rest) = attribute.strip_prefix(level) else {
-                    continue;
-                };
-                // `allowance(…)` strips to `ance(…)`, which opens nothing: the
-                // parenthesis is what makes the prefix an exact attribute name.
-                let Some(list) = rest
-                    .trim_start()
-                    .strip_prefix('(')
-                    .and_then(|body| body.strip_suffix(')'))
-                else {
-                    continue;
-                };
-                if !list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
-                    continue;
-                }
+            if !opener.inner {
+                break;
+            }
+            let Some(close) = super::matching(bytes, opener.open, b'[', b']') else {
+                // An inner attribute whose brackets do not close. Everything
+                // after it is unread, so the answer is a refusal rather than
+                // whatever the attributes before it happened to say.
+                readable = false;
+                break;
+            };
+            readable &= read_attribute(
+                &blanked[opener.open + 1..close],
+                lint,
+                Truth::Always,
+                &mut applied,
+            );
+            at = close + 1;
+        }
+        resolve(&applied, readable)
+    }
+
+    /// One level-setting attribute the prologue applies to the lint, with the
+    /// condition the reader proved it is under.
+    #[derive(Debug, Clone, Copy)]
+    struct Applied {
+        level: &'static str,
+        truth: Truth,
+    }
+
+    /// A `cfg` condition's truth over the targets this repository supports.
+    ///
+    /// The reader proves exactly two things — `all()` is the empty conjunction
+    /// and is true everywhere, `any()` is the empty disjunction and is false
+    /// everywhere — and composes `all`/`any`/`not` over them. **It models no
+    /// target list at all.** A list is a place to be wrong, and the way to be
+    /// wrong here is to report a module as guarded on a target where it is not,
+    /// so `windows`, `target_os = "…"`, `feature = "…"` and `test` are each
+    /// [`Truth::Unknown`] and stay that way.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Truth {
+        Always,
+        Never,
+        Unknown,
+    }
+
+    impl Truth {
+        /// Both conditions, which is what one `cfg_attr` inside another means.
+        fn both(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Never, _) | (_, Self::Never) => Self::Never,
+                (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+                _ => Self::Always,
+            }
+        }
+
+        /// Either condition.
+        fn either(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Always, _) | (_, Self::Always) => Self::Always,
+                (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+                _ => Self::Never,
+            }
+        }
+
+        /// The complement. An unprovable condition has an unprovable one.
+        fn negate(self) -> Self {
+            match self {
+                Self::Always => Self::Never,
+                Self::Never => Self::Always,
+                Self::Unknown => Self::Unknown,
+            }
+        }
+    }
+
+    /// [`Truth`] of one `cfg` predicate.
+    fn evaluate(predicate: &str) -> Truth {
+        let Some((head, body)) = split_call(predicate) else {
+            // A leaf: `test`, `windows`, `feature = "strict"`. Not modelled.
+            return Truth::Unknown;
+        };
+        match head {
+            "all" => split_top_level(body)
+                .into_iter()
+                .fold(Truth::Always, |truth, term| truth.both(evaluate(term))),
+            "any" => split_top_level(body)
+                .into_iter()
+                .fold(Truth::Never, |truth, term| truth.either(evaluate(term))),
+            "not" => match split_top_level(body).as_slice() {
+                [one] => evaluate(one).negate(),
+                // `not` takes exactly one predicate. Anything else is a shape
+                // this reader has not understood.
+                _ => Truth::Unknown,
+            },
+            _ => Truth::Unknown,
+        }
+    }
+
+    /// Read one attribute's contents — already blanked — and append every level
+    /// it applies to `lint`, each under the condition it is written beneath.
+    ///
+    /// `truth` is the condition inherited from the `cfg_attr` chain above it,
+    /// `Truth::Always` at the top. Returns **false** when the attribute names
+    /// the lint somewhere this reader could not resolve: an absence and a
+    /// refusal are not the same answer and the caller must not confuse them.
+    fn read_attribute(
+        attribute: &str,
+        lint: &str,
+        truth: Truth,
+        applied: &mut Vec<Applied>,
+    ) -> bool {
+        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
+        let attribute = super::trim_rust(attribute);
+        let Some((head, body)) = split_call(attribute) else {
+            // Not a call: `#![no_std]`, `#![doc = "…"]`. It sets no level, and
+            // the string a `doc =` carries is already blanked.
+            return !mentions(attribute, lint);
+        };
+        if head == "cfg_attr" {
+            // `#![cfg_attr(P, a, b)]` applies EVERY attribute after the
+            // predicate, not just the first.
+            let mut terms = split_top_level(body);
+            if terms.is_empty() {
+                return !mentions(body, lint);
+            }
+            let condition = truth.both(evaluate(terms.remove(0)));
+            let mut readable = true;
+            for term in terms {
+                readable &= read_attribute(term, lint, condition, applied);
+            }
+            return readable;
+        }
+        if let Some(level) = LEVELS.iter().copied().find(|level| *level == head) {
+            let entries = split_top_level(body);
+            if entries.iter().any(|entry| names_lint(entry, lint)) {
+                applied.push(Applied { level, truth });
+                return true;
+            }
+            // An entry that MENTIONS the lint without parsing as its name is a
+            // shape this reader has not understood, and "this attribute says
+            // nothing about that lint" is the wrong answer for it.
+            // `allow(\u{00A0}clippy::disallowed_methods)` is the live case:
+            // U+00A0 is not Rust whitespace, rustc refuses the file, and
+            // silence here would let a census read the module as merely
+            // unannotated. A refusal is the loud answer and the true one.
+            return !entries.iter().any(|entry| mentions(entry, lint));
+        }
+        // Some other attribute. It governs no lint level, so it matters only if
+        // it names this lint somewhere the reader has not understood — and then
+        // it is a refusal, because the alternative is a reader guessing that
+        // nothing was stated.
+        !mentions(attribute, lint)
+    }
+
+    /// The level the applied attributes leave in force, in source order.
+    ///
+    /// Only [`Truth::Always`] attributes decide it: a [`Truth::Never`] one is
+    /// not in the file on any target and a [`Truth::Unknown`] one refuses the
+    /// whole answer. **A refusal carries no level**, so the two censuses that
+    /// consult this reader are told the module has stated nothing — which is
+    /// the direction that is loud.
+    fn resolve(applied: &[Applied], readable: bool) -> Resolution {
+        let mut level: Option<&'static str> = None;
+        let mut refused_downgrade = false;
+        let mut ambiguous = !readable;
+        for entry in applied {
+            match entry.truth {
+                Truth::Never => {}
+                Truth::Unknown => ambiguous = true,
                 // Ordered, and `forbid` is sticky. A weaker level after a
                 // `forbid` is `E0453`, which is the file not compiling rather
                 // than a level; anything else replaces what came before it.
-                if resolution.level == Some("forbid") {
-                    if matches!(level, "allow" | "warn" | "expect") {
-                        resolution.refused_downgrade = true;
+                Truth::Always => {
+                    if level == Some("forbid") {
+                        if matches!(entry.level, "allow" | "warn" | "expect") {
+                            refused_downgrade = true;
+                        }
+                    } else {
+                        level = Some(entry.level);
                     }
-                } else {
-                    resolution.level = Some(match level {
-                        "allow" => "allow",
-                        "expect" => "expect",
-                        "warn" => "warn",
-                        "deny" => "deny",
-                        _ => "forbid",
-                    });
                 }
-                break;
             }
-            at = close + 1;
         }
-        resolution
+        if ambiguous {
+            return Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            };
+        }
+        Resolution {
+            level,
+            refused_downgrade,
+            ambiguous: false,
+        }
+    }
+
+    /// `head` and the contents of `head(…)`, when `text` is exactly that call.
+    ///
+    /// `head` must be a bare identifier and the closing parenthesis must be the
+    /// last thing in `text`, so `allowance(…)` is a call named `allowance` and
+    /// `deny(a) something` is not a call at all. Both refusals are deliberate:
+    /// this is the structural half of the reader, and a prefix match is what it
+    /// replaced.
+    fn split_call(text: &str) -> Option<(&str, &str)> {
+        let text = super::trim_rust(text);
+        let (head, after) = super::identifier_token(text, 0)?;
+        let open = super::skip_blank(text, after);
+        if text.as_bytes().get(open) != Some(&b'(') {
+            return None;
+        }
+        let close = super::matching(text.as_bytes(), open, b'(', b')')?;
+        if !super::trim_rust(&text[close + 1..]).is_empty() {
+            return None;
+        }
+        Some((head, &text[open + 1..close]))
+    }
+
+    /// `list` split on the commas that are not inside a nested group.
+    ///
+    /// `all(unix, windows), deny(L)` is two terms, not three. Empty terms are
+    /// dropped, so `all()` yields none — which is what makes the empty
+    /// conjunction true and the empty disjunction false.
+    fn split_top_level(list: &str) -> Vec<&str> {
+        let mut terms = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (index, byte) in list.bytes().enumerate() {
+            match byte {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    terms.push(super::trim_rust(&list[start..index]));
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        terms.push(super::trim_rust(&list[start..]));
+        terms.retain(|term| !term.is_empty());
+        terms
+    }
+
+    /// Whether `text` names `lint` as a word rather than as part of a longer one.
+    ///
+    /// The bare name, because an attribute may write either spelling, and
+    /// bounded on both sides so `disallowed_methods_extra` is not this lint.
+    fn mentions(text: &str, lint: &str) -> bool {
+        let canonical = match super::normalize_lint(lint) {
+            Some(name) => name,
+            None => lint.rsplit("::").next().unwrap_or(lint),
+        };
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        // The lint's own name AND every alias that resolves to it: a shape this
+        // reader could not parse is no less about the lint for having been
+        // written in the spelling clippy renamed.
+        std::iter::once(canonical)
+            .chain(
+                super::GOVERNED_LINT_ALIASES
+                    .iter()
+                    .filter(|(_, to)| *to == canonical)
+                    .map(|(alias, _)| *alias),
+            )
+            .any(|needle| {
+                text.match_indices(needle).any(|(at, _)| {
+                    !text.as_bytes()[..at].last().copied().is_some_and(word)
+                        && !text
+                            .as_bytes()
+                            .get(at + needle.len())
+                            .copied()
+                            .is_some_and(word)
+                })
+            })
     }
 
     /// The level in force for `lint` at `source`'s file-module scope, or none.
@@ -2940,6 +3495,22 @@ pub(crate) mod lint_levels {
     }
 
     /// Whether an attribute entry names `lint`, qualified either way.
+    ///
+    /// "Either way" is the inherited reading — this arm has answered "the bare
+    /// spelling is the lint" since `0519514`, and `runner::container::tests`
+    /// pins the same answer — and it is wider than what the two supported
+    /// toolchains jointly honour. `PR74-GOV-003`, measured 2026-08-30: a bare
+    /// spelling sets and takes back levels at its own scope identically on
+    /// stable clippy 0.1.97 and the 1.85.0 pin, but beneath an ancestor that
+    /// has set the lint, the pin does not let a bare spelling override while
+    /// stable does; every `clippy::`-qualified spelling, raw and renamed forms
+    /// included, overrides on both. For nested module files — the funnel
+    /// census's whole domain — a counted bare `deny` therefore over-claims on
+    /// the MSRV toolchain. `tests::the_bare_lint_spelling_is_counted_and_its_\
+    /// toolchain_envelope_is_pinned` holds the measurement, the gate seal that
+    /// keeps the residual non-blocking, and the reason a narrowing here is a
+    /// coordinated change with that census's fixture rather than an edit to
+    /// this arm alone.
     fn names_lint(entry: &str, lint: &str) -> bool {
         if entry == lint {
             return true;
