@@ -15,7 +15,8 @@ contract itself.
    - `upstroke-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
      it is not a trusted merge boundary because a pull request can edit both workflow and validator.
    - `upstroke-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
-4. If the branch is behind `master`, update it and wait for both gates again.
+4. If the branch is behind `master`, update it and wait for both gates again. After the review,
+   a merge of `master` that leaves the pull request's diff byte-identical keeps it; step 6 says how.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent
    frontier-class reviewer at `max` effort. AI-assisted implementation should use a frontier-class
    implementation model at `xhigh` effort or higher. Record the implementation and review model,
@@ -38,10 +39,17 @@ contract itself.
    (`git diff <reviewed> <head>`) against the findings and disclosed that verification in the
    body. The verification confirms the delta contains those repairs and nothing else: a delta
    that adds any new behavior, or that touches workflows, gate scripts, or validators — never a
-   repair — returns to step 3 for a fresh pass. One path is exempt from even that, decided in
-   `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff from the
-   reviewed head lies inside `reviews/FINDINGS.md` — record both SHAs and confirm the
-   exempt-only diff with `git diff --stat <reviewed> <head>`. The owner-verified lane is for
+   repair — returns to step 3 for a fresh pass. Two deltas are exempt from even that. A push
+   whose entire diff from the reviewed head lies inside `reviews/FINDINGS.md`
+   (`decisions/2026-08-20-review-invalidation-scope.md`): record both SHAs and confirm the
+   exempt-only diff with `git diff --stat <reviewed> <head>`. And a conflict-free merge of the
+   base that leaves `git diff <base>...<head>` byte-identical, with CI green on the merged head
+   and the pull request itself touching no workflow, gate script, or validator
+   (`decisions/2026-09-01-clean-base-merge-keeps-review.md`): record both SHAs, both base SHAs,
+   and the diff hash before and after, recomputed by the owner from a default-branch checkout
+   with each `git diff` checked for success, since an empty-input hash is never accepted; the
+   reviewed SHA verified an ancestor of the merged head, and the merge commit's second parent
+   verified equal to the new base tip. The owner-verified lane is for
    single-reviewer passes only: a panel-reviewed merge candidate re-runs every seat on any head
    movement, a repair included (`decisions/2026-08-31-panel-seats.md`). Feature ideas discovered
    during review belong in the design or a follow-up. Re-scoped in
