@@ -27,8 +27,10 @@ paths; record overclaimed its reference cleanup), repaired by `68a50ec`.
 `68a50ec` — two findings (the base had fallen behind master when #82 merged
 mid-cycle; the recovery claim pointed at `7923a912`, whose tree carried
 twelve files under the old names), repaired by `e329eea` plus the master
-merge that produced `136104b`. `136104b` — the one finding below. Each
-round's repairs are recorded in the pull request's finding ledger.
+merge that produced `136104b`. `136104b` — the one finding below. The
+rows live in two ledgers: pull request #84's finding ledger carries the
+pre-merge rounds (`0fbb2c2`, `f70c226`, `68a50ec`); pull request #85's
+carries the `136104b` post-merge finding and this record's own corrections.
 
 ## The verdict, verbatim
 

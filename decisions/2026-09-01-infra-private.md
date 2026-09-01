@@ -95,8 +95,12 @@ The precise statements, each verified against the commit graph:
   `fff6abd97ff49117a7af5841765fcee4f4f058f6`** — `master` immediately before
   the removal merge. Its `infra/` tree is
   `1293e4a71a6637d4d628aeeb5abc308ec7578a80`, the exact 18-file tree, equal
-  to the private intake's. One-command recovery:
-  `git checkout fff6abd9 -- infra/`.
+  to the private intake's. One-command recovery, extracting to an explicit
+  destination outside the working tree so nothing lands in the index for an
+  accidental recommit:
+  `git archive fff6abd9 infra | tar -x -C <destination>`.
+  (An in-clone `git checkout fff6abd9 -- infra/` stages all eighteen files —
+  measured — and is deliberately not the documented path.)
 - The same exact tree is on every **first-parent `master` snapshot** from
   `458d928` through `fff6abd` inclusive — `458d928` introduced the tree in
   exactly this form, and no later first-parent commit through `fff6abd`
