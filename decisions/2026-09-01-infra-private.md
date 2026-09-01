@@ -73,3 +73,31 @@ organizational and prospective.
   `CONTRIBUTING.md` — carries no `infra/` tree path; dated immutable records
   and this record's own mentions remain valid as history, which a stub cannot
   improve.)
+
+## 2026-09-01 — erratum: the canonical recovery point
+
+The post-merge frontier review of the relocating pull request's final head
+(`136104b`, verdict CHANGES_REQUIRED, one finding — recorded in
+`reviews/2026-09-01-pr84-frontier-review-136104b.md`) caught an imprecision
+in the evidence above, corrected here by this folder's appended-erratum
+mechanism; nothing above is rewritten.
+
+- "This change's parent" is ambiguous at the merge head: `136104b` has two
+  parents, and ordinary `HEAD^1` selects `e329eea` — the branch side, which
+  carries no `infra/` at all. The commit meant is the pull request's base
+  parent on `master`.
+- "Every public head from `458d928`" overreached: branch-side commits
+  reachable in history (`26c6e6c`, for one) carry no `infra/`.
+
+The precise statements, each verified against the commit graph:
+
+- **The canonical recovery point is
+  `fff6abd97ff49117a7af5841765fcee4f4f058f6`** — `master` immediately before
+  the removal merge. Its `infra/` tree is
+  `1293e4a71a6637d4d628aeeb5abc308ec7578a80`, the exact 18-file tree, equal
+  to the private intake's. One-command recovery:
+  `git checkout fff6abd9 -- infra/`.
+- The same exact tree is on every **first-parent `master` snapshot** from
+  `458d928` through `fff6abd` inclusive — no first-parent commit in that
+  range touches `infra/`. Claims about heads outside master's first-parent
+  line are withdrawn.
