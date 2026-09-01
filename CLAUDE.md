@@ -193,3 +193,10 @@ against the last verified state before trusting it.
 
 **Imperative success is not persistent success.** Verify that state survives a
 reboot, not just that a command returned 0.
+
+**Concurrent suites must not share an unset `CARGO_TARGET_DIR`.** The
+container pre-clean key is fixed when the variable is unset
+(`src/runner/container/fake.rs`, `R5-SEAMS-006`), so two bare `cargo test`
+runs on one machine derive the same key and remove each other's live Docker
+containers mid-run. Give each concurrent run its own target directory. CI is
+unaffected — each job runs alone on its machine.
