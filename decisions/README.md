@@ -103,3 +103,9 @@ artifacts (§15); records promoted here are the durable subset.
   `gpt-5.6-sol` at max, `claude-fable-5` at max explicitly pinned, `gemini-3.1-pro-high` via
   `agy` by absolute path — each with its invocation guard. No pre-authorized fallback: one
   repair, then wait; the panel never convenes partially.
+- [2026-09-01 — the build-box tree lives outside the public repository](2026-09-01-infra-private.md):
+  the 18-file `infra/` tree relocates to the private companion repository —
+  operator tooling, not engine contract; the 2026-08-22 keep-public floor is
+  untouched, the next publish can no longer package the tree (no published
+  crate ever did), and the private intake landed on the companion default
+  branch, verified byte-for-byte by tree ID, before removal.
