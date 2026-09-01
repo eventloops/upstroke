@@ -11,14 +11,17 @@ proposal  →  council critique  →  decision record  →  implementation  → 
 are filed in the private companion repository, engine mechanisms included — see
 [the filing decision](../decisions/2026-08-27-proposals-private.md) and
 [the relocation decision](../decisions/2026-09-01-proposals-relocated.md).
-Twelve of the thirteen dated files below are stubs: each keeps its path,
-title, and status block verbatim so that decision-record citations keep
-resolving, and this index carries each proposal's one-line summary. The one
-exception is the Decided
-[G2 pass plan](2026-08-24-v0.2-g2-pr3-layer-pass.md), retained in full:
-`DESIGN.md` and the freeze charter rely on its ten workstreams and exit
-criteria as content, not just as a path. The first stage of the lifecycle
-happens privately; every later stage is unchanged and public.
+Eleven of the thirteen dated files below are stubs: each keeps its path,
+title, and status block verbatim — a frozen snapshot as of relocation, with
+lifecycle movement surfacing through `decisions/` records as the filing rule
+already provides — so that decision-record citations keep resolving, and this
+index carries each proposal's one-line summary. Two files are retained in
+full: the Decided [G2 pass plan](2026-08-24-v0.2-g2-pr3-layer-pass.md), whose
+ten workstreams and exit criteria `DESIGN.md` and the freeze charter rely on
+as content, and the
+[portfolio critique](2026-08-13-v0.5-portfolio-coordination-critique-claude.md),
+a review-stage record. The first stage of the lifecycle happens privately;
+every later stage is unchanged and public.
 
 The rest of this file describes the conventions those filings follow, which the
 private folder inherited unchanged.

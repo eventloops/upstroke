@@ -77,7 +77,8 @@ The rule above that engine proposals stay public under `proposals/` was
 narrowed on 2026-09-01: filing has been private since 2026-08-27, and the
 already-filed proposals were reduced to stubs in place, full texts relocated —
 except the Decided G2 pass plan, retained in full under this record's own
-retained-content rule (the content other documents rely on stays). The stub
-mechanism and the no-private-references rule of this record are unchanged and
-applied there. See
+retained-content rule (the content other documents rely on stays), and the
+council critique, retained in full because every lifecycle stage after filing
+remains public. The stub mechanism and the no-private-references rule of this
+record are unchanged and applied there. See
 [2026-09-01 — the filed proposals relocate to the private archive](2026-09-01-proposals-relocated.md).

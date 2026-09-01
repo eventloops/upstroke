@@ -1,20 +1,34 @@
 # 2026-09-01 — the filed proposals relocate to the private archive
 
-**Verdict.** Twelve of the thirteen dated files in `proposals/` — eleven
-proposals and one critique, all filed on or before 2026-08-22 — are replaced
-in place by stubs; their full texts move to the private companion repository's
-`proposals/` folder. The thirteenth, the Decided
-[G2 pass plan](../proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md), stays
-public in full: `DESIGN.md` and the freeze charter rely on its ten workstreams
-and exit criteria as *content*, and 2026-08-22's own retained-content rule —
-what other documents rely on stays — applies here at file granularity. This
-record supersedes the 2026-08-27 pin that the already-public proposals stay
-where they are, and narrows 2026-08-22's "engine proposals stay public" clause
-to match the filing rule in force since 2026-08-27: the first stage of the
-design lifecycle is private end-to-end. Both prior records carry dated
-forward notices appended in this same change. `proposals/README.md` remains as
-the public, citation-bearing index, and every stub keeps its path, title, and
-status block **verbatim** so that every existing citation still resolves.
+**Verdict.** Eleven of the thirteen dated files in `proposals/` — eleven
+proposals, all filed on or before 2026-08-22 — are replaced in place by
+stubs; their full texts move to the private companion repository's
+`proposals/` folder. Two files stay public in full, for two different
+reasons: the Decided
+[G2 pass plan](../proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md), because
+`DESIGN.md` and the freeze charter rely on its ten workstreams and exit
+criteria as *content* (2026-08-22's retained-content rule at file
+granularity); and the
+[council critique](../proposals/2026-08-13-v0.5-portfolio-coordination-critique-claude.md),
+because a critique is a review-stage record — the folder contract's rule that
+every lifecycle stage after filing stays public applies to it, not the filing
+rule. This record supersedes the 2026-08-27 pin that the already-public
+proposals stay where they are, and narrows 2026-08-22's "engine proposals
+stay public" clause to match the filing rule in force since 2026-08-27: the
+*first* stage of the design lifecycle is private end-to-end, and every later
+stage — critiques, decisions, implementation, reviews — is unchanged and
+public. Both prior records carry dated forward notices appended in this same
+change. `proposals/README.md` remains as the public, citation-bearing index,
+and every stub keeps its path, title, and status block **verbatim** so that
+every existing citation still resolves.
+
+**Evidence that this is relocation, not deletion.** The private intake landed
+on the companion repository's default branch, at its commit
+`359953f54f6c1dd08b2d2d1b36b1a1635a72e26b`, before this record merged; all
+thirteen dated files there are blob-for-blob identical to the public
+originals at `0a25698` (verified by object ID, per file). And the standing
+caveat holds either way: relocation does not remove a file from public git
+history; the value is organizational and prospective.
 
 ## Why
 
@@ -26,9 +40,8 @@ status block **verbatim** so that every existing citation still resolves.
 - The 2026-08-27 record kept the files in place because citations must keep
   resolving and history keeps them visible regardless. Both concerns remain
   true and both are honored by mechanism rather than by pin: the stubs keep
-  every citation resolving, the one content-relied-on file stays whole, and
-  this record repeats the standing caveat — relocation does not remove a file
-  from public git history; the value is organizational and prospective.
+  every citation resolving, the two content-relied-on files stay whole, and
+  the intake evidence above makes the move verifiable rather than asserted.
 
 ## The rule
 
@@ -36,9 +49,15 @@ status block **verbatim** so that every existing citation still resolves.
   H1 and status block byte-for-byte, plus the pointer to this record — never
   the content, and never a path or name inside the private repository (the
   2026-08-22 rule, unchanged).
-- A proposal whose content — not merely whose path — is relied on by a living
-  authority or an immutable record is not stubbed; it stays public in full.
-  Today that is exactly the Decided G2 pass plan.
+- **A stub's status block is a frozen snapshot as of relocation.** The living
+  status is tracked with the private text; lifecycle movement surfaces
+  publicly the way the filing rule already provides — a decision record that
+  cites the proposal. A stub is not updated to track private status, and the
+  byte-for-byte rule binds at relocation time, once.
+- A file whose content — not merely whose path — is relied on by a living
+  authority or an immutable record is not stubbed; nor is any record of a
+  lifecycle stage after filing (critiques included). Today that is exactly
+  the Decided G2 pass plan and the portfolio critique.
 - `proposals/README.md` stays, closed to new filings, as the index; its
   per-file summaries are the public record of what each proposal argued.
 - Filing rules are otherwise unchanged from 2026-08-27: new proposals are
@@ -51,10 +70,12 @@ status block **verbatim** so that every existing citation still resolves.
   C1-scanned backticked paths in `CLAUDE.md`, and decision records cite the
   dated files as inputs; deletion breaks both. Rejected on the same grounds
   2026-08-27 rejected it.
-- **Stubbing all thirteen.** A stub of the G2 pass plan leaves
-  `DESIGN.md`'s "the pass's ten workstreams and exit criteria are planned
-  [there]" pointing at an empty file, and the freeze charter — immutable —
-  assigns the pass's scope to it. Content reliance beats uniformity.
+- **Stubbing all thirteen.** A stub of the G2 pass plan leaves `DESIGN.md`'s
+  "the pass's ten workstreams and exit criteria are planned [there]" pointing
+  at an empty file while the freeze charter — immutable — assigns the pass's
+  scope to it; and a stub of the critique removes a review-stage record the
+  folder contract promises stays public. Content reliance and the lifecycle
+  rule beat uniformity.
 - **Leaving the files in place.** The 2026-08-27 status quo, overruled by the
   owner's presentation preference above.
 
