@@ -171,9 +171,10 @@ only when its pull request merges.
 
 ## On the dedicated build box
 
-If you are on the build box rather than a workstation, read `infra/README.md`
-(it arrives with the build-box provisioning pull request; until that merges the
-rules below are the whole contract).
+If you are on the build box rather than a workstation: the provisioning tree
+and its operations guide moved to the private archive on 2026-09-01, and the
+deployed tooling lives in `~/bin` on the box itself. The rules below are the
+whole public contract.
 The rule that matters most:
 
 **Use `upstroke-build`, never set `CARGO_TARGET_DIR` yourself.**
