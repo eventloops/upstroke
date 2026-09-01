@@ -1498,10 +1498,10 @@ mod workflow;
 
 use ci_model::{CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, RUSTFLAGS_KEY};
 use workflow::{
-    WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints, ci_workflow_text,
-    complaint_codes, declared_msrv_toolchain, declared_rust_version, field, field_names,
-    mutate_workflow, parse_workflow, rustflags_complaints, scalar, steps_of, three_component,
-    workflow_complaints,
+    WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints,
+    ci_test_windows_job_complaints, ci_workflow_text, complaint_codes, declared_msrv_toolchain,
+    declared_rust_version, field, field_names, mutate_workflow, parse_workflow,
+    rustflags_complaints, scalar, steps_of, three_component, workflow_complaints,
 };
 
 /// The parser this oracle depends on has the two properties it was chosen for.
@@ -1618,6 +1618,28 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
     assert!(
         complaints.is_empty(),
         "the `test` job does not run these fixtures the way they need:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The Windows suite's job runs these fixtures on the self-hosted labels, and
+/// on nothing else the contract can read.
+///
+/// The claim the `test` job discharges with an install step -- that
+/// `clippy-driver` is present for the fixtures -- is discharged here by the
+/// golden image the runner boots, which this contract cannot read; the decision
+/// record binds re-curation to it instead. What the contract *can* read is
+/// pinned: the labels exactly, the command exactly, the platform-default shell
+/// on every `run:` step, and a field set with no `if:` or `continue-on-error:`.
+/// The refusals are executed in [`WORKFLOW_ESCAPES`], every row named
+/// `MUT-TEST-WINDOWS-*`.
+#[test]
+fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let complaints = ci_test_windows_job_complaints(&doc);
+    assert!(
+        complaints.is_empty(),
+        "the self-hosted Windows leg does not run these fixtures the way the contract pins:\n{}",
         complaints.join("\n")
     );
 }

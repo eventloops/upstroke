@@ -29,11 +29,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the first-class target (DESIGN.md §1), so it is not an
-        # afterthought here: the subprocess supervisor, the cmd /C quoting and
-        # the PATHEXT resolution all behave differently per platform and are
-        # covered by tests.
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # Windows is the first-class target (DESIGN.md §1) and its suite is not
+        # an afterthought: the subprocess supervisor, the cmd /C quoting and the
+        # PATHEXT resolution all behave differently per platform and are covered
+        # by tests. It is absent from this matrix because it runs below, in
+        # `test-windows`, on a self-hosted runner; these two legs stay on
+        # GitHub's runners.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -57,6 +59,30 @@ jobs:
 
       # The engine shells out to git and asserts on its output; runners have
       # git but no identity, and several tests commit.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke CI"
+
+      - run: cargo test --all-targets --all-features
+
+  # The Windows suite runs on an ephemeral self-hosted runner: a throwaway
+  # overlay of a frozen Server 2025 image on the build box, one job per boot,
+  # registered for that job with a single-use just-in-time config
+  # (decisions/2026-09-01-self-hosted-windows-test-leg.md). On windows-latest
+  # this suite took a median of 12.5 minutes and up to 21 -- a 2x host lottery
+  # measured on identical code -- and the guest runs it in about two and a
+  # half. `lint (windows)` and the Windows MSRV leg stay on windows-latest, so
+  # GitHub's runner still compiles every `#[cfg(windows)]` body; only the test
+  # execution moved. The image carries the toolchain, so there is no install
+  # step, and its target directory is pre-warmed, so there is no cache step.
+  test-windows:
+    name: test (winguest)
+    runs-on: [self-hosted, windows, winguest]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: Configure git identity
         run: |
           git config --global user.email "ci@upstroke.local"
@@ -89,9 +115,11 @@ jobs:
   # note by MSVC clippy. So without this job `expected_failures_refusals[5]` and
   # `[6]` are undischarged for the Windows half of the tree.
   #
-  # A separate job rather than a step in `test`, deliberately: `test
-  # (windows-latest)` is the attestation of record for the Windows suite and a
-  # lint failure must not be able to masquerade as a test failure in it.
+  # A separate job rather than a step in a test job, deliberately: `test
+  # (winguest)` is the attestation of record for the Windows suite and a lint
+  # failure must not be able to masquerade as a test failure in it. This leg
+  # stays on windows-latest on purpose: GitHub's runner remains the neutral
+  # witness that the Windows tree compiles clean.
   lint-windows:
     name: lint (windows)
     runs-on: windows-latest
@@ -149,7 +177,7 @@ jobs:
   merge-gate:
     name: upstroke-ci
     if: always()
-    needs: [lint, lint-windows, lint-macos, msrv, test]
+    needs: [lint, lint-windows, lint-macos, msrv, test, test-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -161,9 +189,10 @@ jobs:
           LINT_MACOS_RESULT: ${{ needs.lint-macos.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          TEST_WINDOWS_RESULT: ${{ needs.test-windows.result }}
         run: |
           failed=0
-          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do
+          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST TEST_WINDOWS; do
             result_var="${gate}_RESULT"
             result="${!result_var}"
             if [[ "$result" != "success" ]]; then

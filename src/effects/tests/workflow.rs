@@ -32,8 +32,9 @@ use super::ci_model::{
     AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL, AGGREGATE_STEP_FIELDS,
     CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
     ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS,
-    OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, STEP_FIELDS,
-    TEST_COMMAND, TEST_JOB_FIELDS, WORKFLOW_FIELDS,
+    OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE,
+    SELF_HOSTED_TEST_PLATFORM, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_WINDOWS_JOB,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, WORKFLOW_FIELDS,
 };
 use super::repo_root;
 
@@ -537,11 +538,11 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             ));
         }
         // This job is a matrix, so each `run:` step resolves a shell once per
-        // runner. All three must be the platform default: a workflow-level
+        // hosted runner. Each must be the platform default: a workflow-level
         // default swaps every one of them at once, which is the mutation the
         // step-only reading could not see.
         if scalar(step, "run").is_some() {
-            for target in &CI_TARGETS {
+            for target in CI_TARGETS.iter().filter(|target| hosts_tests(target)) {
                 out.extend(shell_complaints(
                     doc,
                     job,
@@ -567,10 +568,12 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
     }
 
     // The matrix is the platform half of the same claim, and it is compared
-    // against the same derived runner set the Clippy legs are: a fixture that
-    // runs on one platform proves nothing about the other two.
+    // against the same derived runner set the Clippy legs are, less the one
+    // platform whose suite runs self-hosted: a fixture that runs on one
+    // platform proves nothing about the other.
     let expected_runners: BTreeSet<String> = CI_TARGETS
         .iter()
+        .filter(|target| hosts_tests(target))
         .map(|target| target.runner.to_owned())
         .collect();
     // The WHOLE strategy mapping, not just `matrix.os`. `exclude:` removes
@@ -596,7 +599,7 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             if field(strategy, "fail-fast").and_then(Yaml::as_bool) != Some(false) {
                 out.push(
                     "[test-job-matrix] the `test` job's `fail-fast:` is not `false`, so one \
-                     platform's failure cancels the other two before they report"
+                     platform's failure cancels the other before it reports"
                         .to_owned(),
                 );
             }
@@ -663,6 +666,98 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         out.push(format!(
             "[test-job-toolchain] the `test` job selects toolchain {:?}, not `stable`",
             with.and_then(|with| scalar(with, "toolchain"))
+        ));
+    }
+    out
+}
+
+/// Whether a [`CI_TARGETS`] runner hosts its platform's tests in the `test`
+/// matrix -- every platform but the one whose suite is self-hosted.
+fn hosts_tests(target: &CiTarget) -> bool {
+    target.runner != SELF_HOSTED_TEST_PLATFORM
+}
+
+/// Every way the self-hosted Windows job fails its contract.
+///
+/// The same shape as [`ci_test_job_complaints`] without the matrix, and with
+/// the one thing that job cannot say: which machine. A hosted runner is named
+/// by a scalar `runs-on:`; a self-hosted one by the set of labels a runner must
+/// carry, and the set is compared whole -- a subset admits every Windows
+/// machine the account registers, and a scalar `windows-latest` is the leg this
+/// contract retired coming back with every step still matching.
+///
+/// No toolchain step is required: the guest's image carries `clippy-driver`
+/// for the fixtures, and the decision record binds re-curation to that claim,
+/// which a document parser cannot check.
+pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let Some(job) = field(jobs, TEST_WINDOWS_JOB) else {
+        return vec![format!(
+            "[test-windows-missing] no `{TEST_WINDOWS_JOB}` job, so nothing runs the Windows \
+             suite"
+        )];
+    };
+    let Some(platform) = CI_TARGETS
+        .iter()
+        .find(|target| target.runner == SELF_HOSTED_TEST_PLATFORM)
+    else {
+        return vec![format!(
+            "[test-windows-platform] `{SELF_HOSTED_TEST_PLATFORM}` is not a runner this \
+             contract models, so the shell its steps resolve to is undecidable here"
+        )];
+    };
+
+    for complaint in field_complaints(job, &TEST_WINDOWS_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
+        out.push(format!(
+            "[unexpected-job-field] `{TEST_WINDOWS_JOB}` {complaint}"
+        ));
+    }
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let strange = unexpected(&field_names(step), &STEP_FIELDS);
+        if !strange.is_empty() {
+            out.push(format!(
+                "[unexpected-step-field] `{TEST_WINDOWS_JOB}` step {index} declares {strange:?}"
+            ));
+        }
+        if scalar(step, "run").is_some() {
+            out.extend(shell_complaints(
+                doc,
+                job,
+                step,
+                platform,
+                &format!("`{TEST_WINDOWS_JOB}` step {index}"),
+                platform.default_shell,
+            ));
+        }
+    }
+
+    let expected_labels: BTreeSet<String> = TEST_WINDOWS_LABELS
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect();
+    let labels = field(job, "runs-on").and_then(scalar_set);
+    if labels.as_ref() != Some(&expected_labels) {
+        out.push(format!(
+            "[test-windows-runner] `{TEST_WINDOWS_JOB}` runs on {:?}, not exactly the label \
+             set {expected_labels:?}. A scalar here is a hosted runner, a subset is any \
+             self-hosted Windows machine the account registers, and the pinned set names the \
+             curated image.",
+            field(job, "runs-on")
+        ));
+    }
+
+    let running = steps_of(job)
+        .iter()
+        .filter(|step| scalar(step, "run") == Some(TEST_COMMAND))
+        .count();
+    if running != 1 {
+        out.push(format!(
+            "[test-windows-command] `{TEST_WINDOWS_JOB}` has {running} steps whose `run:` is \
+             exactly `{TEST_COMMAND}`, not one"
         ));
     }
     out
@@ -1134,6 +1229,7 @@ fn rustflags_override_complaints(node: &Yaml, named: &str) -> Vec<String> {
 pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     let mut out = ci_gate_complaints(doc);
     out.extend(ci_test_job_complaints(doc));
+    out.extend(ci_test_windows_job_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1263,8 +1359,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  `os:` passes while the fixtures never run on that platform -- the matrix \
                  half of `PR5-MACOS-CLIPPY-NEVER-RUN`.",
         job: Some("test"),
-        anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
-        replacement: "        os: [windows-latest, ubuntu-latest, macos-latest]\n\
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
+        replacement: "        os: [ubuntu-latest, macos-latest]\n\
                       \x20       exclude:\n\
                       \x20         - os: macos-latest\n",
         refused_as: "test-job-matrix",
@@ -1302,8 +1398,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "a gate the aggregate does not depend on: branch protection settles green \
                  while the Windows denial gate is red. `PR5D-MSVC-CLIPPY-NEVER-RUN`.",
         job: Some("merge-gate"),
-        anchor: "    needs: [lint, lint-windows, lint-macos, msrv, test]\n",
-        replacement: "    needs: [lint, lint-macos, msrv, test]\n",
+        anchor: "    needs: [lint, lint-windows, lint-macos, msrv, test, test-windows]\n",
+        replacement: "    needs: [lint, lint-macos, msrv, test, test-windows]\n",
         refused_as: "aggregate-needs",
     },
     WorkflowEscape {
@@ -1324,8 +1420,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  `requires.split_whitespace().any(|word| word == looped)` passes on the \
                  trailing mention.",
         job: Some("merge-gate"),
-        anchor: "          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do\n",
-        replacement: "          for gate in LINT LINT_WINDOWS MSRV TEST; do : LINT_MACOS\n",
+        anchor: "          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST TEST_WINDOWS; do\n",
+        replacement: "          for gate in LINT LINT_WINDOWS MSRV TEST TEST_WINDOWS; do : LINT_MACOS\n",
         refused_as: "aggregate-loop",
     },
     WorkflowEscape {
@@ -1389,12 +1485,68 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-CI-TEST-MATRIX-NARROWED",
-        escape: "the fixtures run on one platform and the other two go unexercised, while \
-                 every check that names the command still passes",
+        escape: "the hosted fixtures run on one platform and the other goes unexercised, \
+                 while every check that names the command still passes",
         job: Some("test"),
-        anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
         replacement: "        os: [ubuntu-latest]\n",
         refused_as: "test-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-MATRIX-KEEPS-WINDOWS",
+        escape: "the hosted matrix quietly re-admits Windows. Two jobs then run the Windows \
+                 suite, and the one whose duration this contract retired is back on the \
+                 critical path with every other check passing.",
+        job: Some("test"),
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
+        replacement: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
+        refused_as: "test-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-REHOSTED",
+        escape: "the self-hosted job moved back to `windows-latest` as a scalar `runs-on:`. \
+                 Every step still matches character for character; only the machine, and \
+                 with it the twelve minutes, changed.",
+        job: Some("test-windows"),
+        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        replacement: "    runs-on: windows-latest\n",
+        refused_as: "test-windows-runner",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-LABEL-DROPPED",
+        escape: "the labels loosened to `[self-hosted, windows]`, which any Windows runner \
+                 the account ever registers satisfies; the curated image is named by the \
+                 label this drops",
+        job: Some("test-windows"),
+        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        replacement: "    runs-on: [self-hosted, windows]\n",
+        refused_as: "test-windows-runner",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-COMMAND-DELETED",
+        escape: "the self-hosted job checks out, configures git, and runs nothing",
+        job: Some("test-windows"),
+        anchor: "      - run: cargo test --all-targets --all-features\n",
+        replacement: "",
+        refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-DISABLED",
+        escape: "a job-level `if: false` on the self-hosted job reports success without \
+                 running the Windows suite anywhere",
+        job: Some("test-windows"),
+        anchor: "    timeout-minutes: 20\n",
+        replacement: "    timeout-minutes: 20\n    if: false\n",
+        refused_as: "unexpected-job-field",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-RENAMED-AWAY",
+        escape: "the job renamed: nothing under the pinned name runs the Windows suite, while \
+                 a job still exists for the aggregate to wire",
+        job: None,
+        anchor: "\n  test-windows:\n",
+        replacement: "\n  test-windows-hosted:\n",
+        refused_as: "test-windows-missing",
     },
     WorkflowEscape {
         name: "MUT-RUSTFLAGS-WEAKENED",

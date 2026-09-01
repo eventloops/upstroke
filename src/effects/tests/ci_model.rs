@@ -31,6 +31,32 @@ pub(super) const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features 
 /// The command that executes this file's fixtures, character for character.
 pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 
+/// The job that runs those fixtures for the one platform whose test execution
+/// left GitHub's runners, and the labels it must run on -- exactly.
+///
+/// The Windows suite is spawn- and worktree-heavy, and on `windows-latest` it
+/// was the whole CI wall clock: a median of 12.5 minutes and a tail of 21 on
+/// identical code, because the harness varied 535-1154 s with the host the
+/// runner landed on. It runs instead on an ephemeral self-hosted guest -- a
+/// throwaway overlay of a frozen image, one job per boot, registered with a
+/// single-use just-in-time config -- in about two and a half minutes
+/// (`decisions/2026-09-01-self-hosted-windows-test-leg.md`).
+///
+/// The labels are an equality because a looser `runs-on:` is a different
+/// machine: `[self-hosted, windows]` admits any Windows runner the account ever
+/// registers, and the third label is what names the curated image. The
+/// platform's Clippy and MSRV legs stay on [`CI_TARGETS`]'s `windows-latest`,
+/// which is why that entry is unchanged: GitHub's runner is still the witness
+/// that compiles every `#[cfg(windows)]` body.
+pub(super) const TEST_WINDOWS_JOB: &str = "test-windows";
+pub(super) const TEST_WINDOWS_LABELS: [&str; 3] = ["self-hosted", "windows", "winguest"];
+
+/// The [`CI_TARGETS`] runner whose tests run in [`TEST_WINDOWS_JOB`] rather than
+/// in the `test` matrix. Its shell and cfg valuations carry over: the guest
+/// carries PowerShell 7, so a `run:` step resolves to `pwsh` there exactly as
+/// on `windows-latest`, and it builds the same MSVC tuple.
+pub(super) const SELF_HOSTED_TEST_PLATFORM: &str = "windows-latest";
+
 /// The job that holds this crate to the floor it publishes, and the command it
 /// must run -- character for character, for `--locked`'s sake.
 ///
@@ -86,7 +112,7 @@ pub(super) const REQUIRED_CONTEXT: &str = "upstroke-ci";
 /// list is re-derived from `needs:` below and compared, so this literal being a
 /// faithful copy is itself checked against the job graph.
 pub(super) const AGGREGATE_SCRIPT: &str = r#"failed=0
-for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do
+for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST TEST_WINDOWS; do
   result_var="${gate}_RESULT"
   result="${!result_var}"
   if [[ "$result" != "success" ]]; then
@@ -128,6 +154,12 @@ pub(super) const AGGREGATE_JOB_FIELDS: [&str; 6] =
 /// The fields the job that runs these fixtures declares.
 pub(super) const TEST_JOB_FIELDS: [&str; 5] =
     ["name", "runs-on", "steps", "strategy", "timeout-minutes"];
+
+/// The fields the self-hosted test job declares: the `test` job's set without a
+/// `strategy:`, since one runner needs no matrix. `if:` and `continue-on-error:`
+/// are absent by construction, as everywhere in this contract.
+pub(super) const TEST_WINDOWS_JOB_FIELDS: [&str; 4] =
+    ["name", "runs-on", "steps", "timeout-minutes"];
 
 /// The fields the MSRV leg declares. The same shape as the `test` job, and named
 /// separately because the reason one of its absences matters is its own.
