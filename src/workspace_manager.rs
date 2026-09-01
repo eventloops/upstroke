@@ -1056,10 +1056,18 @@ pub struct WorkspaceManager {
 ///
 /// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
 /// so the first attempt succeeds — and the retry is not compiled in there. The bound
-/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process,
-/// and the **last attempt's** error is returned rather than masked. It is not necessarily
-/// the first attempt's — a permanent ACL denial and a closing handle both answer error 5,
-/// and only the passage of `ATTEMPTS * STEP` tells them apart.
+/// is deliberate: a handle that survives all `ATTEMPTS` attempts is not a closing
+/// process, and the **last attempt's** error is returned rather than masked. It is not
+/// necessarily the first attempt's — a permanent ACL denial and a closing handle both
+/// answer error 5, and only exhausting the attempts tells them apart.
+///
+/// `ATTEMPTS * STEP` is how long this loop *sleeps*, and not a deadline. A loaded
+/// machine stretches its wall clock well past that, which is the direction to be
+/// wrong in: a machine too busy to schedule this loop is equally too busy to let a
+/// dying process close its handles, so a wall-clock bound would shrink the tolerance
+/// exactly when the condition it tolerates lasts longest, and report a lock that is
+/// not one. Nothing may read `ATTEMPTS * STEP` as elapsed time — a test did, and
+/// became a flake on a starved runner.
 ///
 /// **This is not `runner::container::racing_removal`, and the two must not be merged.**
 /// That one resolves a *handoff*: two threads racing on one path, where the loser needs
@@ -4767,22 +4775,40 @@ mod tests {
     /// This is the deterministic form of what the residue sampler hits at random:
     /// the sampler kills a real `git` child at an unseeded point and *sometimes*
     /// leaves a handle, so it proves the condition exists but cannot be re-run to
-    /// prove a fix. Here the handle is held on purpose and released on a timer.
+    /// prove a fix. Here the handle is held on purpose.
     ///
     /// The second half is the one that matters. A handle held **past** the retry
     /// budget must still fail: a retry that waits forever is not a fix, it is a
     /// hang, and one that swallows the error hides a genuinely locked worktree.
+    ///
+    /// That half is held by a **handshake rather than a timer**, and the
+    /// difference is a measured failure rather than a preference. It first held
+    /// the file for five seconds and read the margin over `ATTEMPTS * STEP` — 39
+    /// sleeps of 25ms, so under a second — as decisive. It is not.
+    /// `ATTEMPTS * STEP` bounds how long the loop *sleeps*, not how long it
+    /// takes, and on a starved scheduler every wake queues behind the runnable
+    /// threads ahead of it. Measured on a 4-vCPU Windows guest at
+    /// `--test-threads=16`, the loop outlived the five seconds: the holder woke,
+    /// dropped the file, and a late attempt succeeded — so the control that
+    /// exists to prove a held worktree is *reported* watched it get removed
+    /// instead. Holding until the assertion has run takes the wall clock out of
+    /// the oracle.
     #[cfg(windows)]
     #[test]
     fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         use std::os::windows::fs::OpenOptionsExt as _;
         use std::sync::mpsc;
 
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
+        // `Some(d)`: a process whose last handle closes `d` after the removal
+        // starts, which is the window the retry exists to cross. `None`: one that
+        // is still holding when the assertion runs, which is a locked worktree
+        // however long the loop took to reach that conclusion.
         for (hold, expected_removal) in [
-            (std::time::Duration::from_millis(300), true),
-            (std::time::Duration::MAX, false),
+            (Some(std::time::Duration::from_millis(300)), true),
+            (None, false),
         ] {
             let fixture = Fixture::created("closing-handle");
             let slot = fixture.task("alpha", 1);
@@ -4803,6 +4829,7 @@ mod tests {
             let held = target.join("held-by-the-dying-child");
             fs::write(&held, b"bytes the child had open").expect("plant the file");
             let (opened, ready) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
             let holder = std::thread::spawn(move || {
                 // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
                 // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
@@ -4816,12 +4843,18 @@ mod tests {
                     .open(&held)
                     .expect("hold the file open the way a git child does");
                 opened.send(()).expect("announce the handle is held");
-                if hold == std::time::Duration::MAX {
-                    // Held for the whole test: the control that proves the retry
-                    // is bounded and still reports a real lock.
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                } else {
-                    std::thread::sleep(hold);
+                match hold {
+                    Some(hold) => std::thread::sleep(hold),
+                    // Held until the main thread drops its sender, which it does
+                    // only once the assertion has run: the control proves the
+                    // retry is bounded, and a timer would only ever prove the
+                    // loop is shorter than that timer. `recv` also returns when a
+                    // *panicking* main thread drops the sender while unwinding,
+                    // so a failing assertion releases the handle rather than
+                    // leaving the tree locked against the fixture's own cleanup.
+                    None => {
+                        let _ = released.recv();
+                    }
                 }
                 drop(file);
             });
@@ -4837,16 +4870,47 @@ mod tests {
                     "and the worktree is actually gone, not merely un-refused"
                 );
             } else {
+                // The wording is deliberately not the one this assertion carried
+                // while the handle was held on a five-second timer. That message
+                // is the recorded fingerprint of a retired flake, and a failure
+                // here now means removal succeeded against a handle that was
+                // provably *still open* -- a defect, not a scheduling artifact.
+                // Reusing the text would invite the next reader to discount it.
                 let error = outcome.expect_err(
-                    "a handle held past the retry budget is a locked worktree, not a closing one, \
-                     and must be reported rather than waited on forever",
+                    "a handle still held when removal returns is a locked worktree, not a closing \
+                     one, and must be reported rather than waited on forever",
                 );
                 assert!(
                     target.exists(),
                     "and the worktree is still there, which is what the error says: {}",
                     refusal_of(&error)
                 );
+                // The *reason*, not merely the fact of a failure. The loop
+                // returns its last attempt's error, and only a sharing violation
+                // or a delete-pending denial says it spent its budget against
+                // this handle. Without this the control is satisfied by any
+                // error at all, including a containment refusal raised before
+                // removal is ever attempted -- which would prove nothing about
+                // the bound the test is named for.
+                let code = match &error {
+                    UpstrokeError::Io { source, .. } => source.raw_os_error(),
+                    _ => None,
+                };
+                assert!(
+                    matches!(
+                        code,
+                        Some(code)
+                            if code == ERROR_SHARING_VIOLATION as i32
+                                || code == ERROR_ACCESS_DENIED as i32
+                    ),
+                    "the refusal must be the handle the loop exhausted its budget against, \
+                     not an earlier failure: {}",
+                    refusal_of(&error)
+                );
             }
+            // Before the join, and load-bearing: the held case's holder blocks on
+            // this sender disconnecting, so joining first would deadlock.
+            drop(release);
             let _ = holder.join();
         }
     }
