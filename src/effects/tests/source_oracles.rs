@@ -532,7 +532,7 @@ pub(super) mod oracles {
     /// The class boundary for `PR7-R5-ATT-001`. Four whole-tree censuses skip test
     /// files; three took the set from
     /// [`census_domain::declared_whole_file_test_modules`] and one wrote its own
-    /// rule, `path.file_stem() == "tests"`. That covers the fourteen files a
+    /// rule, `path.file_stem() == "tests"`. That covers the sixteen files a
     /// literal `#[cfg(test)] mod tests;` declares. The crate declares four more,
     /// and they are exactly the ones a census is most likely to trip over — a
     /// scaffold, a fake and a readiness protocol exist to *name* what production
@@ -548,8 +548,8 @@ pub(super) mod oracles {
     ///
     /// Named individually rather than counted, because a count alone would pass if
     /// the derivation swapped one file for another. Counted as well, because
-    /// names alone would pass if the derivation grew a nineteenth nobody looked
-    /// at.
+    /// names alone would pass if the derivation grew a twenty-first nobody
+    /// looked at.
     pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
@@ -591,22 +591,22 @@ pub(super) mod oracles {
         );
         assert_eq!(
             modules.len(),
-            18,
-            "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
+            20,
+            "the crate declares {} whole-file test modules; a census skipping sixteen of them by \
              file name leaves the rest inside its domain",
             modules.len()
         );
 
-        // **The two halves of the eighteen, separated.** The count above is
-        // satisfied by any eighteen files; these two say *how* each was reached,
-        // which is the part the structural scan changed. Fourteen come from a
+        // **The two halves of the twenty, separated.** The count above is
+        // satisfied by any twenty files; these two say *how* each was reached,
+        // which is the part the structural scan changed. Sixteen come from a
         // literal `#[cfg(test)] mod tests;` — the form a text rule could find —
-        // and the derivation must still find all fourteen after learning to read
+        // and the derivation must still find all sixteen after learning to read
         // structure, because a scan that resolved ancestry and lost the plain
         // case would trade one blind spot for another.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
-        assert_eq!(declarations.len(), 18);
+        assert_eq!(declarations.len(), 20);
         let literal: Vec<String> = declarations
             .iter()
             .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
@@ -614,8 +614,8 @@ pub(super) mod oracles {
             .collect();
         assert_eq!(
             literal.len(),
-            14,
-            "fourteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
+            16,
+            "sixteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
              found {}: {literal:?}",
             literal.len()
         );
