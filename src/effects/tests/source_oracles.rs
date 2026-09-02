@@ -604,13 +604,14 @@ pub(super) mod oracles {
             paths
         }
         // The expected value, and the two halves of it the rules below
-        // partition into. `WHOLE_FILE_TEST_MODULES` holds paths relative to
-        // `src`, which is what `relative` produces. Filtering a sorted list
-        // keeps it sorted, so the halves need no second sort.
+        // partition into. `WHOLE_FILE_TEST_MODULES` holds `PathBuf`s relative
+        // to `src`, which is what `relative` produces, so this borrows them as
+        // paths and converts nothing. Filtering a sorted list keeps it sorted,
+        // so the halves need no second sort.
         let expected = sorted(
             WHOLE_FILE_TEST_MODULES
                 .iter()
-                .map(std::path::Path::new)
+                .map(std::path::PathBuf::as_path)
                 .collect(),
         );
         let stem_is_tests =

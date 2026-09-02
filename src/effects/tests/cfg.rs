@@ -42,6 +42,8 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use super::ci_model::CI_TARGETS;
 use crate::effects::blank_comments_and_strings;
@@ -1171,6 +1173,17 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// rather than what it says: a census that resolved none of them would read
 /// several hundred predicates as unconditional and never notice.
 ///
+/// **A collection of paths, and the type says so.** Every reader compares these
+/// against a `Path` the tree produced, and `CODING_STANDARDS.md` §8 keeps a path
+/// out of `String`: a lossy rendering maps two distinct non-UTF-8 paths onto
+/// one, and rewriting `\` to `/` turns a backslash -- a legal character in a
+/// Unix file name -- into what reads as a separator. A `&[&str]` named as the
+/// source of truth for path identities says "string" in its type however
+/// carefully each use site converts, so what everything reads is a
+/// `Vec<PathBuf>` and the conversion happens once, here. The `&'static str`
+/// literals inside are the *written* form, because a path literal in source is
+/// how a human writes one; nothing reads them without going through `PathBuf`.
+///
 /// **Not every file this crate compiles only under `cfg(test)`, and the gap is
 /// deliberate.** `census_domain::declared_whole_file_test_modules` does not
 /// close over the file graph, so a declaration inside a file that is itself in
@@ -1193,17 +1206,39 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// anywhere.** The whole of it is the domain above. The subset a literal
 /// `#[cfg(test)] mod tests;` declares is the entries whose file stem is
 /// `tests`: declared under that exact name at their parent's own top level,
-/// with the attribute on the declaration, so each is a `tests.rs` and the
-/// file-name rule `file_stem == "tests"` finds it. The rest
+/// with the attribute on the declaration and its effective predicate the bare
+/// `test` atom, so each is a `tests.rs` and the file-name rule `file_stem ==
+/// "tests"` finds it. The rest
 /// -- `scaffold`, `premove`, `fake` and `readiness` -- differ by **how each
 /// file is reached**, which is the distinction a census gets wrong, and they
 /// are the ones it is most likely to trip over, since a scaffold, a fake and a
 /// readiness protocol exist to name what production names.
 ///
+/// **A narrowed guard would stay in this list and leave that subset, and the
+/// disagreement is the signal.** `#[cfg(all(test, unix))] mod tests;` compiles
+/// a whole test file on Unix and no file at all on Windows. It is still
+/// test-only, so the derivation keeps it and it belongs in this domain; it is
+/// not the form `#[cfg(test)] mod tests;`, so it is not in the subset above --
+/// while its file stem is still `tests`, which is the half of this list that
+/// subset is compared against. The two disagree, and the oracle fails naming
+/// the file. That is the decision rather than an oversight: a census skipping
+/// by file name treats such a module as present everywhere, so Windows would
+/// lose it in silence, and the slice that writes one has to say what every
+/// census should do about a module that exists on only some platforms. There
+/// is no such declaration in this tree; PR #101's reviewer supplied the
+/// reproduction and
+/// `a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form`
+/// drives it over synthetic input, so no later change can lose the distinction.
+///
 /// **A slice that adds a whole-file test module adds its path here, in sorted
 /// position, in the same commit.** That is the whole edit: both counts follow,
 /// and so does the named-individually set. The entries cluster by directory, so
-/// slices landing in different directories insert far apart in this list.
+/// slices landing in different directories insert far apart in this list. That
+/// argument depends on the written order actually being sorted, and the
+/// initializer asserts it **as written**, before anything normalises it --
+/// every comparison against this list sorts what it reads, so an entry appended
+/// at the end would otherwise satisfy all of them while the claim quietly
+/// stopped being true.
 ///
 /// Where it is compared with `>=`, the length is a floor. One entry --
 /// `readiness.rs`, reached through an inline ancestor rather than through an
@@ -1224,23 +1259,40 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// `engine::topology::recover::tests` floors its skip count at `.len()`, which
 /// is the only form of that floor that is not satisfied by the derivation
 /// having gone inert.
-pub(crate) const WHOLE_FILE_TEST_MODULES: &[&str] = &[
-    "agent/proc/test_support/readiness.rs",
-    "effects/tests.rs",
-    "engine/tests.rs",
-    "engine/topology/attempt/tests.rs",
-    "engine/topology/create/tests.rs",
-    "engine/topology/dispatch/tests.rs",
-    "engine/topology/emit/tests.rs",
-    "engine/topology/preflight/tests.rs",
-    "engine/topology/recover/tests.rs",
-    "engine/topology/run/tests.rs",
-    "engine/topology/scaffold.rs",
-    "engine/topology/startup/tests.rs",
-    "events/log/premove.rs",
-    "events/log/tests.rs",
-    "runner/container/census/tests.rs",
-    "runner/container/fake.rs",
-    "runner/container/resolve/tests.rs",
-    "runner/container/tests.rs",
-];
+pub(crate) static WHOLE_FILE_TEST_MODULES: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+    // The written order, which is the sorted one the paragraph above argues
+    // for. Sortedness is checked here rather than in a test so that no reader
+    // of the list can bypass it, and on the literals rather than on the
+    // `PathBuf`s so that what is checked is the text a human reads and diffs.
+    // `>=` rather than `>`, so a path written twice fails here as well: the
+    // oracle compares a `Vec` and not a set for the same reason.
+    let written = [
+        "agent/proc/test_support/readiness.rs",
+        "effects/tests.rs",
+        "engine/tests.rs",
+        "engine/topology/attempt/tests.rs",
+        "engine/topology/create/tests.rs",
+        "engine/topology/dispatch/tests.rs",
+        "engine/topology/emit/tests.rs",
+        "engine/topology/preflight/tests.rs",
+        "engine/topology/recover/tests.rs",
+        "engine/topology/run/tests.rs",
+        "engine/topology/scaffold.rs",
+        "engine/topology/startup/tests.rs",
+        "events/log/premove.rs",
+        "events/log/tests.rs",
+        "runner/container/census/tests.rs",
+        "runner/container/fake.rs",
+        "runner/container/resolve/tests.rs",
+        "runner/container/tests.rs",
+    ];
+    let out_of_order = written.windows(2).find(|pair| pair[0] >= pair[1]);
+    assert!(
+        out_of_order.is_none(),
+        "`WHOLE_FILE_TEST_MODULES` is not sorted as written, at {out_of_order:?}. Every \
+         comparison against this list sorts what it reads, so an entry appended at the end -- or \
+         written twice -- passes all of them, and the argument that slices in different \
+         directories insert far apart stops being true without anything failing"
+    );
+    written.into_iter().map(PathBuf::from).collect()
+});
