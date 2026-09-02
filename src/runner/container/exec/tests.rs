@@ -1,3 +1,34 @@
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, which
+// carries this file's own review clause. This is the extracted test module of
+// the `ContainerRunner` funnel -- the region that lived inline in
+// `src/runner/container/exec.rs`, under the outer allow its declaration there
+// still carries, moved out unchanged. The set of calls permitted here is
+// unchanged by the move: the fixtures build worktrees and scratch trees and
+// drive the runtime seam directly, exactly as they did inline. What moved is
+// where the permission is stated, not what it permits.
+//
+// `PR6-LANEF-004`: it states that level **of its own** rather than inheriting
+// one. A lint level is scoped by the MODULE TREE and not by the file, so an
+// out-of-line child of a funnel is covered by the parent's allow unless it says
+// otherwise, and the funnel's child-module census requires each child to say so.
+// The two lints this file does not need are re-denied, so either one appearing
+// here is still a build error.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
+#![deny(clippy::disallowed_types, clippy::disallowed_macros)]
+// The duplication below is deliberate, and it belongs to the move.
+// `src/runner/container/exec.rs` still carries an OUTER
+// `#[allow(clippy::disallowed_methods)]` on this module's declaration -- the
+// form the allowance took while these bodies were inline there, and a
+// production line this packet may not touch. Stating the level here as well is
+// what the funnel's child-module census requires, since a child inherits
+// nothing; so one lint is now allowed twice for one module and
+// `clippy::duplicated_attributes` fires on the pair. It is suppressed here
+// rather than resolved by deleting the outer attribute, which would be a
+// production edit and would strand `exec.rs`'s own allowlist row with an
+// `allows` it no longer carries. The redundancy is reported for a follow-up.
+#![allow(clippy::duplicated_attributes)]
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

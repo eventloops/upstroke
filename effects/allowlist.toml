@@ -71,6 +71,38 @@ supervision primitives live in `src/agent/proc.rs`, the second Process-funnel \
 module listed below."""
 
 [[funnel]]
+path = "src/runner/host/tests.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/runner/host.rs"
+review = """
+The Process funnel host half's own test module, extracted from \
+`src/runner/host.rs` into a sibling file and given attributes of its own IN THE \
+SAME COMMIT -- never inheriting one. A Rust lint level is scoped by the MODULE \
+TREE and not by the file, so this file would otherwise have inherited \
+`src/runner/host.rs`'s inner allow of these same three lints silently: that is \
+`PR6-LANEF-004`, and `runner::container::tests::every_child_module_of_the_\
+container_funnel_states_its_own_lint_level` refuses a child that does not state \
+its own level. That census already named `src/runner/host.rs` as a funnel whose \
+directory it would walk the day one appeared; this extraction is that day, and \
+the census found the child rather than a reviewer having to. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. Every one of these calls was \
+already made by these same test bodies inside `src/runner/host.rs`, under that \
+file's own inner allow of the same three lints; the move changes where the \
+level is stated, not what it permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 82 sites -- the fixtures \
+build and tear down scratch trees (`fs::remove_dir_all` 43, `fs::create_dir_\
+all` 20, `fs::write` 7, `fs::set_permissions` 5, `fs::File::create` 2, \
+`fs::remove_file` 1) and run real child processes (`Command::output` 3, \
+`Command::status` 1); `clippy::disallowed_types`, 5 sites, every one \
+`std::process::Command`, because a host-runner suite that never spawns \
+establishes nothing -- availability cannot be established by inspection; \
+`clippy::disallowed_macros`, 4 sites, `println!` in a diagnostic. It performs \
+no effect outside a scratch directory of its own making. \
+Recorded here rather than left inherited, so the scope is a reviewed artifact \
+rather than an accident of the module tree."""
+
+[[funnel]]
 path = "src/agent/proc.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
 packet = "effect_site_inventory.mechanism (2): Process funnel primitives beneath src/runner/host.rs"
@@ -254,6 +286,39 @@ the fixtures build worktrees and scratch trees with `fs::create_dir_all` and \
 `fs::write`, and drive the seam directly to seed containers the runner then \
 supervises. Recorded here rather than left inherited, so the scope is a \
 reviewed artifact rather than an accident of the module tree."""
+
+[[funnel]]
+path = "src/runner/container/exec/tests.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/runner/container/exec.rs"
+review = """
+The `ContainerRunner`'s own test module (PR6 lane A), extracted from \
+`src/runner/container/exec.rs` into a sibling file and given an attribute of \
+its own IN THE SAME COMMIT -- never inheriting one. A Rust lint level is scoped \
+by the MODULE TREE and not by the file, so this file would otherwise have been \
+covered by the outer allow on its declaration in `exec.rs` while stating \
+nothing itself: that is `PR6-LANEF-004`, and `runner::container::tests::every_\
+child_module_of_the_container_funnel_states_its_own_lint_level` refuses a child \
+that does not state its own level. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. `exec.rs` carries a file-level \
+`#![deny(...)]` of all three governed lints and an OUTER \
+`#[allow(clippy::disallowed_methods)]` on the test declaration, so the test \
+region already had exactly this one lint allowed and the other two denied. \
+These same bodies made these same calls there; the move changes where the level \
+is stated, not what it permits. \
+WHAT IT NEEDS THE ALLOW FOR, measured at extraction by denying all three and \
+counting the errors: 23 sites, every one `clippy::disallowed_methods` -- the \
+fixtures build worktrees and scratch trees (`fs::write` 9, `fs::create_dir_all` \
+7, `fs::set_permissions` 1), delegate the seam's four effectful methods through \
+a wrapper runtime (`ContainerRuntime::{create,start,stop,remove}`, one site \
+each) and drive the view directly (`GitView::{materialize,discard}`, one site \
+each) to seed containers the runner then supervises. It performs no effect \
+outside a scratch directory of its own making. \
+`clippy::disallowed_types` and `clippy::disallowed_macros` are RE-DENIED here \
+rather than inherited -- both measured at zero sites -- so a \
+`std::process::Command` or a `println!` in this file is still a build error. \
+The PRODUCTION region of `exec.rs` keeps its file-level deny and is untouched \
+by this row."""
 
 [[funnel]]
 path = "src/runner/invocation.rs"

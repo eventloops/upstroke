@@ -1,3 +1,25 @@
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, which
+// carries this file's own review clause. This is the extracted test module of
+// the Process funnel in `src/runner/host.rs` -- the region that lived inline
+// there, under that file's own inner allow of these same three lints, moved out
+// unchanged. The set of calls permitted here is unchanged by the move: the
+// fixtures build and tear down scratch trees, mark programs executable, and
+// spawn real child processes, exactly as they did inline. What moved is where
+// the permission is stated, not what it permits.
+//
+// `PR6-LANEF-004`: it states that level **of its own** rather than inheriting
+// one. A lint level is scoped by the MODULE TREE and not by the file, so an
+// out-of-line child of a funnel is covered by the parent's allow unless it says
+// otherwise, and the funnel's child-module census requires each child to say so.
+// All three are needed here and each was measured at extraction; the counts are
+// in the review clause.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
