@@ -75,7 +75,7 @@
 //! body opens a scope the scan reads declarations *inside* rather than naming a
 //! file of its own. So
 //! `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
-//! still resolves eighteen and no pinned test is renamed.
+//! still resolves `cfg::WHOLE_FILE_TEST_MODULES` and no pinned test is renamed.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once

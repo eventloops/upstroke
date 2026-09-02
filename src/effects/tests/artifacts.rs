@@ -52,7 +52,8 @@
 //! `runner::container::resolve::tests::no_module_outside_the_container_runner_writes_a_container_intent`
 //! are green with this file in their domain, and
 //! `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
-//! still resolves eighteen.
+//! still resolves the `cfg::WHOLE_FILE_TEST_MODULES` population, this file not
+//! among them.
 //!
 //! The three effect denials are **restored** here rather than inherited.
 //! `super` allows them because it drives a compiler over fixtures it creates
