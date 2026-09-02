@@ -2755,8 +2755,8 @@ fn the_checked_in_residue_class_record_is_what_the_enums_generate() {
     // `command_internal_sub_effects` says "N frozen per site in the registry";
     // `src/topology/registry.rs` is PR3's and frozen, and carries no N, so the
     // record carries it and this is the cross-check that keeps the two equal.
-    let harness = fs::read_to_string(repo_root().join("src/workspace_manager.rs"))
-        .expect("src/workspace_manager.rs");
+    let harness = fs::read_to_string(repo_root().join("src/workspace_manager/tests.rs"))
+        .expect("src/workspace_manager/tests.rs");
     assert!(
         harness.contains(&format!("const SAMPLING_N: u32 = {SAMPLING_N};")),
         "the sampling harness no longer runs N = {SAMPLING_N}"

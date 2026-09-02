@@ -50,6 +50,91 @@ Every effect is issued inside a `funnel` call taking an `EffectSiteId` by value 
 function returns a `File`, an `OpenOptions` or a `Command`."""
 
 [[funnel]]
+path = "src/workspace_manager/fixture.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] pub(crate) mod fixture;` of src/workspace_manager.rs"
+review = """
+The Worktree/Snapshot/Ref/Object funnel's shared test fixture, extracted from \
+`src/workspace_manager.rs` into a sibling file and given attributes of its own \
+IN THE SAME COMMIT -- never inheriting one. A Rust lint level is scoped by the \
+MODULE TREE and not by the file, so this file would otherwise have inherited \
+`src/workspace_manager.rs`'s inner allow of all three lints silently: that is \
+`PR6-LANEF-004`, and this is the first out-of-line child this funnel has had. \
+`runner::container::tests::every_child_module_of_the_container_funnel_states_\
+its_own_lint_level` is the census that refuses such a child, and its `FUNNELS` \
+domain does NOT reach this parent -- so nothing was red and the level is \
+written here because the hole is the same one, not because a gate caught it. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
+calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
+all three lints; this row allows TWO of that three, so it is a strict subset \
+and the move changes where the level is stated, not what it permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 15 sites -- it builds and \
+tears down the scratch repositories the suites measure against \
+(`fs::create_dir_all` 5, `fs::write` 4, `fs::remove_dir_all` 2, \
+`fs::remove_file` 1) and runs real children (`Command::output` 1, \
+`Command::status` 1, `Command::spawn` 1), because no funnel owns `git init` and \
+a fixture that never runs `git` builds no repository to measure; \
+`clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
+`clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
+at zero sites, and the two `#[cfg(windows)]` bodies a Unix host cannot measure \
+are `ExitStatus` arithmetic naming no macro -- so a `println!` here is still a \
+build error. \
+CONTAINMENT, STATED AS IT IS. Every write and every directory creation is under \
+a root from `scratch`, which is `std::env::temp_dir()` joined with a name \
+carrying the tag, the process id and a per-call ordinal, and `Fixture::drop` \
+removes its own root. Two effects are NOT confined to that root, and they are \
+named rather than elided: `scratch` opens with `let _ = \
+fs::remove_dir_all(&dir)` on that predictable path, so a process-id collision \
+after a crashed run can delete a stale tree this call did not create; and \
+`run_kill_child` re-execs THIS test binary `--exact --ignored` while `git_out` \
+and `KillableGitChild::spawn` run the system `git` in a caller-supplied \
+directory. Both bodies are byte-identical to what already ran inside the parent. \
+HANDLES, PRECISELY, because a blanket claim here would be false: no item returns \
+a `File`, an `OpenOptions` or a `Command`, but one DOES hand back a live process \
+handle and it is named rather than covered. `KillableGitChild::spawn` returns a \
+`pub(crate)` type owning a `std::process::Child`, because the residue kill \
+sampler has to kill a real `git` at a chosen instant and a handle it cannot \
+reach is a kill it cannot time. Its `child` field is private, it exposes only \
+`kill`, `exited`, `wait` and `fired`, and the whole module is `#[cfg(test)]` so \
+the type is not in the rlib at all. \
+Recorded here rather than left inherited, so the scope is a reviewed artifact \
+rather than an accident of the module tree."""
+
+[[funnel]]
+path = "src/workspace_manager/tests.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/workspace_manager.rs"
+review = """
+The Worktree/Snapshot/Ref/Object funnel's own test module, extracted from \
+`src/workspace_manager.rs` into a sibling file and given an attribute of its \
+own IN THE SAME COMMIT -- never inheriting one, for the `PR6-LANEF-004` reason \
+the `fixture.rs` row above states in full. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. This file's three lints are exactly \
+the three `src/workspace_manager.rs` already allowed at file scope, and these \
+same bodies made these same calls under that allow before the extraction: an \
+equal set, so a subset, and the move changes where the level is stated and not \
+what it permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 88 sites -- it drives the \
+site-taking APIs and plants the residue and the husks they are meant to find \
+(`fs::write` 49, `fs::create_dir_all` 15, `fs::remove_dir_all` 6, \
+`fs::remove_file` 6, `fs::rename` 6, `std::os::unix::fs::symlink` 2, \
+`std::io::Write::write_all` 1) and drives real Git children \
+(`Command::spawn` 2, `Command::output` 1); `clippy::disallowed_types`, 3 \
+sites, every one `std::process::Command`; `clippy::disallowed_macros`, 3 \
+sites, every one `std::println` in a diagnostic. \
+CONTAINMENT, STATED AS IT IS. The filesystem effects are under roots \
+`fixture::scratch` minted, with the predictable-path pre-clean that row \
+describes; the process effects are the system `git` and re-execs of this test \
+binary. HANDLES: nothing in this file is `pub` or `pub(crate)` at all, so \
+nothing crosses the module boundary; the one type owning a live \
+`std::process::Child` -- `SampledChild`, the kill sampler's handle -- is \
+private, as is its constructor. \
+Recorded here rather than left inherited, so the scope is a reviewed artifact \
+rather than an accident of the module tree."""
+
+[[funnel]]
 path = "src/topology/effects.rs"
 allows = []
 packet = "effect_site_inventory.mechanism (2): named in the funnel-module list"
@@ -384,11 +469,109 @@ censused; the module is `#[cfg(test)]`, so it is in no production region and \
 not in the rlib at all -- which is why its `Clone`/`Copy`/`Default`/by-value \
 refusals are compiler-decided inside the crate rather than rlib fixtures \
 beside `PrivateHalfProof`'s. \
-AND IT CARRIES NO ATTRIBUTE OF ITS OWN. It is INLINE, so the file-scope allow \
-this row records IS its lint level by the module tree -- the placement \
-`PR72-PLACEMENT-001` and `decisions/2026-08-30-readiness-lint-placement.md` are \
-about from the other side, where an OUT-OF-LINE child inherited a level nobody \
-had written down."""
+AND SINCE W1 IT CARRIES AN ATTRIBUTE AND A ROW OF ITS OWN. It was INLINE, so \
+the file-scope allow this row records WAS its lint level by the module tree; it \
+is now the sibling file `src/rundir/scratch_tree.rs`, which is exactly the \
+OUT-OF-LINE shape `PR72-PLACEMENT-001` and \
+`decisions/2026-08-30-readiness-lint-placement.md` are about -- a child \
+inheriting a level nobody had written down -- so it states its own and its row \
+below records the two lints it needs of the three this file allows."""
+
+[[funnel]]
+path = "src/rundir/scratch_tree.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] pub(crate) mod scratch_tree;` of src/rundir.rs"
+review = """
+The second deletion-authority token and its witnesses, extracted from \
+`src/rundir.rs` into a sibling file and given attributes of its own IN THE SAME \
+COMMIT -- never inheriting one. The row above reviewed this module's recursive \
+deletion while it was INLINE, where the file-scope allow was its lint level by \
+the module tree; it is out of line since W1, so that paragraph now points here \
+and this file states its own level. `PR6-LANEF-004` is the shape it would \
+otherwise have taken. `runner::container::tests::every_child_module_of_the_\
+container_funnel_states_its_own_lint_level` is the census that refuses such a \
+child and its `FUNNELS` domain does NOT reach this parent -- so nothing was red, \
+and the level is written here because the hole is the same one, not because a \
+gate caught it. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
+calls inside `src/rundir.rs`, under that file's own inner allow of all three \
+lints; this row allows TWO of that three, a strict subset, and the move changes \
+where the level is stated and not what it permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 14 sites -- `fs::create_dir` \
+3, ONE of which is `acquire_named`'s exclusive, non-recursive create, the call \
+that MINTS the token, the other two seeding an occupied-root witness; \
+`fs::write` 5, seeding witnesses inside trees already acquired; \
+`fs::remove_dir_all` 1, which is the point of the module -- `remove_tree`, the \
+real remover, reachable only with a `ScratchTreeOwnership` taken by value; \
+`std::io::Write::write_all` 2 and `std::io::Write::flush` 1 in \
+`report_to_stderr`, which exists precisely BECAUSE the print macros panic on a \
+write error during an unwind; `fs::File::options` 1, opening `/dev/full` on the \
+Linux leg, the only reachable device that accepts a descriptor and refuses the \
+bytes; and `Command::output` 1. `clippy::disallowed_types`, 1 site, the \
+`std::process::Command` in `one_test_as_a_child`, which re-execs this test \
+binary `--exact` because the channel under observation is a real fd 2 and no \
+in-process double is one. \
+`clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
+at zero sites, and deliberately rather than incidentally: this module's report \
+path is written through a stderr handle for the stated reason that `eprintln!` \
+panics on a write error, so a print macro appearing in this file is a build \
+error and not a style note. \
+CONTAINMENT. Every filesystem effect is under a root `acquire` created with a \
+non-recursive exclusive `fs::create_dir` of a fresh-ULID name -- so the root did \
+not exist before the token did, an occupied or undecidable root refuses without \
+pre-cleaning anything, and there is no path-taking removal a caller could aim \
+at an ancestor; `Remover` stays module-private for that reason. Two effects are \
+outside any such tree and are named rather than elided: one diagnostic line on \
+the process's own stderr, and the re-exec above. `/dev/full` is opened \
+write-only and by construction accepts no bytes. \
+IT STILL ADDS NO SITE, and the counts above are the whole of what changed: \
+reclaiming a test's scratch tree is not an engine effect, so there is no \
+`RunDirSite` variant, no `effect_sites.json` row and nothing censused. \
+`decisions/2026-08-30-test-scratch-tree-ownership.md` is the record."""
+
+[[funnel]]
+path = "src/rundir/tests.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/rundir.rs"
+review = """
+The run-directory, answer and lock funnels' own test module, extracted from \
+`src/rundir.rs` into a sibling file and given an attribute of its own IN THE \
+SAME COMMIT -- never inheriting one, for the `PR6-LANEF-004` reason the \
+`scratch_tree.rs` row above states in full. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. This file's three lints are exactly \
+the three `src/rundir.rs` already allowed at file scope, and these same bodies \
+made these same calls under that allow before the extraction: an equal set, so \
+a subset, and the move changes where the level is stated and not what it \
+permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 87 sites -- it plants husks \
+and residue for the funnels to classify (`fs::create_dir_all` 38, `fs::write` \
+13, `fs::remove_file` 6, `fs::remove_dir_all` 3, `std::io::Write::flush` 3, \
+`fs::rename` 2, `fs::set_permissions` 2, `std::os::unix::fs::symlink` 2, \
+`fs::create_dir` 1, `fs::hard_link` 1, `fs::File::options` 1), runs real \
+children (`Command::spawn` 4, `Command::status` 2, `Command::output` 1) and \
+reaches libc directly for the two contracts no safe wrapper expresses -- \
+`libc::fork` 2, `libc::waitpid` 2 and `libc::_exit` 2 for a SECOND PROCESS \
+holding a lock, `libc::flock` 1 for the advisory lock itself, and \
+`libc::mkfifo` 1 for a path that blocks on open, which is how the lock funnel's \
+contention and refusal paths are reached at all; `clippy::disallowed_types`, 7 \
+sites, every one `std::process::Command`; `clippy::disallowed_macros`, 3 sites, \
+every one `std::println` in a diagnostic. \
+CONTAINMENT, STATED AS IT IS. The filesystem effects are under a root from this \
+file's own `scratch`, which is `std::env::temp_dir()` joined with a tag and the \
+process id, and which opens with `let _ = fs::remove_dir_all(&dir)` on that \
+predictable path -- so a process-id collision after a crashed run can delete a \
+stale tree this call did not create. That is the older, pre-token shape \
+`scratch_tree::acquire` was written to replace; the body is byte-identical to \
+what already ran inside the parent, and this row records the hazard rather than \
+implying a containment the file does not have. The process effects are forks of \
+this test binary and re-execs of it. HANDLES: nothing in this file is `pub` or \
+`pub(crate)` either; the seven `pub fn`s a grep finds are inside the \
+raw-string rustc fixtures, whose interiors are compile-refusal source rather \
+than items of this module. \
+Recorded here rather than left inherited, so the scope is a reviewed artifact \
+rather than an accident of the module tree."""
 
 [[funnel]]
 path = "src/interaction.rs"
