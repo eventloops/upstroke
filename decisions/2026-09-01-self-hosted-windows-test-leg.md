@@ -8,8 +8,12 @@ single-use just-in-time runner config. `lint (windows)` and the Windows MSRV leg
 stay on `windows-latest`, and `lint (windows)` gains a `cargo build
 --all-targets` step, so GitHub's runner still compiles, code-generates and
 links every `#[cfg(windows)]` body on current stable, the library, the binaries
-and their test harnesses, in the dev profile every leg here builds; only
-execution moves. The new job does not merely run the suite: it counts what
+and their test harnesses, in the dev profile. `cargo test` builds the test
+profile, which inherits from dev and is identical to it until the manifest says
+otherwise, and that compile now happens on the guest with the image's
+toolchain; so what moves is execution and the test-profile compile with it, and
+a `[profile.test]` override that splits the two is a manifest edit in the diff.
+The new job does not merely run the suite: it counts what
 libtest reported and fails below a floor, so the one leg that left GitHub's
 runners is the one leg that says it ran. `upstroke-ci` requires it like every
 other.
@@ -138,10 +142,15 @@ closes only if Cargo stops growing. Two drafts of this change tried to refuse
 the routes, one shell step per machine, and the review found a route past each
 draft. So the leg checks the effect instead: `cargo test` on the guest is
 followed, in the same pinned step, by a sum of the `test result: ok.` counts
-libtest printed and a floor of 1700 — today it reports 1770 there — and no
-arrangement of runners, Cargo homes or manifests produces those lines without
-executing the tests. One equality over one script, in the class every pin here
-belongs to, in place of an enumeration that was wrong twice.
+libtest printed and a floor of 1700 — at `cb8ac1f` it reports 1771 there, 1761
+from the lib harness and 10 from the bin one. A wrapper that executes nothing
+and prints nothing leaves no such line, whichever route installed it, and that
+is every misconfiguration and every lazy substitution. It is not every
+substitution: a wrapper written to print libtest's summary line clears the
+floor, and so does a decoy crate whose `harness = false` main prints it. Both
+are a forgery, on the machine or in the diff, and the next paragraph is where
+forgeries are bounded. One equality over one script, in the class every pin
+here belongs to, in place of an enumeration that was wrong twice.
 
 **What none of this can do, stated plainly.** A pull request that edits
 `ci.yml` can delete those steps, and the oracle that would notice is a Rust
@@ -215,7 +224,7 @@ overlay-per-job loop, and the guest provisioning that reproduces the image.
    boot the base, change, shut down, recreate the overlays — recorded when it
    happens, and due whenever the repository's `stable` expectations move.
 3. The floor on the self-hosted leg is a measured number, and measured
-   numbers age. It is 1700 against 1770 reported today. A change that removes
+   numbers age. It is 1700 against the 1771 reported at `cb8ac1f`. A change that removes
    that many Windows tests, or that gates them behind a feature, edits the
    floor in the same change and says so; a change that finds the leg failing on
    the floor has found either that, or a suite that stopped executing.

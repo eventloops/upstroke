@@ -46,8 +46,13 @@ pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 /// unit-test harnesses, plus examples and integration tests. It executes
 /// nothing, so the suite's execution stays where the decision record put it.
 ///
-/// In the dev profile, which is what every Cargo command in this workflow
-/// builds. A link failure that needs `--release` is not covered here and is not
+/// In the dev profile. `cargo test` builds the test profile, which inherits
+/// from dev and is identical to it until the manifest says otherwise, and that
+/// compile happens on the guest with the image's toolchain; so what stays
+/// hosted on current stable is the dev-profile compile and link of every
+/// target, and what moves with execution is the test-profile compile. A
+/// `[profile.test]` override that splits the two is a manifest edit in the
+/// diff. A link failure that needs `--release` is not covered here and is not
 /// covered on `master` either; `release.yml` builds the shipped artifact with
 /// `--release`, and that build failing is a red release, not a green CI over a
 /// broken tree.
@@ -73,8 +78,8 @@ pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, WINDOWS
 /// The count the self-hosted leg's suite must report before the job is allowed
 /// to succeed.
 ///
-/// Today it reports 1770 there: 1760 from the lib harness, 10 from the
-/// integration one. The floor sits below that by a margin wide enough that
+/// At `cb8ac1f` it reports 1771 there: 1761 from the lib harness, 10 from the
+/// bin one, 0 from the example. The floor sits below that by a margin wide enough that
 /// ordinary churn does not touch it and narrow enough that a suite which
 /// silently stopped running cannot clear it. Dropping this many Windows tests
 /// is a deliberate act, and it edits this number in the same change.
@@ -93,8 +98,13 @@ pub(super) const WINDOWS_TEST_FLOOR: u32 = 1700;
 /// another one. Three of those five are written where nothing reading this
 /// repository can see them, the fifth has as many spellings as TOML has
 /// whitespace, and the list closes only if Cargo stops growing. A count does
-/// not enumerate them: a suite that did not execute reports no `test result:
-/// ok.` line, whichever route stopped it.
+/// not enumerate them: a wrapper that executes nothing and prints nothing
+/// leaves no `test result: ok.` line, whichever route installed it, and that
+/// is every misconfiguration and every lazy substitution. It is not every
+/// substitution. A wrapper written to print libtest's summary line clears the
+/// floor, and so does a decoy crate whose `harness = false` main prints it;
+/// both are a forgery, on the machine or in the diff, and the paragraph below
+/// is where forgeries are bounded.
 ///
 /// What it does not do is bound a hostile candidate, and no step in this file
 /// does. An edit to `ci.yml` deletes this one as easily as the guards it

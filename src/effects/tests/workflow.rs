@@ -763,6 +763,25 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
         }
     }
 
+    // The image carries the compiler this leg runs, and re-curation is how it
+    // moves. So an install step here is not a convenience: it selects a
+    // toolchain the workflow never curated, and the hosted legs' pin on
+    // `stable` never reaches this job, since `toolchain_complaints` is asked
+    // about the jobs that install and this one does not. The action and its
+    // `toolchain` input are allowlisted for those jobs, which is why the
+    // step-pin check alone accepted it. Zero installs, as an equality.
+    // Measured, `MUT-TEST-WINDOWS-TOOLCHAIN-INSTALLED`.
+    for (index, step) in steps_of(job).iter().enumerate() {
+        if scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION)) {
+            out.push(format!(
+                "[test-windows-toolchain] `{TEST_WINDOWS_JOB}` step {index} installs a \
+                 toolchain. The golden image carries the compiler this leg runs; a step here \
+                 selects one the workflow never curated, and a Windows test gated on a newer \
+                 compiler is then omitted on the one leg that executes it."
+            ));
+        }
+    }
+
     let expected_labels: BTreeSet<String> = TEST_WINDOWS_LABELS
         .iter()
         .copied()
@@ -1933,6 +1952,25 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         anchor: "          if ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
         replacement: "          if ($passed -lt 0) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
         refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-TOOLCHAIN-INSTALLED",
+        escape: "the pinned toolchain action, with its allowlisted `toolchain` and `components` \
+                 inputs, is inserted after the self-hosted checkout with `toolchain: 1.96.0`. \
+                 Every step-level pin still holds -- the action is allowlisted, its input keys \
+                 are allowlisted, the components value is pinned -- and the suite runs on a \
+                 compiler the image never carried. A Windows test enabled only on 1.97 and \
+                 later is omitted on the one leg that executes it, and the aggregate is green. \
+                 Found by the ninth review pass: the hosted jobs pin `stable` through \
+                 `toolchain_complaints`, and this job, which installs nothing, was never asked.",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20     - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c\n\
+                      \x20       with:\n\
+                      \x20         toolchain: 1.96.0\n\
+                      \x20         components: clippy\n",
+        refused_as: "test-windows-toolchain",
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-RENAMED-AWAY",

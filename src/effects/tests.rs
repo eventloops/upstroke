@@ -1709,18 +1709,15 @@ fn no_repository_file_overrides_what_ci_compiles_or_runs() {
     );
     // Package selection, for the same reason. `--all-targets` applies to the
     // packages Cargo selected, and `workspace.default-members` chooses them.
-    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
-    // A section header, not a spelling. `[ workspace ]` is the same table to
-    // Cargo and a different string to a literal comparison, which is how the
-    // first version of this check read.
-    let declares_workspace = manifest.lines().any(|line| {
-        line.trim()
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|name| name.trim() == "workspace")
-    });
+    // TOML's parser, not a spelling. `[ workspace ]`, `[workspace] # note` and a
+    // root `workspace.default-members = [...]` are one table to Cargo and three
+    // different strings to a line scan, which is how the first two versions of
+    // this check read and how each was shown a spelling it missed.
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml"))
+            .expect("Cargo.toml parses");
     assert!(
-        !declares_workspace,
+        manifest.get("workspace").is_none(),
         "Cargo.toml declares a workspace, so `--all-targets --all-features` no longer selects \
          this crate: `default-members` decides, and a member with no tests makes every CI \
          command succeed without running this suite."
