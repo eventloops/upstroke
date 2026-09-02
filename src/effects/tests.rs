@@ -2127,15 +2127,20 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 //     `#[cfg]`s conjoin, and so does every enclosing guard -- the module block it
 //     sits in, and, for a whole-file module, the `mod name;` declaration that
 //     names the file -- whether the guard is written on that declaration or on
-//     an inline module enclosing it. Eighteen files in this tree are reached
-//     only that way.
+//     an inline module enclosing it. The files `cfg::WHOLE_FILE_TEST_MODULES`
+//     lists are reached only that way.
 
 // The census is `cfg`, beside this file; the two tests below are what it answers
 // to. It decides predicates against `ci_model`'s targets -- the same table the
 // workflow contract above is checked against -- so "no runner compiles this
 // body" and "no job lints that platform" cannot drift apart.
+//
+// `pub(crate)` for one item and one reader: `cfg::WHOLE_FILE_TEST_MODULES` is
+// the crate's only statement of the whole-file test-module population, and
+// `engine::topology::recover::tests` floors its skip count at that list's
+// length. Nothing else here is reachable from outside this directory.
 
-mod cfg;
+pub(crate) mod cfg;
 
 use cfg::{
     CFG_CENSUS_CONTROL, CFG_ESCAPES, CFG_GATE_FLOOR, CONTROL_GATES, CfgForm, CfgSite,
@@ -2313,11 +2318,12 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
         .map(|site| site.path.as_str())
         .collect();
     assert!(
-        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES,
+        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES.len(),
         "only {} file(s) carry a `test` guard the census resolved, and \
          `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names` \
-         resolves {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
-        under_a_file_guard.len()
+         resolves {} whole-file test modules on its own",
+        under_a_file_guard.len(),
+        WHOLE_FILE_TEST_MODULES.len()
     );
 
     let mut uncovered: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -3501,6 +3507,139 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
         );
         assert!(scan_module_declarations(refused).is_err());
     }
+}
+
+/// Whether a declaration is the literal `#[cfg(test)] mod tests;` form: that
+/// name, at its parent's own top level, under **that** guard rather than one
+/// that merely implies it.
+///
+/// Read by `the_whole_file_modules_are_read_from_the_declarations`, which
+/// compares the files these resolve to against the `tests.rs` half of
+/// `cfg::WHOLE_FILE_TEST_MODULES` — the half a `file_stem == "tests"` census
+/// finds — and driven over synthetic input by
+/// `a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form`.
+///
+/// **The guard has to *be* `test`, and that is the repair.** Membership used to
+/// be an empty `inline_path` and `name == "tests"`, which never looked at the
+/// guard at all — so `#[cfg(all(test, unix))] mod tests;` counted as the plain
+/// form: same name, same file stem, still test-only, every comparison green,
+/// while rustc compiles no such module on Windows and a census skipping by file
+/// name goes on skipping a file that is not there. A repository whose
+/// first-class target is Windows would have lost a whole test module on it with
+/// the Linux suite green — the exact failure this census family exists to
+/// catch. PR #101's reviewer found it and supplied the reproduction.
+///
+/// **The equality is predicate identity, not a text approximation.** `guard` is
+/// `Predicate::render`'s output, and `Predicate::Test` is the only predicate
+/// that renders as the bare `test`: `Other` is constructed for an atom whose
+/// name is not `test`, or for a `name = "value"` form, and every combinator
+/// renders with its own parentheses.
+///
+/// A guard written equivalently but not identically — `all(test)` — is refused
+/// here too, and that direction is deliberate. It fails loudly, naming the
+/// file, where admitting it means deciding equivalence for a rule whose whole
+/// job is to say which files a *file-name* census may skip; a loud failure
+/// costs a sentence in the slice that writes one, and the other direction costs
+/// a platform.
+///
+/// A narrowed declaration is still test-only and still belongs in the domain
+/// list. `cfg::WHOLE_FILE_TEST_MODULES`' doc comment says what happens then and
+/// why the resulting disagreement is the signal.
+///
+/// Takes the three fields rather than a declaration, so the scan's own
+/// `ScannedDeclaration` and the resolved `TestModuleDeclaration` are decided by
+/// this one rule instead of by two copies of it
+/// (`PR5D-VISIBILITY-CHECK-DUPLICATED`).
+fn is_the_literal_mod_tests_form(name: &str, inline_path: &[String], guard: &str) -> bool {
+    name == "tests" && inline_path.is_empty() && guard == "test"
+}
+
+/// A narrowed guard is still a whole-file test module and is **not** the
+/// literal `#[cfg(test)] mod tests;` form.
+///
+/// The reproduction PR #101's reviewer supplied, driven over synthetic input
+/// rather than by a real narrowed declaration under `src/`: writing one there
+/// would make the tree the fixture and would cost that module its Windows
+/// compilation for as long as it stood.
+///
+/// The mutation is one field wide. Every input the membership rule used to read
+/// is identical between the positive and the negative below — the name, the
+/// empty inline path, the resolved file stem, and `test_only` — so a rule that
+/// does not read the guard cannot tell them apart, and nothing else in this
+/// crate would have said so.
+#[test]
+fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form() {
+    use crate::effects::census_domain::{ScannedDeclaration, scan_module_declarations};
+
+    fn only(source: &str) -> ScannedDeclaration {
+        let mut found = scan_module_declarations(source)
+            .unwrap_or_else(|refusal| panic!("the fixture is readable: {refusal}"));
+        assert_eq!(found.len(), 1, "{source:?} -> {found:#?}");
+        found.remove(0)
+    }
+    fn literal(declaration: &ScannedDeclaration) -> bool {
+        is_the_literal_mod_tests_form(
+            &declaration.name,
+            &declaration.inline_path,
+            &declaration.guard,
+        )
+    }
+
+    // The positive: the form the `tests.rs` half of the census domain is a list
+    // of, and the one a `file_stem == "tests"` census may skip.
+    let plain = only("#[cfg(test)]\nmod tests;\n");
+    assert_eq!(plain.guard, "test");
+    assert!(plain.test_only);
+    assert!(literal(&plain), "{plain:#?}");
+
+    // The negatives, written both ways a narrowing reaches the declaration: one
+    // attribute carrying a conjunction, and two attributes conjoined.
+    for narrowed in [
+        "#[cfg(all(test, unix))]\nmod tests;\n",
+        "#[cfg(test)]\n#[cfg(unix)]\nmod tests;\n",
+    ] {
+        let declaration = only(narrowed);
+        assert_eq!(declaration.name, plain.name);
+        assert_eq!(declaration.inline_path, plain.inline_path);
+        assert!(
+            declaration.test_only,
+            "a narrowed guard still entails `test`, so the file is still a whole-file test \
+             module and still belongs in the census domain: {declaration:#?}"
+        );
+        assert_ne!(
+            declaration.guard, plain.guard,
+            "the guard is the only field that differs, so it is the only field that can \
+             distinguish them"
+        );
+        assert!(
+            !literal(&declaration),
+            "{narrowed:?} is not the literal `#[cfg(test)] mod tests;` form: rustc compiles no \
+             such module where the narrowing is false, and a census that counted it as the plain \
+             form would skip a file that is not there and lose the module on that platform in \
+             silence: {declaration:#?}"
+        );
+    }
+
+    // The other two ways out of the subset, so the guard is not the only thing
+    // this rule reads: the inline ancestry `readiness.rs` is reached through,
+    // and a declared name that is not `tests`. Both carry the bare `test` guard,
+    // so each isolates one condition.
+    let inherited = only("#[cfg(test)]\nmod test_support {\n    pub(crate) mod readiness;\n}\n");
+    assert_eq!(
+        (inherited.guard.as_str(), inherited.name.as_str()),
+        ("test", "readiness")
+    );
+    assert!(
+        inherited.test_only && !literal(&inherited),
+        "{inherited:#?}"
+    );
+    let other_name = only("#[cfg(test)]\nmod scaffold;\n");
+    assert_eq!(other_name.guard, "test");
+    assert!(other_name.inline_path.is_empty());
+    assert!(
+        other_name.test_only && !literal(&other_name),
+        "{other_name:#?}"
+    );
 }
 
 /// The resolver **refuses** every shape it cannot resolve, rather than guessing.
