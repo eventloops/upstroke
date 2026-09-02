@@ -98,7 +98,10 @@ pub(super) mod oracles {
     use std::fs;
 
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
-    use crate::effects::tests::{is_the_literal_mod_tests_form, repo_root, scanned_sources};
+    use crate::effects::tests::{
+        crate_roots, is_the_literal_mod_tests_form, repo_root, scanned_source_files,
+        scanned_sources,
+    };
     use crate::effects::{
         TOPOLOGY_MODULES, blank_comments, blank_comments_and_strings, externally_reachable_fns,
         production_code, production_region,
@@ -168,7 +171,7 @@ pub(super) mod oracles {
     /// The census keeps its floor, its control and its staleness check; this
     /// counts and decides nothing.
     pub(in crate::effects::tests) fn topology_funnel_callers(
-        sources: &[(String, String)],
+        sources: &[(std::path::PathBuf, String, String)],
         substrate: &[&str],
     ) -> (usize, Vec<String>, BTreeSet<String>) {
         const FUNNELS: &[&str] = &[
@@ -182,7 +185,7 @@ pub(super) mod oracles {
         let mut topology = 0;
         let mut callers = Vec::new();
         let mut excluded = BTreeSet::new();
-        for (path, source) in sources {
+        for (relative, path, source) in sources {
             let path = path.as_str();
             let is_topology = TOPOLOGY_MODULES
                 .iter()
@@ -197,8 +200,30 @@ pub(super) mod oracles {
             // that meeting an entry is evidence the entry still names a
             // topology module in the walk -- which is what the census asserts
             // about the set this returns.
-            if substrate.contains(&path) {
-                excluded.insert(path.to_owned());
+            //
+            // **Which of the two readings decides what.** `path` is the lossy
+            // rendering and it is what *classifies* -- the two prefix tests
+            // above are over text, they are what this census always did, and a
+            // wrong answer there can only pull a file in. `relative` is the
+            // real path and it is what establishes *identity*, because this is
+            // where a wrong answer pushes a file out. `CODING_STANDARDS.md` §8:
+            // a lossy display string is for diagnostics only, never identity.
+            // The rendering rewrites `\` to `/`, so on Unix a file literally
+            // named `fold\tests.rs` -- one component, a different file -- reads
+            // as the listed `fold/tests.rs` and a text comparison would skip
+            // it. `Path` compares component-wise: on Unix that name does not
+            // match, and on Windows, where `\` is a separator, it does, which
+            // is right, because there it is the same file.
+            //
+            // The **entry** that matched goes in the set, not the path that met
+            // it: the census compares what it gets back with `SUBSTRATE`
+            // itself, so the two sides must be written in the same alphabet.
+            if let Some(entry) = substrate
+                .iter()
+                .copied()
+                .find(|entry| relative.as_path() == std::path::Path::new(entry))
+            {
+                excluded.insert(entry.to_owned());
                 continue;
             }
             topology += 1;
@@ -235,41 +260,53 @@ pub(super) mod oracles {
     /// quietly on a tree whose two excluded files happen to name no funnel.
     ///
     /// The domain is constructed and nothing is read from or written to disk:
-    /// the scan is a function of the `(path, source)` pairs it is given, and
-    /// `src/topology/fold/tests.rs` really is a whole-file test module of this
-    /// tree, so the fixture names it rather than inventing a path.
+    /// the scan is a function of the `(path, rendering, source)` triples it is
+    /// given, and `src/topology/fold/tests.rs` really is a whole-file test
+    /// module of this tree, so the fixture names it rather than inventing a
+    /// path.
+    ///
+    /// **The fourth shape is the one that says why the scan compares `Path`
+    /// and not text** (`PR103-R3-002`): a file whose rendering is the listed
+    /// one and whose path is not.
     pub(in crate::effects::tests) fn the_named_substrate_is_all_the_funnel_census_skips() {
         const SUBSTRATE: &[&str] = &["src/topology/fold/tests.rs"];
+        /// A `(path, rendering, source)` triple built the way the walk builds
+        /// one, so no fixture here can pair a path with a rendering that path
+        /// would not have produced.
+        fn walked(path: &str, source: &str) -> (std::path::PathBuf, String, String) {
+            let path = std::path::PathBuf::from(path);
+            let rendered = path.to_string_lossy().replace('\\', "/");
+            (path, rendered, source.to_owned())
+        }
         let domain = vec![
             // The substrate file: a fixture building its tree through the
             // run-directory funnel, with no `#[cfg(test)]` anywhere in it. That
             // absence is the whole defect -- the file *is* its own production
             // region.
-            (
-                "src/topology/fold/tests.rs".to_owned(),
+            walked(
+                "src/topology/fold/tests.rs",
                 concat!(
                     "use super::*;\n",
                     "fn fixture(root: &Path, hooks: &mut NoHooks) -> PathBuf {\n",
                     "    crate::rundir::create_public_dir(root, hooks).expect(\"a run dir\")\n",
                     "}\n",
-                )
-                .to_owned(),
+                ),
             ),
             // The positive control, in the same call as the assertion it
             // guards: an ordinary topology module naming the same funnel in
             // production, named in no exclusion list. A scan that had stopped
             // scanning fails here rather than reporting the silence the
             // assertion beside it looks for.
-            (
-                "src/topology/queue.rs".to_owned(),
-                "pub(crate) fn enqueue() { let _ = crate::rundir::public_dir; }\n".to_owned(),
+            walked(
+                "src/topology/queue.rs",
+                "pub(crate) fn enqueue() { let _ = crate::rundir::public_dir; }\n",
             ),
             // And the topology filter is still the filter: a funnel module
             // outside `src/topology/` naming a funnel is not this census's
             // business, excluded or not.
-            (
-                "src/workspace_manager.rs".to_owned(),
-                "pub(crate) fn plan() { let _ = crate::rundir::public_dir; }\n".to_owned(),
+            walked(
+                "src/workspace_manager.rs",
+                "pub(crate) fn plan() { let _ = crate::rundir::public_dir; }\n",
             ),
         ];
 
@@ -309,6 +346,57 @@ pub(super) mod oracles {
             excluded.is_empty(),
             "an empty list removes nothing: {excluded:?}"
         );
+
+        // **The exclusion is keyed on the path, not on the rendering**
+        // (`PR103-R3-002`). One file name, one platform-dependent meaning. On
+        // Unix `fold\tests.rs` is a single component -- backslash is an ordinary
+        // character in a file name there -- so this is a *different* file from
+        // the listed `src/topology/fold/tests.rs` that happens to render as it;
+        // it must be scanned, and it is a funnel caller. On Windows `\` is a
+        // separator, so it is the same path as the listed one and skipping it
+        // is the same decision. `Path` gives both answers from one comparison;
+        // the rendering gives the Unix one wrong, and a `BTreeSet` keyed on the
+        // rendering would collapse the two so that even the staleness check
+        // could not see it.
+        let odd = walked(
+            "src/topology/fold\\tests.rs",
+            "pub(crate) fn fold() { let _ = crate::rundir::public_dir; }\n",
+        );
+        assert_eq!(
+            odd.1, "src/topology/fold/tests.rs",
+            "the premise: this name renders exactly like the listed one, or the case below is \
+             not the collision it is written for"
+        );
+        let (topology, callers, excluded) = topology_funnel_callers(&[odd], SUBSTRATE);
+        if cfg!(windows) {
+            assert_eq!(
+                (topology, callers.as_slice()),
+                (0, [].as_slice()),
+                "on Windows the two names are one path, so the entry covers it"
+            );
+            assert_eq!(
+                excluded,
+                BTreeSet::from(["src/topology/fold/tests.rs".to_owned()]),
+                "on Windows the entry is met by this file, because it is that file"
+            );
+        } else {
+            assert_eq!(
+                callers,
+                // The message carries the rendering, which is the one place a
+                // lossy string belongs: a diagnostic, compared with nothing.
+                vec!["src/topology/fold/tests.rs names `rundir::` in production".to_owned()],
+                "a file that merely renders like a SUBSTRATE entry is not that entry and is \
+                 still censused"
+            );
+            assert_eq!(
+                topology, 1,
+                "the scan read it rather than skipping it on the strength of its rendering"
+            );
+            assert!(
+                excluded.is_empty(),
+                "no entry was met: the listed file is not in this domain at all, {excluded:?}"
+            );
+        }
     }
 
     /// `decisions.pr_sequence[6].scope` ends "no topology production callers", and
@@ -321,8 +409,34 @@ pub(super) mod oracles {
     ///
     /// The scan is [`topology_funnel_callers`], which the witness beside it
     /// drives over the shapes this tree does not have; what is here is the tree
-    /// this census is about -- the real walk, the exclusion list, and the two
+    /// this census is about -- the real walk, the exclusion list, and the
     /// controls below.
+    ///
+    /// **What the exclusion list is allowed to name.** Skipping a file by name
+    /// is a hole the size of the name, so the list is held to two properties
+    /// here, before its entries are believed. Neither reads the shared resolver
+    /// -- the two path-by-path oracles below own that -- and neither can quiet
+    /// this census: each can only put a file back into it or fail outright.
+    ///
+    /// 1. **No entry is a Cargo target root** ([`crate_roots`],
+    ///    `PR72-TARGETS-001`). A file the manifest names as a target's path is
+    ///    compiled by Cargo whatever any `mod` declaration says about it, so it
+    ///    is production-reachable and excluding it by name would hide a real
+    ///    caller behind a file that is *also* a test module.
+    /// 2. **Every entry is one of the crate's own whole-file test modules**
+    ///    ([`WHOLE_FILE_TEST_MODULES`]). That list is the crate's single
+    ///    statement of which files are reached only through a `#[cfg(test)]`
+    ///    declaration, and it is pinned path by path against the resolver by
+    ///    `the_whole_file_modules_are_read_from_the_declarations`. Asserting a
+    ///    subset of it ties this exclusion to a resolver-checked statement
+    ///    without this census deriving anything, so no oracle here and no
+    ///    reader of the tree can disagree about what was skipped.
+    ///
+    /// The residual, stated rather than papered over: a listed file made
+    /// production-reachable by a route that is neither a Cargo target nor an
+    /// edit to that list is still skipped. That is the accepted property of the
+    /// precedent this copies, `runner::container::tests`' `SUBSTRATE`, and it
+    /// is the price of excluding by name at all.
     pub(in crate::effects::tests) fn topology_production_names_no_funnel() {
         /// The out-of-line test substrate under `src/topology/`, excluded **by
         /// name** rather than by a pattern, so a new one is a change here.
@@ -339,7 +453,35 @@ pub(super) mod oracles {
             "src/topology/fold/tests.rs",
         ];
 
-        let (topology, callers, excluded) = topology_funnel_callers(&scanned_sources(), SUBSTRATE);
+        // The two guards on the list, before its entries are believed. The
+        // package the inventory is read for is this repository -- `Cargo.toml`
+        // sits at the root -- so a package-relative `/`-separated entry is a
+        // repo-relative one, which is what `SUBSTRATE` and
+        // `WHOLE_FILE_TEST_MODULES` are both written in; the second is written
+        // relative to `src/`, hence the one prefix strip.
+        let roots = crate_roots();
+        for entry in SUBSTRATE {
+            assert!(
+                !roots.is_root_relative(entry),
+                "`{entry}` is a Cargo target root, so Cargo compiles it whatever declares it and \
+                 its code is production-reachable; a census may not drop it by name"
+            );
+            let under_src = std::path::Path::new(entry)
+                .strip_prefix("src")
+                .expect("a SUBSTRATE entry is under `src/`");
+            assert!(
+                WHOLE_FILE_TEST_MODULES
+                    .iter()
+                    .any(|module| module.as_path() == under_src),
+                "`{entry}` is not in `WHOLE_FILE_TEST_MODULES`, the crate's only statement of \
+                 which files nothing but a `#[cfg(test)]` declaration reaches. Only such a file \
+                 has no production region for `production_region` to cut, which is the whole \
+                 reason this census may skip one"
+            );
+        }
+
+        let (topology, callers, excluded) =
+            topology_funnel_callers(&scanned_source_files(), SUBSTRATE);
         assert!(topology >= 8, "only {topology} topology modules scanned");
         assert!(callers.is_empty(), "{callers:#?}");
 

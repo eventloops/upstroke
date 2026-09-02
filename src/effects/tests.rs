@@ -147,12 +147,26 @@ fn cargo_metadata_json(manifest: &Path) -> Result<String, InventoryRefusal> {
     })
 }
 
-/// Every `src/**/*.rs` and `examples/**/*.rs`, as `(repo-relative path, source)`.
+/// Every `src/**/*.rs` and `examples/**/*.rs`, as
+/// `(repo-relative path, that path rendered, source)`.
 ///
 /// `examples/**` is beyond the mechanism sentence's `src/**/*.rs` and is scanned
 /// anyway: `cargo clippy --all-targets` compiles examples, so an ungoverned
 /// example is a hole in the same wall. Scanning wider can only find more.
-fn scanned_sources() -> Vec<(String, String)> {
+///
+/// **The path and its rendering are both here because they are not the same
+/// thing.** `CODING_STANDARDS.md` §8: a lossy display string is for diagnostics
+/// only, never identity. The rendering is `to_string_lossy` with `\` rewritten
+/// to `/`; it maps two distinct non-UTF-8 paths onto one text, and it turns a
+/// backslash — a legal character in a Unix file name — into what reads as a
+/// separator, so a caller deciding *which file this is* from the rendering can
+/// answer about a file that is not the one on disk. Callers that classify by
+/// prefix or interpolate a diagnostic want the rendering and are unaffected by
+/// either; a caller that establishes identity wants the `Path`, which compares
+/// component-wise and accepts both separators on Windows.
+/// [`scanned_sources`] is the projection for the first kind, and is what every
+/// caller that had one before this pair existed still reads.
+fn scanned_source_files() -> Vec<(PathBuf, String, String)> {
     fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -178,10 +192,28 @@ fn scanned_sources() -> Vec<(String, String)> {
             let relative = path
                 .strip_prefix(&root)
                 .expect("under the manifest")
-                .to_string_lossy()
-                .replace('\\', "/");
-            (relative, fs::read_to_string(&path).expect("read source"))
+                .to_path_buf();
+            let rendered = relative.to_string_lossy().replace('\\', "/");
+            (
+                relative,
+                rendered,
+                fs::read_to_string(&path).expect("read source"),
+            )
         })
+        .collect()
+}
+
+/// [`scanned_source_files`] as `(repo-relative path, source)`, the rendering
+/// dropped.
+///
+/// The projection, so that this reads exactly what it read before the walk
+/// carried paths: same walk, same order, same rendering, same sources. Every
+/// census that classifies a file by a path prefix or names one in a message
+/// calls this and is unchanged by the pair existing.
+fn scanned_sources() -> Vec<(String, String)> {
+    scanned_source_files()
+        .into_iter()
+        .map(|(_, rendered, source)| (rendered, source))
         .collect()
 }
 
