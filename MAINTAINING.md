@@ -14,7 +14,10 @@ contract itself.
 3. Let the inexpensive deterministic gates finish first:
    - `upstroke-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
      it is not a trusted merge boundary because a pull request can edit both workflow and validator.
-   - `upstroke-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
+   - `upstroke-ci` aggregates formatting, Clippy, the Linux and macOS test matrix, and the
+     Windows suite on its self-hosted ephemeral runner
+     (`decisions/2026-09-01-self-hosted-windows-test-leg.md`); the Windows Clippy, build-witness
+     and MSRV legs stay on GitHub's runner.
 4. If the branch is behind `master`, update it and wait for both gates again. After the review,
    a merge of `master` that leaves the pull request's diff byte-identical keeps it; step 6 says how.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent

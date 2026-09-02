@@ -153,3 +153,10 @@ artifacts (§15); records promoted here are the durable subset.
   together, releases through 0.1.0 stay AGPL, the CLA stays for relicensing agility, and the
   moat moves from the code to the mark. Owed follow-up: LICENSE/NOTICE/third-party attributions
   inside the release archives.
+- [2026-09-01 — the Windows test leg runs on a self-hosted ephemeral runner](2026-09-01-self-hosted-windows-test-leg.md):
+  `test (windows-latest)` retires; the suite runs in `test-windows` on an ephemeral
+  guest on the build box (throwaway overlay per job, single-use just-in-time
+  registration) in ~2.5 min against a hosted median of 12.5 and a tail of 21 — a
+  measured 2× host lottery no per-run lever could reach. The Clippy and MSRV
+  Windows legs stay on `windows-latest` as the compile witnesses; the fork policy
+  `all_external_contributors` bounds the runner. Owed: the host loop's token.
