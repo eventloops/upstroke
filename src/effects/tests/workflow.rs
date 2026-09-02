@@ -33,9 +33,9 @@ use super::ci_model::{
     CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
     ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB,
     MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS, REQUIRED_CONTEXT, RUSTFLAGS_KEY,
-    RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS,
-    TEST_SCRIPTS, TEST_WINDOWS_JOB, TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS,
-    WINDOWS_BUILD_WITNESS, WORKFLOW_FIELDS,
+    RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND,
+    TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB, TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS,
+    TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS,
 };
 use super::repo_root;
 
@@ -336,6 +336,7 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
             &GATE_SCRIPTS,
         ));
         out.extend(checkout_complaints(job, gate, "gate-checkout"));
+        out.extend(toolchain_complaints(job, gate, "gate-toolchain"));
     }
 
     out.extend(aggregate_complaints(doc, jobs, &job_names));
@@ -852,6 +853,58 @@ fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) ->
         }
     }
     out
+}
+
+/// Every way a job installs a compiler other than the pinned one.
+///
+/// [`PINNED_ACTIONS`] pins the action by commit; this pins the input that
+/// decides which compiler it installs. A gate downgraded from `stable` to the
+/// version the golden image already carries leaves no leg compiling on current
+/// stable, and every other pin in this contract still matches. The MSRV leg is
+/// not checked here: it pins its own floor against the manifest, in
+/// [`ci_msrv_job_complaints`]. Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
+fn toolchain_complaints(job: &Yaml, named: &str, code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, step) in steps_of(job).iter().enumerate() {
+        if !scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION)) {
+            continue;
+        }
+        let selected = field(step, "with").and_then(|with| scalar(with, "toolchain"));
+        if selected != Some(STABLE_TOOLCHAIN) {
+            out.push(format!(
+                "[{code}] `{named}` step {index} installs toolchain {selected:?}, not \
+                 `{STABLE_TOOLCHAIN}`. The action is pinned by commit; its input is what \
+                 decides which compiler runs, and a downgrade here leaves current stable \
+                 compiled by no leg at all."
+            ));
+        }
+    }
+    out
+}
+
+/// Every way the workflow's own `env:` is not the pinned mapping.
+///
+/// The whole map, as an equality. A guard per name can only refuse names
+/// somebody thought of, and the dangerous ones are the others: a Cargo target
+/// runner bound here makes `cargo test` build every harness and run none, on
+/// one target, which no other platform's leg would notice. Refusing the map
+/// wholesale refuses that class rather than that instance.
+/// Measured, `MUT-WORKFLOW-ENV-TARGET-RUNNER`.
+fn workflow_env_complaints(doc: &Yaml) -> Vec<String> {
+    let expected: BTreeMap<String, String> = WORKFLOW_ENV
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let found = field(doc, "env").and_then(scalar_map);
+    if found.as_ref() == Some(&expected) {
+        return Vec::new();
+    }
+    vec![format!(
+        "[workflow-env] the workflow's `env:` is {found:#?}, not exactly {expected:#?}. The \
+         whole mapping is pinned: a name this contract does not model can decide whether the \
+         compiled thing runs at all -- a Cargo target runner builds every harness and executes \
+         none, on one target, with every command, shell and label still matching."
+    )]
 }
 
 /// Every way the hosted Windows codegen witness fails its contract.
@@ -1419,6 +1472,7 @@ pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     out.extend(ci_test_job_complaints(doc));
     out.extend(ci_test_windows_job_complaints(doc));
     out.extend(ci_windows_build_witness_complaints(doc));
+    out.extend(workflow_env_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1795,6 +1849,42 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
         replacement: "      - uses: actions/checkout@v4\n",
         refused_as: "unpinned-action",
+    },
+    WorkflowEscape {
+        name: "MUT-GATE-TOOLCHAIN-DOWNGRADED",
+        escape: "the Windows gate installs the guest's own `1.97.1` instead of `stable`: the \
+                 hosted witness then links the same toolchain the self-hosted leg links, so no \
+                 leg compiles the Windows tree on current stable and a build script emitting a \
+                 bad link directive only on newer rustc goes green",
+        job: Some("lint-windows"),
+        anchor: "          toolchain: stable\n",
+        replacement: "          toolchain: 1.97.1\n",
+        refused_as: "gate-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-DEFAULTS-WORKING-DIRECTORY",
+        escape: "a job-level default working directory points every `run:` step at another \
+                 crate: the pinned test command tests an empty `ci-pass/` while the labels, \
+                 shells, checkout and command all still match character for character",
+        job: Some("test-windows"),
+        anchor: "    timeout-minutes: 20\n",
+        replacement: "    timeout-minutes: 20\n\
+                      \x20   defaults:\n\
+                      \x20     run:\n\
+                      \x20       working-directory: ci-pass\n",
+        refused_as: "defaults-shape",
+    },
+    WorkflowEscape {
+        name: "MUT-WORKFLOW-ENV-TARGET-RUNNER",
+        escape: "a Cargo target runner at workflow scope: every Windows test harness compiles \
+                 and none executes, because the runner script exits zero. No Unix leg reads a \
+                 Windows-target variable, and the command, shell, labels and checkout all still \
+                 match.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings\n\
+                      \x20 CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: pwsh -NoProfile -File .github/scripts/pass.ps1\n",
+        refused_as: "workflow-env",
     },
     WorkflowEscape {
         name: "MUT-WITNESS-CHECKOUT-REF",

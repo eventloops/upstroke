@@ -253,8 +253,46 @@ pub(super) const WORKFLOW_FIELDS: [&str; 6] =
     ["concurrency", "env", "jobs", "name", "on", "permissions"];
 
 /// The fields a `defaults:` mapping and its `run:` mapping may declare.
+///
+/// `working-directory:` is **not** among them. GitHub applies a job- or
+/// workflow-level default directory to every `run:` step, so
+/// `working-directory: ci-pass` beside a trivial `ci-pass/Cargo.toml` makes the
+/// pinned test command test that empty crate -- with the labels, the shells,
+/// the checkout and the command all still matching character for character.
+/// No job here needs one, so the field is refused rather than modelled.
+/// Measured, `MUT-DEFAULTS-WORKING-DIRECTORY`.
 pub(super) const DEFAULTS_FIELDS: [&str; 1] = ["run"];
-pub(super) const DEFAULTS_RUN_FIELDS: [&str; 2] = ["shell", "working-directory"];
+pub(super) const DEFAULTS_RUN_FIELDS: [&str; 1] = ["shell"];
+
+/// The workflow's `env:` mapping, pinned whole.
+///
+/// An equality rather than a guard per name. [`RUSTFLAGS_KEY`] and
+/// [`ENCODED_RUSTFLAGS_KEY`] were guarded by name because they decide what the
+/// compiler sees; but a *name this contract never thought of* decides whether
+/// the compiled thing runs at all. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER`
+/// pointed at a script that exits zero makes `cargo test` build every harness
+/// and execute none, on the Windows target only, which no Unix leg would
+/// notice. Cargo documents that setting as applying to `cargo test`. Pinning
+/// the whole map refuses every such name at once, including the ones nobody
+/// here has thought of yet. Measured, `MUT-WORKFLOW-ENV-TARGET-RUNNER`.
+pub(super) const WORKFLOW_ENV: [(&str, &str); 2] = [
+    ("CARGO_TERM_COLOR", "always"),
+    (RUSTFLAGS_KEY, RUSTFLAGS_VALUE),
+];
+
+/// The toolchain every leg but the MSRV floor installs, and the action that
+/// installs it.
+///
+/// The action is pinned by commit in [`PINNED_ACTIONS`]; this pins its
+/// **input**, which is the part that decides which compiler runs. A
+/// `lint (windows)` downgraded from `stable` to the guest's own `1.97.1` makes
+/// the hosted witness link the same toolchain the self-hosted leg already
+/// links, so nothing in CI code-generates the Windows tree on current stable
+/// and a build script emitting a bad link directive only on newer rustc goes
+/// green. The MSRV leg pins its own floor separately, from the manifest.
+/// Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
+pub(super) const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@";
+pub(super) const STABLE_TOOLCHAIN: &str = "stable";
 
 /// The shell keywords GitHub resolves to an interpreter it defines.
 ///

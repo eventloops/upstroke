@@ -97,7 +97,16 @@ identity script and the suite on the test jobs; Clippy, the witness, the
 formatter and the four shell gates on the gate jobs; the locked check on the
 MSRV leg), and every checkout step takes no inputs: an unpinned step, or an
 input on the checkout, can put another tree in front of the pinned command,
-and `test-windows` would test `master` while every other pin still held. It
+and `test-windows` would test `master` while every other pin still held. Three
+further knobs are pinned for the same reason, each of which produced a green
+aggregate over a suite that never ran the candidate: the toolchain action's
+`toolchain:` input (`stable` on every leg but the MSRV floor, which pins the
+manifest's), because the action's commit does not decide which compiler it
+installs; `defaults.run.working-directory`, refused outright, because a job
+default directory points the pinned command at another crate; and the
+workflow's whole `env:` mapping as an equality, because a Cargo target runner
+bound there builds every Windows harness and executes none, and a guard per
+name can only refuse the names somebody thought of. It
 also pins the hosted witness: exactly one `windows-latest` job carries `cargo
 build --all-targets --all-features` exactly once and that job is the Windows
 Clippy gate, since `cargo check` and Clippy stop before codegen and the guest

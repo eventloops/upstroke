@@ -1656,8 +1656,10 @@ fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
 /// shipped and as test harnesses, so a Windows-only codegen or link failure in
 /// any of them on current stable cannot pass every hosted leg; what it cannot
 /// see is a failure that needs a toolchain newer than current stable, which no
-/// leg has. The refusals are executed in [`WORKFLOW_ESCAPES`],
-/// `MUT-WINDOWS-BUILD-WITNESS-*` and `MUT-WITNESS-CHECKOUT-REF`.
+/// leg has. Its carrier's toolchain input is pinned to `stable` too: the action
+/// is pinned by commit, and the input is what decides which compiler runs. The
+/// refusals are executed in [`WORKFLOW_ESCAPES`], `MUT-WINDOWS-BUILD-WITNESS-*`,
+/// `MUT-WITNESS-CHECKOUT-REF` and `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
 #[test]
 fn the_hosted_windows_leg_still_links_every_test_binary() {
     let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
