@@ -1281,10 +1281,14 @@ pub(crate) static WHOLE_FILE_TEST_MODULES: LazyLock<Vec<PathBuf>> = LazyLock::ne
         "engine/topology/startup/tests.rs",
         "events/log/premove.rs",
         "events/log/tests.rs",
+        "rundir/scratch_tree.rs",
+        "rundir/tests.rs",
         "runner/container/census/tests.rs",
         "runner/container/fake.rs",
         "runner/container/resolve/tests.rs",
         "runner/container/tests.rs",
+        "workspace_manager/fixture.rs",
+        "workspace_manager/tests.rs",
     ];
     let out_of_order = written.windows(2).find(|pair| pair[0] >= pair[1]);
     assert!(
