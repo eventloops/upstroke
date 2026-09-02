@@ -123,15 +123,31 @@ The toolchain install must be the step after the checkout, because the action
 makes its toolchain the rustup default and anything above it runs whatever the
 runner image preinstalled -- during a release rollout, the previous stable,
 which is exactly what the current-stable witness exists to rule out. And the
-guard against the ways Cargo itself can be told not to run anything is a `bash`
-step in the `lint` job, not a Rust test. That is the one structural point in
-this contract: a `.cargo/config.toml` binding `target.<triple>.runner`, or a
-`CARGO_*_RUNNER` variable in the environment, makes `cargo test` build every
+guard against the ways Cargo itself can be told not to run anything is a shell
+step, not a Rust test. That is the one structural point in this contract: a
+`.cargo/config.toml` binding `target.<triple>.runner`, a `CARGO_*_RUNNER`
+variable in the environment, or a `[workspace]` in the root manifest whose
+`default-members` reselect the package, each makes `cargo test` compile every
 harness and execute none — so any check written as a test is a check those
-mechanisms switch off, including the check that would have refused them. The
-step therefore runs before Cargo does and reads the filesystem and the
-effective environment directly. The Rust tests stay as the checks that fail on
-a developer's machine, where the workflow step does not run.
+mechanisms switch off, including the check that would have refused them. Two
+such steps run, one per machine: `lint` reads the hosted runner's filesystem,
+environment and manifest before Cargo does, and `test-windows` reads the
+guest's, including the `%USERPROFILE%\.cargo` that no repository check can see.
+The Rust tests stay as the checks that fail on a developer's machine, where
+neither step runs.
+
+**What none of this can do, stated plainly.** A pull request that edits
+`ci.yml` can delete those steps, and the oracle that would notice is a Rust
+test the same edit can arrange not to run. There is no arrangement of
+in-repository checks that closes that loop, because every one of them is
+executed by the thing under test. `MAINTAINING.md` already says where the
+boundary actually is: `upstroke-ci` and `upstroke-pr-policy` are
+candidate-controlled and are "not the security boundary … the boundary is that
+only the owner merges, after an independent review of the exact head, and that
+the diff the owner reviews includes any change to the gates themselves." What
+the pins above buy is not self-enforcement. It is that any such edit is a
+small, named, reviewable line in that diff rather than a plausible-looking
+change to a workflow nobody reads closely.
 
 Two files outside the workflow can make any reading of it false, and both are
 now held absent by that pair --

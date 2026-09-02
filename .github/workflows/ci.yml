@@ -87,6 +87,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # The guest's own copy of the `lint` job's guard, in the shell this
+      # runner resolves. The Ubuntu step reads Ubuntu's filesystem and
+      # environment; the suite that left GitHub's runners executes here, so a
+      # runner binding in this image -- or in its `%USERPROFILE%\.cargo` --
+      # would suppress it where no repository check can see.
+      - run: foreach ($f in 'rust-toolchain.toml','rust-toolchain','.cargo/config.toml','.cargo/config',"$env:USERPROFILE\.cargo\config.toml","$env:USERPROFILE\.cargo\config") { if (Test-Path $f) { throw "$f outranks ci.yml" } }; if (Get-ChildItem Env:\ | Where-Object { $_.Name -match '^CARGO_.*RUNNER$' }) { throw 'a Cargo runner is bound in the environment' }; if (Select-String -Path Cargo.toml -Pattern '^\[workspace\]' -Quiet) { throw 'Cargo.toml declares a workspace' }
+
       - name: Configure git identity
         run: |
           git config --global user.email "ci@upstroke.local"
@@ -181,7 +188,7 @@ jobs:
       # target runner makes `cargo test` build every harness and execute none,
       # so a test forbidding that file is one the file prevents from running.
       # Pinned by the oracle as `REPO_FILE_GUARD`, exactly once in the workflow.
-      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e "$f" || { echo "$f outranks ci.yml"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }
+      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e "$f" || { echo "$f outranks ci.yml"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }; ! grep -q '^\[workspace\]' Cargo.toml || { echo 'Cargo.toml declares a workspace, so package selection is no longer this crate'; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: bash .github/scripts/test-release-record.sh

@@ -35,8 +35,9 @@ use super::ci_model::{
     MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS,
     REPO_FILE_GUARD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM,
     STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
-    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TOOLCHAIN_ACTION, TOOLCHAIN_COMPONENTS,
-    WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TEST_WINDOWS_SCRIPTS, TOOLCHAIN_ACTION,
+    TOOLCHAIN_COMPONENTS, WINDOWS_BUILD_WITNESS, WINDOWS_REPO_GUARD, WORKFLOW_ENV, WORKFLOW_FIELDS,
+    WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -797,7 +798,7 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
         job,
         TEST_WINDOWS_JOB,
         "test-windows-run-script",
-        &TEST_SCRIPTS,
+        &TEST_WINDOWS_SCRIPTS,
     ));
     out
 }
@@ -982,25 +983,37 @@ pub(super) fn ci_repo_file_guard_complaints(doc: &Yaml) -> Vec<String> {
     let Some(jobs) = field(doc, "jobs") else {
         return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
     };
-    let carriers: Vec<String> = field_names(jobs)
-        .into_iter()
-        .filter(|name| {
-            field(jobs, name).is_some_and(|job| {
-                steps_of(job)
-                    .iter()
-                    .any(|step| scalar(step, "run") == Some(REPO_FILE_GUARD))
+    let mut out = Vec::new();
+    // Two guards, because each reads one machine. The hosted one reads the
+    // Ubuntu runner; the self-hosted one reads the guest, which is where the
+    // suite that left GitHub's runners executes and therefore where a runner
+    // binding -- in the image's environment or its own Cargo home -- would
+    // suppress it unseen by anything on the hosted side.
+    for (guard, what) in [
+        (REPO_FILE_GUARD, "hosted"),
+        (WINDOWS_REPO_GUARD, "self-hosted"),
+    ] {
+        let carriers: Vec<String> = field_names(jobs)
+            .into_iter()
+            .filter(|name| {
+                field(jobs, name).is_some_and(|job| {
+                    steps_of(job)
+                        .iter()
+                        .any(|step| scalar(step, "run") == Some(guard))
+                })
             })
-        })
-        .collect();
-    if carriers.len() == 1 {
-        return Vec::new();
+            .collect();
+        if carriers.len() != 1 {
+            out.push(format!(
+                "[repo-file-guard] {carriers:?} run the {what} guard, not exactly one job. \
+                 Without it nothing outside Cargo refuses a `.cargo/config.toml`, a \
+                 `CARGO_*RUNNER` binding, or a workspace that reselects the package -- and \
+                 each of those makes `cargo test` execute no harness, which takes the Rust \
+                 tests that forbid them with it."
+            ));
+        }
     }
-    vec![format!(
-        "[repo-file-guard] {carriers:?} run the repository-file guard, not exactly one job. \
-         Without it nothing outside Cargo refuses a `.cargo/config.toml` -- and a target \
-         runner bound there makes `cargo test` build every harness and execute none, which \
-         takes the Rust test that forbids the file with it."
-    )]
+    out
 }
 
 /// Every way the workflow's own `env:` is not the pinned mapping.
@@ -2039,6 +2052,17 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "unpinned-action-input",
     },
     WorkflowEscape {
+        name: "MUT-WINDOWS-GUARD-NEUTERED",
+        escape: "the guest's own guard is emptied of the files it checks, so a Cargo runner in \
+                 the golden image's `%USERPROFILE%\\.cargo` still suppresses the suite on the \
+                 one platform whose tests no other leg runs -- and nothing on the hosted \
+                 runners can see that machine's filesystem or environment",
+        job: Some("test-windows"),
+        anchor: "foreach ($f in 'rust-toolchain.toml'",
+        replacement: "foreach ($f in 'nothing-at-all.toml'",
+        refused_as: "repo-file-guard",
+    },
+    WorkflowEscape {
         name: "MUT-COMPONENTS-INJECTED",
         escape: "the toolchain action's `components` value carries shell: the action builds a \
                  command from it and interpolates it into a Bash line, so `clippy` plus a \
@@ -2064,13 +2088,14 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "gate-toolchain",
     },
     WorkflowEscape {
-        name: "MUT-REPO-FILE-GUARD-DELETED",
-        escape: "the bash guard that refuses `rust-toolchain.toml` and `.cargo/config.toml` is \
-                 removed, leaving only the Rust test -- which a `.cargo/config.toml` target \
-                 runner prevents from ever executing, since `cargo test` would then build \
-                 every harness and run none",
+        name: "MUT-REPO-FILE-GUARD-NEUTERED",
+        escape: "the hosted guard's loop is emptied, so the step still runs and refuses \
+                 nothing. What it stops is a `.cargo/config.toml` target runner, a \
+                 `CARGO_*RUNNER` binding and a workspace that reselects the package -- each of \
+                 which makes `cargo test` execute no harness, taking the Rust tests that \
+                 forbid them with it. Only a pin on the script itself can see this.",
         job: Some("lint"),
-        anchor: "      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }\n",
+        anchor: "for f in rust-toolchain.toml",
         replacement: "",
         refused_as: "repo-file-guard",
     },

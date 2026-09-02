@@ -60,6 +60,10 @@ pub(super) const GIT_IDENTITY_SCRIPT: &str = "git config --global user.email \"c
 /// Every script a test job may run: the identity script and the suite.
 pub(super) const TEST_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, TEST_COMMAND];
 
+/// The same, plus the guard the self-hosted leg runs before its suite.
+pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 3] =
+    [GIT_IDENTITY_SCRIPT, TEST_COMMAND, WINDOWS_REPO_GUARD];
+
 /// The formatter gate and the four shell gates the `lint` job runs from the
 /// repository root, character for character.
 pub(super) const FMT_GATE: &str = "cargo fmt --check";
@@ -129,7 +133,23 @@ pub(super) const ACTION_INPUTS: [(&str, &[&str]); 3] = [
 /// parsing YAML, which catches the binding wherever it was written — workflow
 /// scope reaches every job, and job- and step-level `env:` are already refused
 /// as unmodelled fields.
-pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }";
+/// The third clause is package selection. `--all-targets` applies to the
+/// packages Cargo selected, and a root manifest declaring
+/// `workspace.default-members` selects those instead of this crate: every CI
+/// command would then compile and test a crate the candidate chose, and this
+/// crate's suite -- oracle included -- would never run.
+pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }; ! grep -q '^\\[workspace\\]' Cargo.toml || { echo 'Cargo.toml declares a workspace, so package selection is no longer this crate'; exit 1; }";
+
+/// The same guard on the machine that matters, in the shell that machine
+/// resolves.
+///
+/// The Ubuntu step reads Ubuntu's filesystem and Ubuntu's environment. The
+/// suite whose execution left GitHub's runners executes on the guest, so the
+/// guest is where a runner binding would suppress it -- from the image's own
+/// environment, or from a `%USERPROFILE%\.cargo\config.toml` that no
+/// repository check can see. This step runs there, before the suite, in the
+/// platform default shell. Measured, `MUT-WINDOWS-GUARD-DELETED`.
+pub(super) const WINDOWS_REPO_GUARD: &str = "foreach ($f in 'rust-toolchain.toml','rust-toolchain','.cargo/config.toml','.cargo/config',\"$env:USERPROFILE\\.cargo\\config.toml\",\"$env:USERPROFILE\\.cargo\\config\") { if (Test-Path $f) { throw \"$f outranks ci.yml\" } }; if (Get-ChildItem Env:\\ | Where-Object { $_.Name -match '^CARGO_.*RUNNER$' }) { throw 'a Cargo runner is bound in the environment' }; if (Select-String -Path Cargo.toml -Pattern '^\\[workspace\\]' -Quiet) { throw 'Cargo.toml declares a workspace' }";
 
 /// The `components` values the toolchain action may be given.
 ///

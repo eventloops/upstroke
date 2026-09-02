@@ -1704,6 +1704,15 @@ fn no_repository_file_overrides_what_ci_compiles_or_runs() {
          can bind a target runner that reports success without executing a test binary. \
          Adding one is a deliberate act: extend this contract in the same change."
     );
+    // Package selection, for the same reason. `--all-targets` applies to the
+    // packages Cargo selected, and `workspace.default-members` chooses them.
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(
+        !manifest.lines().any(|line| line.trim() == "[workspace]"),
+        "Cargo.toml declares a workspace, so `--all-targets --all-features` no longer selects \
+         this crate: `default-members` decides, and a member with no tests makes every CI \
+         command succeed without running this suite."
+    );
 }
 
 /// The MSRV leg checks the floor the manifest publishes, on every platform.
