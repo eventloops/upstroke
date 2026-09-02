@@ -147,26 +147,12 @@ fn cargo_metadata_json(manifest: &Path) -> Result<String, InventoryRefusal> {
     })
 }
 
-/// Every `src/**/*.rs` and `examples/**/*.rs`, as `(path, repo-relative
-/// rendering, source)`.
+/// Every `src/**/*.rs` and `examples/**/*.rs`, as `(repo-relative path, source)`.
 ///
 /// `examples/**` is beyond the mechanism sentence's `src/**/*.rs` and is scanned
 /// anyway: `cargo clippy --all-targets` compiles examples, so an ungoverned
 /// example is a hole in the same wall. Scanning wider can only find more.
-///
-/// **Both a path and a rendering of it, and a caller that needs both takes both
-/// from here.** Every census in this crate compares the rendering — a
-/// repo-relative, forward-slash string, which is what `TOPOLOGY_MODULES`, the
-/// allowlist and `effects/wrappers.toml` are written in — and the whole-file
-/// test-module derivation takes paths, because a skip is a statement about a
-/// file. The rendering is one way: `to_string_lossy` maps two distinct non-UTF-8
-/// paths onto one, and `replace('\\', "/")` rewrites a byte that is a legal
-/// character in a Unix file name into what reads as a separator, so
-/// `PathBuf::from` of a rendering is a *fabricated* path — on Unix, a real
-/// `src/odd\case.rs` comes back as `src/odd/case.rs`, and a function that reads
-/// it reads nothing or reads the wrong file. `CODING_STANDARDS.md` §8. Carrying
-/// the pair keeps every caller off that round trip.
-pub(in crate::effects::tests) fn walked_sources() -> Vec<(PathBuf, String, String)> {
+fn scanned_sources() -> Vec<(String, String)> {
     fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -194,18 +180,8 @@ pub(in crate::effects::tests) fn walked_sources() -> Vec<(PathBuf, String, Strin
                 .expect("under the manifest")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let source = fs::read_to_string(&path).expect("read source");
-            (path, relative, source)
+            (relative, fs::read_to_string(&path).expect("read source"))
         })
-        .collect()
-}
-
-/// [`walked_sources`] as the `(repo-relative path, source)` pairs every census
-/// that compares text reads.
-fn scanned_sources() -> Vec<(String, String)> {
-    walked_sources()
-        .into_iter()
-        .map(|(_, relative, source)| (relative, source))
         .collect()
 }
 
@@ -2889,21 +2865,23 @@ fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {
 // "no topology production callers", and the source oracles under it
 // ---------------------------------------------------------------------------
 
-// The eleven bodies are in `source_oracles::oracles`, beside this file: the two
-// site censuses here, and, in the T-CONTAINER section further down, the five
-// that hold the two production regions and the whole-file module derivation.
-// The names in this file are the harness -- they are what the contract, CI,
+// The twelve bodies are in `source_oracles::oracles`, beside this file: the two
+// site censuses here with the exclusion witness the second of them needs, and,
+// in the T-CONTAINER section further down, the five that hold the two
+// production regions and the whole-file module derivation. The names in this
+// file are the harness -- they are what the contract, CI,
 // `effects/wrappers.toml`, `reviews/FINDINGS.md` and `--list` know -- and each
-// one delegates and does nothing else, except the two funnel-census witnesses
-// below, whose fixtures cannot be written under that file's own rule.
+// one delegates and does nothing else.
 //
-// The boundary is drawn at "reads the tree, writes nothing". All eleven do
-// exactly that, so the child restores the three effect denials `super` allows
-// and takes no allowlist entry. The needles they carry -- a funnel table, a
-// `RunnerRequest {` in prose, the container-runtime literal -- are the reason
-// the bodies sit inside a `cfg(test)` module there rather than at file level:
-// both source cutters then read them as test logic, and the census that counts
-// files naming a container runtime keeps the set it has.
+// The boundary is drawn at "reads the tree, writes nothing". All twelve do
+// exactly that -- the witness reads a domain handed to it rather than the tree,
+// which is further inside that boundary and not outside it -- so the child
+// restores the three effect denials `super` allows and takes no allowlist
+// entry. The needles they carry -- a funnel table, a `RunnerRequest {` in
+// prose, the container-runtime literal -- are the reason the bodies sit inside
+// a `cfg(test)` module there rather than at file level: both source cutters
+// then read them as test logic, and the census that counts files naming a
+// container runtime keeps the set it has.
 
 mod source_oracles;
 
@@ -2919,233 +2897,9 @@ fn no_topology_module_calls_a_funnel_in_production() {
     oracles::topology_production_names_no_funnel();
 }
 
-// **The two witnesses for the funnel census's domain filter, and their fixtures
-// are why they are here.** `source_oracles.rs` is reached by a plain `mod`
-// declaration, so it sits inside every whole-tree census's domain, and it
-// therefore refuses to spell out a terminated `#[cfg(test)] mod name;` even
-// inside a string literal -- the rule the two module-scan bodies further down
-// are here for, stated at length there. A witness whose whole subject is a file
-// reached *through* that form cannot write its fixture under that rule: the
-// declaration is the input. This file is itself a whole-file test module --
-// `effects.rs` declares it `#[cfg(test)] mod tests;` -- so no census reads it
-// and the fixtures below cost nothing.
-//
-// Both drive `oracles::topology_funnel_callers`, the census function
-// `no_topology_module_calls_a_funnel_in_production` runs, over a domain and an
-// inventory they hand it. That is what binds them to the repair rather than to
-// their own arithmetic: delete the `skipped.contains(path)` line in that
-// function and the first fails with the fixture reported as a production caller
-// and its module count one too high.
-
-/// The domain both witnesses drive the census over: a topology module that
-/// declares two test-only children, those children, and an ordinary topology
-/// module that names the same funnel in its own production region.
-///
-/// Real paths under the repository root, so the resolver's directory rule
-/// (`census_domain::module_directory`) answers about a package it knows and the
-/// renderings are the ones `TOPOLOGY_MODULES` is written in; constructed
-/// contents, because the tree has no instance of the shape -- no whole-file test
-/// module lives under `src/topology/`, which is the only reason this census has
-/// been passing. Nothing here is read from or written to disk: the derivation
-/// resolves `mod name;` against the domain it is given.
-fn topology_domain_with_a_fixture_child() -> Vec<(PathBuf, String, String)> {
-    let root = repo_root();
-    [
-        // The parent. Its own production region -- everything above the first
-        // `#[cfg(test)]` -- names no funnel, so a report about it is a report
-        // about one of its children.
-        (
-            "src/topology/registry.rs",
-            concat!(
-                "pub(crate) fn register() {}\n",
-                "\n",
-                "#[cfg(test)]\n",
-                "mod tests;\n",
-                "\n",
-                "#[cfg(test)]\n",
-                "mod fixture;\n",
-            ),
-        ),
-        // The child that names a funnel: a fixture building its tree through the
-        // run-directory funnel, with no `#[cfg(test)]` of its own anywhere -- it
-        // does not need one, because nothing in it compiles outside a test
-        // build. That is the whole defect: `production_region` has nothing to
-        // truncate at, so the file *is* the production region.
-        (
-            "src/topology/registry/tests.rs",
-            concat!(
-                "use super::*;\n",
-                "fn fixture(root: &std::path::Path) -> std::path::PathBuf {\n",
-                "    crate::rundir::create_public_dir(root).expect(\"a public run directory\")\n",
-                "}\n",
-            ),
-        ),
-        // The second child, and it is load-bearing rather than decoration:
-        // `whole_file_test_modules` refuses a derivation whose every resolved
-        // file is called `tests.rs`, because that is what the file-name rule it
-        // replaces would also have found. A one-child fixture would trip that
-        // control instead of exercising the filter.
-        (
-            "src/topology/registry/fixture.rs",
-            "pub(super) const SEED: &str = \"a plan\";\n",
-        ),
-        // The positive control, in the same call as the assertion it guards: an
-        // ordinary topology module naming the same funnel in production. It is
-        // in no declaration, so no filter may remove it, and a scan that had
-        // stopped scanning would fail here rather than report the silence the
-        // assertion beside it is looking for.
-        (
-            "src/topology/queue.rs",
-            "pub(crate) fn enqueue() { let _ = crate::rundir::public_dir; }\n",
-        ),
-    ]
-    .into_iter()
-    .map(|(relative, source)| {
-        let mut path = root.clone();
-        for part in relative.split('/') {
-            path.push(part);
-        }
-        (path, relative.to_owned(), source.to_owned())
-    })
-    .collect()
-}
-
-/// **A whole-file test module under a topology path is not a production funnel
-/// caller**, and without the filter the census reports it as one.
-///
-/// The regression witness for `PR6E-006` at
-/// `no_topology_module_calls_a_funnel_in_production`. The defect is a
-/// composition of two things that are each correct on their own: a file the
-/// crate reaches only through a test-only `mod` declaration in its parent
-/// carries no `#[cfg(test)]` marker anywhere in it, and
-/// `effects::production_region` returns everything before the first such
-/// marker. Together they make the whole of a fixture a production region, so
-/// the run-directory call a fixture makes to build its tree is
-/// indistinguishable here from one the module makes at run time.
-///
-/// Every assertion is over what the census function returned for the domain it
-/// was handed, and the domain contains the fixture: the census is what removes
-/// it, not this test.
 #[test]
-fn a_topology_fixture_in_a_whole_file_test_module_is_not_a_production_funnel_caller() {
-    let root = repo_root();
-    let domain = topology_domain_with_a_fixture_child();
-    // The floor is `1` and not the census's `13` for the reason the census's
-    // `13` exists: it is a non-vacuity guard scaled to the domain, and this
-    // domain declares two.
-    let (topology, callers, skipped) = oracles::topology_funnel_callers(&domain, crate_roots(), 1);
-
-    // The verdict: the only funnel call reported is the one in a file no
-    // declaration covers. Without the filter this list has the fixture in it
-    // too, which is the report `PR6E-006` describes.
-    assert_eq!(
-        callers,
-        vec!["src/topology/queue.rs names `rundir::` in production".to_owned()],
-        "a fixture with no production half is reading as a production funnel caller"
-    );
-    // And the silence about the fixture is not an empty walk: the module that
-    // declares it is still counted, and so is the control beside it.
-    assert_eq!(
-        topology, 2,
-        "the parent and the control are still in the census's domain: {domain:#?}"
-    );
-    // The filter took out the two children, and only them.
-    assert_eq!(
-        skipped,
-        [
-            root.join("src/topology/registry/fixture.rs"),
-            root.join("src/topology/registry/tests.rs"),
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>(),
-        "the two test-only children are the whole of what a declaration justifies removing"
-    );
-}
-
-/// **A test-only child the manifest also names as a target stays in the
-/// census**, because a declaration proves the file is reachable under
-/// `cfg(test)` and not that it is reachable *only* that way.
-///
-/// The false negative the filter would otherwise trade the false positive for,
-/// and it is the worse of the two: a census that reports a fixture is noisy, a
-/// census that misses a production caller is silent. Cargo compiles an
-/// `[[example]]`, `[[bin]]`, `[[bench]]` or `[[test]]` target with `test` false,
-/// so a `#[cfg(not(test))] fn main` in such a file is production code that
-/// `--all-targets` builds -- and `src/topology/registry/tests.rs` below is
-/// exactly that file, both a test-only `mod` of the library and a target of its
-/// own.
-///
-/// The mutation is one field wide: the same domain, the same census function,
-/// the same floor, and two inventories differing only in whether the manifest
-/// names that path. `crate_roots` cannot answer it, because this package names
-/// no such target -- which is why the census function takes an inventory rather
-/// than reading one.
-#[test]
-fn a_test_only_child_that_is_also_a_cargo_target_stays_in_the_funnel_census() {
-    let root = repo_root();
-    let domain = topology_domain_with_a_fixture_child();
-    let child = root.join("src/topology/registry/tests.rs");
-
-    // The inventory, built the way the resolver's own reader builds one, so
-    // this drives `CrateRoots::from_metadata_json` rather than a hand-made
-    // value. `to_str` rather than a lossy rendering: the document is matched
-    // back against `manifest` as a `Path`, and a rendering that had lost a byte
-    // would report `NoPackage` instead of answering.
-    let manifest = root.join("Cargo.toml");
-    let inventory = |targets: &[&std::path::Path]| {
-        let document = serde_json::json!({
-            "packages": [{
-                "manifest_path": manifest.to_str().expect("CARGO_MANIFEST_DIR is a UTF-8 literal"),
-                "targets": targets
-                    .iter()
-                    .map(|path| {
-                        serde_json::json!({
-                            "src_path": path.to_str().expect("a fixture path under it"),
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            }],
-        });
-        CrateRoots::from_metadata_json(&document.to_string(), &manifest)
-            .expect("the fixture document is well formed")
-    };
-
-    let lib = root.join("src/lib.rs");
-    let names_the_child = inventory(&[&lib, &child]);
-    let does_not = inventory(&[&lib]);
-
-    // The positive: with the child named as a target it is not skipped, it is
-    // scanned, and the funnel call in it is reported.
-    let (topology, callers, skipped) =
-        oracles::topology_funnel_callers(&domain, &names_the_child, 1);
-    assert!(
-        !skipped.contains(&child),
-        "a file Cargo compiles as a target of its own carries production code, and a test-only \
-         declaration elsewhere does not take that away: {skipped:?}"
-    );
-    assert_eq!(
-        topology, 3,
-        "the parent, the child target and the control are all in the domain"
-    );
-    assert_eq!(
-        callers,
-        vec![
-            "src/topology/registry/tests.rs names `rundir::` in production".to_owned(),
-            "src/topology/queue.rs names `rundir::` in production".to_owned(),
-        ],
-        "the census must still see a funnel call in a file Cargo builds outside `cfg(test)`"
-    );
-
-    // The negative, one field away: the same everything with the target entry
-    // dropped, and the child is skipped again. Without this pair the assertions
-    // above would also pass for a filter that had stopped filtering.
-    let (topology, callers, skipped) = oracles::topology_funnel_callers(&domain, &does_not, 1);
-    assert!(skipped.contains(&child), "{skipped:?}");
-    assert_eq!(topology, 2);
-    assert_eq!(
-        callers,
-        vec!["src/topology/queue.rs names `rundir::` in production".to_owned()]
-    );
+fn the_topology_funnel_census_skips_its_named_substrate_and_nothing_else() {
+    oracles::the_named_substrate_is_all_the_funnel_census_skips();
 }
 
 #[test]
@@ -3323,7 +3077,7 @@ fn the_view_directory_has_one_definition_in_the_tree() {
 }
 
 // The five source-oracle bodies that close this section are in
-// `source_oracles::oracles` with the other seven. They belong to that file and
+// `source_oracles::oracles` with the other six. They belong to that file and
 // stand here because this is where the harness names are: the whole-file module
 // derivation the four censuses skip by, and the two production regions every
 // prohibition census counts over.

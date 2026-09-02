@@ -1334,11 +1334,6 @@ pub(crate) mod census_domain {
     /// consolidation had been filed one commit earlier in
     /// `reviews/FINDINGS.md` §20 as tidiness.
     ///
-    /// **A resolved file the manifest also names as a target is not returned**,
-    /// because a skip has to be justified by *exclusive* test-reachability and a
-    /// declaration only proves reachability. The exception is written out at the
-    /// point it is applied, below.
-    ///
     /// # Panics
     ///
     /// When a declaration resolves to no file or to both candidates — a skip
@@ -1353,62 +1348,6 @@ pub(crate) mod census_domain {
         floor: usize,
     ) -> std::collections::BTreeSet<PathBuf> {
         let declarations = declared_whole_file_test_modules(source_root, files);
-        resolve_whole_file_test_modules(
-            crate::effects::tests::crate_roots(),
-            declarations,
-            &|path| path.is_file(),
-            floor,
-        )
-    }
-
-    /// [`whole_file_test_modules`] over sources the caller already holds and an
-    /// inventory it is given, resolving each candidate against that same set of
-    /// sources rather than against the filesystem.
-    ///
-    /// **Why a second entry point exists at all.** The disk-reading one cannot
-    /// be driven: `crate::effects::tests::crate_roots` reads *this* package's
-    /// manifest and `Path::is_file` reads *this* tree, so a census that filters
-    /// its domain through this derivation can only ever be exercised on the
-    /// shapes the tree happens to contain — and the shapes that matter are the
-    /// two it does not contain, a whole-file test module under `src/topology/`
-    /// and a test-only child the manifest also names as a target. A control
-    /// that is only ever run on input satisfying it is a control nobody has
-    /// seen refuse anything; `declaration_cycle` is separately driven for the
-    /// same reason and says so.
-    ///
-    /// **Presence is membership in `sources`, and on a walk that is the same
-    /// question.** Both candidates for `mod name;` are `<dir>/name.rs` and
-    /// `<dir>/name/mod.rs` — `.rs` files under the directory the declaring file
-    /// owns — so for a caller whose `sources` are every `.rs` file of the tree
-    /// it is asking about, "in the set" and "on disk" answer identically. For a
-    /// caller holding a constructed domain it is the only question that has an
-    /// answer at all.
-    ///
-    /// # Panics
-    ///
-    /// As [`whole_file_test_modules`], and additionally when a source lies
-    /// outside the package `roots` describes — [`module_directory`] refuses
-    /// that rather than deciding it, which is the `_over` form's counterpart to
-    /// the disk form's assertion that some target lives under `source_root`.
-    pub(crate) fn whole_file_test_modules_over(
-        roots: &CrateRoots,
-        sources: &[(PathBuf, String)],
-        floor: usize,
-    ) -> std::collections::BTreeSet<PathBuf> {
-        let held: std::collections::BTreeSet<&std::path::Path> =
-            sources.iter().map(|(path, _)| path.as_path()).collect();
-        let declarations = declared_whole_file_test_modules_over(roots, sources);
-        resolve_whole_file_test_modules(roots, declarations, &|path| held.contains(path), floor)
-    }
-
-    /// The resolution both entry points share: candidates to files, the floor,
-    /// the cycle check, the derivation control, and the Cargo-target exception.
-    fn resolve_whole_file_test_modules(
-        roots: &CrateRoots,
-        declarations: Vec<TestModuleDeclaration>,
-        is_present: &dyn Fn(&std::path::Path) -> bool,
-        floor: usize,
-    ) -> std::collections::BTreeSet<PathBuf> {
         assert!(
             declarations.len() >= floor,
             "only {} test-only `mod …;` declarations were derived and the floor is {floor}; \
@@ -1418,7 +1357,7 @@ pub(crate) mod census_domain {
         let mut modules = std::collections::BTreeSet::new();
         let mut edges: Vec<(PathBuf, PathBuf)> = Vec::new();
         for declaration in &declarations {
-            let resolved = sole_present(&declaration.candidates, is_present)
+            let resolved = sole_present(&declaration.candidates, &|path| path.is_file())
                 .unwrap_or_else(|present| {
                     panic!(
                         "`{}` declares `mod {};` under {} and {present} of {:?} exist. A skip \
@@ -1465,25 +1404,6 @@ pub(crate) mod census_domain {
              rule this replaces also finds. The derivation has degraded to the rule it exists to \
              be better than: {modules:?}"
         );
-        // **Test-reachable is not the same as test-only, and only the second
-        // justifies a skip.** A test-only declaration proves the parent reaches
-        // this file under `cfg(test)`. It does not prove that is the *only* way
-        // Cargo compiles it: a file the manifest also names as a target's
-        // `src_path` is a crate root of its own — an `[[example]]`, `[[bin]]`,
-        // `[[bench]]` or `[[test]]` — and Cargo builds that target with `test`
-        // false, so a `#[cfg(not(test))] fn main` in it is production code that
-        // `cargo clippy --all-targets` and `cargo test --all-targets` both
-        // compile. Skipping it would take a real production caller out of every
-        // census that reads this set, and that is the wrong direction to trade:
-        // a census that reports a fixture is noisy, a census that misses a
-        // caller is silent. `PR103-TARGETS-002`, the reviewer's own example, and
-        // the successor of `PR72-TARGETS-001`, which put this inventory in hand
-        // here: it was never asked.
-        //
-        // Kept in the domain rather than refused, because being both is legal
-        // and the fail-safe answer to it is to scan the file. [`CrateRoots`]
-        // filters no kind for the matching reason.
-        modules.retain(|resolved| !roots.is_root(resolved));
         modules
     }
 
@@ -2039,33 +1959,10 @@ pub(crate) mod census_domain {
             source_root.display(),
             roots.roots().collect::<Vec<_>>()
         );
-        let sources: Vec<(PathBuf, String)> = files
-            .iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    std::fs::read_to_string(path).expect("read source"),
-                )
-            })
-            .collect();
-        declared_whole_file_test_modules_over(roots, &sources)
-    }
-
-    /// [`declared_whole_file_test_modules`] over sources the caller already
-    /// holds and an inventory it is given.
-    ///
-    /// The scan is the same one and reads the same text; what moves out is the
-    /// acquisition — which manifest the inventory came from and where the bytes
-    /// came from. That is what makes the derivation drivable on a shape this
-    /// tree does not contain, and [`whole_file_test_modules_over`] says why that
-    /// matters.
-    pub(crate) fn declared_whole_file_test_modules_over(
-        roots: &CrateRoots,
-        sources: &[(PathBuf, String)],
-    ) -> Vec<TestModuleDeclaration> {
         let mut found = Vec::new();
-        for (path, source) in sources {
-            let declarations = scan_module_declarations(source)
+        for path in files {
+            let source = std::fs::read_to_string(path).expect("read source");
+            let declarations = scan_module_declarations(&source)
                 .unwrap_or_else(|refusal| panic!("{}: {refusal}", path.display()));
             let parent = path.parent().expect("a source file has a directory");
             for declaration in declarations {
