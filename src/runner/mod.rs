@@ -1332,8 +1332,8 @@ mod tests {
     ///   sentences in the same file. Measured — it was.
     /// * **The whole file**, because the previous region dropped everything
     ///   between a `#[cfg(test)] mod tests;` declaration and the next line that
-    ///   is exactly `}`. The files
-    ///   `effects::tests::cfg::WHOLE_FILE_TEST_MODULES_NAMED_TESTS` counts
+    ///   is exactly `}`. The `tests.rs` entries of
+    ///   `effects::tests::cfg::WHOLE_FILE_TEST_MODULES`
     ///   declare their tests that way, and a
     ///   `Command::new("git").arg("push")` appended after one was invisible
     ///   while the identical lines above it failed the census.

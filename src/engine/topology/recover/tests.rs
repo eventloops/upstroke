@@ -7684,8 +7684,8 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         // **The crate's own declarations, not a file-name rule.** This skipped
         // by the stem `"tests"`, so it covered only the modules named
         // `tests.rs`; the crate declares **more** whole-file test modules than
-        // that — `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` of them,
-        // against the `WHOLE_FILE_TEST_MODULES_NAMED_TESTS` the stem finds —
+        // that — `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` lists them all,
+        // against the `tests.rs` entries of it the stem finds —
         // and the four it missed — `scaffold`, `premove`, `fake`, `readiness`
         // — are the ones most likely to name what production names.
         // `PR7-R5-ATT-001`.

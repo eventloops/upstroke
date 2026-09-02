@@ -2128,7 +2128,7 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 //     sits in, and, for a whole-file module, the `mod name;` declaration that
 //     names the file -- whether the guard is written on that declaration or on
 //     an inline module enclosing it. The files `cfg::WHOLE_FILE_TEST_MODULES`
-//     counts are reached only that way.
+//     lists are reached only that way.
 
 // The census is `cfg`, beside this file; the two tests below are what it answers
 // to. It decides predicates against `ci_model`'s targets -- the same table the
@@ -2313,11 +2313,12 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
         .map(|site| site.path.as_str())
         .collect();
     assert!(
-        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES,
+        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES.len(),
         "only {} file(s) carry a `test` guard the census resolved, and \
          `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names` \
-         resolves {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
-        under_a_file_guard.len()
+         resolves {} whole-file test modules on its own",
+        under_a_file_guard.len(),
+        WHOLE_FILE_TEST_MODULES.len()
     );
 
     let mut uncovered: BTreeMap<&str, Vec<String>> = BTreeMap::new();

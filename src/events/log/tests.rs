@@ -3310,8 +3310,8 @@ fn relative_slashed(path: &Path) -> String {
 ///   `//`-only strip this census used before saw neither a `/* … */` nor a
 ///   `const CFG_TEST_ATTR: &str = "#[cfg(test)]";`, and either one collapsed a
 ///   whole production file's region to nothing.
-/// * **A region that stops at `#[cfg(test)] mod tests;`.** The files
-///   `effects::tests::cfg::WHOLE_FILE_TEST_MODULES_NAMED_TESTS` counts declare
+/// * **A region that stops at `#[cfg(test)] mod tests;`.** The `tests.rs`
+///   entries of `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` declare
 ///   their tests that way, and everything below such a declaration is legal
 ///   production code that a truncating region cannot see.
 ///   `production_code` removes the item and keeps the rest of the file.

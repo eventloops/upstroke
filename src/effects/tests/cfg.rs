@@ -586,8 +586,8 @@ pub(super) fn module_dir(path: &str) -> String {
 /// Two passes, because a file's guard is written in another file. Pass one reads
 /// the `#[cfg(P)] mod name;` declarations and resolves each to the file it
 /// governs; pass two scans every file with the guard it inherited. The files
-/// [`WHOLE_FILE_TEST_MODULES`] counts exist only under a `cfg(test)` module
-/// declaration -- the count
+/// [`WHOLE_FILE_TEST_MODULES`] lists exist only under a `cfg(test)` module
+/// declaration -- the population
 /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
 /// resolves independently -- and a census that missed it would read every
 /// predicate in them as unconditional.
@@ -1162,8 +1162,8 @@ pub(super) const CFG_ESCAPES: [(&str, &[&str], &str); 12] = [
 /// boundary assertions beside it are what pin the shape.
 pub(super) const CFG_GATE_FLOOR: usize = 350;
 
-/// The number of files this tree reaches only through a `cfg(test)` module
-/// declaration.
+/// Every file this tree reaches only through a `cfg(test)` module
+/// declaration, relative to `src/`, sorted.
 ///
 /// Derived independently by
 /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`,
@@ -1171,33 +1171,59 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// rather than what it says: a census that resolved none of them would read
 /// several hundred predicates as unconditional and never notice.
 ///
-/// A floor, compared with `>=`. One of them -- `readiness.rs`, reached
-/// through an inline ancestor rather than through an attribute on its own
-/// declaration -- is outside *this* pass's grammar and carries no `cfg`
-/// occurrence, so the two derivations agree on the number without this census
-/// having to resolve the ancestry that produces it.
+/// **A list rather than a count, because a count does not say *which* files.**
+/// A derivation that swapped one module for another -- same cardinality,
+/// different set -- satisfies every assertion a number can carry, and fails
+/// here naming the file it gained and the file it lost. The four modules not
+/// called `tests.rs` were already named individually for exactly that reason;
+/// this is that argument applied to the whole population rather than to the
+/// part of it a file-name rule misses.
 ///
-/// **This and [`WHOLE_FILE_TEST_MODULES_NAMED_TESTS`] are the only places
-/// either number is written.** Both were restated as an English word in about
-/// twenty comments across eight files, so one slice adding one whole-file test
-/// module falsified every one of them at once while this floor stayed green --
-/// and a passing `>=` floor is not the same as a true document. PR #97's review
-/// found that, and the prose now names these constants or describes the
-/// population without counting it. A slice that adds a module edits two
-/// integers here.
-pub(super) const WHOLE_FILE_TEST_MODULES: usize = 18;
-
-/// How many of [`WHOLE_FILE_TEST_MODULES`] a literal `#[cfg(test)] mod tests;`
-/// declares.
+/// **Both populations are read off this list, so neither number is written
+/// anywhere.** The whole of it is every file reached only through such a
+/// declaration. The subset a literal `#[cfg(test)] mod tests;` declares is the
+/// entries whose file stem is `tests`: declared under that exact name at their
+/// parent's own top level, with the attribute on the declaration, so each is a
+/// `tests.rs` and the file-name rule `file_stem == "tests"` finds it. The rest
+/// -- `scaffold`, `premove`, `fake` and `readiness` -- differ by **how each
+/// file is reached**, which is the distinction a census gets wrong, and they
+/// are the ones it is most likely to trip over, since a scaffold, a fake and a
+/// readiness protocol exist to name what production names.
 ///
-/// The two populations differ by **how each file is reached**, which is the
-/// distinction a census gets wrong. This subset is declared under that exact
-/// name at its parent's own top level, with the attribute on the declaration,
-/// so each file is a `tests.rs` and the file-name rule `file_stem == "tests"`
-/// finds it. The rest of [`WHOLE_FILE_TEST_MODULES`] is `scaffold`, `premove`,
-/// `fake` and `readiness` -- named individually rather than counted by
-/// `the_whole_file_modules_are_read_from_the_declarations`, because a count
-/// alone would not say *which* files a derivation had swapped -- and those are
-/// the ones a census is most likely to trip over, since a scaffold, a fake and
-/// a readiness protocol exist to name what production names.
-pub(super) const WHOLE_FILE_TEST_MODULES_NAMED_TESTS: usize = 14;
+/// **A slice that adds a whole-file test module adds its path here, in sorted
+/// position, in the same commit.** That is the whole edit: both counts follow,
+/// and so does the named-individually set. The entries cluster by directory, so
+/// slices landing in different directories insert far apart in this list.
+///
+/// Where it is compared with `>=`, the length is a floor. One entry --
+/// `readiness.rs`, reached through an inline ancestor rather than through an
+/// attribute on its own declaration -- is outside [`cfg_regions`]' grammar and
+/// carries no `cfg` occurrence, so the two derivations agree on the number
+/// without that census having to resolve the ancestry that produces it.
+///
+/// **This is the only place the population is written.** It was restated as an
+/// English word in about twenty comments across eight files, so one slice
+/// adding one whole-file test module falsified every one of them at once while
+/// the `>=` floor stayed green -- and a passing floor is not the same as a true
+/// document. PR #97's review found that, and the prose now names this constant
+/// or describes the population without counting it.
+pub(super) const WHOLE_FILE_TEST_MODULES: &[&str] = &[
+    "agent/proc/test_support/readiness.rs",
+    "effects/tests.rs",
+    "engine/tests.rs",
+    "engine/topology/attempt/tests.rs",
+    "engine/topology/create/tests.rs",
+    "engine/topology/dispatch/tests.rs",
+    "engine/topology/emit/tests.rs",
+    "engine/topology/preflight/tests.rs",
+    "engine/topology/recover/tests.rs",
+    "engine/topology/run/tests.rs",
+    "engine/topology/scaffold.rs",
+    "engine/topology/startup/tests.rs",
+    "events/log/premove.rs",
+    "events/log/tests.rs",
+    "runner/container/census/tests.rs",
+    "runner/container/fake.rs",
+    "runner/container/resolve/tests.rs",
+    "runner/container/tests.rs",
+];

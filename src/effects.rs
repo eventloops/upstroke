@@ -557,8 +557,8 @@ pub fn production_region(source: &str) -> String {
 /// pays for with a truncating region, all three measured on this tree:
 ///
 /// * A file that declares its tests as `#[cfg(test)] mod tests;` — the
-///   population `effects::tests::cfg::WHOLE_FILE_TEST_MODULES_NAMED_TESTS`
-///   counts — puts every line **below** that declaration outside the region.
+///   `tests.rs` entries of `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` —
+///   puts every line **below** that declaration outside the region.
 ///   The declaration is usually the last item, so the hole is normally empty;
 ///   appending to the file fills it. Legal Rust, no comment trick, and it
 ///   defeated the barrier census, the process-start census and the container
@@ -1321,11 +1321,12 @@ pub(crate) mod census_domain {
     /// The resolution loop — assert exactly one of the two candidates exists,
     /// collect it — was written out at each caller, and a third caller wrote a
     /// different rule instead: `path.file_stem() == "tests"`. That covers the
-    /// files named `tests.rs` — `effects::tests::cfg`'s
-    /// `WHOLE_FILE_TEST_MODULES_NAMED_TESTS` — and **not** the four that are
-    /// not: `scaffold`, `premove`, `fake` and `readiness`. The whole set, that
-    /// subset and the difference between them are the two constants beside each
-    /// other in that module; the four the rule misses are the ones a census is
+    /// files named `tests.rs` — the entries of
+    /// `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` whose file stem is
+    /// `tests` — and **not** the four that are not: `scaffold`, `premove`,
+    /// `fake` and `readiness`. The whole set, that subset and the difference
+    /// between them are all read off that one list; the four the rule misses
+    /// are the ones a census is
     /// most likely to trip over, because a scaffold, a fake and a readiness
     /// protocol exist to *name* the things production names. Found by S5 round
     /// 5's `seams`, `attempt` and `settle` lenses independently; the
@@ -1898,12 +1899,12 @@ pub(crate) mod census_domain {
     /// change to what every census can see and not a bug fix. The measured
     /// domain is the set
     /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
-    /// names and counts — the literal `#[cfg(test)] mod tests;` declarations,
-    /// plus `scaffold`, `premove`, `fake` and `readiness` — sized by
-    /// `effects::tests::cfg::WHOLE_FILE_TEST_MODULES`. One more arrives with
-    /// the slice that measures it, and that slice moves the constant: the
-    /// number lives in one place so that adding a module is one edit rather
-    /// than a sweep over every comment that had restated it.
+    /// names — the literal `#[cfg(test)] mod tests;` declarations, plus
+    /// `scaffold`, `premove`, `fake` and `readiness` — and it is listed, path
+    /// by path, in `effects::tests::cfg::WHOLE_FILE_TEST_MODULES`. One more
+    /// arrives with the slice that adds it, and that slice adds its path to
+    /// that list: the population lives in one place, so adding a module is one
+    /// edit rather than a sweep over every comment that had restated its size.
     ///
     /// **No `#[path]`.** A `#[path]` attribute on a module is refused rather
     /// than resolved: it is the one construct that can point a declaration

@@ -40,8 +40,8 @@
 //! named set as a fifth
 //! `["agent/proc/test_support/readiness.rs", "effects/tests/classification.rs",
 //! "engine/topology/scaffold.rs", "events/log/premove.rs",
-//! "runner/container/fake.rs"]` against its expected four, and the count below
-//! it reads one more than the constant.
+//! "runner/container/fake.rs"]` against its expected four, and the comparison
+//! below it resolves one module more than `WHOLE_FILE_TEST_MODULES` lists.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once
