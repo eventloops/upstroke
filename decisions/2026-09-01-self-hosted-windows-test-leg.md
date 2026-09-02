@@ -112,8 +112,24 @@ and a token widened to `write-all` reaches every build script and test the
 candidate ships with the checkout's credential still configured, which no guest
 teardown recalls.
 
+Pinning the action by commit says which code runs; three further pins say what
+it is told to do and when. Each action's `with:` inputs are an allowlist,
+because `Swatinem/rust-cache` accepts a `cmd-format` input and wraps the
+commands it runs in it, so one input on an allowlisted action at a pinned
+commit puts a `git checkout` of another tree in front of every gate in the job.
+The toolchain install must be the step after the checkout, because the action
+makes its toolchain the rustup default and anything above it runs whatever the
+runner image preinstalled -- during a release rollout, the previous stable,
+which is exactly what the current-stable witness exists to rule out. And the
+guard against the two overriding repository files runs as a `bash` step in the
+`lint` job, not only as a Rust test: the file it forbids is the one that makes
+`cargo test` build every harness and execute none, so a test forbidding it is a
+test that file prevents from running. The Rust test stays as the check that
+fails on a developer's machine, where the workflow step does not run.
+
 Two files outside the workflow can make any reading of it false, and both are
-now held absent by `no_repository_file_overrides_what_ci_compiles_or_runs`: a
+now held absent by that pair --
+`no_repository_file_overrides_what_ci_compiles_or_runs` and the `lint` step: a
 `rust-toolchain.toml`, which overrides the rustup default the pinned action
 sets and so replaces the compiler every leg runs, witness and MSRV floor
 included; and a `.cargo/config.toml`, which can bind `target.<triple>.runner`

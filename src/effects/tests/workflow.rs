@@ -29,13 +29,14 @@ use std::fs;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use super::ci_model::{
-    AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL, AGGREGATE_STEP_FIELDS,
-    CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
-    ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB,
-    MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS, REQUIRED_CONTEXT, RUSTFLAGS_KEY,
-    RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND,
-    TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB, TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS,
-    TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
+    ACTION_INPUTS, AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL,
+    AGGREGATE_STEP_FIELDS, CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS,
+    DEFAULTS_RUN_FIELDS, ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS,
+    MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS,
+    REPO_FILE_GUARD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM,
+    STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS,
+    WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -336,7 +337,12 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
             &GATE_SCRIPTS,
         ));
         out.extend(checkout_complaints(job, gate, "gate-checkout"));
-        out.extend(toolchain_complaints(job, gate, "gate-toolchain"));
+        out.extend(toolchain_complaints(
+            job,
+            gate,
+            "gate-toolchain",
+            Some(STABLE_TOOLCHAIN),
+        ));
     }
 
     out.extend(aggregate_complaints(doc, jobs, &job_names));
@@ -581,6 +587,12 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         "test",
         "test-job-run-script",
         &TEST_SCRIPTS,
+    ));
+    out.extend(toolchain_complaints(
+        job,
+        "test",
+        "test-job-toolchain",
+        Some(STABLE_TOOLCHAIN),
     ));
 
     // The matrix is the platform half of the same claim, and it is compared
@@ -843,12 +855,41 @@ fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) ->
                  runs, so the pinned command runs against another tree."
             ));
         }
-        let unpinned_action = scalar(step, "uses").filter(|uses| !PINNED_ACTIONS.contains(uses));
-        if let Some(uses) = unpinned_action {
+        let Some(uses) = scalar(step, "uses") else {
+            continue;
+        };
+        if !PINNED_ACTIONS.contains(&uses) {
             out.push(format!(
                 "[unpinned-action] `{named}` step {index} uses {uses:?}, which is not one of the \
                  pinned actions {PINNED_ACTIONS:?}; an unreviewed action, or a reviewed one at a \
                  floating tag, can check out any tree it likes."
+            ));
+            continue;
+        }
+        // The commit says which code runs; the inputs say what it is told to
+        // do. `rust-cache`'s `cmd-format` wraps the commands it runs, so one
+        // input on an allowlisted action at a pinned commit is enough to put
+        // `git checkout` in front of every gate in the job.
+        let Some((_, allowed)) = ACTION_INPUTS
+            .iter()
+            .find(|(prefix, _)| uses.starts_with(prefix))
+        else {
+            out.push(format!(
+                "[unpinned-action-input] `{named}` step {index} uses {uses:?}, whose inputs this \
+                 contract does not model at all"
+            ));
+            continue;
+        };
+        let Some(inputs) = field(step, "with") else {
+            continue;
+        };
+        let strange = unexpected(&field_names(inputs), allowed);
+        if !strange.is_empty() {
+            out.push(format!(
+                "[unpinned-action-input] `{named}` step {index} gives {uses:?} the inputs \
+                 {strange:?}, which are not among {allowed:?}. An input can tell an allowlisted \
+                 action at a pinned commit to run commands of the candidate's choosing -- \
+                 `rust-cache`'s `cmd-format` wraps every command the step runs."
             ));
         }
     }
@@ -863,23 +904,87 @@ fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) ->
 /// stable, and every other pin in this contract still matches. The MSRV leg is
 /// not checked here: it pins its own floor against the manifest, in
 /// [`ci_msrv_job_complaints`]. Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
-fn toolchain_complaints(job: &Yaml, named: &str, code: &str) -> Vec<String> {
+fn toolchain_complaints(
+    job: &Yaml,
+    named: &str,
+    code: &str,
+    expected: Option<&str>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for (index, step) in steps_of(job).iter().enumerate() {
-        if !scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION)) {
-            continue;
-        }
-        let selected = field(step, "with").and_then(|with| scalar(with, "toolchain"));
-        if selected != Some(STABLE_TOOLCHAIN) {
+    let steps = steps_of(job);
+    let installs: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let [install] = installs.as_slice() else {
+        // Zero is legitimate only where the image carries the toolchain, which
+        // is the self-hosted leg, and that job is not checked here.
+        out.push(format!(
+            "[{code}] `{named}` has {} steps using `{TOOLCHAIN_ACTION}`, not one, so which \
+             compiler its commands run is decided by something other than this workflow",
+            installs.len()
+        ));
+        return out;
+    };
+    // Position, not merely presence. The action installs a toolchain and makes
+    // it the rustup default, so a step above it runs whatever the runner image
+    // happened to preinstall -- during a release rollout that is the previous
+    // stable, and the witness that exists to compile *current* stable would be
+    // compiling something else while every other pin still matched.
+    if *install != 1 {
+        out.push(format!(
+            "[{code}] `{named}` installs its toolchain at step {install}, not step 1. The \
+             checkout is step 0 and the compiler is chosen next: any step above the install \
+             runs whatever the runner image preinstalled."
+        ));
+    }
+    if let Some(want) = expected {
+        let selected = field(&steps[*install], "with").and_then(|with| scalar(with, "toolchain"));
+        if selected != Some(want) {
             out.push(format!(
-                "[{code}] `{named}` step {index} installs toolchain {selected:?}, not \
-                 `{STABLE_TOOLCHAIN}`. The action is pinned by commit; its input is what \
-                 decides which compiler runs, and a downgrade here leaves current stable \
-                 compiled by no leg at all."
+                "[{code}] `{named}` step {install} installs toolchain {selected:?}, not \
+                 `{want}`. The action is pinned by commit; its input is what decides which \
+                 compiler runs, and a downgrade here leaves current stable compiled by no leg."
             ));
         }
     }
     out
+}
+
+/// Every way the workflow stops refusing the two overriding repository files.
+///
+/// The guard is a `bash` step because it cannot be a Rust test: the file it
+/// forbids is the one that makes `cargo test` execute nothing. Exactly one
+/// step in the whole workflow runs it, character for character, and that step
+/// is on the job whose fields, shells, scripts and checkout the gate contract
+/// already pins. Measured, `MUT-REPO-FILE-GUARD-DELETED`.
+pub(super) fn ci_repo_file_guard_complaints(doc: &Yaml) -> Vec<String> {
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let carriers: Vec<String> = field_names(jobs)
+        .into_iter()
+        .filter(|name| {
+            field(jobs, name).is_some_and(|job| {
+                steps_of(job)
+                    .iter()
+                    .any(|step| scalar(step, "run") == Some(REPO_FILE_GUARD))
+            })
+        })
+        .collect();
+    if carriers.len() == 1 {
+        return Vec::new();
+    }
+    vec![format!(
+        "[repo-file-guard] {carriers:?} run the repository-file guard, not exactly one job. \
+         Without it nothing outside Cargo refuses a `.cargo/config.toml` -- and a target \
+         runner bound there makes `cargo test` build every harness and execute none, which \
+         takes the Rust test that forbids the file with it."
+    )]
 }
 
 /// Every way the workflow's own `env:` is not the pinned mapping.
@@ -1146,6 +1251,9 @@ pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {
         &[MSRV_COMMAND],
     ));
     out.extend(checkout_complaints(job, MSRV_JOB, "msrv-checkout"));
+    // Position only: this leg installs the manifest's floor, not `stable`, and
+    // the value is checked against `Cargo.toml` above.
+    out.extend(toolchain_complaints(job, MSRV_JOB, "msrv-toolchain", None));
 
     // The platform half, compared against the same derived runner set the Clippy
     // legs and the `test` matrix are. A floor is a per-platform fact: a
@@ -1499,6 +1607,7 @@ pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     out.extend(ci_windows_build_witness_complaints(doc));
     out.extend(workflow_env_complaints(doc));
     out.extend(workflow_permissions_complaints(doc));
+    out.extend(ci_repo_file_guard_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1899,6 +2008,43 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                       \x20     run:\n\
                       \x20       working-directory: ci-pass\n",
         refused_as: "defaults-shape",
+    },
+    WorkflowEscape {
+        name: "MUT-CACHE-CMD-FORMAT",
+        escape: "the cache action, allowlisted and pinned by commit, is given a `cmd-format` \
+                 input that wraps every command it runs in a `git checkout` of `master`. The \
+                 checkout step is still input-free, every `run:` is still exact, and Clippy and \
+                 the build witness examine a tree the candidate never touched.",
+        job: Some("lint-windows"),
+        anchor: "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n",
+        replacement: "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\
+                      \x20       with:\n\
+                      \x20         cmd-format: 'cmd /d /s /c \"git fetch origin master && git checkout --detach FETCH_HEAD && {0}\"'\n",
+        refused_as: "unpinned-action-input",
+    },
+    WorkflowEscape {
+        name: "MUT-TOOLCHAIN-NOT-FIRST",
+        escape: "a Cargo command is placed above the toolchain install, so it runs on whatever \
+                 the runner image preinstalled rather than on the toolchain this workflow \
+                 names. During a release rollout that is the previous stable, and the \
+                 current-stable witness on this job would be compiling something else with \
+                 every other pin still matching.",
+        job: Some("lint-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20     - run: cargo fmt --check\n",
+        refused_as: "gate-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-REPO-FILE-GUARD-DELETED",
+        escape: "the bash guard that refuses `rust-toolchain.toml` and `.cargo/config.toml` is \
+                 removed, leaving only the Rust test -- which a `.cargo/config.toml` target \
+                 runner prevents from ever executing, since `cargo test` would then build \
+                 every harness and run none",
+        job: Some("lint"),
+        anchor: "      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done\n",
+        replacement: "",
+        refused_as: "repo-file-guard",
     },
     WorkflowEscape {
         name: "MUT-WORKFLOW-PERMISSIONS-WIDENED",

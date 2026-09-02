@@ -177,6 +177,11 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Bash, not a Rust test, deliberately: a `.cargo/config.toml` binding a
+      # target runner makes `cargo test` build every harness and execute none,
+      # so a test forbidding that file is one the file prevents from running.
+      # Pinned by the oracle as `REPO_FILE_GUARD`, exactly once in the workflow.
+      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e "$f" || { echo "$f outranks ci.yml"; exit 1; }; done
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: bash .github/scripts/test-release-record.sh

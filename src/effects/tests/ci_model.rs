@@ -74,10 +74,11 @@ pub(super) const SHELL_GATES: [&str; 4] = [
 /// than a set per job: `lint (macos)` running the formatter would be
 /// redundant, not an escape, and the one command that must sit on exactly one
 /// job, the Windows build witness, is pinned to its carrier separately.
-pub(super) const GATE_SCRIPTS: [&str; 7] = [
+pub(super) const GATE_SCRIPTS: [&str; 8] = [
     CLIPPY_GATE,
     WINDOWS_BUILD_WITNESS,
     FMT_GATE,
+    REPO_FILE_GUARD,
     SHELL_GATES[0],
     SHELL_GATES[1],
     SHELL_GATES[2],
@@ -93,6 +94,35 @@ pub(super) const PINNED_ACTIONS: [&str; 3] = [
     "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
     "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 ];
+
+/// The inputs each pinned action may be given, by action prefix.
+///
+/// Pinning the commit says which code runs; this says what it is told to do,
+/// and the difference is not academic. `Swatinem/rust-cache` accepts a
+/// `cmd-format` input and wraps the commands it runs in it, so a cache step
+/// with one input can run `git checkout` against another tree before Clippy and
+/// the build witness ever see the candidate -- with the action allowlisted, the
+/// checkout input-free, and every `run:` still exact. An input this contract
+/// does not model is refused for the same reason an unknown field is.
+/// Measured, `MUT-CACHE-CMD-FORMAT`.
+pub(super) const ACTION_INPUTS: [(&str, &[&str]); 3] = [
+    ("actions/checkout@", &[]),
+    ("dtolnay/rust-toolchain@", &["components", "toolchain"]),
+    ("Swatinem/rust-cache@", &[]),
+];
+
+/// The guard that refuses the two overriding repository files, character for
+/// character, as `ci.yml` runs it.
+///
+/// A `bash` step rather than a Rust test, and the reason is the whole point: a
+/// `.cargo/config.toml` binding `target.<triple>.runner` to a wrapper that
+/// exits zero makes `cargo test` build every harness and execute none, so a
+/// Rust test forbidding that file is a test the file itself prevents from
+/// running. The check has to sit somewhere Cargo cannot reach, and the `lint`
+/// job's shell steps are that place. The Rust test stays as well: it is what
+/// fails on a developer's machine, where this step does not run.
+/// Measured, `MUT-REPO-FILE-GUARD-DELETED`.
+pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done";
 
 /// The job that runs those fixtures for the one platform whose test execution
 /// left GitHub's runners, and the labels it must run on -- exactly.
