@@ -1,3 +1,19 @@
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/workspace_manager.rs` -- the shape
+// `src/runner/container/tests.rs` and `src/agent/proc/test_support/readiness.rs`
+// established for a funnel's out-of-line child. This file builds the scratch
+// repositories the Worktree/Snapshot/Ref/Object suites measure against, so it
+// names `fs::write`, `fs::create_dir_all` and `std::process::Command` directly.
+//
+// `PR6-LANEF-004`: a Rust lint level is scoped by the MODULE TREE and not by
+// the file, so without an attribute here the parent's inner allow of all three
+// would reach this file silently and no reviewed record would name the file
+// doing the work. `clippy::disallowed_macros` is RE-DENIED rather than
+// inherited -- measured at zero sites -- so a `println!` here is still a build
+// error. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![deny(clippy::disallowed_macros)]
+
 use super::*;
 
 use std::sync::atomic::{AtomicU32, Ordering};

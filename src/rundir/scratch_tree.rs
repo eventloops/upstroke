@@ -57,6 +57,20 @@
 //! (`tests::build_refusals`, which compiles against this crate's rlib) cannot
 //! reach this type, and why the refusals it carries are written the way
 //! `NoSecondToken` describes.
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/rundir.rs`. The recursive deletion this module owns was
+// reviewed into that file's row when the module was inline; it is out of line
+// since W1 and carries a row and a level of its own.
+//
+// `PR6-LANEF-004`: a Rust lint level is scoped by the MODULE TREE and not by
+// the file, so without an attribute here the parent's inner allow of all three
+// would reach this file silently. `clippy::disallowed_macros` is RE-DENIED
+// rather than inherited -- measured at zero sites, and deliberately so: the
+// unwinding report path exists because `eprintln!` panics on a write error, so
+// a print macro appearing in this file is a build error and not a style note.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![deny(clippy::disallowed_macros)]
 
 use std::fs;
 use std::io;

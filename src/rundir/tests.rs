@@ -1,3 +1,20 @@
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/rundir.rs` -- the shape `src/runner/container/tests.rs`
+// established for a funnel's own test module. This suite plants husks and
+// residue with raw `fs` calls, forks and locks real descriptors, and re-execs
+// this test binary, so it names those primitives directly.
+//
+// `PR6-LANEF-004`: a Rust lint level is scoped by the MODULE TREE and not by
+// the file, so without an attribute here the parent's inner allow would reach
+// this file silently and no reviewed record would name the file doing the work.
+// All three are needed and all three are measured; none is inherited.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use super::*;
 
 use std::time::{Duration, Instant};

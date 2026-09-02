@@ -3750,10 +3750,13 @@ fn common_git_dir(inside: &Path) -> Result<PathBuf, UpstrokeError> {
 /// worktree, and spawn a child it can kill, and no funnel owns `git init`.
 ///
 /// So the primitives live here, in the funnel module `effects/allowlist.toml`
-/// already reviews, and every one of them is `#[cfg(test)]`. This module adds
-/// **no attribute**: it is nested inside this file and inherits the
-/// module-level allow the allowlist already records for it, so the
-/// allow-placement scan sees nothing new.
+/// already reviews, and every one of them is `#[cfg(test)]`. Since W1 this
+/// module is a **sibling file** rather than a block nested in this one, so it
+/// states a lint level **of its own** — `src/workspace_manager/fixture.rs`
+/// allows `disallowed_methods` and `disallowed_types`, a subset of this file's
+/// three, and re-denies `disallowed_macros` — and carries its own
+/// `effects/allowlist.toml` row. Inheriting this file's allow through the
+/// module tree is `PR6-LANEF-004`, and that prologue exists to refuse it.
 ///
 /// [`Fixture`] and the three helpers above it were `mod tests`'s and are
 /// **moved** rather than copied. A second repository fixture maintained beside

@@ -1,3 +1,21 @@
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/workspace_manager.rs` -- the shape
+// `src/runner/container/tests.rs` established for a funnel's own test module.
+// This suite drives the site-taking APIs and plants the residue they are meant
+// to find, so it names `fs::write`, `fs::create_dir_all`,
+// `std::process::Command` and `println!` directly.
+//
+// `PR6-LANEF-004`: a Rust lint level is scoped by the MODULE TREE and not by
+// the file, so without an attribute here the parent's inner allow would reach
+// this file silently and no reviewed record would name the file doing the work.
+// All three are needed and all three are measured; none is inherited.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use super::*;
 
 use std::collections::BTreeSet;
