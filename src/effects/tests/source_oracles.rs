@@ -1,4 +1,4 @@
-//! The **source oracles**: the eleven checks that hold this crate's own lexical
+//! The **source oracles**: the twelve checks that hold this crate's own lexical
 //! instruments against the tree they read.
 //!
 //! Four instruments, and every whole-tree census in this repository is built on
@@ -8,7 +8,7 @@
 //! [`crate::effects::production_code`] decide what it is allowed to *count*,
 //! and `census_domain::whole_file_test_modules` decides which files it skips
 //! entirely. A defect in any of them is silent by construction — the census
-//! stays green and its count is simply lower — so these eleven drive each
+//! stays green and its count is simply lower — so these twelve drive each
 //! instrument with input that reaches its failure path rather than measuring it
 //! only on compliant input.
 //!
@@ -20,14 +20,15 @@
 //! what tie them to this file rather than to the inventory they read.
 //!
 //! Everything they read with stays where it was. The tree readers
-//! (`scanned_sources`, `repo_root`) are `super`'s, and the instruments
+//! (`scanned_sources`, its whole-file-test-module-filtered sibling, `repo_root`)
+//! are `super`'s, and the instruments
 //! themselves are `crate::effects`'. This file consumes them; it re-derives
 //! none of them, and it defines no region of its own — which is what
 //! `every_early_stop_is_at_a_module` counts two lines from its end.
 //!
-//! **No name here is a test name.** The eleven `#[test]` wrappers stay in
+//! **No name here is a test name.** The twelve `#[test]` wrappers stay in
 //! `super` under the harness names the contract, CI and `reviews/FINDINGS.md`
-//! know, and the eleven functions below are deliberately named otherwise — so
+//! know, and the twelve functions below are deliberately named otherwise — so
 //! `--list` over the test binary is unchanged and nothing nests under
 //! `effects::tests::source_oracles`. `effects/wrappers.toml` names
 //! `no_topology_module_calls_a_funnel_in_production` and `reviews/FINDINGS.md`
@@ -55,7 +56,7 @@
 //! over the file graph, so `super` being a test module itself does not make
 //! this one. No skip is derived and no file leaves any census. That matters
 //! more here than anywhere else in this directory:
-//! `the_whole_file_modules_are_read_from_the_declarations` is one of the eleven
+//! `the_whole_file_modules_are_read_from_the_declarations` is one of the twelve
 //! bodies below, and a declaration written the other way would make this file a
 //! member of the very set it is itself asserting the membership of.
 //!
@@ -87,7 +88,10 @@ pub(super) mod oracles {
     use std::fs;
 
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
-    use crate::effects::tests::{is_the_literal_mod_tests_form, repo_root, scanned_sources};
+    use crate::effects::tests::{
+        is_the_literal_mod_tests_form, repo_root, scanned_sources,
+        scanned_sources_outside_whole_file_test_modules,
+    };
     use crate::effects::{
         TOPOLOGY_MODULES, blank_comments, blank_comments_and_strings, externally_reachable_fns,
         production_code, production_region,
@@ -141,14 +145,15 @@ pub(super) mod oracles {
         assert!(offenders.is_empty(), "{offenders:#?}");
     }
 
-    /// `decisions.pr_sequence[6].scope` ends "no topology production callers", and
-    /// `non_goals[0]` is "production topology callers".
+    /// The funnel scan itself, over a domain: how many topology modules it saw,
+    /// and what it found in their production regions.
     ///
-    /// The census is over the **production region** of every topology module, and it
-    /// carries its own control: the test region of `src/topology/registry.rs` DOES
-    /// name a funnel, so a census whose region split had collapsed to the empty
-    /// string would fail here rather than report "nobody calls anything".
-    pub(in crate::effects::tests) fn topology_production_names_no_funnel() {
+    /// A parameter rather than the walk it used to read directly, so that the
+    /// false positive `a_whole_file_test_module_is_not_a_topology_funnel_caller`
+    /// constructs can be handed to the same code the census runs. The census
+    /// keeps its own floors and controls; this returns what it counts and
+    /// decides nothing.
+    fn topology_funnel_callers(sources: &[(String, String)]) -> (usize, Vec<String>) {
         const FUNNELS: &[&str] = &[
             "workspace_manager::",
             "rundir::",
@@ -159,10 +164,10 @@ pub(super) mod oracles {
         ];
         let mut topology = 0;
         let mut callers = Vec::new();
-        for (path, source) in scanned_sources() {
+        for (path, source) in sources {
             let is_topology = TOPOLOGY_MODULES
                 .iter()
-                .any(|banned| path.starts_with(banned) || path == *banned);
+                .any(|banned| path.starts_with(banned) || path.as_str() == *banned);
             // `src/workspace_manager.rs` and `src/runner/**` are in
             // `TOPOLOGY_MODULES` because the legacy section may not contain them;
             // they are the funnels themselves and naturally name funnels.
@@ -170,13 +175,45 @@ pub(super) mod oracles {
                 continue;
             }
             topology += 1;
-            let production = blank_comments_and_strings(&production_region(&source));
+            let production = blank_comments_and_strings(&production_region(source));
             for funnel in FUNNELS {
                 if production.contains(funnel) {
                     callers.push(format!("{path} names `{funnel}` in production"));
                 }
             }
         }
+        (topology, callers)
+    }
+
+    /// `decisions.pr_sequence[6].scope` ends "no topology production callers", and
+    /// `non_goals[0]` is "production topology callers".
+    ///
+    /// The census is over the **production region** of every topology module, and it
+    /// carries its own control: the test region of `src/topology/registry.rs` DOES
+    /// name a funnel, so a census whose region split had collapsed to the empty
+    /// string would fail here rather than report "nobody calls anything".
+    ///
+    /// **The domain is filtered through the whole-file test-module resolver**,
+    /// and it has to be. A file the crate reaches only through a test-only `mod`
+    /// declaration holds no `#[cfg(test)]` of its own, so
+    /// [`crate::effects::production_region`] has nothing to truncate at and
+    /// hands back the whole file: a fixture calling `rundir::` reads as a
+    /// production caller, and the census reports a module that calls no funnel
+    /// at all. `PR6E-006`, which the comment above
+    /// `the_view_directory_has_one_definition_in_the_tree` records for
+    /// `src/runner/container/tests.rs` and works around by excluding paths by
+    /// name. It is latent here only because no whole-file test module under
+    /// `src/topology/` calls a funnel today, and the registry slice is what
+    /// makes it bite.
+    ///
+    /// The filter changes what this census *reads*, not how strictly it reads
+    /// it. Every module it dropped is a file with no production half; a real
+    /// production funnel call in a topology module is in the domain before and
+    /// after, and the control below is unmoved because `src/topology/registry.rs`
+    /// still carries its test region inline.
+    pub(in crate::effects::tests) fn topology_production_names_no_funnel() {
+        let (topology, callers) =
+            topology_funnel_callers(&scanned_sources_outside_whole_file_test_modules());
         assert!(topology >= 8, "only {topology} topology modules scanned");
         assert!(callers.is_empty(), "{callers:#?}");
 
@@ -197,6 +234,106 @@ pub(super) mod oracles {
         assert!(
             production.len() < registry.len(),
             "the production region is the whole file, so the split did nothing"
+        );
+    }
+
+    /// **A whole-file test module under a topology path is not a production
+    /// funnel caller**, and before the filter above it was reported as one.
+    ///
+    /// The regression witness for `PR6E-006` at this census. The defect is a
+    /// composition of two things that are each correct on their own: a file the
+    /// crate reaches only through a test-only `mod` declaration in its parent
+    /// carries no `#[cfg(test)]` marker anywhere in it, and
+    /// [`crate::effects::production_region`] returns everything before the first
+    /// such marker. Together they make the whole of a fixture a production
+    /// region, so the run-directory call a fixture makes to build its tree is
+    /// indistinguishable here from one the module makes at run time.
+    ///
+    /// Driven over a constructed domain rather than over the tree, because the
+    /// tree has no instance: no whole-file test module under `src/topology/`
+    /// names a funnel today, which is the only reason the census was passing.
+    /// Part (3) is what ties the fixture back to the real walk -- it asserts on
+    /// this tree that the population the resolver pins is in the unfiltered
+    /// domain and in none of the filtered one, so the removal in part (2) is
+    /// the accessor's doing and not this test's arithmetic.
+    pub(in crate::effects::tests) fn a_whole_file_test_module_is_not_a_topology_funnel_caller() {
+        // The parent: a topology module whose own region names no funnel. It
+        // declares the child test-only, which is what puts the child in the
+        // resolver's set; the declaration is not written out here because this
+        // file refuses to spell a terminated test-only declaration, for the
+        // reason its prologue gives.
+        let parent = (
+            "src/topology/registry.rs".to_owned(),
+            "pub(crate) fn register() {}\n".to_owned(),
+        );
+        // The child: a fixture that builds its tree through the run-directory
+        // funnel, with no `#[cfg(test)]` of its own anywhere -- it does not need
+        // one, because nothing in it compiles outside a test build.
+        let child = (
+            "src/topology/registry/tests.rs".to_owned(),
+            concat!(
+                "use super::*;\n",
+                "fn fixture(root: &std::path::Path) -> std::path::PathBuf {\n",
+                "    crate::rundir::create_public_dir(root).expect(\"a public run directory\")\n",
+                "}\n",
+            )
+            .to_owned(),
+        );
+
+        // (1) The false positive, constructed. This is what the census reported
+        // before the domain was filtered, and the scan is unchanged: it is the
+        // domain that was wrong, so this half must still fail loudly.
+        let (topology, callers) = topology_funnel_callers(&[parent.clone(), child]);
+        assert_eq!(topology, 2, "both files are inside this census's domain");
+        assert_eq!(
+            callers,
+            vec!["src/topology/registry/tests.rs names `rundir::` in production".to_owned()],
+            "a fixture with no production half reads as a production funnel caller, which is \
+             the report `PR6E-006` describes"
+        );
+
+        // (2) The same scan, with the child out of the domain: silence, and a
+        // module still scanned, so the silence is not an empty walk.
+        let (topology, callers) = topology_funnel_callers(&[parent]);
+        assert_eq!(topology, 1, "the parent is still scanned");
+        assert!(callers.is_empty(), "{callers:#?}");
+
+        // (3) And on the real tree, taking the child out of the domain is what
+        // the accessor does. Every path `WHOLE_FILE_TEST_MODULES` pins is in the
+        // unfiltered walk and in none of the filtered one -- named file by file
+        // rather than counted, because a count passes when the filter drops one
+        // file and keeps another. Identity is a `Path`: the list's forward
+        // slashes match a native path component-wise and nothing is rendered to
+        // text to compare it, `CODING_STANDARDS.md` §8.
+        let unfiltered: BTreeSet<std::path::PathBuf> = scanned_sources()
+            .into_iter()
+            .map(|(path, _)| std::path::PathBuf::from(path))
+            .collect();
+        let filtered: BTreeSet<std::path::PathBuf> =
+            scanned_sources_outside_whole_file_test_modules()
+                .into_iter()
+                .map(|(path, _)| std::path::PathBuf::from(path))
+                .collect();
+        let mut unwalked = Vec::new();
+        let mut unfiltered_still = Vec::new();
+        for module in WHOLE_FILE_TEST_MODULES.iter() {
+            let path = std::path::Path::new("src").join(module);
+            if !unfiltered.contains(&path) {
+                unwalked.push(path.clone());
+            }
+            if filtered.contains(&path) {
+                unfiltered_still.push(path);
+            }
+        }
+        assert!(
+            unwalked.is_empty(),
+            "these whole-file test modules are not in the walk at all, so their absence from the \
+             filtered domain says nothing about the filter: {unwalked:?}"
+        );
+        assert!(
+            unfiltered_still.is_empty(),
+            "these whole-file test modules are still in the census's domain, and every call in \
+             them reads as a production call: {unfiltered_still:?}"
         );
     }
 

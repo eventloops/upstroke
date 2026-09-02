@@ -185,6 +185,86 @@ fn scanned_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// [`scanned_sources`] with the crate's **whole-file test modules** removed.
+///
+/// A file the crate reaches only through a test-only `mod` declaration in its
+/// parent carries no `#[cfg(test)]` of its own. [`production_region`] truncates
+/// at the first one and finds none, so it returns the *entire* file as
+/// production, and every call a fixture makes reads as a production call.
+/// That is `PR6E-006` — recorded above `the_view_directory_has_one_definition_in_the_tree`
+/// for `src/runner/container/tests.rs`, and in [`production_code`]'s own first
+/// bullet, which says the same hazard "defeated the barrier census, the process
+/// start census and the container token census at once".
+///
+/// The skip set comes from `census_domain::whole_file_test_modules`, the shared
+/// resolver `runner::tests::production_sources` and the fold census in
+/// `events::log::tests` already take theirs from under `PR7-R5-ATT-001` —
+/// rather than a fourth copy of the rule, and rather than the file-name rule
+/// that copy got wrong.
+///
+/// **Beside [`scanned_sources`] rather than inside it.** Every other census in
+/// this crate reads that walk and each has its own settled relationship with
+/// the test files in it: the `cfg` census needs them (their `cfg` occurrences
+/// are its subject), `the_view_directory_has_one_definition_in_the_tree`
+/// excludes them by exact path and its exclusion names a test as the reason,
+/// and the rest are counted over regions whose floors were measured against the
+/// domain as it stands. Narrowing the walk under all of them is a change to
+/// what each can see; this is one census's domain, taken deliberately.
+fn scanned_sources_outside_whole_file_test_modules() -> Vec<(String, String)> {
+    let root = repo_root();
+    let src = root.join("src");
+    let scanned = scanned_sources();
+    // The derivation's domain is the `src/**` half of that walk, which is what
+    // both precedents hand it. `examples/**` stays in the census domain
+    // unfiltered: no example declares a test-only module today, and widening
+    // the derivation to a tree it has not been measured against is its own
+    // change. Paths are rejoined onto `root` rather than compared as text, so
+    // what identifies a file here is a `Path` -- `CODING_STANDARDS.md` §8 --
+    // and the forward slashes `scanned_sources` renders match a native path
+    // component-wise on Windows with no conversion at all.
+    let files: Vec<PathBuf> = scanned
+        .iter()
+        .map(|(path, _)| root.join(path))
+        .filter(|path| path.starts_with(&src))
+        .collect();
+    // `13` is the floor both precedents pass, and it is a non-vacuity guard on
+    // the *derivation* rather than a count of the population: the population is
+    // pinned path by path by `cfg::WHOLE_FILE_TEST_MODULES` and asserted by
+    // `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`.
+    // All three callers pass the same number so that a derivation which
+    // degraded would fail at every one of them rather than at whichever
+    // happened to have the tightest floor.
+    let modules = crate::effects::census_domain::whole_file_test_modules(&src, &files, 13);
+    // The control both precedents carry. A derivation that found nothing would
+    // hand back the domain untouched and every fixture in it would read as
+    // production -- which is the defect this accessor exists to remove, not a
+    // state it may quietly fall back to.
+    assert!(
+        modules.contains(&src.join("effects").join("tests.rs")),
+        "the test-only `mod` derivation found no known whole-file test module: {modules:?}"
+    );
+    let before = scanned.len();
+    let kept: Vec<(String, String)> = scanned
+        .into_iter()
+        .filter(|(path, _)| !modules.contains(&root.join(path)))
+        .collect();
+    // And the second half of it, which the precedents do not need because they
+    // filter the very paths the resolver returned. This one filters
+    // `scanned_sources`'s rendering of them, so a file the resolver named and
+    // this filter failed to match would leave the domain unchanged with the
+    // control above still green -- the separator question, decided by
+    // measurement rather than by argument.
+    assert_eq!(
+        before - kept.len(),
+        modules.len(),
+        "the derivation named {} whole-file test modules and {} left the domain; the two \
+         renderings of a path are not matching each other",
+        modules.len(),
+        before - kept.len()
+    );
+    kept
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Allowlist {
@@ -2858,14 +2938,15 @@ fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {
 // "no topology production callers", and the source oracles under it
 // ---------------------------------------------------------------------------
 
-// The eleven bodies are in `source_oracles::oracles`, beside this file: the two
-// site censuses here, and, in the T-CONTAINER section further down, the five
-// that hold the two production regions and the whole-file module derivation.
+// The twelve bodies are in `source_oracles::oracles`, beside this file: the two
+// site censuses here with the regression witness the second of them carries,
+// and, in the T-CONTAINER section further down, the five that hold the two
+// production regions and the whole-file module derivation.
 // The names in this file are the harness -- they are what the contract, CI,
 // `effects/wrappers.toml`, `reviews/FINDINGS.md` and `--list` know -- and each
 // one delegates and does nothing else.
 //
-// The boundary is drawn at "reads the tree, writes nothing". All eleven do
+// The boundary is drawn at "reads the tree, writes nothing". All twelve do
 // exactly that, so the child restores the three effect denials `super` allows
 // and takes no allowlist entry. The needles they carry -- a funnel table, a
 // `RunnerRequest {` in prose, the container-runtime literal -- are the reason
@@ -2885,6 +2966,11 @@ fn no_site_enums_row_mapping_has_a_wildcard_arm() {
 #[test]
 fn no_topology_module_calls_a_funnel_in_production() {
     oracles::topology_production_names_no_funnel();
+}
+
+#[test]
+fn a_topology_fixture_in_a_whole_file_test_module_is_not_a_production_funnel_caller() {
+    oracles::a_whole_file_test_module_is_not_a_topology_funnel_caller();
 }
 
 #[test]
@@ -3062,7 +3148,7 @@ fn the_view_directory_has_one_definition_in_the_tree() {
 }
 
 // The five source-oracle bodies that close this section are in
-// `source_oracles::oracles` with the other six. They belong to that file and
+// `source_oracles::oracles` with the other seven. They belong to that file and
 // stand here because this is where the harness names are: the whole-file module
 // derivation the four censuses skip by, and the two production regions every
 // prohibition census counts over.
