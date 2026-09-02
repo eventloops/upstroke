@@ -31,10 +31,11 @@ use yaml_rust2::{Yaml, YamlLoader};
 use super::ci_model::{
     AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL, AGGREGATE_STEP_FIELDS,
     CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
-    ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS,
-    OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE,
-    SELF_HOSTED_TEST_PLATFORM, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_WINDOWS_JOB,
-    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, WINDOWS_BUILD_WITNESS, WORKFLOW_FIELDS,
+    ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB,
+    MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS, REQUIRED_CONTEXT, RUSTFLAGS_KEY,
+    RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS,
+    TEST_SCRIPTS, TEST_WINDOWS_JOB, TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS,
+    WINDOWS_BUILD_WITNESS, WORKFLOW_FIELDS,
 };
 use super::repo_root;
 
@@ -328,6 +329,13 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
                 ));
             }
         }
+        out.extend(step_pin_complaints(
+            job,
+            gate,
+            "gate-run-script",
+            &GATE_SCRIPTS,
+        ));
+        out.extend(checkout_complaints(job, gate, "gate-checkout"));
     }
 
     out.extend(aggregate_complaints(doc, jobs, &job_names));
@@ -567,6 +575,12 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         ));
     }
     out.extend(checkout_complaints(job, "test", "test-job-checkout"));
+    out.extend(step_pin_complaints(
+        job,
+        "test",
+        "test-job-run-script",
+        &TEST_SCRIPTS,
+    ));
 
     // The matrix is the platform half of the same claim, and it is compared
     // against the same derived runner set the Clippy legs are, less the one
@@ -766,6 +780,12 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
         TEST_WINDOWS_JOB,
         "test-windows-checkout",
     ));
+    out.extend(step_pin_complaints(
+        job,
+        TEST_WINDOWS_JOB,
+        "test-windows-run-script",
+        &TEST_SCRIPTS,
+    ));
     out
 }
 
@@ -796,6 +816,40 @@ fn checkout_complaints(job: &Yaml, named: &str, code: &str) -> Vec<String> {
              tree while every other leg reads the candidate.",
             field_names(inputs)
         ));
+    }
+    out
+}
+
+/// Every way a step of a modelled job is something this contract did not pin.
+///
+/// The field and shell checks say how a step runs; this says what. A `run:`
+/// step whose script is not in the job's pinned set can move the checkout --
+/// `git fetch origin master && git checkout --detach FETCH_HEAD` -- before the
+/// pinned command runs, so that command runs against another tree while the
+/// labels, fields, shell and input-free checkout all still match. A `uses:`
+/// step off [`PINNED_ACTIONS`] is code nobody here reviewed, with a checkout
+/// of its own. Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED`,
+/// `MUT-TEST-RUN-RETARGETED`, `MUT-GATE-RUN-RETARGETED`,
+/// `MUT-MSRV-RUN-RETARGETED` and `MUT-STEP-USES-UNPINNED`.
+fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let unpinned_script = scalar(step, "run").filter(|script| !scripts.contains(script));
+        if let Some(script) = unpinned_script {
+            out.push(format!(
+                "[{code}] `{named}` step {index} runs a script this contract does not pin: \
+                 {script:?}. An unpinned step can move the checkout before the pinned command \
+                 runs, so the pinned command runs against another tree."
+            ));
+        }
+        let unpinned_action = scalar(step, "uses").filter(|uses| !PINNED_ACTIONS.contains(uses));
+        if let Some(uses) = unpinned_action {
+            out.push(format!(
+                "[unpinned-action] `{named}` step {index} uses {uses:?}, which is not one of the \
+                 pinned actions {PINNED_ACTIONS:?}; an unreviewed action, or a reviewed one at a \
+                 floating tag, can check out any tree it likes."
+            ));
+        }
     }
     out
 }
@@ -859,6 +913,20 @@ pub(super) fn ci_windows_build_witness_complaints(doc: &Yaml) -> Vec<String> {
         out.push(format!(
             "[windows-build-witness] `{carrier}` has {witnesses} steps whose `run:` is \
              exactly `{WINDOWS_BUILD_WITNESS}`, not one"
+        ));
+    }
+    // The carrier must be the Windows Clippy gate's job: that job's fields,
+    // shells, scripts and checkout are pinned by the gate contract, so the
+    // witness inherits every one of those pins. A witness on some other
+    // `windows-latest` job would be a pinned command on an unpinned job.
+    if !steps_of(job)
+        .iter()
+        .any(|step| scalar(step, "run") == Some(CLIPPY_GATE))
+    {
+        out.push(format!(
+            "[windows-build-witness] `{carrier}` carries the witness but not the Windows Clippy \
+             gate `{CLIPPY_GATE}`; the witness rides the gate job so the gate contract's pins \
+             on fields, shells, scripts and the checkout cover it"
         ));
     }
     for (index, step) in steps_of(job).iter().enumerate() {
@@ -993,6 +1061,13 @@ pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {
              every substring reading of the same line."
         ));
     }
+    out.extend(step_pin_complaints(
+        job,
+        MSRV_JOB,
+        "msrv-run-script",
+        &[MSRV_COMMAND],
+    ));
+    out.extend(checkout_complaints(job, MSRV_JOB, "msrv-checkout"));
 
     // The platform half, compared against the same derived runner set the Clippy
     // legs and the `test` matrix are. A floor is a per-platform fact: a
@@ -1657,12 +1732,81 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-RENAMED-AWAY",
-        escape: "the job renamed: nothing under the pinned name runs the Windows suite, while \
-                 a job still exists for the aggregate to wire",
+        escape: "the job renamed: the pinned name has no job. Not a false green -- the \
+                 aggregate's derived `needs` refuses the renamed workflow too -- but a lost \
+                 handle: every pin above hangs from this name, so the contract must notice the \
+                 name going before it notices nothing else",
         job: None,
         anchor: "\n  test-windows:\n",
         replacement: "\n  test-windows-hosted:\n",
         refused_as: "test-windows-missing",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-RUN-RETARGETED",
+        escape: "the identity step of the self-hosted job fetches `master` and checks it out \
+                 detached before the pinned test command runs. Labels, fields, shell, the \
+                 input-free checkout and the exact command all still match; the suite tests \
+                 `master`.",
+        job: Some("test-windows"),
+        anchor: "          git config --global user.name \"upstroke CI\"\n",
+        replacement: "          git config --global user.name \"upstroke CI\"\n\
+                      \x20         git fetch origin master\n\
+                      \x20         git checkout --detach FETCH_HEAD\n",
+        refused_as: "test-windows-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-RUN-RETARGETED",
+        escape: "the same retarget on the hosted test matrix: two platforms test `master` \
+                 while every pin still matches",
+        job: Some("test"),
+        anchor: "          git config --global user.name \"upstroke CI\"\n",
+        replacement: "          git config --global user.name \"upstroke CI\"\n\
+                      \x20         git fetch origin master\n\
+                      \x20         git checkout --detach FETCH_HEAD\n",
+        refused_as: "test-job-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-GATE-RUN-RETARGETED",
+        escape: "a step ahead of the Windows Clippy gate and the build witness checks out \
+                 `master`; both pinned commands then run against a tree the candidate never \
+                 touched, and a Windows-only denial or link failure in the candidate goes green",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: git fetch origin master && git checkout --detach FETCH_HEAD\n\
+                      \x20     - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        refused_as: "gate-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-RUN-RETARGETED",
+        escape: "the MSRV leg checks out `master` ahead of its pinned command; the floor is \
+                 verified on a tree the candidate never touched",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: git fetch origin master && git checkout --detach FETCH_HEAD\n\
+                      \x20     - run: cargo check --locked --all-targets --all-features\n",
+        refused_as: "msrv-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-STEP-USES-UNPINNED",
+        escape: "the self-hosted job's checkout floats to `actions/checkout@v4`: the same \
+                 action at whatever commit the tag points to, which is code nobody here \
+                 reviewed with a checkout of its own",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@v4\n",
+        refused_as: "unpinned-action",
+    },
+    WorkflowEscape {
+        name: "MUT-WITNESS-CHECKOUT-REF",
+        escape: "the witness carrier's checkout points at `master`: the current-stable build \
+                 witness links a tree the candidate never touched while the guest, one stable \
+                 behind, links and passes the candidate",
+        job: Some("lint-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "gate-checkout",
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-CHECKOUT-REF",
@@ -1689,22 +1833,23 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-WINDOWS-BUILD-WITNESS-DELETED",
-        escape: "the hosted `cargo test --no-run` step removed. Clippy and MSRV still \
+        escape: "the hosted `cargo build --all-targets` step removed. Clippy and MSRV still \
                  type-check the Windows tree on GitHub's runner, but nothing on current \
                  stable code-generates or links it: a Windows-only codegen or link failure \
                  passes every hosted leg while the guest, one stable behind, links and passes.",
         job: Some("lint-windows"),
-        anchor: "      - run: cargo test --no-run --all-targets --all-features\n",
+        anchor: "      - run: cargo build --all-targets --all-features\n",
         replacement: "",
         refused_as: "windows-build-witness",
     },
     WorkflowEscape {
-        name: "MUT-WINDOWS-BUILD-WITNESS-ECHOED",
-        escape: "the witness step echoes its command instead of running it; a substring \
-                 reading passes and the equality does not",
+        name: "MUT-WINDOWS-BUILD-WITNESS-NARROWED",
+        escape: "the witness narrowed to `cargo test --no-run`, which builds only test-profile \
+                 artifacts: a `#[cfg(all(windows, not(test)))]` body in a binary is never \
+                 linked on current stable, and a link failure there passes every hosted leg",
         job: Some("lint-windows"),
-        anchor: "      - run: cargo test --no-run --all-targets --all-features\n",
-        replacement: "      - run: echo cargo test --no-run --all-targets --all-features\n",
+        anchor: "      - run: cargo build --all-targets --all-features\n",
+        replacement: "      - run: cargo test --no-run --all-targets --all-features\n",
         refused_as: "windows-build-witness",
     },
     WorkflowEscape {

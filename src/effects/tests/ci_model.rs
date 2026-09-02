@@ -39,10 +39,60 @@ pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 /// by re-curation. Without this step nothing on GitHub's current stable ever
 /// code-generates or links the Windows tree: a Windows-only codegen or link
 /// failure on current stable would pass every hosted leg while the guest, one
-/// stable behind, links and passes. `--no-run` builds every test binary and
-/// executes none, so the suite's execution stays where the decision record
-/// put it.
-pub(super) const WINDOWS_BUILD_WITNESS: &str = "cargo test --no-run --all-targets --all-features";
+/// stable behind, links and passes. `cargo build --all-targets` rather than
+/// `cargo test --no-run`: the latter builds only test-profile artifacts, so a
+/// `#[cfg(all(windows, not(test)))]` body in a binary is never linked by it,
+/// where `--all-targets` links the library and binaries as shipped **and** as
+/// unit-test harnesses, plus examples and integration tests. It executes
+/// nothing, so the suite's execution stays where the decision record put it.
+pub(super) const WINDOWS_BUILD_WITNESS: &str = "cargo build --all-targets --all-features";
+
+/// The script the test jobs run before the suite, character for character:
+/// an identity for the commits several tests make.
+///
+/// Pinned because a `run:` step is a shell with the checkout in front of it.
+/// `git fetch origin master && git checkout --detach FETCH_HEAD` appended here
+/// would test `master` while the labels, the fields, the shell, the input-free
+/// checkout and the pinned test command that follows all still matched.
+/// Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED` and `MUT-TEST-RUN-RETARGETED`.
+pub(super) const GIT_IDENTITY_SCRIPT: &str = "git config --global user.email \"ci@upstroke.local\"\ngit config --global user.name \"upstroke CI\"\n";
+
+/// Every script a test job may run: the identity script and the suite.
+pub(super) const TEST_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, TEST_COMMAND];
+
+/// The formatter gate and the four shell gates the `lint` job runs from the
+/// repository root, character for character.
+pub(super) const FMT_GATE: &str = "cargo fmt --check";
+pub(super) const SHELL_GATES: [&str; 4] = [
+    "bash .github/scripts/test-release-record.sh",
+    "bash .github/scripts/test-pr-policy.sh",
+    "bash .github/scripts/test-pr-ledger-evidence.sh",
+    "bash .github/scripts/test-docs-consistency.sh",
+];
+
+/// Every script a gate job may run. A union across the three gate jobs rather
+/// than a set per job: `lint (macos)` running the formatter would be
+/// redundant, not an escape, and the one command that must sit on exactly one
+/// job, the Windows build witness, is pinned to its carrier separately.
+pub(super) const GATE_SCRIPTS: [&str; 7] = [
+    CLIPPY_GATE,
+    WINDOWS_BUILD_WITNESS,
+    FMT_GATE,
+    SHELL_GATES[0],
+    SHELL_GATES[1],
+    SHELL_GATES[2],
+    SHELL_GATES[3],
+];
+
+/// The actions a step may `uses:`, each pinned to the commit it was reviewed
+/// at. An action off this list is code nobody here reviewed running with a
+/// checkout of its own; a floating tag (`@v4`) is that action at whatever
+/// commit the tag points to tomorrow. Measured, `MUT-STEP-USES-UNPINNED`.
+pub(super) const PINNED_ACTIONS: [&str; 3] = [
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+];
 
 /// The job that runs those fixtures for the one platform whose test execution
 /// left GitHub's runners, and the labels it must run on -- exactly.
@@ -62,7 +112,7 @@ pub(super) const WINDOWS_BUILD_WITNESS: &str = "cargo test --no-run --all-target
 /// which is why that entry is unchanged: GitHub's runner is still the witness
 /// that compiles every `#[cfg(windows)]` body, and through
 /// [`WINDOWS_BUILD_WITNESS`] the one that code-generates and links it on
-/// current stable.
+/// current stable, shipped binaries and test harnesses alike.
 pub(super) const TEST_WINDOWS_JOB: &str = "test-windows";
 pub(super) const TEST_WINDOWS_LABELS: [&str; 3] = ["self-hosted", "windows", "winguest"];
 

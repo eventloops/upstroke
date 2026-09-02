@@ -1650,10 +1650,14 @@ fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
 ///
 /// The self-hosted leg executes the suite with the image's toolchain, which
 /// moves only by re-curation; `cargo check` and Clippy stop before codegen. The
-/// witness is a hosted `cargo test --no-run`, pinned exactly once on exactly one
-/// `windows-latest` job, so a Windows-only codegen or link failure on current
-/// stable cannot pass every hosted leg. The refusals are executed in
-/// [`WORKFLOW_ESCAPES`], `MUT-WINDOWS-BUILD-WITNESS-*`.
+/// witness is a hosted `cargo build --all-targets`, pinned exactly once on
+/// exactly one `windows-latest` job and riding the Windows Clippy gate so that
+/// job's step and checkout pins cover it. It links the library and binaries as
+/// shipped and as test harnesses, so a Windows-only codegen or link failure in
+/// any of them on current stable cannot pass every hosted leg; what it cannot
+/// see is a failure that needs a toolchain newer than current stable, which no
+/// leg has. The refusals are executed in [`WORKFLOW_ESCAPES`],
+/// `MUT-WINDOWS-BUILD-WITNESS-*` and `MUT-WITNESS-CHECKOUT-REF`.
 #[test]
 fn the_hosted_windows_leg_still_links_every_test_binary() {
     let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
