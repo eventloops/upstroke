@@ -1197,8 +1197,8 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// **A list rather than a count, because a count does not say *which* files.**
 /// A derivation that swapped one module for another -- same cardinality,
 /// different set -- satisfies every assertion a number can carry, and fails
-/// here naming the file it gained and the file it lost. The four modules not
-/// called `tests.rs` were already named individually for exactly that reason;
+/// here naming the file it gained and the file it lost. The modules not called
+/// `tests.rs` were already named individually for exactly that reason;
 /// this is that argument applied to the whole population rather than to the
 /// part of it a file-name rule misses.
 ///
@@ -1209,7 +1209,8 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// with the attribute on the declaration and its effective predicate the bare
 /// `test` atom, so each is a `tests.rs` and the file-name rule `file_stem ==
 /// "tests"` finds it. The rest
-/// -- `scaffold`, `premove`, `fake` and `readiness` -- differ by **how each
+/// -- `scaffold`, `premove`, `fake`, `fixture`, `scratch_tree` and `readiness`
+/// -- differ by **how each
 /// file is reached**, which is the distinction a census gets wrong, and they
 /// are the ones it is most likely to trip over, since a scaffold, a fake and a
 /// readiness protocol exist to name what production names.

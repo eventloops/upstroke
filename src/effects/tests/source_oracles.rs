@@ -535,13 +535,13 @@ pub(super) mod oracles {
     /// [`census_domain::declared_whole_file_test_modules`] and one wrote its own
     /// rule, `path.file_stem() == "tests"`. That covers the entries of
     /// [`WHOLE_FILE_TEST_MODULES`] whose file stem is `tests` — the ones a
-    /// literal `#[cfg(test)] mod tests;` declares. The crate declares four
+    /// literal `#[cfg(test)] mod tests;` declares. The crate declares six
     /// more, and they are exactly the ones a census is most likely to trip over
-    /// — a scaffold, a fake and a readiness protocol exist to *name* what
-    /// production names, and `scaffold.rs` sits inside the `engine/topology`
-    /// domain one of those censuses walks.
+    /// — a scaffold, a fake, a fixture and a readiness protocol exist to *name*
+    /// what production names, and `scaffold.rs` sits inside the
+    /// `engine/topology` domain one of those censuses walks.
     ///
-    /// `agent/proc/test_support/readiness.rs` is the fourth and the one no
+    /// `agent/proc/test_support/readiness.rs` is the last of them and the one no
     /// **text** rule finds at all: it is declared `pub(crate) mod readiness;`,
     /// with no attribute of its own, inside `proc`'s inline `#[cfg(test)]
     /// pub(crate) mod test_support { … }`. Nothing in that file is
