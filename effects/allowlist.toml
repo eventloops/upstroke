@@ -90,7 +90,14 @@ after a crashed run can delete a stale tree this call did not create; and \
 `run_kill_child` re-execs THIS test binary `--exact --ignored` while `git_out` \
 and `KillableGitChild::spawn` run the system `git` in a caller-supplied \
 directory. Both bodies are byte-identical to what already ran inside the parent. \
-No item here returns a `File`, an `OpenOptions` or a `Command`. \
+HANDLES, PRECISELY, because a blanket claim here would be false: no item returns \
+a `File`, an `OpenOptions` or a `Command`, but one DOES hand back a live process \
+handle and it is named rather than covered. `KillableGitChild::spawn` returns a \
+`pub(crate)` type owning a `std::process::Child`, because the residue kill \
+sampler has to kill a real `git` at a chosen instant and a handle it cannot \
+reach is a kill it cannot time. Its `child` field is private, it exposes only \
+`kill`, `exited`, `wait` and `fired`, and the whole module is `#[cfg(test)]` so \
+the type is not in the rlib at all. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
@@ -120,7 +127,10 @@ sites, every one `std::println` in a diagnostic. \
 CONTAINMENT, STATED AS IT IS. The filesystem effects are under roots \
 `fixture::scratch` minted, with the predictable-path pre-clean that row \
 describes; the process effects are the system `git` and re-execs of this test \
-binary. No item here returns a writable handle. \
+binary. HANDLES: nothing in this file is `pub` or `pub(crate)` at all, so \
+nothing crosses the module boundary; the one type owning a live \
+`std::process::Child` -- `SampledChild`, the kill sampler's handle -- is \
+private, as is its constructor. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
@@ -462,7 +472,10 @@ stale tree this call did not create. That is the older, pre-token shape \
 `scratch_tree::acquire` was written to replace; the body is byte-identical to \
 what already ran inside the parent, and this row records the hazard rather than \
 implying a containment the file does not have. The process effects are forks of \
-this test binary and re-execs of it. No item here returns a writable handle. \
+this test binary and re-execs of it. HANDLES: nothing in this file is `pub` or \
+`pub(crate)` either; the seven `pub fn`s a grep finds are inside the \
+raw-string rustc fixtures, whose interiors are compile-refusal source rather \
+than items of this module. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
