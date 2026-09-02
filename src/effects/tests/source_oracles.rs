@@ -35,9 +35,11 @@
 //!
 //! **No name here is a test name.** The eleven `#[test]` wrappers stay in
 //! `super` under the harness names the contract, CI and `reviews/FINDINGS.md`
-//! know, and the eleven bodies below are deliberately named otherwise — so
-//! `--list` over the test binary is unchanged and nothing nests under
-//! `effects::tests::source_oracles`. `effects/wrappers.toml` names
+//! know, and the eleven bodies below are deliberately named otherwise — which
+//! is what let the bodies move here without renaming a test, and is why nothing
+//! nests under `effects::tests::source_oracles` in `--list`. It is a statement
+//! about these names and not about any diff: a change that adds a `#[test]` to
+//! `super` adds a name to `--list` like any other. `effects/wrappers.toml` names
 //! `no_topology_module_calls_a_funnel_in_production` and `reviews/FINDINGS.md`
 //! names three more; all four still resolve, because the harness did not move.
 //!
