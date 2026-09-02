@@ -106,7 +106,23 @@ installs; `defaults.run.working-directory`, refused outright, because a job
 default directory points the pinned command at another crate; and the
 workflow's whole `env:` mapping as an equality, because a Cargo target runner
 bound there builds every Windows harness and executes none, and a guard per
-name can only refuse the names somebody thought of. It
+name can only refuse the names somebody thought of. The `permissions:` mapping
+is pinned the same way: the field's presence was checked, its value was not,
+and a token widened to `write-all` reaches every build script and test the
+candidate ships with the checkout's credential still configured, which no guest
+teardown recalls.
+
+Two files outside the workflow can make any reading of it false, and both are
+now held absent by `no_repository_file_overrides_what_ci_compiles_or_runs`: a
+`rust-toolchain.toml`, which overrides the rustup default the pinned action
+sets and so replaces the compiler every leg runs, witness and MSRV floor
+included; and a `.cargo/config.toml`, which can bind `target.<triple>.runner`
+and make `cargo test` build every Windows harness while a wrapper reports
+success without executing one. Neither exists today, and `CLAUDE.md` already
+states the convention for the first; the test makes both enforceable rather
+than remembered. All five of these were reported against this change and are
+older than it: they hold on `master` today, and the self-hosted leg is what
+made them load-bearing by leaving one platform's execution in one place. It
 also pins the hosted witness: exactly one `windows-latest` job carries `cargo
 build --all-targets --all-features` exactly once and that job is the Windows
 Clippy gate, since `cargo check` and Clippy stop before codegen and the guest

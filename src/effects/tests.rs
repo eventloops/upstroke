@@ -1496,7 +1496,9 @@ fn clippy_driver() -> PathBuf {
 mod ci_model;
 mod workflow;
 
-use ci_model::{CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, RUSTFLAGS_KEY};
+use ci_model::{
+    CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, OVERRIDING_REPO_FILES, RUSTFLAGS_KEY,
+};
 use workflow::{
     WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints,
     ci_test_windows_job_complaints, ci_windows_build_witness_complaints, ci_workflow_text,
@@ -1668,6 +1670,39 @@ fn the_hosted_windows_leg_still_links_every_test_binary() {
         complaints.is_empty(),
         "no hosted leg code-generates and links the Windows tree the way the contract pins:\n{}",
         complaints.join("\n")
+    );
+}
+
+/// No file in the repository outranks what `ci.yml` says CI compiles and runs.
+///
+/// Every other assertion in this section reads `ci.yml` and concludes something
+/// about what CI does. Two repository files make that inference false without
+/// touching the workflow at all. A `rust-toolchain.toml` overrides the rustup
+/// default the pinned toolchain action sets, so every bare `cargo` command runs
+/// a compiler the workflow never names -- the current-stable witness included,
+/// and the MSRV floor with it. A `.cargo/config.toml` can bind
+/// `target.<triple>.runner`, which Cargo applies to `cargo test`: every Windows
+/// harness builds and a wrapper reports success without executing one, on the
+/// one platform whose tests no other leg runs.
+///
+/// Neither exists, and this is what keeps it that way. Absence rather than a
+/// parse: adding either is a deliberate act, and the same change must decide
+/// what this contract then reads. `CLAUDE.md` already states the convention for
+/// the toolchain file; this makes it enforceable rather than remembered.
+#[test]
+fn no_repository_file_overrides_what_ci_compiles_or_runs() {
+    let root = repo_root();
+    let present: Vec<&str> = OVERRIDING_REPO_FILES
+        .iter()
+        .copied()
+        .filter(|name| root.join(name).exists())
+        .collect();
+    assert!(
+        present.is_empty(),
+        "these files outrank `{CI_WORKFLOW}` and this contract reads only the workflow: \
+         {present:?}. A toolchain file replaces the compiler every leg runs; a Cargo config \
+         can bind a target runner that reports success without executing a test binary. \
+         Adding one is a deliberate act: extend this contract in the same change."
     );
 }
 

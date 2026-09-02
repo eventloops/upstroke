@@ -35,7 +35,7 @@ use super::ci_model::{
     MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS, REQUIRED_CONTEXT, RUSTFLAGS_KEY,
     RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND,
     TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB, TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS,
-    TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS,
+    TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -907,6 +907,31 @@ fn workflow_env_complaints(doc: &Yaml) -> Vec<String> {
     )]
 }
 
+/// Every way the workflow's `permissions:` is not the pinned mapping.
+///
+/// The whole map, as an equality, for the reason the `env:` map is pinned
+/// whole: the field's presence is not the property that matters, its value is.
+/// A widened token is available to every build script and test the candidate
+/// ships, with the checkout's credential still configured, and no guest
+/// teardown recalls what it pushed.
+/// Measured, `MUT-WORKFLOW-PERMISSIONS-WIDENED`.
+fn workflow_permissions_complaints(doc: &Yaml) -> Vec<String> {
+    let expected: BTreeMap<String, String> = WORKFLOW_PERMISSIONS
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let found = field(doc, "permissions").and_then(scalar_map);
+    if found.as_ref() == Some(&expected) {
+        return Vec::new();
+    }
+    vec![format!(
+        "[workflow-permissions] the workflow's `permissions:` is {found:#?}, not exactly \
+         {expected:#?}. `write-all`, or a scalar this contract cannot read as the pinned \
+         mapping, hands every step a token a candidate's build scripts and tests can push \
+         with -- and the guest's destruction does not recall a push."
+    )]
+}
+
 /// Every way the hosted Windows codegen witness fails its contract.
 ///
 /// The self-hosted leg executes the Windows suite with the golden image's
@@ -1473,6 +1498,7 @@ pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     out.extend(ci_test_windows_job_complaints(doc));
     out.extend(ci_windows_build_witness_complaints(doc));
     out.extend(workflow_env_complaints(doc));
+    out.extend(workflow_permissions_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1873,6 +1899,17 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                       \x20     run:\n\
                       \x20       working-directory: ci-pass\n",
         refused_as: "defaults-shape",
+    },
+    WorkflowEscape {
+        name: "MUT-WORKFLOW-PERMISSIONS-WIDENED",
+        escape: "the job token widened to `write-all`: every build script and test the \
+                 candidate ships runs with a token that can push, the checkout leaves that \
+                 credential configured for later Git commands, and destroying the guest \
+                 afterwards recalls nothing",
+        job: None,
+        anchor: "permissions:\n  contents: read\n",
+        replacement: "permissions: write-all\n",
+        refused_as: "workflow-permissions",
     },
     WorkflowEscape {
         name: "MUT-WORKFLOW-ENV-TARGET-RUNNER",

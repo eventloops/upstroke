@@ -280,6 +280,37 @@ pub(super) const WORKFLOW_ENV: [(&str, &str); 2] = [
     (RUSTFLAGS_KEY, RUSTFLAGS_VALUE),
 ];
 
+/// The workflow's `permissions:` mapping, pinned whole.
+///
+/// The trust story rests on this one binding: the job token is read-only, so a
+/// candidate's build scripts and tests cannot push. `permissions: write-all`,
+/// or a `contents: write` here, hands every step of every job a token that can,
+/// and `actions/checkout` leaves that credential configured for the Git
+/// commands a test makes afterwards. Destroying the guest afterwards does not
+/// recall a push. Requiring the key to *exist* is not the check; the value is.
+/// Measured, `MUT-WORKFLOW-PERMISSIONS-WIDENED`.
+pub(super) const WORKFLOW_PERMISSIONS: [(&str, &str); 1] = [("contents", "read")];
+
+/// Repository files that outrank what `ci.yml` says, and must therefore not
+/// exist while this contract reads only `ci.yml`.
+///
+/// A `rust-toolchain.toml` overrides the rustup default the pinned toolchain
+/// action sets, so every bare `cargo` command in every job would run a compiler
+/// the workflow never names -- including the witness that exists to compile
+/// current stable. A `.cargo/config.toml` can bind
+/// `target.<triple>.runner`, which Cargo applies to `cargo test`: every Windows
+/// harness would build and a wrapper would report success without executing
+/// one. Both are invisible to a reader of `ci.yml`. `CLAUDE.md` already states
+/// the project has no toolchain file and selects toolchains at call sites; this
+/// is that convention made enforceable. Adding either file is a deliberate act
+/// that must extend this contract in the same change.
+pub(super) const OVERRIDING_REPO_FILES: [&str; 4] = [
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
+
 /// The toolchain every leg but the MSRV floor installs, and the action that
 /// installs it.
 ///
