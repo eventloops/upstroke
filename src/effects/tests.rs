@@ -1055,6 +1055,13 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
              `Command::new(` row in `every_production_process_start_is_classified`",
         ),
         (
+            "src/runner/container/exec/tests.rs",
+            "the `ContainerRunner`'s `#[cfg(test)]` suite, out of line since W1. \
+             The same text was inside `exec.rs` below its `#[cfg(test)]` cut and \
+             so was never in this domain; it is named for the same reason \
+             `fake.rs` is, the marker being at the DECLARATION and not in the file",
+        ),
+        (
             "src/runner/container/fake.rs",
             "the funnel's `#[cfg(test)]` substrate — the fake runtime and the \
              Docker gate. Excluded from nothing by `production_region`, because \
@@ -2772,8 +2779,8 @@ fn the_checked_in_residue_class_record_is_what_the_enums_generate() {
     // `command_internal_sub_effects` says "N frozen per site in the registry";
     // `src/topology/registry.rs` is PR3's and frozen, and carries no N, so the
     // record carries it and this is the cross-check that keeps the two equal.
-    let harness = fs::read_to_string(repo_root().join("src/workspace_manager.rs"))
-        .expect("src/workspace_manager.rs");
+    let harness = fs::read_to_string(repo_root().join("src/workspace_manager/tests.rs"))
+        .expect("src/workspace_manager/tests.rs");
     assert!(
         harness.contains(&format!("const SAMPLING_N: u32 = {SAMPLING_N};")),
         "the sampling harness no longer runs N = {SAMPLING_N}"

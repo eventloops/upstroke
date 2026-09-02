@@ -1323,8 +1323,9 @@ pub(crate) mod census_domain {
     /// different rule instead: `path.file_stem() == "tests"`. That covers the
     /// files named `tests.rs` — the entries of
     /// `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` whose file stem is
-    /// `tests` — and **not** the four that are not: `scaffold`, `premove`,
-    /// `fake` and `readiness`. The whole set, that subset and the difference
+    /// `tests` — and **not** the six that are not: `scaffold`, `premove`,
+    /// `fake`, `fixture`, `scratch_tree` and `readiness`. The whole set, that
+    /// subset and the difference
     /// between them are all read off that one list; the four the rule misses
     /// are the ones a census is
     /// most likely to trip over, because a scaffold, a fake and a readiness
@@ -1980,7 +1981,8 @@ pub(crate) mod census_domain {
     /// domain is the set
     /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
     /// names — the literal `#[cfg(test)] mod tests;` declarations, plus
-    /// `scaffold`, `premove`, `fake` and `readiness` — and it is listed, path
+    /// `scaffold`, `premove`, `fake`, `fixture`, `scratch_tree` and
+    /// `readiness` — and it is listed, path
     /// by path, in `effects::tests::cfg::WHOLE_FILE_TEST_MODULES`. One more
     /// arrives with the slice that adds it, and that slice adds its path to
     /// that list: the population lives in one place, so adding a module is one
