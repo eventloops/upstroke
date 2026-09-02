@@ -1499,9 +1499,10 @@ mod workflow;
 use ci_model::{CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, RUSTFLAGS_KEY};
 use workflow::{
     WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints,
-    ci_test_windows_job_complaints, ci_workflow_text, complaint_codes, declared_msrv_toolchain,
-    declared_rust_version, field, field_names, mutate_workflow, parse_workflow,
-    rustflags_complaints, scalar, steps_of, three_component, workflow_complaints,
+    ci_test_windows_job_complaints, ci_windows_build_witness_complaints, ci_workflow_text,
+    complaint_codes, declared_msrv_toolchain, declared_rust_version, field, field_names,
+    mutate_workflow, parse_workflow, rustflags_complaints, scalar, steps_of, three_component,
+    workflow_complaints,
 };
 
 /// The parser this oracle depends on has the two properties it was chosen for.
@@ -1640,6 +1641,26 @@ fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
     assert!(
         complaints.is_empty(),
         "the self-hosted Windows leg does not run these fixtures the way the contract pins:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The Windows tree is code-generated and linked on GitHub's current stable,
+/// not only type-checked.
+///
+/// The self-hosted leg executes the suite with the image's toolchain, which
+/// moves only by re-curation; `cargo check` and Clippy stop before codegen. The
+/// witness is a hosted `cargo test --no-run`, pinned exactly once on exactly one
+/// `windows-latest` job, so a Windows-only codegen or link failure on current
+/// stable cannot pass every hosted leg. The refusals are executed in
+/// [`WORKFLOW_ESCAPES`], `MUT-WINDOWS-BUILD-WITNESS-*`.
+#[test]
+fn the_hosted_windows_leg_still_links_every_test_binary() {
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let complaints = ci_windows_build_witness_complaints(&doc);
+    assert!(
+        complaints.is_empty(),
+        "no hosted leg code-generates and links the Windows tree the way the contract pins:\n{}",
         complaints.join("\n")
     );
 }

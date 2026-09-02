@@ -31,6 +31,19 @@ pub(super) const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features 
 /// The command that executes this file's fixtures, character for character.
 pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 
+/// The hosted codegen and link witness for the platform whose tests run
+/// self-hosted, character for character.
+///
+/// `cargo check` and Clippy type-check and stop before codegen, and the
+/// self-hosted leg links with the golden image's toolchain, which moves only
+/// by re-curation. Without this step nothing on GitHub's current stable ever
+/// code-generates or links the Windows tree: a Windows-only codegen or link
+/// failure on current stable would pass every hosted leg while the guest, one
+/// stable behind, links and passes. `--no-run` builds every test binary and
+/// executes none, so the suite's execution stays where the decision record
+/// put it.
+pub(super) const WINDOWS_BUILD_WITNESS: &str = "cargo test --no-run --all-targets --all-features";
+
 /// The job that runs those fixtures for the one platform whose test execution
 /// left GitHub's runners, and the labels it must run on -- exactly.
 ///
@@ -47,7 +60,9 @@ pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 /// registers, and the third label is what names the curated image. The
 /// platform's Clippy and MSRV legs stay on [`CI_TARGETS`]'s `windows-latest`,
 /// which is why that entry is unchanged: GitHub's runner is still the witness
-/// that compiles every `#[cfg(windows)]` body.
+/// that compiles every `#[cfg(windows)]` body, and through
+/// [`WINDOWS_BUILD_WITNESS`] the one that code-generates and links it on
+/// current stable.
 pub(super) const TEST_WINDOWS_JOB: &str = "test-windows";
 pub(super) const TEST_WINDOWS_LABELS: [&str; 3] = ["self-hosted", "windows", "winguest"];
 

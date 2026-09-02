@@ -34,7 +34,7 @@ use super::ci_model::{
     ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS,
     OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE,
     SELF_HOSTED_TEST_PLATFORM, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_WINDOWS_JOB,
-    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, WORKFLOW_FIELDS,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, WINDOWS_BUILD_WITNESS, WORKFLOW_FIELDS,
 };
 use super::repo_root;
 
@@ -566,6 +566,7 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
              job that executes them."
         ));
     }
+    out.extend(checkout_complaints(job, "test", "test-job-checkout"));
 
     // The matrix is the platform half of the same claim, and it is compared
     // against the same derived runner set the Clippy legs are, less the one
@@ -759,6 +760,118 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
             "[test-windows-command] `{TEST_WINDOWS_JOB}` has {running} steps whose `run:` is \
              exactly `{TEST_COMMAND}`, not one"
         ));
+    }
+    out.extend(checkout_complaints(
+        job,
+        TEST_WINDOWS_JOB,
+        "test-windows-checkout",
+    ));
+    out
+}
+
+/// Every way a test job's checkout points the suite at a tree other than the
+/// head under test.
+///
+/// `actions/checkout` with no inputs checks out the event's own ref: for a
+/// pull request, the candidate merged onto its base. Any input -- `ref:`,
+/// `repository:`, `path:` -- selects something else, and `ref: master` there
+/// tests `master` while every other leg reads the candidate. [`STEP_FIELDS`]
+/// admits `with:` because the toolchain and cache actions need it; on a
+/// checkout step it is refused whole. Measured, `MUT-TEST-WINDOWS-CHECKOUT-REF`
+/// and `MUT-TEST-CHECKOUT-REF`.
+fn checkout_complaints(job: &Yaml, named: &str, code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let checks_out =
+            scalar(step, "uses").is_some_and(|uses| uses.starts_with("actions/checkout@"));
+        if !checks_out {
+            continue;
+        }
+        let Some(inputs) = field(step, "with") else {
+            continue;
+        };
+        out.push(format!(
+            "[{code}] `{named}` step {index} checks out with inputs {:?}. With no inputs the \
+             action checks out the head under test; any input can point this leg at another \
+             tree while every other leg reads the candidate.",
+            field_names(inputs)
+        ));
+    }
+    out
+}
+
+/// Every way the hosted Windows codegen witness fails its contract.
+///
+/// The self-hosted leg executes the Windows suite with the golden image's
+/// toolchain, which moves only by re-curation. `cargo check` and Clippy on
+/// `windows-latest` type-check current stable and stop before codegen, so
+/// without this witness nothing on GitHub's current stable ever code-generates
+/// or links the Windows tree: a Windows-only codegen or link failure there
+/// would pass every hosted leg while the guest, one stable behind, links and
+/// passes. [`WINDOWS_BUILD_WITNESS`] builds every test binary and executes
+/// none. It lives in the Windows Clippy gate's job, whose field set and shells
+/// the gate contract pins; this pins the command, exactly once, on exactly one
+/// hosted Windows job. Measured, `MUT-WINDOWS-BUILD-WITNESS-*`.
+pub(super) fn ci_windows_build_witness_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let Some(platform) = CI_TARGETS
+        .iter()
+        .find(|target| target.runner == SELF_HOSTED_TEST_PLATFORM)
+    else {
+        return vec![format!(
+            "[windows-build-witness] `{SELF_HOSTED_TEST_PLATFORM}` is not a runner this \
+             contract models, so the shell its steps resolve to is undecidable here"
+        )];
+    };
+    let carriers: Vec<String> = field_names(jobs)
+        .into_iter()
+        .filter(|name| {
+            field(jobs, name).is_some_and(|job| {
+                scalar(job, "runs-on") == Some(SELF_HOSTED_TEST_PLATFORM)
+                    && steps_of(job)
+                        .iter()
+                        .any(|step| scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS))
+            })
+        })
+        .collect();
+    let [carrier] = carriers.as_slice() else {
+        out.push(format!(
+            "[windows-build-witness] expected exactly one job whose `runs-on:` is \
+             `{SELF_HOSTED_TEST_PLATFORM}` and one of whose steps has `run:` equal to \
+             `{WINDOWS_BUILD_WITNESS}`, found {carriers:?}. Without it no hosted leg \
+             code-generates or links the Windows tree on current stable: `cargo check` and \
+             Clippy stop before codegen, and the self-hosted leg builds with the image's \
+             toolchain."
+        ));
+        return out;
+    };
+    let Some(job) = field(jobs, carrier) else {
+        return out;
+    };
+    let witnesses = steps_of(job)
+        .iter()
+        .filter(|step| scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS))
+        .count();
+    if witnesses != 1 {
+        out.push(format!(
+            "[windows-build-witness] `{carrier}` has {witnesses} steps whose `run:` is \
+             exactly `{WINDOWS_BUILD_WITNESS}`, not one"
+        ));
+    }
+    for (index, step) in steps_of(job).iter().enumerate() {
+        if scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS) {
+            out.extend(shell_complaints(
+                doc,
+                job,
+                step,
+                platform,
+                &format!("`{carrier}` step {index}"),
+                platform.default_shell,
+            ));
+        }
     }
     out
 }
@@ -1230,6 +1343,7 @@ pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     let mut out = ci_gate_complaints(doc);
     out.extend(ci_test_job_complaints(doc));
     out.extend(ci_test_windows_job_complaints(doc));
+    out.extend(ci_windows_build_witness_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1532,12 +1646,14 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-DISABLED",
-        escape: "a job-level `if: false` on the self-hosted job reports success without \
-                 running the Windows suite anywhere",
+        escape: "a step-level `if: false` on the self-hosted job's test step: the job reports \
+                 success having run nothing. A job-level `if:` is not this escape -- the job \
+                 reports `skipped` and the aggregate, which accepts only `success`, fails.",
         job: Some("test-windows"),
-        anchor: "    timeout-minutes: 20\n",
-        replacement: "    timeout-minutes: 20\n    if: false\n",
-        refused_as: "unexpected-job-field",
+        anchor: "      - run: cargo test --all-targets --all-features\n",
+        replacement: "      - run: cargo test --all-targets --all-features\n\
+                      \x20       if: false\n",
+        refused_as: "unexpected-step-field",
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-RENAMED-AWAY",
@@ -1547,6 +1663,49 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         anchor: "\n  test-windows:\n",
         replacement: "\n  test-windows-hosted:\n",
         refused_as: "test-windows-missing",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-CHECKOUT-REF",
+        escape: "the self-hosted job's checkout points at `master`. Every hosted leg still \
+                 reads the candidate, the self-hosted leg tests a tree the candidate never \
+                 touched, and a Windows-only regression goes green.",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "test-windows-checkout",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-CHECKOUT-REF",
+        escape: "the hosted test matrix checks out `master`: two platforms test a tree the \
+                 candidate never touched while Clippy and MSRV read the candidate",
+        job: Some("test"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "test-job-checkout",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-BUILD-WITNESS-DELETED",
+        escape: "the hosted `cargo test --no-run` step removed. Clippy and MSRV still \
+                 type-check the Windows tree on GitHub's runner, but nothing on current \
+                 stable code-generates or links it: a Windows-only codegen or link failure \
+                 passes every hosted leg while the guest, one stable behind, links and passes.",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo test --no-run --all-targets --all-features\n",
+        replacement: "",
+        refused_as: "windows-build-witness",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-BUILD-WITNESS-ECHOED",
+        escape: "the witness step echoes its command instead of running it; a substring \
+                 reading passes and the equality does not",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo test --no-run --all-targets --all-features\n",
+        replacement: "      - run: echo cargo test --no-run --all-targets --all-features\n",
+        refused_as: "windows-build-witness",
     },
     WorkflowEscape {
         name: "MUT-RUSTFLAGS-WEAKENED",

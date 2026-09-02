@@ -72,10 +72,12 @@ jobs:
   # (decisions/2026-09-01-self-hosted-windows-test-leg.md). On windows-latest
   # this suite took a median of 12.5 minutes and up to 21 -- a 2x host lottery
   # measured on identical code -- and the guest runs it in about two and a
-  # half. `lint (windows)` and the Windows MSRV leg stay on windows-latest, so
-  # GitHub's runner still compiles every `#[cfg(windows)]` body; only the test
-  # execution moved. The image carries the toolchain, so there is no install
-  # step, and its target directory is pre-warmed, so there is no cache step.
+  # half. `lint (windows)` and the Windows MSRV leg stay on windows-latest, and
+  # `lint (windows)` also builds every test binary with `cargo test --no-run`,
+  # so GitHub's runner still compiles, code-generates and links every
+  # `#[cfg(windows)]` body on current stable; only the test execution moved.
+  # The image carries the toolchain, so there is no install step, and its
+  # target directory is pre-warmed, so there is no cache step.
   test-windows:
     name: test (winguest)
     runs-on: [self-hosted, windows, winguest]
@@ -119,7 +121,11 @@ jobs:
   # (winguest)` is the attestation of record for the Windows suite and a lint
   # failure must not be able to masquerade as a test failure in it. This leg
   # stays on windows-latest on purpose: GitHub's runner remains the neutral
-  # witness that the Windows tree compiles clean.
+  # witness that the Windows tree compiles clean, and its second step, `cargo
+  # test --no-run`, makes it the witness that the tree code-generates and links
+  # on current stable too -- `cargo check` and Clippy stop before codegen, and
+  # the self-hosted leg links with the image's toolchain, which moves only by
+  # re-curation. The two steps fail separately and the log names which.
   lint-windows:
     name: lint (windows)
     runs-on: windows-latest
@@ -132,6 +138,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Pinned by the workflow oracle as `WINDOWS_BUILD_WITNESS`, exactly once
+      # on exactly one windows-latest job; a substring reading is not the check.
+      - run: cargo test --no-run --all-targets --all-features
 
   # PR5-MACOS-CLIPPY-NEVER-RUN. Ubuntu Clippy configures out every
   # `#[cfg(target_os = "macos")]` region and the Windows leg configures out the

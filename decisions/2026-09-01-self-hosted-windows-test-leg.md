@@ -5,7 +5,10 @@
 Windows Server 2025 guest on the build box, booted for each job from a throwaway
 qcow2 overlay of a frozen golden image and registered for that one job with a
 single-use just-in-time runner config. `lint (windows)` and the Windows MSRV leg
-stay on `windows-latest`. `upstroke-ci` requires the new job like every other.
+stay on `windows-latest`, and `lint (windows)` gains a `cargo test --no-run`
+step, so GitHub's runner still compiles, code-generates and links every
+`#[cfg(windows)]` body on current stable; only execution moves. `upstroke-ci`
+requires the new job like every other.
 
 ## Why
 
@@ -41,7 +44,9 @@ the pull request opened, deregistering itself on exit and leaving nothing on
 the host. Assumed, and therefore owed as obligations below: that the golden
 image is re-curated when the toolchain should move (its `stable` is whatever
 was current at curation, where `windows-latest` installs the latest on every
-run); that the host's own build load, which shares the same cores, does not
+run; until then the hosted `cargo test --no-run` step is what code-generates
+and links the tree on current stable); that the host's own build load, which
+shares the same cores, does not
 push the job past its 20-minute timeout; that the loop that recycles the guest
 is kept running.
 
@@ -57,9 +62,10 @@ request from a fork can execute its workflow on the host. What bounds it here:
 - The registration is per job and single-use, minted by the host loop; the
   workflow's token stays `contents: read` and the repository holds no secrets
   the job could reach.
-- GitHub's runner is still the witness that the Windows tree *compiles* clean
-  and on the MSRV floor. What moves to owner-controlled hardware is test
-  execution, and the owner's merge was already the attestation
+- GitHub's runner is still the witness that the Windows tree compiles clean,
+  code-generates and links on current stable (`cargo test --no-run` in
+  `lint (windows)`), and holds the MSRV floor. What moves to owner-controlled
+  hardware is test execution, and the owner's merge was already the attestation
   ([2026-08-23](2026-08-23-retire-app-attestation.md)).
 
 ## Rejected
@@ -81,12 +87,21 @@ The workflow-shape oracle (`src/effects/tests/ci_model.rs`,
 `src/effects/tests/workflow.rs`) pins the new job the way it pins the others:
 the labels as an exact set, the test command character for character, the
 platform-default shell on every `run:` step, a field set that admits no `if:` or
-`continue-on-error:`, and the aggregate's `needs`, environment and loop derived
-from the job graph. `windows-latest` keeps its `CI_TARGETS` entry because its
-Clippy and MSRV legs keep it. The `MUT-TEST-WINDOWS-*` rows execute the
-refusals: the job rehosted on `windows-latest`, its labels loosened, its
-command deleted, the job disabled, the job renamed away, and the hosted matrix
-quietly re-admitting Windows.
+`continue-on-error:`, a checkout step with no inputs (any input can point the
+suite at a tree other than the head under test), and the aggregate's `needs`,
+environment and loop derived from the job graph. It also pins the hosted
+witness: exactly one `windows-latest` job carries `cargo test --no-run
+--all-targets --all-features` exactly once, since `cargo check` and Clippy stop
+before codegen and the guest links with the image's toolchain. `windows-latest`
+keeps its `CI_TARGETS` entry because its Clippy, witness and MSRV legs keep it.
+The six `MUT-TEST-WINDOWS-*` rows execute the refusals: the job rehosted on
+`windows-latest`, its labels loosened, its command deleted, its test step
+disabled at step level (a job-level `if:` reports `skipped`, which the
+aggregate already refuses), the job renamed away, and its checkout pointed at
+`master`; `MUT-TEST-MATRIX-KEEPS-WINDOWS` refuses the hosted matrix quietly
+re-admitting Windows, `MUT-TEST-CHECKOUT-REF` the hosted matrix checking out
+`master`, and the two `MUT-WINDOWS-BUILD-WITNESS-*` rows the witness deleted or
+echoed.
 
 The runner mechanism is operator tooling and lives in the private companion
 tree ([2026-09-01](2026-09-01-infra-private.md)): the golden-image curation
