@@ -591,8 +591,8 @@ pub(super) mod oracles {
         );
         assert_eq!(
             modules.len(),
-            18,
-            "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
+            19,
+            "the crate declares {} whole-file test modules; a census skipping fifteen of them by \
              file name leaves the rest inside its domain",
             modules.len()
         );
@@ -606,7 +606,7 @@ pub(super) mod oracles {
         // case would trade one blind spot for another.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
-        assert_eq!(declarations.len(), 18);
+        assert_eq!(declarations.len(), 19);
         let literal: Vec<String> = declarations
             .iter()
             .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
@@ -614,8 +614,8 @@ pub(super) mod oracles {
             .collect();
         assert_eq!(
             literal.len(),
-            14,
-            "fourteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
+            15,
+            "fifteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
              found {}: {literal:?}",
             literal.len()
         );
