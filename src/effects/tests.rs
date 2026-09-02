@@ -2127,8 +2127,8 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 //     `#[cfg]`s conjoin, and so does every enclosing guard -- the module block it
 //     sits in, and, for a whole-file module, the `mod name;` declaration that
 //     names the file -- whether the guard is written on that declaration or on
-//     an inline module enclosing it. Eighteen files in this tree are reached
-//     only that way.
+//     an inline module enclosing it. The files `cfg::WHOLE_FILE_TEST_MODULES`
+//     counts are reached only that way.
 
 // The census is `cfg`, beside this file; the two tests below are what it answers
 // to. It decides predicates against `ci_model`'s targets -- the same table the

@@ -585,13 +585,14 @@ pub(super) fn module_dir(path: &str) -> String {
 ///
 /// Two passes, because a file's guard is written in another file. Pass one reads
 /// the `#[cfg(P)] mod name;` declarations and resolves each to the file it
-/// governs; pass two scans every file with the guard it inherited. Eighteen
-/// files in this tree exist only under a `cfg(test)` module declaration -- the
-/// count `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+/// governs; pass two scans every file with the guard it inherited. The files
+/// [`WHOLE_FILE_TEST_MODULES`] counts exist only under a `cfg(test)` module
+/// declaration -- the count
+/// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
 /// resolves independently -- and a census that missed it would read every
 /// predicate in them as unconditional.
 ///
-/// **Seventeen of the eighteen, and the difference is deliberate.** This pass
+/// **All but one of them, and the difference is deliberate.** This pass
 /// reads `#[cfg(P)] mod name;` -- the attribute is on the declaration -- and
 /// `agent/proc/test_support/readiness.rs` is declared with no attribute at all,
 /// inside an inline `#[cfg(test)]` module. `census_domain` resolves that
@@ -1170,9 +1171,33 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// rather than what it says: a census that resolved none of them would read
 /// several hundred predicates as unconditional and never notice.
 ///
-/// A floor, compared with `>=`. One of the eighteen -- `readiness.rs`, reached
+/// A floor, compared with `>=`. One of them -- `readiness.rs`, reached
 /// through an inline ancestor rather than through an attribute on its own
 /// declaration -- is outside *this* pass's grammar and carries no `cfg`
 /// occurrence, so the two derivations agree on the number without this census
 /// having to resolve the ancestry that produces it.
+///
+/// **This and [`WHOLE_FILE_TEST_MODULES_NAMED_TESTS`] are the only places
+/// either number is written.** Both were restated as an English word in about
+/// twenty comments across eight files, so one slice adding one whole-file test
+/// module falsified every one of them at once while this floor stayed green --
+/// and a passing `>=` floor is not the same as a true document. PR #97's review
+/// found that, and the prose now names these constants or describes the
+/// population without counting it. A slice that adds a module edits two
+/// integers here.
 pub(super) const WHOLE_FILE_TEST_MODULES: usize = 18;
+
+/// How many of [`WHOLE_FILE_TEST_MODULES`] a literal `#[cfg(test)] mod tests;`
+/// declares.
+///
+/// The two populations differ by **how each file is reached**, which is the
+/// distinction a census gets wrong. This subset is declared under that exact
+/// name at its parent's own top level, with the attribute on the declaration,
+/// so each file is a `tests.rs` and the file-name rule `file_stem == "tests"`
+/// finds it. The rest of [`WHOLE_FILE_TEST_MODULES`] is `scaffold`, `premove`,
+/// `fake` and `readiness` -- named individually rather than counted by
+/// `the_whole_file_modules_are_read_from_the_declarations`, because a count
+/// alone would not say *which* files a derivation had swapped -- and those are
+/// the ones a census is most likely to trip over, since a scaffold, a fake and
+/// a readiness protocol exist to name what production names.
+pub(super) const WHOLE_FILE_TEST_MODULES_NAMED_TESTS: usize = 14;
