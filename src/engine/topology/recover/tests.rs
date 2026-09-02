@@ -7722,9 +7722,12 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     );
     // The skip is in force and it removed something. A zero here would mean the
     // control was silently inert — the same failure as an empty region, one
-    // level up.
+    // level up. The floor is the pinned list's length rather than a literal,
+    // which is why it is that list and not `test_modules.len()`: the derivation
+    // is what this floor exists to catch, so a floor read off its own output
+    // would pass on an empty answer.
     assert!(
-        test_files_skipped >= 18
+        test_files_skipped >= crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES.len()
             && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")
                 && !rel.ends_with("scaffold.rs")
                 && !rel.ends_with("premove.rs")

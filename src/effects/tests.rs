@@ -2134,8 +2134,13 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 // to. It decides predicates against `ci_model`'s targets -- the same table the
 // workflow contract above is checked against -- so "no runner compiles this
 // body" and "no job lints that platform" cannot drift apart.
+//
+// `pub(crate)` for one item and one reader: `cfg::WHOLE_FILE_TEST_MODULES` is
+// the crate's only statement of the whole-file test-module population, and
+// `engine::topology::recover::tests` floors its skip count at that list's
+// length. Nothing else here is reachable from outside this directory.
 
-mod cfg;
+pub(crate) mod cfg;
 
 use cfg::{
     CFG_CENSUS_CONTROL, CFG_ESCAPES, CFG_GATE_FLOOR, CONTROL_GATES, CfgForm, CfgSite,

@@ -1910,6 +1910,26 @@ pub(crate) mod census_domain {
     /// than resolved: it is the one construct that can point a declaration
     /// outside its own directory, and there are none in this tree.
     ///
+    /// **No `cfg_attr` that applies a `cfg`, and this one is a hole rather
+    /// than a choice.** [`scan_module_declarations`] treats a `cfg_attr` as
+    /// significant only when it contains `path`, so `#[cfg_attr(all(),
+    /// cfg(test))] mod hidden_tests;` — which rustc applies as `#[cfg(test)]`
+    /// and compiles only under test — is read here as an unconditional
+    /// declaration, and the file it names stays in every census's domain as
+    /// production. There is no such declaration in this tree; the form is
+    /// stated because nothing in the crate would notice one. Measured by
+    /// writing one and reverting it: the module's own `#[test]` ran, so rustc
+    /// had applied the `cfg(test)`, while
+    /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+    /// stayed green with the file outside the population it resolves. It is
+    /// invisible to every reading of this derivation at once,
+    /// `whole_file_test_modules` included, and to the hand-maintained
+    /// `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` that pins the result, so
+    /// no assertion over the population can be the thing that catches it. PR
+    /// #101's reviewer found it, it predates that change, and widening the
+    /// scan to decide `cfg_attr` predicates is its own change with its own
+    /// review.
+    ///
     /// # Panics
     ///
     /// When a file cannot be read structurally at all — an attribute that never
@@ -2959,5 +2979,9 @@ pub(crate) mod lint_levels {
     }
 }
 
+// `pub(crate)` so `cfg::WHOLE_FILE_TEST_MODULES` -- the crate's only statement
+// of the whole-file test-module population -- reaches the one census outside
+// this module that floors a count on it. Test-only either way: the module is
+// compiled only under `cfg(test)`.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

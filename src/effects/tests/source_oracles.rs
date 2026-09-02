@@ -551,9 +551,15 @@ pub(super) mod oracles {
     /// **Every module named, not counted.** A count alone passes when the
     /// derivation swaps one file for another — same cardinality, different set
     /// — and names alone pass when it grows one more nobody looked at.
-    /// [`WHOLE_FILE_TEST_MODULES`] is the whole population as a sorted list of
-    /// paths, so a set comparison against it refuses both, and refuses them by
-    /// naming the file gained or lost rather than by printing two integers.
+    /// [`WHOLE_FILE_TEST_MODULES`] is the census domain as a list of paths, so
+    /// comparing against it refuses both, and refuses them by naming the file
+    /// gained or lost rather than by printing two integers.
+    ///
+    /// **It pins identity, not independence.** What compares against that list
+    /// is one resolver read two ways and a file-name rule, not three separate
+    /// derivations, and a declaration form the resolver cannot see is missing
+    /// from all of them at once. The comment on the second half of the body
+    /// says which is which and names the form this scan misses.
     pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
@@ -570,56 +576,69 @@ pub(super) mod oracles {
         }
 
         let modules = crate::effects::census_domain::whole_file_test_modules(&root, &files, 13);
-        let relative = |path: &std::path::Path| {
-            path.strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
+        // **Identity is a `Path`, never a string.** `CODING_STANDARDS.md` §8:
+        // a lossy display string is for diagnostics only, never identity.
+        // `to_string_lossy` maps two distinct non-UTF-8 paths onto one, and
+        // rewriting `\` to `/` turns a backslash -- a legal character in a Unix
+        // file name -- into what reads as a separator, so an equality over the
+        // rendered text can answer about a file that is not the one on disk.
+        // `Path` compares component-wise and Windows accepts either separator,
+        // so the forward-slash literals of `WHOLE_FILE_TEST_MODULES` match a
+        // native path with no conversion at all. The one lossy rendering left
+        // below is `declaring`, which is interpolated into a message and
+        // compared with nothing; do not fold the two back together.
+        fn relative<'a>(root: &std::path::Path, path: &'a std::path::Path) -> &'a std::path::Path {
+            path.strip_prefix(root).unwrap_or(path)
+        }
+        // Both sides of every comparison are sorted the same way, so no
+        // comparison depends on the order the list happens to be written in and
+        // a failure names the offending file rather than printing two integers.
+        // Sorting both is what makes that safe: `Path` orders component-wise,
+        // which ranks `a.rs` after `a/b.rs` where a byte sort of the same text
+        // does the reverse. No pair of entries differs that way *today*; a
+        // slice adding one that did would otherwise fail here on ordering while
+        // the set was right. A `Vec` rather than a set, so a duplicated entry
+        // fails instead of being absorbed.
+        fn sorted(mut paths: Vec<&std::path::Path>) -> Vec<&std::path::Path> {
+            paths.sort_unstable();
+            paths
+        }
         // The expected value, and the two halves of it the rules below
-        // partition into. `WHOLE_FILE_TEST_MODULES` is a sorted list of paths
-        // relative to `src`, which is what `relative` produces. Every actual
-        // below is sorted before it is compared, so each comparison is between
-        // sorted `Vec<String>`s and a failure names the offending file rather
-        // than printing two integers. Sorted explicitly rather than taken from
-        // the `BTreeSet`'s order: that order is over `Path` components, which
-        // ranks `a.rs` after `a/b.rs` where a string sort does the reverse, and
-        // no entry pairs that way *today*. A slice adding one that did would
-        // otherwise fail here on ordering while the set was right.
-        let expected: Vec<String> = WHOLE_FILE_TEST_MODULES
+        // partition into. `WHOLE_FILE_TEST_MODULES` holds paths relative to
+        // `src`, which is what `relative` produces. Filtering a sorted list
+        // keeps it sorted, so the halves need no second sort.
+        let expected = sorted(
+            WHOLE_FILE_TEST_MODULES
+                .iter()
+                .map(std::path::Path::new)
+                .collect(),
+        );
+        let stem_is_tests =
+            |path: &std::path::Path| path.file_stem().is_some_and(|stem| stem == "tests");
+        let expected_named_tests: Vec<&std::path::Path> = expected
             .iter()
-            .map(|path| (*path).to_owned())
-            .collect();
-        let stem_is_tests = |path: &str| {
-            std::path::Path::new(path)
-                .file_stem()
-                .is_some_and(|stem| stem == "tests")
-        };
-        let expected_named_tests: Vec<String> = expected
-            .iter()
+            .copied()
             .filter(|path| stem_is_tests(path))
-            .cloned()
             .collect();
-        let expected_not_named_tests: Vec<String> = expected
+        let expected_not_named_tests: Vec<&std::path::Path> = expected
             .iter()
+            .copied()
             .filter(|path| !stem_is_tests(path))
-            .cloned()
             .collect();
 
-        let mut named: Vec<String> = modules
-            .iter()
-            .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
-            .map(|path| relative(path))
-            .collect();
-        named.sort();
-
+        let named = sorted(
+            modules
+                .iter()
+                .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
+                .map(|path| relative(&root, path))
+                .collect(),
+        );
         assert_eq!(
             named, expected_not_named_tests,
             "these are the whole-file test modules a `file_stem == \"tests\"` rule does not see, and \
              a census that uses that rule reads them as production"
         );
-        let mut resolved: Vec<String> = modules.iter().map(|path| relative(path)).collect();
-        resolved.sort();
+        let resolved = sorted(modules.iter().map(|path| relative(&root, path)).collect());
         assert_eq!(
             resolved, expected,
             "the crate's whole-file test modules are not what `WHOLE_FILE_TEST_MODULES` lists; a \
@@ -636,50 +655,89 @@ pub(super) mod oracles {
         // structure, because a scan that resolved ancestry and lost the plain
         // case would trade one blind spot for another.
         //
-        // **Reading the list does not couple these assertions, and restoring
-        // per-assertion literals would not decouple them.** The independence
-        // that carries this test is between the three *derivations* —
-        // `whole_file_test_modules` resolves structure, this
-        // `declared_whole_file_test_modules` reads declarations, and the
-        // `file_stem == "tests"` rule the `named` vec above applies is the
-        // third — each of which still computes its own answer from the tree.
-        // Sharing one expected value across them is the point: it is what makes
-        // them agree or disagree about the same claim. Writing the population
-        // out three times adds no fourth derivation, and it used to be restated
-        // in about twenty comments besides, where a slice that added a module
-        // falsified all of them at once (PR #97's review). So this is not
-        // duplication to restore.
+        // **What reading one list buys, and what it does not.** These four
+        // comparisons are not four independent derivations, and this test does
+        // not claim they are. `whole_file_test_modules` calls
+        // `declared_whole_file_test_modules` and resolves each declaration it
+        // returns to a file, so `resolved` above and `declared` below are two
+        // views over **one** resolver; `named` and `literal` are those same two
+        // views filtered, one by the file-name rule `file_stem == "tests"` and
+        // one by the declaration form. The file-name rule is the only genuinely
+        // separate derivation here. What the list buys is identity — a module
+        // swapped for another, renamed, added or dropped fails a comparison by
+        // name rather than by cardinality — and what comparing the two halves
+        // buys is the disagreement between the file-name rule and the
+        // declaration form: a file called `tests.rs` that no literal
+        // declaration reaches, or a literal declaration resolving to a file not
+        // called `tests.rs`, splits the halves apart and fails.
+        //
+        // **The blind spot is shared, and it is not hypothetical.** A
+        // declaration form the resolver cannot see is missing from all of this
+        // at once — from both views, from both filters, and from the list,
+        // which is maintained by hand from the same derivation. PR #101's
+        // reviewer produced one and it reproduces: `#[cfg_attr(all(),
+        // cfg(test))] mod hidden_tests;` is applied by rustc as `#[cfg(test)]`,
+        // but `census_domain::scan_module_declarations` treats a `cfg_attr` as
+        // significant only when it contains `path`, so it reads that
+        // declaration as unconditional and omits the file. It is a stated limit
+        // of the domain, recorded on
+        // `census_domain::declared_whole_file_test_modules`. The gap predates
+        // this change; widening the scan is its own change with its own review.
+        //
+        // Reading one expected value from the list is therefore not duplication
+        // to restore. Writing the population out four times would add no
+        // derivation and close no blind spot, and it would restore what PR
+        // #97's review found: the same two counts were stated as English words
+        // 36 times across ten files, so one slice adding a module falsified
+        // every one of them at once while the `>=` floor stayed green.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
         // Each declaration named by the file it resolves to, through the shared
         // resolver rather than a second copy of the rule
         // (`PR5D-VISIBILITY-CHECK-DUPLICATED`), so this comparison is in the
         // same terms as the list.
-        let declared_file = |declaration: &crate::effects::census_domain::TestModuleDeclaration| {
+        fn declared_file<'a>(
+            root: &std::path::Path,
+            declaration: &'a crate::effects::census_domain::TestModuleDeclaration,
+        ) -> &'a std::path::Path {
             let resolved =
                 crate::effects::census_domain::sole_present(&declaration.candidates, &|path| {
                     path.is_file()
                 })
                 .expect("a derived declaration resolves to exactly one file");
-            relative(resolved)
-        };
-        let mut declared: Vec<String> = declarations.iter().map(declared_file).collect();
-        declared.sort();
+            relative(root, resolved)
+        }
+        let declared = sorted(
+            declarations
+                .iter()
+                .map(|declaration| declared_file(&root, declaration))
+                .collect(),
+        );
         assert_eq!(
             declared, expected,
             "reading the declarations resolves a different population than \
              `WHOLE_FILE_TEST_MODULES` lists"
         );
-        let mut literal: Vec<String> = declarations
-            .iter()
-            .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
-            .map(declared_file)
-            .collect();
-        literal.sort();
+        let literal = sorted(
+            declarations
+                .iter()
+                .filter(|declaration| {
+                    declaration.inline_path.is_empty() && declaration.name == "tests"
+                })
+                .map(|declaration| declared_file(&root, declaration))
+                .collect(),
+        );
+        // Diagnostics, not identity: this names the files those declarations
+        // were *written in*, for the failure message, and is compared with
+        // nothing. §8 allows a lossy rendering here and only here.
         let declaring: Vec<String> = declarations
             .iter()
             .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
-            .map(|declaration| relative(&declaration.declared_in))
+            .map(|declaration| {
+                relative(&root, &declaration.declared_in)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(
             literal, expected_named_tests,
@@ -691,12 +749,12 @@ pub(super) mod oracles {
         // with the ancestry it was reached through. This is the whole of what
         // the structural scan buys, so it is asserted as a value rather than as
         // a count.
-        let inherited: Vec<(String, String, Vec<String>, String)> = declarations
+        let inherited: Vec<(&std::path::Path, String, Vec<String>, String)> = declarations
             .iter()
             .filter(|declaration| !declaration.inline_path.is_empty())
             .map(|declaration| {
                 (
-                    relative(&declaration.declared_in),
+                    relative(&root, &declaration.declared_in),
                     declaration.name.clone(),
                     declaration.inline_path.clone(),
                     declaration.guard.clone(),
@@ -706,7 +764,7 @@ pub(super) mod oracles {
         assert_eq!(
             inherited,
             vec![(
-                "agent/proc.rs".to_owned(),
+                std::path::Path::new("agent/proc.rs"),
                 "readiness".to_owned(),
                 vec!["test_support".to_owned()],
                 "test".to_owned(),

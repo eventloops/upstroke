@@ -1162,14 +1162,24 @@ pub(super) const CFG_ESCAPES: [(&str, &[&str], &str); 12] = [
 /// boundary assertions beside it are what pin the shape.
 pub(super) const CFG_GATE_FLOOR: usize = 350;
 
-/// Every file this tree reaches only through a `cfg(test)` module
-/// declaration, relative to `src/`, sorted.
+/// The census domain: every file a test-only `mod …;` declaration names,
+/// relative to `src/`, sorted.
 ///
-/// Derived independently by
+/// Derived by
 /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`,
 /// and pinned here because every predicate in those files is `all(test, …)`
 /// rather than what it says: a census that resolved none of them would read
 /// several hundred predicates as unconditional and never notice.
+///
+/// **Not every file this crate compiles only under `cfg(test)`, and the gap is
+/// deliberate.** `census_domain::declared_whole_file_test_modules` does not
+/// close over the file graph, so a declaration inside a file that is itself in
+/// this list derives nothing: `effects/tests.rs` is listed and declares `mod
+/// policy;`, which makes rustc compile `effects/tests/policy.rs` under
+/// `cfg(test)` too, and `policy.rs` is deliberately absent here. Adding it
+/// would widen what every census scans, which is a change to the measurement
+/// and not a correction to this list. That derivation's own doc comment states
+/// the closure it declines and the declaration form its scan cannot see.
 ///
 /// **A list rather than a count, because a count does not say *which* files.**
 /// A derivation that swapped one module for another -- same cardinality,
@@ -1180,11 +1190,11 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// part of it a file-name rule misses.
 ///
 /// **Both populations are read off this list, so neither number is written
-/// anywhere.** The whole of it is every file reached only through such a
-/// declaration. The subset a literal `#[cfg(test)] mod tests;` declares is the
-/// entries whose file stem is `tests`: declared under that exact name at their
-/// parent's own top level, with the attribute on the declaration, so each is a
-/// `tests.rs` and the file-name rule `file_stem == "tests"` finds it. The rest
+/// anywhere.** The whole of it is the domain above. The subset a literal
+/// `#[cfg(test)] mod tests;` declares is the entries whose file stem is
+/// `tests`: declared under that exact name at their parent's own top level,
+/// with the attribute on the declaration, so each is a `tests.rs` and the
+/// file-name rule `file_stem == "tests"` finds it. The rest
 /// -- `scaffold`, `premove`, `fake` and `readiness` -- differ by **how each
 /// file is reached**, which is the distinction a census gets wrong, and they
 /// are the ones it is most likely to trip over, since a scaffold, a fake and a
@@ -1201,13 +1211,19 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// carries no `cfg` occurrence, so the two derivations agree on the number
 /// without that census having to resolve the ancestry that produces it.
 ///
-/// **This is the only place the population is written.** It was restated as an
-/// English word in about twenty comments across eight files, so one slice
-/// adding one whole-file test module falsified every one of them at once while
-/// the `>=` floor stayed green -- and a passing floor is not the same as a true
-/// document. PR #97's review found that, and the prose now names this constant
-/// or describes the population without counting it.
-pub(super) const WHOLE_FILE_TEST_MODULES: &[&str] = &[
+/// **This is the only place either population is written, and every assertion
+/// about them reads it.** The two counts were stated as English words 36 times
+/// across ten files, so one slice adding one whole-file test module falsified
+/// every one of them at once while the `>=` floor stayed green -- and a passing
+/// floor is not the same as a true document. PR #97's review found that, and
+/// the prose now names this constant or describes the population without
+/// counting it.
+///
+/// `pub(crate)` rather than `pub(super)` for one reader outside this directory:
+/// `engine::topology::recover::tests` floors its skip count at `.len()`, which
+/// is the only form of that floor that is not satisfied by the derivation
+/// having gone inert.
+pub(crate) const WHOLE_FILE_TEST_MODULES: &[&str] = &[
     "agent/proc/test_support/readiness.rs",
     "effects/tests.rs",
     "engine/tests.rs",
