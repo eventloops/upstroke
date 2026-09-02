@@ -3079,8 +3079,12 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     ];
     // Every funnel module that allows a governed lint at file scope, and
     // therefore every module tree an out-of-line child can inherit one through.
-    // `src/runner/host.rs` has no directory today; it is named anyway, so the
-    // day it grows one the walk finds it rather than the reviewer having to.
+    // `src/runner/host.rs` was named here before it had a directory, so that
+    // the day it grew one the walk would find it rather than the reviewer
+    // having to. **That day arrived in W1**: `src/runner/host/tests.rs` is its
+    // extracted test module, and this walk finds it and grades it against all
+    // three governed lints like any other child. All three funnels have a
+    // directory today, so no arm of the domain below is inert.
     const FUNNELS: [&str; 3] = [
         "src/runner/container.rs",
         "src/agent/proc.rs",

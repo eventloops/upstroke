@@ -1421,34 +1421,36 @@ fn bounded(bytes: &[u8], limit: usize) -> (String, bool) {
 
 // -- test-only declarations ----------------------------------------------
 // At the BOTTOM: `effects::production_region`, which
-// `effects::externally_reachable_fns` and the three censuses further down this
-// file still use, cuts a source at its first `#[cfg(test)]`
+// `effects::externally_reachable_fns` and the three censuses now in
+// `exec/tests.rs` still use, cuts a source at its first `#[cfg(test)]`
 // (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 //
-// **The allow below is written ABOVE `#[cfg(test)]`. That order used to be
-// load-bearing and is now a convention.** The reader that made it load-bearing
-// was `runner::tests::production_region`, which was line-based: it excluded a
-// test module by matching a line that is exactly `#[cfg(test)]` followed by a
-// line starting `mod `, so an attribute between the two made this whole test
-// region read as PRODUCTION and both
+// **This declaration carries no `#[allow]`, and that is a change.** While the
+// bodies were inline here, an outer `#[allow(clippy::disallowed_methods)]` sat
+// above `#[cfg(test)]` and covered them. They are out of line now, in
+// `src/runner/container/exec/tests.rs`, which states that level for itself
+// because the funnel's child-module census requires a child to state one rather
+// than inherit it. The outer attribute was then allowing the same lint a second
+// time for the same module -- `clippy::duplicated_attributes` -- so it was
+// deleted rather than suppressed, and this file's `effects/allowlist.toml` row,
+// in the **funnel section**, records the empty `allows` that leaves. The
+// production region above keeps the file-level `#![deny(...)]`, so a lane's
+// production code here still cannot reach a container primitive
+// (`PR6-LANEF-004`). `decisions.effect_site_inventory.mechanism` (2).
+//
+// **That the allow was written ABOVE `#[cfg(test)]` used to be load-bearing**,
+// and the history is kept because it cost a repair round. The reader that made
+// it so was `runner::tests::production_region`, which was line-based: it
+// excluded a test module by matching a line that is exactly `#[cfg(test)]`
+// followed by a line starting `mod `, so an attribute between the two made this
+// whole test region read as PRODUCTION and both
 // `every_production_runner_request_is_built_by_its_roles_builder` and
 // `every_production_command_spec_payload_is_classified` failed with these
 // fixtures counted as production call sites. Measured in repair round F1 and
-// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`.
-//
-// **That reader is deleted.** `effects::production_code`, which those censuses
-// share now, finds the item's extent by delimiter matching, so it removes this
-// module with the attribute in either position — measured both ways on this
-// file. The order is kept because it is the one `effects::is_module_level`
-// reads without relying on its skip-further-attributes step, and because with
-// the allow written below `#[cfg(test)]` it becomes part of the configured
-// item and is blanked along with it.
-//
-// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
-// attachment to `src/runner/container.rs`. It covers this file's TEST REGION
-// ONLY — the production region above keeps the file-level `#![deny(...)]`, so a
-// lane's production code here still cannot reach a container primitive
-// (`PR6-LANEF-004`). `decisions.effect_site_inventory.mechanism` (2).
-#[allow(clippy::disallowed_methods)]
+// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`. That reader
+// is deleted: `effects::production_code`, which those censuses share now, finds
+// the item's extent by delimiter matching, so it removed the module with the
+// attribute in either position -- measured both ways on this file -- and with
+// no attribute here at all there is nothing left for a reader to trip over.
 #[cfg(test)]
 mod tests;

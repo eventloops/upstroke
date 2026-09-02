@@ -273,19 +273,26 @@ error."""
 
 [[funnel]]
 path = "src/runner/container/exec.rs"
-allows = ["clippy::disallowed_methods"]
+allows = []
 packet = "effect_site_inventory.mechanism (2), by attachment: the `ContainerRunner`, declared beside src/runner/container.rs"
 review = """
 The `ContainerRunner` (PR6 lane A). Its PRODUCTION REGION performs no denied \
 effect at all and carries a file-level `#![deny(clippy::disallowed_methods, \
 disallowed_types, disallowed_macros)]`, so a container primitive called from a \
 lane's production code here is a build error — which is the guarantee \
-`PR6-LANEF-004` found had been inherited away. The allow is an OUTER attribute \
-on the `#[cfg(test)] mod tests` item and therefore covers the test region only: \
-the fixtures build worktrees and scratch trees with `fs::create_dir_all` and \
-`fs::write`, and drive the seam directly to seed containers the runner then \
-supervises. Recorded here rather than left inherited, so the scope is a \
-reviewed artifact rather than an accident of the module tree."""
+`PR6-LANEF-004` found had been inherited away. \
+THIS ROW ALLOWS NOTHING NOW, AND THAT IS A CHANGE. It carried \
+`clippy::disallowed_methods` for an OUTER attribute on the `#[cfg(test)] mod \
+tests` item, which covered the fixtures while they were inline in this file. \
+They are out of line since W1, in `src/runner/container/exec/tests.rs`, which \
+has a row of its own and states that level for itself rather than inheriting \
+one. The outer attribute was then allowing one lint twice for one module — \
+`clippy::duplicated_attributes` — so it was deleted with the move rather than \
+suppressed. No attribute in this file allows a governed lint today, and the \
+empty list is the claim: `effects::tests::every_allow_of_a_governed_lint_is_\
+module_level_and_in_the_allowlist` compares this field against the attributes \
+actually written here, in both directions, so a row that outlived its \
+attribute and a file that grew one back both fail it."""
 
 [[funnel]]
 path = "src/runner/container/exec/tests.rs"
@@ -296,24 +303,46 @@ The `ContainerRunner`'s own test module (PR6 lane A), extracted from \
 `src/runner/container/exec.rs` into a sibling file and given an attribute of \
 its own IN THE SAME COMMIT -- never inheriting one. A Rust lint level is scoped \
 by the MODULE TREE and not by the file, so this file would otherwise have been \
-covered by the outer allow on its declaration in `exec.rs` while stating \
-nothing itself: that is `PR6-LANEF-004`, and `runner::container::tests::every_\
+covered by the outer allow that stood on its declaration in `exec.rs` while \
+stating nothing itself: that is `PR6-LANEF-004`, and `runner::container::tests::every_\
 child_module_of_the_container_funnel_states_its_own_lint_level` refuses a child \
 that does not state its own level. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. `exec.rs` carries a file-level \
-`#![deny(...)]` of all three governed lints and an OUTER \
-`#[allow(clippy::disallowed_methods)]` on the test declaration, so the test \
-region already had exactly this one lint allowed and the other two denied. \
-These same bodies made these same calls there; the move changes where the level \
-is stated, not what it permits. \
+`#![deny(...)]` of all three governed lints and carried, while these bodies \
+were inline in it, an OUTER `#[allow(clippy::disallowed_methods)]` on the test \
+declaration, so the test region already had exactly this one lint allowed and \
+the other two denied. These same bodies made these same calls there; the move \
+changes where the level is stated, not what it permits. That outer attribute \
+is GONE -- deleted with the move, because with the level stated here it \
+allowed one lint twice for one module, which is `clippy::duplicated_attributes` \
+-- and `exec.rs`'s own row now records an empty `allows`. \
 WHAT IT NEEDS THE ALLOW FOR, measured at extraction by denying all three and \
 counting the errors: 23 sites, every one `clippy::disallowed_methods` -- the \
 fixtures build worktrees and scratch trees (`fs::write` 9, `fs::create_dir_all` \
 7, `fs::set_permissions` 1), delegate the seam's four effectful methods through \
 a wrapper runtime (`ContainerRuntime::{create,start,stop,remove}`, one site \
 each) and drive the view directly (`GitView::{materialize,discard}`, one site \
-each) to seed containers the runner then supervises. It performs no effect \
-outside a scratch directory of its own making. \
+each) to seed containers the runner then supervises. \
+WHAT IT REACHES BEYOND ITS OWN SCRATCH TREE, stated because a containment \
+claim that overstates is worse than one that admits: the ten `real_docker_*` \
+tests behind `docker_gate` create, start, stop and remove REAL CONTAINERS IN \
+THE SHARED DOCKER DAEMON and query that daemon by label, and one of them reads \
+the host process table through `/proc` to find a container's daemonised \
+descendant. Daemon state is not inside any scratch directory, so deleting the \
+scratch tree does not undo it. Two guards bound it and neither is absolute: a \
+`LeaveNoResidue` `Drop` reclaims every container carrying the test's own \
+private-root label — `Drop` rather than a line at the end of the test, because \
+that line does not run when the test fails, which is when residue is most \
+likely — and the `GATED_RUNS` ledger gives each gated test a distinct run id, \
+so two trees' suites do not fight over one container name. \
+WHEN THE GUARD CANNOT RUN, RESIDUE SURVIVES: a `SIGKILL`ed process runs no \
+`Drop` at all, and a failing label query returns early from the `Drop` that \
+does run, so the container stays in the shared daemon and nothing in the \
+scratch-directory cleanup removes it. ONE gated test pre-cleans its own \
+container name before the create for exactly that case (`reviews/FINDINGS.md` \
+§16; the key it derives is per build slot and is fixed when \
+`CARGO_TARGET_DIR` is unset, `R5-SEAMS-006`); the other nine rely on the \
+`Drop`. \
 `clippy::disallowed_types` and `clippy::disallowed_macros` are RE-DENIED here \
 rather than inherited -- both measured at zero sites -- so a \
 `std::process::Command` or a `println!` in this file is still a build error. \
