@@ -1212,10 +1212,11 @@ pub(super) const CFG_GATE_FLOOR: usize = 350;
 /// without that census having to resolve the ancestry that produces it.
 ///
 /// **This is the only place either population is written, and every assertion
-/// about them reads it.** The two counts were stated as English words 36 times
-/// across ten files, so one slice adding one whole-file test module falsified
-/// every one of them at once while the `>=` floor stayed green -- and a passing
-/// floor is not the same as a true document. PR #97's review found that, and
+/// about them reads it.** The two counts were stated as English words 37 times
+/// across ten files, and written as an integer literal in five more places, so
+/// one slice adding one whole-file test module falsified every one of them at
+/// once while the `>=` floor stayed green -- and a passing floor is not the
+/// same as a true document. PR #97's review found that, and
 /// the prose now names this constant or describes the population without
 /// counting it.
 ///

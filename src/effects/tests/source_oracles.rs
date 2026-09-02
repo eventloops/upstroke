@@ -688,7 +688,7 @@ pub(super) mod oracles {
         // to restore. Writing the population out four times would add no
         // derivation and close no blind spot, and it would restore what PR
         // #97's review found: the same two counts were stated as English words
-        // 36 times across ten files, so one slice adding a module falsified
+        // 37 times across ten files, so one slice adding a module falsified
         // every one of them at once while the `>=` floor stayed green.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
