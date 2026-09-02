@@ -113,19 +113,25 @@ candidate ships with the checkout's credential still configured, which no guest
 teardown recalls.
 
 Pinning the action by commit says which code runs; three further pins say what
-it is told to do and when. Each action's `with:` inputs are an allowlist,
-because `Swatinem/rust-cache` accepts a `cmd-format` input and wraps the
-commands it runs in it, so one input on an allowlisted action at a pinned
-commit puts a `git checkout` of another tree in front of every gate in the job.
+it is told to do and when. Each action's `with:` inputs are an allowlist by key
+*and* by value, because `Swatinem/rust-cache` accepts a `cmd-format` input and
+wraps the commands it runs in it, and the toolchain action builds shell text
+from `components` and interpolates it into a Bash line — so one input on an
+allowlisted action at a pinned commit puts a `git checkout` of another tree in
+front of every gate in the job, by either route.
 The toolchain install must be the step after the checkout, because the action
 makes its toolchain the rustup default and anything above it runs whatever the
 runner image preinstalled -- during a release rollout, the previous stable,
 which is exactly what the current-stable witness exists to rule out. And the
-guard against the two overriding repository files runs as a `bash` step in the
-`lint` job, not only as a Rust test: the file it forbids is the one that makes
-`cargo test` build every harness and execute none, so a test forbidding it is a
-test that file prevents from running. The Rust test stays as the check that
-fails on a developer's machine, where the workflow step does not run.
+guard against the ways Cargo itself can be told not to run anything is a `bash`
+step in the `lint` job, not a Rust test. That is the one structural point in
+this contract: a `.cargo/config.toml` binding `target.<triple>.runner`, or a
+`CARGO_*_RUNNER` variable in the environment, makes `cargo test` build every
+harness and execute none — so any check written as a test is a check those
+mechanisms switch off, including the check that would have refused them. The
+step therefore runs before Cargo does and reads the filesystem and the
+effective environment directly. The Rust tests stay as the checks that fail on
+a developer's machine, where the workflow step does not run.
 
 Two files outside the workflow can make any reading of it false, and both are
 now held absent by that pair --

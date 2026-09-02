@@ -122,7 +122,24 @@ pub(super) const ACTION_INPUTS: [(&str, &[&str]); 3] = [
 /// job's shell steps are that place. The Rust test stays as well: it is what
 /// fails on a developer's machine, where this step does not run.
 /// Measured, `MUT-REPO-FILE-GUARD-DELETED`.
-pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done";
+/// The second half of the same guard, and the same reasoning one level up: the
+/// oracle that pins the workflow's `env:` is itself a Rust test, so a Cargo
+/// runner variable bound in that `env:` would stop the test that refuses it
+/// from ever executing. This half reads the *effective* environment rather than
+/// parsing YAML, which catches the binding wherever it was written — workflow
+/// scope reaches every job, and job- and step-level `env:` are already refused
+/// as unmodelled fields.
+pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }";
+
+/// The `components` values the toolchain action may be given.
+///
+/// The values, not just the key. The action builds a shell command from this
+/// input and interpolates it into a later Bash line, so a value carrying
+/// `;git fetch origin master && git checkout --detach FETCH_HEAD;` installs
+/// Clippy, checks out another tree, and exits zero — through an allowlisted
+/// action at a pinned commit with an allowlisted input name. Measured,
+/// `MUT-COMPONENTS-INJECTED`.
+pub(super) const TOOLCHAIN_COMPONENTS: [&str; 2] = ["clippy", "rustfmt, clippy"];
 
 /// The job that runs those fixtures for the one platform whose test execution
 /// left GitHub's runners, and the labels it must run on -- exactly.

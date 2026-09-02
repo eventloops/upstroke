@@ -35,8 +35,8 @@ use super::ci_model::{
     MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS,
     REPO_FILE_GUARD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM,
     STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
-    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TOOLCHAIN_ACTION, WINDOWS_BUILD_WITNESS,
-    WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TOOLCHAIN_ACTION, TOOLCHAIN_COMPONENTS,
+    WINDOWS_BUILD_WITNESS, WORKFLOW_ENV, WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -891,6 +891,22 @@ fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) ->
                  action at a pinned commit to run commands of the candidate's choosing -- \
                  `rust-cache`'s `cmd-format` wraps every command the step runs."
             ));
+        }
+        // The values, not only the key names. The toolchain action builds shell
+        // text from `components` and interpolates it into a Bash line, so an
+        // allowlisted key with an unpinned value is a command the candidate
+        // chose running inside an action this contract calls pinned.
+        if uses.starts_with(TOOLCHAIN_ACTION) {
+            if let Some(components) = scalar(inputs, "components") {
+                if !TOOLCHAIN_COMPONENTS.contains(&components) {
+                    out.push(format!(
+                        "[unpinned-action-input] `{named}` step {index} asks for components \
+                         {components:?}, which is not one of {TOOLCHAIN_COMPONENTS:?}. This \
+                         action interpolates the value into a shell command, so an unpinned one \
+                         runs whatever it contains."
+                    ));
+                }
+            }
         }
     }
     out
@@ -2023,6 +2039,18 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "unpinned-action-input",
     },
     WorkflowEscape {
+        name: "MUT-COMPONENTS-INJECTED",
+        escape: "the toolchain action's `components` value carries shell: the action builds a \
+                 command from it and interpolates it into a Bash line, so `clippy` plus a \
+                 checkout of `master` installs Clippy, moves the tree, and exits zero -- \
+                 through an allowlisted action, at a pinned commit, with an allowlisted input \
+                 name",
+        job: Some("lint-windows"),
+        anchor: "          components: clippy\n",
+        replacement: "          components: 'clippy;git${IFS}fetch${IFS}origin${IFS}master&&git${IFS}checkout${IFS}--detach${IFS}FETCH_HEAD;true'\n",
+        refused_as: "unpinned-action-input",
+    },
+    WorkflowEscape {
         name: "MUT-TOOLCHAIN-NOT-FIRST",
         escape: "a Cargo command is placed above the toolchain install, so it runs on whatever \
                  the runner image preinstalled rather than on the toolchain this workflow \
@@ -2042,7 +2070,7 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  runner prevents from ever executing, since `cargo test` would then build \
                  every harness and run none",
         job: Some("lint"),
-        anchor: "      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done\n",
+        anchor: "      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }\n",
         replacement: "",
         refused_as: "repo-file-guard",
     },
