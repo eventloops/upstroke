@@ -87,7 +87,7 @@ pub(super) mod oracles {
     use std::fs;
 
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
-    use crate::effects::tests::{repo_root, scanned_sources};
+    use crate::effects::tests::{is_the_literal_mod_tests_form, repo_root, scanned_sources};
     use crate::effects::{
         TOPOLOGY_MODULES, blank_comments, blank_comments_and_strings, externally_reachable_fns,
         production_code, production_region,
@@ -668,8 +668,12 @@ pub(super) mod oracles {
         // name rather than by cardinality — and what comparing the two halves
         // buys is the disagreement between the file-name rule and the
         // declaration form: a file called `tests.rs` that no literal
-        // declaration reaches, or a literal declaration resolving to a file not
-        // called `tests.rs`, splits the halves apart and fails.
+        // declaration reaches, a literal declaration resolving to a file not
+        // called `tests.rs`, or a `tests.rs` whose declaration is guarded by
+        // something narrower than `test` — present on the file-name side,
+        // absent from the declaration side, and the one of the three that
+        // silently costs a platform its test module — splits the halves apart
+        // and fails.
         //
         // **The blind spot is shared, and it is not hypothetical.** A
         // declaration form the resolver cannot see is missing from all of this
@@ -718,12 +722,26 @@ pub(super) mod oracles {
             "reading the declarations resolves a different population than \
              `WHOLE_FILE_TEST_MODULES` lists"
         );
+        // **Membership is the declaration form, guard included.** This read
+        // only the name and the inline path until PR #101's second pass, which
+        // is a rule that never looked at `guard` though it is right there:
+        // `#[cfg(all(test, unix))] mod tests;` still entails `test`, still
+        // resolves to a file called `tests.rs`, and passed as the plain form
+        // while Windows compiled no such module at all. The rule is
+        // `is_the_literal_mod_tests_form`, shared with the fixture that drives
+        // it over synthetic input, because a second copy here is the defect
+        // `PR5D-VISIBILITY-CHECK-DUPLICATED` names.
+        let is_literal = |declaration: &crate::effects::census_domain::TestModuleDeclaration| {
+            is_the_literal_mod_tests_form(
+                &declaration.name,
+                &declaration.inline_path,
+                &declaration.guard,
+            )
+        };
         let literal = sorted(
             declarations
                 .iter()
-                .filter(|declaration| {
-                    declaration.inline_path.is_empty() && declaration.name == "tests"
-                })
+                .filter(|declaration| is_literal(declaration))
                 .map(|declaration| declared_file(&root, declaration))
                 .collect(),
         );
@@ -732,7 +750,7 @@ pub(super) mod oracles {
         // nothing. §8 allows a lossy rendering here and only here.
         let declaring: Vec<String> = declarations
             .iter()
-            .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
+            .filter(|declaration| is_literal(declaration))
             .map(|declaration| {
                 relative(&root, &declaration.declared_in)
                     .to_string_lossy()
@@ -742,8 +760,12 @@ pub(super) mod oracles {
         assert_eq!(
             literal, expected_named_tests,
             "these are the whole-file test modules declared by a literal `#[cfg(test)] mod \
-             tests;` at their parent's own top level, and the file-name rule finds exactly them; \
-             the declarations were read in {declaring:?}"
+             tests;` -- that name, that guard, at their parent's own top level -- and the \
+             file-name rule finds exactly them. A declaration narrowed to `all(test, <platform>)` \
+             resolves to a `tests.rs` and is missing from the left side only: it is still a \
+             whole-file test module, it is not this form, and what a file-name census should do \
+             about a module that exists on only some platforms is the question this failure \
+             asks. The declarations were read in {declaring:?}"
         );
         // And the one that is reached only through an inline ancestor, named
         // with the ancestry it was reached through. This is the whole of what
