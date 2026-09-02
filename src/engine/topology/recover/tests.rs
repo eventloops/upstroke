@@ -7525,24 +7525,30 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     // the census reads — a unit assertion over literals would pass against a
     // helper nothing was wired into.
     //
-    // **The two counts differ, and the difference is worth keeping.** The whole
-    // file carries four occurrences of `expected_refs(`; the region the census
-    // reads carries one, because three of the four sit inside `#[cfg(test)]`
-    // items that `production_code` blanks. The one that survives is the
-    // **definition line** of `refuse_unexpected_refs`, which the "calls, not
-    // definitions" filter does not catch: the text before the match is
-    // `pub fn refuse_un`, and that does not end in `fn`.
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace_manager.rs"),
-    )
-    .expect("a source file");
+    // **The two counts differ, and the difference is worth keeping.** The module
+    // carries four occurrences of `expected_refs(`; the region the census reads
+    // carries one, because three of the four sit inside `#[cfg(test)]` items
+    // that `production_code` blanks. The one that survives is the **definition
+    // line** of `refuse_unexpected_refs`, which the "calls, not definitions"
+    // filter does not catch: the text before the match is `pub fn refuse_un`,
+    // and that does not end in `fn`.
+    //
+    // The three that `production_code` blanks now sit in the sibling file
+    // `mod tests;` declares, so the module is two files and `whole` is read
+    // from both. The comparison is the one it always was: every occurrence the
+    // module carries, against the one the production region keeps.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        std::fs::read_to_string(manifest.join("src/workspace_manager.rs")).expect("a source file");
+    let moved = std::fs::read_to_string(manifest.join("src/workspace_manager/tests.rs"))
+        .expect("a source file");
     let code = crate::effects::production_code(&source);
-    let whole = source.matches("expected_refs(").count();
+    let whole = source.matches("expected_refs(").count() + moved.matches("expected_refs(").count();
     let region = code.matches("expected_refs(").count();
     assert!(
         whole >= 4 && region >= 1,
-        "`workspace_manager.rs` no longer carries the substring this test is about ({whole} in \
-         the file, {region} in the production region), so the zero below proves nothing"
+        "`workspace_manager` no longer carries the substring this test is about ({whole} in \
+         the module, {region} in the production region), so the zero below proves nothing"
     );
     assert_eq!(
         crate::effects::census_domain::production_calls(
