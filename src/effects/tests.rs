@@ -1498,6 +1498,7 @@ mod workflow;
 
 use ci_model::{
     CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, OVERRIDING_REPO_FILES, RUSTFLAGS_KEY,
+    TEST_COMMAND, WINDOWS_TEST_FLOOR, WINDOWS_TEST_WITNESS,
 };
 use workflow::{
     WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints,
@@ -1632,10 +1633,12 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// `clippy-driver` is present for the fixtures -- is discharged here by the
 /// golden image the runner boots, which this contract cannot read; the decision
 /// record binds re-curation to it instead. What the contract *can* read is
-/// pinned: the labels exactly, the command exactly, the platform-default shell
-/// on every `run:` step, and a field set with no `if:` or `continue-on-error:`.
-/// The refusals are executed in [`WORKFLOW_ESCAPES`], every row named
-/// `MUT-TEST-WINDOWS-*`.
+/// pinned: the labels exactly, the suite step exactly -- the command and the
+/// count that says it executed, see
+/// [`the_self_hosted_leg_counts_the_tests_it_ran`] -- the platform-default
+/// shell on every `run:` step, and a field set with no `if:` or
+/// `continue-on-error:`. The refusals are executed in [`WORKFLOW_ESCAPES`],
+/// every row named `MUT-TEST-WINDOWS-*` and both `MUT-WINDOWS-WITNESS-*`.
 #[test]
 fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
     let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
@@ -1707,11 +1710,56 @@ fn no_repository_file_overrides_what_ci_compiles_or_runs() {
     // Package selection, for the same reason. `--all-targets` applies to the
     // packages Cargo selected, and `workspace.default-members` chooses them.
     let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    // A section header, not a spelling. `[ workspace ]` is the same table to
+    // Cargo and a different string to a literal comparison, which is how the
+    // first version of this check read.
+    let declares_workspace = manifest.lines().any(|line| {
+        line.trim()
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|name| name.trim() == "workspace")
+    });
     assert!(
-        !manifest.lines().any(|line| line.trim() == "[workspace]"),
+        !declares_workspace,
         "Cargo.toml declares a workspace, so `--all-targets --all-features` no longer selects \
          this crate: `default-members` decides, and a member with no tests makes every CI \
          command succeed without running this suite."
+    );
+}
+
+/// The leg whose tests left GitHub's runners reports that they ran.
+///
+/// Every other assertion here reads `ci.yml` and concludes what CI was *asked*
+/// to do. Cargo can be asked for this suite and execute none of it: a
+/// `target.<triple>.runner` in a repository `.cargo/config.toml`, in
+/// `$CARGO_HOME`, in a directory above the checkout or in the process
+/// environment hands each compiled harness to a wrapper that exits zero, and a
+/// root `[workspace]` whose `default-members` name another crate builds no
+/// harness of this one. Three of those are written where nothing reading this
+/// repository can see them, and Cargo is free to add a fourth route.
+///
+/// So this leg counts instead of enumerating: a suite that did not execute
+/// reports no `test result: ok.` line, and a job that cannot reach the floor
+/// fails. It is pinned like every other script, and the pin is what stops the
+/// count being deleted or its floor lowered to a number nothing has to clear.
+///
+/// It is not a defence against a pull request, and nothing in this file is: an
+/// edit to `ci.yml` deletes this step as easily as any other, and the decision
+/// record says where the boundary actually is. It is a defence against the
+/// machine, which is the input this change added. The guest is provisioned
+/// outside the repository, so its Cargo home and its environment are not in any
+/// diff, and this is the leg saying it ran what it says it ran.
+#[test]
+fn the_self_hosted_leg_counts_the_tests_it_ran() {
+    assert!(
+        WINDOWS_TEST_WITNESS.starts_with(TEST_COMMAND),
+        "the self-hosted leg's step does not open with `{TEST_COMMAND}`, so the suite it \
+         witnesses is not the suite the other legs run"
+    );
+    assert!(
+        WINDOWS_TEST_WITNESS.contains(&format!("-lt {WINDOWS_TEST_FLOOR}")),
+        "the self-hosted leg's step does not test the count against \
+         {WINDOWS_TEST_FLOOR}, so the floor this contract documents is not the floor it runs"
     );
 }
 

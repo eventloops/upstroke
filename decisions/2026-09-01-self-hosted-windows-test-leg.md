@@ -7,9 +7,12 @@ qcow2 overlay of a frozen golden image and registered for that one job with a
 single-use just-in-time runner config. `lint (windows)` and the Windows MSRV leg
 stay on `windows-latest`, and `lint (windows)` gains a `cargo build
 --all-targets` step, so GitHub's runner still compiles, code-generates and
-links every `#[cfg(windows)]` body on current stable, shipped binaries and test
-harnesses alike; only execution moves. `upstroke-ci` requires the new job like
-every other.
+links every `#[cfg(windows)]` body on current stable, the library, the binaries
+and their test harnesses, in the dev profile every leg here builds; only
+execution moves. The new job does not merely run the suite: it counts what
+libtest reported and fails below a floor, so the one leg that left GitHub's
+runners is the one leg that says it ran. `upstroke-ci` requires it like every
+other.
 
 ## Why
 
@@ -66,8 +69,8 @@ request from a fork can execute its workflow on the host. What bounds it here:
   the job could reach.
 - GitHub's runner is still the witness that the Windows tree compiles clean,
   code-generates and links on current stable (`cargo build --all-targets` in
-  `lint (windows)`, binaries and test harnesses both), and holds the MSRV
-  floor. What moves to owner-controlled
+  `lint (windows)`, binaries and test harnesses both, in the dev profile), and
+  holds the MSRV floor. What moves to owner-controlled
   hardware is test execution, and the owner's merge was already the attestation
   ([2026-08-23](2026-08-23-retire-app-attestation.md)).
 
@@ -122,19 +125,23 @@ front of every gate in the job, by either route.
 The toolchain install must be the step after the checkout, because the action
 makes its toolchain the rustup default and anything above it runs whatever the
 runner image preinstalled -- during a release rollout, the previous stable,
-which is exactly what the current-stable witness exists to rule out. And the
-guard against the ways Cargo itself can be told not to run anything is a shell
-step, not a Rust test. That is the one structural point in this contract: a
-`.cargo/config.toml` binding `target.<triple>.runner`, a `CARGO_*_RUNNER`
-variable in the environment, or a `[workspace]` in the root manifest whose
-`default-members` reselect the package, each makes `cargo test` compile every
-harness and execute none — so any check written as a test is a check those
-mechanisms switch off, including the check that would have refused them. Two
-such steps run, one per machine: `lint` reads the hosted runner's filesystem,
-environment and manifest before Cargo does, and `test-windows` reads the
-guest's, including the `%USERPROFILE%\.cargo` that no repository check can see.
-The Rust tests stay as the checks that fail on a developer's machine, where
-neither step runs.
+which is exactly what the current-stable witness exists to rule out. And the self-hosted leg counts
+the tests it ran. That is the one structural point in this contract. Cargo can
+be asked for this suite and execute none of it: a `target.<triple>.runner`
+bound in a repository `.cargo/config.toml`, in `$CARGO_HOME`, in any directory
+above the checkout or in the process environment hands every compiled harness
+to a wrapper that exits zero, and a `[workspace]` in the root manifest whose
+`default-members` name another crate builds no harness of this one at all.
+Three of those five are written where nothing reading this repository can see
+them; the fifth has as many spellings as TOML has whitespace; and the list
+closes only if Cargo stops growing. Two drafts of this change tried to refuse
+the routes, one shell step per machine, and the review found a route past each
+draft. So the leg checks the effect instead: `cargo test` on the guest is
+followed, in the same pinned step, by a sum of the `test result: ok.` counts
+libtest printed and a floor of 1700 — today it reports 1770 there — and no
+arrangement of runners, Cargo homes or manifests produces those lines without
+executing the tests. One equality over one script, in the class every pin here
+belongs to, in place of an enumeration that was wrong twice.
 
 **What none of this can do, stated plainly.** A pull request that edits
 `ci.yml` can delete those steps, and the oracle that would notice is a Rust
@@ -149,19 +156,24 @@ the pins above buy is not self-enforcement. It is that any such edit is a
 small, named, reviewable line in that diff rather than a plausible-looking
 change to a workflow nobody reads closely.
 
-Two files outside the workflow can make any reading of it false, and both are
-now held absent by that pair --
-`no_repository_file_overrides_what_ci_compiles_or_runs` and the `lint` step: a
+Two files outside the workflow can make any reading of it false, and
+`no_repository_file_overrides_what_ci_compiles_or_runs` holds both absent: a
 `rust-toolchain.toml`, which overrides the rustup default the pinned action
 sets and so replaces the compiler every leg runs, witness and MSRV floor
 included; and a `.cargo/config.toml`, which can bind `target.<triple>.runner`
 and make `cargo test` build every Windows harness while a wrapper reports
-success without executing one. Neither exists today, and `CLAUDE.md` already
-states the convention for the first; the test makes both enforceable rather
-than remembered. All five of these were reported against this change and are
-older than it: they hold on `master` today, and the self-hosted leg is what
-made them load-bearing by leaving one platform's execution in one place. It
-also pins the hosted witness: exactly one `windows-latest` job carries `cargo
+success without executing one. It is a Rust test, and a Rust test is precisely
+what the second of those switches off. That is deliberate and it is why the
+test is not written as a defence: what it catches is the file committed by
+accident, on a developer's machine and in CI alike, and what it says in a diff
+is that adding one is a decision this contract has to be extended for. The
+count on the self-hosted leg is what covers the platform whose execution moved.
+
+These were all reported against this change and are older than it: they hold on
+`master` today, on every leg, and the self-hosted leg is what made the Windows
+one load-bearing by leaving that platform's execution in one place. Closing
+them for the hosted legs is not in this change and is not claimed by it. The
+contract also pins the hosted witness: exactly one `windows-latest` job carries `cargo
 build --all-targets --all-features` exactly once and that job is the Windows
 Clippy gate, since `cargo check` and Clippy stop before codegen and the guest
 links with the image's toolchain; `--all-targets` rather than `test --no-run`
@@ -174,6 +186,8 @@ disabled at step level (a job-level `if:` reports `skipped`, which the
 aggregate already refuses), its checkout pointed at `master`, its identity
 step retargeted to `master`, and the job renamed away (a lost handle rather
 than a false green, since the aggregate's derived `needs` refuses that too);
+the two `MUT-WINDOWS-WITNESS-*` rows drop the count and lower its floor to
+zero, which are the two ways a step that reads as a witness stops being one;
 `MUT-TEST-MATRIX-KEEPS-WINDOWS`, `MUT-TEST-CHECKOUT-REF` and
 `MUT-TEST-RUN-RETARGETED` cover the hosted matrix; `MUT-GATE-RUN-RETARGETED`,
 `MUT-MSRV-RUN-RETARGETED`, `MUT-WITNESS-CHECKOUT-REF` and
@@ -200,7 +214,12 @@ overlay-per-job loop, and the guest provisioning that reproduces the image.
 2. Re-curation of the golden image is a deliberate act — shut both guests down,
    boot the base, change, shut down, recreate the overlays — recorded when it
    happens, and due whenever the repository's `stable` expectations move.
-3. Rollback is a revert of the pull request that lands this record: the
+3. The floor on the self-hosted leg is a measured number, and measured
+   numbers age. It is 1700 against 1770 reported today. A change that removes
+   that many Windows tests, or that gates them behind a feature, edits the
+   floor in the same change and says so; a change that finds the leg failing on
+   the floor has found either that, or a suite that stopped executing.
+4. Rollback is a revert of the pull request that lands this record: the
    `windows-latest` test leg returns and the oracle returns with it. The
    guest, the image and the loop are outside the repository and need no
    change to be ignored.

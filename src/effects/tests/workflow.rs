@@ -33,11 +33,11 @@ use super::ci_model::{
     AGGREGATE_STEP_FIELDS, CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS,
     DEFAULTS_RUN_FIELDS, ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS,
     MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS,
-    REPO_FILE_GUARD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM,
-    STABLE_TOOLCHAIN, STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
+    REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STABLE_TOOLCHAIN,
+    STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
     TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TEST_WINDOWS_SCRIPTS, TOOLCHAIN_ACTION,
-    TOOLCHAIN_COMPONENTS, WINDOWS_BUILD_WITNESS, WINDOWS_REPO_GUARD, WORKFLOW_ENV, WORKFLOW_FIELDS,
-    WORKFLOW_PERMISSIONS,
+    TOOLCHAIN_COMPONENTS, WINDOWS_BUILD_WITNESS, WINDOWS_TEST_WITNESS, WORKFLOW_ENV,
+    WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -779,14 +779,21 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
         ));
     }
 
+    // The whole step, not the command inside it. The command says which suite
+    // Cargo was asked for; the lines after it are what say the suite ran, and
+    // an equality over the step is what stops those lines being dropped, or
+    // their floor lowered to a number an unexecuted suite clears. Measured,
+    // `MUT-WINDOWS-WITNESS-COUNT-DROPPED` and `MUT-WINDOWS-WITNESS-FLOOR-DROPPED`.
     let running = steps_of(job)
         .iter()
-        .filter(|step| scalar(step, "run") == Some(TEST_COMMAND))
+        .filter(|step| scalar(step, "run") == Some(WINDOWS_TEST_WITNESS))
         .count();
     if running != 1 {
         out.push(format!(
             "[test-windows-command] `{TEST_WINDOWS_JOB}` has {running} steps whose `run:` is \
-             exactly `{TEST_COMMAND}`, not one"
+             exactly the pinned suite-and-witness script, not one. Its first line is \
+             `{TEST_COMMAND}`; the rest is the count that says the suite executed rather \
+             than compiling and being handed to something that exits zero."
         ));
     }
     out.extend(checkout_complaints(
@@ -966,50 +973,6 @@ fn toolchain_complaints(
                 "[{code}] `{named}` step {install} installs toolchain {selected:?}, not \
                  `{want}`. The action is pinned by commit; its input is what decides which \
                  compiler runs, and a downgrade here leaves current stable compiled by no leg."
-            ));
-        }
-    }
-    out
-}
-
-/// Every way the workflow stops refusing the two overriding repository files.
-///
-/// The guard is a `bash` step because it cannot be a Rust test: the file it
-/// forbids is the one that makes `cargo test` execute nothing. Exactly one
-/// step in the whole workflow runs it, character for character, and that step
-/// is on the job whose fields, shells, scripts and checkout the gate contract
-/// already pins. Measured, `MUT-REPO-FILE-GUARD-DELETED`.
-pub(super) fn ci_repo_file_guard_complaints(doc: &Yaml) -> Vec<String> {
-    let Some(jobs) = field(doc, "jobs") else {
-        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
-    };
-    let mut out = Vec::new();
-    // Two guards, because each reads one machine. The hosted one reads the
-    // Ubuntu runner; the self-hosted one reads the guest, which is where the
-    // suite that left GitHub's runners executes and therefore where a runner
-    // binding -- in the image's environment or its own Cargo home -- would
-    // suppress it unseen by anything on the hosted side.
-    for (guard, what) in [
-        (REPO_FILE_GUARD, "hosted"),
-        (WINDOWS_REPO_GUARD, "self-hosted"),
-    ] {
-        let carriers: Vec<String> = field_names(jobs)
-            .into_iter()
-            .filter(|name| {
-                field(jobs, name).is_some_and(|job| {
-                    steps_of(job)
-                        .iter()
-                        .any(|step| scalar(step, "run") == Some(guard))
-                })
-            })
-            .collect();
-        if carriers.len() != 1 {
-            out.push(format!(
-                "[repo-file-guard] {carriers:?} run the {what} guard, not exactly one job. \
-                 Without it nothing outside Cargo refuses a `.cargo/config.toml`, a \
-                 `CARGO_*RUNNER` binding, or a workspace that reselects the package -- and \
-                 each of those makes `cargo test` execute no harness, which takes the Rust \
-                 tests that forbid them with it."
             ));
         }
     }
@@ -1636,7 +1599,6 @@ pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     out.extend(ci_windows_build_witness_complaints(doc));
     out.extend(workflow_env_complaints(doc));
     out.extend(workflow_permissions_complaints(doc));
-    out.extend(ci_repo_file_guard_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1931,9 +1893,11 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-COMMAND-DELETED",
-        escape: "the self-hosted job checks out, configures git, and runs nothing",
+        escape: "the self-hosted job checks out, configures git, and runs no suite. The \
+                 witness makes this one loud twice over -- the step is off its pin, and a \
+                 count of nothing is below the floor -- but the pin is what refuses it here.",
         job: Some("test-windows"),
-        anchor: "      - run: cargo test --all-targets --all-features\n",
+        anchor: "          cargo test --all-targets --all-features | Tee-Object -Variable log\n",
         replacement: "",
         refused_as: "test-windows-command",
     },
@@ -1943,10 +1907,32 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  success having run nothing. A job-level `if:` is not this escape -- the job \
                  reports `skipped` and the aggregate, which accepts only `success`, fails.",
         job: Some("test-windows"),
-        anchor: "      - run: cargo test --all-targets --all-features\n",
-        replacement: "      - run: cargo test --all-targets --all-features\n\
+        anchor: "      - name: Test, and witness that the suite ran\n",
+        replacement: "      - name: Test, and witness that the suite ran\n\
                       \x20       if: false\n",
         refused_as: "unexpected-step-field",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-WITNESS-COUNT-DROPPED",
+        escape: "the suite step keeps the pinned command and loses the count, which is the \
+                 shape this leg had before the witness and the shape `master` still has. A \
+                 `target.<triple>.runner` in the guest's Cargo home or environment then hands \
+                 every compiled harness to a wrapper that exits zero, the job is green, and \
+                 nothing on the hosted side can see the machine it happened on.",
+        job: Some("test-windows"),
+        anchor: "          $passed = [int](($log | Select-String -Pattern '^test result: ok\\. (\\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)\n          if ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        replacement: "",
+        refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-WITNESS-FLOOR-DROPPED",
+        escape: "the count stays and its floor drops to zero, so a suite that executed no \
+                 test clears it. The step still reads as a witness; it witnesses nothing. \
+                 Only an equality over the whole script sees the number change.",
+        job: Some("test-windows"),
+        anchor: "          if ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        replacement: "          if ($passed -lt 0) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        refused_as: "test-windows-command",
     },
     WorkflowEscape {
         name: "MUT-TEST-WINDOWS-RENAMED-AWAY",
@@ -2052,17 +2038,6 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "unpinned-action-input",
     },
     WorkflowEscape {
-        name: "MUT-WINDOWS-GUARD-NEUTERED",
-        escape: "the guest's own guard is emptied of the files it checks, so a Cargo runner in \
-                 the golden image's `%USERPROFILE%\\.cargo` still suppresses the suite on the \
-                 one platform whose tests no other leg runs -- and nothing on the hosted \
-                 runners can see that machine's filesystem or environment",
-        job: Some("test-windows"),
-        anchor: "foreach ($f in 'rust-toolchain.toml'",
-        replacement: "foreach ($f in 'nothing-at-all.toml'",
-        refused_as: "repo-file-guard",
-    },
-    WorkflowEscape {
         name: "MUT-COMPONENTS-INJECTED",
         escape: "the toolchain action's `components` value carries shell: the action builds a \
                  command from it and interpolates it into a Bash line, so `clippy` plus a \
@@ -2088,18 +2063,6 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "gate-toolchain",
     },
     WorkflowEscape {
-        name: "MUT-REPO-FILE-GUARD-NEUTERED",
-        escape: "the hosted guard's loop is emptied, so the step still runs and refuses \
-                 nothing. What it stops is a `.cargo/config.toml` target runner, a \
-                 `CARGO_*RUNNER` binding and a workspace that reselects the package -- each of \
-                 which makes `cargo test` execute no harness, taking the Rust tests that \
-                 forbid them with it. Only a pin on the script itself can see this.",
-        job: Some("lint"),
-        anchor: "for f in rust-toolchain.toml",
-        replacement: "",
-        refused_as: "repo-file-guard",
-    },
-    WorkflowEscape {
         name: "MUT-WORKFLOW-PERMISSIONS-WIDENED",
         escape: "the job token widened to `write-all`: every build script and test the \
                  candidate ships runs with a token that can push, the checkout leaves that \
@@ -2113,13 +2076,13 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     WorkflowEscape {
         name: "MUT-WORKFLOW-ENV-TARGET-RUNNER",
         escape: "a Cargo target runner at workflow scope: every Windows test harness compiles \
-                 and none executes, because the runner script exits zero. No Unix leg reads a \
-                 Windows-target variable, and the command, shell, labels and checkout all still \
-                 match.",
+                 and none executes, because Cargo hands each one to `cmd /c echo`, which prints \
+                 the path it was given and exits zero. No Unix leg reads a Windows-target \
+                 variable, and the command, shell, labels and checkout all still match.",
         job: None,
         anchor: "  RUSTFLAGS: -D warnings\n",
         replacement: "  RUSTFLAGS: -D warnings\n\
-                      \x20 CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: pwsh -NoProfile -File .github/scripts/pass.ps1\n",
+                      \x20 CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: cmd /c echo\n",
         refused_as: "workflow-env",
     },
     WorkflowEscape {

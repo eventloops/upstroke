@@ -87,19 +87,32 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The guest's own copy of the `lint` job's guard, in the shell this
-      # runner resolves. The Ubuntu step reads Ubuntu's filesystem and
-      # environment; the suite that left GitHub's runners executes here, so a
-      # runner binding in this image -- or in its `%USERPROFILE%\.cargo` --
-      # would suppress it where no repository check can see.
-      - run: foreach ($f in 'rust-toolchain.toml','rust-toolchain','.cargo/config.toml','.cargo/config',"$env:USERPROFILE\.cargo\config.toml","$env:USERPROFILE\.cargo\config") { if (Test-Path $f) { throw "$f outranks ci.yml" } }; if (Get-ChildItem Env:\ | Where-Object { $_.Name -match '^CARGO_.*RUNNER$' }) { throw 'a Cargo runner is bound in the environment' }; if (Select-String -Path Cargo.toml -Pattern '^\[workspace\]' -Quiet) { throw 'Cargo.toml declares a workspace' }
-
       - name: Configure git identity
         run: |
           git config --global user.email "ci@upstroke.local"
           git config --global user.name "upstroke CI"
 
-      - run: cargo test --all-targets --all-features
+      # The suite, and a witness that it ran. A green `cargo test` is not that
+      # claim. A `target.<triple>.runner` bound in a `.cargo/config.toml`, in
+      # `$CARGO_HOME`, in a directory above the checkout or in the process
+      # environment makes Cargo compile every harness and hand each one to a
+      # wrapper that exits zero; a `[workspace]` in the root manifest whose
+      # `default-members` name another crate makes it build no harness of this
+      # one at all. Each is a green job over a suite that never ran, each is
+      # written somewhere a check reading this repository cannot see, and the
+      # list is not closed -- Cargo has more ways to be told this than anyone
+      # will enumerate. Counting what libtest itself reported refuses the
+      # effect instead of the causes: a suite that did not execute has no
+      # `test result: ok.` line to count. This is the one leg whose execution
+      # left GitHub's runners, so it is the leg that has to say so. The floor
+      # is today's count on this platform less a margin; removing that many
+      # tests is a deliberate act, and it edits this number in the same change.
+      - name: Test, and witness that the suite ran
+        run: |
+          cargo test --all-targets --all-features | Tee-Object -Variable log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = [int](($log | Select-String -Pattern '^test result: ok\. (\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)
+          if ($passed -lt 1700) { throw "the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them" }
 
   msrv:
     name: msrv (Rust 1.85, ${{ matrix.os }})
@@ -132,10 +145,12 @@ jobs:
   # stays on windows-latest on purpose: GitHub's runner remains the neutral
   # witness that the Windows tree compiles clean, and its second step, `cargo
   # build --all-targets`, makes it the witness that the tree code-generates and
-  # links on current stable too, shipped binaries and test harnesses alike --
+  # links on current stable too, library, binaries and test harnesses alike --
   # `cargo check` and Clippy stop before codegen, and the self-hosted leg links
-  # with the image's toolchain, which moves only by re-curation. The two steps
-  # fail separately and the log names which.
+  # with the image's toolchain, which moves only by re-curation. In the dev
+  # profile, which is the profile every CI leg here builds; `release.yml` builds
+  # the shipped artifact with `--release`. The two steps fail separately and the
+  # log names which.
   lint-windows:
     name: lint (windows)
     runs-on: windows-latest
@@ -184,11 +199,6 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Bash, not a Rust test, deliberately: a `.cargo/config.toml` binding a
-      # target runner makes `cargo test` build every harness and execute none,
-      # so a test forbidding that file is one the file prevents from running.
-      # Pinned by the oracle as `REPO_FILE_GUARD`, exactly once in the workflow.
-      - run: for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e "$f" || { echo "$f outranks ci.yml"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }; ! grep -q '^\[workspace\]' Cargo.toml || { echo 'Cargo.toml declares a workspace, so package selection is no longer this crate'; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: bash .github/scripts/test-release-record.sh

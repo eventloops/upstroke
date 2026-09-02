@@ -42,9 +42,15 @@ pub(super) const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 /// stable behind, links and passes. `cargo build --all-targets` rather than
 /// `cargo test --no-run`: the latter builds only test-profile artifacts, so a
 /// `#[cfg(all(windows, not(test)))]` body in a binary is never linked by it,
-/// where `--all-targets` links the library and binaries as shipped **and** as
+/// where `--all-targets` links the library and the binaries **and** their
 /// unit-test harnesses, plus examples and integration tests. It executes
 /// nothing, so the suite's execution stays where the decision record put it.
+///
+/// In the dev profile, which is what every Cargo command in this workflow
+/// builds. A link failure that needs `--release` is not covered here and is not
+/// covered on `master` either; `release.yml` builds the shipped artifact with
+/// `--release`, and that build failing is a red release, not a green CI over a
+/// broken tree.
 pub(super) const WINDOWS_BUILD_WITNESS: &str = "cargo build --all-targets --all-features";
 
 /// The script the test jobs run before the suite, character for character:
@@ -60,9 +66,46 @@ pub(super) const GIT_IDENTITY_SCRIPT: &str = "git config --global user.email \"c
 /// Every script a test job may run: the identity script and the suite.
 pub(super) const TEST_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, TEST_COMMAND];
 
-/// The same, plus the guard the self-hosted leg runs before its suite.
-pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 3] =
-    [GIT_IDENTITY_SCRIPT, TEST_COMMAND, WINDOWS_REPO_GUARD];
+/// The scripts the self-hosted leg runs: the identity script, and the suite
+/// with the witness that it executed.
+pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, WINDOWS_TEST_WITNESS];
+
+/// The count the self-hosted leg's suite must report before the job is allowed
+/// to succeed.
+///
+/// Today it reports 1770 there: 1760 from the lib harness, 10 from the
+/// integration one. The floor sits below that by a margin wide enough that
+/// ordinary churn does not touch it and narrow enough that a suite which
+/// silently stopped running cannot clear it. Dropping this many Windows tests
+/// is a deliberate act, and it edits this number in the same change.
+pub(super) const WINDOWS_TEST_FLOOR: u32 = 1700;
+
+/// The self-hosted leg's suite step, character for character: the pinned test
+/// command, its exit status, and a count of what libtest reported.
+///
+/// Every other pin in this contract is an equality over `ci.yml`, and each
+/// refuses one named way of arriving at a green job over a suite that never
+/// ran. This one refuses the arrival itself. Cargo can be told to compile every
+/// harness and execute none by a `target.<triple>.runner` in a repository
+/// `.cargo/config.toml`, in `$CARGO_HOME`, in any directory above the checkout,
+/// or in the process environment, and it can be told to build no harness of
+/// this crate at all by a root `[workspace]` whose `default-members` name
+/// another one. Three of those five are written where nothing reading this
+/// repository can see them, the fifth has as many spellings as TOML has
+/// whitespace, and the list closes only if Cargo stops growing. A count does
+/// not enumerate them: a suite that did not execute reports no `test result:
+/// ok.` line, whichever route stopped it.
+///
+/// What it does not do is bound a hostile candidate, and no step in this file
+/// does. An edit to `ci.yml` deletes this one as easily as the guards it
+/// replaces, and the decision record says so where it says where the boundary
+/// actually is. What it bounds is the guest: the machine that now executes this
+/// platform's suite is provisioned outside the repository, so its Cargo home
+/// and its environment are inputs no reviewer of a diff can check, and this is
+/// the leg saying that it ran what it claims to have run.
+/// Measured, `MUT-WINDOWS-WITNESS-FLOOR-DROPPED` and
+/// `MUT-WINDOWS-WITNESS-COUNT-DROPPED`.
+pub(super) const WINDOWS_TEST_WITNESS: &str = "cargo test --all-targets --all-features | Tee-Object -Variable log\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n$passed = [int](($log | Select-String -Pattern '^test result: ok\\. (\\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)\nif ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n";
 
 /// The formatter gate and the four shell gates the `lint` job runs from the
 /// repository root, character for character.
@@ -78,11 +121,10 @@ pub(super) const SHELL_GATES: [&str; 4] = [
 /// than a set per job: `lint (macos)` running the formatter would be
 /// redundant, not an escape, and the one command that must sit on exactly one
 /// job, the Windows build witness, is pinned to its carrier separately.
-pub(super) const GATE_SCRIPTS: [&str; 8] = [
+pub(super) const GATE_SCRIPTS: [&str; 7] = [
     CLIPPY_GATE,
     WINDOWS_BUILD_WITNESS,
     FMT_GATE,
-    REPO_FILE_GUARD,
     SHELL_GATES[0],
     SHELL_GATES[1],
     SHELL_GATES[2],
@@ -114,42 +156,6 @@ pub(super) const ACTION_INPUTS: [(&str, &[&str]); 3] = [
     ("dtolnay/rust-toolchain@", &["components", "toolchain"]),
     ("Swatinem/rust-cache@", &[]),
 ];
-
-/// The guard that refuses the two overriding repository files, character for
-/// character, as `ci.yml` runs it.
-///
-/// A `bash` step rather than a Rust test, and the reason is the whole point: a
-/// `.cargo/config.toml` binding `target.<triple>.runner` to a wrapper that
-/// exits zero makes `cargo test` build every harness and execute none, so a
-/// Rust test forbidding that file is a test the file itself prevents from
-/// running. The check has to sit somewhere Cargo cannot reach, and the `lint`
-/// job's shell steps are that place. The Rust test stays as well: it is what
-/// fails on a developer's machine, where this step does not run.
-/// Measured, `MUT-REPO-FILE-GUARD-DELETED`.
-/// The second half of the same guard, and the same reasoning one level up: the
-/// oracle that pins the workflow's `env:` is itself a Rust test, so a Cargo
-/// runner variable bound in that `env:` would stop the test that refuses it
-/// from ever executing. This half reads the *effective* environment rather than
-/// parsing YAML, which catches the binding wherever it was written — workflow
-/// scope reaches every job, and job- and step-level `env:` are already refused
-/// as unmodelled fields.
-/// The third clause is package selection. `--all-targets` applies to the
-/// packages Cargo selected, and a root manifest declaring
-/// `workspace.default-members` selects those instead of this crate: every CI
-/// command would then compile and test a crate the candidate chose, and this
-/// crate's suite -- oracle included -- would never run.
-pub(super) const REPO_FILE_GUARD: &str = "for f in rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config; do test ! -e \"$f\" || { echo \"$f outranks ci.yml\"; exit 1; }; done; ! env | grep -qiE '^CARGO_[A-Z0-9_]*RUNNER=' || { echo 'a Cargo runner is bound in the environment'; exit 1; }; ! grep -q '^\\[workspace\\]' Cargo.toml || { echo 'Cargo.toml declares a workspace, so package selection is no longer this crate'; exit 1; }";
-
-/// The same guard on the machine that matters, in the shell that machine
-/// resolves.
-///
-/// The Ubuntu step reads Ubuntu's filesystem and Ubuntu's environment. The
-/// suite whose execution left GitHub's runners executes on the guest, so the
-/// guest is where a runner binding would suppress it -- from the image's own
-/// environment, or from a `%USERPROFILE%\.cargo\config.toml` that no
-/// repository check can see. This step runs there, before the suite, in the
-/// platform default shell. Measured, `MUT-WINDOWS-GUARD-DELETED`.
-pub(super) const WINDOWS_REPO_GUARD: &str = "foreach ($f in 'rust-toolchain.toml','rust-toolchain','.cargo/config.toml','.cargo/config',\"$env:USERPROFILE\\.cargo\\config.toml\",\"$env:USERPROFILE\\.cargo\\config\") { if (Test-Path $f) { throw \"$f outranks ci.yml\" } }; if (Get-ChildItem Env:\\ | Where-Object { $_.Name -match '^CARGO_.*RUNNER$' }) { throw 'a Cargo runner is bound in the environment' }; if (Select-String -Path Cargo.toml -Pattern '^\\[workspace\\]' -Quiet) { throw 'Cargo.toml declares a workspace' }";
 
 /// The `components` values the toolchain action may be given.
 ///
@@ -371,6 +377,13 @@ pub(super) const WORKFLOW_PERMISSIONS: [(&str, &str); 1] = [("contents", "read")
 /// the project has no toolchain file and selects toolchains at call sites; this
 /// is that convention made enforceable. Adding either file is a deliberate act
 /// that must extend this contract in the same change.
+///
+/// A Rust test holds this, and a Rust test is exactly what a `.cargo/config.toml`
+/// runner switches off. That is a real limit and it is why this is not written
+/// as a defence: it catches the file committed by accident, on a developer's
+/// machine and in CI, and it says in the diff that the convention is deliberate.
+/// The leg whose execution left GitHub's runners is covered instead by
+/// [`WINDOWS_TEST_WITNESS`], which counts what actually ran.
 pub(super) const OVERRIDING_REPO_FILES: [&str; 4] = [
     "rust-toolchain.toml",
     "rust-toolchain",
