@@ -51,6 +51,113 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
         })
 }
 
+/// The plan corpus, inlined.
+///
+/// Until 2026-09-02 these four plans were files in a `fixtures/` directory at
+/// the repository root, read from disk by two test regions that could not see
+/// each other's copy. They are constants here, in one module both reach, for
+/// the reason the directory was retired: a corpus kept in two places drifts,
+/// and the drift is invisible until a plan that no longer parses the same way
+/// still passes the test that reads the other copy.
+///
+/// **Every byte is significant.** `plan::markdown` mints `Plan.source.hash`
+/// from the content, the annotation grammar is column- and delimiter-sensitive,
+/// and a trailing newline is the difference between a last task and none. Each
+/// constant below is the file it replaced byte for byte, LF endings and final
+/// newline included. Do not reflow, re-indent, or tidy them.
+///
+/// `crate::validate`'s tests need them as files, because `validate::run` reads
+/// its plan from a path; [`PLANS`] pairs each with the name it had, so that
+/// caller can write the corpus out under its own scratch root.
+#[cfg(test)]
+pub(crate) mod corpus {
+    /// No annotations at all, so every field comes from the heuristics: five
+    /// tasks inferred from `##` headings, with one acceptance list.
+    pub(crate) const BARE_PLAN: &str = r"# Search improvements
+
+## Design the search index schema
+
+Sketch the fields, analyzers, and ranking signals.
+
+Acceptance:
+- Field list agreed
+- Ranking signals documented
+
+## Implement the batch indexer
+
+Build the batch indexer over the document store.
+
+## Fix stale-cache invalidation
+
+## Test the reindex path
+
+## Update search docs
+";
+
+    /// Deliberately cyclic — `a -> c -> b -> a`. It is a refusal fixture and
+    /// the cycle is the point; do not repair it.
+    pub(crate) const CYCLIC_PLAN: &str = r"# Cyclic plan (must fail validation)
+
+## Task A
+<!-- upstroke: id=a depends=c -->
+
+## Task B
+<!-- upstroke: id=b depends=a -->
+
+## Task C
+<!-- upstroke: id=c depends=b -->
+";
+
+    /// The annotated plan: every annotation attribute the grammar carries, a
+    /// `min=` clip, path hints, and an artifact wired along the dependency
+    /// chain. Four tasks, no cycles.
+    pub(crate) const SAMPLE_PLAN: &str = r"# Pagination rework
+
+## Design the pagination API
+<!-- upstroke: id=api-design kind=design depends= tier=frontier out=api-contract -->
+Define cursor format, page-size limits, and error contract.
+
+Acceptance:
+- Cursor format documented
+- Error contract covers empty pages
+
+## Implement cursor encoding
+<!-- upstroke: id=cursors kind=implement depends=api-design needs=api-contract paths=src/api/** -->
+Implement opaque cursor encode/decode per the contract.
+
+## Fix off-by-one in list endpoint
+<!-- upstroke: id=fix-obo kind=fix depends=cursors min=mid paths=src/api/** -->
+
+## Update API docs
+<!-- upstroke: id=docs kind=docs depends=fix-obo -->
+";
+
+    /// The Claude Code plan-mode shape: an ordered list, no per-task headings,
+    /// no annotations. Its third line carries a U+2014 em dash, which is one of
+    /// the bytes this corpus exists to keep exact.
+    pub(crate) const STEPS_PLAN: &str = r"# Add rate limiting to the API
+
+Claude Code plan-mode shape: numbered implementation steps, no headings per
+task, no annotations — everything comes from heuristics.
+
+1. Design the limiter interface and storage schema
+2. Implement the token-bucket middleware
+   - keep counters in `src/limit/bucket.rs`
+3. Fix the flaky retry test that hits the limiter
+4. Document the rate-limit headers
+";
+
+    /// The corpus by the file name each plan carried under `fixtures/`, for a
+    /// consumer that has to materialize it on disk. Sorted by name, which is the
+    /// order the directory listed them in.
+    pub(crate) const PLANS: [(&str, &str); 4] = [
+        ("bare-plan.md", BARE_PLAN),
+        ("cyclic-plan.md", CYCLIC_PLAN),
+        ("sample-plan.md", SAMPLE_PLAN),
+        ("steps-plan.md", STEPS_PLAN),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -364,12 +364,12 @@ mod tests {
     use std::env;
     use std::sync::OnceLock;
 
-    fn opts(plan: &str) -> ValidateOptions {
+    fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
         let hermetic_root =
             env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
         fs::create_dir_all(&hermetic_root).expect("hermetic root");
         ValidateOptions {
-            plan_path: PathBuf::from(plan),
+            plan_path: plan.into(),
             config_path: None,
             config_root: hermetic_root,
             engine_limits: config::EngineLimits::Fresh,
@@ -412,6 +412,29 @@ mod tests {
         let mut opts = opts(plan);
         opts.config_root = root.to_path_buf();
         opts
+    }
+
+    /// One plan of [`crate::plan::corpus`], written out under a scratch root of
+    /// this process's own.
+    ///
+    /// The corpus is inline, but [`run`] reads its plan from a path, so these
+    /// tests still need files on disk. Written inside a `OnceLock` for the
+    /// reason [`opts`]'s pools file is, and §12's: a shared path created and
+    /// then written can be read half-written by a test running beside this one.
+    /// Here no caller learns the directory until every plan under it is
+    /// complete, so the path it returns is only ever handed out whole.
+    fn corpus(plan: &str) -> PathBuf {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir =
+                env::temp_dir().join(format!("upstroke-validate-corpus-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("corpus root");
+            for (name, text) in crate::plan::corpus::PLANS {
+                fs::write(dir.join(name), text).expect("corpus plan");
+            }
+            dir
+        })
+        .join(plan)
     }
 
     #[test]
@@ -629,7 +652,7 @@ mod tests {
         for (name, config, expected) in cases {
             let cfg = root.join(format!("{name}.toml"));
             fs::write(&cfg, config).expect("config");
-            let mut o = opts("fixtures/sample-plan.md");
+            let mut o = opts(corpus("sample-plan.md"));
             o.config_path = Some(cfg);
             let rendered = run(&o).expect("validate").render();
             let actual = rendered
@@ -652,7 +675,7 @@ mod tests {
              \"local-logs\"]\nprofile = \"personal\"\n",
         )
         .expect("pools");
-        let mut o = opts("fixtures/sample-plan.md");
+        let mut o = opts(corpus("sample-plan.md"));
         o.pools_path = Some(pools);
         let rendered = run(&o).expect("validates").render();
 
@@ -691,7 +714,7 @@ mod tests {
         let root = env::temp_dir().join(format!("upstroke-validate-gates-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
         fs::write(root.join("Cargo.toml"), "[package]\nname='x'\n").expect("marker");
-        let mut o = opts("fixtures/sample-plan.md");
+        let mut o = opts(corpus("sample-plan.md"));
         o.config_root = root;
         let report = run(&o).expect("validates");
         let rendered = report.render();
@@ -701,13 +724,13 @@ mod tests {
         );
 
         // Hermetic root with no markers: no gates, still explicit.
-        let report = run(&opts("fixtures/sample-plan.md")).expect("validates");
+        let report = run(&opts(corpus("sample-plan.md"))).expect("validates");
         assert!(report.render().contains("gates: none"));
     }
 
     #[test]
     fn sample_plan_renders_expected_table() {
-        let report = run(&opts("fixtures/sample-plan.md")).expect("sample plan validates");
+        let report = run(&opts(corpus("sample-plan.md"))).expect("sample plan validates");
         let rendered = report.render();
 
         assert!(rendered.contains("api-design"));
@@ -728,7 +751,7 @@ mod tests {
 
     #[test]
     fn bare_plan_validates_via_heuristics() {
-        let report = run(&opts("fixtures/bare-plan.md")).expect("bare plan validates");
+        let report = run(&opts(corpus("bare-plan.md"))).expect("bare plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 5 tasks, no cycles"));
         assert!(rendered.contains("design-the-search-index-schema"));
@@ -736,7 +759,7 @@ mod tests {
 
     #[test]
     fn cyclic_plan_fails_naming_the_cycle() {
-        let err = run(&opts("fixtures/cyclic-plan.md")).expect_err("cycle must fail");
+        let err = run(&opts(corpus("cyclic-plan.md"))).expect_err("cycle must fail");
         let message = err.to_string();
         assert!(message.contains("dependency cycle"), "got: {message}");
         assert!(message.contains("a -> c -> b -> a"), "got: {message}");
@@ -773,7 +796,7 @@ mod tests {
 
     #[test]
     fn steps_plan_validates_via_ordered_list_fallback() {
-        let report = run(&opts("fixtures/steps-plan.md")).expect("steps plan validates");
+        let report = run(&opts(corpus("steps-plan.md"))).expect("steps plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 4 tasks, no cycles"));
         assert!(rendered.contains("design-the-limiter-interface-and-storage-schema"));
@@ -803,7 +826,7 @@ mod tests {
         );
 
         // The sample plan wires artifacts along its dependency chain — silent.
-        let clean = run(&opts("fixtures/sample-plan.md")).expect("sample validates");
+        let clean = run(&opts(corpus("sample-plan.md"))).expect("sample validates");
         assert!(clean.warnings.is_empty(), "warnings: {:?}", clean.warnings);
     }
 
@@ -821,7 +844,7 @@ mod tests {
 
     #[test]
     fn emit_json_round_trips_through_the_ir() {
-        let report = run(&opts("fixtures/sample-plan.md")).expect("sample plan validates");
+        let report = run(&opts(corpus("sample-plan.md"))).expect("sample plan validates");
         let dir = env::temp_dir().join(format!("upstroke-emit-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let json_path = dir.join("plan.normalized.json");

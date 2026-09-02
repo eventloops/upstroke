@@ -3119,15 +3119,14 @@ mod tests {
     fn the_registry_round_trips_the_frozen_plan_byte_for_byte() {
         // Real plans first: whatever the parser produces, including fields no
         // hand-written fixture would think to set.
-        for fixture in [
-            "fixtures/sample-plan.md",
-            "fixtures/bare-plan.md",
-            "fixtures/steps-plan.md",
+        for (fixture, raw) in [
+            ("sample-plan.md", crate::plan::corpus::SAMPLE_PLAN),
+            ("bare-plan.md", crate::plan::corpus::BARE_PLAN),
+            ("steps-plan.md", crate::plan::corpus::STEPS_PLAN),
         ] {
-            let raw = std::fs::read_to_string(fixture).expect("fixture plan");
-            let plan = crate::plan::detect(&raw)
+            let plan = crate::plan::detect(raw)
                 .expect("a markdown plan")
-                .parse(&raw)
+                .parse(raw)
                 .expect("parses");
             assert!(!plan.tasks.is_empty(), "{fixture} has tasks");
             assert_eq!(
