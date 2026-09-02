@@ -591,22 +591,22 @@ pub(super) mod oracles {
         );
         assert_eq!(
             modules.len(),
-            18,
-            "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
+            21,
+            "the crate declares {} whole-file test modules; a census skipping seventeen of them by \
              file name leaves the rest inside its domain",
             modules.len()
         );
 
-        // **The two halves of the eighteen, separated.** The count above is
-        // satisfied by any eighteen files; these two say *how* each was reached,
-        // which is the part the structural scan changed. Fourteen come from a
+        // **The two halves of the twenty-one, separated.** The count above is
+        // satisfied by any twenty-one files; these two say *how* each was reached,
+        // which is the part the structural scan changed. Seventeen come from a
         // literal `#[cfg(test)] mod tests;` — the form a text rule could find —
-        // and the derivation must still find all fourteen after learning to read
+        // and the derivation must still find all seventeen after learning to read
         // structure, because a scan that resolved ancestry and lost the plain
         // case would trade one blind spot for another.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
-        assert_eq!(declarations.len(), 18);
+        assert_eq!(declarations.len(), 21);
         let literal: Vec<String> = declarations
             .iter()
             .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
@@ -614,8 +614,8 @@ pub(super) mod oracles {
             .collect();
         assert_eq!(
             literal.len(),
-            14,
-            "fourteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
+            17,
+            "seventeen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
              found {}: {literal:?}",
             literal.len()
         );
