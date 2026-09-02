@@ -2923,7 +2923,9 @@ fn every_container_effect_in_the_tree_goes_through_the_funnel() {
         // Test modules of this subtree drive the funnel and may construct a
         // fake; they are excluded by name rather than by a pattern, so a new
         // one is a change here.
-        if relative == "src/runner/container/fake.rs" || relative == "src/runner/container/tests.rs"
+        if relative == "src/runner/container/fake.rs"
+            || relative == "src/runner/container/tests.rs"
+            || relative == "src/runner/container/exec/tests.rs"
         {
             continue;
         }
@@ -4752,7 +4754,9 @@ fn every_view_discard_removes_through_the_one_racing_removal() {
         "src/runner/container/fake.rs",
         "src/runner/container/tests.rs",
         "src/runner/container/census/tests.rs",
+        "src/runner/container/exec/tests.rs",
         "src/runner/container/resolve/tests.rs",
+        "src/runner/host/tests.rs",
     ];
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

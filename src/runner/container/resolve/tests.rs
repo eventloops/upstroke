@@ -1675,6 +1675,14 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             "src/runner/container/exec.rs",
             "the ContainerRunner that owns an invocation",
         ),
+        (
+            "src/runner/container/exec/tests.rs",
+            "that runner's own suite, out of line since W1. It is ALLOWED and \
+             not EXCLUDED because this census scans the whole file: the text \
+             was inside `exec.rs` and was scanned there, and it is the only \
+             place `container::write_intent` matches, so excluding it would \
+             leave needle control (b) matching nothing",
+        ),
     ];
     /// The files left out of the scan, each an **exact** repo-relative path.
     ///

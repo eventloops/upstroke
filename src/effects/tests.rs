@@ -1031,6 +1031,13 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
              `Command::new(` row in `every_production_process_start_is_classified`",
         ),
         (
+            "src/runner/container/exec/tests.rs",
+            "the `ContainerRunner`'s `#[cfg(test)]` suite, out of line since W1. \
+             The same text was inside `exec.rs` below its `#[cfg(test)]` cut and \
+             so was never in this domain; it is named for the same reason \
+             `fake.rs` is, the marker being at the DECLARATION and not in the file",
+        ),
+        (
             "src/runner/container/fake.rs",
             "the funnel's `#[cfg(test)]` substrate — the fake runtime and the \
              Docker gate. Excluded from nothing by `production_region`, because \
