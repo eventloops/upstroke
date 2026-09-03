@@ -85,7 +85,15 @@ pub(super) const FIRST_LINE_WINDOW: u64 = 1 << 20;
 /// window exists for — costs one stack buffer however large the file is.
 pub(super) const SCAN_CHUNK: usize = 64 * 1024;
 
-/// Classify one run directory. Read-only, and total.
+/// Classify one run directory. Read-only, and bounded rather than total.
+///
+/// The read is bounded; acquiring the handle is not. `first_committed_line`
+/// refuses anything that is not a regular file, and a path swapped for a
+/// writer-less fifo inside the window between that check and the `open`
+/// blocks in the kernel — under the physical worktree lock the census holds
+/// across this call. That race is byte-identical to the parent's and out of
+/// this split's scope; asserting totality over it would not be, which is why
+/// this sentence no longer does.
 #[must_use]
 pub fn classify_run_dir(public: &Path) -> RunDirClass {
     match first_committed_line(public) {
