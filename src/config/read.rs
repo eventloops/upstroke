@@ -1,11 +1,16 @@
 //! Turning captured bytes into raw and typed shapes.
 //!
-//! Every function here takes a [`FileSnapshot`] and never a path. That is the
-//! whole of what makes a pre-lock validation worth its ordering: the bytes that
-//! were validated and the bytes that are parsed are the same object, so there
-//! is no second read for the file to change between. A reader here that
-//! reached for the path instead would reintroduce exactly the window the
-//! capture exists to close.
+//! Every function here that reads a file's contents takes a [`FileSnapshot`]
+//! and never a path. That is the whole of what makes a pre-lock validation
+//! worth its ordering: the bytes that were validated and the bytes that are
+//! parsed are the same object, so there is no second read for the file to
+//! change between. A reader here that reached for the path instead would
+//! reintroduce exactly the window the capture exists to close.
+//!
+//! `parse_pool` is the exception to the shape and not to the rule: it takes a
+//! `&Path` and never reads through it. The path is what it names in the error
+//! it returns and in one diagnostic string, nothing more. A later change that
+//! wants a file's contents here reaches for the snapshot, never for that path.
 //!
 //! `[pools]` keeps the temperament the rest of the configuration surface has:
 //! anything that would silently change what the estimator does is an error,
