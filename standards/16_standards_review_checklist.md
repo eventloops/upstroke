@@ -1,26 +1,28 @@
 ## 16. Review checklist
 
-Reviewers and authors should be able to answer yes to each applicable item:
+A reviewer and an author should be able to answer yes to each applicable item:
 
-- [ ] The change preserves all `DESIGN.md` §4 invariants and follows the current build order.
+- [ ] Preserves every `DESIGN.md` §4 invariant and fits the §21 build order.
 - [ ] Invalid states are rejected at the boundary or excluded by types.
-- [ ] Ownership, side effects, and state-transition authority are unambiguous.
-- [ ] Absence, failure, retry, cancellation, and terminal outcomes remain distinguishable.
-- [ ] No production panic path handles data, environment, persistence, process, or scheduling.
-- [ ] Filesystem publication and concurrent arbitration use the required atomic semantics.
+- [ ] Ownership, side effects and state-transition authority are unambiguous; no `Rc`, `Arc`,
+      `Mutex` or `clone()` without a stated reason (§6).
+- [ ] Absence, failure, retry, cancellation and terminal outcomes stay distinguishable; every `?`
+      propagates an error the caller can act on as it is (§7).
+- [ ] No production panic path handles data, environment, persistence, process or scheduling.
+- [ ] Filesystem publication and concurrent arbitration use atomic primitives.
 - [ ] External commands check both process and protocol outcomes and clean up descendants.
-- [ ] Platform assumptions are isolated and tested natively, and platform-gated code, tests, and
-      annotations name the leg that evaluates them.
+- [ ] Platform assumptions are isolated, tested natively, and name the CI leg that evaluates them.
 - [ ] Untrusted input is bounded and validated before it gains authority; secrets stay redacted.
-- [ ] Tests force the important failure/interleaving and do not depend on ambient machine state.
-- [ ] Readiness signals follow their state, cannot be read partially, and every wait is bounded.
-- [ ] An intermittent failure carries a measured rate, established provenance, a fingerprint, an
-      owner, and a re-run-or-repair rule.
-- [ ] Source instruments scan their complete claimed domain and their injected controls fail.
-- [ ] Public behaviour, persisted formats, events, and documentation change together.
-- [ ] New abstraction and dependencies have a demonstrated purpose and do not widen capability.
-- [ ] Every cited standard maps to a named mechanism or is explicitly review-only.
-- [ ] Lint-level changes live only in `[lints]`, and new suppressions are `#[expect]` with a reason.
-- [ ] Ambient time, environment, and randomness stay inside the named funnel modules.
-- [ ] All eight §2 baseline commands pass from the repository root.
-
+- [ ] Tests force the important failure or interleaving and depend on no ambient machine state;
+      readiness signals follow their state; every wait is bounded.
+- [ ] An intermittent failure carries a rate, provenance, fingerprint, owner and consequence.
+- [ ] Source instruments scan their whole claimed domain and their injected controls fail.
+- [ ] Behaviour, persisted formats, events and documentation change together.
+- [ ] New abstraction and dependencies have a demonstrated purpose.
+- [ ] Lint levels change only in `[lints]`; new suppressions are `#[expect]` with a reason.
+- [ ] Ambient time, environment and randomness stay inside the funnel modules.
+- [ ] All eight §2 commands pass from the repository root.
+
+A finding that cites a standard names the section and says whether a mechanism or review enforces
+it. A finding against an unswept file for §6 or §7 is out of scope unless the change touched the
+line (`standards/SWEEP.md`).

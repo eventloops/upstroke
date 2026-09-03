@@ -1,59 +1,42 @@
 ## 5. Types, modules, and APIs
 
-### Representing state
+**State.**
 
-- Parse and validate untrusted or weakly typed input once. Internal code SHOULD consume validated
-  enums, newtypes, and structs rather than rechecking strings and integers.
-- Use an enum when alternatives have different meaning or behaviour. Do not use string tags or a
-  collection of booleans to encode a state machine.
-- Avoid boolean parameters whose call sites do not explain themselves. Use a named enum or options
-  struct when the value selects behaviour.
-- Keep fields private when construction or mutation must preserve an invariant. Provide validated
-  constructors and operations; do not expose a representation and ask callers to behave.
-- Use `Option<T>` for legitimate absence and `Result<T, E>` for failure. Use
-  `Result<Option<T>, E>` when both are possible; never collapse failure into absence.
-- Do not encode domain identifiers, paths, timestamps, durations, or capacity quantities as
-  interchangeable strings or numbers when a dedicated type can prevent a mix-up.
-- Use checked conversions for narrowing or signedness changes. An `as` cast is acceptable only
-  when it is lossless by type or a nearby invariant proves the range. Arithmetic MUST choose
-  checked, saturating, wrapping, or failing behaviour deliberately; floating-point input MUST
-  reject non-finite values before it is ordered, budgeted, or persisted. Release builds keep
-  `overflow-checks = true`, so an overflow nobody chose fails loudly instead of wrapping.
-- Avoid wildcard arms over closed domain enums when a new variant should force a decision at each
-  call site. Wildcards remain appropriate for intentionally open external inputs.
+- Parse and validate untrusted or weakly typed input once; internal code consumes validated enums,
+  newtypes and structs rather than rechecking strings and integers.
+- An enum, not string tags or a set of booleans, encodes alternatives with different meaning. A
+  boolean parameter whose call site does not explain itself becomes a named enum or options struct.
+- Fields stay private where construction or mutation must preserve an invariant; provide validated
+  constructors and operations instead of exposing the representation.
+- `Option<T>` is absence, `Result<T, E>` is failure, `Result<Option<T>, E>` when both are possible.
+  Never collapse failure into absence.
+- Identifiers, paths, timestamps, durations and capacity quantities get dedicated types wherever a
+  mix-up is possible.
+- Narrowing and sign changes use checked conversions; an `as` cast needs a nearby invariant that
+  proves the range. Arithmetic chooses checked, saturating, wrapping or failing behaviour
+  deliberately; floating-point input rejects non-finite values before it is ordered, budgeted or
+  persisted. Release builds keep `overflow-checks = true`.
+- No wildcard arm over a closed domain enum where a new variant should force a decision at each
+  site. Wildcards are fine over intentionally open external input.
 
-### API shape and visibility
+**API shape.**
 
-- Default to private. Use `pub(crate)` for crate-internal collaboration and `pub` only for a
-  supported external contract.
-- A function SHOULD perform one coherent operation at one abstraction level. Many parameters,
-  especially repeated booleans or optional values, indicate that a request/configuration type may
-  better express the contract.
-- Borrow inputs (`&str`, `&Path`, slices, references) when the callee does not retain ownership.
-  Accept or return owned values when data is stored, transferred to another task, or deliberately
-  detached from the input lifetime.
-- Return useful values rather than mutating caller-provided output parameters.
-- Implement common traits (`Debug`, `Clone`, `Eq`, `Hash`, iterators, and conversions) when their
-  semantics are honest and useful. `From` is infallible; validation belongs in `TryFrom` or a
-  named fallible constructor.
-- New or changed public APIs MUST be assessed for SemVer impact — the crate is published, so this
-  is a live contract. `cargo semver-checks` becomes the named mechanism when a release-workflow
-  leg runs it; the assessment is review-only until then. Public types SHOULD remain open to
-  compatible evolution only when that flexibility is deliberate; do not add `#[non_exhaustive]`
-  reflexively.
+- Default to private; `pub(crate)` for crate-internal collaboration; `pub` only for a supported
+  external contract. The crate is published, so a public API change is assessed for SemVer impact
+  in review (`cargo semver-checks` is the intended mechanism once a release leg runs it).
+- A function performs one coherent operation at one abstraction level. Many parameters, especially
+  repeated booleans or options, point to a request or configuration type.
+- Borrow (`&str`, `&Path`, slices) when the callee does not retain ownership; take or return owned
+  values when data is stored, transferred to another task, or deliberately detached.
+- Return values rather than mutating caller-provided output parameters.
+- Implement `Debug`, `Clone`, `Eq`, `Hash`, iterators and conversions when their semantics are
+  honest. `From` is infallible; validation belongs in `TryFrom` or a named fallible constructor.
 
-### Traits and abstraction
+**Traits.** Introduce a trait when multiple implementations exist or are part of the accepted
+design, callers are generic over a real behavioural contract, runtime heterogeneity is required, or
+the trait isolates a real effect boundary — never to mirror a class/interface pair. Traits are
+cohesive, object-safe only when trait objects are needed, and explicit about observable semantics.
+Before creating a shared abstraction compare the full invariants, not the syntax: callers that
+differ in atomicity, ownership, error handling, ordering or durability are not the same operation.
 
-Introduce a trait when at least one of these is true: multiple implementations exist or are part
-of the accepted design; callers are generic over a meaningful behavioural contract; runtime
-heterogeneity is required; or the trait isolates a real effect boundary. Do not introduce a trait
-solely to mirror an object-oriented class/interface pair.
-
-Traits MUST be cohesive, object-safe only when trait objects are needed, and explicit about
-observable semantics. Prefer generics for static composition and trait objects for genuine runtime
-selection. Avoid public blanket implementations that foreclose future implementations.
-
-Before creating a shared abstraction, compare the full invariants—not just similar syntax. If two
-callers differ in atomicity, ownership, error handling, ordering, or durability, they are not yet
-the same operation.
-
+Enforced by: rustc and targeted Clippy lints where they apply; review for the rest.

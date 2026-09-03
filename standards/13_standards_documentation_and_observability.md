@@ -1,21 +1,21 @@
 ## 13. Documentation and observability
 
-New or changed public items MUST have rustdoc that states their contract. Include `# Errors`,
-`# Panics`, and `# Safety` sections when applicable. Examples SHOULD remain valid Rust and MAY be
-doctests, but doctests are documentation in this repository: `cargo test --all-targets` excludes
-them. Executable evidence MUST live in a unit, integration, or other run target executed by a
-named CI command; a doctest alone does not satisfy a testing requirement.
+New or changed public items have rustdoc stating their contract, with `# Errors`, `# Panics` and
+`# Safety` sections where they apply. Doctests are documentation here: `cargo test --all-targets`
+does not run them, so executable evidence lives in a unit or integration test that a named CI
+command runs.
 
-Process output is part of the product surface. The `println!` and `eprintln!` macros are denied
-(`clippy::print_stdout`, `print_stderr`) outside the named output modules — the CLI binary and the
-terminal interaction module — each of which carries `#![expect]` stating its contract. Examples
-print what they demonstrate and carry the same expectation.
+Process output is product surface. `println!` and `eprintln!` are denied (`clippy::print_stdout`,
+`print_stderr`) outside the named output modules — the CLI binary and the terminal interaction
+module — each of which carries a crate-level `#![expect]` stating its contract; examples carry the
+same expectation.
 
-A change to behaviour, configuration, events, persisted data, CLI output, or a supported platform
-MUST update its user and design documentation in the same pull request. Do not leave a code comment
-or review note as the only record of a new contract.
+A change to behaviour, configuration, events, persisted data, CLI output or a supported platform
+updates the design (`design/`) and any user documentation in the same pull request. A code comment
+or review note is never the only record of a contract.
 
-Events and diagnostics SHOULD make decisions reconstructable: identify the operation and stable
-domain IDs, preserve causal errors, and distinguish retryable, parked, cancelled, and terminal
-outcomes. They MUST NOT expose secrets. Logs are diagnostic evidence, not a second source of state.
-
+Events and diagnostics make decisions reconstructable: they identify the operation and stable domain
+ids, preserve causal errors, and distinguish retryable, parked, cancelled and terminal outcomes. They
+never expose secrets. Logs are diagnostic evidence, not a second source of state.
+
+Enforced by: the two print lints; review for rustdoc and same-change documentation.

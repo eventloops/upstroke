@@ -1,17 +1,31 @@
 ## 6. Ownership, mutation, and resources
 
-- Each mutable resource MUST have an identifiable owner. Mutation should occur through the
-  narrowest API that can preserve its invariants.
-- Prefer immutable values and explicit state transitions. Interior mutability, global state, and
-  shared mutable ownership require a concrete lifecycle or concurrency reason.
-- Do not add `clone()` merely to silence a borrow-checker problem. A clone is appropriate when an
-  owned snapshot, task transfer, or small independent value is the intended semantics; expensive
-  or non-obvious clones SHOULD be evident at the boundary or explained.
-- Use RAII for files, locks, temporary directories, child processes, and other resources. Cleanup
-  MUST also occur on early return, error, panic unwinding, and cancellation to the extent the
-  platform permits.
-- Scope guards and resource-owning types are preferable to paired `start`/`finish` calls whose
-  second half can be skipped.
-- Do not leak references or guards across layers merely to avoid defining ownership. Return an
-  owned result or a purpose-built guard whose lifetime expresses the actual protocol.
-
+- Every mutable resource has one identifiable owner, and mutation goes through the narrowest API
+  that preserves its invariants.
+- Prefer immutable values and explicit state transitions.
+- RAII owns files, locks, temporary directories, child processes and every other resource; cleanup
+  happens on early return, error, panic unwinding and cancellation as far as the platform allows.
+  A guard or resource-owning type beats a `start`/`finish` pair whose second half can be skipped.
+- Do not leak references or guards across layers to avoid defining ownership; return an owned
+  result or a purpose-built guard whose lifetime is the actual protocol.
+
+**Shared ownership, locks and clones are exceptions, not conveniences.**
+
+- `Rc` and `Arc` MUST NOT be used to avoid deciding who owns a value. Shared ownership is allowed
+  only where the design has a real multi-owner lifecycle — a value that must outlive each of its
+  holders individually — and the type or an adjacent comment says what that lifecycle is. Prefer a
+  single owner with borrowed views, and prefer moving a value into the task that needs it.
+- `Mutex` and `RwLock` MUST NOT guard state that a single owner or message passing can hold. A lock
+  is allowed only with a documented protected invariant, an explicit acquisition order where more
+  than one lock exists, and a small critical section (§10). `Arc<Mutex<T>>` shared between tasks is
+  the shape to justify, never the default.
+- `clone()` MUST NOT be used to satisfy the borrow checker. A clone is correct when an owned
+  snapshot, a transfer to another thread or task, or a small independent value is the intended
+  semantics. A clone of anything larger than a handle is visible at a boundary or explained beside
+  the call. Prefer `Copy` types, borrows, and moving the original.
+
+These three rules bind new and materially changed code now. The existing tree predates them and is
+being brought up to them file by file; `standards/SWEEP.md` records which files have been swept. An
+occurrence in an unswept file is not a review finding unless the change under review touched it.
+
+Enforced by: review; `standards/SWEEP.md` for the transitional clause.

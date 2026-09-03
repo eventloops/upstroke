@@ -1,16 +1,13 @@
 # Rust coding standards
 
-This document is the normative implementation standard for Rust code in upstroke. It applies to
-production code, tests, examples, build support, and code-generation inputs. It is deliberately
-project-specific: official Rust guidance is the foundation, while upstroke's product invariants,
-failure modes, and supported platforms determine the stricter rules.
-
-Last reconciled with the sources listed below: 2026-08-28.
+The normative implementation standard for Rust in upstroke: production code, tests, examples and
+build support. Official Rust guidance is the foundation; the product's invariants, failure modes and
+supported platforms set the stricter rules. Reworked and slimmed on 2026-09-03.
 
 This file is the index. Each standard lives in `standards/`, one numbered section per file.
-Section numbers are the API: code comments, `effects/allowlist.toml`, and review records cite
+Section numbers are the API: code comments, `effects/allowlist.toml` and review records cite
 `CODING_STANDARDS.md §N`, so a number is never reassigned. New standards append; a retired one
-keeps its number and says so.
+keeps its number and says so. Each file ends with the mechanism that enforces it, or `review`.
 
 | § | Standard | File |
 |---|---|---|
@@ -31,4 +28,13 @@ keeps its number and says so.
 | 15 | Dependencies and features | [standards/15_standards_dependencies_and_features.md](standards/15_standards_dependencies_and_features.md) |
 | 16 | Review checklist | [standards/16_standards_review_checklist.md](standards/16_standards_review_checklist.md) |
 | 17 | Upstream references | [standards/17_standards_upstream_references.md](standards/17_standards_upstream_references.md) |
-| A | Enforcement map | [standards/appendix_a_standards_enforcement_map.md](standards/appendix_a_standards_enforcement_map.md) |
+
+[standards/SWEEP.md](standards/SWEEP.md) tracks the file-by-file cleanup under the §6 and §7
+rules tightened on 2026-09-03; until a file is listed there, those two sections bind only the lines
+a change touches.
+
+The hard requirements most changes meet head-on: edition 2024 with MSRV 1.85; no `.unwrap()` or
+`.expect()` in production and no `.unwrap()` in tests (§7, lint-enforced); `anyhow` only at the
+binary edge (§7); every path through `std::path` (§8); no `Rc`, `Arc`, `Mutex` or `clone()` without
+a stated reason (§6); every `?` deliberate (§7); ambient time, environment and randomness only in
+the funnel modules (§3, denylist-enforced).
