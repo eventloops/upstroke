@@ -1587,6 +1587,15 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
     assert_ne!(0, after.rung, "a process-local rung tally reads zero here");
 }
 
+/// `RunState::charge_allowance`, as a value.
+///
+/// `runner::tests::the_rungs_allowance_is_counted_in_one_production_place`
+/// carries a `SPELLINGS` fixture listing the ways this call can be written.
+/// That fixture is a `&str`, so rustc never reads it and a path in it can name
+/// nothing at all — it named `TaskFold::charge_allowance` for a round. This is
+/// the same path where the compiler does read it.
+const CHARGE_ALLOWANCE: fn(&mut RunState, TaskKey, &AttemptRecord) = RunState::charge_allowance;
+
 /// **An interrupted attempt does not spend the rung's allowance.**
 ///
 /// `transaction_fault_matrix[T-ATTEMPT]`'s `resume_action` in its own words:
@@ -1605,6 +1614,29 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
 /// an **interruption** does not, and the difference is the only thing that
 /// changed between the two halves. A fold that stopped counting altogether
 /// would satisfy half of this and fail the other.
+///
+/// # The behavioural half of the `runner` census
+///
+/// `runner::tests::the_rungs_allowance_is_counted_in_one_production_place`
+/// counts the *spelling* `charge_allowance(` in each applier's body, and a
+/// count over text cannot enforce a property about calls: an alias and a
+/// closure of the same name leave its per-applier map and its subtree total
+/// both reading exactly what they read today while a whole settlement arm
+/// stops charging. That was measured at `823ad36`, against the whole suite
+/// and not only the census.
+///
+/// This test reads `attempts_on_rung` off the state instead, so a spelling is
+/// invisible to it by construction, and it drives **every settlement the
+/// vocabulary has** rather than the one arm the repair was written on — an
+/// escape that skips a single arm is the shape this class arrives in.
+/// `apply_candidate_prepared`, the successful settlement, is the sibling half
+/// and is driven by
+/// [`a_successful_attempt_charges_its_rung_live_and_on_replay`].
+///
+/// **`Escalated` is excluded, and that is not a gap.** The arm resets
+/// `attempts_on_rung` to zero on the rung it climbs onto, *after* the charge,
+/// so the charge has no observable effect there — not by this test and not by
+/// anything else. There is nothing for an escape to gain by skipping it.
 #[test]
 fn an_interrupted_attempt_refunds_the_rungs_allowance() {
     use crate::ladder::FailureKind;
@@ -1662,6 +1694,165 @@ fn an_interrupted_attempt_refunds_the_rungs_allowance() {
         "T-ATTEMPT refunds an interrupted attempt's allowance. A fold that \
              counted the START charged for a run that never got a verdict, and \
              an operator paid a pricier tier for the engine having died"
+    );
+
+    // **The same pair on every settlement `apply_settlement` can be handed.**
+    // The two halves above both settle `Closed`/`Retry`, so an applier that
+    // charged on that arm and nowhere else satisfied them — and that is
+    // precisely the escape the lexical census cannot see:
+    //
+    //     let real_charge = Self::charge_allowance;
+    //     let charge_allowance = |state: &mut Self| {
+    //         if !matches!(&finished.settlement, AttemptSettlement::Retained { .. }) {
+    //             real_charge(state, finished.key, &finished.record);
+    //         }
+    //     };
+    //     charge_allowance(self);
+    //
+    // With `attempts_per = 2` a retained failure then never persists its
+    // spend, the next rejection derives `0 + 1 < 2`, and the run retries the
+    // rung it should have escalated off — indefinitely, while every count in
+    // `runner`'s census still reads what it reads today.
+    //
+    // **The label is derived by an exhaustive match, not written beside each
+    // arm.** A hand-written list of arms with hand-written names is how an arm
+    // nobody thought to charge arrives: it is missing, and nothing says so.
+    // `label_of` matches every shape the wire vocabulary has, so a variant
+    // added to `AttemptSettlement` or `SettlementTransition` stops the build
+    // here, and the coverage assertion below is over names this match produced
+    // rather than over names this test asserted about itself.
+    let label_of = |settlement: &AttemptSettlement| -> &'static str {
+        match settlement {
+            AttemptSettlement::Retained { .. } => "retained",
+            AttemptSettlement::Closed { transition, .. } => match transition {
+                SettlementTransition::Succeeded => "closed/succeeded",
+                SettlementTransition::Retry => "closed/retry",
+                SettlementTransition::Escalated { .. } => "closed/escalated",
+                SettlementTransition::Deferred { .. } => "closed/deferred",
+                SettlementTransition::Parked { .. } => "closed/parked",
+                SettlementTransition::Failed { .. } => "closed/failed",
+            },
+        }
+    };
+    let arms: Vec<AttemptSettlement> = vec![
+        AttemptSettlement::Retained {
+            retained_session: SessionId("sess-ÜNI-allowance".to_owned()),
+            retained_incarnation: Epoch(0),
+        },
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Retry,
+            lease: LeaseDisposition::PredictedReleased,
+        },
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Deferred {
+                defers: 1,
+                reason: "  the fixture's backoff  ".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        },
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Parked {
+                question: question("q-allowance", ALPHA),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        },
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Failed {
+                halts_run: false,
+                reason: "  the fixture's terminal failure  ".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        },
+    ];
+    // The two the vocabulary has and this test does not drive, named rather
+    // than absent. `closed/succeeded` is refused by `check_attempt_finished`
+    // before `apply` is reached — `candidate_prepared` is the sole successful
+    // settlement — and `closed/escalated` resets the count to zero on the rung
+    // it climbs onto, *after* the charge, so the charge has no observable
+    // effect there for an escape to gain.
+    let mut driven: Vec<&str> = arms.iter().map(&label_of).collect();
+    driven.sort_unstable();
+    assert_eq!(
+        driven,
+        [
+            "closed/deferred",
+            "closed/failed",
+            "closed/parked",
+            "closed/retry",
+            "retained"
+        ],
+        "the settlements driven below are not the vocabulary minus \
+         `closed/succeeded` and `closed/escalated`, so an arm has left this \
+         table and the pair is asserted about fewer settlements than the doc \
+         above claims"
+    );
+    for settlement in arms {
+        let label = label_of(&settlement);
+        // The judged/interrupted pair, so an arm that stopped charging
+        // altogether and an arm that charges everything are told apart by the
+        // same two cells the halves above use.
+        for (kind, spent) in [
+            (FailureKind::GateFailed, 1_u32),
+            (FailureKind::Interrupted, 0),
+        ] {
+            let mut fold = started();
+            for event in [
+                dispatch(ALPHA, 0, &base),
+                attempt_started(&fold, ALPHA, 0, 1, 0),
+            ] {
+                apply(&mut fold, &event);
+            }
+            let mut event = settle_failing(ALPHA, 0, 1, kind, settlement.clone());
+            // One session in both places the event carries it, as `settle`
+            // does: the fold refuses a retained settlement whose two halves
+            // disagree about which conversation was left open.
+            if let TopologyEventBody::AttemptFinished { data } = &mut event.body {
+                if let AttemptSettlement::Retained {
+                    retained_session, ..
+                } = &data.settlement
+                {
+                    data.record.session_id = Some(retained_session.0.clone());
+                }
+            }
+            apply(&mut fold, &event);
+            assert_eq!(
+                fold.task(ALPHA).expect("registered").attempts_on_rung,
+                spent,
+                "{label} settling a {kind:?} attempt did not leave the rung's \
+                 allowance where `ladder::spends_allowance` puts it. The charge \
+                 is decided by the failure and by nothing about the \
+                 settlement's shape, so an arm that skips it hands an operator \
+                 retries on a rung already paid for"
+            );
+        }
+    }
+
+    // **The compiled half of that census's `SPELLINGS` fixture.** The fixture
+    // is a string the census counts over, so it named
+    // `TaskFold::charge_allowance` — an item that does not exist, the method
+    // being defined on `RunState` — for a whole round with nothing able to
+    // report it. [`CHARGE_ALLOWANCE`] is the same path as a value: a rename or
+    // a move to another type stops the build here rather than silently
+    // emptying a control there. Called, not merely bound, so the item it names
+    // is shown to be the one that moves the count.
+    let mut direct = started();
+    apply(&mut direct, &dispatch(ALPHA, 0, &base));
+    let mut run = direct.run.take().expect("the fixture's run has started");
+    let mut judged = attempt_record(1);
+    judged.failure = Some(crate::events::FailureRecord {
+        kind: FailureKind::GateFailed,
+        origin: crate::ladder::FailureOrigin::Worker,
+        reason: "the fixture's judged failure".to_owned(),
+        detail: None,
+    });
+    CHARGE_ALLOWANCE(&mut run, ALPHA, &judged);
+    direct.run = Some(run);
+    assert_eq!(
+        direct.task(ALPHA).expect("registered").attempts_on_rung,
+        1,
+        "the path `RunState::charge_allowance` resolves to an item that does \
+             not charge the rung, so the census's fixture names one thing and \
+             the appliers call another"
     );
 }
 

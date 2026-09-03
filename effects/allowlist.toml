@@ -145,10 +145,22 @@ path = "src/topology/effects.rs"
 allows = []
 packet = "effect_site_inventory.mechanism (2): named in the funnel-module list"
 review = """
-The site enums, their const accessors and `effect_sites()`. Performs no effect \
-at all, in production or in tests, so it carries no attribute — listed because \
-the packet lists it, and because a future effect here would have to be reviewed \
-into `allows` rather than appearing silently."""
+The `EffectSiteId` union over the eleven site enums, its `row()` mapping and the \
+inventory constants. The site enums themselves are in the `sites` child and \
+`effect_sites()` in the `export` child: this module was split into per-concern \
+children, and this row is the root of that module rather than the whole of it. \
+Performs no effect at all, in production or in tests, so it carries no \
+attribute — listed because the packet lists it, and because a future effect \
+here would have to be reviewed into `allows` rather than appearing silently. \
+WHAT HOLDS THE SAME PROPERTY FOR THE SEVEN CHILDREN, which this row does not \
+reach: none of them carries a module-level `allow` either, so `clippy.toml`'s \
+denials bind them exactly as written and the lint gate is what enforces this — \
+not this entry. An `allow` added to any of them would have to be recorded here, \
+which is what \
+`every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` fails on. \
+Said out loud because the split narrowed what this row covers without narrowing \
+the property: a reader who mistook the entry for the guarantee could remove the \
+thing actually providing it."""
 
 [[funnel]]
 path = "src/runner/host.rs"
