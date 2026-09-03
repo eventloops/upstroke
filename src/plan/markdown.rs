@@ -104,6 +104,7 @@ fn is_ordered_item(line: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{ArtifactId, TaskId, TaskKind, Tier};
+    use crate::plan::corpus;
 
     fn parse(raw: &str) -> Parsed {
         MarkdownPlanAdapter
@@ -111,14 +112,9 @@ mod tests {
             .expect("plan should parse")
     }
 
-    fn fixture(name: &str) -> String {
-        std::fs::read_to_string(std::path::Path::new("fixtures").join(name))
-            .expect("fixture should exist")
-    }
-
     #[test]
     fn annotated_sample_fixture_parses_fully() {
-        let parsed = parse(&fixture("sample-plan.md"));
+        let parsed = parse(corpus::SAMPLE_PLAN);
         let tasks = &parsed.plan.tasks;
         assert_eq!(tasks.len(), 4);
 
@@ -164,7 +160,7 @@ mod tests {
 
     #[test]
     fn bare_fixture_uses_heuristics() {
-        let parsed = parse(&fixture("bare-plan.md"));
+        let parsed = parse(corpus::BARE_PLAN);
         let tasks = &parsed.plan.tasks;
         assert_eq!(tasks.len(), 5);
 
@@ -267,7 +263,7 @@ mod tests {
 
     #[test]
     fn ordered_step_plans_become_tasks() {
-        let parsed = parse(&fixture("steps-plan.md"));
+        let parsed = parse(corpus::STEPS_PLAN);
         let tasks = &parsed.plan.tasks;
         assert_eq!(tasks.len(), 4);
         let kinds: Vec<TaskKind> = tasks.iter().map(|t| t.kind).collect();
@@ -429,7 +425,7 @@ mod tests {
 
     #[test]
     fn crlf_plans_parse_identically() {
-        let lf = fixture("sample-plan.md").replace("\r\n", "\n");
+        let lf = corpus::SAMPLE_PLAN.replace("\r\n", "\n");
         let crlf = lf.replace('\n', "\r\n");
         let from_lf = MarkdownPlanAdapter
             .parse_with_warnings(&lf)
