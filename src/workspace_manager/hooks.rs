@@ -137,26 +137,37 @@ impl HarnessEffects {
 }
 
 impl EffectHooks for HarnessEffects {
-    /// One `hook` call under the harness's lock.
+    /// One `hook` call under the harness's lock, or a refusal if the lock is
+    /// poisoned.
     ///
-    /// **What the lock protects.** Each `hook` call is one atomic append to
-    /// the harness's record. The ordering tests read `coverage()` by
-    /// position, so two observers recording into one harness from two
-    /// threads must not interleave inside a call. The critical section is
-    /// that one call, and the guard is dropped before [`funnel`] runs the
-    /// primitive, which is where the ledger takes its own lock. The two locks
-    /// are never held together, so there is no acquisition order to keep.
+    /// **What the lock protects.** `HookHarness::hook` writes up to three of
+    /// the harness's records in one call (the open fast sequence's touched
+    /// sites, the reached points, the observed phases), and the other
+    /// holders of the same lock arm and disarm injections and open and close
+    /// fast sequences. The lock makes each of those one step: the ordering
+    /// tests read `coverage()` by position, and an arming or a sequence
+    /// boundary must not land between the fields a single `hook` call
+    /// writes. The critical section is the one call, and the guard is
+    /// dropped before [`funnel`] runs the primitive, which is where the
+    /// ledger takes its own lock. The two locks are never held together, so
+    /// there is no acquisition order to keep.
     ///
-    /// **Poison is recovered, not propagated.** A poisoned harness means
-    /// another thread panicked while holding it, which is that thread's
-    /// failed test. Every holder either appends or reads, so the record is
-    /// intact, and the assertion that follows can still read it.
+    /// **A poisoned harness refuses.** Poison means another thread panicked
+    /// while holding the harness, and what it left cannot be trusted: a
+    /// `hook` call may have written some of its fields and not the rest, and
+    /// a fast sequence the panicking holder opened stays open, so anything
+    /// recorded next would be attributed to it. Recording into that would
+    /// manufacture coverage evidence, and this is production code that may
+    /// not panic, so the observer answers [`Injection::Error`] and the funnel
+    /// returns a refusal naming the site and the phase instead of running or
+    /// completing the primitive. The test driving the funnel fails there,
+    /// which is the defined outcome a worker panic must have; the panic
+    /// itself is reported by whoever joins the worker.
     fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-        let mut harness = self
-            .harness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        harness.hook(site, phase)
+        match self.harness.lock() {
+            Ok(mut harness) => harness.hook(site, phase),
+            Err(_poisoned) => Injection::Error,
+        }
     }
 
     /// The same handle clone as [`Self::ledger`].
@@ -285,24 +296,25 @@ mod tests {
     /// funnels reach in the parent, declares one and cannot exercise it.
     const TWO_MODES: SubEffectPoint = SubEffectPoint::Written;
 
-    /// Answers `Injection::Error` at one phase and `Proceed` everywhere else,
-    /// and records every phase it was asked about, in order.
+    /// Answers `Injection::Error` at the scripted phases and `Proceed`
+    /// everywhere else, and records every phase it was asked about, in order.
     struct Scripted {
-        refuse_at: Option<HookPhase>,
+        refuse_at: Vec<HookPhase>,
         asked: Vec<HookPhase>,
     }
 
     impl Scripted {
         fn proceeding() -> Self {
-            Self {
-                refuse_at: None,
-                asked: Vec::new(),
-            }
+            Self::refusing_at_each(&[])
         }
 
         fn refusing_at(phase: HookPhase) -> Self {
+            Self::refusing_at_each(&[phase])
+        }
+
+        fn refusing_at_each(phases: &[HookPhase]) -> Self {
             Self {
-                refuse_at: Some(phase),
+                refuse_at: phases.to_vec(),
                 asked: Vec::new(),
             }
         }
@@ -312,7 +324,7 @@ mod tests {
         fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
             assert_eq!(site, SITE, "the funnel consulted a site it was not given");
             self.asked.push(phase);
-            if self.refuse_at == Some(phase) {
+            if self.refuse_at.contains(&phase) {
                 Injection::Error
             } else {
                 Injection::Proceed
@@ -420,9 +432,55 @@ mod tests {
             "the refusal names the mode that answered, not a fixed one: {message}"
         );
 
+        // Both modes answer `Error`: the first declared mode wins, and the
+        // second is still consulted so the harness records it as reached. A
+        // `point` that let the last answer win would name `/error-return`.
+        let mut hooks = Scripted::refusing_at_each(&[kill, error_return]);
+        let message = refusal(point(&mut hooks, SITE, TWO_MODES));
+        assert_eq!(
+            hooks.asked,
+            vec![kill, error_return],
+            "a decision does not stop the remaining modes being consulted"
+        );
+        assert!(
+            message.contains("/kill` phase") && !message.contains("/error-return"),
+            "the first non-Proceed answer wins, not the last: {message}"
+        );
+
         let mut hooks = Scripted::proceeding();
         point(&mut hooks, SITE, TWO_MODES).expect("nothing armed");
         assert_eq!(hooks.asked, vec![kill, error_return]);
+    }
+
+    /// A worker panics while holding the harness, mid-way through opening a
+    /// fast sequence. The observer must not record into what it left.
+    #[test]
+    fn a_poisoned_harness_refuses_rather_than_recording_into_it() {
+        let shared = Arc::new(Mutex::new(HookHarness::new()));
+        let poisoner = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let mut harness = poisoner.lock().expect("not yet poisoned");
+            harness.begin_fast_sequence("abandoned");
+            panic!("a worker dies while holding the harness");
+        });
+        assert!(
+            worker.join().is_err(),
+            "the worker's panic is its join error, and nothing else"
+        );
+        assert!(shared.is_poisoned(), "the harness is poisoned");
+
+        let mut hooks = HarnessEffects::new(Arc::clone(&shared));
+        assert_eq!(hooks.phase(SITE, HookPhase::Before), Injection::Error);
+        let mut ran = false;
+        let message = refusal(funnel(&mut hooks, SITE, || {
+            ran = true;
+            Ok(())
+        }));
+        assert!(!ran, "the primitive ran against a poisoned harness");
+        assert!(
+            message.contains("`before` phase"),
+            "the refusal names the phase at which the harness was found poisoned: {message}"
+        );
     }
 
     #[test]
@@ -434,8 +492,13 @@ mod tests {
         assert!(!hooks.durability_ledger().is_recording());
     }
 
+    /// The two §6 claims the type makes, each driven so that a `Clone` that
+    /// produced an independent harness or ledger would fail it: the original
+    /// observer is dropped before its clone records, what the original's
+    /// ledger handle wrote is read through the clone, and the harness is read
+    /// only after every observer is gone.
     #[test]
-    fn harness_effects_records_into_the_shared_harness_and_shares_its_ledger() {
+    fn a_clone_shares_the_harness_and_the_ledger_and_the_harness_outlives_every_observer() {
         let shared = Arc::new(Mutex::new(HookHarness::new()));
         let mut hooks = HarnessEffects::new(Arc::clone(&shared));
         funnel(&mut hooks, SITE, || Ok(())).expect("nothing is armed");
@@ -444,20 +507,33 @@ mod tests {
             "recording starts off"
         );
 
-        let mut hooks = hooks.recording_durability();
-        funnel(&mut hooks, SITE, || Ok(())).expect("nothing is armed");
-        drop(hooks.clone());
-
-        let handle = hooks.durability_ledger();
-        handle.record(DurableStep::Renamed, Path::new("staged"), 0);
+        let original = hooks.recording_durability();
+        let mut clone = original.clone();
+        let handle = original.durability_ledger();
+        drop(original);
+        funnel(&mut clone, SITE, || {
+            handle.record(DurableStep::Renamed, Path::new("staged"), 0);
+            Ok(())
+        })
+        .expect("nothing is armed");
         assert_eq!(
-            hooks.ledger().steps(),
+            clone.ledger().steps(),
             vec![DurableStep::Renamed],
-            "the handle a funnel body records into is the ledger the caller reads"
+            "what the original's handle recorded is read through the clone"
         );
+        drop(clone);
 
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "every observer is gone and the test's Arc is the last holder"
+        );
         let harness = shared.lock().expect("the harness outlives its observers");
-        assert_eq!(harness.count(SITE, HookPhase::Before), 2);
+        assert_eq!(
+            harness.count(SITE, HookPhase::Before),
+            2,
+            "the original and the clone recorded into one harness"
+        );
         assert_eq!(harness.count(SITE, HookPhase::After), 2);
     }
 }
