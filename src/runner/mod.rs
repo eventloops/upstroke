@@ -1862,10 +1862,11 @@ mod tests {
     /// Write-command containment is joined in **one** place and proved in
     /// **one** place, and this is the count.
     ///
-    /// `Contained`'s constructor is private to `runner::host`, so the only
-    /// mutation that can mint a proof out of a failed join — `let _ =
-    /// proc::join_ambient_job(hooks); Ok(Contained::new())` — is one that can
-    /// be *written* inside that module, and nowhere else in the crate. That
+    /// `Contained`'s constructor is private to `runner::host::proof`, a module
+    /// with no descendants, so the only mutation that can mint a proof out of a
+    /// failed join — `let _ = proc::join_ambient_job(hooks); Ok(Contained::new())`
+    /// — is one that can be *written* inside that module, and nowhere else in the
+    /// crate: not in `runner::host` itself, and not in its other children. That
     /// makes the class closable by counting: one call to
     /// `proc::join_ambient_job`, one call to `Contained::new`, both inside the
     /// function
@@ -1879,10 +1880,12 @@ mod tests {
     /// symbols, and two of them do it to explain this very rule.
     ///
     /// **Three needles, because the named constructor can be walked around.**
-    /// `Contained`'s field is private to `runner::host`, and inside that module
-    /// `Contained(())` builds one without going anywhere near `Contained::new`
-    /// — and without touching the establishment counter the failure-path test
-    /// reads. So the tuple-struct call is counted too, which is why
+    /// `Contained`'s field is private to `runner::host::proof`, and inside *that*
+    /// module `Contained(())` builds one without going anywhere near
+    /// `Contained::new` — and without touching the establishment counter the
+    /// failure-path test reads. Written anywhere else, including `runner::host`
+    /// itself, it is now a compile error (`E0423`). So the tuple-struct call is
+    /// counted too, which is why
     /// `src/runner/host.rs` shows one (the declaration) and `src/main.rs` shows
     /// two.
     #[test]
