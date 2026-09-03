@@ -21,13 +21,15 @@ a `?` that survives a sweep is one the reviewer agreed was deliberate.
 ## Review queue
 
 The large modules are being split into per-concern child modules, one pull request per parent.
-When a split merges, every Rust file under the family's directory joins the queue (the children
-the split produced, and the test, fixture and support files that were extracted there earlier),
-followed by the parent, which keeps whatever the split did not move. Families are queued in the
-order their splits merged. Each file is swept in queue order: one session, one file, one review
-by Claude Fable 5.1 whose only subject is that file, then the pull request that lands the
-cleanup and moves the row to the swept table. Files outside `src/` that the standards govern
-(today `examples/probe.rs`) are queued last.
+Once a split has merged, every Rust file under the family's directory is due on this queue (the
+children the split produced, and the test, fixture and support files that were extracted there
+earlier), followed by the parent, which keeps whatever the split did not move. Families are
+listed in the order their splits merged, and a family that merged after the last edit of this
+table joins it in the next pull request that touches the table, whichever that is; a stale
+queue is a queue with work owed, not a broken one. Each file is swept in queue order: one
+session, one file, one review by Claude Fable 5.1 whose only subject is that file, then the
+pull request that lands the cleanup and moves the row to the swept table. Files outside `src/`
+that the standards govern (today `examples/probe.rs`) are queued last.
 
 | # | File | Lines | From | Merged |
 |---|---|---|---|---|
@@ -42,23 +44,23 @@ cleanup and moves the row to the swept table. Files outside `src/` that the stan
 | 9 | `src/workspace_manager/fixture.rs` | 386 | #100 | 2026-09-02 |
 | 10 | `src/workspace_manager/tests.rs` | 5,973 | #100 | 2026-09-02 |
 | 11 | `src/workspace_manager.rs` | 2,535 | #110 | 2026-09-03 |
-| 12 | `src/topology/effects/bijection.rs` | 475 | #106 | 2026-09-03 |
-| 13 | `src/topology/effects/export.rs` | 123 | #106 | 2026-09-03 |
-| 14 | `src/topology/effects/harness.rs` | 360 | #106 | 2026-09-03 |
-| 15 | `src/topology/effects/registry.rs` | 727 | #106 | 2026-09-03 |
-| 16 | `src/topology/effects/residue_authority.rs` | 1,086 | #106 | 2026-09-03 |
-| 17 | `src/topology/effects/sites.rs` | 1,617 | #106 | 2026-09-03 |
-| 18 | `src/topology/effects/vocab.rs` | 796 | #106 | 2026-09-03 |
-| 19 | `src/topology/effects/tests.rs` | 6,073 | #98 | 2026-09-02 |
-| 20 | `src/topology/effects.rs` | 723 | #106 | 2026-09-03 |
-| 21 | `src/rundir/classify.rs` | 280 | #107 | 2026-09-03 |
-| 22 | `src/rundir/discovery.rs` | 331 | #107 | 2026-09-03 |
-| 23 | `src/rundir/names.rs` | 45 | #107 | 2026-09-03 |
-| 24 | `src/rundir/ownership.rs` | 344 | #107 | 2026-09-03 |
-| 25 | `src/rundir/retention.rs` | 232 | #107 | 2026-09-03 |
-| 26 | `src/rundir/scratch_tree.rs` | 1,281 | #77 | 2026-08-31 |
-| 27 | `src/rundir/tests.rs` | 4,079 | #100 | 2026-09-02 |
-| 28 | `src/rundir.rs` | 1,792 | #107 | 2026-09-03 |
+| 12 | `src/rundir/classify.rs` | 280 | #107 | 2026-09-03 |
+| 13 | `src/rundir/discovery.rs` | 331 | #107 | 2026-09-03 |
+| 14 | `src/rundir/names.rs` | 45 | #107 | 2026-09-03 |
+| 15 | `src/rundir/ownership.rs` | 344 | #107 | 2026-09-03 |
+| 16 | `src/rundir/retention.rs` | 232 | #107 | 2026-09-03 |
+| 17 | `src/rundir/scratch_tree.rs` | 1,281 | #77 | 2026-08-31 |
+| 18 | `src/rundir/tests.rs` | 4,079 | #100 | 2026-09-02 |
+| 19 | `src/rundir.rs` | 1,792 | #107 | 2026-09-03 |
+| 20 | `src/topology/effects/bijection.rs` | 475 | #106 | 2026-09-03 |
+| 21 | `src/topology/effects/export.rs` | 123 | #106 | 2026-09-03 |
+| 22 | `src/topology/effects/harness.rs` | 360 | #106 | 2026-09-03 |
+| 23 | `src/topology/effects/registry.rs` | 727 | #106 | 2026-09-03 |
+| 24 | `src/topology/effects/residue_authority.rs` | 1,086 | #106 | 2026-09-03 |
+| 25 | `src/topology/effects/sites.rs` | 1,617 | #106 | 2026-09-03 |
+| 26 | `src/topology/effects/vocab.rs` | 796 | #106 | 2026-09-03 |
+| 27 | `src/topology/effects/tests.rs` | 6,073 | #98 | 2026-09-02 |
+| 28 | `src/topology/effects.rs` | 723 | #106 | 2026-09-03 |
 | 29 | `src/topology/fold/apply.rs` | 603 | #108 | 2026-09-03 |
 | 30 | `src/topology/fold/check_attempt.rs` | 792 | #108 | 2026-09-03 |
 | 31 | `src/topology/fold/check_candidate.rs` | 252 | #108 | 2026-09-03 |
@@ -82,7 +84,10 @@ cleanup and moves the row to the swept table. Files outside `src/` that the stan
 | 49 | `src/agent/proc/test_support/readiness.rs` | 583 | #115 | 2026-09-03 |
 | 50 | `src/agent/proc/tests.rs` | 3,893 | #117 | 2026-09-03 |
 | 51 | `src/agent/proc.rs` | 5,239 | #117 | 2026-09-03 |
-| 52 | `examples/probe.rs` | 70 | — | — |
+| 52 | `src/config/parse.rs` | 571 | #123 | 2026-09-03 |
+| 53 | `src/config/read.rs` | 274 | #123 | 2026-09-03 |
+| 54 | `src/config.rs` | 2,875 | #123 | 2026-09-03 |
+| 55 | `examples/probe.rs` | 70 | — | — |
 
 Line counts are as of the split's merge and are a guide to session sizing, not a contract. The
 "From" column is the pull request that created the file at its current path; "Merged" is when
