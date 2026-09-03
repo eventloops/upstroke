@@ -1,12 +1,13 @@
 //! Path hygiene: reparse points, the verbatim prefix, and the canonical
 //! comparisons containment is decided by.
 //!
-//! `decisions.workspace_candidates.execution_root` requires an execution root
-//! reached "with no symlink/reparse point on the chain", under a base that is a
-//! "real directory", and every containment answer in the parent is a comparison
-//! of two [`canonical_prefix`] results. Those four predicates are here; the
-//! revalidation that calls them before each effect, and every effect it guards,
-//! is the parent's.
+//! `DESIGN.md` §15 creates an execution root only when the managed base is a
+//! real directory and the chain from the authorized private root down to the
+//! root carries no symlink, reparse point or regular file, and every
+//! containment answer in the parent is a comparison of two
+//! [`canonical_prefix`] results. Those predicates are here; the revalidation
+//! that calls them before each effect funnel and again inside it, and every
+//! effect it guards, is the parent's.
 //!
 //! **Read-only, and that is why it can be a child.** `fs::symlink_metadata` and
 //! `fs::canonicalize` observe; neither is a governed primitive, and no function
@@ -36,15 +37,17 @@ use crate::error::UpstrokeError;
 
 use super::Refusal;
 
-/// Whether `error` says the path names nothing.
+/// Whether `error` says the path names nothing, for the peel and the leaf
+/// check.
 ///
 /// `NotFound` is the obvious half. `NotADirectory` is the other: a path that
-/// runs through a regular file names nothing either, and Unix reports that
-/// shape as `ENOTDIR` where Windows need not, so a check that read only
-/// `NotFound` could answer differently on the two platforms for the same
-/// tree. Everything else — permission denied, a link loop, a name the
-/// filesystem cannot represent, transient I/O — is a failure and stays one:
-/// only an actual not-found becomes absence.
+/// runs through a regular file names nothing either, so the peel treats it as
+/// a prefix to peel past and the leaf check as "not a real directory". The
+/// reparse-point walk does **not** read this: it meets the file itself, one
+/// component earlier, and reports it there ([`reparse_point_below`]).
+/// Everything else — permission denied, a link loop, a name the filesystem
+/// cannot represent, transient I/O — is a failure and stays one: only an
+/// actual not-found becomes absence.
 fn is_absent(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -59,8 +62,9 @@ fn is_absent(error: &io::Error) -> bool {
 /// such object is a symbolic link. On Windows the set is larger — a directory
 /// junction (`mklink /J`) and a mount point are reparse points that are *not*
 /// symbolic links, and `FileType::is_symlink` answers true only for the
-/// name-surrogate tags. `expected_failures_refusals[0]` is "symlink/**junction**
-/// on the chain", so the Windows half reads the raw attribute
+/// name-surrogate tags. `DESIGN.md` §15 names the symlink and the reparse
+/// point together, and the retired v0.2 workspace decision spelt the refusal
+/// as "symlink/**junction** on the chain", so the Windows half reads the raw attribute
 /// (`FILE_ATTRIBUTE_REPARSE_POINT`) instead, which is true for every reparse
 /// point whatever its tag. A refusal that fired only on POSIX symlinks would
 /// pass every Linux test and refuse nothing a Windows operator can build.
@@ -107,13 +111,12 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 ///
 /// # Why the walk is anchored
 ///
-/// `decisions.workspace_candidates.execution_root` says "with no
-/// symlink/reparse point on the chain", and a chain has to start somewhere.
-/// It starts at the operator's own authorized root, canonicalized — which is
-/// how the packet anchors the same check on the other half of the same
-/// structure: `expected_failures_refusals[9]` requires "a locator chain without
-/// reparse points **canonicalizing to** `<authorized private root>/runs/
-/// <basename>`". The root is resolved at `derive` and re-examined at every
+/// `DESIGN.md` §15 requires no symlink or reparse point on the chain, and a
+/// chain has to start somewhere. It starts at the operator's own authorized
+/// root, canonicalized: §15 records the execution root as
+/// `<private root>/workspaces/<repo-key>/<run-id>`, so the private root is
+/// the anchor and everything below it is the run's. The root is resolved at
+/// `derive` and re-examined at every
 /// revalidation by [`refuse_reparse_points`]: it must still be a real
 /// directory and still canonicalize to itself, or the chain has moved under
 /// the run. What must be reparse-free is everything the run itself builds
@@ -138,22 +141,34 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
-/// run. Nothing below a regular file exists either, so a file on the chain is
-/// absence too, on every platform ([`is_absent`]). `chain` is plain
+/// run. A regular file on the chain is **not** absence. Nothing below it can
+/// ever exist, so walking past it hands the failure to whichever effect comes
+/// next — or to none: `remove_execution_root` asks `exists()`, which folds
+/// the file into "nothing to remove". The walk reports the file where it
+/// stands instead, as `NotADirectory` at its own path, and reports it the
+/// same on every platform: it reads the component's type rather than waiting
+/// for the `ENOTDIR` only Unix raises one component later. `chain` is plain
 /// components by construction ([`plain_chain_below`]), so the walk has no
 /// root to skip and no `..` to climb.
 ///
 /// # Errors
 ///
-/// A component that exists but cannot be read, with its path.
+/// A component that exists but cannot be read, or that is a regular file,
+/// with its path.
 fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf>, UpstrokeError> {
     let mut walked = anchor.to_path_buf();
     for name in chain {
         walked.push(name);
         match fs::symlink_metadata(&walked) {
             Ok(metadata) if is_reparse_point(&metadata) => return Ok(Some(walked)),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(UpstrokeError::Io {
+                    path: walked,
+                    source: io::Error::from(io::ErrorKind::NotADirectory),
+                });
+            }
             Ok(_) => {}
-            Err(error) if is_absent(&error) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
                 return Err(UpstrokeError::Io {
                     path: walked,
@@ -199,10 +214,23 @@ fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf
 /// is, or the anchor's resolution failing for a reason other than absence.
 pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
     refuse_unreal_directory(anchor)?;
-    let resolved = fs::canonicalize(anchor).map_err(|source| UpstrokeError::Io {
-        path: anchor.to_path_buf(),
-        source,
-    })?;
+    let resolved = match fs::canonicalize(anchor) {
+        Ok(resolved) => resolved,
+        // A real directory a moment ago and gone now is the same refusal as
+        // never having been one; only a failure to resolve it is an error.
+        Err(error) if is_absent(&error) => {
+            return Err(Refusal::BaseIsNotADirectory {
+                path: anchor.to_path_buf(),
+            }
+            .into());
+        }
+        Err(source) => {
+            return Err(UpstrokeError::Io {
+                path: anchor.to_path_buf(),
+                source,
+            });
+        }
+    };
     if strip_verbatim(resolved) != anchor {
         return Err(Refusal::ReparsePointOnChain {
             chain: path.to_path_buf(),
@@ -328,15 +356,17 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// filesystem sees it, POSIX cannot traverse the absent directory — so there
 /// is no canonical form to hand back: where the filesystem fails on it the
 /// peel meets the `..`, finds no plain component left to peel, and returns
-/// that failure rather than the raw path. A path with no existing prefix at
-/// all — a relative one none of whose components exists — is the same case,
-/// and the error names its first component, the prefix that failed last.
+/// that failure rather than the raw path.
+///
+/// A relative path is anchored at the current directory, so `missing` and
+/// `./missing` resolve alike: when the peel reaches the empty parent it
+/// canonicalizes `.`, the current directory, and rejoins the rest onto that.
 ///
 /// # Errors
 ///
 /// [`UpstrokeError::Io`] naming the prefix whose resolution failed: the whole
-/// path, the `..`-terminated head, or the first component of a relative path
-/// none of whose components exists.
+/// path, a `..`-terminated head, or `.` when the current directory itself
+/// cannot be resolved.
 pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
     let mut tail = Vec::new();
     let mut head = path.to_path_buf();
@@ -360,23 +390,21 @@ pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
                 source: absent,
             });
         };
-        // The empty parent is a relative path none of whose components
-        // exists: `head` is its first component, the prefix that just
-        // failed, and the error names it rather than the whole path.
+        // The empty parent is the current-directory anchor of a relative
+        // path: `.` is what canonicalizes to it. Otherwise `pop` truncates in
+        // place rather than copying the parent each step; it answers false
+        // only when there is no parent to pop to, which is the same terminal
+        // case as a `..`-terminated head and gets the same answer.
         if head
             .parent()
-            .is_none_or(|parent| parent.as_os_str().is_empty())
+            .is_some_and(|parent| parent.as_os_str().is_empty())
         {
+            head = PathBuf::from(".");
+        } else if !head.pop() {
             return Err(UpstrokeError::Io {
                 path: head,
                 source: absent,
             });
-        }
-        // `pop` truncates in place rather than copying the parent each step.
-        // It answers false only when there is no parent, which the arm above
-        // excluded.
-        if !head.pop() {
-            unreachable!("a head with a parent pops to it");
         }
         tail.push(name);
     }

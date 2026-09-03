@@ -37,6 +37,9 @@ use super::fixture::{Fixture, git, git_out, scratch};
 // removes. The `canonical_prefix` tests below build no repository, so this is
 // the fixture they take.
 use crate::rundir::scratch_tree::acquire;
+// The slot-component grammar, named so the run-id restatement of it can be
+// held to the same verdicts.
+use super::naming::safe_component;
 // Named here rather than borrowed from the parent's import list. The split
 // moved the items that needed them into children -- the hook observers, the
 // residue classifier, the slot vocabulary and the changed-path decoder -- so
@@ -1056,27 +1059,92 @@ fn a_link_planted_above_the_private_root_after_derive_refuses_every_revalidation
     );
 }
 
-/// A regular file where a directory of the chain should be is **absence**
-/// for the walk, on every platform: nothing below a file exists, so nothing
-/// below it is a reparse point. The walk used to treat only `NotFound` as
-/// absence, and Unix reports this shape as `ENOTDIR`, so the two platforms
-/// could answer differently for the same tree. The effect that needs the
-/// directory is what reports it, with the path.
+/// A regular file where a directory of the chain should be is a broken
+/// chain, reported where it stands and on every platform alike: the walk
+/// reads the component's type rather than waiting for the `ENOTDIR` only
+/// Unix raises one component later, and never walks past it. Walking past
+/// handed the failure to the next effect, or to none: `remove_execution_root`
+/// asks `exists()`, which folded the file into "nothing to remove" and
+/// answered `Ok(false)` with no path named.
 #[test]
-fn a_regular_file_on_the_chain_is_absence_for_the_walk_and_the_effect_reports_it() {
+fn a_regular_file_on_the_chain_is_reported_where_it_stands_and_never_as_nothing_to_remove() {
     let fixture = Fixture::new("file-on-chain");
-    fs::write(fixture.private.join("workspaces"), "not a directory\n").expect("plant the file");
-    fixture
-        .manager
-        .revalidate()
-        .expect("a file on the chain is absence for the walk, not a failure of it");
+    let file = fixture.manager.private_root().join("workspaces");
+    fs::write(&file, "not a directory\n").expect("plant the file");
+
     let error = fixture
         .manager
-        .create_execution_root(&mut NoHooks)
-        .expect_err("the directories cannot be created through a file");
+        .revalidate()
+        .expect_err("a file on the chain is a broken chain, not absence");
     assert!(
-        matches!(&error, UpstrokeError::Io { path, .. } if path == fixture.manager.execution_root()),
-        "the effect names the path it could not create: {error}"
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &file && source.kind() == std::io::ErrorKind::NotADirectory
+        ),
+        "the walk names the file itself, as not a directory: {error}"
+    );
+    fixture
+        .manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("the create revalidates and refuses");
+    fixture
+        .manager
+        .remove_execution_root(&mut NoHooks)
+        .expect_err(
+            "the removal revalidates and refuses rather than answering \"nothing to remove\"",
+        );
+}
+
+/// `DESIGN.md` §15: every create, reclaim and delete revalidates inside its
+/// effect funnel, after the before-hook and immediately before the effect. A
+/// revalidation outside the funnel left a window: a `Before` hook — the seam
+/// `a_registration_rebound_after_validation_keeps_its_admin_state` already
+/// drives — that renamed the private root away and planted a link in its
+/// place after the check had passed, and `create_dir_all` then built the
+/// hierarchy under the link's target. The hook here does exactly that at the
+/// create's `Before`, so the only check that can refuse is the one inside.
+#[test]
+fn a_private_root_exchanged_between_the_before_hook_and_the_effect_is_still_refused() {
+    struct ExchangeAtBefore {
+        private: PathBuf,
+        moved: PathBuf,
+        elsewhere: PathBuf,
+    }
+
+    impl EffectHooks for ExchangeAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot)
+                && phase == HookPhase::Before
+            {
+                fs::rename(&self.private, &self.moved).expect("move the real private root aside");
+                plant_directory_link(&self.elsewhere, &self.private);
+            }
+            Injection::Proceed
+        }
+    }
+
+    let fixture = Fixture::new("anchor-exchanged-in-funnel");
+    let elsewhere = fixture.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the unrelated directory");
+    let mut hooks = ExchangeAtBefore {
+        private: fixture.manager.private_root().to_path_buf(),
+        moved: fixture.root.join("private-moved"),
+        elsewhere: elsewhere.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .create_execution_root(&mut hooks)
+        .expect_err("the check inside the funnel sees the exchanged root");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !elsewhere.join("workspaces").exists() && !hooks.moved.join("workspaces").exists(),
+        "and nothing is built under the link's target or the moved root"
     );
 }
 
@@ -1160,20 +1228,99 @@ fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically
     );
 }
 
-/// The relative-path terminal arm names the prefix that failed — the first
-/// component, the last one the peel tried — not the whole path.
+/// A relative path is anchored at the current directory, so `missing` and
+/// `./missing` resolve alike. The peel used to stop at the empty parent and
+/// report the first component as a failed prefix, while the same path spelt
+/// `./missing` peeled to `.` and resolved — two answers for one path, and a
+/// public caller (`quiescence`) failed as I/O on one spelling and reached its
+/// ordinary verdict on the other.
 #[test]
-fn canonical_prefix_names_the_prefix_that_failed_for_a_relative_path() {
+fn canonical_prefix_anchors_a_relative_path_at_the_current_directory() {
     let first = PathBuf::from(format!("upstroke-absent-{}", std::process::id()));
-    let error = canonical_prefix(&first.join("x")).expect_err("nothing in it exists");
-    assert!(
-        matches!(
-            &error,
-            UpstrokeError::Io { path, source }
-                if path == &first && source.kind() == std::io::ErrorKind::NotFound
-        ),
-        "the error names the prefix that failed: {error}"
+    let cwd = strip_verbatim(
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory"),
     );
+    let expected = cwd.join(&first).join("x");
+    assert_eq!(
+        canonical_prefix(&first.join("x")).expect("anchored at the current directory"),
+        expected
+    );
+    assert_eq!(
+        canonical_prefix(&Path::new(".").join(&first).join("x"))
+            .expect("the same path spelt with `.`"),
+        expected
+    );
+}
+
+/// A relative path whose first component exists and whose next does not:
+/// the peel finds the existing prefix under the current directory and
+/// rejoins the rest, exactly as it does for an absolute path. `src/` exists
+/// at the crate root, which is where the suite runs.
+#[test]
+fn canonical_prefix_resolves_an_existing_relative_prefix_and_rejoins_the_rest() {
+    let cwd = strip_verbatim(
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory"),
+    );
+    let absent = format!("upstroke-absent-{}", std::process::id());
+    let path = Path::new("src").join(&absent).join("x");
+    assert_eq!(
+        canonical_prefix(&path).expect("an existing relative prefix resolves"),
+        cwd.join("src").join(&absent).join("x")
+    );
+}
+
+/// An anchor that names nothing is the same refusal as one that is a file
+/// or a link — at the anchor's own check, and at its canonical pin should it
+/// vanish between the two, which routes absence through the same predicate.
+/// That race cannot be staged from a test; the arm is decided by the rule
+/// this drives at the function's edge.
+#[test]
+fn an_absent_anchor_refuses_as_not_a_real_directory() {
+    let fixture = Fixture::new("absent-anchor");
+    let anchor = fixture.root.join("never-created");
+    let error = refuse_reparse_points(&anchor, &anchor.join("workspaces"))
+        .expect_err("an absent anchor refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+}
+
+/// `refuse_unplain_run_id` restates `naming::safe_component`'s grammar with
+/// its own messages until the parent's sweep folds the two into one helper.
+/// Held to the same verdicts here, on the same inputs, so the restatement
+/// cannot drift from the rule it restates.
+#[test]
+fn a_run_id_and_a_slot_component_are_refused_by_the_same_rule() {
+    for input in [
+        "run-1",
+        "01KZCAND00000000000000000G",
+        "a_b",
+        "",
+        ".",
+        "..",
+        "/x",
+        "a/b",
+        "a\\b",
+        "-x",
+        "x.",
+        "x ",
+        "C:x",
+        "é",
+    ] {
+        assert_eq!(
+            safe_component(input).is_some(),
+            refuse_unplain_run_id(input).is_err(),
+            "{input:?}: the run-id rule and the slot-component rule must agree"
+        );
+    }
 }
 
 /// The Windows half of the test above: Win32 resolves `..` lexically before

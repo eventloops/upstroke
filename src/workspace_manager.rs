@@ -103,9 +103,8 @@ pub enum Refusal {
     /// `transaction_fault_matrix[T-DISPATCH].refusal_condition`: "worktree path
     /// outside execution root **or on a reparse point**".
     #[error(
-        "refusing {}: `{}` on the chain is a symlink or reparse point, and \
-         decisions.workspace_candidates.execution_root creates a root only when the chain carries \
-         none",
+        "refusing {}: `{}` on the chain is a symlink or reparse point, and DESIGN.md §15 creates an \
+         execution root only when the chain from the authorized private root carries none",
         .chain.display(),
         .at.display()
     )]
@@ -383,7 +382,13 @@ pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> P
 /// refusal names what was offered: non-empty, ASCII alphanumerics, `-` and
 /// `_` only, no leading `-`. That excludes every separator on every
 /// platform, `.`, `..`, a prefix such as `C:` and the trailing dot or space
-/// Win32 rewrites.
+/// Win32 rewrites. It is a restatement rather than a call because
+/// `safe_component` is being reshaped into a `Result` carrying the same
+/// messages on another branch; the two fold into one helper in the parent's
+/// own sweep (`src/workspace_manager.rs` in `standards/SWEEP.md`'s queue),
+/// and until then
+/// `a_run_id_and_a_slot_component_are_refused_by_the_same_rule` holds them
+/// to the same verdicts so the restatement cannot drift.
 fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
     let why = if run_id.is_empty() {
         "it is empty"
@@ -591,7 +596,7 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
 impl WorkspaceManager {
     /// Derive the execution root of `run_id` from the managed base and the
     /// authorized private root, and refuse every containment condition
-    /// `decisions.workspace_candidates.execution_root` names.
+    /// `DESIGN.md` §15 names.
     ///
     /// # Errors
     ///
@@ -673,6 +678,12 @@ impl WorkspaceManager {
 
     /// The three containment conditions, re-checked.
     ///
+    /// This is the **gate**, run before a funnel is entered: it refuses
+    /// before any hook runs, and it is the check that asks Git for the
+    /// worktree list. The chain half of it runs again *inside* every funnel
+    /// primitive, immediately before the effect, as
+    /// [`Self::revalidate_chain`]; that doc says why the two are separate.
+    ///
     /// `execution_root`: "created only when the managed base is a real
     /// directory with no symlink/reparse point on the chain, the canonical root
     /// is inside no repository worktree, and no repository worktree is inside
@@ -689,8 +700,7 @@ impl WorkspaceManager {
     ///
     /// The containment refusals, or a Git error reading the worktree list.
     pub fn revalidate(&self) -> Result<(), UpstrokeError> {
-        refuse_unreal_directory(&self.base)?;
-        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        self.revalidate_chain()?;
         let root = canonical_prefix(&self.execution_root)?;
         for record in self.worktree_records()? {
             let worktree = canonical_prefix(&record.path)?;
@@ -710,6 +720,40 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    /// The chain half of [`Self::revalidate`], re-run inside every funnel
+    /// primitive immediately before its effect: the managed base is a real
+    /// directory, the authorized private root is still the directory it was
+    /// resolved as, and the chain below it is plain components with no
+    /// reparse point or regular file among them.
+    ///
+    /// `DESIGN.md` §15: every create, reclaim and delete revalidates before
+    /// its funnel and re-checks the chain inside it. Between the gate and the
+    /// effect sit the funnel's `Before` hook and whatever else the machine
+    /// does in that window, and a private root exchanged for a link there
+    /// would have every path under it resolve elsewhere with nothing left to
+    /// notice — `a_registration_rebound_after_validation_keeps_its_admin_state`
+    /// already drives a `Before` hook that rewrites filesystem identity. So
+    /// the checks that decide *where the effect lands* run again here,
+    /// adjacent to the syscall.
+    ///
+    /// Only these, and not the whole gate: `git worktree list` inside a
+    /// primitive would make a removal depend on Git parsing the very
+    /// registration that recovery exists to remove (see
+    /// [`Self::revalidate_removal`]), and the worktree comparisons the gate
+    /// makes need no filesystem effect to stay true. The window this leaves
+    /// is a concurrent writer between two instructions, which no re-check
+    /// closes.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+    /// [`Refusal::ReparsePointOnChain`], or an I/O error naming the component
+    /// that could not be read or is a regular file.
+    fn revalidate_chain(&self) -> Result<(), UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        refuse_reparse_points(&self.private_root, &self.execution_root)
     }
 
     /// Whether `worktree` occupies one of this manager's own slot namespaces.
@@ -789,6 +833,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
             || {
+                self.revalidate_chain()?;
                 for directory in [
                     self.execution_root.clone(),
                     self.execution_root.join("intents"),
@@ -825,6 +870,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
             || {
+                self.revalidate_chain()?;
                 if !self.execution_root.exists() {
                     return Ok(false);
                 }
@@ -892,6 +938,7 @@ impl WorkspaceManager {
         };
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
+            self.revalidate_chain()?;
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
                 message: format!("serializing the {} intent: {error}", slot.kind()),
             })?;
@@ -918,6 +965,7 @@ impl WorkspaceManager {
         let path = self.intent_path(slot);
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.remove_intent_site(), || {
+            self.revalidate_chain()?;
             match fs::remove_file(&path) {
                 Ok(()) => sync_directory(path.parent().unwrap_or(&self.execution_root), &ledger),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1061,6 +1109,7 @@ impl WorkspaceManager {
             .into());
         }
         funnel(hooks, slot.add_site(), || {
+            self.revalidate_chain()?;
             // Inside the funnel, not before it (`PR5-CONF-003`). `identity` says
             // "the funnel itself calls hook(Before, site) -> primitive ->
             // hook(After, site)" and `scope` requires "every effect through
@@ -1105,6 +1154,7 @@ impl WorkspaceManager {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(hooks, EffectSiteId::Worktree(WorktreeSite::Verify), || {
+            self.revalidate_chain()?;
             self.quiescence(&path, expected)
         })
     }
@@ -1290,6 +1340,7 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
+            self.revalidate_chain()?;
             if path.exists() {
                 let contained = self.contained(&path)?;
                 remove_tree_once_handles_close(&contained).map_err(|source| UpstrokeError::Io {
@@ -1621,6 +1672,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateStage),
             || {
+                self.revalidate_chain()?;
                 self.git_ok(
                     &path,
                     &Self::CANDIDATE_STAGE_ARGV
@@ -1648,7 +1700,10 @@ impl WorkspaceManager {
         funnel(
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateWriteTree),
-            || self.git_line(&path, &Self::CANDIDATE_WRITE_TREE_ARGV),
+            || {
+                self.revalidate_chain()?;
+                self.git_line(&path, &Self::CANDIDATE_WRITE_TREE_ARGV)
+            },
         )
     }
 
@@ -1780,6 +1835,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::ProposalCherryPick),
             || {
+                self.revalidate_chain()?;
                 let mut argv: Vec<OsString> = Self::PROPOSAL_CHERRY_PICK_ARGV
                     .iter()
                     .map(OsString::from)
@@ -1814,6 +1870,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::RepairMaterialize),
             || {
+                self.revalidate_chain()?;
                 self.git_ok(
                     &path,
                     &[
@@ -2136,8 +2193,7 @@ impl WorkspaceManager {
     /// partial `gitdir` refuses; guessing from the admin directory's basename
     /// would authorize deletion from a Git-generated, collision-suffixed name.
     fn revalidate_removal(&self, target: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-        refuse_unreal_directory(&self.base)?;
-        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        self.revalidate_chain()?;
         let root = canonical_prefix(&self.execution_root)?;
         let target = canonical_prefix(target)?;
         let base = canonical_prefix(&self.base)?;
