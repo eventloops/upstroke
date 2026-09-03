@@ -80,14 +80,23 @@ pub enum Slot {
     },
     /// `snapshots/<name>` — an exact gate or review snapshot, R24.
     Snapshot {
-        /// The snapshot's name, which encodes its role, generation, and
-        /// attempt so that no two roles or attempts can collide.
+        /// The snapshot's name. Built through one of [`SnapshotName`]'s three
+        /// constructors it encodes the role, the generation and the attempt, so
+        /// callers going through them cannot collide; see that type for why
+        /// that is not a property of every `SnapshotName`.
         name: SnapshotName,
     },
 }
 
-/// A snapshot's name, built so that "never reused across roles or attempts" is
-/// a property of the name rather than of the caller's discipline.
+/// A snapshot's name.
+///
+/// The three constructors below encode the role, the generation and the attempt
+/// into the string, which is how a caller that uses them satisfies
+/// `decisions.workspace_candidates.snapshots`' "never reused across roles or
+/// attempts". It is **not** a property of the type: `Slot::from_intent_name`
+/// rebuilds one straight from an on-disk intent filename, so a reconstructed
+/// name carries whatever the filename carried. The module doc says where that
+/// leaves the guarantee.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SnapshotName(String);
 
