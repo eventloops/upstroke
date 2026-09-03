@@ -16,7 +16,17 @@
 )]
 
 use super::*;
+// The split moved the classification probe into a child. `use super::*` reaches the
+// parent's namespace only, so the five items this suite drives directly --
+// `FIRST_LINE_WINDOW`, `SCAN_CHUNK`, `first_line`, `first_line_within` and
+// `RunStartedHeader` -- are reached through the child's own `pub(super)` surface, and
+// the three `std::io` traits it drove them with are named here rather than borrowed
+// from the parent's import list, which no longer needs them. No test is renamed, no
+// assertion changes and no body moves; these two lines are the whole of what the
+// extraction owes this file.
+use super::classify::*;
 
+use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
 use crate::agent::proc::test_support::readiness;
