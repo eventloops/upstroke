@@ -134,10 +134,12 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 /// compares **canonical** paths, and that worktree's Git admin entry, which
 /// `revalidate_removal` bound to the same slot byte-for-byte before anything
 /// was deleted. A resolved link cannot carry either outside the root. The
-/// parent's other removals never recurse: `remove_dir` on the root and its
-/// own empty scaffolding, `remove_file` on an intent whose validated name
-/// cannot leave `intents/`, and on the `locked` marker inside that admin
-/// entry.
+/// parent's other removals never recurse — `remove_dir` on the root and its
+/// own empty scaffolding, `remove_file` on an intent, and on the `locked`
+/// marker inside that admin entry — but a non-recursive removal still
+/// follows a link in its *parent*, so every effect's in-funnel check walks
+/// this chain down to the directory the effect acts in, and an exchanged
+/// `intents/` or `tasks/` refuses exactly as an exchanged root does.
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
@@ -348,7 +350,11 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// past: a prefix the filesystem refuses to resolve for any other reason —
 /// permission, a link loop, a name it cannot represent, transient I/O — is
 /// an error, because a comparison over a path the filesystem never verified
-/// proves nothing about containment.
+/// proves nothing about containment. And a prefix that resolves to something
+/// other than a directory while components remain below it is
+/// `NotADirectory` at that prefix, on every platform: the filesystem has
+/// said the rest of the path cannot exist, and rejoining it lexically would
+/// hand back exactly the unverified path this function exists not to.
 ///
 /// The rejoined tail is plain components. A `..` below a component that
 /// does not exist has no directory to refer to, and the platforms
@@ -374,6 +380,23 @@ pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
         let absent = match fs::canonicalize(&head) {
             Ok(canonical) => {
                 let mut canonical = strip_verbatim(canonical);
+                if !tail.is_empty() {
+                    // It resolved a moment ago; a read failure now is a
+                    // failure, and anything but a directory cannot carry the
+                    // tail.
+                    let directory = fs::metadata(&canonical)
+                        .map(|metadata| metadata.is_dir())
+                        .map_err(|source| UpstrokeError::Io {
+                            path: canonical.clone(),
+                            source,
+                        })?;
+                    if !directory {
+                        return Err(UpstrokeError::Io {
+                            path: canonical,
+                            source: io::Error::from(io::ErrorKind::NotADirectory),
+                        });
+                    }
+                }
                 for name in tail.iter().rev() {
                     canonical.push(name);
                 }
