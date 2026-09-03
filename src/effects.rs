@@ -977,14 +977,16 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // finding that this roll-call is hand-maintained rather than derived, and it
     // is not this split's to repair.
     //
-    // They are named because the split moved ten externally reachable `fn`s out
-    // of `src/agent/proc.rs` and made five previously private ones `pub(super)`
-    // in the children -- the same visibility a private item of `proc` had, and
-    // the visibility `externally_reachable_fns` counts. Naming the children
-    // keeps every one of those names accounted for on the other side of the
-    // move. The funnel entry point, both `ProcessSite` values, the
-    // no-degraded-mode memo, `windows_job` and `termination` stayed in
-    // `src/agent/proc.rs`.
+    // They are named because the split moved externally reachable `fn`s out of
+    // `src/agent/proc.rs` and made previously private ones `pub(super)` in the
+    // children -- the same visibility a private item of `proc` had, and the
+    // visibility `externally_reachable_fns` counts. Naming the children keeps
+    // every one of those names accounted for on the other side of the move.
+    // Stated as a property and not as a tally: this list merges as a sorted
+    // union and a count beside it does not, so a number here would be wrong at
+    // the next edit to any of these files rather than at a merge anyone reads.
+    // The funnel entry point, both `ProcessSite` values, the no-degraded-mode
+    // memo, `windows_job` and `termination` stayed in `src/agent/proc.rs`.
     "src/agent/proc/ambient.rs",
     "src/agent/proc/drain.rs",
     "src/agent/proc/hooks.rs",
