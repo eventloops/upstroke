@@ -117,6 +117,11 @@ The default-branch ruleset requires a pull request and an up-to-date branch, `up
 deletion and non-fast-forward updates and has no bypass actor. A tag ruleset on `refs/tags/v*`
 blocks updates and deletions with no bypass. Required-check names are API: to rename one, land the
 replacement, observe it on a pull request, update the ruleset, then remove the old requirement.
+The workflow trigger contract is fixed too: `ci.yml` runs on `push` and `pull_request`, and
+`pr-policy.yml` on `pull_request`, each with the branch list exactly `[master,
+codex/parallelism-design]` and nothing else, so slice pull requests into the integration branch
+get both contexts; `test-docs-consistency.sh` pins that contract, and changing it is a change to
+this file first.
 
 **Trust boundary.** There is one trusted same-repository writer: the owner. A pull request can
 edit `ci.yml`, `pr-policy.yml` and the validators they run and still turn both contexts green, so
