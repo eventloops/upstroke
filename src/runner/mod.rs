@@ -2239,7 +2239,7 @@ mod tests {
                 "**the legacy schema-3 progress tracker, and the reason this census exists rather than a bare repair.** It counts an attempt at its *start* and refunds by SUBTRACTION — five `saturating_sub` sites against one `saturating_add`, plus two resets. Each of those five is a place a future refund can be forgotten, which is the bug schema 4 shipped. **Recorded, not unified**: this is the legacy engine's own in-memory state, `invariants_preserved[1]` freezes its behaviour, and rewriting it would change the engine actually in production to tidy the one that is not. Zero consults is the finding in one number — the legacy engine never asks `spends_allowance`, because the rule was extracted FROM it",
             ),
             (
-                "src/topology/fold.rs",
+                "src/topology/fold/apply.rs",
                 2,
                 1,
                 "the only place schema 4 writes the count: one more at the settlement, and back to zero on the rung an escalation climbs onto. **No subtraction** — counting at the settlement makes T-ATTEMPT's refund the absence of a charge rather than a correction, which is the contrast with the seven sites above. The increment CONSULTS `spends_allowance` rather than answering for itself, and that is the whole of this census",
@@ -2328,16 +2328,44 @@ mod tests {
         // failure and `apply_candidate_prepared` for a success — and both must
         // charge. Counting the calls is what makes a settlement that stops
         // charging a failing census rather than a silent undercount.
-        let fold = std::fs::read_to_string("src/topology/fold.rs").expect("the fold reads");
-        let production = crate::effects::production_code(&fold);
-        let charges = crate::effects::census_domain::production_calls(
-            &production,
-            "self.charge_allowance",
-            crate::effects::census_domain::Call::Free,
+        //
+        // **The fold is a directory.** It was one file when this was written,
+        // and the read below was that file. The domain is unchanged — the
+        // fold's production code — but it is now the root plus its children,
+        // so reading `fold.rs` alone would count only the state types and the
+        // `plan_transition`/`apply_delta` pair and would report zero for a
+        // charge that moved into a sibling. `fold/tests.rs` is the whole-file
+        // test module and was never in this domain.
+        let mut sources = vec![PathBuf::from("src/topology/fold.rs")];
+        let mut children: Vec<PathBuf> = std::fs::read_dir("src/topology/fold")
+            .expect("the fold's children")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .filter(|path| !path.ends_with("tests.rs"))
+            .collect();
+        children.sort();
+        // The control: a walk that found nothing would count zero charges in a
+        // tree that has two, and the assertion below would then be about an
+        // empty region rather than about the appliers.
+        assert!(
+            children.len() >= 10,
+            "the walk found {} production children of the fold, so the count below is over \
+             almost nothing",
+            children.len()
         );
+        sources.extend(children);
+        let mut charges = 0;
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("the fold reads");
+            charges += crate::effects::census_domain::production_calls(
+                &crate::effects::production_code(&source),
+                "self.charge_allowance",
+                crate::effects::census_domain::Call::Free,
+            );
+        }
         assert_eq!(
             charges, 2,
-            "`charge_allowance` is called {charges} time(s) in the fold's production \
+            "`charge_allowance` is called {charges} time(s) in the fold module's production \
              region; schema 4 has two settlement appliers and each must charge the \
              rung — a failure through `apply_settlement` and a success through \
              `apply_candidate_prepared`"
