@@ -1055,8 +1055,9 @@ mod tests {
     /// T-ATTEMPT.
     ///
     /// **The site's own variants are not this slice's to add.** The site enum,
-    /// its adjacency and its fault row are `src/topology/effects.rs` — PR3's,
-    /// frozen here — and a probe context would be a *new variant* of an
+    /// its adjacency and its fault row are `topology::effects` — PR3's, frozen
+    /// here, and in its `sites.rs` and `vocab.rs` children since that module was
+    /// split — and a probe context would be a *new variant* of an
     /// inventory the packet enumerates. That half is deferred, with an owner,
     /// in `reviews/FINDINGS.md`. What this test contributes is that the
     /// mismatch is counted rather than silent: the two roles are named here,
