@@ -1269,6 +1269,7 @@ pub(crate) static WHOLE_FILE_TEST_MODULES: LazyLock<Vec<PathBuf>> = LazyLock::ne
     // oracle compares a `Vec` and not a set for the same reason.
     let written = [
         "agent/proc/test_support/readiness.rs",
+        "agent/proc/tests.rs",
         "effects/tests.rs",
         "engine/tests.rs",
         "engine/topology/attempt/tests.rs",
