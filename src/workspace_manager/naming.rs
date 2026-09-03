@@ -5,10 +5,21 @@
 //! literally -- "detached linked worktrees with durable synced intents
 //! (`tasks/k<key>-g<gen>`, `merge/s<seq>`)" -- and
 //! `decisions.workspace_candidates.snapshots` requires the third's members to be
-//! "never reused across roles or attempts". Both are properties of the *name*
-//! here rather than of the caller's discipline: [`SnapshotName`] can only be
-//! built by one of its three constructors, and [`safe_component`] is what makes
-//! a [`Slot`] path containment-by-construction.
+//! "never reused across roles or attempts".
+//!
+//! **Containment is structural; uniqueness is not, and the difference is worth
+//! stating exactly.** [`safe_component`] is what makes a [`Slot`] path
+//! containment-by-construction — a name that could escape the execution root is
+//! refused, whatever produced it. Uniqueness across roles and attempts is a
+//! weaker guarantee: [`SnapshotName`]'s three constructors encode the role, the
+//! generation and the attempt into the name, so a caller that goes through them
+//! cannot collide — but they are not the only way to obtain one.
+//! [`Slot::from_intent_name`] reconstructs a [`Slot::Snapshot`] straight from an
+//! on-disk intent filename, so that reclaim never has to trust a path stored
+//! inside a record, and a name reconstructed that way carries whatever the
+//! filename carried. **So "never reused across roles or attempts" rests on
+//! caller discipline rather than on the type**, and this module documents that
+//! rather than claiming a guarantee it does not provide.
 //!
 //! Pure string and path arithmetic. Nothing in this module reads or writes the
 //! filesystem; the funnels that act on the paths it names are the parent's.
