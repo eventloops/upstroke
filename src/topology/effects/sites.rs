@@ -1280,8 +1280,13 @@ impl LockSite {
 ///
 /// One site. `report.json` is also named by [`RunDirSite::WriteReport`] in the
 /// frozen inventory; both are implemented because both are named, and the two
-/// are the same durable object reached through two funnels — see this module's
-/// worker report for the note against the design.
+/// are the same durable object reached through two funnels — see the
+/// `topology::effects` worker report for the note against the design.
+///
+/// Named rather than left as "this module" because the split moved this type
+/// out of the root: at base the phrase denoted `topology::effects`, and in this
+/// child it reads as `sites`, which has no worker report and is not what the
+/// note is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportSite {
     /// Writing `report.json`.
