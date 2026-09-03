@@ -2333,9 +2333,9 @@ mod tests {
         // It was one file when this was written, and the read below was that
         // file. The domain is unchanged — the fold's production code — but it
         // is now the root plus everything beneath it, so reading `fold.rs`
-        // alone would count only the state types and the
-        // `plan_transition`/`apply_delta` pair and would report zero for a
-        // charge that moved into a sibling.
+        // alone would report **zero** charges — both calls this census counts
+        // are in `apply.rs` — and a read of the root cannot see a charge that
+        // lives in a child, nor one that moves between children.
         //
         // **The walk is [`production_sources`], not a one-level `read_dir`.**
         // A `read_dir` of `src/topology/fold` claimed this whole domain while
