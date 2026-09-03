@@ -61,8 +61,11 @@ bash .github/scripts/test-docs-consistency.sh
 The crate defines no features today, so `--all-features` is a no-op; use the CI form regardless.
 `1.85.0` is the MSRV and CI pins it; there is **no** `rust-toolchain.toml`, so toolchain selection
 is explicit at call sites. The 4 `test-*.sh` gates in `.github/scripts/` run in CI's `lint` job.
-`test-release-record.sh` needs `jq`, and `test-pr-policy.sh` only works from the root (it derives
-its location with `${BASH_SOURCE[0]%/*}`).
+`test-release-record.sh` needs `jq`. `test-pr-policy.sh` derives its own directory with
+`${BASH_SOURCE[0]%/*}`, which works from any directory except one: invoked by bare name from
+inside `.github/scripts/`, the expansion strips nothing and it fails. Invoke it by path, as above.
+These are CI's commands; a shared build machine may wrap `cargo` and assign target directories
+itself, and its wrapper is the way to run them there.
 
 ## Hard conventions
 
@@ -132,8 +135,10 @@ verified state before trusting a tree.
 
 **Concurrent suites must not share an unset `CARGO_TARGET_DIR`.** The container pre-clean key is
 fixed when the variable is unset (`src/runner/container/fake.rs`, `R5-SEAMS-006`), so two bare
-`cargo test` runs on one machine remove each other's live Docker containers mid-run. Give each
-concurrent run its own target directory. CI is unaffected.
+`cargo test` runs on one machine remove each other's live Docker containers mid-run. Concurrent
+runs need distinct target directories, assigned however the machine assigns them (a build wrapper
+that owns them, or an explicit `CARGO_TARGET_DIR` per run where nothing does); never two runs on
+one unset value. CI is unaffected.
 
 **`src/export.rs` pins sentences in the docs.** Its tests `include_str!` `README.md`,
 `MAINTAINING.md`, `design/15_design_event_log_resume_run_layout.md` and
