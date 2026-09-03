@@ -1056,10 +1056,22 @@ pub struct WorkspaceManager {
 ///
 /// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
 /// so the first attempt succeeds — and the retry is not compiled in there. The bound
-/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process,
-/// and the **last attempt's** error is returned rather than masked. It is not necessarily
-/// the first attempt's — a permanent ACL denial and a closing handle both answer error 5,
-/// and only the passage of `ATTEMPTS * STEP` tells them apart.
+/// is deliberate: a handle that survives all `ATTEMPTS` attempts is treated as a lock
+/// rather than a closing process, and the **last attempt's** error is returned rather
+/// than masked. It is not necessarily the first attempt's — a permanent ACL denial and
+/// a closing handle both answer error 5. Exhausting the attempts does **not** tell those
+/// two apart, and nothing available here can: it bounds how long the ambiguity is
+/// tolerated before the caller is told, which is the only decision this function is in
+/// a position to make.
+///
+/// The loop sleeps *between* attempts and not after the last, so it sleeps
+/// `(ATTEMPTS - 1) * STEP` — and that is time spent **sleeping**, not a deadline. A
+/// loaded machine stretches its wall clock well past that, which is the direction to be
+/// wrong in: a machine too busy to schedule this loop is equally too busy to let a
+/// dying process close its handles, so a wall-clock bound would shrink the tolerance
+/// exactly when the condition it tolerates lasts longest, and report a lock that is
+/// not one. Nothing may read the budget as elapsed time — a test did, and became a
+/// flake on a starved runner.
 ///
 /// **This is not `runner::container::racing_removal`, and the two must not be merged.**
 /// That one resolves a *handoff*: two threads racing on one path, where the loser needs
