@@ -359,7 +359,17 @@ pub(super) mod oracles {
                     sources.iter().map(|(path, _)| path).collect::<Vec<_>>()
                 );
                 refuse_unaccounted_files(root, &accounted, &test_owned);
+                refuse_macro_declared_modules(&sources);
                 Self { sources }
+            }
+
+            /// The walked files with the source the walk read, for the one
+            /// witness that drives [`refuse_macro_declared_modules`] against
+            /// the real module. Not a way to obtain the domain: the census
+            /// takes its scan from [`Self::row_mapping_wildcards`], and a
+            /// caller holding this still cannot construct a [`RowMappingScan`].
+            pub(super) fn sources_for_witness(&self) -> Vec<(PathBuf, String)> {
+                self.sources.clone()
             }
 
             /// The domain, sorted.
@@ -491,6 +501,134 @@ pub(super) mod oracles {
             );
         }
 
+        /// Every item-position macro invocation in `source`, as (line, name).
+        ///
+        /// Item position, not expression position: `const _: () = assert!(..)`
+        /// is a macro at brace depth 0 and is **not** an item, so the character
+        /// before the name decides. `;`, `}` and `]` (an attribute) precede an
+        /// item; anything else is an expression context.
+        fn item_position_macros(blanked: &str) -> Vec<(usize, String)> {
+            let bytes = blanked.as_bytes();
+            let mut depth = 0_usize;
+            let mut found = Vec::new();
+            for (at, byte) in bytes.iter().enumerate() {
+                match byte {
+                    b'{' | b'(' | b'[' => depth += 1,
+                    b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+                    b'!' if depth == 0 => {
+                        // A delimiter after the `!` is what makes this an
+                        // invocation rather than `macro_rules! name {` or `!=`.
+                        let mut after = at + 1;
+                        while bytes.get(after).is_some_and(|b| b.is_ascii_whitespace()) {
+                            after += 1;
+                        }
+                        if !matches!(bytes.get(after), Some(b'(' | b'[' | b'{')) {
+                            continue;
+                        }
+                        let mut start = at;
+                        while start > 0
+                            && (bytes[start - 1].is_ascii_alphanumeric()
+                                || bytes[start - 1] == b'_')
+                        {
+                            start -= 1;
+                        }
+                        if start == at {
+                            continue;
+                        }
+                        let mut before = start;
+                        while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+                            before -= 1;
+                        }
+                        let item = before == 0 || matches!(bytes[before - 1], b';' | b'}' | b']');
+                        if item {
+                            let name = blanked[start..at].to_owned();
+                            let line = blanked[..start].matches('\n').count() + 1;
+                            found.push((line, name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found
+        }
+
+        /// Refuse an item-position macro invocation whose `macro_rules!` the
+        /// walk cannot read.
+        ///
+        /// **This is the half [`refuse_unaccounted_files`] cannot reach.** That
+        /// one reconciles the module's own directory, so it catches a hidden
+        /// child that lands *inside* it. A macro expanding to
+        /// `#[path = "effects_hidden.rs"] mod hidden;` puts the file beside the
+        /// module rather than under it, and no directory walk rooted at the
+        /// module finds it. Reported by the sixth frontier pass on `27c8b2b`,
+        /// with a sequence that preserves behaviour while it hides: move
+        /// `EventSite::row` into the hidden file and write `_ => ResourceRow::R21`,
+        /// which every current variant already maps to, so eleven mappings
+        /// remain and the floor still passes.
+        ///
+        /// **Why the definition's location is the right test.** The hole is a
+        /// macro whose *expansion* the walk cannot see. When the `macro_rules!`
+        /// is itself in one of the walked files, the walk does see it, and
+        /// `scan_module_declarations` already refuses any macro body holding a
+        /// module-shaped token sequence (`ScanRefusal::ModuleShapedMacroBody`).
+        /// So an in-domain macro cannot hide a module, and one defined anywhere
+        /// else cannot be ruled out from here. The refusal is exactly the
+        /// second case.
+        ///
+        /// Its cost on this tree is **zero, measured rather than assumed**: the
+        /// module writes one item-position invocation, `const_identity_walk!`
+        /// at `src/topology/effects.rs:619`, and its `macro_rules!` is at
+        /// `:599` in the same file.
+        ///
+        /// **What it does not close.** An in-domain macro that itself invokes an
+        /// out-of-domain macro, and any expansion produced by a procedural
+        /// macro, whose body is not token trees this crate can read at all.
+        /// Neither is reachable on this tree — the module uses no proc macro at
+        /// item position — and both would need the scanner to evaluate
+        /// expansion, which is the widening this file declines for the reason
+        /// `declared_whole_file_test_modules` records.
+        ///
+        /// # Panics
+        ///
+        /// When such an invocation exists. Driven in both directions by
+        /// `the_row_mapping_census_domain_is_the_declared_module` part (8).
+        pub(super) fn refuse_macro_declared_modules(sources: &[(PathBuf, String)]) {
+            let blanked: Vec<(PathBuf, String)> = sources
+                .iter()
+                .map(|(path, source)| (path.clone(), blank_comments_and_strings(source)))
+                .collect();
+            let mut defined: BTreeSet<String> = BTreeSet::new();
+            for (_, source) in &blanked {
+                let mut rest = source.as_str();
+                while let Some(at) = rest.find("macro_rules!") {
+                    rest = &rest[at + "macro_rules!".len()..];
+                    let name: String = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        defined.insert(name);
+                    }
+                }
+            }
+            let mut offenders = Vec::new();
+            for (path, source) in &blanked {
+                for (line, name) in item_position_macros(source) {
+                    if !defined.contains(&name) {
+                        offenders.push(format!("`{}:{line}` invokes `{name}!`", path.display()));
+                    }
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "an item-position macro whose `macro_rules!` is not in this module expands to \
+                 items the declaration scan cannot read, so it can declare a module -- with a \
+                 `#[path]` even one outside the module's own directory, where the directory \
+                 reconciliation cannot find it either: {offenders:?}"
+            );
+        }
+
         /// What [`ProductionModule::row_mapping_wildcards`] read, and what it
         /// found in it.
         ///
@@ -574,7 +712,7 @@ pub(super) mod oracles {
         }
     }
 
-    use domain::{ProductionModule, refuse_unaccounted_files};
+    use domain::{ProductionModule, refuse_macro_declared_modules, refuse_unaccounted_files};
 
     /// The body of the item whose signature line contains `signature`, read out
     /// of `source` with comments and string literals blanked.
@@ -931,6 +1069,52 @@ pub(super) mod oracles {
             tests_refusal.contains("tests.rs"),
             "the refusal did not name the test file: {tests_refusal}"
         );
+
+        // (8) AND A MACRO THE WALK CANNOT READ STOPS IT TOO.
+        //
+        // Part (7) reconciles the module's own DIRECTORY, so it catches a hidden
+        // child that lands inside it. A macro expanding to
+        // `#[path = "effects_hidden.rs"] mod hidden;` puts the file beside the
+        // module instead, where no directory walk rooted at the module finds it
+        // — the sixth pass's finding, with a sequence that preserves behaviour
+        // while it hides: `EventSite::row` moved into the hidden file with
+        // `_ => ResourceRow::R21`, which every current variant already maps to.
+        //
+        // The test is where the `macro_rules!` lives, not whether a macro is
+        // present. A macro defined in a walked file is one the walk reads, and
+        // `scan_module_declarations` already refuses a module-shaped body there;
+        // one defined anywhere else cannot be ruled out from here. Synthetic
+        // sources, because the input is a list of (path, source) pairs and both
+        // directions are reachable by varying it.
+        let hidden = repo_root().join("src/topology/effects.rs");
+        let invocation = "mod bijection;\ndeclare_hidden!();\n".to_owned();
+        let refusal = panic_message(|| {
+            refuse_macro_declared_modules(&[(hidden.clone(), invocation.clone())]);
+        })
+        .expect("an item-position macro the walk cannot read has to stop it");
+        assert!(
+            refusal.contains("declare_hidden") && refusal.contains("cannot read"),
+            "the walk stopped, but for some other reason: {refusal}"
+        );
+        // THE CONTROL THAT MAKES IT THE DEFINITION'S LOCATION AND NOT THE MACRO:
+        // the same invocation passes once the definition is in the walked set,
+        // because then the scan reads the body and refuses a module-shaped one
+        // itself.
+        refuse_macro_declared_modules(&[
+            (hidden.clone(), invocation),
+            (
+                repo_root().join("src/topology/effects/vocab.rs"),
+                "macro_rules! declare_hidden { () => {}; }\n".to_owned(),
+            ),
+        ]);
+        // And an expression-position macro is not an item: this is what keeps
+        // the refusal's cost at zero on a module that writes
+        // `const _: () = assert!(...)`.
+        refuse_macro_declared_modules(&[(hidden, "const _: () = assert!(true);\n".to_owned())]);
+        // The real module refuses nothing — measured, not assumed. Its one
+        // item-position invocation is `const_identity_walk!`, defined in the
+        // same file.
+        refuse_macro_declared_modules(&module.sources_for_witness());
 
         // (6) BELT AND BRACES: THE CENSUS'S OWN BODY NAMES NO READER.
         //
