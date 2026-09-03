@@ -2215,6 +2215,55 @@ fn reclaim_removes_a_registered_but_unpopulated_worktree() {
     assert!(!fixture.manager.intent_path(&slot).exists());
 }
 
+/// A non-canonical intent name beside the canonical one is refused before
+/// anything is removed (`PR118-RECLAIM-REGRESSION-PINNED-AT-PARSER-ONLY`).
+///
+/// `str::parse` reads `03` as 3, so before `Slot::from_intent_name` compared
+/// the parsed slot with its own rendering, `tasks.kalpha-g03.intent` produced
+/// the slot whose intent file is `tasks.kalpha-g3.intent`: reclaim removed the
+/// legitimate worktree and the canonical intent and left the `g03` file for
+/// every later start to enumerate again. The parser's own test pins the
+/// verdict; this one pins the composition through `intents()` and
+/// `reclaim_intents()`: the walk refuses the file it cannot account for, the
+/// refusal names the file, and it comes before any removal.
+#[test]
+fn reclaim_refuses_a_non_canonical_intent_name_before_removing_anything() {
+    let fixture = Fixture::created("non-canonical-intent");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 3);
+    let worktree = fixture.manager.slot_path(&slot);
+    let canonical = fixture.manager.intent_path(&slot);
+    assert!(
+        worktree.is_dir() && canonical.is_file(),
+        "the legitimate slot exists before the stray file is planted"
+    );
+    let bytes = fs::read(&canonical).expect("read the canonical intent");
+    let stray = canonical.with_file_name("tasks.kalpha-g03.intent");
+    fs::write(&stray, &bytes).expect("plant the non-canonical intent");
+
+    let error = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect_err("the walk refuses a file no slot renders");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Git { message }
+                if message.contains("unexpected file `tasks.kalpha-g03.intent`")
+        ),
+        "refused for the wrong reason: {error}"
+    );
+    assert!(worktree.is_dir(), "the legitimate worktree is untouched");
+    assert_eq!(
+        fs::read(&canonical).expect("read the canonical intent back"),
+        bytes,
+        "the canonical intent is untouched"
+    );
+    assert!(
+        stray.is_file(),
+        "the stray file is left for the operator: nothing is deleted on inference"
+    );
+}
+
 #[test]
 fn reclaim_removes_the_registration_whose_commondir_is_empty() {
     let fixture = Fixture::created("empty-commondir");

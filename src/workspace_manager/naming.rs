@@ -227,12 +227,34 @@ impl Slot {
     /// reclaim would remove that file's intent and leave this one for every
     /// later start to enumerate, report as reclaimed, and leave again.
     ///
-    /// `None` is this parser's whole verdict, and the `?`s that produce it are
-    /// deliberate. The parser does not know it is reading the intents
-    /// directory, so it cannot say what a stray file there means; the caller
-    /// that walks that directory does, and refuses with the file's name. The
-    /// integer parse errors are discarded for the same reason: which way a
-    /// generation failed to parse adds nothing to "not an intent name".
+    /// `None` is this parser's whole verdict. Five `?` reach it, one per
+    /// clause of the grammar, and the round-trip comparison is a sixth exit.
+    /// Each is dispositioned here in terms of what the verdict means to the
+    /// one caller, the intents directory walk:
+    ///
+    /// - `strip_suffix(".intent")?`: no `.intent` suffix. **Not an intent
+    ///   name** at all: a staging `.tmp`, an editor's backup, a stray file.
+    /// - `rsplit_once("-g")?`: a task name with no generation separator.
+    ///   **Malformed.**
+    /// - the two `parse().ok()?`: a generation that is not a `u32`, or a
+    ///   sequence that is not a `u64`. **Malformed.** The `ParseIntError` is
+    ///   discarded because which way the digits failed adds nothing the
+    ///   file's name, which the caller reports, does not already say.
+    /// - `strip_prefix("snapshots.")?`, reached once `tasks.k` and `merge.s`
+    ///   have not matched: the suffix is there and the namespace is not one
+    ///   this version writes. **Malformed**, or another version's.
+    /// - `then_some`: the name parses but does not re-render to itself.
+    ///   **Malformed by canon** rather than by shape; the `g03` case above.
+    ///
+    /// "Not an intent name" and "malformed intent name" are told apart here
+    /// for the reader and folded into one `None` for the caller, deliberately:
+    /// the walk has one action for both. It refuses the reclaim and names the
+    /// file, because it may delete only what it can prove it owns and may
+    /// skip nothing that might be an intent another version wrote. The name
+    /// in the refusal carries the distinction to the operator; a second
+    /// variant would carry it to a caller with no second action to take. The
+    /// parser itself does not know it is reading the intents directory, which
+    /// is why the refusal, and its context, are the caller's.
     ///
     /// Grammar here, containment in [`Self::validate`]: a well-formed name
     /// whose component is not a [`safe_component`] — an empty key, a snapshot
@@ -335,8 +357,8 @@ mod tests {
             slot.validate().expect("every fixture slot is a valid one");
             let name = slot.intent_name();
             assert_eq!(
-                Slot::from_intent_name(&name),
-                Some(slot.clone()),
+                Slot::from_intent_name(&name).as_ref(),
+                Some(&slot),
                 "`{name}` did not come back as the slot that rendered it"
             );
             assert_eq!(
@@ -459,19 +481,39 @@ mod tests {
         );
         let back: IntentRecord = serde_json::from_str(&json).expect("the record reads back");
         assert_eq!(back, record);
-        assert!(
-            serde_json::from_str::<IntentRecord>(
-                r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run","incarnation":"01","path":"/x"}"#
-            )
-            .is_err(),
-            "an unknown field is refused: a record must not smuggle a path into reclaim"
+
+        // The field list is derived from the serialized record, not written
+        // out again here, so a field added to the type is dropped below like
+        // the others. Each field is dropped on its own: `#[serde(default)]`
+        // on any one of them would turn that absence into a silently accepted
+        // record, and only a per-field drop sees which one.
+        let object = || -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(&json).expect("the record is a JSON object")
+        };
+        // `serde_json::Map` sorts its keys; the order is pinned by the exact
+        // string above, the set by this.
+        let fields: Vec<String> = object().keys().cloned().collect();
+        assert_eq!(
+            fields,
+            ["incarnation", "kind", "run_id", "slot"],
+            "the field list this test varies is the type's"
+        );
+        for field in &fields {
+            let mut without = object();
+            without.remove(field);
+            assert!(
+                serde_json::from_value::<IntentRecord>(serde_json::Value::Object(without)).is_err(),
+                "a record without `{field}` was accepted: no field has a default"
+            );
+        }
+        let mut extra = object();
+        extra.insert(
+            "path".to_owned(),
+            serde_json::Value::String("/x".to_owned()),
         );
         assert!(
-            serde_json::from_str::<IntentRecord>(
-                r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run"}"#
-            )
-            .is_err(),
-            "no field has a default"
+            serde_json::from_value::<IntentRecord>(serde_json::Value::Object(extra)).is_err(),
+            "an unknown field is refused: a record must not smuggle a path into reclaim"
         );
     }
 
@@ -489,8 +531,11 @@ mod tests {
         fn component(&self) -> String {
             self.relative()
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .expect("every slot path ends in a component")
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .expect(
+                    "every slot path ends in a UTF-8 component: the fixtures are built from &str",
+                )
         }
     }
 }
