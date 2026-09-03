@@ -2357,9 +2357,21 @@ mod tests {
         const FOLD_ROOT: &str = "src/topology/fold.rs";
         const FOLD_SUBTREE: &str = "src/topology/fold/";
         let walked = production_sources();
+        // **The floor counts DIRECT children; only the charge count below
+        // widens to the whole subtree.** Widening the scan must not widen the
+        // control. Counting descendants here would let ten files under one
+        // grandchild directory satisfy a floor whose sentence says "children",
+        // and would hold this control green on a tree where every direct child
+        // had gone — which the one-level walk this replaces would have caught.
+        // It would also make the message below true only while no grandchild
+        // exists, which is the same contingent shape as the truncation being
+        // repaired.
         let children = walked
             .iter()
-            .filter(|(path, _)| path.starts_with(FOLD_SUBTREE))
+            .filter(|(path, _)| {
+                path.strip_prefix(FOLD_SUBTREE)
+                    .is_some_and(|rest| !rest.contains('/'))
+            })
             .count();
         // The control: a walk that found nothing would count zero charges in a
         // tree that has two, and the assertion below would then be about an
