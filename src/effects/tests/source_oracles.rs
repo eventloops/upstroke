@@ -395,9 +395,30 @@ pub(super) mod oracles {
         /// body) was never the claim's domain (the files the census reads).
         ///
         /// Recording the paths moves the question to run time. A caller compares
-        /// this collection with [`ProductionModule::files`]; a scan that read
-        /// eight files while the walk produced nine fails on the set difference,
-        /// whatever any function body says.
+        /// [`Self::paths`] with [`ProductionModule::files`], and a scan that read
+        /// eight files while the walk produced nine fails on the set difference.
+        ///
+        /// **The fields are private to this module and there is no constructor,
+        /// so that comparison cannot be handed forged operands.** The first
+        /// version of this type exposed both fields `pub(super)`, and a reviewer
+        /// showed the equality still bypassable: a sibling helper scans the
+        /// stale eight, then builds a `RowMappingScan` whose `scanned` is copied
+        /// from `ProductionModule::files()` with a zero count for the ninth path
+        /// it never read. The equality then compares the walk against **the
+        /// helper's own report of what it read**, which is not evidence about
+        /// what it read, and the wildcard in the unscanned child is missed with
+        /// both tests green. That was measured, not argued: the bypass passed at
+        /// `6dc5987`.
+        ///
+        /// It is the same defect as the lexical witness this type replaced, one
+        /// level down — an assertion whose stated domain (the files scanned) is
+        /// wider than the domain it counts (the files *reported*) — so the
+        /// repair is the one `CODING_STANDARDS.md` prescribes under
+        /// "Representing state": keep fields private when construction must
+        /// preserve an invariant, and do not expose a representation and ask
+        /// callers to behave. [`ProductionModule::row_mapping_wildcards`] is now
+        /// the only expression in the crate that can produce this value, and it
+        /// is a method on a type only [`ProductionModule::walk`] constructs.
         pub(super) struct RowMappingScan {
             /// Every file the scan read, in the order the walk sorted them, with
             /// the number of `row()` mappings found in its production region.
@@ -407,10 +428,40 @@ pub(super) mod oracles {
             /// none, so the distinction is measured rather than stipulated —
             /// `the_row_mapping_census_domain_is_the_declared_module` part (5)
             /// is where.
-            pub(super) scanned: Vec<(PathBuf, usize)>,
+            scanned: Vec<(PathBuf, usize)>,
             /// Every mapping that falls back through a wildcard arm, named by
             /// the file it was found in.
-            pub(super) offenders: Vec<String>,
+            offenders: Vec<String>,
+        }
+
+        impl RowMappingScan {
+            /// The files the scan read, in walk order.
+            pub(super) fn paths(&self) -> Vec<PathBuf> {
+                self.scanned.iter().map(|(path, _)| path.clone()).collect()
+            }
+
+            /// How many `row()` mappings were found across all of them.
+            pub(super) fn mappings(&self) -> usize {
+                self.scanned.iter().map(|(_, found)| found).sum()
+            }
+
+            /// The files that were read and held no mapping.
+            ///
+            /// The control that keeps [`Self::paths`] from being a tautology:
+            /// non-empty on the real module, so the recorded collection is
+            /// demonstrably the domain and not the hits.
+            pub(super) fn read_without_a_mapping(&self) -> Vec<&PathBuf> {
+                self.scanned
+                    .iter()
+                    .filter(|(_, found)| *found == 0)
+                    .map(|(path, _)| path)
+                    .collect()
+            }
+
+            /// Every mapping that falls back through a wildcard arm.
+            pub(super) fn offenders(&self) -> &[String] {
+                &self.offenders
+            }
         }
     }
 
@@ -517,7 +568,7 @@ pub(super) mod oracles {
         // produced. Not "the body of this function names no reader" — that is a
         // claim about this text, and a helper beside it reading a stale list of
         // paths satisfies it while scanning the wrong set.
-        let scanned: Vec<PathBuf> = scan.scanned.iter().map(|(path, _)| path.clone()).collect();
+        let scanned: Vec<PathBuf> = scan.paths();
         let unwalked: Vec<&PathBuf> = scanned
             .iter()
             .filter(|path| !walked.contains(path))
@@ -539,13 +590,13 @@ pub(super) mod oracles {
              looking at the wrong module: {walked:?}",
             walked.len()
         );
-        let mappings: usize = scan.scanned.iter().map(|(_, found)| found).sum();
+        let mappings: usize = scan.mappings();
         assert!(
             mappings >= 8,
             "only {mappings} `row()` mappings scanned, so this census is looking at the wrong \
              files"
         );
-        assert!(scan.offenders.is_empty(), "{:#?}", scan.offenders);
+        assert!(scan.offenders().is_empty(), "{:#?}", scan.offenders());
     }
 
     /// The `row()` census's domain is the **declared** production module, and
@@ -687,18 +738,13 @@ pub(super) mod oracles {
         // stale-helper shape exactly: a helper reports the set it looked at, and
         // the set it looked at is the wrong one.
         let scan = module.row_mapping_wildcards();
-        let recorded: Vec<PathBuf> = scan.scanned.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
-            recorded, walked,
+            scan.paths(),
+            walked,
             "the scan's record is not the walk's output, so the equality the census asserts is \
              between something else and something else"
         );
-        let barren: Vec<&PathBuf> = scan
-            .scanned
-            .iter()
-            .filter(|(_, found)| *found == 0)
-            .map(|(path, _)| path)
-            .collect();
+        let barren = scan.read_without_a_mapping();
         assert!(
             barren.len() >= 5,
             "only {} file(s) of the domain hold no `row()` mapping, so this part no longer \
@@ -706,7 +752,7 @@ pub(super) mod oracles {
             barren.len()
         );
         assert!(
-            scan.scanned.iter().any(|(_, found)| *found > 0),
+            scan.mappings() > 0,
             "no file of the domain holds a `row()` mapping at all, so the scan found nothing \
              and the count above is vacuous"
         );
