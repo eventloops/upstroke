@@ -422,9 +422,9 @@ enum Framed {
 /// per-stream output allowance, reused rather than a second cap
 /// introduced beside it. It matters because `read_line` against a
 /// producer that never frames anything grows a `String` without limit:
-/// the same shape `rundir::first_line` already refuses, and a fixture
-/// that ran the machine out of memory while waiting would be a worse
-/// failure than the one the wait is bounding.
+/// the same shape `rundir::classify::first_line` already refuses, and a
+/// fixture that ran the machine out of memory while waiting would be a
+/// worse failure than the one the wait is bounding.
 fn read_frames(stdout: ChildStdout, framed: &Sender<Framed>) {
     let mut reader = BufReader::new(stdout);
     let mut drained = 0_usize;
