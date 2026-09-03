@@ -61,9 +61,15 @@ MODULE TREE and not by the file, so this file would otherwise have inherited \
 `src/workspace_manager.rs`'s inner allow of all three lints silently: that is \
 `PR6-LANEF-004`, and this is the first out-of-line child this funnel has had. \
 `runner::container::tests::every_child_module_of_the_container_funnel_states_\
-its_own_lint_level` is the census that refuses such a child, and its `FUNNELS` \
-domain does NOT reach this parent -- so nothing was red and the level is \
-written here because the hole is the same one, not because a gate caught it. \
+its_own_lint_level` is the census that refuses such a child. Its `FUNNELS` \
+domain did NOT reach this parent when this row was written, so nothing was red \
+and the level was written here because the hole was the same one, not because a \
+gate caught it. THAT IS NO LONGER TRUE, and the sentence is corrected rather \
+than left standing: the `m4-workspace` split added \
+`src/workspace_manager.rs` to that census's `FUNNELS` domain in the same \
+commit, so this file is now graded against all three governed lints and named \
+in the domain individually. The level below is unchanged; what changed is that \
+a gate now checks it. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
 all three lints; this row allows TWO of that three, so it is a strict subset \

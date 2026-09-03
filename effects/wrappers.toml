@@ -53,7 +53,6 @@ funnel = [
     "remove_intent_site",
     "remove_site",
     "repair_materialize",
-    "residue_classified_sites",
     "snapshot_commit_tree",
     "verify_worktree",
     "write_intent_site",
@@ -62,62 +61,37 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "add_snapshot",
-    "as_str",
     "assert_publishable",
-    "at",
     "base",
     "candidate_diff",
     "changed_paths",
-    "classify_object_residue",
     "commit_parent",
     "commit_tree_sha",
     "common_git_dir",
-    "decode_changed_paths",
     "derive",
     "direct_ref_target",
-    "durability_ledger",
-    "element_breaks_quiescence",
     "execution_root",
     "execution_root_of",
-    "fmt",
     "from",
-    "from_base",
-    "gates",
-    "harness",
-    "integration",
-    "intent_name",
     "intent_path",
     "intents",
-    "is_null_object_id",
-    "is_object_id",
-    "kind",
-    "ledger",
-    "new",
     "object_directory",
     "object_exists",
-    "observed_residue_elements",
-    "phase",
     "private_root",
-    "published",
     "quiescence",
     "reclaim_intents",
-    "recording_durability",
     "refs_under",
     "refuse_unexpected_refs",
-    "relative",
     "remove_intent",
     "remove_snapshot",
     "remove_worktree",
     "repo_key",
     "repo_key_v1",
-    "repository",
     "revalidate",
-    "review",
     "row",
     "slot_path",
     "temporary_object_files",
     "unreachable_objects",
-    "worktree",
     "worktree_records",
     "write_intent",
 ]
@@ -190,6 +164,167 @@ effect_free = [
 path = "src/rundir/names.rs"
 crate_path = "upstroke::rundir::names"
 funnel = []
+# The eight production children the `m4-workspace` split gave
+# `src/workspace_manager.rs`, added in the same commit as the split. Twenty-six
+# names left the parent's file, and a name that leaves the domain is a name
+# nobody has to classify any more -- so the children join `CLASSIFIED_MODULES`
+# by name, which is the only form that list has: `reachable_fns_are_classified`
+# joins every entry onto the manifest root and reads it as a source file, so
+# there is no directory prefix to widen `src/workspace_manager.rs` into. `C-002`
+# is the standing finding that the roll-call is hand-maintained rather than
+# derived, and it is not this split's to repair.
+#
+# THE REPOINT IS A NET WIDENING OF NINETEEN, and it is written down rather than
+# implied: 26 names leave the parent's block and 45 arrive in the children's.
+# The difference is two effects, both of them widenings:
+#
+#   * SEVENTEEN names were PRIVATE `fn`s of `src/workspace_manager.rs`, below
+#     the classification threshold entirely. The extraction made them
+#     `pub(super)` in a child so the parent (and, for `is_reparse_point`, the
+#     suite) can still call them by name, and a `pub(super) fn` is externally
+#     reachable, so they must be classified now. `pub(super)` here is
+#     `workspace_manager` and its descendants and nothing wider. They are
+#     `canonical_prefix`, `is_at_or_inside`, `is_reparse_point`,
+#     `refuse_reparse_points`, `refuse_unreal_directory` and `strip_verbatim`
+#     (containment); `apply`, `funnel` and `point` (hooks); `from_intent_name`,
+#     `safe_component` and `validate` (naming); `refuse_expected_old` and
+#     `refuse_malformed_object_id` (object); `parse_worktree_records` and
+#     `registration_checkout` (parsers); and `administrative_residue_at`
+#     (residue).
+#   * `fmt` and `new` each named TWO items inside the parent's file -- the
+#     `Display` impls of `SnapshotName` and `VerifyFailure`, and the
+#     constructors of `HarnessEffects` and `ResidueTarget` -- and this record
+#     classifies by bare name, so one entry covered both. The split separates
+#     each pair into different files, so each half is now classified on its own.
+#     That is why they are not among the seventeen: the pair was already
+#     classified, once.
+#
+# Both are widenings. No name that was classified before is unclassified now.
+#
+# Every one of the eight is `effect_free` apart from the one `funnel` row the
+# parent already carried, and that is what the split was arranged to make true:
+# no funnel and no effect site moved. Each child DENIES all three governed lints
+# at file scope and takes no `effects/allowlist.toml` row -- an allowance is what
+# that file records, and these modules take none. Every `Command`, every `fs`
+# write, every durability barrier and every platform removal retry stayed in the
+# parent, which keeps the allowlist identity.
+
+# The four containment predicates plus the two platform helpers they are built on. Every one observes -- `fs::symlink_metadata` and `fs::canonicalize` -- and none of the six is a governed primitive; nothing here creates, renames or removes a path.
+[[module]]
+path = "src/workspace_manager/containment.rs"
+crate_path = "upstroke::workspace_manager::containment"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "canonical_prefix",
+    "is_at_or_inside",
+    "is_reparse_point",
+    "refuse_reparse_points",
+    "refuse_unreal_directory",
+    "strip_verbatim",
+]
+
+# The observer seam and the funnel protocol. `funnel`, `point` and `apply` perform no effect of their own: `funnel` takes the primitive as a closure and the parent supplies it, so the effect and its allowlist row stay in `src/workspace_manager.rs`. `apply` can end the process on `Injection::Kill`, and `std::process::abort` is not a governed primitive.
+[[module]]
+path = "src/workspace_manager/hooks.rs"
+crate_path = "upstroke::workspace_manager::hooks"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "apply",
+    "durability_ledger",
+    "funnel",
+    "harness",
+    "ledger",
+    "new",
+    "phase",
+    "point",
+    "recording_durability",
+]
+
+# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
+[[module]]
+path = "src/workspace_manager/naming.rs"
+crate_path = "upstroke::workspace_manager::naming"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "as_str",
+    "fmt",
+    "from_intent_name",
+    "gates",
+    "integration",
+    "intent_name",
+    "kind",
+    "relative",
+    "review",
+    "safe_component",
+    "validate",
+]
+
+# Object-id well-formedness and the two refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
+[[module]]
+path = "src/workspace_manager/object.rs"
+crate_path = "upstroke::workspace_manager::object"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "is_null_object_id",
+    "is_object_id",
+    "refuse_expected_old",
+    "refuse_malformed_object_id",
+]
+
+# Decoders for the bytes Git's plumbing hands back. Functions over `&[u8]`; the commands whose output they read are run by the parent, inside its funnels.
+[[module]]
+path = "src/workspace_manager/parsers.rs"
+crate_path = "upstroke::workspace_manager::parsers"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "decode_changed_paths",
+    "parse_worktree_records",
+    "registration_checkout",
+]
+
+# The read-only residue classifier. `residue_classified_sites` keeps the `funnel` class the parent's row gave it -- it derives its answer from the frozen site enums and is reached as part of that surface -- and every other name here observes: no object is written, no ref moved, no index touched. The Git inspections it reads through are the parent's helpers, and so is every process start.
+[[module]]
+path = "src/workspace_manager/residue.rs"
+crate_path = "upstroke::workspace_manager::residue"
+funnel = [
+    "residue_classified_sites",
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "administrative_residue_at",
+    "at",
+    "classify_object_residue",
+    "element_breaks_quiescence",
+    "from_base",
+    "new",
+    "observed_residue_elements",
+    "published",
+    "repository",
+    "worktree",
+]
+
+# Two data types and no functions at all: `SnapshotInput` and `Snapshot` carry public fields and declare no externally reachable `fn`. The row is present and empty because the domain is derived from the module, so an empty module must be recorded as empty rather than omitted.
+[[module]]
+path = "src/workspace_manager/snapshot_ref.rs"
+crate_path = "upstroke::workspace_manager::snapshot_ref"
+funnel = [
+]
 effectful = []
 effectful_unnameable = []
 effect_free = [
@@ -216,6 +351,12 @@ effect_free = [
 path = "src/rundir/retention.rs"
 crate_path = "upstroke::rundir::retention"
 funnel = []
+# The worktree record, the quiescence a reuse demands and the reasons the answer can be no. One `fn`: `VerifyFailure`'s `Display`. The verification that produces these values runs a Git child and is the parent's.
+[[module]]
+path = "src/workspace_manager/worktree.rs"
+crate_path = "upstroke::workspace_manager::worktree"
+funnel = [
+]
 effectful = []
 effectful_unnameable = []
 effect_free = [
