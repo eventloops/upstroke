@@ -88,11 +88,12 @@ Read the `standards/` sections a change touches. In particular:
 
 `MAINTAINING.md` is authoritative. In outline: draft PR early; the eight gates and both required
 contexts (`upstroke-ci`, `upstroke-pr-policy`) green; one frontier review of the exact green head
-(`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage — serious P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in
-touched code and any finding carrying a failing test, reproduction or mutation witness are fixed
-whatever their label; everything else is fixed or logged as a tech-debt ledger row; merge commit
-once green. The PR body must carry the six
-sections and the exact canonical ledger header; run `validate-pr-body.sh` against it locally.
+(`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage: serious
+P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in touched code and any
+finding carrying a failing test, reproduction or mutation witness are fixed whatever their label;
+everything else is fixed or logged as a tech-debt ledger row; merge commit once green. The PR body
+must carry the six sections and the exact canonical ledger header; run `validate-pr-body.sh`
+against it locally.
 
 Merging is the owner's act unless the owner has delegated it in writing for that PR; say so in the
 body when it has been.
