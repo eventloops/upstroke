@@ -420,12 +420,21 @@ effect_free = [
 # child DENIES all three governed lints at file scope and takes no
 # `effects/allowlist.toml` row.
 #
-# `crate_path` is recorded for each even though the modules are private: the
-# field is read only to build `{crate_path}::{name}` for a `funnel` or
-# `effectful` row, and all three classify neither.
+# `crate_path` is EMPTY for all three, because each is a private `mod`. The
+# schema says so at `src/effects/tests.rs:327` -- "the path a denied entry would
+# name this module by, or empty when the module is not reachable from outside
+# its parent (a private `mod`, or the binary crate root)" -- and
+# `src/engine/{coordinator,resume,attempt,preflight}.rs` are the tree's
+# convention. An earlier revision of this note recorded
+# `upstroke::runner::host::probe` and argued the value was harmless because the
+# field is read only for a `funnel` or `effectful` row. That argument was true
+# and beside the point: `E0603` makes the path unnameable, so it was false
+# metadata that validation happens not to look at, and if one of these `fn`s is
+# ever reclassified effectful the stored path could not name it for the
+# denylist. Review finding 2 on PR #111.
 [[module]]
 path = "src/runner/host/environment.rs"
-crate_path = "upstroke::runner::host::environment"
+crate_path = ""
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -452,7 +461,7 @@ effect_free = [
 # under `src/runner/host.rs`.
 [[module]]
 path = "src/runner/host/naming.rs"
-crate_path = "upstroke::runner::host::naming"
+crate_path = ""
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -466,7 +475,7 @@ effect_free = [
 
 [[module]]
 path = "src/runner/host/probe.rs"
-crate_path = "upstroke::runner::host::probe"
+crate_path = ""
 funnel = []
 effectful = []
 effectful_unnameable = []

@@ -562,34 +562,125 @@ pub fn program_searches() -> u64 {
     SEARCHES.with(std::cell::Cell::get)
 }
 
-/// Proof that this process has performed its write-command containment
-/// startup (INV-18, host portion).
+/// The containment proof and its sole mint, in a module with no descendants.
 ///
-/// The type exists so that "the ambient job is established before anything
-/// this run could spawn" is a thing the compiler checks rather than a thing
-/// each new entry point is trusted to remember. Its field is private to this
-/// module, so the only values of it in the crate are the ones
-/// [`contain_write_command`] returns after [`proc::join_ambient_job`] has
-/// succeeded — a caller cannot forge one, and
-/// [`crate::engine`]'s write coordinator will not start without one.
-///
-/// `src/main.rs` has the same shape for the CLI's own dispatch (its
-/// `containment::Contained` proves *classification*: a write command joined,
-/// a read-only one was not asked to). This is the library half of that idea,
-/// for the callers that never go through `main.rs` at all — the frozen public
-/// `engine::run/run_with/run_harness` and `resume/resume_with/resume_harness`
-/// facades, which a downstream crate may call directly.
-#[derive(Debug)]
-pub struct Contained(());
+/// `Contained`'s field is private to **this** module rather than to
+/// `runner::host`, which is the whole point: Rust privacy reaches a module
+/// and everything below it, so a field private to `runner::host` is
+/// constructible from `runner::host::naming`, `::environment` and `::probe`.
+/// `proof` has no children, so its siblings cannot reach the field and the
+/// only route to a value is [`contain_write_command`], which performs the
+/// join. The mint stays with the type, as `M5.md` requires.
+mod proof {
+    use super::ESTABLISHMENTS;
+    use crate::agent::proc::{self, SpawnHooks};
+    use crate::error::UpstrokeError;
 
-impl Contained {
-    /// The only constructor, and it is private: a token exists exactly when
-    /// the containment step ran and returned `Ok`.
-    fn new() -> Self {
-        ESTABLISHMENTS.with(|count| count.set(count.get() + 1));
-        Self(())
+    /// Proof that this process has performed its write-command containment
+    /// startup (INV-18, host portion).
+    ///
+    /// The type exists so that "the ambient job is established before anything
+    /// this run could spawn" is a thing the compiler checks rather than a thing
+    /// each new entry point is trusted to remember. **The field is private to
+    /// this module, and this module has no descendants** — so no sibling of
+    /// `runner::host`'s children, and not `runner::host` itself, can name it.
+    /// The only values of it in the crate are the ones
+    /// [`contain_write_command`] returns after [`proc::join_ambient_job`] has
+    /// succeeded, and that is enforced by the compiler rather than by a census.
+    ///
+    /// **The module boundary is the mechanism, and it is load-bearing.** Rust
+    /// privacy is scoped to a module *and everything below it*, so a private
+    /// field in `runner::host` is reachable from every child of
+    /// `runner::host` — which the per-concern split made four modules rather
+    /// than one. **Three spellings construct one**, and only the third contains
+    /// the `Contained(` needle a lexical census looks for:
+    /// `Contained { 0: () }`, `let c = Contained; c(())`, and the plain
+    /// `Contained(())` — none of them calling `Contained::new`, so none of them
+    /// incrementing [`super::containment_establishments`]. Confining the type to
+    /// a module with nothing beneath it is what makes "a caller cannot forge
+    /// one" true again. **A runtime test cannot observe that**, because the
+    /// property is that the offending code does not compile: those three forms
+    /// and `proof::Contained::new()` — four in all — were each planted in
+    /// `runner::host::naming` and each rejected, as `E0451`, `E0423`, `E0423`
+    /// and `E0624`. The fourth is the control that decides the shape: it is what
+    /// a `pub(super) fn new` would have let through, minting a token with no
+    /// join performed while the counter agreed with it. The evidence is the
+    /// repair round's, not a `#[test]`'s.
+    ///
+    /// `src/main.rs` has the same shape for the CLI's own dispatch (its
+    /// `containment::Contained` proves *classification*: a write command joined,
+    /// a read-only one was not asked to). This is the library half of that idea,
+    /// for the callers that never go through `main.rs` at all — the frozen public
+    /// `engine::run/run_with/run_harness` and `resume/resume_with/resume_harness`
+    /// facades, which a downstream crate may call directly.
+    #[derive(Debug)]
+    pub struct Contained(());
+
+    impl Contained {
+        /// The only constructor, and it is private: a token exists exactly when
+        /// the containment step ran and returned `Ok`.
+        fn new() -> Self {
+            ESTABLISHMENTS.with(|count| count.set(count.get() + 1));
+            Self(())
+        }
+    }
+
+    /// The write-command containment startup step (INV-18, host portion), and the
+    /// proof that it ran.
+    ///
+    /// What `src/main.rs` calls at the top of every write command, before any
+    /// dispatch arm runs, and what the engine's write coordinator calls before it
+    /// touches anything. `crash_reconstruction`: "at process start every write
+    /// command creates one non-inheritable ambient Job Object with
+    /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns the coordinator process
+    /// itself to it … if the ambient job cannot be created or joined the write
+    /// command refuses at startup with a diagnostic before any workspace effect".
+    ///
+    /// A free function because the ambient job is a property of the *process*, not
+    /// of a runner value: it is established once at startup and held to process
+    /// exit, and it must be established before anything that could spawn exists.
+    /// Idempotent for the same reason — `windows_job::join_ambient` memoises the
+    /// process's one answer — so a coordinator entered through the CLI, which has
+    /// already joined, re-establishes at no cost and gets its proof.
+    /// [`crate::runner::host::HostRunner::start_write_command`] is the same step
+    /// with a runner's own
+    /// observer attached, for the ST-07 evidence, and it calls **this** function —
+    /// so there is one join site and one mint in the crate, not two.
+    ///
+    /// ## Why the observer is a parameter
+    ///
+    /// It is threaded one level further out than the funnel's, and for the reason
+    /// that put a `join` closure inside `proc::join_ambient_job_with` and a
+    /// `contain` parameter on `engine::run_contained`: **no machine here can make
+    /// the real join fail on demand** — `windows_job::join_ambient` memoises the
+    /// process's one answer, so a binary that has ever joined can never observe a
+    /// failure — and a step that took no observer therefore had no failure path
+    /// any test could drive.
+    ///
+    /// That matters here more than anywhere else it is threaded. This is the
+    /// function the frozen public facades (`engine::run_harness`,
+    /// `engine::resume_harness`) and `src/main.rs`'s dispatch all reach, and it is
+    /// the **only** place in the crate that mints a [`Contained`]; the `map` below
+    /// losing its short-circuit is the whole of INV-18's host portion silently
+    /// ceasing to hold, on the platform where the failure is real. Production
+    /// passes [`crate::agent::proc::NoHooks`] at every call site, exactly as it
+    /// does to the process
+    /// funnel; the suite arms an observer that refuses at
+    /// `Spawn.AmbientJobJoined` and watches the refusal come back out with no
+    /// proof minted (see
+    /// `tests::the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing`).
+    ///
+    /// # Errors
+    ///
+    /// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
+    /// created or joined. On Unix this cannot fail: containment there is the
+    /// per-invocation reaper and the isolated process group.
+    pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
+        proc::join_ambient_job(hooks).map(|()| Contained::new())
     }
 }
+
+pub use self::proof::{Contained, contain_write_command};
 
 thread_local! {
     /// See [`containment_establishments`].
@@ -616,58 +707,6 @@ thread_local! {
 #[must_use]
 pub fn containment_establishments() -> u64 {
     ESTABLISHMENTS.with(std::cell::Cell::get)
-}
-
-/// The write-command containment startup step (INV-18, host portion), and the
-/// proof that it ran.
-///
-/// What `src/main.rs` calls at the top of every write command, before any
-/// dispatch arm runs, and what the engine's write coordinator calls before it
-/// touches anything. `crash_reconstruction`: "at process start every write
-/// command creates one non-inheritable ambient Job Object with
-/// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns the coordinator process
-/// itself to it … if the ambient job cannot be created or joined the write
-/// command refuses at startup with a diagnostic before any workspace effect".
-///
-/// A free function because the ambient job is a property of the *process*, not
-/// of a runner value: it is established once at startup and held to process
-/// exit, and it must be established before anything that could spawn exists.
-/// Idempotent for the same reason — `windows_job::join_ambient` memoises the
-/// process's one answer — so a coordinator entered through the CLI, which has
-/// already joined, re-establishes at no cost and gets its proof.
-/// [`HostRunner::start_write_command`] is the same step with a runner's own
-/// observer attached, for the ST-07 evidence, and it calls **this** function —
-/// so there is one join site and one mint in the crate, not two.
-///
-/// ## Why the observer is a parameter
-///
-/// It is threaded one level further out than the funnel's, and for the reason
-/// that put a `join` closure inside `proc::join_ambient_job_with` and a
-/// `contain` parameter on `engine::run_contained`: **no machine here can make
-/// the real join fail on demand** — `windows_job::join_ambient` memoises the
-/// process's one answer, so a binary that has ever joined can never observe a
-/// failure — and a step that took no observer therefore had no failure path
-/// any test could drive.
-///
-/// That matters here more than anywhere else it is threaded. This is the
-/// function the frozen public facades (`engine::run_harness`,
-/// `engine::resume_harness`) and `src/main.rs`'s dispatch all reach, and it is
-/// the **only** place in the crate that mints a [`Contained`]; the `map` below
-/// losing its short-circuit is the whole of INV-18's host portion silently
-/// ceasing to hold, on the platform where the failure is real. Production
-/// passes [`NoHooks`] at every call site, exactly as it does to the process
-/// funnel; the suite arms an observer that refuses at
-/// `Spawn.AmbientJobJoined` and watches the refusal come back out with no
-/// proof minted (see
-/// `tests::the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing`).
-///
-/// # Errors
-///
-/// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
-/// created or joined. On Unix this cannot fail: containment there is the
-/// per-invocation reaper and the isolated process group.
-pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
-    proc::join_ambient_job(hooks).map(|()| Contained::new())
 }
 
 /// [`contain_write_command`] for a caller with nothing to prove it to.
