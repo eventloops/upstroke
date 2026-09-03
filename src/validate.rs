@@ -362,17 +362,13 @@ impl Report {
 mod tests {
     use super::*;
     use std::env;
+    use std::io::{self, ErrorKind, Write};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The hermetic config root every [`opts`] uses. Created if absent and
-    /// **never deleted**: [`run`] inspects it only for the three gate markers
-    /// and `upstroke.toml`, and nothing else in this module lists it, so a plan
-    /// written here by name is seen by the one test that wrote it and by nothing
-    /// else. The four corpus tests that need a plan on disk write it here rather
-    /// than into a root of their own, because the alternative in this file,
-    /// [`scratch_root`], removes a directory it did not create before it makes
-    /// one — the harm review pass 7 reproduced — and this root already exists
-    /// in every run of theirs.
+    /// The hermetic config root every [`opts`] uses: created if absent, never
+    /// deleted, and inspected by [`run`] only for the three gate markers and
+    /// `upstroke.toml`.
     fn hermetic_root() -> PathBuf {
         let root =
             env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
@@ -435,6 +431,52 @@ mod tests {
         let plan = root.join(name);
         fs::write(&plan, text).expect("plan");
         plan
+    }
+
+    /// A directory of one test's own for the plan it writes. Unique to the
+    /// process and the call, created with `create_dir` so an existing path is a
+    /// loud error rather than an adoption, never pre-deleted, and removed when
+    /// the test ends — on an unwind too — with a failed removal reported: a
+    /// panic on the ordinary exit, a line on stderr while a panic is already
+    /// travelling, because a second panic out of a destructor aborts the
+    /// process and destroys the test's own report. A directory already gone is
+    /// not a failure. `eprintln!` is a denied macro here and panics on a write
+    /// error; the write's own failure has no channel left to complain on.
+    struct PlanDir {
+        path: PathBuf,
+    }
+
+    impl PlanDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = env::temp_dir().join(format!(
+                "upstroke-validate-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("a plan directory of this test's own");
+            Self { path }
+        }
+    }
+
+    impl Drop for PlanDir {
+        fn drop(&mut self) {
+            let Err(error) = fs::remove_dir_all(&self.path) else {
+                return;
+            };
+            if error.kind() == ErrorKind::NotFound {
+                return;
+            }
+            let message = format!(
+                "plan directory {} was not reclaimed: {error}",
+                self.path.display()
+            );
+            if std::thread::panicking() {
+                let _unreportable = writeln!(io::stderr(), "{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 
     #[test]
@@ -733,8 +775,9 @@ mod tests {
 
     #[test]
     fn sample_plan_renders_expected_table() {
+        let dir = PlanDir::new("sample");
         let plan = write_plan(
-            &hermetic_root(),
+            &dir.path,
             "sample-plan.md",
             crate::plan::corpus::SAMPLE_PLAN,
         );
@@ -759,11 +802,8 @@ mod tests {
 
     #[test]
     fn bare_plan_validates_via_heuristics() {
-        let plan = write_plan(
-            &hermetic_root(),
-            "bare-plan.md",
-            crate::plan::corpus::BARE_PLAN,
-        );
+        let dir = PlanDir::new("bare");
+        let plan = write_plan(&dir.path, "bare-plan.md", crate::plan::corpus::BARE_PLAN);
         let report = run(&opts(&plan)).expect("bare plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 5 tasks, no cycles"));
@@ -772,8 +812,9 @@ mod tests {
 
     #[test]
     fn cyclic_plan_fails_naming_the_cycle() {
+        let dir = PlanDir::new("cyclic");
         let plan = write_plan(
-            &hermetic_root(),
+            &dir.path,
             "cyclic-plan.md",
             crate::plan::corpus::CYCLIC_PLAN,
         );
@@ -814,11 +855,8 @@ mod tests {
 
     #[test]
     fn steps_plan_validates_via_ordered_list_fallback() {
-        let plan = write_plan(
-            &hermetic_root(),
-            "steps-plan.md",
-            crate::plan::corpus::STEPS_PLAN,
-        );
+        let dir = PlanDir::new("steps");
+        let plan = write_plan(&dir.path, "steps-plan.md", crate::plan::corpus::STEPS_PLAN);
         let report = run(&opts(&plan)).expect("steps plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 4 tasks, no cycles"));
