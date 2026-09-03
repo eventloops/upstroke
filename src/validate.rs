@@ -364,14 +364,27 @@ mod tests {
     use std::env;
     use std::sync::OnceLock;
 
-    fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
-        let hermetic_root =
+    /// The hermetic config root every [`opts`] uses. Created if absent and
+    /// **never deleted**: [`run`] inspects it only for the three gate markers
+    /// and `upstroke.toml`, and nothing else in this module lists it, so a plan
+    /// written here by name is seen by the one test that wrote it and by nothing
+    /// else. The four corpus tests that need a plan on disk write it here rather
+    /// than into a root of their own, because the alternative in this file,
+    /// [`scratch_root`], removes a directory it did not create before it makes
+    /// one — the harm review pass 7 reproduced — and this root already exists
+    /// in every run of theirs.
+    fn hermetic_root() -> PathBuf {
+        let root =
             env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
-        fs::create_dir_all(&hermetic_root).expect("hermetic root");
+        fs::create_dir_all(&root).expect("hermetic root");
+        root
+    }
+
+    fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
         ValidateOptions {
             plan_path: plan.into(),
             config_path: None,
-            config_root: hermetic_root,
+            config_root: hermetic_root(),
             engine_limits: config::EngineLimits::Fresh,
             pools_path: Some({
                 // A real, empty pools file: an explicit `--pools` that does not
@@ -416,8 +429,8 @@ mod tests {
 
     /// One plan of [`crate::plan::corpus`], written under `root` by the name it
     /// carried under `fixtures/`, so [`run`] can read it from a path. It owns
-    /// nothing: the root is the caller's, on the same footing as every other
-    /// scratch directory in this module.
+    /// nothing: the root is the caller's. It does not delete, and it is not
+    /// handed a root that was cleared by deleting — see [`hermetic_root`].
     fn write_plan(root: &Path, name: &str, text: &str) -> PathBuf {
         let plan = root.join(name);
         fs::write(&plan, text).expect("plan");
@@ -720,8 +733,11 @@ mod tests {
 
     #[test]
     fn sample_plan_renders_expected_table() {
-        let root = scratch_root("sample");
-        let plan = write_plan(&root, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan = write_plan(
+            &hermetic_root(),
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let report = run(&opts(&plan)).expect("sample plan validates");
         let rendered = report.render();
 
@@ -743,8 +759,11 @@ mod tests {
 
     #[test]
     fn bare_plan_validates_via_heuristics() {
-        let root = scratch_root("bare");
-        let plan = write_plan(&root, "bare-plan.md", crate::plan::corpus::BARE_PLAN);
+        let plan = write_plan(
+            &hermetic_root(),
+            "bare-plan.md",
+            crate::plan::corpus::BARE_PLAN,
+        );
         let report = run(&opts(&plan)).expect("bare plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 5 tasks, no cycles"));
@@ -753,8 +772,11 @@ mod tests {
 
     #[test]
     fn cyclic_plan_fails_naming_the_cycle() {
-        let root = scratch_root("cyclic");
-        let plan = write_plan(&root, "cyclic-plan.md", crate::plan::corpus::CYCLIC_PLAN);
+        let plan = write_plan(
+            &hermetic_root(),
+            "cyclic-plan.md",
+            crate::plan::corpus::CYCLIC_PLAN,
+        );
         let err = run(&opts(&plan)).expect_err("cycle must fail");
         let message = err.to_string();
         assert!(message.contains("dependency cycle"), "got: {message}");
@@ -792,8 +814,11 @@ mod tests {
 
     #[test]
     fn steps_plan_validates_via_ordered_list_fallback() {
-        let root = scratch_root("steps");
-        let plan = write_plan(&root, "steps-plan.md", crate::plan::corpus::STEPS_PLAN);
+        let plan = write_plan(
+            &hermetic_root(),
+            "steps-plan.md",
+            crate::plan::corpus::STEPS_PLAN,
+        );
         let report = run(&opts(&plan)).expect("steps plan validates");
         let rendered = report.render();
         assert!(rendered.contains("ok: 4 tasks, no cycles"));
