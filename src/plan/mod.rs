@@ -54,21 +54,23 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
 /// The plan corpus, inlined.
 ///
 /// Until 2026-09-02 these four plans were files in a `fixtures/` directory at
-/// the repository root, read from disk by two test regions that could not see
-/// each other's copy. They are constants here, in one module both reach, for
-/// the reason the directory was retired: a corpus kept in two places drifts,
-/// and the drift is invisible until a plan that no longer parses the same way
-/// still passes the test that reads the other copy.
+/// the repository root: read from disk by three separate test regions —
+/// `plan::markdown`, `crate::validate` and `crate::topology::registry` — and
+/// shipped as four standalone paths inside the published crate. They are
+/// constants here, in one module every consumer reaches, so a second copy
+/// cannot appear later.
 ///
 /// **Every byte is significant.** `plan::markdown` mints `Plan.source.hash`
-/// from the content, the annotation grammar is column- and delimiter-sensitive,
-/// and a trailing newline is the difference between a last task and none. Each
-/// constant below is the file it replaced byte for byte, LF endings and final
-/// newline included. Do not reflow, re-indent, or tidy them.
+/// from the content and the annotation grammar is column- and
+/// delimiter-sensitive, so a plan's text is its identity: dropping the final
+/// newline alone changes `Plan.source.hash`, even where the task list it parses
+/// to is unchanged. Each constant below is the file it replaced byte for byte,
+/// LF endings and final newline included. Do not reflow, re-indent, or tidy
+/// them.
 ///
 /// `crate::validate`'s tests need them as files, because `validate::run` reads
 /// its plan from a path; [`PLANS`] pairs each with the name it had, so that
-/// caller can write the corpus out under its own scratch root.
+/// caller can write the corpus out under a scratch directory of its own.
 #[cfg(test)]
 pub(crate) mod corpus {
     /// No annotations at all, so every field comes from the heuristics: five
