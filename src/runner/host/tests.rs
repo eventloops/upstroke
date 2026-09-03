@@ -22,6 +22,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+// The split moved `SHELL_PROBE_TIMEOUT` -- the parent's one use of `Duration` --
+// into `super::probe`, so the parent's import list no longer carries the type
+// and `use super::*` no longer supplies it here. Named directly rather than
+// kept as a re-export the parent does not need. No test is renamed, no
+// assertion changes and no body moves; this line is the whole of what the
+// extraction owes this file.
+use std::time::Duration;
 
 use super::*;
 use crate::runner::invocation::{AttemptRole, InvocationId};
@@ -2945,9 +2952,10 @@ fn the_two_points_whose_operation_is_not_parent_side_are_named_and_counted() {
 /// inventory rather than transcribed from it.
 ///
 /// `SPAWN_SITE.sub_effects()` is `Process.Spawn`'s own list and
-/// `SubEffectPoint::platform()` is the point's own host, both in
-/// `src/topology/effects.rs`, so a point added to the site later is in this
-/// domain the moment it exists. That is not tidiness: the hand-written
+/// `SubEffectPoint::platform()` is the point's own host, both in the frozen
+/// `topology::effects` inventory — `sites.rs` and `vocab.rs` respectively since
+/// that module was split into per-concern children — so a point added to the
+/// site later is in this domain the moment it exists. That is not tidiness: the hand-written
 /// Windows list this replaced named `CreatedSuspended`, `PrivateJobAssigned`
 /// and `Resumed` and silently omitted `AmbientJobJoined`, so the kill grid
 /// iterated three of the four points the platform has and six guest runs
@@ -2997,7 +3005,8 @@ const STARTUP_POINTS: &[SubEffectPoint] = &[SubEffectPoint::AmbientJobJoined];
 /// one of the two by construction, and cannot land in neither. Asserted
 /// against `containment_points`, which is itself derived from the frozen
 /// inventory, so the only way to lose a point from both is to delete it
-/// from `src/topology/effects.rs`.
+/// from the `topology::effects` inventory (`vocab.rs` holds the points since
+/// that module was split).
 #[test]
 fn the_startup_and_per_spawn_domains_partition_this_platforms_points() {
     let all = containment_points();
