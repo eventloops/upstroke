@@ -56,8 +56,8 @@
 //! this one. No skip is derived and no file leaves any census. That matters
 //! more here than anywhere else in this directory:
 //! `the_whole_file_modules_are_read_from_the_declarations` is one of the eleven
-//! bodies below, and a declaration written the other way would make this file
-//! the nineteenth module of the set it is itself asserting is eighteen.
+//! bodies below, and a declaration written the other way would make this file a
+//! member of the very set it is itself asserting the membership of.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once
@@ -86,7 +86,8 @@ pub(super) mod oracles {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
-    use crate::effects::tests::{repo_root, scanned_sources};
+    use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
+    use crate::effects::tests::{is_the_literal_mod_tests_form, repo_root, scanned_sources};
     use crate::effects::{
         TOPOLOGY_MODULES, blank_comments, blank_comments_and_strings, externally_reachable_fns,
         production_code, production_region,
@@ -532,24 +533,33 @@ pub(super) mod oracles {
     /// The class boundary for `PR7-R5-ATT-001`. Four whole-tree censuses skip test
     /// files; three took the set from
     /// [`census_domain::declared_whole_file_test_modules`] and one wrote its own
-    /// rule, `path.file_stem() == "tests"`. That covers the fourteen files a
-    /// literal `#[cfg(test)] mod tests;` declares. The crate declares four more,
-    /// and they are exactly the ones a census is most likely to trip over — a
-    /// scaffold, a fake and a readiness protocol exist to *name* what production
-    /// names, and `scaffold.rs` sits inside the `engine/topology` domain one of
-    /// those censuses walks.
+    /// rule, `path.file_stem() == "tests"`. That covers the entries of
+    /// [`WHOLE_FILE_TEST_MODULES`] whose file stem is `tests` — the ones a
+    /// literal `#[cfg(test)] mod tests;` declares. The crate declares six
+    /// more, and they are exactly the ones a census is most likely to trip over
+    /// — a scaffold, a fake, a fixture and a readiness protocol exist to *name*
+    /// what production names, and `scaffold.rs` sits inside the
+    /// `engine/topology` domain one of those censuses walks.
     ///
-    /// `agent/proc/test_support/readiness.rs` is the fourth and the one no
+    /// `agent/proc/test_support/readiness.rs` is the last of them and the one no
     /// **text** rule finds at all: it is declared `pub(crate) mod readiness;`,
     /// with no attribute of its own, inside `proc`'s inline `#[cfg(test)]
     /// pub(crate) mod test_support { … }`. Nothing in that file is
     /// `#[cfg(test)]`, so a census that did not skip it would read 500 lines of
     /// fixture — five denied effect calls among them — as production.
     ///
-    /// Named individually rather than counted, because a count alone would pass if
-    /// the derivation swapped one file for another. Counted as well, because
-    /// names alone would pass if the derivation grew a nineteenth nobody looked
-    /// at.
+    /// **Every module named, not counted.** A count alone passes when the
+    /// derivation swaps one file for another — same cardinality, different set
+    /// — and names alone pass when it grows one more nobody looked at.
+    /// [`WHOLE_FILE_TEST_MODULES`] is the census domain as a list of paths, so
+    /// comparing against it refuses both, and refuses them by naming the file
+    /// gained or lost rather than by printing two integers.
+    ///
+    /// **It pins identity, not independence.** What compares against that list
+    /// is one resolver read two ways and a file-name rule, not three separate
+    /// derivations, and a declaration form the resolver cannot see is missing
+    /// from all of them at once. The comment on the second half of the body
+    /// says which is which and names the form this scan misses.
     pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
@@ -566,69 +576,208 @@ pub(super) mod oracles {
         }
 
         let modules = crate::effects::census_domain::whole_file_test_modules(&root, &files, 13);
-        let relative = |path: &std::path::Path| {
-            path.strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-        let named: Vec<String> = modules
+        // **Identity is a `Path`, never a string.** `CODING_STANDARDS.md` §8:
+        // a lossy display string is for diagnostics only, never identity.
+        // `to_string_lossy` maps two distinct non-UTF-8 paths onto one, and
+        // rewriting `\` to `/` turns a backslash -- a legal character in a Unix
+        // file name -- into what reads as a separator, so an equality over the
+        // rendered text can answer about a file that is not the one on disk.
+        // `Path` compares component-wise and Windows accepts either separator,
+        // so the forward-slash literals of `WHOLE_FILE_TEST_MODULES` match a
+        // native path with no conversion at all. The one lossy rendering left
+        // below is `declaring`, which is interpolated into a message and
+        // compared with nothing; do not fold the two back together.
+        fn relative<'a>(root: &std::path::Path, path: &'a std::path::Path) -> &'a std::path::Path {
+            path.strip_prefix(root).unwrap_or(path)
+        }
+        // Both sides of every comparison are sorted the same way, so no
+        // comparison depends on the order the list happens to be written in and
+        // a failure names the offending file rather than printing two integers.
+        // Sorting both is what makes that safe: `Path` orders component-wise,
+        // which ranks `a.rs` after `a/b.rs` where a byte sort of the same text
+        // does the reverse. No pair of entries differs that way *today*; a
+        // slice adding one that did would otherwise fail here on ordering while
+        // the set was right. A `Vec` rather than a set, so a duplicated entry
+        // fails instead of being absorbed.
+        fn sorted(mut paths: Vec<&std::path::Path>) -> Vec<&std::path::Path> {
+            paths.sort_unstable();
+            paths
+        }
+        // The expected value, and the two halves of it the rules below
+        // partition into. `WHOLE_FILE_TEST_MODULES` holds `PathBuf`s relative
+        // to `src`, which is what `relative` produces, so this borrows them as
+        // paths and converts nothing. Filtering a sorted list keeps it sorted,
+        // so the halves need no second sort.
+        let expected = sorted(
+            WHOLE_FILE_TEST_MODULES
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .collect(),
+        );
+        let stem_is_tests =
+            |path: &std::path::Path| path.file_stem().is_some_and(|stem| stem == "tests");
+        let expected_named_tests: Vec<&std::path::Path> = expected
             .iter()
-            .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
-            .map(|path| relative(path))
+            .copied()
+            .filter(|path| stem_is_tests(path))
+            .collect();
+        let expected_not_named_tests: Vec<&std::path::Path> = expected
+            .iter()
+            .copied()
+            .filter(|path| !stem_is_tests(path))
             .collect();
 
+        let named = sorted(
+            modules
+                .iter()
+                .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
+                .map(|path| relative(&root, path))
+                .collect(),
+        );
         assert_eq!(
-            named,
-            vec![
-                "agent/proc/test_support/readiness.rs".to_owned(),
-                "engine/topology/scaffold.rs".to_owned(),
-                "events/log/premove.rs".to_owned(),
-                "runner/container/fake.rs".to_owned(),
-            ],
+            named, expected_not_named_tests,
             "these are the whole-file test modules a `file_stem == \"tests\"` rule does not see, and \
              a census that uses that rule reads them as production"
         );
+        let resolved = sorted(modules.iter().map(|path| relative(&root, path)).collect());
         assert_eq!(
-            modules.len(),
-            18,
-            "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
-             file name leaves the rest inside its domain",
-            modules.len()
+            resolved, expected,
+            "the crate's whole-file test modules are not what `WHOLE_FILE_TEST_MODULES` lists; a \
+             census skipping only the ones named `tests.rs` by file name leaves the rest inside \
+             its domain"
         );
 
-        // **The two halves of the eighteen, separated.** The count above is
-        // satisfied by any eighteen files; these two say *how* each was reached,
-        // which is the part the structural scan changed. Fourteen come from a
-        // literal `#[cfg(test)] mod tests;` — the form a text rule could find —
-        // and the derivation must still find all fourteen after learning to read
+        // **The two halves of `WHOLE_FILE_TEST_MODULES`, separated.** The
+        // comparison above is satisfied by any derivation that reaches this
+        // set; these two say *how* each file was reached, which is the part the
+        // structural scan changed. The `tests.rs` half comes from a literal
+        // `#[cfg(test)] mod tests;` — the form a text rule could find — and
+        // the derivation must still find all of those after learning to read
         // structure, because a scan that resolved ancestry and lost the plain
         // case would trade one blind spot for another.
+        //
+        // **What reading one list buys, and what it does not.** These four
+        // comparisons are not four independent derivations, and this test does
+        // not claim they are. `whole_file_test_modules` calls
+        // `declared_whole_file_test_modules` and resolves each declaration it
+        // returns to a file, so `resolved` above and `declared` below are two
+        // views over **one** resolver; `named` and `literal` are those same two
+        // views filtered, one by the file-name rule `file_stem == "tests"` and
+        // one by the declaration form. The file-name rule is the only genuinely
+        // separate derivation here. What the list buys is identity — a module
+        // swapped for another, renamed, added or dropped fails a comparison by
+        // name rather than by cardinality — and what comparing the two halves
+        // buys is the disagreement between the file-name rule and the
+        // declaration form: a file called `tests.rs` that no literal
+        // declaration reaches, a literal declaration resolving to a file not
+        // called `tests.rs`, or a `tests.rs` whose declaration is guarded by
+        // something narrower than `test` — present on the file-name side,
+        // absent from the declaration side, and the one of the three that
+        // silently costs a platform its test module — splits the halves apart
+        // and fails.
+        //
+        // **The blind spot is shared, and it is not hypothetical.** A
+        // declaration form the resolver cannot see is missing from all of this
+        // at once — from both views, from both filters, and from the list,
+        // which is maintained by hand from the same derivation. PR #101's
+        // reviewer produced one and it reproduces: `#[cfg_attr(all(),
+        // cfg(test))] mod hidden_tests;` is applied by rustc as `#[cfg(test)]`,
+        // but `census_domain::scan_module_declarations` treats a `cfg_attr` as
+        // significant only when it contains `path`, so it reads that
+        // declaration as unconditional and omits the file. It is a stated limit
+        // of the domain, recorded on
+        // `census_domain::declared_whole_file_test_modules`. The gap predates
+        // this change; widening the scan is its own change with its own review.
+        //
+        // Reading one expected value from the list is therefore not duplication
+        // to restore. Writing the population out four times would add no
+        // derivation and close no blind spot, and it would restore what PR
+        // #97's review found: the same two counts were stated as English words
+        // 37 times across ten files, so one slice adding a module falsified
+        // every one of them at once while the `>=` floor stayed green.
         let declarations =
             crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
-        assert_eq!(declarations.len(), 18);
-        let literal: Vec<String> = declarations
+        // Each declaration named by the file it resolves to, through the shared
+        // resolver rather than a second copy of the rule
+        // (`PR5D-VISIBILITY-CHECK-DUPLICATED`), so this comparison is in the
+        // same terms as the list.
+        fn declared_file<'a>(
+            root: &std::path::Path,
+            declaration: &'a crate::effects::census_domain::TestModuleDeclaration,
+        ) -> &'a std::path::Path {
+            let resolved =
+                crate::effects::census_domain::sole_present(&declaration.candidates, &|path| {
+                    path.is_file()
+                })
+                .expect("a derived declaration resolves to exactly one file");
+            relative(root, resolved)
+        }
+        let declared = sorted(
+            declarations
+                .iter()
+                .map(|declaration| declared_file(&root, declaration))
+                .collect(),
+        );
+        assert_eq!(
+            declared, expected,
+            "reading the declarations resolves a different population than \
+             `WHOLE_FILE_TEST_MODULES` lists"
+        );
+        // **Membership is the declaration form, guard included.** This read
+        // only the name and the inline path until PR #101's second pass, which
+        // is a rule that never looked at `guard` though it is right there:
+        // `#[cfg(all(test, unix))] mod tests;` still entails `test`, still
+        // resolves to a file called `tests.rs`, and passed as the plain form
+        // while Windows compiled no such module at all. The rule is
+        // `is_the_literal_mod_tests_form`, shared with the fixture that drives
+        // it over synthetic input, because a second copy here is the defect
+        // `PR5D-VISIBILITY-CHECK-DUPLICATED` names.
+        let is_literal = |declaration: &crate::effects::census_domain::TestModuleDeclaration| {
+            is_the_literal_mod_tests_form(
+                &declaration.name,
+                &declaration.inline_path,
+                &declaration.guard,
+            )
+        };
+        let literal = sorted(
+            declarations
+                .iter()
+                .filter(|declaration| is_literal(declaration))
+                .map(|declaration| declared_file(&root, declaration))
+                .collect(),
+        );
+        // Diagnostics, not identity: this names the files those declarations
+        // were *written in*, for the failure message, and is compared with
+        // nothing. §8 allows a lossy rendering here and only here.
+        let declaring: Vec<String> = declarations
             .iter()
-            .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
-            .map(|declaration| relative(&declaration.declared_in))
+            .filter(|declaration| is_literal(declaration))
+            .map(|declaration| {
+                relative(&root, &declaration.declared_in)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(
-            literal.len(),
-            14,
-            "fourteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
-             found {}: {literal:?}",
-            literal.len()
+            literal, expected_named_tests,
+            "these are the whole-file test modules declared by a literal `#[cfg(test)] mod \
+             tests;` -- that name, that guard, at their parent's own top level -- and the \
+             file-name rule finds exactly them. A declaration narrowed to `all(test, <platform>)` \
+             resolves to a `tests.rs` and is missing from the left side only: it is still a \
+             whole-file test module, it is not this form, and what a file-name census should do \
+             about a module that exists on only some platforms is the question this failure \
+             asks. The declarations were read in {declaring:?}"
         );
         // And the one that is reached only through an inline ancestor, named
         // with the ancestry it was reached through. This is the whole of what
         // the structural scan buys, so it is asserted as a value rather than as
         // a count.
-        let inherited: Vec<(String, String, Vec<String>, String)> = declarations
+        let inherited: Vec<(&std::path::Path, String, Vec<String>, String)> = declarations
             .iter()
             .filter(|declaration| !declaration.inline_path.is_empty())
             .map(|declaration| {
                 (
-                    relative(&declaration.declared_in),
+                    relative(&root, &declaration.declared_in),
                     declaration.name.clone(),
                     declaration.inline_path.clone(),
                     declaration.guard.clone(),
@@ -638,7 +787,7 @@ pub(super) mod oracles {
         assert_eq!(
             inherited,
             vec![(
-                "agent/proc.rs".to_owned(),
+                std::path::Path::new("agent/proc.rs"),
                 "readiness".to_owned(),
                 vec!["test_support".to_owned()],
                 "test".to_owned(),
@@ -655,8 +804,10 @@ pub(super) mod oracles {
     /// count over the whole tree, so a shape it mishandles is a hole nobody would
     /// see: the count would simply be lower.
     pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {
-        // A `mod tests;` declaration. Fourteen files in this tree end with one, and
-        // everything below it used to be outside every region that truncates.
+        // A `mod tests;` declaration. The files that declare a whole-file
+        // test module named `tests` — the `tests.rs` entries of
+        // `WHOLE_FILE_TEST_MODULES` — end with one, and everything below it
+        // used to be outside every region that truncates.
         let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests;\nfn below() {}\n");
         assert!(region.contains("fn above()"), "{region:?}");
         assert!(region.contains("fn below()"), "{region:?}");

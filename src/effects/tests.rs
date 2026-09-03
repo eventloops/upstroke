@@ -203,7 +203,7 @@ struct AllowlistEntry {
     /// How many **per-site** `#[expect(…)]` attributes of the recorded lints the
     /// file carries, or zero when its allowance is the module-level one.
     ///
-    /// `decisions/2026-08-30-readiness-lint-placement.md`. A per-site
+    /// `standards/02_standards_automated_baseline.md`. A per-site
     /// expectation is narrower than a module-level allow and the compiler owns
     /// its count in both directions; this is the reviewed number that count is
     /// checked against, so an annotation appearing or vanishing has to pass
@@ -392,7 +392,7 @@ fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
     const LINT: &str = "clippy::disallowed_methods";
     const SITES: usize = 6;
-    const DECISION: &str = "decisions/2026-08-30-readiness-lint-placement.md";
+    const DECISION: &str = "standards/02_standards_automated_baseline.md";
     // The records are prose and spell the count as a word. The two are bound
     // rather than restated: changing `SITES` without changing the word fails
     // here instead of quietly searching for a phrase no record contains.
@@ -1031,6 +1031,13 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
              `Command::new(` row in `every_production_process_start_is_classified`",
         ),
         (
+            "src/runner/container/exec/tests.rs",
+            "the `ContainerRunner`'s `#[cfg(test)]` suite, out of line since W1. \
+             The same text was inside `exec.rs` below its `#[cfg(test)]` cut and \
+             so was never in this domain; it is named for the same reason \
+             `fake.rs` is, the marker being at the DECLARATION and not in the file",
+        ),
+        (
             "src/runner/container/fake.rs",
             "the funnel's `#[cfg(test)]` substrate — the fake runtime and the \
              Docker gate. Excluded from nothing by `production_region`, because \
@@ -1496,9 +1503,13 @@ fn clippy_driver() -> PathBuf {
 mod ci_model;
 mod workflow;
 
-use ci_model::{CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, RUSTFLAGS_KEY};
+use ci_model::{
+    CI_TARGETS, CI_WORKFLOW, MSRV_COMMAND, MSRV_JOB, OVERRIDING_REPO_FILES, RUSTFLAGS_KEY,
+    TEST_COMMAND, WINDOWS_TEST_FLOOR, WINDOWS_TEST_WITNESS,
+};
 use workflow::{
-    WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints, ci_workflow_text,
+    WORKFLOW_ESCAPES, ci_msrv_job_complaints, ci_test_job_complaints,
+    ci_test_windows_job_complaints, ci_windows_build_witness_complaints, ci_workflow_text,
     complaint_codes, declared_msrv_toolchain, declared_rust_version, field, field_names,
     mutate_workflow, parse_workflow, rustflags_complaints, scalar, steps_of, three_component,
     workflow_complaints,
@@ -1619,6 +1630,140 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
         complaints.is_empty(),
         "the `test` job does not run these fixtures the way they need:\n{}",
         complaints.join("\n")
+    );
+}
+
+/// The Windows suite's job runs these fixtures on the self-hosted labels, and
+/// on nothing else the contract can read.
+///
+/// The claim the `test` job discharges with an install step -- that
+/// `clippy-driver` is present for the fixtures -- is discharged here by the
+/// golden image the runner boots, which this contract cannot read; the decision
+/// record binds re-curation to it instead. What the contract *can* read is
+/// pinned: the labels exactly, the suite step exactly -- the command and the
+/// count that says it executed, see
+/// [`the_self_hosted_leg_counts_the_tests_it_ran`] -- the platform-default
+/// shell on every `run:` step, and a field set with no `if:` or
+/// `continue-on-error:`. The refusals are executed in [`WORKFLOW_ESCAPES`],
+/// every row named `MUT-TEST-WINDOWS-*` and both `MUT-WINDOWS-WITNESS-*`.
+#[test]
+fn the_self_hosted_windows_leg_runs_these_fixtures_on_the_pinned_labels() {
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let complaints = ci_test_windows_job_complaints(&doc);
+    assert!(
+        complaints.is_empty(),
+        "the self-hosted Windows leg does not run these fixtures the way the contract pins:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The Windows tree is code-generated and linked on GitHub's current stable,
+/// not only type-checked.
+///
+/// The self-hosted leg executes the suite with the image's toolchain, which
+/// moves only by re-curation; `cargo check` and Clippy stop before codegen. The
+/// witness is a hosted `cargo build --all-targets`, pinned exactly once on
+/// exactly one `windows-latest` job and riding the Windows Clippy gate so that
+/// job's step and checkout pins cover it. It links the library and binaries as
+/// shipped and as test harnesses, so a Windows-only codegen or link failure in
+/// any of them on current stable cannot pass every hosted leg; what it cannot
+/// see is a failure that needs a toolchain newer than current stable, which no
+/// leg has. Its carrier's toolchain input is pinned to `stable` too: the action
+/// is pinned by commit, and the input is what decides which compiler runs. The
+/// refusals are executed in [`WORKFLOW_ESCAPES`], `MUT-WINDOWS-BUILD-WITNESS-*`,
+/// `MUT-WITNESS-CHECKOUT-REF` and `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
+#[test]
+fn the_hosted_windows_leg_still_links_every_test_binary() {
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let complaints = ci_windows_build_witness_complaints(&doc);
+    assert!(
+        complaints.is_empty(),
+        "no hosted leg code-generates and links the Windows tree the way the contract pins:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// No file in the repository outranks what `ci.yml` says CI compiles and runs.
+///
+/// Every other assertion in this section reads `ci.yml` and concludes something
+/// about what CI does. Two repository files make that inference false without
+/// touching the workflow at all. A `rust-toolchain.toml` overrides the rustup
+/// default the pinned toolchain action sets, so every bare `cargo` command runs
+/// a compiler the workflow never names -- the current-stable witness included,
+/// and the MSRV floor with it. A `.cargo/config.toml` can bind
+/// `target.<triple>.runner`, which Cargo applies to `cargo test`: every Windows
+/// harness builds and a wrapper reports success without executing one, on the
+/// one platform whose tests no other leg runs.
+///
+/// Neither exists, and this is what keeps it that way. Absence rather than a
+/// parse: adding either is a deliberate act, and the same change must decide
+/// what this contract then reads. `CLAUDE.md` already states the convention for
+/// the toolchain file; this makes it enforceable rather than remembered.
+#[test]
+fn no_repository_file_overrides_what_ci_compiles_or_runs() {
+    let root = repo_root();
+    let present: Vec<&str> = OVERRIDING_REPO_FILES
+        .iter()
+        .copied()
+        .filter(|name| root.join(name).exists())
+        .collect();
+    assert!(
+        present.is_empty(),
+        "these files outrank `{CI_WORKFLOW}` and this contract reads only the workflow: \
+         {present:?}. A toolchain file replaces the compiler every leg runs; a Cargo config \
+         can bind a target runner that reports success without executing a test binary. \
+         Adding one is a deliberate act: extend this contract in the same change."
+    );
+    // Package selection, for the same reason. `--all-targets` applies to the
+    // packages Cargo selected, and `workspace.default-members` chooses them.
+    // TOML's parser, not a spelling. `[ workspace ]`, `[workspace] # note` and a
+    // root `workspace.default-members = [...]` are one table to Cargo and three
+    // different strings to a line scan, which is how the first two versions of
+    // this check read and how each was shown a spelling it missed.
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml"))
+            .expect("Cargo.toml parses");
+    assert!(
+        manifest.get("workspace").is_none(),
+        "Cargo.toml declares a workspace, so `--all-targets --all-features` no longer selects \
+         this crate: `default-members` decides, and a member with no tests makes every CI \
+         command succeed without running this suite."
+    );
+}
+
+/// The leg whose tests left GitHub's runners reports that they ran.
+///
+/// Every other assertion here reads `ci.yml` and concludes what CI was *asked*
+/// to do. Cargo can be asked for this suite and execute none of it: a
+/// `target.<triple>.runner` in a repository `.cargo/config.toml`, in
+/// `$CARGO_HOME`, in a directory above the checkout or in the process
+/// environment hands each compiled harness to a wrapper that exits zero, and a
+/// root `[workspace]` whose `default-members` name another crate builds no
+/// harness of this one. Three of those are written where nothing reading this
+/// repository can see them, and Cargo is free to add a fourth route.
+///
+/// So this leg counts instead of enumerating: a suite that did not execute
+/// reports no `test result: ok.` line, and a job that cannot reach the floor
+/// fails. It is pinned like every other script, and the pin is what stops the
+/// count being deleted or its floor lowered to a number nothing has to clear.
+///
+/// It is not a defence against a pull request, and nothing in this file is: an
+/// edit to `ci.yml` deletes this step as easily as any other, and the decision
+/// record says where the boundary actually is. It is a defence against the
+/// machine, which is the input this change added. The guest is provisioned
+/// outside the repository, so its Cargo home and its environment are not in any
+/// diff, and this is the leg saying it ran what it says it ran.
+#[test]
+fn the_self_hosted_leg_counts_the_tests_it_ran() {
+    assert!(
+        WINDOWS_TEST_WITNESS.starts_with(TEST_COMMAND),
+        "the self-hosted leg's step does not open with `{TEST_COMMAND}`, so the suite it \
+         witnesses is not the suite the other legs run"
+    );
+    assert!(
+        WINDOWS_TEST_WITNESS.contains(&format!("-lt {WINDOWS_TEST_FLOOR}")),
+        "the self-hosted leg's step does not test the count against \
+         {WINDOWS_TEST_FLOOR}, so the floor this contract documents is not the floor it runs"
     );
 }
 
@@ -1989,15 +2134,20 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 //     `#[cfg]`s conjoin, and so does every enclosing guard -- the module block it
 //     sits in, and, for a whole-file module, the `mod name;` declaration that
 //     names the file -- whether the guard is written on that declaration or on
-//     an inline module enclosing it. Eighteen files in this tree are reached
-//     only that way.
+//     an inline module enclosing it. The files `cfg::WHOLE_FILE_TEST_MODULES`
+//     lists are reached only that way.
 
 // The census is `cfg`, beside this file; the two tests below are what it answers
 // to. It decides predicates against `ci_model`'s targets -- the same table the
 // workflow contract above is checked against -- so "no runner compiles this
 // body" and "no job lints that platform" cannot drift apart.
+//
+// `pub(crate)` for one item and one reader: `cfg::WHOLE_FILE_TEST_MODULES` is
+// the crate's only statement of the whole-file test-module population, and
+// `engine::topology::recover::tests` floors its skip count at that list's
+// length. Nothing else here is reachable from outside this directory.
 
-mod cfg;
+pub(crate) mod cfg;
 
 use cfg::{
     CFG_CENSUS_CONTROL, CFG_ESCAPES, CFG_GATE_FLOOR, CONTROL_GATES, CfgForm, CfgSite,
@@ -2175,11 +2325,12 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
         .map(|site| site.path.as_str())
         .collect();
     assert!(
-        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES,
+        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES.len(),
         "only {} file(s) carry a `test` guard the census resolved, and \
          `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names` \
-         resolves {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
-        under_a_file_guard.len()
+         resolves {} whole-file test modules on its own",
+        under_a_file_guard.len(),
+        WHOLE_FILE_TEST_MODULES.len()
     );
 
     let mut uncovered: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -2604,8 +2755,8 @@ fn the_checked_in_residue_class_record_is_what_the_enums_generate() {
     // `command_internal_sub_effects` says "N frozen per site in the registry";
     // `src/topology/registry.rs` is PR3's and frozen, and carries no N, so the
     // record carries it and this is the cross-check that keeps the two equal.
-    let harness = fs::read_to_string(repo_root().join("src/workspace_manager.rs"))
-        .expect("src/workspace_manager.rs");
+    let harness = fs::read_to_string(repo_root().join("src/workspace_manager/tests.rs"))
+        .expect("src/workspace_manager/tests.rs");
     assert!(
         harness.contains(&format!("const SAMPLING_N: u32 = {SAMPLING_N};")),
         "the sampling harness no longer runs N = {SAMPLING_N}"
@@ -3363,6 +3514,139 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
         );
         assert!(scan_module_declarations(refused).is_err());
     }
+}
+
+/// Whether a declaration is the literal `#[cfg(test)] mod tests;` form: that
+/// name, at its parent's own top level, under **that** guard rather than one
+/// that merely implies it.
+///
+/// Read by `the_whole_file_modules_are_read_from_the_declarations`, which
+/// compares the files these resolve to against the `tests.rs` half of
+/// `cfg::WHOLE_FILE_TEST_MODULES` — the half a `file_stem == "tests"` census
+/// finds — and driven over synthetic input by
+/// `a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form`.
+///
+/// **The guard has to *be* `test`, and that is the repair.** Membership used to
+/// be an empty `inline_path` and `name == "tests"`, which never looked at the
+/// guard at all — so `#[cfg(all(test, unix))] mod tests;` counted as the plain
+/// form: same name, same file stem, still test-only, every comparison green,
+/// while rustc compiles no such module on Windows and a census skipping by file
+/// name goes on skipping a file that is not there. A repository whose
+/// first-class target is Windows would have lost a whole test module on it with
+/// the Linux suite green — the exact failure this census family exists to
+/// catch. PR #101's reviewer found it and supplied the reproduction.
+///
+/// **The equality is predicate identity, not a text approximation.** `guard` is
+/// `Predicate::render`'s output, and `Predicate::Test` is the only predicate
+/// that renders as the bare `test`: `Other` is constructed for an atom whose
+/// name is not `test`, or for a `name = "value"` form, and every combinator
+/// renders with its own parentheses.
+///
+/// A guard written equivalently but not identically — `all(test)` — is refused
+/// here too, and that direction is deliberate. It fails loudly, naming the
+/// file, where admitting it means deciding equivalence for a rule whose whole
+/// job is to say which files a *file-name* census may skip; a loud failure
+/// costs a sentence in the slice that writes one, and the other direction costs
+/// a platform.
+///
+/// A narrowed declaration is still test-only and still belongs in the domain
+/// list. `cfg::WHOLE_FILE_TEST_MODULES`' doc comment says what happens then and
+/// why the resulting disagreement is the signal.
+///
+/// Takes the three fields rather than a declaration, so the scan's own
+/// `ScannedDeclaration` and the resolved `TestModuleDeclaration` are decided by
+/// this one rule instead of by two copies of it
+/// (`PR5D-VISIBILITY-CHECK-DUPLICATED`).
+fn is_the_literal_mod_tests_form(name: &str, inline_path: &[String], guard: &str) -> bool {
+    name == "tests" && inline_path.is_empty() && guard == "test"
+}
+
+/// A narrowed guard is still a whole-file test module and is **not** the
+/// literal `#[cfg(test)] mod tests;` form.
+///
+/// The reproduction PR #101's reviewer supplied, driven over synthetic input
+/// rather than by a real narrowed declaration under `src/`: writing one there
+/// would make the tree the fixture and would cost that module its Windows
+/// compilation for as long as it stood.
+///
+/// The mutation is one field wide. Every input the membership rule used to read
+/// is identical between the positive and the negative below — the name, the
+/// empty inline path, the resolved file stem, and `test_only` — so a rule that
+/// does not read the guard cannot tell them apart, and nothing else in this
+/// crate would have said so.
+#[test]
+fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form() {
+    use crate::effects::census_domain::{ScannedDeclaration, scan_module_declarations};
+
+    fn only(source: &str) -> ScannedDeclaration {
+        let mut found = scan_module_declarations(source)
+            .unwrap_or_else(|refusal| panic!("the fixture is readable: {refusal}"));
+        assert_eq!(found.len(), 1, "{source:?} -> {found:#?}");
+        found.remove(0)
+    }
+    fn literal(declaration: &ScannedDeclaration) -> bool {
+        is_the_literal_mod_tests_form(
+            &declaration.name,
+            &declaration.inline_path,
+            &declaration.guard,
+        )
+    }
+
+    // The positive: the form the `tests.rs` half of the census domain is a list
+    // of, and the one a `file_stem == "tests"` census may skip.
+    let plain = only("#[cfg(test)]\nmod tests;\n");
+    assert_eq!(plain.guard, "test");
+    assert!(plain.test_only);
+    assert!(literal(&plain), "{plain:#?}");
+
+    // The negatives, written both ways a narrowing reaches the declaration: one
+    // attribute carrying a conjunction, and two attributes conjoined.
+    for narrowed in [
+        "#[cfg(all(test, unix))]\nmod tests;\n",
+        "#[cfg(test)]\n#[cfg(unix)]\nmod tests;\n",
+    ] {
+        let declaration = only(narrowed);
+        assert_eq!(declaration.name, plain.name);
+        assert_eq!(declaration.inline_path, plain.inline_path);
+        assert!(
+            declaration.test_only,
+            "a narrowed guard still entails `test`, so the file is still a whole-file test \
+             module and still belongs in the census domain: {declaration:#?}"
+        );
+        assert_ne!(
+            declaration.guard, plain.guard,
+            "the guard is the only field that differs, so it is the only field that can \
+             distinguish them"
+        );
+        assert!(
+            !literal(&declaration),
+            "{narrowed:?} is not the literal `#[cfg(test)] mod tests;` form: rustc compiles no \
+             such module where the narrowing is false, and a census that counted it as the plain \
+             form would skip a file that is not there and lose the module on that platform in \
+             silence: {declaration:#?}"
+        );
+    }
+
+    // The other two ways out of the subset, so the guard is not the only thing
+    // this rule reads: the inline ancestry `readiness.rs` is reached through,
+    // and a declared name that is not `tests`. Both carry the bare `test` guard,
+    // so each isolates one condition.
+    let inherited = only("#[cfg(test)]\nmod test_support {\n    pub(crate) mod readiness;\n}\n");
+    assert_eq!(
+        (inherited.guard.as_str(), inherited.name.as_str()),
+        ("test", "readiness")
+    );
+    assert!(
+        inherited.test_only && !literal(&inherited),
+        "{inherited:#?}"
+    );
+    let other_name = only("#[cfg(test)]\nmod scaffold;\n");
+    assert_eq!(other_name.guard, "test");
+    assert!(other_name.inline_path.is_empty());
+    assert!(
+        other_name.test_only && !literal(&other_name),
+        "{other_name:#?}"
+    );
 }
 
 /// The resolver **refuses** every shape it cannot resolve, rather than guessing.

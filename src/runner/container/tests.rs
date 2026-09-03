@@ -2923,7 +2923,9 @@ fn every_container_effect_in_the_tree_goes_through_the_funnel() {
         // Test modules of this subtree drive the funnel and may construct a
         // fake; they are excluded by name rather than by a pattern, so a new
         // one is a change here.
-        if relative == "src/runner/container/fake.rs" || relative == "src/runner/container/tests.rs"
+        if relative == "src/runner/container/fake.rs"
+            || relative == "src/runner/container/tests.rs"
+            || relative == "src/runner/container/exec/tests.rs"
         {
             continue;
         }
@@ -3077,8 +3079,12 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     ];
     // Every funnel module that allows a governed lint at file scope, and
     // therefore every module tree an out-of-line child can inherit one through.
-    // `src/runner/host.rs` has no directory today; it is named anyway, so the
-    // day it grows one the walk finds it rather than the reviewer having to.
+    // `src/runner/host.rs` was named here before it had a directory, so that
+    // the day it grew one the walk would find it rather than the reviewer
+    // having to. **That day arrived in W1**: `src/runner/host/tests.rs` is its
+    // extracted test module, and this walk finds it and grades it against all
+    // three governed lints like any other child. All three funnels have a
+    // directory today, so no arm of the domain below is inert.
     const FUNNELS: [&str; 3] = [
         "src/runner/container.rs",
         "src/agent/proc.rs",
@@ -3170,7 +3176,7 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     }
 
     // And the Process funnel's child **denies all three at file scope**. It
-    // allowed one of them until `decisions/2026-08-30-readiness-lint-placement.md`,
+    // allowed one of them until `standards/02_standards_automated_baseline.md`,
     // and the allowance is six per-site `#[expect]` attributes now: narrower
     // than the file-scope allow it replaces, and counted by the compiler in both
     // directions under `-D warnings` — a seventh denied call is an error, and an
@@ -4752,7 +4758,9 @@ fn every_view_discard_removes_through_the_one_racing_removal() {
         "src/runner/container/fake.rs",
         "src/runner/container/tests.rs",
         "src/runner/container/census/tests.rs",
+        "src/runner/container/exec/tests.rs",
         "src/runner/container/resolve/tests.rs",
+        "src/runner/host/tests.rs",
     ];
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

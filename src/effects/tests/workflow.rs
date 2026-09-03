@@ -29,11 +29,15 @@ use std::fs;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use super::ci_model::{
-    AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL, AGGREGATE_STEP_FIELDS,
-    CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
-    ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS,
-    OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, STEP_FIELDS,
-    TEST_COMMAND, TEST_JOB_FIELDS, WORKFLOW_FIELDS,
+    ACTION_INPUTS, AGGREGATE_JOB, AGGREGATE_JOB_FIELDS, AGGREGATE_SCRIPT, AGGREGATE_SHELL,
+    AGGREGATE_STEP_FIELDS, CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS,
+    DEFAULTS_RUN_FIELDS, ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, GATE_SCRIPTS, KNOWN_SHELLS,
+    MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS, OPTIONAL_DEFAULTS_FIELD, PINNED_ACTIONS,
+    REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, SELF_HOSTED_TEST_PLATFORM, STABLE_TOOLCHAIN,
+    STEP_FIELDS, TEST_COMMAND, TEST_JOB_FIELDS, TEST_SCRIPTS, TEST_WINDOWS_JOB,
+    TEST_WINDOWS_JOB_FIELDS, TEST_WINDOWS_LABELS, TEST_WINDOWS_SCRIPTS, TOOLCHAIN_ACTION,
+    TOOLCHAIN_COMPONENTS, WINDOWS_BUILD_WITNESS, WINDOWS_TEST_WITNESS, WORKFLOW_ENV,
+    WORKFLOW_FIELDS, WORKFLOW_PERMISSIONS,
 };
 use super::repo_root;
 
@@ -327,6 +331,19 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
                 ));
             }
         }
+        out.extend(step_pin_complaints(
+            job,
+            gate,
+            "gate-run-script",
+            &GATE_SCRIPTS,
+        ));
+        out.extend(checkout_complaints(job, gate, "gate-checkout"));
+        out.extend(toolchain_complaints(
+            job,
+            gate,
+            "gate-toolchain",
+            Some(STABLE_TOOLCHAIN),
+        ));
     }
 
     out.extend(aggregate_complaints(doc, jobs, &job_names));
@@ -537,11 +554,11 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             ));
         }
         // This job is a matrix, so each `run:` step resolves a shell once per
-        // runner. All three must be the platform default: a workflow-level
+        // hosted runner. Each must be the platform default: a workflow-level
         // default swaps every one of them at once, which is the mutation the
         // step-only reading could not see.
         if scalar(step, "run").is_some() {
-            for target in &CI_TARGETS {
+            for target in CI_TARGETS.iter().filter(|target| hosts_tests(target)) {
                 out.extend(shell_complaints(
                     doc,
                     job,
@@ -565,12 +582,27 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
              job that executes them."
         ));
     }
+    out.extend(checkout_complaints(job, "test", "test-job-checkout"));
+    out.extend(step_pin_complaints(
+        job,
+        "test",
+        "test-job-run-script",
+        &TEST_SCRIPTS,
+    ));
+    out.extend(toolchain_complaints(
+        job,
+        "test",
+        "test-job-toolchain",
+        Some(STABLE_TOOLCHAIN),
+    ));
 
     // The matrix is the platform half of the same claim, and it is compared
-    // against the same derived runner set the Clippy legs are: a fixture that
-    // runs on one platform proves nothing about the other two.
+    // against the same derived runner set the Clippy legs are, less the one
+    // platform whose suite runs self-hosted: a fixture that runs on one
+    // platform proves nothing about the other.
     let expected_runners: BTreeSet<String> = CI_TARGETS
         .iter()
+        .filter(|target| hosts_tests(target))
         .map(|target| target.runner.to_owned())
         .collect();
     // The WHOLE strategy mapping, not just `matrix.os`. `exclude:` removes
@@ -596,7 +628,7 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             if field(strategy, "fail-fast").and_then(Yaml::as_bool) != Some(false) {
                 out.push(
                     "[test-job-matrix] the `test` job's `fail-fast:` is not `false`, so one \
-                     platform's failure cancels the other two before they report"
+                     platform's failure cancels the other before it reports"
                         .to_owned(),
                 );
             }
@@ -664,6 +696,444 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             "[test-job-toolchain] the `test` job selects toolchain {:?}, not `stable`",
             with.and_then(|with| scalar(with, "toolchain"))
         ));
+    }
+    out
+}
+
+/// Whether a [`CI_TARGETS`] runner hosts its platform's tests in the `test`
+/// matrix -- every platform but the one whose suite is self-hosted.
+fn hosts_tests(target: &CiTarget) -> bool {
+    target.runner != SELF_HOSTED_TEST_PLATFORM
+}
+
+/// Every way the self-hosted Windows job fails its contract.
+///
+/// The same shape as [`ci_test_job_complaints`] without the matrix, and with
+/// the one thing that job cannot say: which machine. A hosted runner is named
+/// by a scalar `runs-on:`; a self-hosted one by the set of labels a runner must
+/// carry, and the set is compared whole -- a subset admits every Windows
+/// machine the account registers, and a scalar `windows-latest` is the leg this
+/// contract retired coming back with every step still matching.
+///
+/// No toolchain step is required: the guest's image carries `clippy-driver`
+/// for the fixtures, and the decision record binds re-curation to that claim,
+/// which a document parser cannot check.
+pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let Some(job) = field(jobs, TEST_WINDOWS_JOB) else {
+        return vec![format!(
+            "[test-windows-missing] no `{TEST_WINDOWS_JOB}` job, so nothing runs the Windows \
+             suite"
+        )];
+    };
+    let Some(platform) = CI_TARGETS
+        .iter()
+        .find(|target| target.runner == SELF_HOSTED_TEST_PLATFORM)
+    else {
+        return vec![format!(
+            "[test-windows-platform] `{SELF_HOSTED_TEST_PLATFORM}` is not a runner this \
+             contract models, so the shell its steps resolve to is undecidable here"
+        )];
+    };
+
+    for complaint in field_complaints(job, &TEST_WINDOWS_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
+        out.push(format!(
+            "[unexpected-job-field] `{TEST_WINDOWS_JOB}` {complaint}"
+        ));
+    }
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let strange = unexpected(&field_names(step), &STEP_FIELDS);
+        if !strange.is_empty() {
+            out.push(format!(
+                "[unexpected-step-field] `{TEST_WINDOWS_JOB}` step {index} declares {strange:?}"
+            ));
+        }
+        if scalar(step, "run").is_some() {
+            out.extend(shell_complaints(
+                doc,
+                job,
+                step,
+                platform,
+                &format!("`{TEST_WINDOWS_JOB}` step {index}"),
+                platform.default_shell,
+            ));
+        }
+    }
+
+    // The image carries the compiler this leg runs, and re-curation is how it
+    // moves. So an install step here is not a convenience: it selects a
+    // toolchain the workflow never curated, and the hosted legs' pin on
+    // `stable` never reaches this job, since `toolchain_complaints` is asked
+    // about the jobs that install and this one does not. The action and its
+    // `toolchain` input are allowlisted for those jobs, which is why the
+    // step-pin check alone accepted it. Zero installs, as an equality.
+    // Measured, `MUT-TEST-WINDOWS-TOOLCHAIN-INSTALLED`.
+    for (index, step) in steps_of(job).iter().enumerate() {
+        if scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION)) {
+            out.push(format!(
+                "[test-windows-toolchain] `{TEST_WINDOWS_JOB}` step {index} installs a \
+                 toolchain. The golden image carries the compiler this leg runs; a step here \
+                 selects one the workflow never curated, and a Windows test gated on a newer \
+                 compiler is then omitted on the one leg that executes it."
+            ));
+        }
+    }
+
+    let expected_labels: BTreeSet<String> = TEST_WINDOWS_LABELS
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect();
+    let labels = field(job, "runs-on").and_then(scalar_set);
+    if labels.as_ref() != Some(&expected_labels) {
+        out.push(format!(
+            "[test-windows-runner] `{TEST_WINDOWS_JOB}` runs on {:?}, not exactly the label \
+             set {expected_labels:?}. A scalar here is a hosted runner, a subset is any \
+             self-hosted Windows machine the account registers, and the pinned set names the \
+             curated image.",
+            field(job, "runs-on")
+        ));
+    }
+
+    // The whole step, not the command inside it. The command says which suite
+    // Cargo was asked for; the lines after it are what say the suite ran, and
+    // an equality over the step is what stops those lines being dropped, or
+    // their floor lowered to a number an unexecuted suite clears. Measured,
+    // `MUT-WINDOWS-WITNESS-COUNT-DROPPED` and `MUT-WINDOWS-WITNESS-FLOOR-DROPPED`.
+    let running = steps_of(job)
+        .iter()
+        .filter(|step| scalar(step, "run") == Some(WINDOWS_TEST_WITNESS))
+        .count();
+    if running != 1 {
+        out.push(format!(
+            "[test-windows-command] `{TEST_WINDOWS_JOB}` has {running} steps whose `run:` is \
+             exactly the pinned suite-and-witness script, not one. Its first line is \
+             `{TEST_COMMAND}`; the rest is the count that says the suite executed rather \
+             than compiling and being handed to something that exits zero."
+        ));
+    }
+    out.extend(checkout_complaints(
+        job,
+        TEST_WINDOWS_JOB,
+        "test-windows-checkout",
+    ));
+    out.extend(step_pin_complaints(
+        job,
+        TEST_WINDOWS_JOB,
+        "test-windows-run-script",
+        &TEST_WINDOWS_SCRIPTS,
+    ));
+    out
+}
+
+/// Every way a test job's checkout points the suite at a tree other than the
+/// head under test.
+///
+/// `actions/checkout` with no inputs checks out the event's own ref: for a
+/// pull request, the candidate merged onto its base. Any input -- `ref:`,
+/// `repository:`, `path:` -- selects something else, and `ref: master` there
+/// tests `master` while every other leg reads the candidate. [`STEP_FIELDS`]
+/// admits `with:` because the toolchain and cache actions need it; on a
+/// checkout step it is refused whole. Measured, `MUT-TEST-WINDOWS-CHECKOUT-REF`
+/// and `MUT-TEST-CHECKOUT-REF`.
+fn checkout_complaints(job: &Yaml, named: &str, code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let checks_out =
+            scalar(step, "uses").is_some_and(|uses| uses.starts_with("actions/checkout@"));
+        if !checks_out {
+            continue;
+        }
+        let Some(inputs) = field(step, "with") else {
+            continue;
+        };
+        out.push(format!(
+            "[{code}] `{named}` step {index} checks out with inputs {:?}. With no inputs the \
+             action checks out the head under test; any input can point this leg at another \
+             tree while every other leg reads the candidate.",
+            field_names(inputs)
+        ));
+    }
+    out
+}
+
+/// Every way a step of a modelled job is something this contract did not pin.
+///
+/// The field and shell checks say how a step runs; this says what. A `run:`
+/// step whose script is not in the job's pinned set can move the checkout --
+/// `git fetch origin master && git checkout --detach FETCH_HEAD` -- before the
+/// pinned command runs, so that command runs against another tree while the
+/// labels, fields, shell and input-free checkout all still match. A `uses:`
+/// step off [`PINNED_ACTIONS`] is code nobody here reviewed, with a checkout
+/// of its own. Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED`,
+/// `MUT-TEST-RUN-RETARGETED`, `MUT-GATE-RUN-RETARGETED`,
+/// `MUT-MSRV-RUN-RETARGETED` and `MUT-STEP-USES-UNPINNED`.
+fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let unpinned_script = scalar(step, "run").filter(|script| !scripts.contains(script));
+        if let Some(script) = unpinned_script {
+            out.push(format!(
+                "[{code}] `{named}` step {index} runs a script this contract does not pin: \
+                 {script:?}. An unpinned step can move the checkout before the pinned command \
+                 runs, so the pinned command runs against another tree."
+            ));
+        }
+        let Some(uses) = scalar(step, "uses") else {
+            continue;
+        };
+        if !PINNED_ACTIONS.contains(&uses) {
+            out.push(format!(
+                "[unpinned-action] `{named}` step {index} uses {uses:?}, which is not one of the \
+                 pinned actions {PINNED_ACTIONS:?}; an unreviewed action, or a reviewed one at a \
+                 floating tag, can check out any tree it likes."
+            ));
+            continue;
+        }
+        // The commit says which code runs; the inputs say what it is told to
+        // do. `rust-cache`'s `cmd-format` wraps the commands it runs, so one
+        // input on an allowlisted action at a pinned commit is enough to put
+        // `git checkout` in front of every gate in the job.
+        let Some((_, allowed)) = ACTION_INPUTS
+            .iter()
+            .find(|(prefix, _)| uses.starts_with(prefix))
+        else {
+            out.push(format!(
+                "[unpinned-action-input] `{named}` step {index} uses {uses:?}, whose inputs this \
+                 contract does not model at all"
+            ));
+            continue;
+        };
+        let Some(inputs) = field(step, "with") else {
+            continue;
+        };
+        let strange = unexpected(&field_names(inputs), allowed);
+        if !strange.is_empty() {
+            out.push(format!(
+                "[unpinned-action-input] `{named}` step {index} gives {uses:?} the inputs \
+                 {strange:?}, which are not among {allowed:?}. An input can tell an allowlisted \
+                 action at a pinned commit to run commands of the candidate's choosing -- \
+                 `rust-cache`'s `cmd-format` wraps every command the step runs."
+            ));
+        }
+        // The values, not only the key names. The toolchain action builds shell
+        // text from `components` and interpolates it into a Bash line, so an
+        // allowlisted key with an unpinned value is a command the candidate
+        // chose running inside an action this contract calls pinned.
+        if uses.starts_with(TOOLCHAIN_ACTION) {
+            if let Some(components) = scalar(inputs, "components") {
+                if !TOOLCHAIN_COMPONENTS.contains(&components) {
+                    out.push(format!(
+                        "[unpinned-action-input] `{named}` step {index} asks for components \
+                         {components:?}, which is not one of {TOOLCHAIN_COMPONENTS:?}. This \
+                         action interpolates the value into a shell command, so an unpinned one \
+                         runs whatever it contains."
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every way a job installs a compiler other than the pinned one.
+///
+/// [`PINNED_ACTIONS`] pins the action by commit; this pins the input that
+/// decides which compiler it installs. A gate downgraded from `stable` to the
+/// version the golden image already carries leaves no leg compiling on current
+/// stable, and every other pin in this contract still matches. The MSRV leg is
+/// not checked here: it pins its own floor against the manifest, in
+/// [`ci_msrv_job_complaints`]. Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
+fn toolchain_complaints(
+    job: &Yaml,
+    named: &str,
+    code: &str,
+    expected: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let steps = steps_of(job);
+    let installs: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            scalar(step, "uses").is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let [install] = installs.as_slice() else {
+        // Zero is legitimate only where the image carries the toolchain, which
+        // is the self-hosted leg, and that job is not checked here.
+        out.push(format!(
+            "[{code}] `{named}` has {} steps using `{TOOLCHAIN_ACTION}`, not one, so which \
+             compiler its commands run is decided by something other than this workflow",
+            installs.len()
+        ));
+        return out;
+    };
+    // Position, not merely presence. The action installs a toolchain and makes
+    // it the rustup default, so a step above it runs whatever the runner image
+    // happened to preinstall -- during a release rollout that is the previous
+    // stable, and the witness that exists to compile *current* stable would be
+    // compiling something else while every other pin still matched.
+    if *install != 1 {
+        out.push(format!(
+            "[{code}] `{named}` installs its toolchain at step {install}, not step 1. The \
+             checkout is step 0 and the compiler is chosen next: any step above the install \
+             runs whatever the runner image preinstalled."
+        ));
+    }
+    if let Some(want) = expected {
+        let selected = field(&steps[*install], "with").and_then(|with| scalar(with, "toolchain"));
+        if selected != Some(want) {
+            out.push(format!(
+                "[{code}] `{named}` step {install} installs toolchain {selected:?}, not \
+                 `{want}`. The action is pinned by commit; its input is what decides which \
+                 compiler runs, and a downgrade here leaves current stable compiled by no leg."
+            ));
+        }
+    }
+    out
+}
+
+/// Every way the workflow's own `env:` is not the pinned mapping.
+///
+/// The whole map, as an equality. A guard per name can only refuse names
+/// somebody thought of, and the dangerous ones are the others: a Cargo target
+/// runner bound here makes `cargo test` build every harness and run none, on
+/// one target, which no other platform's leg would notice. Refusing the map
+/// wholesale refuses that class rather than that instance.
+/// Measured, `MUT-WORKFLOW-ENV-TARGET-RUNNER`.
+fn workflow_env_complaints(doc: &Yaml) -> Vec<String> {
+    let expected: BTreeMap<String, String> = WORKFLOW_ENV
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let found = field(doc, "env").and_then(scalar_map);
+    if found.as_ref() == Some(&expected) {
+        return Vec::new();
+    }
+    vec![format!(
+        "[workflow-env] the workflow's `env:` is {found:#?}, not exactly {expected:#?}. The \
+         whole mapping is pinned: a name this contract does not model can decide whether the \
+         compiled thing runs at all -- a Cargo target runner builds every harness and executes \
+         none, on one target, with every command, shell and label still matching."
+    )]
+}
+
+/// Every way the workflow's `permissions:` is not the pinned mapping.
+///
+/// The whole map, as an equality, for the reason the `env:` map is pinned
+/// whole: the field's presence is not the property that matters, its value is.
+/// A widened token is available to every build script and test the candidate
+/// ships, with the checkout's credential still configured, and no guest
+/// teardown recalls what it pushed.
+/// Measured, `MUT-WORKFLOW-PERMISSIONS-WIDENED`.
+fn workflow_permissions_complaints(doc: &Yaml) -> Vec<String> {
+    let expected: BTreeMap<String, String> = WORKFLOW_PERMISSIONS
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let found = field(doc, "permissions").and_then(scalar_map);
+    if found.as_ref() == Some(&expected) {
+        return Vec::new();
+    }
+    vec![format!(
+        "[workflow-permissions] the workflow's `permissions:` is {found:#?}, not exactly \
+         {expected:#?}. `write-all`, or a scalar this contract cannot read as the pinned \
+         mapping, hands every step a token a candidate's build scripts and tests can push \
+         with -- and the guest's destruction does not recall a push."
+    )]
+}
+
+/// Every way the hosted Windows codegen witness fails its contract.
+///
+/// The self-hosted leg executes the Windows suite with the golden image's
+/// toolchain, which moves only by re-curation. `cargo check` and Clippy on
+/// `windows-latest` type-check current stable and stop before codegen, so
+/// without this witness nothing on GitHub's current stable ever code-generates
+/// or links the Windows tree: a Windows-only codegen or link failure there
+/// would pass every hosted leg while the guest, one stable behind, links and
+/// passes. [`WINDOWS_BUILD_WITNESS`] builds every test binary and executes
+/// none. It lives in the Windows Clippy gate's job, whose field set and shells
+/// the gate contract pins; this pins the command, exactly once, on exactly one
+/// hosted Windows job. Measured, `MUT-WINDOWS-BUILD-WITNESS-*`.
+pub(super) fn ci_windows_build_witness_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let Some(platform) = CI_TARGETS
+        .iter()
+        .find(|target| target.runner == SELF_HOSTED_TEST_PLATFORM)
+    else {
+        return vec![format!(
+            "[windows-build-witness] `{SELF_HOSTED_TEST_PLATFORM}` is not a runner this \
+             contract models, so the shell its steps resolve to is undecidable here"
+        )];
+    };
+    let carriers: Vec<String> = field_names(jobs)
+        .into_iter()
+        .filter(|name| {
+            field(jobs, name).is_some_and(|job| {
+                scalar(job, "runs-on") == Some(SELF_HOSTED_TEST_PLATFORM)
+                    && steps_of(job)
+                        .iter()
+                        .any(|step| scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS))
+            })
+        })
+        .collect();
+    let [carrier] = carriers.as_slice() else {
+        out.push(format!(
+            "[windows-build-witness] expected exactly one job whose `runs-on:` is \
+             `{SELF_HOSTED_TEST_PLATFORM}` and one of whose steps has `run:` equal to \
+             `{WINDOWS_BUILD_WITNESS}`, found {carriers:?}. Without it no hosted leg \
+             code-generates or links the Windows tree on current stable: `cargo check` and \
+             Clippy stop before codegen, and the self-hosted leg builds with the image's \
+             toolchain."
+        ));
+        return out;
+    };
+    let Some(job) = field(jobs, carrier) else {
+        return out;
+    };
+    let witnesses = steps_of(job)
+        .iter()
+        .filter(|step| scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS))
+        .count();
+    if witnesses != 1 {
+        out.push(format!(
+            "[windows-build-witness] `{carrier}` has {witnesses} steps whose `run:` is \
+             exactly `{WINDOWS_BUILD_WITNESS}`, not one"
+        ));
+    }
+    // The carrier must be the Windows Clippy gate's job: that job's fields,
+    // shells, scripts and checkout are pinned by the gate contract, so the
+    // witness inherits every one of those pins. A witness on some other
+    // `windows-latest` job would be a pinned command on an unpinned job.
+    if !steps_of(job)
+        .iter()
+        .any(|step| scalar(step, "run") == Some(CLIPPY_GATE))
+    {
+        out.push(format!(
+            "[windows-build-witness] `{carrier}` carries the witness but not the Windows Clippy \
+             gate `{CLIPPY_GATE}`; the witness rides the gate job so the gate contract's pins \
+             on fields, shells, scripts and the checkout cover it"
+        ));
+    }
+    for (index, step) in steps_of(job).iter().enumerate() {
+        if scalar(step, "run") == Some(WINDOWS_BUILD_WITNESS) {
+            out.extend(shell_complaints(
+                doc,
+                job,
+                step,
+                platform,
+                &format!("`{carrier}` step {index}"),
+                platform.default_shell,
+            ));
+        }
     }
     out
 }
@@ -785,6 +1255,16 @@ pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {
              every substring reading of the same line."
         ));
     }
+    out.extend(step_pin_complaints(
+        job,
+        MSRV_JOB,
+        "msrv-run-script",
+        &[MSRV_COMMAND],
+    ));
+    out.extend(checkout_complaints(job, MSRV_JOB, "msrv-checkout"));
+    // Position only: this leg installs the manifest's floor, not `stable`, and
+    // the value is checked against `Cargo.toml` above.
+    out.extend(toolchain_complaints(job, MSRV_JOB, "msrv-toolchain", None));
 
     // The platform half, compared against the same derived runner set the Clippy
     // legs and the `test` matrix are. A floor is a per-platform fact: a
@@ -1134,6 +1614,10 @@ fn rustflags_override_complaints(node: &Yaml, named: &str) -> Vec<String> {
 pub(super) fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     let mut out = ci_gate_complaints(doc);
     out.extend(ci_test_job_complaints(doc));
+    out.extend(ci_test_windows_job_complaints(doc));
+    out.extend(ci_windows_build_witness_complaints(doc));
+    out.extend(workflow_env_complaints(doc));
+    out.extend(workflow_permissions_complaints(doc));
     out.extend(ci_msrv_job_complaints(doc));
     out.extend(rustflags_complaints(doc));
     out
@@ -1263,8 +1747,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  `os:` passes while the fixtures never run on that platform -- the matrix \
                  half of `PR5-MACOS-CLIPPY-NEVER-RUN`.",
         job: Some("test"),
-        anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
-        replacement: "        os: [windows-latest, ubuntu-latest, macos-latest]\n\
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
+        replacement: "        os: [ubuntu-latest, macos-latest]\n\
                       \x20       exclude:\n\
                       \x20         - os: macos-latest\n",
         refused_as: "test-job-matrix",
@@ -1302,8 +1786,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "a gate the aggregate does not depend on: branch protection settles green \
                  while the Windows denial gate is red. `PR5D-MSVC-CLIPPY-NEVER-RUN`.",
         job: Some("merge-gate"),
-        anchor: "    needs: [lint, lint-windows, lint-macos, msrv, test]\n",
-        replacement: "    needs: [lint, lint-macos, msrv, test]\n",
+        anchor: "    needs: [lint, lint-windows, lint-macos, msrv, test, test-windows]\n",
+        replacement: "    needs: [lint, lint-macos, msrv, test, test-windows]\n",
         refused_as: "aggregate-needs",
     },
     WorkflowEscape {
@@ -1324,8 +1808,8 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  `requires.split_whitespace().any(|word| word == looped)` passes on the \
                  trailing mention.",
         job: Some("merge-gate"),
-        anchor: "          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do\n",
-        replacement: "          for gate in LINT LINT_WINDOWS MSRV TEST; do : LINT_MACOS\n",
+        anchor: "          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST TEST_WINDOWS; do\n",
+        replacement: "          for gate in LINT LINT_WINDOWS MSRV TEST TEST_WINDOWS; do : LINT_MACOS\n",
         refused_as: "aggregate-loop",
     },
     WorkflowEscape {
@@ -1389,12 +1873,311 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     },
     WorkflowEscape {
         name: "MUT-CI-TEST-MATRIX-NARROWED",
-        escape: "the fixtures run on one platform and the other two go unexercised, while \
-                 every check that names the command still passes",
+        escape: "the hosted fixtures run on one platform and the other goes unexercised, \
+                 while every check that names the command still passes",
         job: Some("test"),
-        anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
         replacement: "        os: [ubuntu-latest]\n",
         refused_as: "test-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-MATRIX-KEEPS-WINDOWS",
+        escape: "the hosted matrix quietly re-admits Windows. Two jobs then run the Windows \
+                 suite, and the one whose duration this contract retired is back on the \
+                 critical path with every other check passing.",
+        job: Some("test"),
+        anchor: "        os: [ubuntu-latest, macos-latest]\n",
+        replacement: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
+        refused_as: "test-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-REHOSTED",
+        escape: "the self-hosted job moved back to `windows-latest` as a scalar `runs-on:`. \
+                 Every step still matches character for character; only the machine, and \
+                 with it the twelve minutes, changed.",
+        job: Some("test-windows"),
+        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        replacement: "    runs-on: windows-latest\n",
+        refused_as: "test-windows-runner",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-LABEL-DROPPED",
+        escape: "the labels loosened to `[self-hosted, windows]`, which any Windows runner \
+                 the account ever registers satisfies; the curated image is named by the \
+                 label this drops",
+        job: Some("test-windows"),
+        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        replacement: "    runs-on: [self-hosted, windows]\n",
+        refused_as: "test-windows-runner",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-COMMAND-DELETED",
+        escape: "the self-hosted job checks out, configures git, and runs no suite. The \
+                 witness makes this one loud twice over -- the step is off its pin, and a \
+                 count of nothing is below the floor -- but the pin is what refuses it here.",
+        job: Some("test-windows"),
+        anchor: "          cargo test --all-targets --all-features | Tee-Object -Variable log\n",
+        replacement: "",
+        refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-DISABLED",
+        escape: "a step-level `if: false` on the self-hosted job's test step: the job reports \
+                 success having run nothing. A job-level `if:` is not this escape -- the job \
+                 reports `skipped` and the aggregate, which accepts only `success`, fails.",
+        job: Some("test-windows"),
+        anchor: "      - name: Test, and witness that the suite ran\n",
+        replacement: "      - name: Test, and witness that the suite ran\n\
+                      \x20       if: false\n",
+        refused_as: "unexpected-step-field",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-WITNESS-COUNT-DROPPED",
+        escape: "the suite step keeps the pinned command and loses the count, which is the \
+                 shape this leg had before the witness and the shape `master` still has. A \
+                 `target.<triple>.runner` in the guest's Cargo home or environment then hands \
+                 every compiled harness to a wrapper that exits zero, the job is green, and \
+                 nothing on the hosted side can see the machine it happened on.",
+        job: Some("test-windows"),
+        anchor: "          $passed = [int](($log | Select-String -Pattern '^test result: ok\\. (\\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)\n          if ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        replacement: "",
+        refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-WITNESS-FLOOR-DROPPED",
+        escape: "the count stays and its floor drops to zero, so a suite that executed no \
+                 test clears it. The step still reads as a witness; it witnesses nothing. \
+                 Only an equality over the whole script sees the number change.",
+        job: Some("test-windows"),
+        anchor: "          if ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        replacement: "          if ($passed -lt 0) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n",
+        refused_as: "test-windows-command",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-TOOLCHAIN-INSTALLED",
+        escape: "the pinned toolchain action, with its allowlisted `toolchain` and `components` \
+                 inputs, is inserted after the self-hosted checkout with `toolchain: 1.96.0`. \
+                 Every step-level pin still holds -- the action is allowlisted, its input keys \
+                 are allowlisted, the components value is pinned -- and the suite runs on a \
+                 compiler the image never carried. A Windows test enabled only on 1.97 and \
+                 later is omitted on the one leg that executes it, and the aggregate is green. \
+                 Found by the ninth review pass: the hosted jobs pin `stable` through \
+                 `toolchain_complaints`, and this job, which installs nothing, was never asked.",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20     - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c\n\
+                      \x20       with:\n\
+                      \x20         toolchain: 1.96.0\n\
+                      \x20         components: clippy\n",
+        refused_as: "test-windows-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-RENAMED-AWAY",
+        escape: "the job renamed: the pinned name has no job. Not a false green -- the \
+                 aggregate's derived `needs` refuses the renamed workflow too -- but a lost \
+                 handle: every pin above hangs from this name, so the contract must notice the \
+                 name going before it notices nothing else",
+        job: None,
+        anchor: "\n  test-windows:\n",
+        replacement: "\n  test-windows-hosted:\n",
+        refused_as: "test-windows-missing",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-RUN-RETARGETED",
+        escape: "the identity step of the self-hosted job fetches `master` and checks it out \
+                 detached before the pinned test command runs. Labels, fields, shell, the \
+                 input-free checkout and the exact command all still match; the suite tests \
+                 `master`.",
+        job: Some("test-windows"),
+        anchor: "          git config --global user.name \"upstroke CI\"\n",
+        replacement: "          git config --global user.name \"upstroke CI\"\n\
+                      \x20         git fetch origin master\n\
+                      \x20         git checkout --detach FETCH_HEAD\n",
+        refused_as: "test-windows-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-RUN-RETARGETED",
+        escape: "the same retarget on the hosted test matrix: two platforms test `master` \
+                 while every pin still matches",
+        job: Some("test"),
+        anchor: "          git config --global user.name \"upstroke CI\"\n",
+        replacement: "          git config --global user.name \"upstroke CI\"\n\
+                      \x20         git fetch origin master\n\
+                      \x20         git checkout --detach FETCH_HEAD\n",
+        refused_as: "test-job-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-GATE-RUN-RETARGETED",
+        escape: "a step ahead of the Windows Clippy gate and the build witness checks out \
+                 `master`; both pinned commands then run against a tree the candidate never \
+                 touched, and a Windows-only denial or link failure in the candidate goes green",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: git fetch origin master && git checkout --detach FETCH_HEAD\n\
+                      \x20     - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        refused_as: "gate-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-RUN-RETARGETED",
+        escape: "the MSRV leg checks out `master` ahead of its pinned command; the floor is \
+                 verified on a tree the candidate never touched",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: git fetch origin master && git checkout --detach FETCH_HEAD\n\
+                      \x20     - run: cargo check --locked --all-targets --all-features\n",
+        refused_as: "msrv-run-script",
+    },
+    WorkflowEscape {
+        name: "MUT-STEP-USES-UNPINNED",
+        escape: "the self-hosted job's checkout floats to `actions/checkout@v4`: the same \
+                 action at whatever commit the tag points to, which is code nobody here \
+                 reviewed with a checkout of its own",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@v4\n",
+        refused_as: "unpinned-action",
+    },
+    WorkflowEscape {
+        name: "MUT-GATE-TOOLCHAIN-DOWNGRADED",
+        escape: "the Windows gate installs the guest's own `1.97.1` instead of `stable`: the \
+                 hosted witness then links the same toolchain the self-hosted leg links, so no \
+                 leg compiles the Windows tree on current stable and a build script emitting a \
+                 bad link directive only on newer rustc goes green",
+        job: Some("lint-windows"),
+        anchor: "          toolchain: stable\n",
+        replacement: "          toolchain: 1.97.1\n",
+        refused_as: "gate-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-DEFAULTS-WORKING-DIRECTORY",
+        escape: "a job-level default working directory points every `run:` step at another \
+                 crate: the pinned test command tests an empty `ci-pass/` while the labels, \
+                 shells, checkout and command all still match character for character",
+        job: Some("test-windows"),
+        anchor: "    timeout-minutes: 20\n",
+        replacement: "    timeout-minutes: 20\n\
+                      \x20   defaults:\n\
+                      \x20     run:\n\
+                      \x20       working-directory: ci-pass\n",
+        refused_as: "defaults-shape",
+    },
+    WorkflowEscape {
+        name: "MUT-CACHE-CMD-FORMAT",
+        escape: "the cache action, allowlisted and pinned by commit, is given a `cmd-format` \
+                 input that wraps every command it runs in a `git checkout` of `master`. The \
+                 checkout step is still input-free, every `run:` is still exact, and Clippy and \
+                 the build witness examine a tree the candidate never touched.",
+        job: Some("lint-windows"),
+        anchor: "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n",
+        replacement: "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\
+                      \x20       with:\n\
+                      \x20         cmd-format: 'cmd /d /s /c \"git fetch origin master && git checkout --detach FETCH_HEAD && {0}\"'\n",
+        refused_as: "unpinned-action-input",
+    },
+    WorkflowEscape {
+        name: "MUT-COMPONENTS-INJECTED",
+        escape: "the toolchain action's `components` value carries shell: the action builds a \
+                 command from it and interpolates it into a Bash line, so `clippy` plus a \
+                 checkout of `master` installs Clippy, moves the tree, and exits zero -- \
+                 through an allowlisted action, at a pinned commit, with an allowlisted input \
+                 name",
+        job: Some("lint-windows"),
+        anchor: "          components: clippy\n",
+        replacement: "          components: 'clippy;git${IFS}fetch${IFS}origin${IFS}master&&git${IFS}checkout${IFS}--detach${IFS}FETCH_HEAD;true'\n",
+        refused_as: "unpinned-action-input",
+    },
+    WorkflowEscape {
+        name: "MUT-TOOLCHAIN-NOT-FIRST",
+        escape: "a Cargo command is placed above the toolchain install, so it runs on whatever \
+                 the runner image preinstalled rather than on the toolchain this workflow \
+                 names. During a release rollout that is the previous stable, and the \
+                 current-stable witness on this job would be compiling something else with \
+                 every other pin still matching.",
+        job: Some("lint-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20     - run: cargo fmt --check\n",
+        refused_as: "gate-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-WORKFLOW-PERMISSIONS-WIDENED",
+        escape: "the job token widened to `write-all`: every build script and test the \
+                 candidate ships runs with a token that can push, the checkout leaves that \
+                 credential configured for later Git commands, and destroying the guest \
+                 afterwards recalls nothing",
+        job: None,
+        anchor: "permissions:\n  contents: read\n",
+        replacement: "permissions: write-all\n",
+        refused_as: "workflow-permissions",
+    },
+    WorkflowEscape {
+        name: "MUT-WORKFLOW-ENV-TARGET-RUNNER",
+        escape: "a Cargo target runner at workflow scope: every Windows test harness compiles \
+                 and none executes, because Cargo hands each one to `cmd /c echo`, which prints \
+                 the path it was given and exits zero. No Unix leg reads a Windows-target \
+                 variable, and the command, shell, labels and checkout all still match.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings\n\
+                      \x20 CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER: cmd /c echo\n",
+        refused_as: "workflow-env",
+    },
+    WorkflowEscape {
+        name: "MUT-WITNESS-CHECKOUT-REF",
+        escape: "the witness carrier's checkout points at `master`: the current-stable build \
+                 witness links a tree the candidate never touched while the guest, one stable \
+                 behind, links and passes the candidate",
+        job: Some("lint-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "gate-checkout",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-CHECKOUT-REF",
+        escape: "the self-hosted job's checkout points at `master`. Every hosted leg still \
+                 reads the candidate, the self-hosted leg tests a tree the candidate never \
+                 touched, and a Windows-only regression goes green.",
+        job: Some("test-windows"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "test-windows-checkout",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-CHECKOUT-REF",
+        escape: "the hosted test matrix checks out `master`: two platforms test a tree the \
+                 candidate never touched while Clippy and MSRV read the candidate",
+        job: Some("test"),
+        anchor: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n",
+        replacement: "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n\
+                      \x20       with:\n\
+                      \x20         ref: master\n",
+        refused_as: "test-job-checkout",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-BUILD-WITNESS-DELETED",
+        escape: "the hosted `cargo build --all-targets` step removed. Clippy and MSRV still \
+                 type-check the Windows tree on GitHub's runner, but nothing on current \
+                 stable code-generates or links it: a Windows-only codegen or link failure \
+                 passes every hosted leg while the guest, one stable behind, links and passes.",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo build --all-targets --all-features\n",
+        replacement: "",
+        refused_as: "windows-build-witness",
+    },
+    WorkflowEscape {
+        name: "MUT-WINDOWS-BUILD-WITNESS-NARROWED",
+        escape: "the witness narrowed to `cargo test --no-run`, which builds only test-profile \
+                 artifacts: a `#[cfg(all(windows, not(test)))]` body in a binary is never \
+                 linked on current stable, and a link failure there passes every hosted leg",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo build --all-targets --all-features\n",
+        replacement: "      - run: cargo test --no-run --all-targets --all-features\n",
+        refused_as: "windows-build-witness",
     },
     WorkflowEscape {
         name: "MUT-RUSTFLAGS-WEAKENED",

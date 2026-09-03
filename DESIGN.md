@@ -72,6 +72,7 @@ some records by path; this table says where each one's substance now lives.
 | 2026-08-26 durable retry feedback | §15 (`FailureRecord.detail` carries the retry brief onto the durable record) |
 | 2026-08-30 readiness lint placement | `CODING_STANDARDS.md` §2 and §12 (a per-site `#[expect]` recorded in `effects/allowlist.toml` may stand where a module-level allow did) |
 | 2026-08-30 test scratch-tree ownership | §15 (run-directory deletion authority is token-carried: `rundir::PrivateHalfProof` and the `cfg(test)`-only scratch-tree token) |
+| 2026-09-01 self-hosted Windows test leg | `MAINTAINING.md` step 3 and `ci.yml` (`test (winguest)` runs the Windows suite on an ephemeral self-hosted runner; the Windows Clippy, build-witness and MSRV legs stay on GitHub's runner) |
 | 2026-09-01 relicense to Apache-2.0 | `LICENSE`, `NOTICE`, `CONTRIBUTING.md` (the CLA), `MAINTAINING.md` (the archive-contents release gate) |
 | The thirteen proposals | Ten were already stubs; the G2 pass plan is discharged (§21), and the v0.5 portfolio proposal and its critique are v0.5 material, out of the engine's contract |
 | The acceptance run book and write-ups | §21 (the v0.1 definition of done and the date it was met) |

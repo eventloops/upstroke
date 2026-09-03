@@ -29,11 +29,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the first-class target (DESIGN.md §1), so it is not an
-        # afterthought here: the subprocess supervisor, the cmd /C quoting and
-        # the PATHEXT resolution all behave differently per platform and are
-        # covered by tests.
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # Windows is the first-class target (DESIGN.md §1) and its suite is not
+        # an afterthought: the subprocess supervisor, the cmd /C quoting and the
+        # PATHEXT resolution all behave differently per platform and are covered
+        # by tests. It is absent from this matrix because it runs below, in
+        # `test-windows`, on a self-hosted runner; these two legs stay on
+        # GitHub's runners.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -64,6 +66,54 @@ jobs:
 
       - run: cargo test --all-targets --all-features
 
+  # The Windows suite runs on an ephemeral self-hosted runner: a throwaway
+  # overlay of a frozen Server 2025 image on the build box, one job per boot,
+  # registered for that job with a single-use just-in-time config
+  # (decisions/2026-09-01-self-hosted-windows-test-leg.md). On windows-latest
+  # this suite took a median of 12.5 minutes and up to 21 -- a 2x host lottery
+  # measured on identical code -- and the guest runs it in about two and a
+  # half. `lint (windows)` and the Windows MSRV leg stay on windows-latest, and
+  # `lint (windows)` also links every binary and test harness with `cargo
+  # build --all-targets`, so GitHub's runner still compiles, code-generates
+  # and links every `#[cfg(windows)]` body on current stable; only the test
+  # execution moved. Every step of every job here is a pinned action or a
+  # pinned script: an unpinned step could check out another tree first.
+  # The image carries the toolchain, so there is no install step, and its
+  # target directory is pre-warmed, so there is no cache step.
+  test-windows:
+    name: test (winguest)
+    runs-on: [self-hosted, windows, winguest]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke CI"
+
+      # The suite, and a witness that it ran. A green `cargo test` is not that
+      # claim. A `target.<triple>.runner` bound in a `.cargo/config.toml`, in
+      # `$CARGO_HOME`, in a directory above the checkout or in the process
+      # environment makes Cargo compile every harness and hand each one to a
+      # wrapper that exits zero; a `[workspace]` in the root manifest whose
+      # `default-members` name another crate makes it build no harness of this
+      # one at all. Each is a green job over a suite that never ran, each is
+      # written somewhere a check reading this repository cannot see, and the
+      # list is not closed -- Cargo has more ways to be told this than anyone
+      # will enumerate. Counting what libtest itself reported refuses the
+      # effect instead of the causes: a suite that did not execute has no
+      # `test result: ok.` line to count. This is the one leg whose execution
+      # left GitHub's runners, so it is the leg that has to say so. The floor
+      # is today's count on this platform less a margin; removing that many
+      # tests is a deliberate act, and it edits this number in the same change.
+      - name: Test, and witness that the suite ran
+        run: |
+          cargo test --all-targets --all-features | Tee-Object -Variable log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = [int](($log | Select-String -Pattern '^test result: ok\. (\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)
+          if ($passed -lt 1700) { throw "the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them" }
+
   msrv:
     name: msrv (Rust 1.85, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -89,9 +139,18 @@ jobs:
   # note by MSVC clippy. So without this job `expected_failures_refusals[5]` and
   # `[6]` are undischarged for the Windows half of the tree.
   #
-  # A separate job rather than a step in `test`, deliberately: `test
-  # (windows-latest)` is the attestation of record for the Windows suite and a
-  # lint failure must not be able to masquerade as a test failure in it.
+  # A separate job rather than a step in a test job, deliberately: `test
+  # (winguest)` is the attestation of record for the Windows suite and a lint
+  # failure must not be able to masquerade as a test failure in it. This leg
+  # stays on windows-latest on purpose: GitHub's runner remains the neutral
+  # witness that the Windows tree compiles clean, and its second step, `cargo
+  # build --all-targets`, makes it the witness that the tree code-generates and
+  # links on current stable too, library, binaries and test harnesses alike --
+  # `cargo check` and Clippy stop before codegen, and the self-hosted leg links
+  # with the image's toolchain, which moves only by re-curation. In the dev
+  # profile, which is the profile every CI leg here builds; `release.yml` builds
+  # the shipped artifact with `--release`. The two steps fail separately and the
+  # log names which.
   lint-windows:
     name: lint (windows)
     runs-on: windows-latest
@@ -104,6 +163,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Pinned by the workflow oracle as `WINDOWS_BUILD_WITNESS`, exactly once
+      # on exactly one windows-latest job; a substring reading is not the check.
+      # `build --all-targets`, not `test --no-run`: the latter links only
+      # test-profile artifacts, so a `#[cfg(all(windows, not(test)))]` body in
+      # a binary would never be linked here.
+      - run: cargo build --all-targets --all-features
 
   # PR5-MACOS-CLIPPY-NEVER-RUN. Ubuntu Clippy configures out every
   # `#[cfg(target_os = "macos")]` region and the Windows leg configures out the
@@ -149,7 +214,7 @@ jobs:
   merge-gate:
     name: upstroke-ci
     if: always()
-    needs: [lint, lint-windows, lint-macos, msrv, test]
+    needs: [lint, lint-windows, lint-macos, msrv, test, test-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -161,9 +226,10 @@ jobs:
           LINT_MACOS_RESULT: ${{ needs.lint-macos.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          TEST_WINDOWS_RESULT: ${{ needs.test-windows.result }}
         run: |
           failed=0
-          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do
+          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST TEST_WINDOWS; do
             result_var="${gate}_RESULT"
             result="${!result_var}"
             if [[ "$result" != "success" ]]; then
