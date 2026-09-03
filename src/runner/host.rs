@@ -570,7 +570,9 @@ pub fn program_searches() -> u64 {
 /// constructible from `runner::host::naming`, `::environment` and `::probe`.
 /// `proof` has no children, so its siblings cannot reach the field and the
 /// only route to a value is [`contain_write_command`], which performs the
-/// join. The mint stays with the type, as `M5.md` requires.
+/// join. The mint stays with the type as a local implementation invariant of this
+/// module: a proof and the only code that may create it are read together or not
+/// at all.
 mod proof {
     use super::ESTABLISHMENTS;
     use crate::agent::proc::{self, SpawnHooks};
