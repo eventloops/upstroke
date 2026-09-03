@@ -78,8 +78,8 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
 /// evidence that nothing did.
 ///
 /// `crate::validate`'s tests need them as files, because `validate::run` reads
-/// its plan from a path; [`PLANS`] pairs each with the name it had, so that
-/// caller can write the corpus out under a scratch directory of its own.
+/// its plan from a path; each such test writes the one plan it needs into its
+/// own scratch root, under the name the plan carried.
 #[cfg(test)]
 pub(crate) mod corpus {
     /// No annotations at all, so every field comes from the heuristics: five
@@ -157,16 +157,6 @@ task, no annotations — everything comes from heuristics.
 3. Fix the flaky retry test that hits the limiter
 4. Document the rate-limit headers
 ";
-
-    /// The corpus by the file name each plan carried under `fixtures/`, for a
-    /// consumer that has to materialize it on disk. Sorted by name, which is the
-    /// order the directory listed them in.
-    pub(crate) const PLANS: [(&str, &str); 4] = [
-        ("bare-plan.md", BARE_PLAN),
-        ("cyclic-plan.md", CYCLIC_PLAN),
-        ("sample-plan.md", SAMPLE_PLAN),
-        ("steps-plan.md", STEPS_PLAN),
-    ];
 }
 
 #[cfg(test)]
