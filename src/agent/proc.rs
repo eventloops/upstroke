@@ -1442,8 +1442,30 @@ mod termination {
     /// as soon as the child has closed its descriptors. Runtime
     /// acknowledgements from a helper that is already up keep their own,
     /// shorter budgets.
+    ///
+    /// The wait is not a barrier against termination. Both READY waits run
+    /// while `claim_launch` holds the launch barrier, and the monitor refuses
+    /// to kill or stop any registered group while that barrier is held, so a
+    /// budget this long would otherwise let running agents outlive a SIGTERM
+    /// by the budget. The waits therefore poll in `LAUNCH_INTERRUPT_SLICE`
+    /// slices and abandon the launch, failing it, as soon as a termination is
+    /// pending (`launch_interrupted`); a termination that arrives with READY
+    /// fails it too. A suspension request is not an interruption: the guard
+    /// is what performs a suspension, and a launch that failed on Ctrl-Z would
+    /// be a surprise, so a suspension waits for READY and is then honoured,
+    /// within this budget rather than the old two seconds.
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
+    /// How long a READY wait goes between looks at the termination flag.
+    const LAUNCH_INTERRUPT_SLICE: Duration = Duration::from_millis(50);
     const GUARD_PROBE: u8 = 0xe1;
+
+    /// Whether a launch in progress should be given up: a termination is
+    /// pending, and the launch barrier it holds is what keeps the monitor
+    /// from acting on the groups already running. The same test
+    /// `claim_launch` makes before taking the barrier.
+    fn launch_interrupted() -> bool {
+        PENDING_TERMINATION.load(Ordering::SeqCst) != 0
+    }
     const HANDLE_SIGINT: u8 = 1 << 0;
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
@@ -2474,11 +2496,19 @@ mod termination {
             pid,
         };
         let ready_wait = std::time::Instant::now();
-        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
+        let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
+        // A termination that arrived during the wait, or with READY, wins:
+        // the caller holds the launch barrier, and releasing it is what lets
+        // the monitor act on the groups already running.
+        if launch_interrupted() {
+            reaper.abandon();
+            return Err("process launch interrupted by a termination signal".to_owned());
+        }
+        if ready != Some(REAPER_READY) {
             let waited = ready_wait.elapsed();
             reaper.abandon();
-            // Hints for a recurrence, not a diagnosis: `read_guard_ack`
-            // answers `None` for a timeout, EOF and a read error alike, and a
+            // Hints for a recurrence, not a diagnosis: the wait answers
+            // `None` for a timeout, EOF and a read error alike, and a
             // full-budget wait can be the close loop, a starved child, or a
             // stopped one. A short wait does rule the loop out.
             return Err(format!(
@@ -2837,13 +2867,31 @@ mod termination {
     }
 
     fn read_guard_ack(fd: libc::c_int, timeout: Duration) -> Option<u8> {
+        read_guard_ack_until(fd, timeout, || false)
+    }
+
+    /// One byte from `fd` within `timeout`, unless `interrupted` says to stop
+    /// waiting first.
+    ///
+    /// The wait polls in slices no longer than `LAUNCH_INTERRUPT_SLICE` and
+    /// asks `interrupted` after each empty slice, so a caller holding the
+    /// launch barrier (`claim_launch`) can give it up as soon as a termination
+    /// is pending rather than at the end of its budget. `None` for a timeout,
+    /// an interruption, EOF and a read error alike; a caller that needs to
+    /// tell interruption apart asks its predicate again.
+    fn read_guard_ack_until(
+        fd: libc::c_int,
+        timeout: Duration,
+        interrupted: impl Fn() -> bool,
+    ) -> Option<u8> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return None;
             }
-            let timeout_ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128))
+            let slice = remaining.min(LAUNCH_INTERRUPT_SLICE);
+            let timeout_ms = i32::try_from(slice.as_millis().min(i32::MAX as u128))
                 .unwrap_or(i32::MAX)
                 .max(1);
             let mut poll_fd = libc::pollfd {
@@ -2855,7 +2903,12 @@ mod termination {
             // prevents a failed guard wedging the signal monitor.
             let polled = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
             if polled == 0 {
-                return None;
+                // An empty slice: give up if asked to, otherwise the loop
+                // recomputes what is left of the budget.
+                if interrupted() {
+                    return None;
+                }
+                continue;
             }
             if polled < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -3051,9 +3104,14 @@ mod termination {
         };
         let mut probe_pid_bytes = [0_u8; 4];
         // Startup READY waits on the child's descriptor close loop; see
-        // `HELPER_READY_BUDGET`. Read here rather than through `read_ack`,
-        // whose two-second budget is the runtime ARM acknowledgement's.
-        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(GUARD_READY)
+        // `HELPER_READY_BUDGET`, and its note on why the wait gives up as
+        // soon as a termination is pending. Read here rather than through
+        // `read_ack`, whose two-second budget is the runtime ARM
+        // acknowledgement's.
+        let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
+        let interrupted = launch_interrupted();
+        if interrupted
+            || ready != Some(GUARD_READY)
             || !read_raw_exact(ack[0], &mut probe_pid_bytes)
             || i32::from_ne_bytes(probe_pid_bytes) <= 0
         {
@@ -3065,6 +3123,11 @@ mod termination {
             unsafe {
                 let _ = libc::kill(pid, libc::SIGKILL);
                 let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            if interrupted {
+                return Err(
+                    "Unix job-control guard launch interrupted by a termination signal".to_owned(),
+                );
             }
             return Err("Unix job-control guard did not initialize".to_owned());
         }
@@ -4685,6 +4748,88 @@ mod termination {
             assert!(
                 output.status.success(),
                 "reaper handshake helper: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn reaper_interrupt_helper() {
+            if std::env::var_os("UPSTROKE_REAPER_INTERRUPT_HELPER").is_none() {
+                return;
+            }
+            // A termination pending while the reaper is still closing its
+            // descriptors: the launch must fail well inside the READY budget,
+            // say why, leave the flag as it found it, and leave no child.
+            PENDING_TERMINATION.store(1, Ordering::SeqCst);
+            let started = Instant::now();
+            let launch = spawn_reaper();
+            let elapsed = started.elapsed();
+            let message = match launch {
+                Ok(_) => panic!("a launch with a termination pending was accepted"),
+                Err(message) => message,
+            };
+            assert!(
+                message.contains("interrupted by a termination signal"),
+                "the launch failed for the wrong reason: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "a pending termination held the launch for {elapsed:?}"
+            );
+            assert_eq!(
+                PENDING_TERMINATION.load(Ordering::SeqCst),
+                1,
+                "an interrupted launch changed the pending termination"
+            );
+            // SAFETY: `waitpid(-1, WNOHANG)` inspects only this process's
+            // children, and the abandoned reaper is the only child it has had.
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(
+                waited < 0 && !last_errno_is_interrupted(),
+                "the interrupted reaper was left behind (waitpid(-1, WNOHANG) returned {waited})"
+            );
+
+            // The same termination arriving with READY rather than before it:
+            // no delay, so READY is immediate, and the launch still fails.
+            // SAFETY: the variable is read by this process's own spawn, and
+            // the helper is single-threaded at this point.
+            unsafe { std::env::remove_var("UPSTROKE_TEST_REAPER_READY_DELAY_MS") };
+            let message = match spawn_reaper() {
+                Ok(_) => panic!("a launch whose READY arrived with a termination pending was accepted"),
+                Err(message) => message,
+            };
+            assert!(
+                message.contains("interrupted by a termination signal"),
+                "the launch at READY failed for the wrong reason: {message}"
+            );
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(
+                waited < 0 && !last_errno_is_interrupted(),
+                "the reaper abandoned at READY was left behind (waitpid(-1, WNOHANG) returned {waited})"
+            );
+        }
+
+        /// A termination pending during the READY wait interrupts the launch:
+        /// the launch barrier it holds is what keeps the monitor from acting on
+        /// the groups already running, so the wait may not outlast the signal.
+        #[test]
+        fn a_termination_pending_during_ready_interrupts_the_launch() {
+            use std::os::unix::process::CommandExt;
+
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["reaper_interrupt_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_REAPER_INTERRUPT_HELPER", "1")
+                .env("UPSTROKE_TEST_REAPER_READY_DELAY_MS", "3000")
+                .process_group(0)
+                .stdin(Stdio::null())
+                .output()
+                .expect("run the reaper interrupt helper");
+            assert!(
+                output.status.success(),
+                "reaper interrupt helper: {}\n{}\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
