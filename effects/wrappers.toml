@@ -260,7 +260,9 @@ effect_free = [
     "from",
     "from_intent_name",
     "gates",
-    "git_path",
+    "deserialize",
+    "expecting",
+    "id",
     "integration",
     "intent_kind",
     "intent_name",
@@ -268,8 +270,11 @@ effect_free = [
     "relative",
     "review",
     "safe_component",
+    "serialize",
     "try_from",
     "validate",
+    "visit_map",
+    "visit_str",
 ]
 
 # Object-id well-formedness and the two refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
