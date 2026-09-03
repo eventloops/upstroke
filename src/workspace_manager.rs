@@ -653,7 +653,7 @@ impl WorkspaceManager {
             Some("tasks") | Some("merge") | Some("snapshots")
         ) && name
             .to_str()
-            .is_some_and(|name| safe_component(name).is_none())
+            .is_some_and(|name| safe_component(name).is_ok())
     }
 
     /// The slot's path, with its name validated first.

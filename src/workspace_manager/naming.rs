@@ -132,23 +132,33 @@ impl fmt::Display for SnapshotName {
     }
 }
 
-/// Whether `name` is safe as a single path component.
-pub(super) fn safe_component(name: &str) -> Option<&'static str> {
+/// Check that `name` is safe as a single path component, or say why it is not.
+///
+/// The grammar is one non-empty run of ASCII alphanumerics, `-` and `_` that
+/// does not start with `-`. Everything containment needs follows from it: a
+/// separator, `..`, a drive or UNC prefix and a non-UTF-8 byte cannot occur
+/// at all, and `.` is excluded so that [`Slot::intent_name`]'s `.` joins stay
+/// unambiguous. The objection is the `why` of [`Refusal::SlotName`], and the
+/// verdict is a `Result` so that a caller cannot drop it unread.
+///
+/// # Errors
+///
+/// The first objection, as a sentence fragment that completes "refusing the
+/// slot name `x`: ...".
+pub(super) fn safe_component(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
-        return Some("it is empty");
+        return Err("it is empty");
     }
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Some("only ASCII alphanumerics, `-`, and `_` are legal in a slot component");
+        return Err("only ASCII alphanumerics, `-`, and `_` are legal in a slot component");
     }
     if name.starts_with('-') {
-        return Some(
-            "a leading `-` would be read as an option by the Git commands the funnels run",
-        );
+        return Err("a leading `-` would be read as an option by the Git commands the funnels run");
     }
-    None
+    Ok(())
 }
 
 impl Slot {
@@ -186,44 +196,67 @@ impl Slot {
     }
 
     /// Refuse a slot whose components could escape the execution root.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::SlotName`], naming the kind, the name and
+    /// [`safe_component`]'s objection.
     pub(super) fn validate(&self) -> Result<(), Refusal> {
-        let (kind, name) = match self {
-            Self::Task { key, .. } => ("task", key.as_str()),
+        let name = match self {
+            Self::Task { key, .. } => key.as_str(),
+            // A sequence number renders as decimal digits, which is a safe
+            // component by construction.
             Self::Staging { .. } => return Ok(()),
-            Self::Snapshot { name } => ("snapshot", name.as_str()),
+            Self::Snapshot { name } => name.as_str(),
         };
-        match safe_component(name) {
-            None => Ok(()),
-            Some(why) => Err(Refusal::SlotName {
-                kind,
-                name: name.to_owned(),
-                why,
-            }),
-        }
+        safe_component(name).map_err(|why| Refusal::SlotName {
+            kind: self.kind(),
+            name: name.to_owned(),
+            why,
+        })
     }
 
     /// Rebuild a slot from an intent file name, so reclaim never has to trust
     /// a path stored inside a record.
+    ///
+    /// `Some` exactly on [`Self::intent_name`]'s image. The name is parsed and
+    /// then re-rendered, and only a name equal to its own rendering is an
+    /// intent name. A name that merely *reads* as one — `tasks.kalpha-g03.intent`
+    /// or `merge.s+7.intent`, both of which the integer parser accepts — is
+    /// refused, because the slot it would produce renders to a different file:
+    /// reclaim would remove that file's intent and leave this one for every
+    /// later start to enumerate, report as reclaimed, and leave again.
+    ///
+    /// `None` is this parser's whole verdict, and the `?`s that produce it are
+    /// deliberate. The parser does not know it is reading the intents
+    /// directory, so it cannot say what a stray file there means; the caller
+    /// that walks that directory does, and refuses with the file's name. The
+    /// integer parse errors are discarded for the same reason: which way a
+    /// generation failed to parse adds nothing to "not an intent name".
+    ///
+    /// Grammar here, containment in [`Self::validate`]: a well-formed name
+    /// whose component is not a [`safe_component`] — an empty key, a snapshot
+    /// name carrying `.` — is returned, and `validate` refuses it.
+    #[must_use]
     pub(super) fn from_intent_name(name: &str) -> Option<Self> {
         let stem = name.strip_suffix(".intent")?;
-        if let Some(rest) = stem.strip_prefix("tasks.k") {
+        let slot = if let Some(rest) = stem.strip_prefix("tasks.k") {
             let (key, generation) = rest.rsplit_once("-g")?;
-            return Some(Self::Task {
+            Self::Task {
                 key: key.to_owned(),
                 generation: generation.parse().ok()?,
-            });
-        }
-        if let Some(rest) = stem.strip_prefix("merge.s") {
-            return Some(Self::Staging {
+            }
+        } else if let Some(rest) = stem.strip_prefix("merge.s") {
+            Self::Staging {
                 sequence: rest.parse().ok()?,
-            });
-        }
-        if let Some(rest) = stem.strip_prefix("snapshots.") {
-            return Some(Self::Snapshot {
+            }
+        } else {
+            let rest = stem.strip_prefix("snapshots.")?;
+            Self::Snapshot {
                 name: SnapshotName(rest.to_owned()),
-            });
-        }
-        None
+            }
+        };
+        (slot.intent_name() == name).then_some(slot)
     }
 }
 
@@ -251,4 +284,213 @@ pub struct IntentRecord {
     /// The coordinator incarnation that wrote it, so a later incarnation of the
     /// same run can tell its own residue from a live sibling's.
     pub incarnation: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One slot per shape the grammar has to tell apart: a key that contains,
+    /// ends with, or is the `-g` separator's letter; the generation and
+    /// sequence extremes; and all three snapshot constructors.
+    fn every_shape() -> Vec<Slot> {
+        vec![
+            Slot::Task {
+                key: "alpha".to_owned(),
+                generation: 0,
+            },
+            Slot::Task {
+                key: "alpha-g2".to_owned(),
+                generation: 3,
+            },
+            Slot::Task {
+                key: "alpha-g".to_owned(),
+                generation: 3,
+            },
+            Slot::Task {
+                key: "g".to_owned(),
+                generation: u32::MAX,
+            },
+            Slot::Task {
+                key: "0123456789abcdef".to_owned(),
+                generation: 1,
+            },
+            Slot::Staging { sequence: 0 },
+            Slot::Staging { sequence: u64::MAX },
+            Slot::Snapshot {
+                name: SnapshotName::gates(1, 2),
+            },
+            Slot::Snapshot {
+                name: SnapshotName::review(1, 2, 3),
+            },
+            Slot::Snapshot {
+                name: SnapshotName::integration(4),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_slot_shape_survives_the_intent_name_round_trip() {
+        for slot in every_shape() {
+            slot.validate().expect("every fixture slot is a valid one");
+            let name = slot.intent_name();
+            assert_eq!(
+                Slot::from_intent_name(&name),
+                Some(slot.clone()),
+                "`{name}` did not come back as the slot that rendered it"
+            );
+            assert_eq!(
+                name,
+                format!("{}.{}.intent", slot.kind_namespace(), slot.component()),
+                "the intent name is the namespace, the component and the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_intent_name_did_not_produce_is_not_an_intent_name() {
+        for name in [
+            // The integer parser accepts these; the round trip does not,
+            // because each re-renders to a different file name.
+            "tasks.kalpha-g03.intent",
+            "tasks.kalpha-g+3.intent",
+            "merge.s007.intent",
+            "merge.s+7.intent",
+            // Malformed bodies under a known namespace.
+            "tasks.kalpha.intent",
+            "tasks.kalpha-g.intent",
+            "tasks.kalpha-gx.intent",
+            "tasks.kalpha-g4294967296.intent",
+            "tasks.kalpha-g-1.intent",
+            "merge.s.intent",
+            "merge.s-1.intent",
+            "merge.sx.intent",
+            // Unknown or misspelled namespaces, and no namespace.
+            "snapshot.g1-a1-gates.intent",
+            "task.kalpha-g1.intent",
+            "intents.x.intent",
+            ".intent",
+            "",
+            // Not the suffix. The first is the name `write_synced` stages an
+            // intent under before its rename; the parser refuses it like any
+            // other stray file, and what the directory walk should make of
+            // that residue is the parent's decision, not this parser's.
+            "tasks.kalpha-g1.tmp",
+            "tasks.kalpha-g1.intent.bak",
+            "tasks.kalpha-g1",
+            "tasks.kalpha-g1.intent ",
+        ] {
+            assert_eq!(
+                Slot::from_intent_name(name),
+                None,
+                "`{name}` was accepted as an intent name"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parser_reads_the_grammar_and_validate_reads_containment() {
+        // Well-formed under the grammar, refused by containment: the parser
+        // returns the slot and `validate` is where it is refused, so the
+        // directory walk sees the refusal that names the component.
+        for (name, objection) in [
+            ("tasks.k-g3.intent", "it is empty"),
+            ("snapshots..intent", "it is empty"),
+            ("snapshots.a.b.intent", "only ASCII alphanumerics"),
+            ("tasks.ka/b-g1.intent", "only ASCII alphanumerics"),
+            ("snapshots.-x.intent", "a leading `-`"),
+        ] {
+            let slot = Slot::from_intent_name(name)
+                .unwrap_or_else(|| panic!("`{name}` is well-formed under the grammar"));
+            assert_eq!(
+                slot.intent_name(),
+                name,
+                "the round trip holds for `{name}`"
+            );
+            let refusal = slot
+                .validate()
+                .expect_err("containment refuses what the grammar admitted");
+            assert!(
+                matches!(&refusal, Refusal::SlotName { why, .. } if why.starts_with(objection)),
+                "`{name}` was refused for the wrong reason: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_component_names_the_first_objection() {
+        for name in ["a", "A-1_b", "0", "a-", "_"] {
+            assert_eq!(safe_component(name), Ok(()), "`{name}` is a safe component");
+        }
+        assert_eq!(safe_component(""), Err("it is empty"));
+        for name in ["a/b", "a\\b", "a.b", "..", "a b", "\u{e9}", "a\0"] {
+            assert!(
+                safe_component(name).is_err_and(|why| why.starts_with("only ASCII")),
+                "`{name}` was accepted"
+            );
+        }
+        assert!(
+            safe_component("-x").is_err_and(|why| why.starts_with("a leading `-`")),
+            "a leading `-` is refused after the character-set check"
+        );
+        // A staging slot's component is decimal digits by construction and is
+        // the one `validate` never checks; the claim is kept honest here.
+        for sequence in [0, 1, u64::MAX] {
+            let slot = Slot::Staging { sequence };
+            assert_eq!(safe_component(&slot.component()), Ok(()));
+            slot.validate()
+                .expect("a staging slot is valid by construction");
+        }
+    }
+
+    #[test]
+    fn the_intent_record_schema_is_pinned() {
+        let record = IntentRecord {
+            kind: "task".to_owned(),
+            slot: "tasks/kalpha-g1".to_owned(),
+            run_id: "run".to_owned(),
+            incarnation: "01".to_owned(),
+        };
+        let json = serde_json::to_string(&record).expect("a record serializes");
+        assert_eq!(
+            json, r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run","incarnation":"01"}"#,
+            "the persisted field names and order are the on-disk schema; a change here is a \
+             compatibility decision, not a refactor"
+        );
+        let back: IntentRecord = serde_json::from_str(&json).expect("the record reads back");
+        assert_eq!(back, record);
+        assert!(
+            serde_json::from_str::<IntentRecord>(
+                r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run","incarnation":"01","path":"/x"}"#
+            )
+            .is_err(),
+            "an unknown field is refused: a record must not smuggle a path into reclaim"
+        );
+        assert!(
+            serde_json::from_str::<IntentRecord>(
+                r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run"}"#
+            )
+            .is_err(),
+            "no field has a default"
+        );
+    }
+
+    impl Slot {
+        /// The namespace half of the intent name, for the tests' own oracle.
+        fn kind_namespace(&self) -> &'static str {
+            match self {
+                Self::Task { .. } => "tasks",
+                Self::Staging { .. } => "merge",
+                Self::Snapshot { .. } => "snapshots",
+            }
+        }
+
+        /// The component half: the last path component of [`Self::relative`].
+        fn component(&self) -> String {
+            self.relative()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .expect("every slot path ends in a component")
+        }
+    }
 }
