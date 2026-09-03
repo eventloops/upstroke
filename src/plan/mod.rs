@@ -51,112 +51,44 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
         })
 }
 
-/// The plan corpus, inlined.
+/// The plan corpus, embedded at compile time from `fixtures/`.
 ///
-/// Until 2026-09-02 these four plans were files in a `fixtures/` directory at
-/// the repository root: read from disk by three separate test regions —
-/// `plan::markdown`, `crate::validate` and `crate::topology::registry` — and
-/// shipped as four standalone paths inside the published crate. They are
-/// constants here, and every one of those consumers now reads this one source.
-/// Nothing enforces that. A new test module can declare its own literal and
-/// compile, and the two can then drift with nothing failing; this is where the
-/// corpus lives, not a guarantee that it is the only copy.
+/// The four plan files under `fixtures/` at the repository root are the single
+/// source of this corpus. Each constant below is [`include_str!`] of one of
+/// them: the compiler reads the file, the text is part of the test binary, and
+/// nothing reads the file at run time — `plan::markdown`'s and
+/// `crate::topology::registry`'s tests take the text from here. The one region
+/// that still reads the files from disk at run time is `crate::validate`'s
+/// tests, which never stopped: `validate::run` takes a path, and those tests
+/// hand it `fixtures/<name>.md` as they always have. Only the plans a
+/// compile-time consumer uses are embedded; `cyclic-plan.md` has none — its
+/// one reader is `validate`'s refusal test, at run time — so it is a file and
+/// nothing else.
 ///
-/// **Do not reflow, re-indent, or tidy them.** Each constant below is the file
-/// it replaced byte for byte, LF endings and final newline included, and what
-/// pins it there is the external SHA-256 comparison recorded in the pull
-/// request that inlined them. The suite computes no such hash, so it is not a
-/// second opinion on the bytes.
+/// One copy, not two. A literal here would put the plan text in the file and in
+/// the source, and a corpus kept in two places drifts — the class this
+/// repository has recorded three times. Edit the file; the constant follows.
 ///
-/// The parser is what the bytes matter to. The annotation grammar is column-
-/// and delimiter-sensitive, and dropping the final LF changes
-/// `Plan.source.hash`. That hash is **not** a byte oracle, though:
+/// The parser is what the bytes matter to: the annotation grammar is column-
+/// and delimiter-sensitive, and `steps-plan.md` carries a U+2014 em dash it
+/// sees. `Plan.source.hash` is not a byte oracle for them —
 /// [`crate::ir::content_hash`] skips every CR deliberately, so a CRLF checkout
-/// of a plan hashes the same as its LF original — which is what
-/// `markdown::tests::crlf_plans_parse_identically` asserts. Read a changed
-/// `source.hash` as evidence that something moved, never a stable one as
-/// evidence that nothing did.
-///
-/// `crate::validate`'s tests need them as files, because `validate::run` reads
-/// its plan from a path; each such test writes the one plan it needs into its
-/// own scratch root, under the name the plan carried.
+/// hashes the same as the LF original, which
+/// `markdown::tests::crlf_plans_parse_identically` asserts.
 #[cfg(test)]
 pub(crate) mod corpus {
     /// No annotations at all, so every field comes from the heuristics: five
     /// tasks inferred from `##` headings, with one acceptance list.
-    pub(crate) const BARE_PLAN: &str = r"# Search improvements
-
-## Design the search index schema
-
-Sketch the fields, analyzers, and ranking signals.
-
-Acceptance:
-- Field list agreed
-- Ranking signals documented
-
-## Implement the batch indexer
-
-Build the batch indexer over the document store.
-
-## Fix stale-cache invalidation
-
-## Test the reindex path
-
-## Update search docs
-";
-
-    /// Deliberately cyclic — `a -> c -> b -> a`. It is a refusal fixture and
-    /// the cycle is the point; do not repair it.
-    pub(crate) const CYCLIC_PLAN: &str = r"# Cyclic plan (must fail validation)
-
-## Task A
-<!-- upstroke: id=a depends=c -->
-
-## Task B
-<!-- upstroke: id=b depends=a -->
-
-## Task C
-<!-- upstroke: id=c depends=b -->
-";
+    pub(crate) const BARE_PLAN: &str = include_str!("../../fixtures/bare-plan.md");
 
     /// The annotated plan: every annotation attribute the grammar carries, a
     /// `min=` clip, path hints, and an artifact wired along the dependency
     /// chain. Four tasks, no cycles.
-    pub(crate) const SAMPLE_PLAN: &str = r"# Pagination rework
-
-## Design the pagination API
-<!-- upstroke: id=api-design kind=design depends= tier=frontier out=api-contract -->
-Define cursor format, page-size limits, and error contract.
-
-Acceptance:
-- Cursor format documented
-- Error contract covers empty pages
-
-## Implement cursor encoding
-<!-- upstroke: id=cursors kind=implement depends=api-design needs=api-contract paths=src/api/** -->
-Implement opaque cursor encode/decode per the contract.
-
-## Fix off-by-one in list endpoint
-<!-- upstroke: id=fix-obo kind=fix depends=cursors min=mid paths=src/api/** -->
-
-## Update API docs
-<!-- upstroke: id=docs kind=docs depends=fix-obo -->
-";
+    pub(crate) const SAMPLE_PLAN: &str = include_str!("../../fixtures/sample-plan.md");
 
     /// The Claude Code plan-mode shape: an ordered list, no per-task headings,
-    /// no annotations. Its third line carries a U+2014 em dash, which is one of
-    /// the bytes this corpus exists to keep exact.
-    pub(crate) const STEPS_PLAN: &str = r"# Add rate limiting to the API
-
-Claude Code plan-mode shape: numbered implementation steps, no headings per
-task, no annotations — everything comes from heuristics.
-
-1. Design the limiter interface and storage schema
-2. Implement the token-bucket middleware
-   - keep counters in `src/limit/bucket.rs`
-3. Fix the flaky retry test that hits the limiter
-4. Document the rate-limit headers
-";
+    /// no annotations. Its third line carries a U+2014 em dash.
+    pub(crate) const STEPS_PLAN: &str = include_str!("../../fixtures/steps-plan.md");
 }
 
 #[cfg(test)]
