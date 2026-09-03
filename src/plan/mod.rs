@@ -57,16 +57,25 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
 /// the repository root: read from disk by three separate test regions —
 /// `plan::markdown`, `crate::validate` and `crate::topology::registry` — and
 /// shipped as four standalone paths inside the published crate. They are
-/// constants here, in one module every consumer reaches, so a second copy
-/// cannot appear later.
+/// constants here, and every one of those consumers now reads this one source.
+/// Nothing enforces that. A new test module can declare its own literal and
+/// compile, and the two can then drift with nothing failing; this is where the
+/// corpus lives, not a guarantee that it is the only copy.
 ///
-/// **Every byte is significant.** `plan::markdown` mints `Plan.source.hash`
-/// from the content and the annotation grammar is column- and
-/// delimiter-sensitive, so a plan's text is its identity: dropping the final
-/// newline alone changes `Plan.source.hash`, even where the task list it parses
-/// to is unchanged. Each constant below is the file it replaced byte for byte,
-/// LF endings and final newline included. Do not reflow, re-indent, or tidy
-/// them.
+/// **Do not reflow, re-indent, or tidy them.** Each constant below is the file
+/// it replaced byte for byte, LF endings and final newline included, and what
+/// pins it there is the external SHA-256 comparison recorded in the pull
+/// request that inlined them. The suite computes no such hash, so it is not a
+/// second opinion on the bytes.
+///
+/// The parser is what the bytes matter to. The annotation grammar is column-
+/// and delimiter-sensitive, and dropping the final LF changes
+/// `Plan.source.hash`. That hash is **not** a byte oracle, though:
+/// [`crate::ir::content_hash`] skips every CR deliberately, so a CRLF checkout
+/// of a plan hashes the same as its LF original — which is what
+/// `markdown::tests::crlf_plans_parse_identically` asserts. Read a changed
+/// `source.hash` as evidence that something moved, never a stable one as
+/// evidence that nothing did.
 ///
 /// `crate::validate`'s tests need them as files, because `validate::run` reads
 /// its plan from a path; [`PLANS`] pairs each with the name it had, so that
