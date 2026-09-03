@@ -203,7 +203,7 @@ struct AllowlistEntry {
     /// How many **per-site** `#[expect(…)]` attributes of the recorded lints the
     /// file carries, or zero when its allowance is the module-level one.
     ///
-    /// `decisions/2026-08-30-readiness-lint-placement.md`. A per-site
+    /// `standards/02_standards_automated_baseline.md`. A per-site
     /// expectation is narrower than a module-level allow and the compiler owns
     /// its count in both directions; this is the reviewed number that count is
     /// checked against, so an annotation appearing or vanishing has to pass
@@ -392,7 +392,7 @@ fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
     const LINT: &str = "clippy::disallowed_methods";
     const SITES: usize = 6;
-    const DECISION: &str = "decisions/2026-08-30-readiness-lint-placement.md";
+    const DECISION: &str = "standards/02_standards_automated_baseline.md";
     // The records are prose and spell the count as a word. The two are bound
     // rather than restated: changing `SITES` without changing the word fails
     // here instead of quietly searching for a phrase no record contains.
