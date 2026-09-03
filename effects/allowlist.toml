@@ -212,10 +212,10 @@ that is `PR6-LANEF-004`, measured twice in the Container subtree, and this is \
 the first out-of-line child the Process funnel has ever had. \
 ALL THREE GOVERNED LINTS ARE DENIED AT FILE SCOPE, AND THE ALLOWANCE IS SIX \
 PER-SITE `#[expect]` ATTRIBUTES rather than a file-scope allow. That is \
-`PR72-PLACEMENT-001` and `standards/02_standards_automated_baseline.md` is \
-the amendment admitting it: `mechanism` (2) permits an allowance "only as \
-module-level attributes", and a per-site expectation is NARROWER than the \
-module-level allow it replaces, not a widening of it. \
+`PR72-PLACEMENT-001`, and `standards/02_standards_automated_baseline.md` \
+(the lints paragraph) admits it: this file's own mechanism otherwise permits an \
+allowance "only as module-level attributes", and a per-site expectation is \
+NARROWER than the module-level allow it replaces, not a widening of it. \
 MEASURED, and it is why the old shape was wrong rather than merely untidy: \
 deleting the previous `#![allow(clippy::disallowed_methods)]` changed nothing \
 at `cargo clippy --all-targets --all-features -- -D warnings`, because \

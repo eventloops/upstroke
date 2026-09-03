@@ -24,5 +24,5 @@ A reviewer and an author should be able to answer yes to each applicable item:
 - [ ] All eight §2 commands pass from the repository root.
 
 A finding that cites a standard names the section and says whether a mechanism or review enforces
-it. A finding against an unswept file for §6 or §7 is out of scope unless the change touched the
-line (`standards/SWEEP.md`).
+it. A §6 or §7 finding in an unswept file is in scope only under the activation rule in
+`standards/SWEEP.md`.

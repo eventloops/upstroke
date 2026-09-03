@@ -24,8 +24,9 @@
   semantics. A clone of anything larger than a handle is visible at a boundary or explained beside
   the call. Prefer `Copy` types, borrows, and moving the original.
 
-These three rules bind new and materially changed code now. The existing tree predates them and is
-being brought up to them file by file; `standards/SWEEP.md` records which files have been swept. An
-occurrence in an unswept file is not a review finding unless the change under review touched it.
+These three rules bind the code a change adds or rewrites, now. The existing tree predates them and
+is being brought up to them file by file; `standards/SWEEP.md` records which files have been swept
+and states the one activation rule for unswept files (the lines a change introduces or modifies,
+and any function whose body it modifies).
 
 Enforced by: review; `standards/SWEEP.md` for the transitional clause.

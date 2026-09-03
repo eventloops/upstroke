@@ -25,4 +25,3 @@ The router's economics depend on which pool pays. Pools have different shapes, a
 The ledger accounts every attempt in both currencies: API-equivalent dollars (honestly labeled — subscription spend is notional) and pool units drained. Where a worker's route reports no spend at all — Copilot's does not (§16) — the total it contributes to is marked `?` rather than presented as complete, since a cross-vendor review makes that the normal case rather than a corner of it. Budgets exist per run ($), per task ($), and per pool (fraction).
 
 **Sequencing:** v0.1 ships the capacity engine **read-only** — the dry-run preview and `upstroke capacity` show each pool's estimated remaining capacity, resets, and what each strategy *would* do. v0.2 wires it into live routing. This de-risks estimator fragility before any routing depends on it, and the preview alone is the demo that sells the product.
-

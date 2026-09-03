@@ -5,9 +5,12 @@ bind new and materially changed code immediately. The existing tree predates the
 brought up to them one file at a time: each file gets a deep review by a frontier model, then a
 pull request that lands the cleanup and adds the file to the table below.
 
-Until a file is listed here, an existing `Rc`, `Arc`, `Mutex`, `RwLock`, `clone()` or `?` in it is
-not a review finding unless the change under review touched that line. Once a file is listed, §6
-and §7 apply to it in full, and a reviewer may cite them against any line.
+**Activation rule.** In a file not yet listed here, §6 and §7 apply to the code a change adds or
+rewrites: every line inside a hunk the change introduces or modifies, and the whole body of any
+function the change modifies. A pure formatting, renaming or comment change activates nothing.
+An existing `Rc`, `Arc`, `Mutex`, `RwLock`, `clone()` or `?` outside that scope is not a review
+finding. Once a file is listed, §6 and §7 apply to it in full, and a reviewer may cite them
+against any line.
 
 Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 

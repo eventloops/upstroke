@@ -5,4 +5,3 @@
 It never edits a file, never implements an agentic loop, and never calls a model API. It is the conductor, not an instrument — and it treats your Claude Max windows, Copilot credits, API dollars, and local models as one portfolio to be spent optimally.
 
 When it gets stuck at 2am it doesn't stop the run: it parks only the blocked branch, keeps everything else moving, and pings you as the top rung of the escalation chain.
-

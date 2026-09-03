@@ -52,13 +52,13 @@ JSON types are normative. A "measured" field is a stored fact copied from the ev
 | `failure_reason` | string | yes | measured settlement prose; null on pass and on a dangling start |
 | `reviews` | array of review objects, below | never | measured review passes that actually ran, in recorded pass order; empty when none ran or the start dangles |
 
-`task_features` has exactly: measured `kind`, `suggested_tier` (or null), `minimum_tier` (or null), `path_hints` (ordered as frozen); plus derived `dependency_count`, `acceptance_count`, `artifact_input_count`, `artifact_output_count`, each the length of its frozen-plan array. No post-execution feature belongs here.
+`task_features` has exactly: measured `kind` (string), `suggested_tier` (string or null), `minimum_tier` (string or null), and `path_hints` (array of strings, exact and ordered as frozen); plus derived `dependency_count`, `acceptance_count`, `artifact_input_count`, and `artifact_output_count` (each a non-negative integer equal to the length of its frozen-plan array). No diff size or other post-execution feature belongs here.
 
-`chain` has `tiers` (non-empty ordered array) and `attempts_per` (positive integer), copied from the run-start chain for that task.
+`chain` has `tiers` (non-empty ordered array of tier strings) and `attempts_per` (positive integer), copied from the run-start chain for that task. `selected_tier` is separate because it is the choice actually made for this attempt.
 
 `usage`, when present, has nullable non-negative integers `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `num_turns`, and `reasoning_output_tokens`. Reported absences are preserved; tokens are never priced and totals never calculated.
 
-Each `reviews` element has `pass` (lens id), `adapter_id`, `adapter_cli_version` (or null), `model`, `effort` (or null), `pool` (or null), `cost_usd` (or null), and `outcome` (`passed`, `failed`, or `unavailable`). Version and effort are the values recorded for that pass, never borrowed from the worker or today's config.
+Each `reviews` element has `pass` (string lens id), `adapter_id` (string), `adapter_cli_version` (string, or null for legacy absence), `model` (full configured slug string), `effort` (`low`, `medium`, `high`, `xhigh`, or `max`, or null for legacy absence), `pool` (string or null), `cost_usd` (finite non-negative number, or null when unreported), and `outcome` (`passed`, `failed`, or `unavailable`). Version and effort are the values recorded for that pass, never borrowed from the worker or today's config.
 
 ### Exhaustive failure projection
 
@@ -95,6 +95,6 @@ Null scalars are empty cells; booleans are `true`/`false`; numbers use their JSO
 
 ### Provenance boundary
 
-The four provenance classes are disjoint: exporter-supplied metadata (`schema_version` only); measured stored facts (raw events and the frozen plan — stored, not independently verified); deterministic derived values (the resumed boolean, outcome, category, evidence, legacy `unknown`, plan-array counts, dangling-start fields); and assumptions about valid input (append order defines attempt order; identities are well formed; every attempt and chain joins exactly once to a frozen-plan task; pairs are unique; chains are non-empty with positive `attempts_per`; the frozen plan is the plan named by the run's recorded hash). Assumptions are not fallback permission: the exporter validates every join and invariant it relies on and fails loudly naming the run and offending identity. It never fills a gap from today's source plan, config, catalog, pricing table, or a provider call.
+The four provenance classes are disjoint: exporter-supplied metadata (`schema_version` only); measured stored facts (raw events and the frozen plan — stored, not independently verified); deterministic derived values (the resumed boolean, outcome, category, evidence, legacy `unknown`, plan-array counts, dangling-start fields); and assumptions about valid input (the event log's append order defines attempt-start order; event timestamps and identities are well formed; the run id agrees with its `RunStarted`; every attempt task and every run-start chain joins exactly once to a task in the frozen plan; attempt/settlement identities pair uniquely; chain tiers are non-empty and `attempts_per` is positive; numeric values satisfy the types above; the frozen plan is the plan named by the run's recorded hash). Assumptions are not fallback permission: the exporter validates every join and invariant it relies on and fails loudly naming the run and offending identity. It never fills a gap from today's source plan, config, catalog, pricing table, or a provider call.
 
 The export schema version is independent of the event schema. Schema 2 was required when the public exhaustive failure domain gained `review_input_too_large` and `review_input_opaque`; a change to one schema does not imply a change to the other.

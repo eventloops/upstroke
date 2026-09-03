@@ -66,4 +66,3 @@ schema-1 through schema-3 runs finish through the sequential path, including the
 review-contract upgrade when needed. No in-flight run appends a 3 → 4 upgrade:
 starting a new run is the compatibility boundary for adopting worktrees,
 candidates, and the merge queue.
-

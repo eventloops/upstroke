@@ -7,8 +7,8 @@
 A headless orchestration engine for AI coding agents. You and a frontier model design a piece of
 work; `upstroke` executes the plan unattended: it turns the plan into a dependency graph of typed
 tasks, dispatches each to an existing coding-agent CLI with a model chosen per task, verifies every
-result through objective gates and an independent strong-model review, and commits only what
-passes.
+result through objective gates and a strong-model review — cross-family where a second model
+family is available — and commits only what passes.
 
 It never edits a file, never runs an agentic loop, and never calls a model API. It is the
 conductor, not an instrument.

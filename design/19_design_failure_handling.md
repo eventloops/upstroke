@@ -14,4 +14,3 @@
 | Budget or pool budget exceeded | ledger | stop scheduling; run ends `BudgetExceeded` |
 | Merge conflict or code-attributed stale integration rejection (v0.2) | merge queue | publish nothing; atomically append rejection plus its replayable frozen Fix task, respecting hard pins/ceilings and the lineage-wide `max_merge_repairs`; infrastructure keeps its ordinary policy |
 | Engine crash / power loss | — | `upstroke resume` replays the event log |
-

@@ -12,4 +12,3 @@ Every piece of work lives in one unit (a "pane" in the eventual UI; a run direct
 **Phase 2 — Execution (headless, interrupt-driven).** The plan is frozen; the engine takes over. Runtime questions pass through a pre-filter before ever reaching the human: the question plus the decisions record go to the frontier (architect) profile — *"was this already answered?"* Only genuinely novel questions escalate to the user.
 
 **The defect loop:** every question that reaches the human at runtime is, by definition, a design-phase defect. It is logged as one (`design_defect` event, with the question and eventual answer), and the accumulated defects become review material for the designer prompt. The system learns to need the user less.
-

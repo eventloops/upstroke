@@ -74,9 +74,9 @@ Read the `standards/` sections a change touches. In particular:
 - **`anyhow` only at the binary edge.** Libraries return `thiserror` types.
 - **All paths through `std::path`.** Windows is a first-class target; CI runs the full matrix on
   ubuntu, macos and windows.
-- **No `Rc`, `Arc`, `Mutex` or `clone()` without a stated reason, and every `?` deliberate**
-  (§6, §7). These bind new and touched code; `standards/SWEEP.md` tracks the file-by-file cleanup
-  of the existing tree, and an untouched line in an unswept file is not a finding.
+- **No shared ownership, locks, or non-trivial clones without a stated reason, and every `?`
+  deliberate** (§6, §7). These bind the code a change adds or rewrites; `standards/SWEEP.md`
+  states the activation rule and tracks the file-by-file cleanup of the existing tree.
 - **Conventional commit titles**, enforced on PR titles by `.github/scripts/validate-pr-body.sh`:
   `type(optional-scope): summary`, type one of feat, fix, docs, refactor, test, chore, ci, build,
   perf, security, release, revert.
@@ -85,8 +85,10 @@ Read the `standards/` sections a change touches. In particular:
 
 `MAINTAINING.md` is authoritative. In outline: draft PR early; the eight gates and both required
 contexts (`upstroke-ci`, `upstroke-pr-policy`) green; one frontier review of the exact green head
-(`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage — serious P1s relevant to the change are fixed and re-reviewed, everything else is
-fixed or logged as a tech-debt ledger row; merge commit once green. The PR body must carry the six
+(`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage — serious P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in
+touched code and any finding carrying a failing test, reproduction or mutation witness are fixed
+whatever their label; everything else is fixed or logged as a tech-debt ledger row; merge commit
+once green. The PR body must carry the six
 sections and the exact canonical ledger header; run `validate-pr-body.sh` against it locally.
 
 Merging is the owner's act unless the owner has delegated it in writing for that PR; say so in the

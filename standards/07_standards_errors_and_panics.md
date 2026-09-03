@@ -24,8 +24,8 @@ function has nothing to add that a reader of the failure would need. Otherwise d
 `io::Error`, a serde error, or another library's error across a module boundary is a finding. `?`
 on an `Option` MUST NOT turn absence into failure silently. The aim is fewer `?` sites, each one
 deliberate: a function that is a long chain of `?` has usually not decided what its errors mean.
-This rule is transitional in the same way as §6's — it binds new and materially changed code now,
-and `standards/SWEEP.md` tracks the existing tree.
+This rule is transitional in the same way as §6's: it binds the code a change adds or rewrites,
+under the activation rule `standards/SWEEP.md` states, and that file tracks the existing tree.
 
 **Panics.** Production code MUST NOT call `.unwrap()` or `.expect()`, nor use `panic!`, `todo!`,
 `unimplemented!`, panicking indexing or assertions to handle input, configuration, persisted state,

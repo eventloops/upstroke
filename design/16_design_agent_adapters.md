@@ -13,4 +13,3 @@ What this route does not give us is recorded honestly rather than assumed: no JS
 **Aider** (v0.2): `--yes`, `--model`; brings local models via OpenAI-compatible endpoints — the free pool for the home-server tier.
 
 Adapter rule inherited as an invariant: subprocess the real binary, official CLIs only, no spoofed headers — ToS safety is a feature, not a compliance chore.
-

@@ -5,4 +5,3 @@
 - **ACP (`--acp --stdio`)** as the durable programmatic surface for the Copilot adapter (GitHub).
 - **Notifier transport abstraction** and the "subprocess the real binary, no spoofed headers" ToS posture (ductor).
 - **Local-log usage parsing** as a capacity source that sees interactive sessions too (ccusage lineage).
-

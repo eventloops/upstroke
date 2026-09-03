@@ -44,4 +44,3 @@
 | **Reviewer** | Ordinary read-only worker profile emitting a structured verdict; optionally a different vendor from the implementer. |
 | **Interaction** | Question/answer events, parking semantics, notifier plugins, CI degradation. |
 | **Event log** | Append-only JSONL; source of truth for state, resume, status, questions, ledger, and the future decision-export dataset. |
-

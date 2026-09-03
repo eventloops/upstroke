@@ -63,4 +63,3 @@ mounts, reserved values, and overlay, so pre-flight certifies the environment
 that will actually spend.
 
 Deliberate omissions: no `Router` trait (config-evaluating struct until a second policy exists) and no `Executor` trait beyond `AgentAdapter` (a native agentic loop remains explicitly out of scope; the seam exists if that ever changes).
-

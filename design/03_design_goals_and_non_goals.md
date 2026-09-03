@@ -15,4 +15,3 @@
 - Not a UI (the engine): panes, dashboards, and notifiers are thin clients of the event log. The design-pane product is v0.3, built *on* the engine.
 - Does not repair bad plans. The design phase exists to make plans good; execution assumes they are.
 - No cross-run learning in v0.x — but every routing decision is logged so a learned router is possible later.
-

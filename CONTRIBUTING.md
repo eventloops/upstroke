@@ -6,8 +6,9 @@ project currently is.
 
 Every change enters `master` the same way: a draft pull request opened early, the deterministic CI
 and PR-policy gates green, one independent frontier-model review of the exact green head, findings
-triaged (serious P1s fixed and re-reviewed, the rest fixed or logged as tech debt), and the owner's
-merge as the attestation. [`MAINTAINING.md`](MAINTAINING.md) has the full lifecycle, trust boundary
+triaged (serious P1s fixed and re-reviewed; `MUST` deviations in touched code and evidence-backed
+findings fixed whatever their label; the rest fixed or logged as tech debt), and the owner's merge
+as the attestation. [`MAINTAINING.md`](MAINTAINING.md) has the full lifecycle, trust boundary
 and release contract. Contributions from external forks are provisional: the required checks are
 candidate-controlled, so a fork's entire diff, workflow edits included, is reviewed before merge.
 

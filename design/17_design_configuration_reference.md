@@ -89,4 +89,3 @@ name = "test"
 cmd  = "cargo test"
 timeout_secs = 1200
 ```
-

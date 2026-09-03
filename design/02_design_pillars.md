@@ -13,4 +13,3 @@
 | P9 | Capacity engine | Connect your plans; late-bound tier→(model, pool) selection with conserve / value-max / spend-down strategies and affinity-aware assignment |
 
 The design's emphasis is P4, P8 and above all P9; the competitive analysis that ranks the pillars this way is maintained in the strategy record outside this repository and is not part of the engine's contract.
-

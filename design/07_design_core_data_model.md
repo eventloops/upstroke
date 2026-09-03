@@ -75,4 +75,3 @@ Pending ─► Ready ─► Running(attempt n, rung r) ─► Gating ─► Revi
 ```
 
 v0.2 replaces the terminal edge with `Reviewing ─► AwaitingMerge(candidate) ─► Merged | AwaitingRepair(fix task)`. There is no pre-merge `Done`: **dependency readiness is `Merged`** — a dependent's worktree must branch from an integration head that already contains its dependencies' code. `Ready`, the attempt phases, and `MergeVerifying` are derived views; the durable fold stores candidates, repair lineage, and the one prepared merge transaction (decided 2026-08-12; the shipped protocol is in §15).
-

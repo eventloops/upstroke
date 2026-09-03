@@ -7,4 +7,3 @@
 5. **Official CLIs only.** No ToS-violating proxies, ever — the trust wedge is part of the product.
 6. **Questions never stop the runnable frontier.** A question parks exactly the tasks it affects; the run hard-blocks only when nothing remains runnable.
 7. **Capacity is estimated conservatively.** Safety margins on every pool, a reserve floor for the user's own interactive use, and rate-limit signals treated as ground truth over any estimate.
-

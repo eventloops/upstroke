@@ -41,9 +41,30 @@ the same pull request — there is no separate record to keep in step.
 | 23 | Risks and kill criteria | [design/23_design_risks.md](design/23_design_risks.md) |
 | 24 | References | [design/24_design_references.md](design/24_design_references.md) |
 | 25 | Export schema (`export-decisions`) | [design/25_design_export_decisions_schema.md](design/25_design_export_decisions_schema.md) |
+| 26 | Merge queue and execution topology protocol | [design/26_design_merge_queue_protocol.md](design/26_design_merge_queue_protocol.md) |
 
 Read §4 in full before touching the engine, the event log, or anything that
 handles capacity or questions. §21 is the build order, and it is deliberate.
+
+## Line citations
+
+Comments in `src/` cite the pre-split document by line, as `DESIGN.md:<line>`.
+Those lines refer to the single-file `DESIGN.md` as it stood at master
+`cfec136` on 2026-09-03, the last commit before the split; the file is
+unchanged in that history. This table resolves a line to its section, which is
+where the sentence now lives, unchanged. New citations use `§N`.
+
+| Lines | § | Lines | § | Lines | § |
+|---|---|---|---|---|---|
+| 1–9 | preamble (this file) | 268–287 | 9 | 550–567 | 18 |
+| 10–17 | 1 | 288–303 | 10 | 568–584 | 19 |
+| 18–33 | 2 | 304–315 | 11 | 585–591 | 20 |
+| 34–51 | 3 | 316–325 | 12 | 592–629 | 21 |
+| 52–61 | 4 | 326–353 | 13 | 630–637 | 22 |
+| 62–76 | 5 | 354–372 | 14 | 638–688 | 23 |
+| 77–123 | 6 | 373–441 | 15 | 689–693 | 24 |
+| 124–201 | 7 | 442–457 | 16 | | |
+| 202–267 | 8 | 458–549 | 17 | | |
 
 ## Retired records
 
@@ -63,14 +84,14 @@ some records by path; this table says where each one's substance now lives.
 | 2026-08-11 gate config across a resume | §15 (gates are taken from the record, warning on drift) |
 | 2026-08-11 Codex reasoning effort | §10, §16, §21 (effort is a routing axis, stated on every attempt) |
 | 2026-08-11 export schema | §25 |
-| 2026-08-12 merge queue and execution topology | §7, §14, §15 (immutable candidates, exact-tree verification, CAS integration, bounded repair) |
+| 2026-08-12 merge queue and execution topology | §26 (the verdict and the durable protocol, verbatim), summarised in §7, §14, §15 |
 | 2026-08-17 review effort and fan-out | `MAINTAINING.md` (one frontier pass at `max`; `ultra` is delegation, not depth) |
-| 2026-08-20 automated review gate; 2026-08-20 review invalidation scope; 2026-08-21 stacked slice PRs; 2026-08-23 retire App attestation; 2026-08-25 checkpoint merges; 2026-08-31 panel seats; 2026-09-01 review effort re-scoped; 2026-09-01 clean base merge keeps review | `MAINTAINING.md` (the whole review and merge lifecycle, restated in its current form) |
+| 2026-08-20 automated review gate; 2026-08-20 review invalidation scope; 2026-08-21 stacked slice PRs; 2026-08-23 retire App attestation; 2026-08-25 checkpoint merges; 2026-08-31 panel seats; 2026-09-01 review effort re-scoped; 2026-09-01 clean base merge keeps review | `MAINTAINING.md` (the whole review and merge lifecycle, restated in its current form; the workflow trigger contract under Repository rules) |
 | 2026-08-22 strategy record private; 2026-08-27 proposals private; 2026-09-01 proposals relocated; 2026-09-01 infra private | This section (strategy, proposals and operator tooling live in the private companion repository) |
 | 2026-08-24 PR3-layer freeze charter; 2026-08-31 G2 checkpoint promotion; 2026-08-31 inertness premise behavioural | §21 (the G2 pass ran; the schema-4 machinery is on master, inert by default) |
 | 2026-08-25 `CommandSpec.program` stays `String` | §8 (the field carries a bare CLI name; `CODING_STANDARDS.md` §8 governs it the moment a path-valued input exists) |
 | 2026-08-26 durable retry feedback | §15 (`FailureRecord.detail` carries the retry brief onto the durable record) |
-| 2026-08-30 readiness lint placement | `CODING_STANDARDS.md` §2 and §12 (a per-site `#[expect]` recorded in `effects/allowlist.toml` may stand where a module-level allow did) |
+| 2026-08-30 readiness lint placement | `CODING_STANDARDS.md` §2 (lints) and §12 (a per-site `#[expect]` recorded in `effects/allowlist.toml` may stand where a module-level allow did) |
 | 2026-08-30 test scratch-tree ownership | §15 (run-directory deletion authority is token-carried: `rundir::PrivateHalfProof` and the `cfg(test)`-only scratch-tree token) |
 | 2026-09-01 self-hosted Windows test leg | `MAINTAINING.md` step 3 and `ci.yml` (`test (winguest)` runs the Windows suite on an ephemeral self-hosted runner; the Windows Clippy, build-witness and MSRV legs stay on GitHub's runner) |
 | 2026-09-01 relicense to Apache-2.0 | `LICENSE`, `NOTICE`, `CONTRIBUTING.md` (the CLA), `MAINTAINING.md` (the archive-contents release gate) |
