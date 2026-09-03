@@ -245,8 +245,8 @@ build a scratch directory of their own making under `std::env::temp_dir()`, \
 keyed by process id plus a ulid or a nanosecond timestamp, and touch nothing \
 outside it; the process effects are re-execs of this test binary and the trees \
 it starts and kills. FOUR SITES ARE NOT THAT, in two shapes, and every one of \
-them is a body moved verbatim out of `src/agent/proc.rs` rather than anything \
-this extraction wrote. \
+them moved out of `src/agent/proc.rs` rather than being anything this \
+extraction wrote. \
 (1) `timeout_kills_a_background_grandchild_before_it_can_escape` and \
 `successful_direct_exit_still_kills_detached_group_members` put a marker FILE \
 directly in `std::env::temp_dir()` and call `std::fs::remove_file` on it before \
@@ -263,9 +263,27 @@ a ulid or nanoseconds. \
 That is the older, pre-token shape `rundir::scratch_tree::acquire` was written \
 to replace, and it is the same hazard the `src/rundir/tests.rs` row above \
 records for the same reason. THIS ROW RECORDS IT RATHER THAN IMPLYING A \
-CONTAINMENT THE FILE DOES NOT HAVE: the bodies are byte-identical to what \
-already ran inside the parent under the parent's own allow, and repairing them \
-is a change to test behaviour that this move deliberately does not make. \
+CONTAINMENT THE FILE DOES NOT HAVE: all four ran inside the parent under the \
+parent's own allow, and repairing them is a change to test behaviour that this \
+move deliberately does not make. \
+HOW EQUAL "MOVED" IS, STATED EXACTLY, BECAUSE "BYTE-IDENTICAL" WOULD BE FALSE \
+OF THIS FILE. Lifting the block out of `mod tests { … }` dedents every line by \
+four columns, which changes what fits inside the width and makes `rustfmt` \
+reflow: 87 lines here differ from the dedented original, every one of them \
+formatting -- expressions that now fit on one line, a dropped trailing comma, an \
+elided closure brace, one `panic!` match arm braced. THE EQUALITY THAT DOES \
+HOLD IS REPRODUCIBLE, and it is the one worth stating: dedent the body of \
+`mod tests` in `src/agent/proc.rs` at this branch's base by four columns, run \
+`rustfmt --edition 2024` over it, and the result is this file byte-for-byte once \
+the three imports the split forced it to name for itself are removed \
+(`std::io::Read`, `crate::topology::effects::Injection`, and a `#[cfg(windows)]` \
+`super::ambient::join_ambient_job_with`; every one of them reached this suite \
+through `use super::*` before the move -- the first two as names the parent \
+imported, the third as a sibling item of the parent that the split relocated). \
+The four bodies named above are byte-identical after the dedent alone; \
+`rustfmt` touched none of them. So \
+the suite is semantically equivalent and formatting-normalised rather than \
+byte-equal, and this row says which rather than claiming the stronger thing. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
