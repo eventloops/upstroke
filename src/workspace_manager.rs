@@ -116,6 +116,28 @@ pub enum Refusal {
         at: PathBuf,
     },
 
+    /// `execution_root`: "`<private_root>/workspaces/<repo_key>/<run_id>`,
+    /// recorded exactly". The reparse-point walk is anchored at the authorized
+    /// private root and inspects the chain **below** it, one plain component
+    /// at a time. A root that does not lie below the private root as plain
+    /// components — no common prefix, or a prefix, a root, `.` or `..` in the
+    /// remainder, which is what a run id such as `../../x` or an absolute one
+    /// produces — has no such chain, and the walk refuses it rather than
+    /// answer "no reparse point" for a chain it never inspected.
+    #[error(
+        "refusing execution root {}: it does not lie below the authorized private root {} as a \
+         chain of plain components, and decisions.workspace_candidates.execution_root records \
+         every execution root at <private_root>/workspaces/<repo_key>/<run_id>",
+        .root.display(),
+        .private_root.display()
+    )]
+    RootOutsidePrivateRoot {
+        /// The candidate execution root.
+        root: PathBuf,
+        /// The authorized private root the walk is anchored at.
+        private_root: PathBuf,
+    },
+
     /// `execution_root`: "the canonical root is inside no repository worktree".
     #[error(
         "refusing execution root {}: it is inside the repository worktree {}",
@@ -519,10 +541,10 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::ReparsePointOnChain`],
-    /// [`Refusal::RootInsideRepositoryWorktree`], and
-    /// [`Refusal::WorktreeInsideRoot`], plus a Git error when the base is not a
-    /// repository.
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+    /// [`Refusal::ReparsePointOnChain`], [`Refusal::RootInsideRepositoryWorktree`],
+    /// and [`Refusal::WorktreeInsideRoot`], plus a Git error when the base is
+    /// not a repository.
     pub fn derive(
         base: &Path,
         private_root: &Path,

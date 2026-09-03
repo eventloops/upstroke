@@ -908,6 +908,160 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     assert_eq!(named.len(), 3, "three distinct call sites: {named:?}");
 }
 
+/// A run id that climbs out of the private root, or is absolute, gives
+/// `execution_root_of` a root with no plain chain below the anchor the
+/// reparse-point walk starts at. The walk answered "no reparse point" for it
+/// — true of a chain it never inspected — and on Linux `derive` then
+/// succeeded with `<private>/workspaces/<key>/../../../escape` as its
+/// execution root, which `create_execution_root` would have created outside
+/// the private root.
+///
+/// Both shapes, on every platform: `..` components survive `strip_prefix`
+/// lexically, and an absolute run id replaces the private root in `join`.
+#[test]
+fn an_execution_root_with_no_plain_chain_below_the_private_root_refuses_before_any_effect() {
+    let fixture = Fixture::new("root-not-below");
+    for run_id in ["../../../escape", "/escape"] {
+        let error = WorkspaceManager::derive(&fixture.base, &fixture.private, run_id, "inc-1")
+            .expect_err("a run id whose root leaves the private root refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("does not lie below the authorized private root"),
+            "{run_id}: the refusal must name its reason: {message}"
+        );
+        assert!(
+            message.contains("escape"),
+            "{run_id}: and the root it refused: {message}"
+        );
+    }
+    assert!(
+        !fixture.root.join("escape").exists() && !fixture.private.join("workspaces").exists(),
+        "and perform no effect"
+    );
+}
+
+/// A regular file where a directory of the chain should be is **absence**
+/// for the walk, on every platform: nothing below a file exists, so nothing
+/// below it is a reparse point. The walk used to treat only `NotFound` as
+/// absence, and Unix reports this shape as `ENOTDIR`, so the two platforms
+/// could answer differently for the same tree. The effect that needs the
+/// directory is what reports it, with the path.
+#[test]
+fn a_regular_file_on_the_chain_is_absence_for_the_walk_and_the_effect_reports_it() {
+    let fixture = Fixture::new("file-on-chain");
+    fs::write(fixture.private.join("workspaces"), "not a directory\n").expect("plant the file");
+    fixture
+        .manager
+        .revalidate()
+        .expect("a file on the chain is absence for the walk, not a failure of it");
+    let error = fixture
+        .manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("the directories cannot be created through a file");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == fixture.manager.execution_root()),
+        "the effect names the path it could not create: {error}"
+    );
+}
+
+/// An absent managed base, or an absent private root, is "not a real
+/// directory" — the refusal `execution_root` names — and not an I/O failure
+/// to read it. Only an actual not-found becomes absence; a leaf that cannot
+/// be read for any other reason stays an error.
+#[test]
+fn an_absent_managed_base_or_private_root_refuses_as_not_a_real_directory() {
+    let fixture = Fixture::new("absent-leaf");
+    let absent = fixture.root.join("absent");
+    for (site, base, private) in [
+        ("derive/base", absent.as_path(), fixture.private.as_path()),
+        (
+            "derive/private-root",
+            fixture.base.as_path(),
+            absent.as_path(),
+        ),
+    ] {
+        let error = WorkspaceManager::derive(base, private, "run-9", "inc-1")
+            .expect_err("an absent leaf refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("not a real directory"),
+            "{site}: the refusal must name its reason: {message}"
+        );
+        assert!(
+            message.contains(&absent.display().to_string()),
+            "{site}: and the path: {message}"
+        );
+    }
+}
+
+/// `canonical_prefix` peels past **absence** only. A prefix the filesystem
+/// refuses to resolve for any other reason is an error, not a component to
+/// rejoin lexically: the peel used to discard every `canonicalize` failure,
+/// so a link loop under the root produced a "canonical" path the filesystem
+/// had never verified. Evaluated on the Unix legs; a loop needs a symbolic
+/// link, which the Windows guest's test user cannot create.
+#[cfg(unix)]
+#[test]
+fn canonical_prefix_propagates_a_resolution_failure_that_is_not_absence() {
+    let dir = scratch("canonical-loop");
+    let real = dir.canonicalize().expect("canonical scratch");
+    let link = real.join("loop");
+    std::os::unix::fs::symlink(&link, &link).expect("plant the loop");
+    let below = link.join("child");
+    let error = canonical_prefix(&below).expect_err("a link loop is not absence");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &below && source.kind() != std::io::ErrorKind::NotFound
+        ),
+        "the error names the path that could not be resolved and its reason: {error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `..` below a component that does not exist has no directory to refer
+/// to. POSIX cannot traverse the absent directory, so the peel meets the
+/// `..`, finds no plain component left to peel, and returns that failure
+/// naming the prefix it stopped at — rather than the raw path, whose lexical
+/// `starts_with` would have answered "inside" for a path the filesystem
+/// never resolved. Evaluated on the Unix legs; Win32 resolves the same shape
+/// before the filesystem sees it, and the test below pins that answer.
+#[cfg(unix)]
+#[test]
+fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically() {
+    let dir = scratch("canonical-dotdot");
+    let real = dir.canonicalize().expect("canonical scratch");
+    let path = real.join("missing").join("..").join("x");
+    let error = canonical_prefix(&path).expect_err("no canonical form exists");
+    let stopped_at = real.join("missing").join("..");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &stopped_at && source.kind() == std::io::ErrorKind::NotFound
+        ),
+        "the error names the prefix the peel stopped at: {error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The Windows half of the test above: Win32 resolves `..` lexically before
+/// the filesystem sees it, so `missing\..` canonicalizes to the scratch
+/// directory and the peel rejoins `x` onto it. Evaluated on `test (winguest)`.
+#[cfg(windows)]
+#[test]
+fn windows_resolves_a_dot_dot_below_an_absent_component_before_the_filesystem_sees_it() {
+    let dir = scratch("canonical-dotdot");
+    let real = strip_verbatim(dir.canonicalize().expect("canonical scratch"));
+    let path = real.join("missing").join("..").join("x");
+    assert_eq!(
+        canonical_prefix(&path).expect("Win32 resolves the `..`"),
+        real.join("x")
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A **deletion** revalidates the chain, and refuses before it acts
 /// (`PR5-WORKSPACE-009`).
 ///

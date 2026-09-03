@@ -29,11 +29,28 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::UpstrokeError;
 
 use super::Refusal;
+
+/// Whether `error` says the path names nothing.
+///
+/// `NotFound` is the obvious half. `NotADirectory` is the other: a path that
+/// runs through a regular file names nothing either, and Unix reports that
+/// shape as `ENOTDIR` where Windows need not, so a check that read only
+/// `NotFound` could answer differently on the two platforms for the same
+/// tree. Everything else — permission denied, a link loop, a name the
+/// filesystem cannot represent, transient I/O — is a failure and stays one:
+/// only an actual not-found becomes absence.
+fn is_absent(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
 
 /// Whether `metadata` describes a symlink, junction, or any other reparse
 /// point.
@@ -60,8 +77,29 @@ pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-/// The first component of `path`'s chain **at or below `anchor`** that is a
-/// reparse point, if any.
+/// The components of `path` below `anchor`, when `path` is `anchor` followed
+/// by plain components and nothing else.
+///
+/// `None` when the two share no prefix, and when the remainder carries a
+/// prefix, a root, `.` or `..`. Such a path has no chain below the anchor to
+/// walk, and the walk must not answer for one. `strip_prefix` is lexical: a
+/// `..` in the remainder passes it while climbing straight back out of the
+/// anchor, which is why the components are checked and not only the prefix.
+fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>> {
+    let Ok(relative) = path.strip_prefix(anchor) else {
+        return None;
+    };
+    relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first component of `anchor` joined with `chain` that is a reparse
+/// point, if any.
 ///
 /// # Why the walk is anchored
 ///
@@ -80,33 +118,35 @@ pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 /// under `/var` — including every default temporary directory on that OS —
 /// would have every run refused for a link they did not create and cannot
 /// remove. No live passage asks for that, and the containment the refusal
-/// exists to protect is unaffected: every deletion **in this subsystem** goes
-/// through [`WorkspaceManager::contained`](super::WorkspaceManager::contained),
-/// which compares **canonical** paths, so a resolved link cannot carry a removal
-/// outside the root. (This module performs no deletion of its own -- the
-/// sentence said "in this module" when it lived in the parent, and the split is
-/// what made that reading vacuous rather than load-bearing.)
+/// exists to protect is unaffected. The subsystem's two recursive deletions
+/// are the parent's: a worktree's tree, which goes through
+/// [`WorkspaceManager::contained`](super::WorkspaceManager::contained) and so
+/// compares **canonical** paths, and that worktree's Git admin entry, which
+/// `revalidate_removal` bound to the same slot byte-for-byte before anything
+/// was deleted. A resolved link cannot carry either outside the root. The
+/// parent's other removals never recurse: `remove_dir` on the root and its
+/// own empty scaffolding, `remove_file` on an intent whose validated name
+/// cannot leave `intents/`, and on the `locked` marker inside that admin
+/// entry.
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
-/// run.
-fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-    let Ok(relative) = path.strip_prefix(anchor) else {
-        return Ok(None);
-    };
+/// run. Nothing below a regular file exists either, so a file on the chain is
+/// absence too, on every platform ([`is_absent`]). `chain` is plain
+/// components by construction ([`plain_chain_below`]), so the walk has no
+/// root to skip and no `..` to climb.
+///
+/// # Errors
+///
+/// A component that exists but cannot be read, with its path.
+fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf>, UpstrokeError> {
     let mut walked = anchor.to_path_buf();
-    for component in relative.components() {
-        walked.push(component.as_os_str());
-        if matches!(component, Component::Prefix(_) | Component::RootDir) {
-            continue;
-        }
+    for name in chain {
+        walked.push(name);
         match fs::symlink_metadata(&walked) {
-            Ok(metadata) => {
-                if is_reparse_point(&metadata) {
-                    return Ok(Some(walked));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata) if is_reparse_point(&metadata) => return Ok(Some(walked)),
+            Ok(_) => {}
+            Err(error) if is_absent(&error) => return Ok(None),
             Err(source) => {
                 return Err(UpstrokeError::Io {
                     path: walked,
@@ -118,10 +158,31 @@ fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, Up
     Ok(None)
 }
 
-/// Refuse `path` when a component of its chain below `anchor` is a reparse
-/// point.
+/// Refuse `path` unless its chain below `anchor` is plain components with no
+/// reparse point among them.
+///
+/// `path` is the execution root and `anchor` the authorized private root at
+/// both call sites, and the refusals name them so. A path with no plain
+/// chain below the anchor — no common prefix, or a prefix, a root, `.` or
+/// `..` in the remainder — is refused rather than walked: the walk's answer
+/// for it would be "no reparse point below the anchor", true of a chain it
+/// never inspected, and a run id such as `../../x` reaches here through
+/// `execution_root_of` with exactly that shape.
+///
+/// # Errors
+///
+/// [`Refusal::RootOutsidePrivateRoot`], [`Refusal::ReparsePointOnChain`], or
+/// the walk's own I/O error, which already names the component it could not
+/// read and is propagated as it is.
 pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
-    if let Some(at) = reparse_point_below(anchor, path)? {
+    let Some(chain) = plain_chain_below(anchor, path) else {
+        return Err(Refusal::RootOutsidePrivateRoot {
+            root: path.to_path_buf(),
+            private_root: anchor.to_path_buf(),
+        }
+        .into());
+    };
+    if let Some(at) = reparse_point_below(anchor, &chain)? {
         return Err(Refusal::ReparsePointOnChain {
             chain: path.to_path_buf(),
             at,
@@ -133,12 +194,26 @@ pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), Up
 
 /// The leaf clause of `execution_root`: "the managed base is a **real
 /// directory**".
+///
+/// A path that names nothing is not a real directory and gets the same
+/// refusal as a file or a link; every other failure to read it stays an I/O
+/// error with the path attached.
+///
+/// # Errors
+///
+/// [`Refusal::BaseIsNotADirectory`], or the I/O error.
 pub(super) fn refuse_unreal_directory(path: &Path) -> Result<(), UpstrokeError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| UpstrokeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.is_dir() || is_reparse_point(&metadata) {
+    let real = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_dir() && !is_reparse_point(&metadata),
+        Err(error) if is_absent(&error) => false,
+        Err(source) => {
+            return Err(UpstrokeError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !real {
         return Err(Refusal::BaseIsNotADirectory {
             path: path.to_path_buf(),
         }
@@ -159,10 +234,16 @@ pub(super) fn refuse_unreal_directory(path: &Path) -> Result<(), UpstrokeError> 
 /// here, before the path leaves this module. (Nothing in this module invokes
 /// Git; it returns paths, and the parent's funnels are what run the children.)
 ///
-/// A path that genuinely *requires* the verbatim form — one longer than
-/// `MAX_PATH`, or carrying a component Win32 would reject — is left as it is:
-/// stripping it would produce a path that names something else, and Git could
-/// not have used either spelling.
+/// The prefix comes off **unconditionally**; there is no length or component
+/// check here. For a path within `MAX_PATH` the stripped spelling is the one
+/// Git can open. For a longer one Git can open neither spelling without
+/// `core.longpaths`, and std puts the prefix back at its own syscall boundary,
+/// so this subsystem's filesystem calls are no worse off. The one spelling
+/// stripping changes is a component Win32 itself rewrites — a trailing dot or
+/// space — which only a verbatim-path creator can produce and `naming` keeps
+/// out of every slot component; and both operands of every containment
+/// comparison pass through here, so a comparison is between like spellings
+/// either way.
 #[cfg(windows)]
 pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
     use std::path::Prefix;
@@ -172,7 +253,7 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
         return path;
     };
     let mut rebuilt = match prefix.kind() {
-        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:\\", letter as char)),
+        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:\\", char::from(letter))),
         Prefix::VerbatimUNC(server, share) => {
             let mut unc = PathBuf::from("\\\\");
             unc.push(server);
@@ -199,32 +280,59 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// Canonicalize the longest existing prefix of `path` and rejoin the rest.
 ///
 /// `fs::canonicalize` needs the whole path to exist; an execution root is
-/// compared for containment before it does.
+/// compared for containment before it does. The peel stops at the first
+/// prefix that canonicalizes, and only absence ([`is_absent`]) is peeled
+/// past: a prefix the filesystem refuses to resolve for any other reason —
+/// permission, a link loop, a name it cannot represent, transient I/O — is
+/// an error, because a comparison over a path the filesystem never verified
+/// proves nothing about containment.
+///
+/// The rejoined tail is plain components. A `.` or `..` below a component
+/// that does not exist has no directory to refer to, and the platforms
+/// disagree about what it would name — Win32 resolves it lexically before the
+/// filesystem sees it, POSIX cannot traverse the absent directory — so there
+/// is no canonical form to hand back: where the filesystem fails on it the
+/// peel meets the `..`, finds no plain component left to peel, and returns
+/// that failure rather than the raw path. A path with no existing prefix at
+/// all — a relative one none of whose components exists — is the same case.
+///
+/// # Errors
+///
+/// [`UpstrokeError::Io`] naming the deepest prefix that could not be resolved.
 pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(strip_verbatim(canonical));
-    }
     let mut tail = Vec::new();
     let mut head = path.to_path_buf();
     loop {
-        let Some(parent) = head.parent().map(Path::to_path_buf) else {
-            return Ok(path.to_path_buf());
-        };
-        let Some(name) = head.file_name().map(OsStr::to_os_string) else {
-            return Ok(path.to_path_buf());
-        };
-        tail.push(name);
-        head = parent;
-        if let Ok(canonical) = fs::canonicalize(&head) {
-            let mut canonical = strip_verbatim(canonical);
-            for name in tail.iter().rev() {
-                canonical.push(name);
+        let absent = match fs::canonicalize(&head) {
+            Ok(canonical) => {
+                let mut canonical = strip_verbatim(canonical);
+                for name in tail.iter().rev() {
+                    canonical.push(name);
+                }
+                return Ok(canonical);
             }
-            return Ok(canonical);
+            Err(error) if is_absent(&error) => error,
+            Err(source) => return Err(UpstrokeError::Io { path: head, source }),
+        };
+        // `file_name` is `None` when what is left ends in `..` or is a root:
+        // there is no plain component to peel.
+        let Some(name) = head.file_name().map(OsStr::to_os_string) else {
+            return Err(UpstrokeError::Io {
+                path: head,
+                source: absent,
+            });
+        };
+        // `pop` truncates in place rather than copying the parent each step.
+        // A head with a file name always has a parent, so `false` is a
+        // defensive arm; the empty parent is a relative path none of whose
+        // components exists, and the end of the peel.
+        if !head.pop() || head.as_os_str().is_empty() {
+            return Err(UpstrokeError::Io {
+                path: path.to_path_buf(),
+                source: absent,
+            });
         }
-        if head.parent().is_none() {
-            return Ok(path.to_path_buf());
-        }
+        tail.push(name);
     }
 }
 
