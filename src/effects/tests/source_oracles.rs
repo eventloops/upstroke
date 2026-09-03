@@ -110,33 +110,41 @@ pub(super) mod oracles {
     /// something fails to compile today. `src/topology/effects.rs` is frozen, so
     /// this scan is a guard on a file this slice does not edit rather than a
     /// requirement on one it does.
+    ///
+    /// The mappings live in **two** files since `topology::effects` was split into
+    /// per-concern child modules: `EffectSiteId::row` stayed in the root and the
+    /// eleven site enums' went to `sites.rs`. Both are scanned, so the population
+    /// is the same twelve mappings the single file used to hold, and the floor
+    /// below still means what it meant.
     pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {
-        let source =
-            std::fs::read_to_string("src/topology/effects.rs").expect("the frozen inventory");
-        let production = blank_comments_and_strings(&production_region(&source));
         let mut scanned = 0_usize;
         let mut offenders = Vec::new();
-        let mut rest = production.as_str();
-        while let Some(at) = rest.find("fn row(") {
-            rest = &rest[at + "fn row(".len()..];
-            // The body runs to the closing brace of the `match`, which is the first
-            // line at the function's own indentation that is exactly `    }`.
-            let body_end = rest.find("\n    }").unwrap_or(rest.len());
-            let body = &rest[..body_end];
-            scanned += 1;
-            for wildcard in ["_ =>", "_=>"] {
-                if body.contains(wildcard) {
-                    offenders.push(format!(
-                        "a `row()` mapping falls back through `{wildcard}`, so a site added later \
-                         compiles with no declared row: …{}",
-                        &body[..body.len().min(160)]
-                    ));
+        for path in ["src/topology/effects.rs", "src/topology/effects/sites.rs"] {
+            let source = std::fs::read_to_string(path).expect("the frozen inventory");
+            let production = blank_comments_and_strings(&production_region(&source));
+            let mut rest = production.as_str();
+            while let Some(at) = rest.find("fn row(") {
+                rest = &rest[at + "fn row(".len()..];
+                // The body runs to the closing brace of the `match`, which is the
+                // first line at the function's own indentation that is exactly
+                // `    }`.
+                let body_end = rest.find("\n    }").unwrap_or(rest.len());
+                let body = &rest[..body_end];
+                scanned += 1;
+                for wildcard in ["_ =>", "_=>"] {
+                    if body.contains(wildcard) {
+                        offenders.push(format!(
+                            "a `row()` mapping falls back through `{wildcard}`, so a site added \
+                             later compiles with no declared row: …{}",
+                            &body[..body.len().min(160)]
+                        ));
+                    }
                 }
             }
         }
         assert!(
             scanned >= 8,
-            "only {scanned} `row()` mappings scanned, so this census is looking at the wrong file"
+            "only {scanned} `row()` mappings scanned, so this census is looking at the wrong files"
         );
         assert!(offenders.is_empty(), "{offenders:#?}");
     }
