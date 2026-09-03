@@ -262,6 +262,17 @@ fn run_with_timeout_and_limit(
     )?;
     #[cfg(unix)]
     termination.prepare(&mut command);
+    // The last look before the syscall. The reaper's READY wait and the hook
+    // above both ran under the launch barrier, during which the monitor
+    // cannot act on the groups already running; a termination that arrived
+    // in that time must fail this launch rather than let a new group start
+    // past it. Dropping `termination` on the error path releases the barrier.
+    #[cfg(unix)]
+    if termination::launch_interrupted() {
+        return Err(UpstrokeError::Agent {
+            message: "process launch interrupted by a termination signal".to_owned(),
+        });
+    }
 
     let started = Instant::now();
     let mut child = ProcessTree::spawn(&mut command, hooks).map_err(|e| UpstrokeError::Agent {
@@ -1431,9 +1442,10 @@ mod termination {
 
     /// How long a forked helper (the cleanup reaper, the job-control guard)
     /// has to report READY at startup. Before it does, the child closes every
-    /// inherited descriptor; Linux does that in one `close_range`, but Darwin
-    /// and the other hosts close them one syscall at a time up to the
-    /// descriptor ceiling. Loaded macOS CI runners began failing random
+    /// inherited descriptor; Linux does that in a handful of `close_range`
+    /// calls, one per gap between the descriptors it keeps, but Darwin and
+    /// the other hosts close them one syscall at a time up to the descriptor
+    /// ceiling. Loaded macOS CI runners began failing random
     /// agent-spawning tests at the two-second budget this used to be, with no
     /// other change to the handshake; the close loop is the likeliest reason
     /// and the budget is sized for it, without claiming to have measured it.
@@ -1443,17 +1455,24 @@ mod termination {
     /// acknowledgements from a helper that is already up keep their own,
     /// shorter budgets.
     ///
-    /// The wait is not a barrier against termination. Both READY waits run
-    /// while `claim_launch` holds the launch barrier, and the monitor refuses
-    /// to kill or stop any registered group while that barrier is held, so a
+    /// The reaper's wait is not a barrier against termination. It runs while
+    /// `claim_launch` holds the launch barrier, and the monitor refuses to
+    /// kill or stop any registered group while that barrier is held, so a
     /// budget this long would otherwise let running agents outlive a SIGTERM
-    /// by the budget. The waits therefore poll in `LAUNCH_INTERRUPT_SLICE`
-    /// slices and abandon the launch, failing it, as soon as a termination is
-    /// pending (`launch_interrupted`); a termination that arrives with READY
-    /// fails it too. A suspension request is not an interruption: the guard
-    /// is what performs a suspension, and a launch that failed on Ctrl-Z would
-    /// be a surprise, so a suspension waits for READY and is then honoured,
-    /// within this budget rather than the old two seconds.
+    /// by the budget. That wait therefore polls in `LAUNCH_INTERRUPT_SLICE`
+    /// slices, asks `launch_interrupted` after every empty slice and every
+    /// signal that interrupts the poll, and abandons the launch, failing it,
+    /// as soon as a termination is pending; the launch asks again after READY
+    /// and again immediately before `ProcessTree::spawn`, so the window in
+    /// which a termination can go unnoticed is the spawn syscall itself,
+    /// after which the registered group is the monitor's to kill. A
+    /// suspension request is not an interruption: the guard is what performs
+    /// a suspension, and a launch that failed on Ctrl-Z would be a surprise,
+    /// so a suspension waits for READY and is then honoured, within this
+    /// budget rather than the old two seconds. The guard's own READY wait
+    /// runs during supervisor initialisation, before any handler is installed
+    /// or group registered, so nothing can be pending behind it and it is a
+    /// plain budgeted wait.
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
     /// How long a READY wait goes between looks at the termination flag.
     const LAUNCH_INTERRUPT_SLICE: Duration = Duration::from_millis(50);
@@ -1463,7 +1482,7 @@ mod termination {
     /// pending, and the launch barrier it holds is what keeps the monitor
     /// from acting on the groups already running. The same test
     /// `claim_launch` makes before taking the barrier.
-    fn launch_interrupted() -> bool {
+    pub(super) fn launch_interrupted() -> bool {
         PENDING_TERMINATION.load(Ordering::SeqCst) != 0
     }
     const HANDLE_SIGINT: u8 = 1 << 0;
@@ -2912,6 +2931,13 @@ mod termination {
             }
             if polled < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    // A signal landed on this thread. That is exactly when
+                    // the predicate is most likely to have turned, and a
+                    // handled signal arriving faster than the slice would
+                    // otherwise keep the loop from ever asking it.
+                    if interrupted() {
+                        return None;
+                    }
                     continue;
                 }
                 return None;
@@ -2927,6 +2953,9 @@ mod termination {
                 return None;
             }
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+            if interrupted() {
                 return None;
             }
         }
@@ -3104,14 +3133,14 @@ mod termination {
         };
         let mut probe_pid_bytes = [0_u8; 4];
         // Startup READY waits on the child's descriptor close loop; see
-        // `HELPER_READY_BUDGET`, and its note on why the wait gives up as
-        // soon as a termination is pending. Read here rather than through
+        // `HELPER_READY_BUDGET`. The guard is spawned while the supervisor
+        // state is being initialised, before Upstroke's signal handlers are
+        // installed and before any group is registered, so no termination
+        // can be pending here and nothing waits behind this read; a plain
+        // budgeted wait is the whole contract. Read here rather than through
         // `read_ack`, whose two-second budget is the runtime ARM
         // acknowledgement's.
-        let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
-        let interrupted = launch_interrupted();
-        if interrupted
-            || ready != Some(GUARD_READY)
+        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(GUARD_READY)
             || !read_raw_exact(ack[0], &mut probe_pid_bytes)
             || i32::from_ne_bytes(probe_pid_bytes) <= 0
         {
@@ -3123,11 +3152,6 @@ mod termination {
             unsafe {
                 let _ = libc::kill(pid, libc::SIGKILL);
                 let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
-            if interrupted {
-                return Err(
-                    "Unix job-control guard launch interrupted by a termination signal".to_owned(),
-                );
             }
             return Err("Unix job-control guard did not initialize".to_owned());
         }
