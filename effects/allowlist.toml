@@ -239,8 +239,33 @@ the readiness protocol over pipes (`std::io::Write::flush` 4, \
 establishes nothing -- containment cannot be established by inspection; \
 `clippy::disallowed_macros`, 4 sites, `std::print` 2 and one each of \
 `std::println` and `std::eprint`, all of them a subprocess helper reporting to \
-its parent over the stream the test reads. It performs no effect outside a \
-scratch directory of its own making and the process trees it starts and kills. \
+its parent over the stream the test reads. \
+CONTAINMENT, STATED AS IT IS, BECAUSE IT IS NOT UNIFORM. Most of these bodies \
+build a scratch directory of their own making under `std::env::temp_dir()`, \
+keyed by process id plus a ulid or a nanosecond timestamp, and touch nothing \
+outside it; the process effects are re-execs of this test binary and the trees \
+it starts and kills. FOUR SITES ARE NOT THAT, in two shapes, and every one of \
+them is a body moved verbatim out of `src/agent/proc.rs` rather than anything \
+this extraction wrote. \
+(1) `timeout_kills_a_background_grandchild_before_it_can_escape` and \
+`successful_direct_exit_still_kills_detached_group_members` put a marker FILE \
+directly in `std::env::temp_dir()` and call `std::fs::remove_file` on it before \
+creating any directory or child, so the removal is of a path they have not \
+proven they own. The first keys on process id and thread name ALONE: after a \
+crashed run leaves its marker behind and the operating system reuses that pid, \
+that `remove_file` deletes a file this suite did not create. The second adds a \
+nanosecond timestamp, which makes the same collision remote rather than \
+impossible. \
+(2) `spawn_signal_helper` and the reaper suite's `scratch` helper call \
+`std::fs::remove_dir_all` on their scratch path BEFORE `create_dir_all`, which \
+is the same unproven-ownership removal one level up; both key on process id plus \
+a ulid or nanoseconds. \
+That is the older, pre-token shape `rundir::scratch_tree::acquire` was written \
+to replace, and it is the same hazard the `src/rundir/tests.rs` row above \
+records for the same reason. THIS ROW RECORDS IT RATHER THAN IMPLYING A \
+CONTAINMENT THE FILE DOES NOT HAVE: the bodies are byte-identical to what \
+already ran inside the parent under the parent's own allow, and repairing them \
+is a change to test behaviour that this move deliberately does not make. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
