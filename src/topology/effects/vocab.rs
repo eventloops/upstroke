@@ -230,9 +230,17 @@ pub enum EnforcementDomain {
 ///
 /// A mirror of [`crate::topology::events::TOPOLOGY_EVENT_KINDS`], typed so that
 /// a site's adjacency is a value the compiler checks rather than a string a
-/// typo can invent. The two lists are asserted equal element-for-element by a
-/// unit test, so a change to the vocabulary breaks this module rather than
-/// silently leaving a site pointing at an append that no longer exists.
+/// typo can invent. The two lists are asserted equal element-for-element by
+/// `topology::effects::tests::the_adjacency_vocabulary_is_the_logs_vocabulary`,
+/// so a change to the vocabulary breaks **that assertion** rather than silently
+/// leaving a site pointing at an append that no longer exists.
+///
+/// The guard is named rather than called "a unit test in this module" because
+/// the split moved this type out of the root: "this module" now reads as
+/// `vocab`, and the assertion is in a *sibling* of it. The property is
+/// unchanged -- the test still fires -- but a reader who took the locality at
+/// its word would be looking for the guard in the wrong place, and the danger
+/// in that is removing the real one believing the documented one applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurableEvent {
