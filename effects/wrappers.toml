@@ -122,6 +122,94 @@ effect_free = [
     "write_intent",
 ]
 
+# The five production children the `m3-rundir` split gave `src/rundir.rs`, added
+# in the same commit as the split. Seventeen externally reachable `fn`s left the
+# parent's file, and a name that leaves the domain is a name nobody has to
+# classify any more -- so the children join `CLASSIFIED_MODULES` by name (never
+# by turning that list's `src/rundir.rs` into a prefix; that is `C-002`'s change,
+# and this list's other consumer matches with `starts_with`) and the same names
+# are accounted for here on the other side of the move.
+#
+# Every one of them is `effect_free`, and that is what the split was arranged to
+# make true: no funnel and no effect site moved. Each child DENIES all three
+# governed lints at file scope and takes no `effects/allowlist.toml` row -- the
+# whole run-directory, answer and lock funnel surface, its atomic publication
+# primitives and its platform locking stayed in the parent, which keeps the
+# allowlist identity.
+#
+# `first_line` and `first_line_within` are new to this record and not new to the
+# tree: they were private `fn`s of `src/rundir.rs`, and the extraction made them
+# `pub(super)` in `classify.rs` so `rundir::tests` can still drive them by name.
+# `pub(super)` here is `rundir` and its descendants and nothing wider.
+[[module]]
+path = "src/rundir/classify.rs"
+crate_path = "upstroke::rundir::classify"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "classify_run_dir",
+    "first_line",
+    "first_line_within",
+    "run_started_sha256",
+]
+
+[[module]]
+path = "src/rundir/discovery.rs"
+crate_path = "upstroke::rundir::discovery"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "describe",
+    "find_question",
+    "husk_report",
+    "latest_run",
+    "list_husks",
+    "list_runs",
+    "resolve_run_id",
+    "run_dir_names",
+]
+
+[[module]]
+path = "src/rundir/names.rs"
+crate_path = "upstroke::rundir::names"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+]
+
+[[module]]
+path = "src/rundir/ownership.rs"
+crate_path = "upstroke::rundir::ownership"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # Conjunct 12's classification, read-only and total: it takes the stat that
+    # was already performed and answers whether it *proves* the private commit
+    # record absent. Only `NotFound` does.
+    "commit_record_proves_absence",
+    "prove_private_half_ownership",
+    "public_dir",
+    "run_id",
+    "target",
+]
+
+[[module]]
+path = "src/rundir/retention.rs"
+crate_path = "upstroke::rundir::retention"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "fmt",
+    "kind",
+    "name",
+    "owner_field",
+]
+
 [[module]]
 path = "src/rundir.rs"
 crate_path = "upstroke::rundir"
@@ -162,22 +250,15 @@ effect_free = [
     "answers",
     "artifacts",
     "as_str",
-    "classify_run_dir",
     "commit_record_after_error",
-    # Conjunct 12's classification, read-only and total: it takes the stat that
-    # was already performed and answers whether it *proves* the private commit
-    # record absent. Only `NotFound` does.
-    "commit_record_proves_absence",
     "create",
     "create_hooked",
     "default_private_root",
-    "describe",
     "drop",
     "durability_ledger",
     "enter",
     "enter_cleanup_scope",
     "events",
-    "find_question",
     "fmt",
     "for_repo",
     "for_worktree_git_dir",
@@ -188,32 +269,19 @@ effect_free = [
     "harness",
     "holder",
     "hook",
-    "husk_report",
     "is_running",
-    "kind",
-    "latest_run",
     "ledger",
-    "list_husks",
-    "list_runs",
     "lock_file",
-    "name",
     "new",
-    "owner_field",
     "permits_deletion",
     "plan_json",
-    "prove_private_half_ownership",
     "public_dir",
     "questions",
     "recording_durability",
     "report_json",
-    "resolve_run_id",
     "reviews",
-    "run_dir_names",
-    "run_id",
-    "run_started_sha256",
     "runs_root",
     "settings",
-    "target",
     "transcripts",
     "v1",
     "with_private_root",

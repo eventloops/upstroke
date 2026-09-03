@@ -937,6 +937,24 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // shared
     "src/workspace_manager.rs",
     "src/rundir.rs",
+    // The five production children the `m3-rundir` split gave `src/rundir.rs`.
+    // They are named **one path each** rather than by turning the entry above
+    // into a prefix: `topology_modules_among` matches this file's other list
+    // with `starts_with`, and making these entries prefixes would change what
+    // every census in the crate measures. That is `C-002`'s own change and not
+    // this split's.
+    //
+    // They are here because the split moved seventeen externally reachable
+    // `fn`s out of `src/rundir.rs`, and a name that leaves the domain is a name
+    // nobody has to classify any more. Listing the children keeps the whole of
+    // the run-directory subsystem inside `mechanism` (3)'s classification with
+    // the same names accounted for on the other side of the move; the funnels,
+    // and every effect site, stayed in the parent.
+    "src/rundir/classify.rs",
+    "src/rundir/discovery.rs",
+    "src/rundir/names.rs",
+    "src/rundir/ownership.rs",
+    "src/rundir/retention.rs",
     "src/interaction.rs",
     "src/util.rs",
     "src/events/log.rs",
