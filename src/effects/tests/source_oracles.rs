@@ -87,9 +87,7 @@ pub(super) mod oracles {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::effects::census_domain::{
-        Call, candidates_for, production_calls, scan_module_declarations, sole_present,
-    };
+    use crate::effects::census_domain::{candidates_for, scan_module_declarations, sole_present};
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
     use crate::effects::tests::{
         crate_roots, is_the_literal_mod_tests_form, repo_root, scanned_sources,
@@ -128,13 +126,13 @@ pub(super) mod oracles {
     /// * [`sole_present`] refuses zero candidates and refuses two, rather than
     ///   picking one. A domain that cannot name the file a declaration resolves
     ///   to is not a domain.
-    /// * **The hole the precedent records, inherited knowingly**:
-    ///   `#[cfg_attr(all(), cfg(test))] mod hidden;` is applied by rustc as
-    ///   `#[cfg(test)]` and read here as unconditional, so such a child would be
-    ///   scanned as production. There is none in this tree, it predates this
-    ///   census, and widening the scan to decide `cfg_attr` predicates is its own
-    ///   change with its own review — the same disposition
-    ///   `declared_whole_file_test_modules` records for it.
+    /// * **The one thing the scan does not decide**, and it is a hole rather
+    ///   than a choice: a `cfg_attr` that applies a `cfg` is invisible to it, so
+    ///   `#[cfg_attr(all(), cfg(test))] mod hidden;` reads as unconditional.
+    ///   This walk is the first caller whose answer depends on that
+    ///   classification, so it is the change that would activate the hole —
+    ///   and [`refuse_unclassifiable_cfg_attr`] stops the walk on one rather
+    ///   than classifying it. The reasoning is there.
     /// * **The limitation that does *not* transfer.**
     ///   `declared_whole_file_test_modules` deliberately does not close over the
     ///   file graph, because there closing would *remove* a dozen files from
@@ -146,6 +144,7 @@ pub(super) mod oracles {
         declared_in: &Path,
         source: &str,
     ) -> Vec<(String, [PathBuf; 2])> {
+        refuse_unclassifiable_cfg_attr(declared_in, source);
         scan_module_declarations(source)
             .unwrap_or_else(|refusal| panic!("{}: {refusal}", declared_in.display()))
             .into_iter()
@@ -163,57 +162,206 @@ pub(super) mod oracles {
             .collect()
     }
 
-    /// Every file of the production module rooted at `root`: the root, and
-    /// transitively each file its production `mod <name>;` declarations resolve
-    /// to.
+    /// Stop, rather than classify, when a file writes a `cfg_attr` that could
+    /// apply a `cfg`.
     ///
-    /// Transitive because a domain is the module, not its first level: a
-    /// `row()` mapping in `effects/sites/worktree.rs` is as much inside
-    /// `topology::effects` as one in `effects/sites.rs`. Bounded by the visited
-    /// set rather than by a depth limit — candidates descend into directories,
-    /// so the relation is a forest and a cycle is unreachable, which is the
-    /// reason to hold the set rather than a reason to trust the shape.
-    fn production_module_files(root: &Path) -> Vec<PathBuf> {
-        let mut queue = vec![root.to_path_buf()];
-        let mut seen = BTreeSet::new();
-        let mut files = Vec::new();
-        while let Some(path) = queue.pop() {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let source = fs::read_to_string(&path).expect("a declared module file");
-            for (name, candidates) in declared_production_children(&path, &source) {
-                let resolved = sole_present(&candidates, &|candidate| candidate.is_file())
-                    .unwrap_or_else(|present| {
-                        panic!(
-                            "`{}` declares `mod {name};` and {present} of {candidates:?} exist. \
-                             A census domain that cannot name the file a declaration resolves \
-                             to is not a domain",
-                            path.display()
-                        )
-                    })
-                    .clone();
-                queue.push(resolved);
-            }
-            files.push(path);
+    /// [`scan_module_declarations`] treats a `cfg_attr` as significant only when
+    /// it mentions `path` (`src/effects.rs`), so
+    /// `#[cfg_attr(all(), cfg(test))] mod row_cases;` — which rustc applies as
+    /// `#[cfg(test)]` and compiles only under `test` — is read there as an
+    /// unconditional declaration. `declared_whole_file_test_modules` records the
+    /// hole at length and calls it a hole rather than a choice.
+    ///
+    /// **Which censuses it can reach is decided here.** Before this walk existed,
+    /// the row-mapping census read one file named by a literal and derived no
+    /// domain at all, so no `cfg_attr` anywhere could change what it scanned.
+    /// A walk that sorts declarations into production and test-only is the first
+    /// reader of that classification, and so is the change that would put the
+    /// hole in reach: a test-only child read as production drops a file of
+    /// legitimate test code into a census that rejects a wildcard `row()` arm.
+    ///
+    /// **The scan is not widened to close it.** What [`scan_module_declarations`]
+    /// decides is what every census in this crate measures; teaching it to
+    /// evaluate `cfg_attr` predicates changes all of them at once and is its own
+    /// change with its own review — the disposition
+    /// `declared_whole_file_test_modules` records for exactly this. So the walk
+    /// refuses instead, in the direction every `ScanRefusal` variant takes: a
+    /// scan that cannot say what a file declares must not answer.
+    ///
+    /// The test is the scan's own `"cfg_attr" if raw.contains("path")` shape read
+    /// for `cfg` rather than for `path`, and it is deliberately coarser than the
+    /// attribute-to-item association that deciding this properly would need —
+    /// that association *is* the widening. Any `cfg_attr` whose attribute could
+    /// apply a `cfg` stops the walk, whether or not it sits on a `mod`.
+    /// Over-refusal is the safe direction, and its cost here is measured rather
+    /// than assumed: no file of the `topology::effects` module writes a
+    /// `cfg_attr` at all, and no `cfg_attr` **attribute** anywhere in this crate
+    /// is of the refused form — every one of them conditions an `allow` or a
+    /// `path`. So the walk refuses nothing on this tree, and part (3) of the
+    /// witness is what keeps saying so: it walks the real module, and a
+    /// `cfg_attr` added to any file of it stops that test rather than quietly
+    /// changing what the census counts.
+    ///
+    /// Comments and string literals are blanked first, so the `cfg_attr` written
+    /// in the prose above is spaces by the time it is looked for. That is the
+    /// defence `policy.rs` records a phantom skip for the want of.
+    ///
+    /// # Panics
+    ///
+    /// When `source` writes such an attribute. Driven, with a control that the
+    /// same declaration without it is classified, by
+    /// `the_row_mapping_census_domain_is_the_declared_module` part (4).
+    fn refuse_unclassifiable_cfg_attr(declared_in: &Path, source: &str) {
+        let blanked = blank_comments_and_strings(source);
+        let mut rest = blanked.as_str();
+        while let Some(at) = rest.find("cfg_attr") {
+            rest = &rest[at + "cfg_attr".len()..];
+            let applied = &rest[..rest.find(']').unwrap_or(rest.len())];
+            assert!(
+                !applied.contains("cfg"),
+                "`{}` writes `cfg_attr{applied}]`, which rustc can apply as a `cfg` that \
+                 `scan_module_declarations` does not decide. A walk that cannot classify a \
+                 declaration production or test-only must not classify it",
+                declared_in.display()
+            );
         }
-        files.sort();
-        // **The control that binds every caller**, placed here rather than at
-        // each of them, for the reason `census_domain::whole_file_test_modules`
-        // gives at `src/effects.rs:1392`. A walk that found nothing but the file
-        // it was handed is a domain that has stopped meaning anything, and a
-        // caller cannot reach the set without passing through this line. It is
-        // not sufficient on its own -- see
-        // `the_row_mapping_census_domain_is_the_declared_module` part (4) for
-        // the half placement cannot cover.
-        assert!(
-            files.len() > 1 && files.contains(&root.to_path_buf()),
-            "the walk of `{}` returned {:?}: a module domain is the root plus what it declares",
-            root.display(),
-            files
-        );
-        files
     }
+
+    /// The privacy boundary that makes the row-mapping census's domain
+    /// *provably* the walk's output. It holds nothing else.
+    mod domain {
+        use std::collections::BTreeSet;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        use crate::effects::census_domain::sole_present;
+        use crate::effects::{blank_comments_and_strings, production_region};
+
+        use super::declared_production_children;
+
+        /// Every file of the production module rooted at one file — the root,
+        /// and transitively each file its production `mod <name>;` declarations
+        /// resolve to — each with the source the walk read for it.
+        ///
+        /// Transitive because a domain is the module, not its first level: a
+        /// `row()` mapping in `effects/sites/worktree.rs` is as much inside
+        /// `topology::effects` as one in `effects/sites.rs`. Bounded by the
+        /// visited set rather than by a depth limit — candidates descend into
+        /// directories, so the relation is a forest and a cycle is unreachable,
+        /// which is the reason to hold the set rather than a reason to trust the
+        /// shape.
+        ///
+        /// **A type rather than a `Vec<PathBuf>`, because the census's domain has
+        /// to be provably this walk's output, and a list of paths is a value any
+        /// caller can equally well write down by hand.** On this tree the two are
+        /// indistinguishable *by value*: the module's seven production children
+        /// are all flat `.rs` files, so a hard-coded list of the current eight
+        /// paths and the derived domain are the same eight paths in the same
+        /// order, and no assertion comparing values can tell a census that walks
+        /// from one that enumerates. Two successive repairs tried to close that
+        /// by counting the call lexically; a reviewer twice showed the same
+        /// substitution walking through it — keep the call, bind its result to
+        /// `_`, scan a hard-coded list instead, and there is still exactly one
+        /// call and no `read_dir`.
+        ///
+        /// So the difference is made a *type* error instead. [`Self::walk`] is
+        /// the only constructor, `sources` is private to this module, and the
+        /// scan is [`Self::row_mapping_wildcards`], a method over source text
+        /// only the walk can put in the struct. Under that substitution there is
+        /// no `ProductionModule` to call the scan on, and the census does not
+        /// compile.
+        pub(super) struct ProductionModule {
+            sources: Vec<(PathBuf, String)>,
+        }
+
+        impl ProductionModule {
+            /// Walk the production module rooted at `root`.
+            ///
+            /// # Panics
+            ///
+            /// When a declared child cannot be read or cannot be resolved to
+            /// exactly one file on disk, and when the walk returns nothing but
+            /// the file it was handed.
+            pub(super) fn walk(root: &Path) -> Self {
+                let mut queue = vec![root.to_path_buf()];
+                let mut seen = BTreeSet::new();
+                let mut sources: Vec<(PathBuf, String)> = Vec::new();
+                while let Some(path) = queue.pop() {
+                    if !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    let source = fs::read_to_string(&path).expect("a declared module file");
+                    for (name, candidates) in declared_production_children(&path, &source) {
+                        let resolved = sole_present(&candidates, &|candidate| candidate.is_file())
+                            .unwrap_or_else(|present| {
+                                panic!(
+                                    "`{}` declares `mod {name};` and {present} of {candidates:?} \
+                                     exist. A census domain that cannot name the file a \
+                                     declaration resolves to is not a domain",
+                                    path.display()
+                                )
+                            })
+                            .clone();
+                        queue.push(resolved);
+                    }
+                    sources.push((path, source));
+                }
+                sources.sort_by(|(left, _), (right, _)| left.cmp(right));
+                // **The control that binds every caller**, placed here rather
+                // than at each of them, for the reason
+                // `census_domain::whole_file_test_modules` gives at
+                // `src/effects.rs:1392`. A walk that found nothing but the file
+                // it was handed is a domain that has stopped meaning anything,
+                // and no caller can hold a `ProductionModule` without having
+                // come through this line.
+                assert!(
+                    sources.len() > 1 && sources.iter().any(|(path, _)| path == root),
+                    "the walk of `{}` returned {:?}: a module domain is the root plus what it \
+                     declares",
+                    root.display(),
+                    sources.iter().map(|(path, _)| path).collect::<Vec<_>>()
+                );
+                Self { sources }
+            }
+
+            /// The domain, sorted.
+            pub(super) fn files(&self) -> Vec<PathBuf> {
+                self.sources.iter().map(|(path, _)| path.clone()).collect()
+            }
+
+            /// How many `row()` mappings the module's production regions hold,
+            /// and which of them fall back through a wildcard arm.
+            pub(super) fn row_mapping_wildcards(&self) -> (usize, Vec<String>) {
+                let mut scanned = 0_usize;
+                let mut offenders = Vec::new();
+                for (_, source) in &self.sources {
+                    let production = blank_comments_and_strings(&production_region(source));
+                    let mut rest = production.as_str();
+                    while let Some(at) = rest.find("fn row(") {
+                        rest = &rest[at + "fn row(".len()..];
+                        // The body runs to the closing brace of the `match`,
+                        // which is the first line at the function's own
+                        // indentation that is exactly `    }`.
+                        let body_end = rest.find("\n    }").unwrap_or(rest.len());
+                        let body = &rest[..body_end];
+                        scanned += 1;
+                        for wildcard in ["_ =>", "_=>"] {
+                            if body.contains(wildcard) {
+                                offenders.push(format!(
+                                    "a `row()` mapping falls back through `{wildcard}`, so a \
+                                     site added later compiles with no declared row: …{}",
+                                    &body[..body.len().min(160)]
+                                ));
+                            }
+                        }
+                    }
+                }
+                (scanned, offenders)
+            }
+        }
+    }
+
+    use domain::ProductionModule;
 
     /// The body of the item whose signature line contains `signature`, read out
     /// of `source` with comments and string literals blanked.
@@ -244,6 +392,30 @@ pub(super) mod oracles {
         panic!("`{signature}` has no closing brace")
     }
 
+    /// Run `body`, returning its panic message if it panicked.
+    ///
+    /// **The panic hook is deliberately left alone**, for the reason
+    /// `workspace_manager::tests::panic_message` gives at length: the hook is
+    /// process-global and these tests run in parallel, so two of them swapping it
+    /// out and back can interleave and leave the process running with a no-op
+    /// hook for good. A few lines of expected noise on stderr is the cheaper
+    /// half of that trade.
+    fn panic_message(body: impl FnOnce()) -> Option<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+            .err()
+            .map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|text| (*text).to_owned())
+                    })
+                    .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+            })
+    }
+
     /// Every site enum's `row()` is **exhaustive by construction**: no wildcard
     /// arm (`PR5-EVENTS-063`, and the other half of `PR5-WORKSPACE-049`).
     ///
@@ -269,43 +441,20 @@ pub(super) mod oracles {
     /// The mappings live in a **module** rather than a file since
     /// `topology::effects` was split into per-concern child modules:
     /// `EffectSiteId::row` stayed in the root and the eleven site enums' went to
-    /// `sites.rs`. So the domain is [`production_module_files`] — a path here is
-    /// a domain, not an address — and
+    /// `sites.rs`. So the domain is a [`ProductionModule`] — a path here names a
+    /// module, not a file — and
     /// `the_row_mapping_census_reads_the_declared_production_module` is what
     /// measures membership in it, in both directions.
     pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {
-        let sources = production_module_files(&repo_root().join("src/topology/effects.rs"));
+        let module = ProductionModule::walk(&repo_root().join("src/topology/effects.rs"));
+        let sources = module.files();
         assert!(
             sources.len() >= 8,
             "only {} file(s) in the `topology::effects` production module, so this census is \
              looking at the wrong module: {sources:?}",
             sources.len()
         );
-        let mut scanned = 0_usize;
-        let mut offenders = Vec::new();
-        for path in &sources {
-            let source = fs::read_to_string(path).expect("the frozen inventory");
-            let production = blank_comments_and_strings(&production_region(&source));
-            let mut rest = production.as_str();
-            while let Some(at) = rest.find("fn row(") {
-                rest = &rest[at + "fn row(".len()..];
-                // The body runs to the closing brace of the `match`, which is the
-                // first line at the function's own indentation that is exactly
-                // `    }`.
-                let body_end = rest.find("\n    }").unwrap_or(rest.len());
-                let body = &rest[..body_end];
-                scanned += 1;
-                for wildcard in ["_ =>", "_=>"] {
-                    if body.contains(wildcard) {
-                        offenders.push(format!(
-                            "a `row()` mapping falls back through `{wildcard}`, so a site added \
-                             later compiles with no declared row: …{}",
-                            &body[..body.len().min(160)]
-                        ));
-                    }
-                }
-            }
-        }
+        let (scanned, offenders) = module.row_mapping_wildcards();
         assert!(
             scanned >= 8,
             "only {scanned} `row()` mappings scanned, so this census is looking at the wrong files"
@@ -368,7 +517,7 @@ pub(super) mod oracles {
 
         // (3) THE REAL DOMAIN, named file by file — and `tests.rs` is outside it
         // because its declaration carries `#[cfg(test)]`, not because of its stem.
-        let domain = production_module_files(&effects);
+        let walked = ProductionModule::walk(&effects).files();
         let mut expected: Vec<PathBuf> = [
             "src/topology/effects.rs",
             "src/topology/effects/bijection.rs",
@@ -387,68 +536,107 @@ pub(super) mod oracles {
         // component, so `effects` precedes `effects.rs`.
         expected.sort();
         assert_eq!(
-            domain, expected,
+            walked, expected,
             "the `row()` census reads the root and the seven production children of \
              `topology::effects`, and nothing else"
         );
         assert!(
-            !domain.contains(&repo_root().join("src/topology/effects/tests.rs")),
-            "`tests.rs` is declared `#[cfg(test)]` and is not production code: {domain:?}"
+            !walked.contains(&repo_root().join("src/topology/effects/tests.rs")),
+            "`tests.rs` is declared `#[cfg(test)]` and is not production code: {walked:?}"
         );
 
-        // (4) AND THE CENSUS STILL CONSUMES THE WALKER.
+        // (4) A DECLARATION THE SCAN CANNOT CLASSIFY STOPS THE WALK.
         //
-        // Parts (1) to (3) test the walker. They cannot tell whether the census
-        // calls it, and on today's tree nothing else can either: the module's
-        // seven production children are all flat `.rs`, so a root-plus-immediate-
-        // `*.rs` enumeration returns the identical eight files and every
-        // value-based assertion agrees. Measured by restoring that enumeration
-        // while leaving the walker and parts (1)-(3) intact: the whole suite
-        // stayed green, and it stayed green with a wildcard `row()` planted in
-        // `effects/twelfth/mod.rs` that the census could not see.
-        //
-        // `census_domain::whole_file_test_modules` records this defect class
-        // (`3a91626`, `R6-SETTLE-003`) and its remedy is placement — the control
-        // sits inside the helper so a caller cannot reach the set without it,
-        // which `production_module_files` above now does too. **That remedy does
-        // not cover a caller that stopped calling**, and its own comment says so:
-        // "it says nothing about whether a census calls it". So this last part is
-        // lexical, using the instrument this crate keeps for exactly the question
-        // of whether one named item calls another.
-        let body = item_body(
-            &fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"))
-                .expect("this file"),
-            "fn site_row_mappings_have_no_wildcard_arm",
+        // `scan_module_declarations` does not decide a `cfg_attr` that applies a
+        // `cfg`, and the walk above is the first reader of its production /
+        // test-only classification — so this walk is what would put that hole in
+        // reach of the census, and `refuse_unclassifiable_cfg_attr` is what keeps
+        // it out. Driven here rather than argued, because a refusal nothing
+        // exercises is the same silence it exists to break.
+        let refusal = panic_message(|| {
+            declared_production_children(&effects, "#[cfg_attr(all(), cfg(test))]\nmod hidden;\n");
+        })
+        .expect("a `cfg_attr` that can apply a `cfg` has to stop the walk");
+        assert!(
+            refusal.contains("cannot classify a declaration"),
+            "the walk stopped, but for some other reason: {refusal}"
         );
-        // Non-vacuity, both directions: the extractor isolated that census and
-        // not the whole file, and the counter answers 0 for a name it does not
-        // call.
-        // The needles here are *identifiers*, not literals: `item_body` blanks
-        // string literals, so a control written as a quoted needle the census
-        // contains would be spaces by the time it is checked. `offenders` is
-        // code inside the census; `sole_present` is code inside the walker and
-        // inside part (2) above, so its absence is what says the extractor did
-        // not run past the census's own closing brace.
+        // The control: the refusal is the attribute, not the declaration under
+        // it. Without the `cfg_attr` the same `mod hidden;` classifies as
+        // production and the walk carries on.
+        assert_eq!(
+            declared_production_children(&effects, "mod hidden;\n")
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["hidden"],
+            "control: `mod hidden;` on its own is classified, so (4) measured the `cfg_attr`"
+        );
+
+        // (5) AND THE CENSUS CANNOT SCAN ANYTHING THE WALK DID NOT HAND IT.
+        //
+        // Parts (1) to (4) test the walk. They cannot say whether the census uses
+        // it, and on today's tree no assertion over *values* can either: the
+        // module's seven production children are all flat `.rs` files, so a
+        // root-plus-immediate-`*.rs` enumeration returns the identical eight
+        // paths and every comparison above agrees. A reviewer showed the same
+        // substitution surviving two successive lexical witnesses — keep the
+        // call, bind it to `_`, scan a hard-coded list of those eight — and it
+        // was reproduced against this file before this part was written: both
+        // row-mapping tests passed under exactly that mutation.
+        //
+        // What replaced the call count is `ProductionModule`: `sources` is
+        // private to `domain`, `walk` is its only constructor, and the scan is a
+        // method on it, so that substitution now has nothing to call the scan on
+        // and fails to compile. **That half is the compiler's and is not
+        // restated here** — an assertion repeating it would be the adjacent
+        // measurement all over again.
+        //
+        // The one bypass a type cannot reach is a census that abandons the method
+        // and re-reads the files itself. This part is that control. It bans the
+        // constructs that can obtain source text rather than counting a name:
+        // there is no adjacent identifier that reads a file, so unlike a call
+        // count it has no near-miss to slip through. Needles are matched with
+        // comments and string literals blanked, so one written in prose or in an
+        // assertion message is spaces by the time it is looked for.
+        let this_file = fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"))
+            .expect("this file");
+        let body = item_body(&this_file, "fn site_row_mappings_have_no_wildcard_arm");
+        // Non-vacuity, both directions: `offenders` is code inside the census,
+        // and `sole_present` is code inside the walk and inside part (2) above,
+        // so its absence is what says the extractor stopped at the census's own
+        // closing brace instead of running on through the file.
         assert!(
             body.contains("offenders") && !body.contains("sole_present"),
             "`item_body` did not isolate the row-mapping census: {body}"
         );
-        assert_eq!(
-            production_calls(&body, "declared_production_children", Call::Free),
-            0,
-            "control: the census does not call the walker's helper directly"
-        );
-        assert_eq!(
-            production_calls(&body, "production_module_files", Call::Free),
-            1,
-            "the row-mapping census must take its domain from `production_module_files`. \
-             Parts (1)-(3) pass whatever the census does, because an immediate-`*.rs` \
-             enumeration returns the same eight files on this tree — so this is the \
-             assertion that fails when the census stops consuming the walker"
+        const READERS: [&str; 6] = [
+            "fs",
+            "File",
+            "read_to_string",
+            "read_dir",
+            "include_str",
+            "include_bytes",
+        ];
+        for reader in READERS {
+            assert!(
+                !body.contains(reader),
+                "the row-mapping census names `{reader}`, so it can read a file the walk did \
+                 not give it and its domain is no longer whatever `ProductionModule::walk` \
+                 derived: {body}"
+            );
+        }
+        // And the needle set can fire at all: this witness's own body reads a
+        // file, and the same extractor over the same needles finds it. Without
+        // this, six needles that matched nothing would read exactly like six
+        // needles that found nothing to match.
+        let own = item_body(
+            &this_file,
+            "fn the_row_mapping_census_domain_is_the_declared_module",
         );
         assert!(
-            !body.contains("read_dir"),
-            "the row-mapping census is building its own domain again: {body}"
+            READERS.iter().any(|reader| own.contains(reader)),
+            "control: the needle set cannot detect a file read even in a body that does one"
         );
     }
 
