@@ -977,6 +977,27 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/workspace_manager/snapshot_ref.rs",
     "src/workspace_manager/worktree.rs",
     "src/rundir.rs",
+    // The five production children the `m3-rundir` split gave `src/rundir.rs`.
+    // They are named **one path each**, which is the only form this list has:
+    // `reachable_fns_are_classified` joins every entry onto the manifest root
+    // and reads it as a source file, so a directory prefix would name nothing
+    // and the entry above cannot be widened into one. `C-002` is the standing
+    // finding that this roll-call is hand-maintained rather than derived, and it
+    // is not this split's to repair. (`TOPOLOGY_MODULES` above is the list that
+    // *does* match with `starts_with`, and it does not name `src/rundir.rs` at
+    // all -- neither the ban it serves nor the prefix question reaches here.)
+    //
+    // They are here because the split moved seventeen externally reachable
+    // `fn`s out of `src/rundir.rs`, and a name that leaves the domain is a name
+    // nobody has to classify any more. Listing the children keeps the whole of
+    // the run-directory subsystem inside `mechanism` (3)'s classification with
+    // the same names accounted for on the other side of the move; the funnels,
+    // and every effect site, stayed in the parent.
+    "src/rundir/classify.rs",
+    "src/rundir/discovery.rs",
+    "src/rundir/names.rs",
+    "src/rundir/ownership.rs",
+    "src/rundir/retention.rs",
     "src/interaction.rs",
     "src/util.rs",
     "src/events/log.rs",

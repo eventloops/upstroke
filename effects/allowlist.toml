@@ -583,9 +583,10 @@ the module tree; it is out of line since W1, so that paragraph now points here \
 and this file states its own level. `PR6-LANEF-004` is the shape it would \
 otherwise have taken. `runner::container::tests::every_child_module_of_the_\
 container_funnel_states_its_own_lint_level` is the census that refuses such a \
-child and its `FUNNELS` domain does NOT reach this parent -- so nothing was red, \
-and the level is written here because the hole is the same one, not because a \
-gate caught it. \
+child. Its `FUNNELS` domain did NOT reach this parent when this row was \
+written, so nothing was red and the level was written here because the hole was \
+the same one, not because a gate caught it; `src/rundir.rs` joined that domain \
+in W2 and the census now grades this file like any other child. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/rundir.rs`, under that file's own inner allow of all three \
 lints; this row allows TWO of that three, a strict subset, and the move changes \
