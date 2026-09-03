@@ -203,10 +203,20 @@ pub(super) fn apply(
 ///   the variant the parent's callers match on. `After` is then **not**
 ///   consulted, so the harness never records `After` for an effect that did
 ///   not complete.
-/// * **A refusal at `After`** is returned after the primitive ran: the effect
-///   is durable and its result is withheld, which is what error-return mode
-///   means. The result is dropped here. No funnel in the parent returns a
-///   guard, so dropping it undoes nothing.
+/// * **A refusal at `After`** is returned after the primitive returned
+///   `Ok`, and the result is dropped. That is all error-return mode
+///   promises ([`crate::topology::effects::InjectionMode::ErrorReturn`]:
+///   performed or partially performed, then `Err`). Whether anything became
+///   durable is the primitive's business, not this function's: for a
+///   read-only site such as `Worktree.Verify` nothing did, and the refusal
+///   still fires there because a read-only site is still a site whose
+///   phases are observed. The `?` stands because the caller can act on the
+///   error exactly as it is. It names the site and the phase, and what the
+///   caller does under this injection is treat the result as lost and
+///   examine what the primitive left behind, which is the residue the fault
+///   exists to produce; a funnel that reported "durable" would be claiming
+///   something it cannot see. No funnel in the parent returns a guard, so
+///   dropping the result undoes nothing.
 pub(super) fn funnel<T, F>(
     hooks: &mut dyn EffectHooks,
     site: EffectSiteId,
@@ -353,6 +363,11 @@ mod tests {
         );
     }
 
+    /// The primitive here performs no effect, which is the `Worktree.Verify`
+    /// shape: `Proceed` at `Before`, `Ok` from a read-only body, `Error` at
+    /// `After`. The funnel refuses and drops the result all the same, and
+    /// nothing about durability is claimed or checked, because nothing is
+    /// there to check.
     #[test]
     fn a_refusal_at_after_is_returned_after_the_primitive_ran() {
         let mut hooks = Scripted::refusing_at(HookPhase::After);
