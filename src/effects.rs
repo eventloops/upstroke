@@ -878,10 +878,42 @@ pub const FROZEN_LEGACY_ALLOWLIST: &[&str] = &[
 /// `the_legacy_section_never_contains_a_topology_module` executes the gap: it
 /// asserts the four-entry list misses a submodule that the five-entry list
 /// catches.
+///
+/// The `src/workspace_manager/` entry is **that paragraph again**, for the same
+/// reason and with the same evidence. The sentence names
+/// `src/workspace_manager.rs` — a file — and `"src/workspace_manager/residue.rs"`
+/// does not start with it. That cost nothing while the directory held only
+/// `fixture.rs` and `tests.rs`, both `#[cfg(test)]`; the `m4-workspace` split
+/// puts eight **production** modules there, and without this entry the ban would
+/// silently stop covering the funnel's own production code in the very commit
+/// that created it. Restoring coverage a split removed is neutrality rather than
+/// a widening of the packet, and the gap is executed below just as the
+/// `src/engine/topology/` one is.
+///
+/// **What is reachable through the hole, stated rather than dressed up.** The
+/// ban is on the legacy section alone, and
+/// `the_legacy_section_is_frozen_and_may_only_shrink` pins that section by
+/// length *and* by exact set equality, so it cannot grow at all. Reaching this
+/// hole therefore means first editing a PR5-frozen production constant. It is
+/// lost defence-in-depth, not a live escape — and it is closed here because
+/// `m4-workspace` is the only split that opens it: `src/topology/` and
+/// `src/runner/` are already prefixes, and `src/rundir.rs` and
+/// `src/agent/proc.rs` are not in this list at all.
+///
+/// **Why this list takes a directory prefix and [`CLASSIFIED_MODULES`] does
+/// not**, since one commit does both and the two answers look contradictory.
+/// They are matched differently on purpose. Entries here are matched with
+/// `str::starts_with`, so a prefix is the only form that covers a module tree,
+/// and a ban that covers more is strictly better. Entries there are joined onto
+/// the manifest root and **read as source files** by
+/// `reachable_fns_are_classified`, so a directory would name nothing at all;
+/// that list is a roll-call whose whole point is per-module review, which is why
+/// its children are enrolled one path each (`C-002`).
 pub const TOPOLOGY_MODULES: &[&str] = &[
     "src/topology/",
     "src/runner/",
     "src/workspace_manager.rs",
+    "src/workspace_manager/",
     "src/engine/topology.rs",
     "src/engine/topology/",
 ];
@@ -936,6 +968,14 @@ pub fn topology_modules_among<'a>(paths: &[&'a str]) -> Vec<&'a str> {
 pub const CLASSIFIED_MODULES: &[&str] = &[
     // shared
     "src/workspace_manager.rs",
+    "src/workspace_manager/containment.rs",
+    "src/workspace_manager/hooks.rs",
+    "src/workspace_manager/naming.rs",
+    "src/workspace_manager/object.rs",
+    "src/workspace_manager/parsers.rs",
+    "src/workspace_manager/residue.rs",
+    "src/workspace_manager/snapshot_ref.rs",
+    "src/workspace_manager/worktree.rs",
     "src/rundir.rs",
     "src/interaction.rs",
     "src/util.rs",

@@ -3059,6 +3059,24 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 /// silence. The domain below is derived from the funnel list rather than
 /// written out, so the next funnel to grow a child is covered by the same line.
 ///
+/// **The schema-4 workspace funnel is in the domain too, and W2 is when that
+/// stopped being optional.** `src/workspace_manager.rs` carries the same inner
+/// allow of all three and has had out-of-line children since W1 —
+/// `src/workspace_manager/tests.rs` and `src/workspace_manager/fixture.rs` —
+/// which this census never visited, because deriving the domain from a funnel
+/// *list* only covers the funnels somebody put on it. The `fixture.rs` row in
+/// `effects/allowlist.toml` said so in as many words: its level was "written
+/// here because the hole is the same one, not because a gate caught it". The
+/// `m4-workspace` split then added eight **production** children under that
+/// allowance, and the escape it opened is concrete rather than theoretical:
+/// delete one child's `#![deny(…)]`, put a `std::fs::write` in an existing
+/// function, and the child inherits the parent's allowance, so Clippy accepts
+/// it; the allow-placement scan sees no child allowance to object to; this
+/// census never walks the directory; and wrapper classification matches the
+/// same bare `fn` name without reading the body. An effect lands with no site
+/// while every control stays green. The `src/workspace_manager.rs` entry below
+/// is what closes it.
+///
 /// Every file under a funnel's directory either **denies** a governed lint or
 /// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
 /// grid is {file} × {which of the three governed lints}, every cell asserted:
@@ -3083,12 +3101,25 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     // the day it grew one the walk would find it rather than the reviewer
     // having to. **That day arrived in W1**: `src/runner/host/tests.rs` is its
     // extracted test module, and this walk finds it and grades it against all
-    // three governed lints like any other child. All three funnels have a
-    // directory today, so no arm of the domain below is inert.
-    const FUNNELS: [&str; 3] = [
+    // three governed lints like any other child.
+    //
+    // `src/workspace_manager.rs` was added in W2. It allowed all three at file
+    // scope and had two children this census did not visit, so the list -- not
+    // the walk -- was the whole of the gap. Measured when it was added: the arm
+    // grades ten files and every cell already passes, because
+    // `src/workspace_manager/tests.rs` allows all three against a row recording
+    // all three, `src/workspace_manager/fixture.rs` allows two against a row
+    // recording those two and denies the third, and the eight production
+    // children of the `m4-workspace` split deny all three. Nothing was red; the
+    // entry exists so that the next one would be.
+    //
+    // Every funnel named here has a directory today, and the assertions below
+    // require that rather than tolerating it, so no arm of the domain is inert.
+    const FUNNELS: [&str; 4] = [
         "src/runner/container.rs",
         "src/agent/proc.rs",
         "src/runner/host.rs",
+        "src/workspace_manager.rs",
     ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
@@ -3100,14 +3131,39 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
             continue;
         }
         with_children += 1;
-        children.extend(walk(&directory));
+        // **Per arm, not in aggregate.** A union floor cannot see one arm go
+        // missing once the other arms are large enough to cover for it: the arms
+        // are of very unequal size, so a union floor set for the small ones
+        // survives losing the largest entirely. The floor is therefore stated
+        // where the loss happens -- once per arm, over the class rather than
+        // over the arms that happen to have a named assertion below -- so the
+        // next funnel root inherits the guard instead of needing its own.
+        let arm = walk(&directory);
+        assert!(
+            !arm.is_empty(),
+            "`{funnel}` has a child directory and the walk returned no file from it, so \
+             this funnel's arm of the census is measuring nothing"
+        );
+        children.extend(arm);
     }
     children.sort();
-    assert!(
-        with_children >= 2,
-        "only {with_children} funnel(s) have an out-of-line child directory; the census is \
-         scoped to fewer module trees than the tree has"
+    // Every funnel in the list, not a floor under it. The comment above says
+    // no arm is inert; this is that sentence asserted rather than believed, and
+    // a funnel that loses its directory is now the finding it always should
+    // have been rather than a silently skipped arm.
+    assert_eq!(
+        with_children,
+        FUNNELS.len(),
+        "only {with_children} of the {} funnels have an out-of-line child directory; the \
+         census is scoped to fewer module trees than the list names",
+        FUNNELS.len()
     );
+    // The union backstop stays, and it is a backstop: with the per-arm floor
+    // above it can no longer be the thing that catches a lost arm, and it is
+    // deliberately not raised to the true population, because every remaining
+    // W2 split adds files to one of these arms and a tightened union count
+    // would conflict at each merge while binding nothing the per-arm assertion
+    // does not already bind.
     assert!(
         children.len() >= 9,
         "the walk found only {} child modules; the census is measuring nothing",
@@ -3123,6 +3179,32 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         children.contains(&root.join("src/agent/proc/test_support/readiness.rs")),
         "`src/agent/proc/test_support/readiness.rs` is not in the census domain: {children:#?}"
     );
+    // And the schema-4 workspace funnel's ten children, by name, for the same
+    // reason: a count would stay green if the walk lost the
+    // `src/workspace_manager/` arm entirely, and that arm is what this census
+    // was widened for. Named rather than counted, because *which* file stopped
+    // being graded is the finding -- a count survives a swap. The two W1
+    // children are named beside the eight the `m4-workspace` split added,
+    // because they are the two that were inheriting in silence until this entry
+    // existed.
+    for child in [
+        "src/workspace_manager/containment.rs",
+        "src/workspace_manager/fixture.rs",
+        "src/workspace_manager/hooks.rs",
+        "src/workspace_manager/naming.rs",
+        "src/workspace_manager/object.rs",
+        "src/workspace_manager/parsers.rs",
+        "src/workspace_manager/residue.rs",
+        "src/workspace_manager/snapshot_ref.rs",
+        "src/workspace_manager/tests.rs",
+        "src/workspace_manager/worktree.rs",
+    ] {
+        assert!(
+            children.contains(&root.join(child)),
+            "the schema-4 workspace funnel's child `{child}` is not in the census \
+             domain: {children:#?}"
+        );
+    }
 
     let mut missing = Vec::new();
     let mut unlisted = Vec::new();
