@@ -334,11 +334,8 @@ impl From<Refusal> for UpstrokeError {
 
 /// The domain-separation prefix of `repo_key` v1.
 ///
-/// `DESIGN.md` §15: `<repo-key>` is the first sixteen hexadecimal characters
-/// of SHA-256 over these bytes, one NUL byte, and the bytes of the canonical
-/// common git dir. (The retired v0.2 workspace decision wrote the same
-/// formula as `hex16(sha256('upstroke-repo-key-v1' NUL canonical common git
-/// dir bytes))`; §15 is where it lives now.)
+/// `decisions.workspace_candidates.execution_root`: "repo_key v1 =
+/// hex16(sha256('upstroke-repo-key-v1' NUL canonical common git dir bytes))".
 const REPO_KEY_V1_DOMAIN: &[u8] = b"upstroke-repo-key-v1";
 
 /// How many hex characters `hex16` keeps.
@@ -351,8 +348,7 @@ const REPO_KEY_V1_DOMAIN: &[u8] = b"upstroke-repo-key-v1";
 /// count it produces.
 const REPO_KEY_HEX_CHARS: usize = 16;
 
-/// `repo_key` v1 of `DESIGN.md` §15: `hex16(sha256(...))` over the domain
-/// prefix, a NUL byte and the canonical common git dir's bytes.
+/// `hex16(sha256(...))` of `decisions.workspace_candidates.execution_root`.
 #[must_use]
 pub fn repo_key_v1(canonical_common_git_dir: &Path) -> String {
     let mut hasher = Sha256::new();
@@ -756,8 +752,11 @@ impl WorkspaceManager {
     /// registration that recovery exists to remove (see
     /// [`Self::revalidate_removal`]), and the worktree comparisons the gate
     /// makes need no filesystem effect to stay true. The window this leaves
-    /// is a concurrent writer between two instructions, which no re-check
-    /// closes.
+    /// is the one between this check and the syscall itself: a writer that
+    /// exchanges a component in that gap is not seen, and no re-check closes
+    /// it. Only directory-relative syscalls close it — `openat` and
+    /// `unlinkat` against a directory descriptor held from the check — and
+    /// that is platform code for a later change, not this one.
     ///
     /// # Errors
     ///
@@ -846,12 +845,8 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
             || {
-                self.revalidate_chain(&self.execution_root)?;
-                fs::create_dir_all(&self.execution_root).map_err(|source| UpstrokeError::Io {
-                    path: self.execution_root.clone(),
-                    source,
-                })?;
                 for directory in [
+                    self.execution_root.clone(),
                     self.execution_root.join("intents"),
                     self.execution_root.join("tasks"),
                     self.execution_root.join("merge"),
@@ -888,17 +883,8 @@ impl WorkspaceManager {
             EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
             || {
                 self.revalidate_chain(&self.execution_root)?;
-                match fs::symlink_metadata(&self.execution_root) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(false);
-                    }
-                    Err(source) => {
-                        return Err(UpstrokeError::Io {
-                            path: self.execution_root.clone(),
-                            source,
-                        });
-                    }
+                if !self.execution_root.exists() {
+                    return Ok(false);
                 }
                 for scaffolding in [
                     self.hooks_dir(),
@@ -908,21 +894,8 @@ impl WorkspaceManager {
                     self.execution_root.join("snapshots"),
                 ] {
                     self.revalidate_chain(&scaffolding)?;
-                    if !directory_is_empty(&scaffolding)? {
-                        continue;
-                    }
-                    // Empty a moment ago, so a failure to remove it is a
-                    // failure to report, not a race to swallow: a scaffolding
-                    // directory nothing can remove is what keeps the root.
-                    match fs::remove_dir(&scaffolding) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(source) => {
-                            return Err(UpstrokeError::Io {
-                                path: scaffolding,
-                                source,
-                            });
-                        }
+                    if directory_is_empty(&scaffolding)? {
+                        let _ = fs::remove_dir(&scaffolding);
                     }
                 }
                 if !directory_is_empty(&self.execution_root)? {
@@ -969,29 +942,15 @@ impl WorkspaceManager {
     ) -> Result<(), UpstrokeError> {
         slot.validate()?;
         self.revalidate()?;
-        let directory = self.execution_root.join("intents");
-        let path = directory.join(slot.intent_name());
-        // The record is a persisted schema, and its slot text is identity:
-        // a validated slot is ASCII, so the checked conversion cannot fail,
-        // and it is checked rather than lossy so that it never could silently.
-        let relative = slot.relative();
-        let slot_text = relative
-            .to_str()
-            .ok_or_else(|| UpstrokeError::Refused {
-                message: format!(
-                    "refusing to record the {} slot {}: its path is not UTF-8",
-                    slot.kind(),
-                    relative.display()
-                ),
-            })?
-            .replace('\\', "/");
+        let path = self.intent_path(slot);
         let record = IntentRecord {
             kind: slot.kind().to_owned(),
-            slot: slot_text,
+            slot: slot.relative().to_string_lossy().replace('\\', "/"),
             run_id: self.run_id.clone(),
             incarnation: self.incarnation.clone(),
         };
         let ledger = hooks.durability_ledger();
+        let directory = self.execution_root.join("intents");
         funnel(hooks, slot.write_intent_site(), || {
             self.revalidate_chain(&directory)?;
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
@@ -1017,13 +976,13 @@ impl WorkspaceManager {
     ) -> Result<(), UpstrokeError> {
         slot.validate()?;
         self.revalidate()?;
-        let directory = self.execution_root.join("intents");
-        let path = directory.join(slot.intent_name());
+        let path = self.intent_path(slot);
         let ledger = hooks.durability_ledger();
+        let directory = self.execution_root.join("intents");
         funnel(hooks, slot.remove_intent_site(), || {
             self.revalidate_chain(&directory)?;
             match fs::remove_file(&path) {
-                Ok(()) => sync_directory(&directory, &ledger),
+                Ok(()) => sync_directory(path.parent().unwrap_or(&self.execution_root), &ledger),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(source) => Err(UpstrokeError::Io { path, source }),
             }
@@ -1157,28 +1116,14 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         self.revalidate()?;
         let intent = self.intent_path(slot);
-        // Absent is the refusal; anything that is not a regular file is the
-        // same refusal, since only a file is a durable record; a metadata
-        // failure — a loop planted at the intent's name, permission — is an
-        // error, not "no intent".
-        let durable = match fs::symlink_metadata(&intent) {
-            Ok(metadata) => metadata.is_file(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(UpstrokeError::Io {
-                    path: intent,
-                    source,
-                });
-            }
-        };
-        if !durable {
+        if !intent.is_file() {
             return Err(Refusal::AddWithoutIntent {
                 slot: slot.relative().display().to_string(),
                 intent,
             }
             .into());
         }
-        funnel(hooks, slot.add_site(), move || {
+        funnel(hooks, slot.add_site(), || {
             self.revalidate_chain(&path)?;
             // Inside the funnel, not before it (`PR5-CONF-003`). `identity` says
             // "the funnel itself calls hook(Before, site) -> primitive ->
@@ -1197,10 +1142,10 @@ impl WorkspaceManager {
             }
             let mut argv: Vec<OsString> =
                 Self::WORKTREE_ADD_ARGV.iter().map(OsString::from).collect();
-            argv.push(path.as_os_str().to_os_string());
+            argv.push(path.clone().into_os_string());
             argv.push(OsString::from(commit));
             self.git_ok(&self.base, &argv)?;
-            Ok(path)
+            Ok(path.clone())
         })
     }
 
@@ -1411,17 +1356,7 @@ impl WorkspaceManager {
         let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
             self.revalidate_chain(&path)?;
-            let present = match fs::symlink_metadata(&path) {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(source) => {
-                    return Err(UpstrokeError::Io {
-                        path: path.clone(),
-                        source,
-                    });
-                }
-            };
-            if present {
+            if path.exists() {
                 let contained = self.contained(&path)?;
                 remove_tree_once_handles_close(&contained).map_err(|source| UpstrokeError::Io {
                     path: contained,
@@ -1455,20 +1390,7 @@ impl WorkspaceManager {
                 // directory to the exact, contained slot from its byte-safe
                 // `gitdir` before the checkout was deleted. Only that proved
                 // registration may be removed directly.
-                let commondir = admin.join("commondir");
-                let commondir_empty = match fs::metadata(&commondir) {
-                    Ok(metadata) => metadata.len() == 0,
-                    // No `commondir` at all is Git's to prune; only a read
-                    // failure is ours to report.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(source) => {
-                        return Err(UpstrokeError::Io {
-                            path: commondir,
-                            source,
-                        });
-                    }
-                };
-                if commondir_empty {
+                if fs::metadata(admin.join("commondir")).is_ok_and(|metadata| metadata.len() == 0) {
                     if !self.registration_still_names(admin, &path)? {
                         self.git_ok(
                             &self.base,
@@ -2308,22 +2230,8 @@ impl WorkspaceManager {
         let worktrees = self.common_git_dir.join("worktrees");
         let entries = match fs::read_dir(&worktrees) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // No registrations at all. Nothing to remove only if the
-                // target is absent too; a target that is there with no
-                // registration directory is the I/O failure it looks like,
-                // and a target that cannot be read is its own.
-                return match fs::symlink_metadata(&target) {
-                    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Ok(_) => Err(UpstrokeError::Io {
-                        path: worktrees,
-                        source: error,
-                    }),
-                    Err(source) => Err(UpstrokeError::Io {
-                        path: target,
-                        source,
-                    }),
-                };
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !target.exists() => {
+                return Ok(None);
             }
             Err(source) => {
                 return Err(UpstrokeError::Io {
