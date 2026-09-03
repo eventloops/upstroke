@@ -3258,7 +3258,7 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     }
 
     // And the Process funnel's child **denies all three at file scope**. It
-    // allowed one of them until `decisions/2026-08-30-readiness-lint-placement.md`,
+    // allowed one of them until `standards/02_standards_automated_baseline.md`,
     // and the allowance is six per-site `#[expect]` attributes now: narrower
     // than the file-scope allow it replaces, and counted by the compiler in both
     // directions under `-D warnings` — a seventh denied call is an error, and an
