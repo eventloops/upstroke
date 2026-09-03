@@ -3134,9 +3134,9 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         // missing once the other arms are large enough to cover for it: the arms
         // are of very unequal size, so a union floor set for the small ones
         // survives losing the largest entirely. The floor is therefore stated
-        // where the loss happens -- once per arm, over the class rather than over
-        // the arms that happen to have a named assertion below -- so the next
-        // funnel root inherits the guard instead of needing its own.
+        // where the loss happens -- once per arm, over the class rather than
+        // over the arms that happen to have a named assertion below -- so the
+        // next funnel root inherits the guard instead of needing its own.
         let arm = walk(&directory);
         assert!(
             !arm.is_empty(),
