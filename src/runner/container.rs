@@ -3,8 +3,10 @@
 //! `decisions.effect_site_inventory.identity`: "every effectful funnel API
 //! takes its group's site by value, and the funnel itself calls `hook(Before,
 //! site)` -> primitive -> `hook(After, site)`, so hooks exist for every site by
-//! construction". `ContainerSite` in the frozen `src/topology/effects.rs` has
-//! **eight** variants and all eight are taken by value by an API here.
+//! construction". `ContainerSite` in the frozen `topology::effects` inventory
+//! — `src/topology/effects/sites.rs` since that module was split into
+//! per-concern children — has **eight** variants and all eight are taken by
+//! value by an API here.
 //!
 //! ## Why this is a file and not `container/mod.rs`
 //!
