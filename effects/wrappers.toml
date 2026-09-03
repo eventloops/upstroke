@@ -246,7 +246,7 @@ effect_free = [
     "recording_durability",
 ]
 
-# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
+# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
 [[module]]
 path = "src/workspace_manager/naming.rs"
 crate_path = "upstroke::workspace_manager::naming"
@@ -257,14 +257,18 @@ effectful_unnameable = []
 effect_free = [
     "as_str",
     "fmt",
+    "from",
     "from_intent_name",
     "gates",
+    "git_path",
     "integration",
+    "intent_kind",
     "intent_name",
     "kind",
     "relative",
     "review",
     "safe_component",
+    "try_from",
     "validate",
 ]
 

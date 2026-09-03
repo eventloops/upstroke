@@ -343,7 +343,7 @@ use self::containment::{
 
 mod naming;
 use self::naming::safe_component;
-pub use self::naming::{IntentRecord, Slot, SnapshotName};
+pub use self::naming::{IntentKind, IntentRecord, Slot, SlotPath, SlotPathError, SnapshotName};
 
 /// The slot's effect-site vocabulary: which [`EffectSiteId`] each of its four
 /// funnel positions runs under, and the [`ResourceRow`] that accounts for it.
@@ -806,8 +806,10 @@ impl WorkspaceManager {
         self.revalidate()?;
         let path = self.intent_path(slot);
         let record = IntentRecord {
-            kind: slot.kind().to_owned(),
-            slot: slot.relative().to_string_lossy().replace('\\', "/"),
+            kind: slot.intent_kind(),
+            slot: slot.git_path()?,
+            // Owned snapshots: the record is persisted, and serde owns its
+            // fields.
             run_id: self.run_id.clone(),
             incarnation: self.incarnation.clone(),
         };

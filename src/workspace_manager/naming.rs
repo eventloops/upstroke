@@ -49,6 +49,7 @@
     clippy::disallowed_macros
 )]
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -162,37 +163,67 @@ pub(super) fn safe_component(name: &str) -> Result<(), &'static str> {
 }
 
 impl Slot {
-    /// The slot's path relative to the execution root.
-    #[must_use]
-    pub fn relative(&self) -> PathBuf {
+    /// The slot's namespace directory and its component within it: the one
+    /// rendering that [`Self::relative`], [`Self::git_path`] and
+    /// [`Self::intent_name`] are three spellings of.
+    fn parts(&self) -> (&'static str, Cow<'_, str>) {
         match self {
             Self::Task { key, generation } => {
-                PathBuf::from("tasks").join(format!("k{key}-g{generation}"))
+                ("tasks", Cow::Owned(format!("k{key}-g{generation}")))
             }
-            Self::Staging { sequence } => PathBuf::from("merge").join(format!("s{sequence}")),
-            Self::Snapshot { name } => PathBuf::from("snapshots").join(name.as_str()),
+            Self::Staging { sequence } => ("merge", Cow::Owned(format!("s{sequence}"))),
+            Self::Snapshot { name } => ("snapshots", Cow::Borrowed(name.as_str())),
         }
     }
 
-    /// The intent file's name, injective over slots: the two components are
-    /// joined by `.`, which [`safe_component`] forbids inside either.
+    /// The slot's path relative to the execution root.
+    #[must_use]
+    pub fn relative(&self) -> PathBuf {
+        let (namespace, component) = self.parts();
+        PathBuf::from(namespace).join(&*component)
+    }
+
+    /// The slot's relative path as the intent record spells it: a
+    /// [`SlotPath`], `<namespace>/<component>` with a forward slash on every
+    /// platform.
+    ///
+    /// String arithmetic over the same two parts as [`Self::relative`], not a
+    /// conversion of that path, so no OS path is rendered lossily on the way
+    /// into the record. The slot is validated first, which is what lets the
+    /// result be a `SlotPath` by construction: [`SlotPath`]'s grammar is
+    /// exactly the two parts of a slot that passes [`Self::validate`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::SlotName`], from [`Self::validate`].
+    pub fn git_path(&self) -> Result<SlotPath, Refusal> {
+        self.validate()?;
+        let (namespace, component) = self.parts();
+        Ok(SlotPath(format!("{namespace}/{component}")))
+    }
+
+    /// The intent file's name, injective over slots: the two parts are joined
+    /// by `.`, which [`safe_component`] forbids inside either.
     #[must_use]
     pub fn intent_name(&self) -> String {
-        match self {
-            Self::Task { key, generation } => format!("tasks.k{key}-g{generation}.intent"),
-            Self::Staging { sequence } => format!("merge.s{sequence}.intent"),
-            Self::Snapshot { name } => format!("snapshots.{name}.intent"),
-        }
+        let (namespace, component) = self.parts();
+        format!("{namespace}.{component}.intent")
     }
 
     /// What the intent record calls this kind.
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub fn intent_kind(&self) -> IntentKind {
         match self {
-            Self::Task { .. } => "task",
-            Self::Staging { .. } => "staging",
-            Self::Snapshot { .. } => "snapshot",
+            Self::Task { .. } => IntentKind::Task,
+            Self::Staging { .. } => IntentKind::Staging,
+            Self::Snapshot { .. } => IntentKind::Snapshot,
         }
+    }
+
+    /// [`Self::intent_kind`] as the word the record and the refusals use.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        self.intent_kind().as_str()
     }
 
     /// Refuse a slot whose components could escape the execution root.
@@ -294,18 +325,139 @@ impl Slot {
 /// root it lives in — the containment `cleanup` requires ("expected-path,
 /// contained, idempotent, and never establishes authority") is then structural
 /// rather than checked.
+///
+/// **This is a persisted schema.** The wire format is four JSON strings in
+/// this order — `kind`, `slot`, `run_id`, `incarnation` — with no defaults,
+/// no aliases and unknown fields refused; the test on this type pins the
+/// exact bytes. Two of the fields are typed on the way in as well as on the
+/// way out: `kind` is an [`IntentKind`], so a record whose kind is not one
+/// of the three words is refused on read, and `slot` is a [`SlotPath`], so a
+/// record whose slot is not `<namespace>/<safe component>` is refused on read.
+/// Reclaim still trusts the file's name and nothing inside the file; the
+/// typing keeps a record honest for whoever reads it, it grants nothing.
+///
+/// Written by [`WorkspaceManager::write_intent`] from a slot that passed
+/// [`Slot::validate`]: `kind` from [`Slot::intent_kind`], `slot` from
+/// [`Slot::git_path`].
+///
+/// [`WorkspaceManager::write_intent`]: super::WorkspaceManager::write_intent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntentRecord {
     /// `task`, `staging`, or `snapshot`.
-    pub kind: String,
-    /// The slot's path relative to the execution root, as Git names paths.
-    pub slot: String,
+    pub kind: IntentKind,
+    /// The slot's path relative to the execution root as the record spells
+    /// it, from [`Slot::git_path`].
+    pub slot: SlotPath,
     /// The run that owns it.
     pub run_id: String,
     /// The coordinator incarnation that wrote it, so a later incarnation of the
     /// same run can tell its own residue from a live sibling's.
     pub incarnation: String,
+}
+
+/// What the intent record calls a slot's kind. The wire spelling is the
+/// lowercase variant name, and nothing else deserializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntentKind {
+    /// `tasks/k<key>-g<gen>`.
+    Task,
+    /// `merge/s<seq>`.
+    Staging,
+    /// `snapshots/<name>`.
+    Snapshot,
+}
+
+impl IntentKind {
+    /// The word the record and the refusals use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Staging => "staging",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+impl fmt::Display for IntentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A slot's path relative to the execution root as the intent record spells
+/// it: `<namespace>/<component>`, the namespace one of `tasks`, `merge` or
+/// `snapshots`, the component a [`safe_component`], the separator `/` on
+/// every platform.
+///
+/// **This is the documented exception to "all paths through `std::path`".**
+/// The record is platform-independent on-disk text by design: a `/` here is
+/// part of the schema, not a separator this process chose, and nothing ever
+/// joins a `SlotPath` to a root or opens it. It is produced by
+/// [`Slot::git_path`] as string arithmetic over the slot's validated parts,
+/// so no OS path is converted on the way in, and it is validated by
+/// [`TryFrom<String>`] on the way out of JSON, so a record cannot carry
+/// `..`, a leading `/`, a backslash or an empty component past a reader.
+/// The private field is the invariant: the only way to hold one is through
+/// one of those two doors.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SlotPath(String);
+
+impl SlotPath {
+    /// The path as the record spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The grammar, as a verdict over the text.
+    fn objection(value: &str) -> Result<(), &'static str> {
+        let (namespace, component) = value
+            .split_once('/')
+            .ok_or("it has no `/` between the namespace and the component")?;
+        if !matches!(namespace, "tasks" | "merge" | "snapshots") {
+            return Err("the namespace is not `tasks`, `merge` or `snapshots`");
+        }
+        safe_component(component)
+    }
+}
+
+impl TryFrom<String> for SlotPath {
+    type Error = SlotPathError;
+
+    /// The grammar is checked on the whole value; a second `/` is refused
+    /// because `/` is not legal inside a component.
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match Self::objection(&value) {
+            Ok(()) => Ok(Self(value)),
+            Err(why) => Err(SlotPathError { value, why }),
+        }
+    }
+}
+
+impl From<SlotPath> for String {
+    fn from(path: SlotPath) -> Self {
+        path.0
+    }
+}
+
+impl fmt::Display for SlotPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A string offered as a [`SlotPath`] that is not one.
+#[derive(Debug, thiserror::Error)]
+#[error("`{value}` is not a slot path: {why}")]
+pub struct SlotPathError {
+    /// The value as it was offered.
+    value: String,
+    /// The first objection, from [`SlotPath`]'s grammar.
+    why: &'static str,
 }
 
 #[cfg(test)]
@@ -433,6 +585,10 @@ mod tests {
                 .validate()
                 .expect_err("containment refuses what the grammar admitted");
             assert!(
+                slot.git_path().is_err(),
+                "and `git_path` refuses it too, so no record can spell it"
+            );
+            assert!(
                 matches!(&refusal, Refusal::SlotName { why, .. } if why.starts_with(objection)),
                 "`{name}` was refused for the wrong reason: {refusal}"
             );
@@ -465,11 +621,16 @@ mod tests {
         }
     }
 
+    /// What this pins: the exact bytes, so the field names and their order;
+    /// that the four names deserialize; that no field has a default; that a
+    /// field under another name is refused, the same value included; and
+    /// that an unknown field is refused. Values are pinned by the two typed
+    /// fields' own tests below.
     #[test]
     fn the_intent_record_schema_is_pinned() {
         let record = IntentRecord {
-            kind: "task".to_owned(),
-            slot: "tasks/kalpha-g1".to_owned(),
+            kind: IntentKind::Task,
+            slot: SlotPath::try_from("tasks/kalpha-g1".to_owned()).expect("a slot path"),
             run_id: "run".to_owned(),
             incarnation: "01".to_owned(),
         };
@@ -491,8 +652,8 @@ mod tests {
             serde_json::from_str(&json).expect("the record is a JSON object")
         };
         // `serde_json::Map` sorts its keys; the order is pinned by the exact
-        // string above, the set by this.
-        let fields: Vec<String> = object().keys().cloned().collect();
+        // string above, the set by this. The map is consumed for its keys.
+        let fields: Vec<String> = object().into_iter().map(|(key, _)| key).collect();
         assert_eq!(
             fields,
             ["incarnation", "kind", "run_id", "slot"],
@@ -506,6 +667,33 @@ mod tests {
                 "a record without `{field}` was accepted: no field has a default"
             );
         }
+        // The key set from the deserializing side: the four names read back,
+        // and a field offered under another name, its value unchanged, is an
+        // unknown field plus a missing one and refuses. `#[serde(alias =
+        // "legacy_kind")]` on `kind` would accept the first spelling below.
+        let read: IntentRecord = serde_json::from_value(serde_json::Value::Object(object()))
+            .expect("the four names deserialize");
+        assert_eq!(read, record);
+        for field in &fields {
+            for other in [
+                format!("legacy_{field}"),
+                format!("{field}_"),
+                "x".to_owned(),
+            ] {
+                let mut renamed = object();
+                let value = renamed
+                    .remove(field)
+                    .expect("the field list came from this object");
+                let accepted =
+                    format!("`{field}` was accepted as `{other}`: no field has an alias");
+                renamed.insert(other, value);
+                assert!(
+                    serde_json::from_value::<IntentRecord>(serde_json::Value::Object(renamed))
+                        .is_err(),
+                    "{accepted}"
+                );
+            }
+        }
         let mut extra = object();
         extra.insert(
             "path".to_owned(),
@@ -515,6 +703,117 @@ mod tests {
             serde_json::from_value::<IntentRecord>(serde_json::Value::Object(extra)).is_err(),
             "an unknown field is refused: a record must not smuggle a path into reclaim"
         );
+    }
+
+    #[test]
+    fn the_record_kind_is_one_of_three_words() {
+        let with_kind = |kind: &str| {
+            serde_json::from_str::<IntentRecord>(&format!(
+                r#"{{"kind":{kind},"slot":"tasks/kalpha-g1","run_id":"run","incarnation":"01"}}"#
+            ))
+        };
+        for (word, kind) in [
+            ("task", IntentKind::Task),
+            ("staging", IntentKind::Staging),
+            ("snapshot", IntentKind::Snapshot),
+        ] {
+            let record = with_kind(&format!("\"{word}\"")).expect("a known kind reads");
+            assert_eq!(record.kind, kind);
+            assert_eq!(kind.as_str(), word, "and renders back to the same word");
+        }
+        for bogus in ["\"bogus\"", "\"Task\"", "\"\"", "0", "null", "[\"task\"]"] {
+            assert!(
+                with_kind(bogus).is_err(),
+                "kind {bogus} was accepted: the record's kind is one of three words"
+            );
+        }
+        for slot in every_shape() {
+            assert_eq!(slot.intent_kind().as_str(), slot.kind());
+        }
+    }
+
+    #[test]
+    fn the_record_slot_is_refused_on_read_outside_its_grammar() {
+        let with_slot = |slot: &str| {
+            serde_json::from_str::<IntentRecord>(&format!(
+                r#"{{"kind":"task","slot":"{slot}","run_id":"run","incarnation":"01"}}"#
+            ))
+        };
+        for good in ["tasks/kalpha-g1", "merge/s1", "snapshots/g1-a1-gates"] {
+            let record = with_slot(good).expect("a slot path in the grammar reads");
+            assert_eq!(record.slot.as_str(), good);
+            assert_eq!(
+                String::from(record.slot),
+                good,
+                "and converts back to the same text"
+            );
+        }
+        // JSON spelling on the left, so a backslash is `\\\\` here and one
+        // backslash in the value the record reads.
+        for (bad, objection) in [
+            ("tasks/..", "only ASCII"),
+            ("../tasks/kalpha-g1", "the namespace"),
+            ("/tasks/kalpha-g1", "the namespace"),
+            ("tasks\\\\kalpha-g1", "it has no `/`"),
+            ("tasks/kalpha\\\\g1", "only ASCII"),
+            ("tasks/", "it is empty"),
+            ("tasks//kalpha-g1", "only ASCII"),
+            ("tasks/kalpha-g1/", "only ASCII"),
+            ("/", "the namespace"),
+            ("", "it has no `/`"),
+            ("kalpha-g1", "it has no `/`"),
+            ("worktrees/kalpha-g1", "the namespace"),
+            ("tasks/-g1", "a leading `-`"),
+        ] {
+            let error = with_slot(bad).expect_err("a slot path outside the grammar is refused");
+            assert!(
+                error.to_string().contains(objection),
+                "`{bad}` was refused for the wrong reason: {error}"
+            );
+            let direct = SlotPath::try_from(bad.replace("\\\\", "\\"))
+                .expect_err("and refused by the constructor itself");
+            assert!(direct.to_string().contains(objection), "{direct}");
+        }
+    }
+
+    #[test]
+    fn the_record_slot_is_the_relative_path_spelled_with_forward_slashes() {
+        for slot in every_shape() {
+            let git_path = slot.git_path().expect("every fixture slot is a valid one");
+            let components: Vec<String> = slot
+                .relative()
+                .components()
+                .map(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .expect(
+                            "every slot path component is UTF-8: the fixtures are built from &str",
+                        )
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(
+                git_path.as_str(),
+                components.join("/"),
+                "`git_path` and `relative` are two spellings of the same parts"
+            );
+            assert!(
+                !git_path.as_str().contains('\\'),
+                "the schema string has no OS separator on any platform: {git_path}"
+            );
+            assert_eq!(
+                slot.intent_name(),
+                format!("{}.intent", git_path.as_str().replace('/', ".")),
+                "and the intent name is the third spelling"
+            );
+            let again = SlotPath::try_from(String::from(git_path)).expect("round trip");
+            assert_eq!(
+                again.as_str(),
+                components.join("/"),
+                "what `git_path` builds, the grammar admits"
+            );
+        }
     }
 
     impl Slot {
