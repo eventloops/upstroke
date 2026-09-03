@@ -362,9 +362,8 @@ impl Report {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Mutex, OnceLock};
 
     fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
         let hermetic_root =
@@ -416,54 +415,64 @@ mod tests {
         opts
     }
 
-    /// [`crate::plan::corpus`] written out under a directory of this binding's
-    /// own, removed when the binding goes out of scope.
+    /// A directory holding [`crate::plan::corpus`] that **owns** its tree.
     ///
     /// The corpus is inline, but [`run`] reads its plan from a path, so these
     /// tests still need files on disk. §12's hermetic rule is what shapes the
-    /// type: unique, exclusive, reclaimed.
+    /// type, and `engine::topology::prelock::tests::Scratch` is the precedent
+    /// it copies: the same three decisions, for the same reasons that file
+    /// records after a `fn scratch(&str) -> PathBuf` handed back a path nothing
+    /// owned and leaked 5050 roots.
     ///
-    /// *Unique* is the name. It carries this process's id, a counter no two
-    /// calls in this process share, and a nanosecond timestamp. `Relaxed` is
-    /// the whole ordering that counter needs: uniqueness wants an atomic
-    /// increment, and no other memory is published through it.
+    /// **The name reads no clock.** The pid, the thread id and a counter keep
+    /// two live guards apart, and the test harness gives each test its own
+    /// thread. A wall clock would make every test that builds one depend on
+    /// ambient time, which §12 forbids — a host set before the epoch would
+    /// panic each of them before it reached any validation behaviour.
     ///
-    /// *Exclusive* is the arbitration point, and it is [`fs::create_dir`]
-    /// rather than `create_dir_all` (§8 and §10: a check followed by a write is
-    /// not exclusive). Whoever creates the leaf owns it until [`Drop`], and a
-    /// caller that finds one already there fails instead of sharing it. The
-    /// name is what makes a collision unreachable in practice; `create_dir` is
-    /// what makes a residual one, needing the same pid in another namespace at
-    /// the same nanosecond, an error rather than an adoption.
+    /// **The leaf is [`fs::create_dir`], not `create_dir_all`.** An existing
+    /// leaf is an error rather than a directory this test adopts, which is §8's
+    /// rule that a check followed by a write is not exclusive. That is the
+    /// guarantee; the name only makes reaching for it rare.
     ///
-    /// *Reclaimed* is [`Drop`]. The crate keeps the `unwind` panic strategy in
-    /// every profile, so it runs for a failing test as well as a passing one
-    /// and neither leaves a directory behind.
+    /// **The guard exists before the first fallible write.** Constructing it
+    /// after the four writes leaves the window the reviewer named: the temp
+    /// filesystem fills, a write panics, no guard exists, the partial directory
+    /// stays. [`Corpus::of`] creates the directory, builds `Self`, and writes
+    /// through it.
     ///
-    /// Every plan is written before [`Corpus::plan`] can hand out a path, for
-    /// the reason [`opts`]'s pools file is written inside its `OnceLock`: a
-    /// path handed out and written afterwards can be read half-written.
+    /// [`Corpus::plan`] can only be reached from a value, and a value only
+    /// exists once every plan is written, so no caller sees a path before the
+    /// file under it is complete — [`opts`]'s pools file is written inside its
+    /// `OnceLock` for the same reason.
     struct Corpus {
         dir: PathBuf,
     }
 
     impl Corpus {
         fn new() -> Self {
+            Self::of("corpus", &crate::plan::corpus::PLANS)
+        }
+
+        /// [`Corpus::new`] with the tag and the plan table named, so this
+        /// guard's own witnesses can drive a write that fails and then look for
+        /// what it left under a tag nothing else uses.
+        fn of(tag: &str, plans: &[(&str, &str)]) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("a clock set after the epoch")
-                .as_nanos();
             let dir = env::temp_dir().join(format!(
-                "upstroke-validate-corpus-{}-{}-{nanos}",
+                "upstroke-validate-{tag}-{}-{:?}-{}",
                 std::process::id(),
+                std::thread::current().id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&dir).expect("corpus directory");
-            for (name, text) in crate::plan::corpus::PLANS {
-                fs::write(dir.join(name), text).expect("corpus plan");
+            // Before the writes, not after: from here on every exit out of this
+            // function is an exit out of a live guard.
+            let corpus = Self { dir };
+            for (name, text) in plans {
+                fs::write(corpus.dir.join(name), text).expect("corpus plan");
             }
-            Self { dir }
+            corpus
         }
 
         /// The path of one plan, by the file name it carried under `fixtures/`.
@@ -474,12 +483,178 @@ mod tests {
 
     impl Drop for Corpus {
         fn drop(&mut self) {
-            // Best effort, and deliberately silent: a directory this process
-            // could not remove is a stale path no later run can collide with,
-            // and a panic from a destructor while a test's own panic is
-            // travelling aborts the process and loses the failure report.
-            let _ = fs::remove_dir_all(&self.dir);
+            let reclaimed = fs::remove_dir_all(&self.dir);
+            // A failed reclamation is the leak this type exists to close, so it
+            // is reported rather than discarded — but never while a panic is
+            // already travelling. A second panic out of a destructor aborts the
+            // process, which would replace the test's own failure with an abort
+            // and lose the report that says what actually broke.
+            assert!(
+                reclaimed.is_ok() || std::thread::panicking(),
+                "the corpus directory {} was not reclaimed: {reclaimed:?}",
+                self.dir.display()
+            );
         }
+    }
+
+    /// A corpus of one plan: enough for a witness whose subject is the guard's
+    /// reclamation rather than anything the plan says.
+    const ONE_PLAN: [(&str, &str); 1] = [("one.md", "## One\n")];
+
+    /// Every directory [`Corpus::of`] made in this process under `tag`.
+    ///
+    /// A prefix rather than a whole name: what the guard's witnesses assert is
+    /// that nothing of theirs survives, and the pid keeps a parallel suite's
+    /// other processes out of the answer. A search that matched nothing would
+    /// make an "it left nothing" assertion vacuous, so every caller pairs it
+    /// with a live guard it must find.
+    fn residue(tag: &str) -> Vec<PathBuf> {
+        let prefix = format!("upstroke-validate-{tag}-{}-", std::process::id());
+        let mut found: Vec<PathBuf> = fs::read_dir(env::temp_dir())
+            .expect("the temp directory lists")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The guard reclaims its tree on every exit — the ordinary one and the
+    /// unwind, which is the exit a failing assertion in any test below takes.
+    ///
+    /// Each path is recorded from inside the scope that made it rather than
+    /// re-derived out here: a witness that restates [`Corpus::of`]'s naming
+    /// rule agrees with whatever that rule happens to be and proves nothing
+    /// about it.
+    ///
+    /// The panic hook is deliberately **not** silenced for the second half.
+    /// The hook is process-global and this suite runs in parallel, so a test
+    /// that takes it, installs a no-op and restores it can interleave with
+    /// another doing the same and leave the process with a no-op hook for good
+    /// — every later panic anywhere in the suite losing its message. The few
+    /// lines this prints cost less than that.
+    #[test]
+    fn a_corpus_directory_is_reclaimed_on_every_exit_including_an_unwind() {
+        let ordinary = {
+            let corpus = Corpus::new();
+            let plan = corpus.plan("sample-plan.md");
+            assert!(plan.is_file(), "the corpus wrote no sample plan");
+            corpus.dir.clone()
+        };
+        assert!(
+            !ordinary.exists(),
+            "the corpus directory {} outlived its guard on the ordinary exit",
+            ordinary.display()
+        );
+
+        let recorded = Mutex::new(None);
+        let unwound = std::panic::catch_unwind(|| {
+            let corpus = Corpus::new();
+            *recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(corpus.dir.clone());
+            // The shape of a real failure: an assertion about the run that does
+            // not hold, raised with the guard still in scope.
+            assert!(
+                !corpus.plan("sample-plan.md").is_file(),
+                "a deliberate failure, mid-test"
+            );
+        });
+        assert!(
+            unwound.is_err(),
+            "the closure was supposed to unwind, so nothing about the panic path was measured"
+        );
+        let path = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the closure recorded its directory before it panicked");
+        assert!(
+            !path.exists(),
+            "the corpus directory {} survived the unwind",
+            path.display()
+        );
+    }
+
+    /// A construction that fails partway through its own setup leaves nothing
+    /// behind.
+    ///
+    /// This is the window a guard built *after* the writes cannot cover, and it
+    /// is the failure the review named: the directory exists, some plans are in
+    /// it, a later write fails, and with no live guard the partial tree stays.
+    /// The failing write is a real one rather than an injected fault — a plan
+    /// name whose parent directory was never created, so `fs::write` fails with
+    /// `NotFound` on every platform.
+    ///
+    /// The first half is the control, and it is not optional: [`residue`]
+    /// matches on a name prefix, so a naming change alone would make "it left
+    /// nothing" pass while proving nothing. The control fails first if the
+    /// search cannot see a live guard of this shape.
+    #[test]
+    fn a_corpus_that_fails_midway_through_its_own_setup_leaves_nothing_behind() {
+        const TAG: &str = "raii-setup";
+        // `deeper/` is never created, so the second write fails where the first
+        // succeeded: the directory is there, one plan is in it, and reclaiming
+        // both is what the guard has to do from inside its own constructor.
+        const PARTIAL: [(&str, &str); 2] = [("one.md", "## One\n"), ("deeper/two.md", "## Two\n")];
+
+        let live = Corpus::of(TAG, &ONE_PLAN);
+        assert_eq!(
+            residue(TAG),
+            vec![live.dir.clone()],
+            "the search cannot see a live corpus under this tag, so its absence would prove nothing"
+        );
+        drop(live);
+        assert!(
+            residue(TAG).is_empty(),
+            "the control corpus outlived its guard: {:?}",
+            residue(TAG)
+        );
+
+        let failed = std::panic::catch_unwind(|| Corpus::of(TAG, &PARTIAL));
+        assert!(
+            failed.is_err(),
+            "the setup was supposed to fail on the second plan"
+        );
+        assert!(
+            residue(TAG).is_empty(),
+            "a corpus that failed partway through its own setup left {:?}",
+            residue(TAG)
+        );
+    }
+
+    /// A reclamation that fails is **reported**, not discarded.
+    ///
+    /// `Drop` cannot return, so the alternative to reporting is silence — and
+    /// silence here is the same leak the guard exists to close, with nothing to
+    /// say it happened. The review named this half explicitly: on Windows a
+    /// process holding a plan file without delete sharing makes
+    /// `remove_dir_all` fail, and a discarded error let the test report success
+    /// over a tree that was still there.
+    ///
+    /// The tree is reclaimed out from under the live guard through the very
+    /// call the guard will use, so the removal it then attempts fails with
+    /// `NotFound` for a real reason rather than an injected one, and the panic
+    /// that carries the report is caught here rather than failing this test.
+    #[test]
+    fn a_corpus_directory_that_cannot_be_reclaimed_is_reported_rather_than_discarded() {
+        let reported = std::panic::catch_unwind(|| {
+            let corpus = Corpus::of("raii-reported", &ONE_PLAN);
+            fs::remove_dir_all(&corpus.dir).expect("the tree reclaims early");
+        })
+        .expect_err("the guard discarded a failed reclamation");
+
+        let message = reported
+            .downcast_ref::<String>()
+            .map_or_else(String::new, Clone::clone);
+        assert!(
+            message.contains("was not reclaimed") && message.contains("raii-reported"),
+            "the report must name the directory it could not reclaim: {message}"
+        );
     }
 
     #[test]
