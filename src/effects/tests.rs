@@ -1025,6 +1025,15 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
              have to be written down",
         ),
         (
+            "src/agent/proc/tests.rs",
+            "the Process funnel's `#[cfg(test)]` suite, out of line since M6. \
+             The reaper-reclaim tests name the runtime the cleanup reaper is \
+             armed with -- the same text was inside `src/agent/proc.rs` below \
+             its `#[cfg(test)]` cut and so was never in this domain; it is \
+             named for the same reason `fake.rs` is, the marker being at the \
+             DECLARATION and not in the file",
+        ),
+        (
             "src/runner/container.rs",
             "the Container funnel: `FunnelGroup::Container.module()`, the one \
              production file that may reach a container runtime, and the one \

@@ -3113,12 +3113,15 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "the walk found only {} child modules; the census is measuring nothing",
         children.len()
     );
-    // The Process funnel's child is in the domain **by name**. A count alone
-    // would stay green if the walk lost the `src/agent/proc/` arm entirely, and
-    // that arm is the one this census was widened for.
+    // `readiness.rs` is in the domain **by name**. A count alone would stay
+    // green if the walk lost the `src/agent/proc/` arm entirely, and that arm is
+    // the one this census was widened for. The Process funnel has had siblings
+    // there since the `m6-proc` split, so the pin is on this path rather than on
+    // the arm holding one file: a named path keeps saying the same thing however
+    // many children the arm grows.
     assert!(
         children.contains(&root.join("src/agent/proc/test_support/readiness.rs")),
-        "the Process funnel's only child is not in the census domain: {children:#?}"
+        "`src/agent/proc/test_support/readiness.rs` is not in the census domain: {children:#?}"
     );
 
     let mut missing = Vec::new();
@@ -3175,7 +3178,7 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         }
     }
 
-    // And the Process funnel's child **denies all three at file scope**. It
+    // And `readiness.rs` **denies all three at file scope**. It
     // allowed one of them until `decisions/2026-08-30-readiness-lint-placement.md`,
     // and the allowance is six per-site `#[expect]` attributes now: narrower
     // than the file-scope allow it replaces, and counted by the compiler in both
@@ -3191,12 +3194,12 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     // level_and_in_the_allowlist`, and this is the same claim read from the
     // other end, so a row that grew a second lint fails here too.
     let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))
-        .expect("the child");
+        .expect("the readiness child");
     for lint in GOVERNED {
         assert_eq!(
             stated_lint_level(&readiness, lint),
             Some("deny"),
-            "the Process funnel's child no longer denies `{lint}` at file scope"
+            "`readiness.rs` no longer denies `{lint}` at file scope"
         );
     }
     assert!(allowlist_records(

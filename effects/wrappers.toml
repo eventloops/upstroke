@@ -681,22 +681,64 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "active_processes_with",
+    "child_leads_its_own_group",
+    "deref",
+    "deref_mut",
+    # A pure decision over a memoised `Result`: it clones a message or returns
+    # `Ok`, and touches nothing.
+    "memoised_outcome",
+    "terminate_and_wait",
+    "terminate_and_wait_with",
+]
+
+# The observation and injection surface, out of line since the `m6-proc` split.
+# A private `mod` of the funnel, so nothing here is reachable from outside
+# `agent::proc` except through the root's own re-exports of `SpawnHooks` and
+# `NoHooks` -- the two names that were `pub` before the move and are `pub` after
+# it. `crate_path` is the module's real path all the same, because the two
+# appliers are `pub(super)` and `externally_reachable_fns` counts that.
+[[module]]
+path = "src/agent/proc/hooks.rs"
+crate_path = "upstroke::agent::proc::hooks"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # `apply`/`apply_io`: turn a hook's answer back into control flow. Both
+    # return `Ok` or an error carrying the point's name; neither starts,
+    # signals or waits on anything. The one non-returning path is
+    # `std::process::abort()` under an injected `Kill`, which is the harness
+    # deliberately ending THIS process without running a destructor -- the
+    # whole claim under test -- and not an effect on anything outside it.
+    "apply",
+    "apply_io",
     # `SpawnHooks` default bodies. `child_created` does nothing; `point_mode`
     # delegates to `point`, which is an observer question and not an effect.
     # In the domain since `PR6-LANEF-007`.
     "child_created",
+    "point",
     "point_mode",
-    "active_processes_with",
+]
+
+# The ambient Job Object and the cleanup reapers' reclaim scope, out of line
+# since the `m6-proc` split. Every Win32 call underneath these is made by
+# `windows_job`, which stayed in the parent; every Unix one by `termination`,
+# which stayed there too. The classifications are the ones these names carried
+# in the parent's block, unchanged by the move.
+[[module]]
+path = "src/agent/proc/ambient.rs"
+crate_path = "upstroke::agent::proc::ambient"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
     "ambient_job_established",
     "child_in_ambient_job",
-    "child_leads_its_own_group",
-    "deref",
-    "deref_mut",
     "join_ambient_job",
-    # A pure decision over a memoised `Result`: it clones a message or returns
-    # `Ok`, and touches nothing.
-    "memoised_outcome",
-    "point",
+    # `join_ambient_job` over an explicit join step, so the error arm can be
+    # executed at all. Same classification as the entry point it implements.
+    "join_ambient_job_with",
     # `#[cfg(all(windows, test))]`: writes a value into a process-local
     # `OnceLock` so a subprocess helper can carry a real ambient failure. No
     # effect outside this process, and no production caller at all.
@@ -710,8 +752,33 @@ effect_free = [
     # coordinator has died. The same classification `poison_ambient_for_tests`
     # carries, for the same reason.
     "set_container_reclaim_scope",
-    "terminate_and_wait",
-    "terminate_and_wait_with",
+]
+
+# The pipe reader, out of line since the `m6-proc` split. It reads the stdout
+# and stderr handles `run_with_timeout_and_limit` already holds, inside that
+# funnel call's own `Process.Spawn` site; it starts no process, opens nothing,
+# and names no path. So it reaches no effect of its own and takes no site --
+# which is why all four are `effect_free` and none is denied. The four were
+# private items of `src/agent/proc.rs` before the move and are `pub(super)`
+# after it, the same visibility, and that is what puts them in this domain.
+[[module]]
+path = "src/agent/proc/drain.rs"
+crate_path = "upstroke::agent::proc::drain"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # Snapshot the buffer after a bounded grace instead of joining, so an
+    # orphan holding the write end cannot stall the supervisor.
+    "collect",
+    # Whether either stream hit the capture allowance; the supervisor asks
+    # before it decides to terminate the tree.
+    "drain_limit_exceeded",
+    "limit_exceeded",
+    # Hands the reader to a thread. `thread::spawn` is not
+    # `std::process::Command::spawn`, and this module's own `start` is not a
+    # denied path: a segment-matching scan flags both and neither is one.
+    "start",
 ]
 
 [[module]]

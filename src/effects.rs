@@ -966,6 +966,28 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/gates.rs",
     "src/review.rs",
     "src/agent/proc.rs",
+    // The three production children the `m6-proc` split gave
+    // `src/agent/proc.rs`: `hooks.rs` (the observation and injection surface),
+    // `ambient.rs` (the ambient Job Object and the reclaim scope) and `drain.rs`
+    // (the pipe reader), named **one path each**. That is the only form this
+    // list has: `reachable_fns_are_classified` joins every entry onto the
+    // manifest root and reads it as a source file, so a directory prefix would
+    // name nothing, and `"src/agent/proc.rs"` is therefore left as an exact path
+    // rather than widened into `"src/agent/proc"`. `C-002` is the standing
+    // finding that this roll-call is hand-maintained rather than derived, and it
+    // is not this split's to repair.
+    //
+    // They are named because the split moved ten externally reachable `fn`s out
+    // of `src/agent/proc.rs` and made five previously private ones `pub(super)`
+    // in the children -- the same visibility a private item of `proc` had, and
+    // the visibility `externally_reachable_fns` counts. Naming the children
+    // keeps every one of those names accounted for on the other side of the
+    // move. The funnel entry point, both `ProcessSite` values, the
+    // no-degraded-mode memo, `windows_job` and `termination` stayed in
+    // `src/agent/proc.rs`.
+    "src/agent/proc/ambient.rs",
+    "src/agent/proc/drain.rs",
+    "src/agent/proc/hooks.rs",
     "src/agent/bin.rs",
     "src/agent/claude.rs",
     "src/agent/codex.rs",
