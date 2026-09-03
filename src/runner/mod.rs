@@ -1283,6 +1283,65 @@ mod tests {
         value
     }
 
+    /// The body of `fn name` in `code`, braces matched, or `None` when `code`
+    /// does not define it.
+    ///
+    /// **Per-item, because a whole-file count is not a mapping.** A census that
+    /// totals a call across a subtree is green for every arrangement summing to
+    /// the same total, so a charge that moves from one function to another is
+    /// invisible to it. Reading each function's own body is what turns "two
+    /// calls somewhere" into "this one calls it, and so does that one".
+    ///
+    /// The scan is over [`crate::effects::production_code`]'s region, where
+    /// comments and string literals are already blanked, so a brace inside
+    /// either cannot open or close a body here.
+    ///
+    /// # Panics
+    ///
+    /// When `code` defines `name` more than once: two bodies is two answers and
+    /// the caller would silently read the first.
+    fn function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("fn {name}(");
+        let mut definitions = code.match_indices(&needle);
+        let (found, _) = definitions.next()?;
+        assert!(
+            definitions.next().is_none(),
+            "`{name}` is defined more than once in this region, so a body-wise count would \
+             read only the first"
+        );
+        let bytes = code.as_bytes();
+        // The signature first: the body opens at the first `{` outside the
+        // parameter list and outside any bracketed bound. A `;` there instead
+        // is a declaration without a body — a trait signature — and running on
+        // would return the *next* item's body.
+        let mut at = found + needle.len() - 1;
+        let mut round = 0_i32;
+        let mut square = 0_i32;
+        let open = loop {
+            match bytes.get(at)? {
+                b'(' => round += 1,
+                b')' => round -= 1,
+                b'[' => square += 1,
+                b']' => square -= 1,
+                b';' if round == 0 && square == 0 => return None,
+                b'{' if round == 0 && square == 0 => break at,
+                _ => {}
+            }
+            at += 1;
+        };
+        let mut depth = 0_i32;
+        let mut end = open;
+        loop {
+            match bytes.get(end)? {
+                b'{' => depth += 1,
+                b'}' if depth == 1 => return Some(&code[open + 1..end]),
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+    }
+
     /// Every place production builds a filename `stem`, and the expression it
     /// builds it from.
     ///
@@ -2316,18 +2375,50 @@ mod tests {
              an entire slice"
         );
 
-        // **And every settlement reaches that one place.** The table above
-        // counts *write sites*, which is what it was written for — but a write
-        // site nothing calls is a rule nothing applies, and that is exactly how
-        // the allowance broke on 2026-08-27: `candidate_prepared` became the
-        // sole successful settlement, the increment stayed behind in
-        // `apply_settlement`, and this census went on finding its one write and
-        // passing. A successful attempt spent nothing and nothing said so.
+        // **And every settlement reaches that one place — each of them, not
+        // two between them.** The table above counts *write sites*, which is
+        // what it was written for — but a write site nothing calls is a rule
+        // nothing applies, and that is exactly how the allowance broke on
+        // 2026-08-27: `candidate_prepared` became the sole successful
+        // settlement, the increment stayed behind in `apply_settlement`, and
+        // this census went on finding its one write and passing. A successful
+        // attempt spent nothing and nothing said so.
         //
         // Schema 4 has two settlement appliers — `apply_settlement` for a
         // failure and `apply_candidate_prepared` for a success — and both must
-        // charge. Counting the calls is what makes a settlement that stops
-        // charging a failing census rather than a silent undercount.
+        // charge.
+        //
+        // **The count is per applier, because an aggregate is not that
+        // mapping.** A total of two is green for every arrangement that sums to
+        // two, so taking the success charge out of `apply_candidate_prepared`
+        // and putting a second one into `apply_settlement` — failures charged
+        // twice, successes not charged at all — left the total at two and this
+        // census green. Measured, by planting exactly that. The table below is
+        // keyed by applier and asserted whole, so the failure names the applier
+        // that stopped charging alongside the one that gained a charge, rather
+        // than reporting a number that did not move.
+        //
+        // **Every spelling of the call, not one.** The needle was the literal
+        // `self.charge_allowance`, and `Self::charge_allowance(self, …)` and a
+        // fully-qualified `TaskFold::charge_allowance(self, …)` are the same
+        // call to rustc while being invisible to it.
+        // [`crate::effects::census_domain::production_calls`] is asked for both
+        // call forms — `Call::Method` for the dotted receiver, `Call::Free` for
+        // every path form — and their sum is what this counts. `SPELLINGS`
+        // drives that sum, so the control travels through the census's own
+        // counter rather than beside it.
+        //
+        // **What this cannot see, stated rather than left implied.** It is
+        // lexical. The crate's rustc-resolved mechanism is `clippy.toml`'s
+        // `disallowed-*` lists, and those *deny* a call — there is no resolved
+        // form of "this function must call that one", so a resolved version of
+        // this property is not available at this seam. What the lexical form
+        // accepts is the four spellings `SPELLINGS` carries; what it does not
+        // read as a charge is a call an applier reaches through an intermediate
+        // helper. The two assertions divide that between them rather than
+        // leaving it open: a charge that leaves an applier's body is a `0` in
+        // the map, whichever helper it moved into, and a charge that appears
+        // outside both bodies moves the subtree total off two.
         //
         // **The fold is a directory, and one level of it is not the subtree.**
         // It was one file when this was written, and the read below was that
@@ -2354,8 +2445,20 @@ mod tests {
         // through `census_domain::whole_file_test_modules`, so `fold/tests.rs`
         // — and any deeper one a later split adds — leaves this domain by
         // derivation rather than by a `tests.rs` name check.
-        const FOLD_ROOT: &str = "src/topology/fold.rs";
-        const FOLD_SUBTREE: &str = "src/topology/fold/";
+        //
+        // **The boundary is `std::path`, compared component-wise.** It read the
+        // display form: `starts_with` on a `String` against a hand-written
+        // `"src/topology/fold/"`, and `!rest.contains('/')` for "no deeper".
+        // That is a separator assumption standing in for a path comparison,
+        // against `CLAUDE.md`'s "all paths through `std::path`".
+        // `Path::starts_with` compares components, so a sibling
+        // `src/topology/foldx.rs` is outside the subtree by construction rather
+        // than by a trailing slash, and `parent()` names the direct children
+        // without scanning for a separator.
+        use std::path::Path;
+
+        let fold_root = Path::new("src/topology/fold.rs");
+        let fold_dir = Path::new("src/topology/fold");
         let walked = production_sources();
         // **The floor counts DIRECT children; only the charge count below
         // widens to the whole subtree.** Widening the scan must not widen the
@@ -2368,36 +2471,87 @@ mod tests {
         // repaired.
         let children = walked
             .iter()
-            .filter(|(path, _)| {
-                path.strip_prefix(FOLD_SUBTREE)
-                    .is_some_and(|rest| !rest.contains('/'))
-            })
+            .filter(|(path, _)| Path::new(path).parent() == Some(fold_dir))
             .count();
         // The control: a walk that found nothing would count zero charges in a
-        // tree that has two, and the assertion below would then be about an
+        // tree that has two, and the assertions below would then be about an
         // empty region rather than about the appliers.
         assert!(
             children >= 10,
-            "the walk found {children} production children of the fold, so the count below is \
+            "the walk found {children} production children of the fold, so the counts below are \
              over almost nothing"
         );
+
+        // Both call forms, summed: `receiver.charge_allowance(…)` and every
+        // path form of the same call.
+        let charge_calls = |code: &str| {
+            use crate::effects::census_domain::{Call, production_calls};
+            production_calls(code, "charge_allowance", Call::Free)
+                + production_calls(code, "charge_allowance", Call::Method)
+        };
+        // The control, through the counter the census itself uses: the four
+        // spellings that reach the same item, the definition line, and two
+        // near-names that are different items. The literal needle this
+        // replaces scores this body **1**.
+        const SPELLINGS: &str = "\
+fn control() {
+    self.charge_allowance(key, record);
+    Self::charge_allowance(self, key, record);
+    TaskFold::charge_allowance(self, key, record);
+    crate::topology::fold::TaskFold::charge_allowance(self, key, record);
+    self.recharge_allowance(key, record);
+    self.charge_allowance_twice(key, record);
+}
+fn charge_allowance(&mut self) {}
+";
+        let spelled = charge_calls(SPELLINGS);
+        assert_eq!(
+            spelled, 4,
+            "the counter reads {spelled} of the four spellings of this call, so an applier \
+             could stop charging by rewriting the one spelling it does read"
+        );
+
+        const APPLIERS: [&str; 2] = ["apply_settlement", "apply_candidate_prepared"];
+        let mut charging: BTreeMap<&str, usize> = BTreeMap::new();
         let mut charges = 0;
         for (path, code) in &walked {
-            if path.as_str() != FOLD_ROOT && !path.starts_with(FOLD_SUBTREE) {
+            let path = Path::new(path);
+            if path != fold_root && !path.starts_with(fold_dir) {
                 continue;
             }
-            charges += crate::effects::census_domain::production_calls(
-                code,
-                "self.charge_allowance",
-                crate::effects::census_domain::Call::Free,
-            );
+            charges += charge_calls(code);
+            for applier in APPLIERS {
+                let Some(body) = function_body(code, applier) else {
+                    continue;
+                };
+                assert!(
+                    charging.insert(applier, charge_calls(body)).is_none(),
+                    "`{applier}` is defined in two files of the fold's production region, so \
+                     which of them settles is not decided here"
+                );
+            }
         }
+        assert_eq!(
+            charging,
+            APPLIERS
+                .iter()
+                .map(|name| (*name, 1))
+                .collect::<BTreeMap<_, _>>(),
+            "each settlement applier charges the rung exactly once, and the map on the left is \
+             what the fold's production region actually does. A `0` is a settlement that spends \
+             nothing — the 2026-08-27 defect, an operator handed a free attempt on a rung \
+             already paid for; a `2` is one settlement charged twice; a missing applier is one \
+             that has been renamed or has left the fold, and this census has stopped reading \
+             the code it names"
+        );
+        // And nowhere else in the subtree. The map above is per applier and
+        // says nothing about a third charge site — a helper charging a retained
+        // failure a second time is outside both bodies and inside this count.
         assert_eq!(
             charges, 2,
             "`charge_allowance` is called {charges} time(s) in the fold module's production \
-             region; schema 4 has two settlement appliers and each must charge the \
-             rung — a failure through `apply_settlement` and a success through \
-             `apply_candidate_prepared`"
+             region; the two settlement appliers account for two, so any other number is a \
+             charge outside both of them"
         );
     }
 
