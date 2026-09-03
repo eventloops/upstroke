@@ -28,7 +28,6 @@ after its children, since it keeps whatever the split did not move.
 | # | File | Lines | From | Merged |
 |---|---|---|---|---|
 | 1 | `src/workspace_manager/containment.rs` | 235 | #110 | 2026-09-03 |
-| 2 | `src/workspace_manager/hooks.rs` | 200 | #110 | 2026-09-03 |
 | 3 | `src/workspace_manager/naming.rs` | 254 | #110 | 2026-09-03 |
 | 4 | `src/workspace_manager/object.rs` | 68 | #110 | 2026-09-03 |
 | 5 | `src/workspace_manager/parsers.rs` | 274 | #110 | 2026-09-03 |
@@ -54,4 +53,4 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 
 | File | Swept at (commit) | Date | Notes |
 |---|---|---|---|
-| _none yet_ | | | |
+| `src/workspace_manager/hooks.rs` | `f58747a` | 2026-09-03 | `Arc<Mutex<HookHarness>>`, the lock and the two ledger clones kept with their lifecycle, protected invariant and handle semantics stated; the three `?` in `funnel` kept as deliberate and documented at the site; `point` now applies a refusal at the mode that answered (it named `kill` whatever fired); a test module for the protocol itself. |
