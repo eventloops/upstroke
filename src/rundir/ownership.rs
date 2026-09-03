@@ -33,10 +33,10 @@
 // a writer-less fifo blocks `read_to_string` in the kernel, and `husk_report`
 // calls this proof under the physical worktree lock, so an entry that never
 // proves is a lock held for ever. That code is byte-identical to the parent's
-// and out of this split's scope -- `prove_private_half_ownership`'s own older
-// doc sentence still says "total" and is carried unchanged for the same
-// reason. This prologue is what the split added, so this prologue is what
-// stops restating it.
+// and stays out of this split's scope; the assertion of totality over it does
+// not, in either place it was made. `prove_private_half_ownership`'s own doc
+// says the same thing where a reader of that function will see it, so the two
+// cannot be read as disagreeing.
 //
 // **Measured, not believed.** A probe of three lines -- a `std::fs::write`, a
 // `std::process::Command` and a `println!` -- is refused three times here, once
@@ -87,7 +87,16 @@ impl PrivateHalfProof {
     }
 }
 
-/// The bidirectional ownership proof, read-only and total.
+/// The bidirectional ownership proof. Read-only, and **not** total.
+///
+/// Nothing here bounds a read. `.creating` or `owner.json` swapped for a
+/// writer-less fifo blocks `fs::read_to_string` in the kernel, and
+/// `husk_report` calls this proof under the physical worktree lock, so an
+/// entry that never proves is a lock held for ever. There is deliberately no
+/// analogue of the classification probe's byte budget: these two reads take
+/// whole small records and have no `take` on them. The race is byte-identical
+/// to the parent's and out of this split's scope; asserting totality over it
+/// would not be, which is why this sentence no longer does.
 ///
 /// `startup_census` (ii) states the conjunction and this is it, in that
 /// order: a parseable marker, whose `run_id` equals the directory basename
