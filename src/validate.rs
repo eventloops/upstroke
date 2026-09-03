@@ -424,11 +424,16 @@ mod tests {
     /// records after a `fn scratch(&str) -> PathBuf` handed back a path nothing
     /// owned and leaked 5050 roots.
     ///
-    /// **The name reads no clock.** The pid, the thread id and a counter keep
-    /// two live guards apart, and the test harness gives each test its own
-    /// thread. A wall clock would make every test that builds one depend on
-    /// ambient time, which §12 forbids — a host set before the epoch would
-    /// panic each of them before it reached any validation behaviour.
+    /// **The name reads no clock.** A wall clock would make every test that
+    /// builds one depend on ambient time, which §12 forbids: a host set before
+    /// the epoch would panic each of them before it reached any validation
+    /// behaviour. What replaces it is the precedent's naming — the pid and
+    /// `std::thread::current().id()`, which is how that file keeps two live
+    /// fixtures apart — plus the counter, which is what actually makes the name
+    /// unique within a process rather than leaving that to an assumption about
+    /// how the harness schedules tests. `Relaxed` is the whole ordering the
+    /// counter needs (§10): uniqueness wants an atomic increment, and no other
+    /// memory is published through it.
     ///
     /// **The leaf is [`fs::create_dir`], not `create_dir_all`.** An existing
     /// leaf is an error rather than a directory this test adopts, which is §8's
