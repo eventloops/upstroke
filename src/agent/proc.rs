@@ -4798,7 +4798,9 @@ mod termination {
             // the helper is single-threaded at this point.
             unsafe { std::env::remove_var("UPSTROKE_TEST_REAPER_READY_DELAY_MS") };
             let message = match spawn_reaper() {
-                Ok(_) => panic!("a launch whose READY arrived with a termination pending was accepted"),
+                Ok(_) => {
+                    panic!("a launch whose READY arrived with a termination pending was accepted")
+                }
                 Err(message) => message,
             };
             assert!(
