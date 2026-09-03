@@ -1002,6 +1002,28 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/util.rs",
     "src/events/log.rs",
     "src/runner/host.rs",
+    // The three production children the `m5-host` split gave
+    // `src/runner/host.rs`: `environment.rs`, `naming.rs` and `probe.rs`, named
+    // **one path each**. That is the only form this list has:
+    // `reachable_fns_are_classified` joins every entry onto the manifest root
+    // and reads it as a source file, so a directory prefix would name nothing,
+    // and `"src/runner/host.rs"` is therefore left as an exact path rather than
+    // widened into `"src/runner/host"`. `C-002` is the standing finding that
+    // this roll-call is hand-maintained rather than derived, and it is not this
+    // split's to repair. (`TOPOLOGY_MODULES` is the list that *does* match with
+    // `starts_with`, and it already names `src/runner/`, so neither the ban it
+    // serves nor the prefix question reaches here.)
+    //
+    // They are named because the split moved ten externally reachable `fn`s out
+    // of `src/runner/host.rs`, and a name that leaves the domain is a name
+    // nobody has to classify any more. Naming the children keeps the whole of
+    // the host boundary inside `mechanism` (3)'s classification with the same
+    // names accounted for on the other side of the move; the funnel, both
+    // `ProcessSite` values, the `Contained` mint and the reserved-key
+    // vocabulary stayed in `src/runner/host.rs`.
+    "src/runner/host/environment.rs",
+    "src/runner/host/naming.rs",
+    "src/runner/host/probe.rs",
     "src/runner/invocation.rs",
     // The third of `mechanism` (2)'s `src/runner/{host,container,invocation}.rs`,
     // added by PR6. It is here rather than only in the allowlist because it

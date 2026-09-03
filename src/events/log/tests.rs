@@ -3371,8 +3371,15 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         "src/events/log.rs",
         // ST-14's bounded reachability census over fold states.
         "src/topology/census.rs",
-        // The fold itself.
+        // The fold itself: the root holds the state types, the
+        // `plan_transition`/`apply_delta` pair and the child declarations, and the
+        // children listed below carry an `impl TopologyFold` block of their own.
+        // Every other child names the type in prose only, if at all, and prose is
+        // blanked — so it does not appear here.
         "src/topology/fold.rs",
+        "src/topology/fold/parse.rs",
+        "src/topology/fold/predicates.rs",
+        "src/topology/fold/start.rs",
     ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let funnel = src.join("events").join("log.rs");

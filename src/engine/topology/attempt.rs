@@ -285,8 +285,9 @@ pub trait ReviewInputPolicy {
 /// itself rather than calling it.
 ///
 /// Making the call legal directly would need a new `RunDirSite` variant for a
-/// transcript write — there is none — in `src/topology/effects.rs`, which is
-/// the file `ff0490a` froze by name. So the topology module declares what it
+/// transcript write — there is none — in `topology::effects`, whose root
+/// `src/topology/effects.rs` is the file `ff0490a` froze by name and whose site
+/// enums are in its `sites.rs` child since that module was split. So the topology module declares what it
 /// needs and something outside the tree performs it, exactly as
 /// [`EventEmitter`], `Probes` and `IntegrationRefs` already do here.
 ///
