@@ -269,10 +269,13 @@ move deliberately does not make. \
 HOW EQUAL "MOVED" IS, STATED EXACTLY, BECAUSE "BYTE-IDENTICAL" WOULD BE FALSE \
 OF THIS FILE. Lifting the block out of `mod tests { … }` dedents every line by \
 four columns, which changes what fits inside the width and makes `rustfmt` \
-reflow: 87 lines here differ from the dedented original, every one of them \
-formatting -- expressions that now fit on one line, a dropped trailing comma, an \
-elided closure brace, one `panic!` match arm braced. THE EQUALITY THAT DOES \
-HOLD IS REPRODUCIBLE, and it is the one worth stating: dedent the body of \
+reflow. Every difference it produces is formatting and nothing else -- \
+expressions that now fit on one line, a dropped trailing comma, an elided \
+closure brace, one `panic!` match arm braced -- and the property is stated \
+without a line count on purpose: a count here mixes the reflowed lines together \
+with the imports the split forced this file to name for itself, which are not \
+formatting, and it goes stale at the next edit while the next reader trusts it. \
+THE EQUALITY THAT DOES HOLD IS REPRODUCIBLE, and it is the one worth stating: dedent the body of \
 `mod tests` in `src/agent/proc.rs` at this branch's base by four columns, run \
 `rustfmt --edition 2024` over it, and the result is this file byte-for-byte once \
 the three imports the split forced it to name for itself are removed \
