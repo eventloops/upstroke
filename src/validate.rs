@@ -361,8 +361,8 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::env;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
@@ -415,6 +415,46 @@ mod tests {
         opts
     }
 
+    /// The name [`Corpus::of`] gives its `index`-th attempt on this thread.
+    ///
+    /// Shared with the allocator rather than restated, so the witness that
+    /// pre-creates a collision cannot drift from the rule it is testing.
+    fn candidate(tag: &str, index: usize) -> PathBuf {
+        env::temp_dir().join(format!(
+            "upstroke-validate-{tag}-{}-{:?}-{index}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    thread_local! {
+        /// The attempt counter, **per thread rather than per process**.
+        ///
+        /// The thread id is already in the name, so a process-wide counter
+        /// separates nothing a thread-local one does not — and it costs two
+        /// things. It couples parallel tests' names to each other's allocation
+        /// rate, and it makes
+        /// [`a_corpus_steps_over_a_name_already_taken_and_leaves_it_alone`]
+        /// non-deterministic: that witness reads the value its own next call
+        /// will use, and a test running beside it could consume that value
+        /// first, leaving the witness green with no collision ever driven.
+        static NEXT_INDEX: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The next attempt index on this thread, advancing it.
+    fn next_index() -> usize {
+        NEXT_INDEX.with(|next| {
+            let index = next.get();
+            next.set(index + 1);
+            index
+        })
+    }
+
+    /// The next attempt index on this thread, **without** advancing it.
+    fn peek_index() -> usize {
+        NEXT_INDEX.with(Cell::get)
+    }
+
     /// A directory holding [`crate::plan::corpus`] that **owns** its tree.
     ///
     /// The corpus is inline, but [`run`] reads its plan from a path, so these
@@ -429,16 +469,22 @@ mod tests {
     /// the epoch would panic each of them before it reached any validation
     /// behaviour. What replaces it is the precedent's naming — the pid and
     /// `std::thread::current().id()`, which is how that file keeps two live
-    /// fixtures apart — plus the counter, which is what actually makes the name
-    /// unique within a process rather than leaving that to an assumption about
-    /// how the harness schedules tests. `Relaxed` is the whole ordering the
-    /// counter needs (§10): uniqueness wants an atomic increment, and no other
-    /// memory is published through it.
+    /// fixtures apart — plus [`NEXT_INDEX`], which makes the name unique within
+    /// a process rather than leaving that to an assumption about how the
+    /// harness schedules tests.
     ///
-    /// **The leaf is [`fs::create_dir`], not `create_dir_all`.** An existing
-    /// leaf is an error rather than a directory this test adopts, which is §8's
-    /// rule that a check followed by a write is not exclusive. That is the
-    /// guarantee; the name only makes reaching for it rare.
+    /// **Every one of those components resets with the process, so the name is
+    /// reproducible across runs and the allocator has to expect a collision.**
+    /// A run killed before its guards dropped leaves directories that a later
+    /// run under a reused pid will name again. [`Corpus::of`] creates its leaf
+    /// with [`fs::create_dir`] rather than `create_dir_all`, so a name already
+    /// taken is refused rather than adopted — §8's rule that a check followed
+    /// by a write is not exclusive — and then **steps over it**: `AlreadyExists`
+    /// takes the next index, never the directory. It is not adopted, it is not
+    /// deleted (deleting a directory this process did not create is
+    /// `scratch_root`'s anti-pattern, which C-006 exists for), and it is not
+    /// written into. Any other error still fails on the first attempt, naming
+    /// the candidate.
     ///
     /// **The guard exists before the first fallible write.** Constructing it
     /// after the four writes leaves the window the reviewer named: the temp
@@ -463,14 +509,38 @@ mod tests {
         /// guard's own witnesses can drive a write that fails and then look for
         /// what it left under a tag nothing else uses.
         fn of(tag: &str, plans: &[(&str, &str)]) -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let dir = env::temp_dir().join(format!(
-                "upstroke-validate-{tag}-{}-{:?}-{}",
-                std::process::id(),
-                std::thread::current().id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&dir).expect("corpus directory");
+            /// Names to try before giving up. Each attempt takes a fresh index,
+            /// so the only way to burn one is a directory a *previous* process
+            /// left at the same pid, thread id and index — and a run leaves at
+            /// most as many per thread as it built guards on it, which is
+            /// single digits here. 64 is two orders of magnitude past that and
+            /// still bounded, and it is not the cap that catches a broken temp
+            /// directory: any error other than `AlreadyExists` fails on the
+            /// first attempt.
+            const ATTEMPTS: usize = 64;
+
+            let mut tried = 0usize;
+            let dir = loop {
+                let candidate = candidate(tag, next_index());
+                tried += 1;
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    // Step over it. Never adopt a directory this process did
+                    // not create, and never delete one either: that is
+                    // `scratch_root`'s anti-pattern, which C-006 exists for.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        assert!(
+                            tried < ATTEMPTS,
+                            "no free corpus directory in {tried} names on this thread; \
+                             the last one tried was {}",
+                            candidate.display()
+                        );
+                    }
+                    Err(error) => {
+                        panic!("corpus directory {}: {error}", candidate.display())
+                    }
+                }
+            };
             // Before the writes, not after: from here on every exit out of this
             // function is an exit out of a live guard.
             let corpus = Self { dir };
@@ -630,6 +700,67 @@ mod tests {
             "a corpus that failed partway through its own setup left {:?}",
             residue(TAG)
         );
+    }
+
+    /// A name already taken is **stepped over**: not adopted, not deleted, not
+    /// written into.
+    ///
+    /// This is review pass 3's own reproduction turned into a test. Every
+    /// component of the name resets with the process, so a run killed before
+    /// its guards dropped leaves directories a later run under a reused pid
+    /// names again; exclusive creation then turned that into a hard failure
+    /// rather than a step aside. The reviewer pre-created the predicted path at
+    /// `dbdce08` and `sample_plan_renders_expected_table` exited 101 with
+    /// `AlreadyExists`, before reaching any validation behaviour.
+    ///
+    /// The collision is **exact rather than probable**. [`candidate`] is the
+    /// allocator's own name function, not a restatement of it, and
+    /// [`peek_index`] reads the index this thread will use next without
+    /// advancing it — so the directory pre-created here is precisely the one
+    /// the next [`Corpus::of`] tries first. That is what [`NEXT_INDEX`] being
+    /// per thread buys: a process-wide counter could be advanced by a test
+    /// running beside this one, and this witness would then go green with no
+    /// collision ever driven.
+    ///
+    /// The leftover carries a file, because "stepped over" has to mean the
+    /// directory survives with its contents rather than merely surviving.
+    #[test]
+    fn a_corpus_steps_over_a_name_already_taken_and_leaves_it_alone() {
+        const TAG: &str = "raii-taken";
+        const LEFTOVER: &str = "left by a run that never dropped its guard\n";
+
+        let taken = candidate(TAG, peek_index());
+        fs::create_dir(&taken).expect("stand in for a killed run's leftover");
+        let marker = taken.join("not-ours.md");
+        fs::write(&marker, LEFTOVER).expect("the leftover's contents");
+
+        let corpus = Corpus::of(TAG, &ONE_PLAN);
+        assert_ne!(
+            corpus.dir, taken,
+            "the guard adopted the directory it found rather than stepping over it"
+        );
+        assert!(
+            corpus.plan("one.md").is_file(),
+            "the guard stepped aside but wrote no corpus"
+        );
+        assert!(
+            marker.is_file(),
+            "the guard removed a directory it did not create"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).expect("the leftover still reads"),
+            LEFTOVER,
+            "the guard wrote over a file it did not create"
+        );
+
+        drop(corpus);
+        assert!(
+            marker.is_file(),
+            "the guard removed the leftover on its way out"
+        );
+        // This test made the leftover, so this test removes it. The guard must
+        // not, and does not — which is the whole assertion above.
+        fs::remove_dir_all(&taken).expect("the test reclaims what the guard would not");
     }
 
     /// A reclamation that fails is **reported**, not discarded.
