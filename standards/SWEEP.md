@@ -29,7 +29,6 @@ after its children, since it keeps whatever the split did not move.
 |---|---|---|---|---|
 | 1 | `src/workspace_manager/containment.rs` | 235 | #110 | 2026-09-03 |
 | 2 | `src/workspace_manager/hooks.rs` | 200 | #110 | 2026-09-03 |
-| 3 | `src/workspace_manager/naming.rs` | 254 | #110 | 2026-09-03 |
 | 4 | `src/workspace_manager/object.rs` | 68 | #110 | 2026-09-03 |
 | 5 | `src/workspace_manager/parsers.rs` | 274 | #110 | 2026-09-03 |
 | 6 | `src/workspace_manager/residue.rs` | 400 | #110 | 2026-09-03 |
@@ -54,4 +53,4 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 
 | File | Swept at (commit) | Date | Notes |
 |---|---|---|---|
-| _none yet_ | | | |
+| `src/workspace_manager/naming.rs` | `51feba7` | 2026-09-03 | §6: nothing to cite. §7: the two `?` on `Option` in `from_intent_name` are the parser's verdict and stay, documented. Fixed: `from_intent_name` accepted non-canonical integers (`g03`, `g+3`) and so was not `intent_name`'s inverse; it now round-trips. `safe_component` returns `Result` (§5); `validate` reuses `kind()`. Unit tests added in the file, including the intent record's persisted schema. Deferred to row 9 (the parent): `write_synced` stages an intent as `<stem>.tmp` in the intents directory, and `intents()` refuses that residue after an interrupted write. |
