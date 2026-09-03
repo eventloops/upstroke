@@ -1,25 +1,19 @@
 # Contributing to upstroke
 
-Contributions are welcome. Please open an issue before starting anything substantial — the build
-order in `DESIGN.md` §21 is deliberate, and it's worth checking that a change fits where the
+Contributions are welcome. Please open an issue before starting anything substantial: the build
+order in `DESIGN.md` §21 is deliberate, and it is worth checking that a change fits where the
 project currently is.
 
-Every change enters `master` through the same path: open a draft pull request early, wait for the
-deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
-green head before merge. The reviewed SHA and a durable link to the verdict are recorded in the
-pull request; a new push means the recorded review no longer binds to the head — serious P1
-repairs get a fresh pass, `MUST` deviations and evidence-backed findings are fixed whatever their
-label, a repair-only delta after a single-reviewer pass that found no serious P1 is owner-verified
-and disclosed, a conflict-free merge of `master` that leaves the diff byte-identical keeps the
-review when CI is green on the merged head and the pull request edits no gate, anything wider is
-re-reviewed; the owner's merge is the attestation. See
-[`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
-emergency policy. Contributions from external forks remain provisional: the required checks are
-candidate-controlled, so a fork's entire diff — workflow edits included — is reviewed before merge.
+Every change enters `master` the same way: a draft pull request opened early, the deterministic CI
+and PR-policy gates green, one independent frontier-model review of the exact green head, findings
+triaged (serious P1s fixed and re-reviewed, the rest fixed or logged as tech debt), and the owner's
+merge as the attestation. [`MAINTAINING.md`](MAINTAINING.md) has the full lifecycle, trust boundary
+and release contract. Contributions from external forks are provisional: the required checks are
+candidate-controlled, so a fork's entire diff, workflow edits included, is reviewed before merge.
 
 ## Before you send a PR
 
-The project holds itself to these; CI enforces all eight, verbatim:
+CI enforces all eight of these, verbatim, from the repository root:
 
 ```bash
 cargo fmt --check
@@ -32,22 +26,19 @@ bash .github/scripts/test-pr-ledger-evidence.sh
 bash .github/scripts/test-docs-consistency.sh
 ```
 
-Run all eight from the repository root. CI splits them across its jobs — `lint` runs rustfmt,
-Clippy and the four Bash gates, `test` runs the suite, `msrv` runs the locked check, and Clippy
-runs again on the Windows and macOS lint legs — and `upstroke-ci` aggregates every leg.
-`CLAUDE.md`'s Gates section records the root-invocation trap and the `jq` prerequisite the
-release-record fixture carries; `CODING_STANDARDS.md` §2 is the normative statement of this
-baseline, and no gate checks that these copies of it agree.
+`CODING_STANDARDS.md` §2 is the normative statement of this baseline and says how CI splits it
+across jobs. `test-release-record.sh` needs `jq`; `test-pr-policy.sh` only works from the root.
 
 Use the pull-request template to record the exact commands, implementation provenance, reviewed
-SHA, review model and effort, evidence link, risk, and rollback. Resolve every review conversation;
+SHA, review model and effort, evidence link, risk and rollback. Resolve every review conversation;
 merge commits are the only accepted merge method.
 
-[`CODING_STANDARDS.md`](CODING_STANDARDS.md) is the normative implementation standard; read it
-before changing Rust code. Among its hard requirements: edition 2024 with MSRV 1.85, no
-`.unwrap()` or `.expect()` in production, `anyhow` only at the binary edge (libraries return typed
-`thiserror` errors), and paths represented with `std::path` types. Windows, macOS, and Linux are
-supported targets. The eight commands above are the automated baseline, not the whole standard.
+[`CODING_STANDARDS.md`](CODING_STANDARDS.md) indexes the implementation standards; read the
+sections a change touches before changing Rust. Among the hard requirements: edition 2024 with MSRV
+1.85, no `.unwrap()` or `.expect()` in production, `anyhow` only at the binary edge (libraries
+return typed `thiserror` errors), paths through `std::path` types, and no shared ownership, locks
+or clones without a stated reason. Windows, macOS and Linux are supported targets. The eight
+commands above are the automated baseline, not the whole standard.
 
 ## Contributor Licence Agreement
 
@@ -73,11 +64,11 @@ pull request is your acceptance, and it applies to every contribution you make t
 
 ### Why this exists
 
-Licences are not forever: this project began under the AGPL and was relicensed to Apache-2.0
-([the 2026-09-01 decision](decisions/2026-09-01-relicense-apache-2.md)). A move like that is
-only ever cheap while one party can license the whole codebase, which is what clause 2
-preserves as outside contributions arrive — a future change, such as a licence exception or a
-newer licence version, should not require tracking down every past contributor.
+Licences are not forever: this project began under the AGPL and was relicensed to Apache-2.0 on
+2026-09-01. A move like that is only ever cheap while one party can license the whole codebase,
+which is what clause 2 preserves as outside contributions arrive: a future change, such as a
+licence exception or a newer licence version, should not require tracking down every past
+contributor.
 
 The trade is explicit and worth stating plainly: your contribution may later be offered under
 terms you did not choose. Everything you contribute also remains available to everyone under

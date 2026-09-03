@@ -22,5 +22,5 @@
 
 - The sequential conductor, end to end: plan ingestion, routing, the Claude Code and Copilot
   adapters, the engine with git ownership, gates, cross-family review, the verification ladder,
-  the event log with resume and status, and the read-only capacity engine. `acceptance/RESULT.md`
-  is the evidence.
+  the event log with resume and status, and the read-only capacity engine. The acceptance
+  write-up, kept in the repository history, is the evidence.
