@@ -376,10 +376,18 @@ static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// How many times [`fsync_file`] or [`fsync_dir`] has been entered.
 ///
 /// Only a test reads it — production performs barriers, it does not count them —
-/// so the non-test build is told, in the same idiom `src/agent/proc.rs:155`
-/// already uses for its per-platform dead code. The *counter* stays
-/// unconditional; see [`BARRIERS`] for why a `#[cfg(test)]` item here would
-/// truncate every source census's production region.
+/// so the non-test build is told, in the same idiom
+/// `agent::proc::memoised_outcome` already uses for its per-platform dead code.
+/// Named rather than cited by line: the citation was three lines out before the
+/// `m6-proc` split moved that item's neighbours, and a line number in a file
+/// this one does not otherwise touch goes stale at every edit to it. Not a
+/// linked path either, because the item is `pub(crate)` and a link to it is
+/// unresolved under a plain `cargo rustdoc`, which is the run the census
+/// compares.
+///
+/// The *counter* stays unconditional; see [`BARRIERS`] for why a
+/// `#[cfg(test)]` item here would truncate every source census's production
+/// region.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn barriers_performed() -> u64 {
     BARRIERS.load(std::sync::atomic::Ordering::Relaxed)
