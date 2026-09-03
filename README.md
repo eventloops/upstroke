@@ -29,8 +29,7 @@ conductor, not an instrument.
 > escalation to a stronger rung, and a design question parking one task while an independent one
 > kept moving. It found three engine defects, all fixed and two of them re-verified live on the
 > run that found them; a fourth turned up on the first real-library run afterwards.
-> `acceptance/RESULT.md` is the write-up. Parallelism, worktrees, Aider, and capacity-driven
-> routing are v0.2.
+> Parallelism, worktrees, Aider, and capacity-driven routing are v0.2.
 >
 > **[See a run, start to finish →](https://eventloops.github.io/upstroke/)** — captured output from
 > both: the verdict where a reviewer rejected a fix that built clean and passed all 722 tests

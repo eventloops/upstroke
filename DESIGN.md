@@ -3,14 +3,16 @@
 > **Name:** `upstroke` — the Renaissance term for the shared steady pulse every performer synchronizes to. Verified free on crates.io and npm (2026-08-08, live API check). Known adjacent collision: AnthusAI/Upstroke, an alpha Lua DSL for agent orchestration (~3★) — assessed as tolerable, but the decision is deliberate: we differentiate hard rather than share ground by accident. **Action on repo creation: publish a placeholder crate immediately.**
 
 **Status:** v2 — consolidates the original architecture, the two-phase lifecycle, the interaction model, the capacity engine, and two rounds of research whose companion reports are maintained in the strategy record outside this repository, plus the v2.1 late-binding refinement: connect your plans; tiers bind to concrete models and pools at attempt time.
-**Language:** Rust · **License:** Apache-2.0, relicensed from AGPL-3.0-only by [the 2026-09-01 decision](decisions/2026-09-01-relicense-apache-2.md) · **Form factor:** single static binary, Windows first-class
+**Language:** Rust · **License:** Apache-2.0, relicensed from AGPL-3.0-only on 2026-09-01 · **Form factor:** single static binary, Windows first-class
 
 ---
 
 This file is the index. The design lives in `design/`, one numbered section per
-file. Section numbers are the API: code, reviews, and the standards cite
-`DESIGN.md §N`, so a number is never reassigned. New sections append; a retired
-section keeps its number and says so.
+file, and **it is the only living authority for product design.** Section
+numbers are the API: code, reviews, and the standards cite `DESIGN.md §N`, so a
+number is never reassigned. New sections append; a retired section keeps its
+number and says so. When a decision changes the design, the section changes in
+the same pull request — there is no separate record to keep in step.
 
 | § | Section | File |
 |---|---|---|
@@ -38,6 +40,38 @@ section keeps its number and says so.
 | 22 | Adopted from the field (with credit) | [design/22_design_adopted_from_the_field.md](design/22_design_adopted_from_the_field.md) |
 | 23 | Risks and kill criteria | [design/23_design_risks.md](design/23_design_risks.md) |
 | 24 | References | [design/24_design_references.md](design/24_design_references.md) |
+| 25 | Export schema (`export-decisions`) | [design/25_design_export_decisions_schema.md](design/25_design_export_decisions_schema.md) |
 
 Read §4 in full before touching the engine, the event log, or anything that
 handles capacity or questions. §21 is the build order, and it is deliberate.
+
+## Retired records
+
+Until 2026-09-03 the repository also carried `decisions/` (dated decision
+records), `proposals/` (design proposals and their council critiques) and
+`acceptance/` (the v0.1 acceptance run book and write-ups). They were retired
+so that the design is the one place a rule lives; every conclusion they reached
+that still binds is in the sections above. The full texts remain in the
+repository history before that date and in the private companion repository.
+Comments in `src/`, `effects/allowlist.toml` and `upstroke.toml` still cite
+some records by path; this table says where each one's substance now lives.
+
+| Record | Substance now in |
+|---|---|
+| 2026-08-11 design council | §21 (learned routing parked; the council is manual, ≤3 family seats) |
+| 2026-08-11 self-hosting v0.2 | §21 (v0.2 development runs through upstroke) |
+| 2026-08-11 gate config across a resume | §15 (gates are taken from the record, warning on drift) |
+| 2026-08-11 Codex reasoning effort | §10, §16, §21 (effort is a routing axis, stated on every attempt) |
+| 2026-08-11 export schema | §25 |
+| 2026-08-12 merge queue and execution topology | §7, §14, §15 (immutable candidates, exact-tree verification, CAS integration, bounded repair) |
+| 2026-08-17 review effort and fan-out | `MAINTAINING.md` (one frontier pass at `max`; `ultra` is delegation, not depth) |
+| 2026-08-20 automated review gate; 2026-08-20 review invalidation scope; 2026-08-21 stacked slice PRs; 2026-08-23 retire App attestation; 2026-08-25 checkpoint merges; 2026-08-31 panel seats; 2026-09-01 review effort re-scoped; 2026-09-01 clean base merge keeps review | `MAINTAINING.md` (the whole review and merge lifecycle, restated in its current form) |
+| 2026-08-22 strategy record private; 2026-08-27 proposals private; 2026-09-01 proposals relocated; 2026-09-01 infra private | This section (strategy, proposals and operator tooling live in the private companion repository) |
+| 2026-08-24 PR3-layer freeze charter; 2026-08-31 G2 checkpoint promotion; 2026-08-31 inertness premise behavioural | §21 (the G2 pass ran; the schema-4 machinery is on master, inert by default) |
+| 2026-08-25 `CommandSpec.program` stays `String` | §8 (the field carries a bare CLI name; `CODING_STANDARDS.md` §8 governs it the moment a path-valued input exists) |
+| 2026-08-26 durable retry feedback | §15 (`FailureRecord.detail` carries the retry brief onto the durable record) |
+| 2026-08-30 readiness lint placement | `CODING_STANDARDS.md` §2 and §12 (a per-site `#[expect]` recorded in `effects/allowlist.toml` may stand where a module-level allow did) |
+| 2026-08-30 test scratch-tree ownership | §15 (run-directory deletion authority is token-carried: `rundir::PrivateHalfProof` and the `cfg(test)`-only scratch-tree token) |
+| 2026-09-01 relicense to Apache-2.0 | `LICENSE`, `NOTICE`, `CONTRIBUTING.md` (the CLA), `MAINTAINING.md` (the archive-contents release gate) |
+| The thirteen proposals | Ten were already stubs; the G2 pass plan is discharged (§21), and the v0.5 portfolio proposal and its critique are v0.5 material, out of the engine's contract |
+| The acceptance run book and write-ups | §21 (the v0.1 definition of done and the date it was met) |

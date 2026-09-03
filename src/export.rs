@@ -1088,11 +1088,11 @@ mod tests {
 
     #[test]
     fn the_decision_index_names_the_shipped_export_schema() {
-        let index = include_str!("../decisions/README.md");
+        let index = include_str!("../design/25_design_export_decisions_schema.md");
         let expected = format!("schema-{EXPORT_SCHEMA_VERSION} JSONL/CSV projection");
         assert!(
             index.contains(&expected),
-            "decision index must track the public exporter constant: expected `{expected}`"
+            "the design must track the public exporter constant: expected `{expected}`"
         );
     }
 
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn export_schema_decision_lists_every_failure_kind() {
-        let decision = include_str!("../decisions/2026-08-11-export-decisions-schema.md");
+        let decision = include_str!("../design/25_design_export_decisions_schema.md");
         for kind in [
             FailureKind::NoChain,
             FailureKind::EmptyDiff,
@@ -1132,7 +1132,7 @@ mod tests {
             let token = failure_kind(kind);
             assert!(
                 decision.contains(&format!("| `{token}` |")),
-                "export decision omits `{token}`"
+                "the export schema omits `{token}`"
             );
         }
     }
