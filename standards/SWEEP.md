@@ -15,18 +15,24 @@ against any line.
 **The activation rule is temporary.** It exists only because the tree predates the rules. When
 every Rust file the standards govern (§1: all Rust in the repository, which today is `src/` and
 `examples/probe.rs`) is listed in the swept table, the transitional wording goes in one pull
-request: this paragraph and the activation rule above; §6's paragraph "These three rules bind
-the code a change adds or rewrites, now" and its "Enforced by" line's reference to this file;
-§7's sentence "This rule is transitional in the same way as §6's"; and the `CODING_STANDARDS.md`
-index paragraph that points here. After that §6 and §7 bind the whole tree with no scoping, and
-this file is the record of how the tree got there. Errors are handled where they arise; a `?`
-that survives a sweep is one the reviewer agreed was deliberate.
+request, every sentence of it: this file's opening paragraph ("bind new and materially changed
+code immediately ... one file at a time"), this paragraph and the activation rule above; §6's
+paragraph "These three rules bind the code a change adds or rewrites, now" and its "Enforced by"
+line's reference to this file; §7's sentence "This rule is transitional in the same way as
+§6's"; §1's sentence "Some standards are newer than the tree; `standards/SWEEP.md` says which";
+§16's sentence "A §6 or §7 finding in an unswept file is in scope only under the activation
+rule"; `MAINTAINING.md`'s triage clause "or against an unswept file under a transitional
+standard"; the `CODING_STANDARDS.md` index paragraph that points here; and the hard-conventions
+bullet in `CLAUDE.md` and `AGENTS.md` that says these rules "bind the code a change adds or
+rewrites" and points at the activation rule. After that §6 and §7 bind the whole tree with no
+scoping, and this file is the record of how the tree got there. Errors are handled where they
+arise; a `?` that survives a sweep is one the reviewer agreed was deliberate.
 
 ## Review queue
 
 The queue is the W2 decomposition wave: the seven large modules split into per-concern child
-modules by the pull requests that merged on 2026-09-02 and 2026-09-03 (#110, #107, #106, #108,
-#111, #117, #123), one pull request per parent. For each family, every Rust file under its
+modules by the pull requests that merged on 2026-09-03 (#110, #107, #106, #108, #111, #117,
+#123), one pull request per parent. For each family, every Rust file under its
 directory is queued (the children the split produced, and the test, fixture and support files
 that were extracted there earlier), followed by the parent, which keeps whatever the split did
 not move. Families are listed in the order their splits merged, and a family of this wave that
@@ -104,8 +110,9 @@ wave, not across the history of the tree.
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and
 "Merged" is when that split landed; neither says which pull request first created the file at
-its path (several of the test and support files were extracted earlier, by #98, #100, #102 and
-#115), and `git log --follow` is the record for that. `examples/probe.rs` belongs to no family.
+its path (several of the test and support files were extracted earlier: by #98, #100 and #102,
+and `readiness.rs` by `1cd4b1e` on 2026-08-30), and `git log --follow` is the record for that.
+`examples/probe.rs` belongs to no family.
 
 Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 
