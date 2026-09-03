@@ -1430,14 +1430,18 @@ mod termination {
     const GUARD_DISARM: u8 = 0xd1;
 
     /// How long a forked helper (the cleanup reaper, the job-control guard)
-    /// has to report READY. Before it does, the child closes every inherited
-    /// descriptor; Linux does that in one `close_range`, but Darwin and the
-    /// other hosts close them one syscall at a time up to the descriptor
-    /// ceiling, and on a loaded macOS CI runner that alone has taken more than
-    /// the two seconds this used to be. A helper that never comes up still
-    /// fails the launch, only later; nothing waits on this budget in the
-    /// ordinary case, since READY arrives as soon as the child has closed its
-    /// descriptors.
+    /// has to report READY at startup. Before it does, the child closes every
+    /// inherited descriptor; Linux does that in one `close_range`, but Darwin
+    /// and the other hosts close them one syscall at a time up to the
+    /// descriptor ceiling. Loaded macOS CI runners began failing random
+    /// agent-spawning tests at the two-second budget this used to be, with no
+    /// other change to the handshake; the close loop is the likeliest reason
+    /// and the budget is sized for it, without claiming to have measured it.
+    /// A helper that never comes up still fails the launch, only later;
+    /// nothing waits on this budget in the ordinary case, since READY arrives
+    /// as soon as the child has closed its descriptors. Runtime
+    /// acknowledgements from a helper that is already up keep their own,
+    /// shorter budgets.
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
     const GUARD_PROBE: u8 = 0xe1;
     const HANDLE_SIGINT: u8 = 1 << 0;
@@ -2473,9 +2477,10 @@ mod termination {
         if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
             let waited = ready_wait.elapsed();
             reaper.abandon();
-            // The wait and the ceiling are the two facts a recurrence needs:
-            // a wait at the budget with a large ceiling is the per-descriptor
-            // close loop; a short wait is the child dying before READY.
+            // Hints for a recurrence, not a diagnosis: `read_guard_ack`
+            // answers `None` for a timeout, EOF and a read error alike, and a
+            // full-budget wait can be the close loop, a starved child, or a
+            // stopped one. A short wait does rule the loop out.
             return Err(format!(
                 "Unix cleanup reaper did not initialize (waited {waited:?} of \
                  {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max})"
@@ -2819,8 +2824,15 @@ mod termination {
             let _ = write_byte(self.command_fd, GUARD_DISARM);
         }
 
+        /// The runtime acknowledgement budget, for `arm`: the guard is
+        /// already running, so two seconds is generous, and a monitor that
+        /// waited longer here would hold pending terminate and continue
+        /// requests for that long with the agent groups stopped. Startup
+        /// READY has its own, larger budget (`HELPER_READY_BUDGET`) because
+        /// it waits on the descriptor close loop; that wait is read directly
+        /// at the launch site, not through this method.
         fn read_ack(self) -> Option<u8> {
-            read_guard_ack(self.ack_fd, HELPER_READY_BUDGET)
+            read_guard_ack(self.ack_fd, Duration::from_secs(2))
         }
     }
 
@@ -3038,7 +3050,10 @@ mod termination {
             pid,
         };
         let mut probe_pid_bytes = [0_u8; 4];
-        if guard.read_ack() != Some(GUARD_READY)
+        // Startup READY waits on the child's descriptor close loop; see
+        // `HELPER_READY_BUDGET`. Read here rather than through `read_ack`,
+        // whose two-second budget is the runtime ARM acknowledgement's.
+        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(GUARD_READY)
             || !read_raw_exact(ack[0], &mut probe_pid_bytes)
             || i32::from_ne_bytes(probe_pid_bytes) <= 0
         {
