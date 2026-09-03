@@ -144,11 +144,27 @@ pub(super) mod oracles {
         declared_in: &Path,
         source: &str,
     ) -> Vec<(String, [PathBuf; 2])> {
+        declared_children(declared_in, source)
+            .into_iter()
+            .filter(|(_, _, test_only)| !test_only)
+            .map(|(name, candidates, _)| (name, candidates))
+            .collect()
+    }
+
+    /// Every `mod <name>;` the file writes, production and test-only alike, with
+    /// the two files the name can resolve to and which kind it is.
+    ///
+    /// The test-only half is not part of any census domain. It is here because
+    /// the **reconciliation** needs it: a `.rs` file under the module's
+    /// directory is legitimate when *some* declaration accounts for it, and
+    /// `tests.rs` is accounted for by a `#[cfg(test)] mod tests;`. Without that
+    /// half the reconciliation would refuse the one file the split is required
+    /// to leave behind.
+    fn declared_children(declared_in: &Path, source: &str) -> Vec<(String, [PathBuf; 2], bool)> {
         refuse_unclassifiable_cfg_attr(declared_in, source);
         scan_module_declarations(source)
             .unwrap_or_else(|refusal| panic!("{}: {refusal}", declared_in.display()))
             .into_iter()
-            .filter(|declaration| !declaration.test_only)
             .map(|declaration| {
                 let candidates = candidates_for(
                     crate_roots(),
@@ -157,7 +173,7 @@ pub(super) mod oracles {
                     &declaration.name,
                 )
                 .unwrap_or_else(|refusal| panic!("{refusal}"));
-                (declaration.name, candidates)
+                (declaration.name, candidates, declaration.test_only)
             })
             .collect()
     }
@@ -237,7 +253,7 @@ pub(super) mod oracles {
         use crate::effects::census_domain::sole_present;
         use crate::effects::{blank_comments_and_strings, production_region};
 
-        use super::declared_production_children;
+        use super::declared_children;
 
         /// Every file of the production module rooted at one file — the root,
         /// and transitively each file its production `mod <name>;` declarations
@@ -296,12 +312,14 @@ pub(super) mod oracles {
                 let mut queue = vec![root.to_path_buf()];
                 let mut seen = BTreeSet::new();
                 let mut sources: Vec<(PathBuf, String)> = Vec::new();
+                let mut accounted: BTreeSet<PathBuf> = BTreeSet::new();
+                let mut test_owned: BTreeSet<PathBuf> = BTreeSet::new();
                 while let Some(path) = queue.pop() {
                     if !seen.insert(path.clone()) {
                         continue;
                     }
                     let source = fs::read_to_string(&path).expect("a declared module file");
-                    for (name, candidates) in declared_production_children(&path, &source) {
+                    for (name, candidates, test_only) in declared_children(&path, &source) {
                         let resolved = sole_present(&candidates, &|candidate| candidate.is_file())
                             .unwrap_or_else(|present| {
                                 panic!(
@@ -312,7 +330,16 @@ pub(super) mod oracles {
                                 )
                             })
                             .clone();
-                        queue.push(resolved);
+                        accounted.insert(resolved.clone());
+                        if test_only {
+                            // A test-only child owns its own subtree. Its files
+                            // are not production and are not this domain's, so
+                            // the reconciliation prunes there rather than
+                            // descending into test code to account for them.
+                            test_owned.insert(module_dir(&resolved));
+                        } else {
+                            queue.push(resolved);
+                        }
                     }
                     sources.push((path, source));
                 }
@@ -331,6 +358,7 @@ pub(super) mod oracles {
                     root.display(),
                     sources.iter().map(|(path, _)| path).collect::<Vec<_>>()
                 );
+                refuse_unaccounted_files(root, &accounted, &test_owned);
                 Self { sources }
             }
 
@@ -380,6 +408,87 @@ pub(super) mod oracles {
                 }
                 scan
             }
+        }
+
+        /// The directory a module owns: `x/foo.rs` owns `x/foo/`, and
+        /// `x/foo/mod.rs` owns `x/foo/`.
+        pub(super) fn module_dir(file: &Path) -> PathBuf {
+            if file.file_stem().is_some_and(|stem| stem == "mod") {
+                file.parent().unwrap_or(file).to_path_buf()
+            } else {
+                file.with_extension("")
+            }
+        }
+
+        /// Refuse a `.rs` file under the module's own directory that **no
+        /// declaration accounts for**.
+        ///
+        /// The domain stays *declared*, not enumerated — this does not add the
+        /// directory to it, and a file found here is a refusal rather than a new
+        /// member. What it closes is the direction a declaration scan cannot see
+        /// on its own: [`scan_module_declarations`] reads an item-position macro
+        /// invocation's **tokens**, and a macro whose body lives in a file the
+        /// walk never reads expands to `mod twelfth;` while its invocation site
+        /// shows nothing module-shaped. The walk then stays at eight paths and
+        /// every value assertion above it still holds, because they all agree
+        /// about a domain that is quietly one file short.
+        ///
+        /// Reproduced before this existed: `macro_rules! declare_twelfth` in
+        /// `src/topology/mod.rs`, `declare_twelfth!();` in `effects.rs`, and a
+        /// wildcard `row()` in `effects/twelfth/mod.rs` — both row-mapping tests
+        /// green, no test file touched, the wildcard missed. The scanner is not
+        /// widened to evaluate macro expansion: that would change what every
+        /// census in this crate measures, which is the disposition
+        /// `declared_whole_file_test_modules` records. This refuses instead,
+        /// which is the direction every `ScanRefusal` variant takes.
+        ///
+        /// A test-only child owns its own subtree and is pruned rather than
+        /// descended into: its files are not production, so accounting for them
+        /// would mean reading test code to decide something no census asks.
+        ///
+        /// # Panics
+        ///
+        /// When such a file exists. Driven in both directions, with the real
+        /// module and a deliberately incomplete accounting, by
+        /// `the_row_mapping_census_domain_is_the_declared_module` part (7).
+        pub(super) fn refuse_unaccounted_files(
+            root: &Path,
+            accounted: &BTreeSet<PathBuf>,
+            test_owned: &BTreeSet<PathBuf>,
+        ) {
+            let owned = module_dir(root);
+            if !owned.is_dir() {
+                return;
+            }
+            let mut stack = vec![owned];
+            let mut unaccounted: Vec<PathBuf> = Vec::new();
+            while let Some(current) = stack.pop() {
+                let entries = fs::read_dir(&current).unwrap_or_else(|error| {
+                    panic!("`{}` is not readable: {error}", current.display())
+                });
+                for entry in entries {
+                    let path = entry.expect("a directory entry").path();
+                    if path.is_dir() {
+                        if !test_owned.contains(&path) {
+                            stack.push(path);
+                        }
+                    } else if path.extension().is_some_and(|ext| ext == "rs")
+                        && !accounted.contains(&path)
+                    {
+                        unaccounted.push(path);
+                    }
+                }
+            }
+            unaccounted.sort();
+            assert!(
+                unaccounted.is_empty(),
+                "no declaration in the module rooted at `{}` accounts for {unaccounted:?}. A \
+                 census domain derived from declarations is only the module when the \
+                 declarations account for every file of it; a macro at item position expands to \
+                 a declaration this scan cannot read, and the file it declares would otherwise \
+                 be scanned by nothing",
+                root.display()
+            );
         }
 
         /// What [`ProductionModule::row_mapping_wildcards`] read, and what it
@@ -465,7 +574,7 @@ pub(super) mod oracles {
         }
     }
 
-    use domain::ProductionModule;
+    use domain::{ProductionModule, refuse_unaccounted_files};
 
     /// The body of the item whose signature line contains `signature`, read out
     /// of `source` with comments and string literals blanked.
@@ -755,6 +864,72 @@ pub(super) mod oracles {
             scan.mappings() > 0,
             "no file of the domain holds a `row()` mapping at all, so the scan found nothing \
              and the count above is vacuous"
+        );
+
+        // (7) AND A FILE NO DECLARATION ACCOUNTS FOR STOPS THE WALK.
+        //
+        // Parts (1) to (5) all reason from the declarations. None of them can
+        // see a declaration the scan cannot read, and there is one:
+        // `scan_module_declarations` reads an item-position macro invocation's
+        // *tokens*, so a macro whose body lives in a file the walk never reads
+        // expands to `mod twelfth;` while its invocation shows nothing
+        // module-shaped. Reproduced before the refusal existed — the macro in
+        // `src/topology/mod.rs`, the invocation in `effects.rs`, a wildcard
+        // `row()` in `effects/twelfth/mod.rs` — and **both row-mapping tests
+        // stayed green with no test file touched**. Every assertion above agreed
+        // about a domain one file short, which is what makes it invisible from
+        // inside the declarations.
+        //
+        // `refuse_unaccounted_files` reconciles the declared set against the
+        // module's own directory. The domain is still declared: a file found
+        // here is a refusal, never a new member.
+        //
+        // Driven with the real module and no fixture tree, because this module
+        // restores the three effect denials and writes nothing. The accounting
+        // is the input, so both directions are reachable by varying it.
+        let owned: BTreeSet<PathBuf> = [repo_root().join("src/topology/effects/tests")]
+            .into_iter()
+            .collect();
+        let mut accounted: BTreeSet<PathBuf> = walked
+            .iter()
+            .filter(|path| *path != &effects)
+            .cloned()
+            .collect();
+        accounted.insert(repo_root().join("src/topology/effects/tests.rs"));
+        // The honest accounting refuses nothing — the control, and it is what
+        // says the refusal below is about the missing entry rather than about
+        // the directory being unreadable or the pruning being wrong.
+        refuse_unaccounted_files(&effects, &accounted, &owned);
+        // Drop one file from the accounting and it is named. That is exactly
+        // the shape a macro-declared child presents: on disk, in no declaration.
+        let mut short = accounted.clone();
+        let dropped = repo_root().join("src/topology/effects/vocab.rs");
+        assert!(
+            short.remove(&dropped),
+            "the accounting did not hold `vocab.rs`"
+        );
+        let refusal = panic_message(|| {
+            refuse_unaccounted_files(&effects, &short, &owned);
+        })
+        .expect("a file no declaration accounts for has to stop the walk");
+        assert!(
+            refusal.contains("no declaration in the module rooted at")
+                && refusal.contains("vocab.rs"),
+            "the walk stopped, but for some other reason: {refusal}"
+        );
+        // And the test-only prune is load-bearing, not decoration: without it
+        // `tests.rs` is a `.rs` file under the directory that the PRODUCTION
+        // accounting does not hold, so the reconciliation would refuse the one
+        // file every split of this shape is required to leave behind.
+        let mut without_tests = accounted.clone();
+        assert!(without_tests.remove(&repo_root().join("src/topology/effects/tests.rs")));
+        let tests_refusal = panic_message(|| {
+            refuse_unaccounted_files(&effects, &without_tests, &owned);
+        })
+        .expect("an unaccounted `tests.rs` has to stop the walk too");
+        assert!(
+            tests_refusal.contains("tests.rs"),
+            "the refusal did not name the test file: {tests_refusal}"
         );
 
         // (6) BELT AND BRACES: THE CENSUS'S OWN BODY NAMES NO READER.
