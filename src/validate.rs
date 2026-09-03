@@ -525,7 +525,10 @@ mod tests {
                 let candidate = candidate(tag, next_index());
                 tried += 1;
                 match fs::create_dir(&candidate) {
-                    Ok(()) => break candidate,
+                    Ok(()) => {
+                        created(tag, &candidate);
+                        break candidate;
+                    }
                     // Step over it. Never adopt a directory this process did
                     // not create, and never delete one either: that is
                     // `scratch_root`'s anti-pattern, which C-006 exists for.
@@ -599,23 +602,42 @@ mod tests {
     /// reclamation rather than anything the plan says.
     const ONE_PLAN: [(&str, &str); 1] = [("one.md", "## One\n")];
 
-    /// Every directory [`Corpus::of`] made in this process under `tag`.
+    /// Every directory this process has created under a corpus tag, recorded
+    /// by the two places one is born — [`Corpus::of`] and [`Leftover::plant`] —
+    /// the moment `fs::create_dir` succeeds. Complete by construction, and
+    /// written before any write that could fail, so a directory a failed setup
+    /// left behind is in here too.
+    static CREATED: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// Record a directory this process just created under `tag`.
+    fn created(tag: &str, dir: &Path) {
+        CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((tag.to_owned(), dir.to_path_buf()));
+    }
+
+    /// What **this process** has left behind under `tag`: of the directories it
+    /// created there, the ones that still exist — absence proved by [`is_gone`]
+    /// rather than assumed.
     ///
-    /// A prefix rather than a whole name: what the guard's witnesses assert is
-    /// that nothing of theirs survives, and the pid keeps a parallel suite's
-    /// other processes out of the answer. A search that matched nothing would
-    /// make an "it left nothing" assertion vacuous, so every caller pairs it
-    /// with a live guard it must find.
+    /// Not a scan of the temp directory. A scan keyed on the tag and the pid can
+    /// see another process's directories, because pids repeat across runs and
+    /// namespaces — the allocator says so itself and steps over exactly such a
+    /// leftover — so a witness built on one turned a tolerated collision into a
+    /// false red: review pass 5 pre-created this run's first candidate, the
+    /// allocator stepped to the next index, and the scan returned both. The
+    /// record [`created`] keeps cannot see another process at all. Vacuity is
+    /// guarded the same way as before: a caller pairs "nothing left" with a live
+    /// guard it must find first, which fails if nothing registers.
     fn residue(tag: &str) -> Vec<PathBuf> {
-        let prefix = format!("upstroke-validate-{tag}-{}-", std::process::id());
-        let mut found: Vec<PathBuf> = fs::read_dir(env::temp_dir())
-            .expect("the temp directory lists")
-            .map(|entry| entry.expect("a temp directory entry reads").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&prefix))
-            })
+        let mut found: Vec<PathBuf> = CREATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(created_under, _)| created_under == tag)
+            .map(|(_, dir)| dir.clone())
+            .filter(|dir| !is_gone(dir))
             .collect();
         found.sort();
         found
@@ -669,7 +691,10 @@ mod tests {
                 let candidate = candidate(tag, peek_index());
                 tried += 1;
                 match fs::create_dir(&candidate) {
-                    Ok(()) => break candidate,
+                    Ok(()) => {
+                        created(tag, &candidate);
+                        break candidate;
+                    }
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                         // The index the guard would have skipped too.
                         next_index();
@@ -1043,9 +1068,13 @@ mod tests {
     /// two things: that the primary panic's payload comes back intact, and that
     /// the tree the guard could not reclaim is genuinely still there for the
     /// test's own guard to take back. What it cannot assert is the stderr line
-    /// itself — no in-process hook captures it — and if the destructor ever
-    /// regressed to a second panic, this test would not fail so much as take
-    /// the whole binary down with an abort, which is loud in its own way.
+    /// itself — no in-process hook captures it, and every in-process record of
+    /// it would be written by the very arm under test — so that half is
+    /// asserted from outside the process, by
+    /// [`an_unwinding_reclamation_report_crosses_the_child_process_stderr`]. And
+    /// if the destructor ever regressed to a second panic, this test would not
+    /// fail so much as take the whole binary down with an abort, which is loud
+    /// in its own way.
     ///
     /// Unix only, for the reason the witness above gives.
     #[cfg(unix)]
@@ -1091,6 +1120,143 @@ mod tests {
             is_gone(&dir),
             "the test's own guard did not reclaim {}",
             dir.display()
+        );
+    }
+
+    /// The child half of
+    /// [`an_unwinding_reclamation_report_crosses_the_child_process_stderr`]:
+    /// exactly one genuine reclamation failure during an unwind, and nothing
+    /// else written to this process's stderr.
+    ///
+    /// `#[ignore]`d because the parent runs it as a child of this same binary,
+    /// `--ignored --exact`, where its fd 2 can be read from outside. In the
+    /// ordinary suite its subject is already covered by the in-process witness
+    /// above; running it there as well would only put a second report line into
+    /// the suite's stderr. Everything asserted here is asserted in this
+    /// process — reaching the end is the claim, and the harness's result line on
+    /// stdout is how the parent reads it. Unix, for the reason the failure drive
+    /// gives.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by an_unwinding_reclamation_report_crosses_the_child_process_stderr"]
+    fn an_unwinding_reclamation_failure_report_child() {
+        const PRIMARY: &str = "the primary failure this child keeps observable";
+        let cleanup = Mutex::new(None);
+        let caught = std::panic::catch_unwind(|| {
+            let corpus = Corpus::of("raii-unwind-report", &ONE_PLAN);
+            *cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Unwritable::new(corpus.dir.clone()));
+            panic!("{PRIMARY}");
+        })
+        .expect_err("the closure was supposed to unwind");
+        let message = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default();
+        assert_eq!(
+            message, PRIMARY,
+            "the destructor's own report displaced the primary panic"
+        );
+        let held = cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the closure armed the test's own cleanup before it panicked");
+        assert!(
+            !is_gone(&held.dir),
+            "the guard reclaimed the tree after all, so no report was made on this path"
+        );
+        // `held` drops here, on the ordinary exit: the mode is restored and the
+        // tree reclaimed, so nothing further crosses stderr.
+    }
+
+    /// The unwinding report reaches the process's **real stderr** — asserted
+    /// from outside the process.
+    ///
+    /// `rundir::scratch_tree`'s `PR78-EMIT-UNWIND-REPORT-ORACLE`, applied here:
+    /// every in-process record of whether the panicking arm wrote anything is
+    /// written by that arm, so the in-process witness above cannot tell a
+    /// report from silence — review pass 5 replaced the write with nothing and
+    /// it stayed green. The child is
+    /// [`an_unwinding_reclamation_failure_report_child`], run out of this same
+    /// binary and read back off its actual fd 2, where no arm of the code under
+    /// test can reach. It is spawned through the host Runner — `Process.Spawn`
+    /// is the Runner's funnel, `std::process::Command` is a denied type in this
+    /// file, and `prelock::tests` spawns its own child the same way. Exactly one
+    /// reclaim is refused in that child, so exactly one report may cross, and it
+    /// must name the child's tree and the real cause.
+    ///
+    /// The vacuity guard is the harness's own result line on the child's
+    /// stdout: `--exact` with a drifted name matches nothing, and a child that
+    /// ran no test exits 0 with exactly the silent stderr this witness would
+    /// otherwise misread as an answer.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwinding_reclamation_report_crosses_the_child_process_stderr() {
+        use crate::runner::host::HostRunner;
+        use crate::runner::{
+            CommandSpec, ExecutionRole, InvocationId, ProbeTarget, Runner, RunnerRequest,
+        };
+        const CHILD: &str = "validate::tests::an_unwinding_reclamation_failure_report_child";
+
+        // Any owned directory serves as the child's working directory: the
+        // child derives its own temp paths and shares no state with this one.
+        let workspace = Corpus::of("raii-report-parent", &ONE_PLAN);
+        let exe = std::env::current_exe().expect("the test binary knows where it is");
+        let request = RunnerRequest {
+            command: CommandSpec {
+                program: exe.display().to_string(),
+                args: vec![
+                    "--exact".to_owned(),
+                    CHILD.to_owned(),
+                    "--ignored".to_owned(),
+                    "--test-threads".to_owned(),
+                    "1".to_owned(),
+                ],
+                env: Vec::new(),
+                stdin: Vec::new(),
+            },
+            workspace: workspace.dir.clone(),
+            role: ExecutionRole::Gate,
+            timeout: std::time::Duration::from_secs(120),
+            agent: None,
+            invocation: InvocationId::probe(ProbeTarget::Shell, 17)
+                .expect("a probe identity for the spawned child"),
+        };
+        let output = HostRunner::new().run(&request).expect("the child runs");
+
+        assert!(
+            !output.timed_out,
+            "the child never finished, so nothing about its report was observed"
+        );
+        assert_eq!(
+            output.code,
+            Some(0),
+            "the child did not pass on its own, so its stderr is not the report's alone:\n\
+             --- child stdout ---\n{}\n--- child stderr ---\n{}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains(CHILD) && output.stdout.contains("test result: ok. 1 passed"),
+            "`--exact {CHILD}` matched nothing — the name has drifted, so the child ran no \
+             test at all:\n{}",
+            output.stdout
+        );
+        let reports = output.stderr.matches("was not reclaimed").count();
+        assert_eq!(
+            reports, 1,
+            "exactly one report may cross the child's stderr, and one must; saw {reports}:\n{}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("raii-unwind-report")
+                && output.stderr.contains("Permission denied"),
+            "the report must name the child's tree and its real cause:\n{}",
+            output.stderr
         );
     }
 
