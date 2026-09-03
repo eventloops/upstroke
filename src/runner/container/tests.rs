@@ -3073,8 +3073,8 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 /// allowance, so Clippy accepts it; the allow-placement scan sees no child
 /// allowance to object to; this census never walks the directory; and wrapper
 /// classification matches the same bare `fn` name without reading the body. An
-/// effect lands with no site while every control stays green. The fourth entry
-/// below is what closes it.
+/// effect lands with no site while every control stays green. The
+/// `src/rundir.rs` entry below is what closes it.
 ///
 /// Every file under a funnel's directory either **denies** a governed lint or
 /// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
@@ -3102,17 +3102,17 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     // extracted test module, and this walk finds it and grades it against all
     // three governed lints like any other child.
     //
-    // `src/rundir.rs` is the fourth, added in W2. It allowed all three at file
-    // scope and had children this census did not visit, so the list -- not the
-    // walk -- was the whole of the gap. Measured when it was added: the arm
-    // grades seven files and every cell already passes, because
+    // `src/rundir.rs` was added in W2. It allowed all three at file scope and
+    // had children this census did not visit, so the list -- not the walk --
+    // was the whole of the gap. Measured when it was added: the arm grades
+    // seven files and every cell already passes, because
     // `src/rundir/tests.rs` allows all three against a row recording all three,
     // `src/rundir/scratch_tree.rs` allows two against a row recording those two
     // and denies the third, and the five production children of the `m3-rundir`
     // split deny all three. Nothing was red; the entry exists so that the next
     // one would be.
     //
-    // All four funnels have a directory today, so no arm of the domain below is
+    // Every funnel named here has a directory today, so no arm of the domain is
     // inert.
     const FUNNELS: [&str; 4] = [
         "src/runner/container.rs",
