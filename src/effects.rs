@@ -938,11 +938,14 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/workspace_manager.rs",
     "src/rundir.rs",
     // The five production children the `m3-rundir` split gave `src/rundir.rs`.
-    // They are named **one path each** rather than by turning the entry above
-    // into a prefix: `topology_modules_among` matches this file's other list
-    // with `starts_with`, and making these entries prefixes would change what
-    // every census in the crate measures. That is `C-002`'s own change and not
-    // this split's.
+    // They are named **one path each**, which is the only form this list has:
+    // `reachable_fns_are_classified` joins every entry onto the manifest root
+    // and reads it as a source file, so a directory prefix would name nothing
+    // and the entry above cannot be widened into one. `C-002` is the standing
+    // finding that this roll-call is hand-maintained rather than derived, and it
+    // is not this split's to repair. (`TOPOLOGY_MODULES` above is the list that
+    // *does* match with `starts_with`, and it does not name `src/rundir.rs` at
+    // all -- neither the ban it serves nor the prefix question reaches here.)
     //
     // They are here because the split moved seventeen externally reachable
     // `fn`s out of `src/rundir.rs`, and a name that leaves the domain is a name

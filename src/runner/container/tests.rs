@@ -3059,6 +3059,23 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 /// silence. The domain below is derived from the funnel list rather than
 /// written out, so the next funnel to grow a child is covered by the same line.
 ///
+/// **The RunDir funnel is in the domain too, and W2 is when that stopped being
+/// optional.** `src/rundir.rs` carries the same inner allow of all three and has
+/// had out-of-line children since W1 — `src/rundir/tests.rs` and
+/// `src/rundir/scratch_tree.rs` — which this census never visited, because
+/// deriving the domain from a funnel *list* only covers the funnels somebody put
+/// on it. `src/rundir/scratch_tree.rs`'s own `effects/allowlist.toml` row says so
+/// in as many words: its level "is written here because the hole is the same one,
+/// not because a gate caught it". The `m3-rundir` split then added five
+/// **production** children under that allowance, and the escape it opened is
+/// concrete rather than theoretical: delete one child's `#![deny(…)]`, put a
+/// `std::fs::write` in an existing function, and the child inherits the parent's
+/// allowance, so Clippy accepts it; the allow-placement scan sees no child
+/// allowance to object to; this census never walks the directory; and wrapper
+/// classification matches the same bare `fn` name without reading the body. An
+/// effect lands with no site while every control stays green. The fourth entry
+/// below is what closes it.
+///
 /// Every file under a funnel's directory either **denies** a governed lint or
 /// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
 /// grid is {file} × {which of the three governed lints}, every cell asserted:
@@ -3083,12 +3100,25 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     // the day it grew one the walk would find it rather than the reviewer
     // having to. **That day arrived in W1**: `src/runner/host/tests.rs` is its
     // extracted test module, and this walk finds it and grades it against all
-    // three governed lints like any other child. All three funnels have a
-    // directory today, so no arm of the domain below is inert.
-    const FUNNELS: [&str; 3] = [
+    // three governed lints like any other child.
+    //
+    // `src/rundir.rs` is the fourth, added in W2. It allowed all three at file
+    // scope and had children this census did not visit, so the list -- not the
+    // walk -- was the whole of the gap. Measured when it was added: the arm
+    // grades seven files and every cell already passes, because
+    // `src/rundir/tests.rs` allows all three against a row recording all three,
+    // `src/rundir/scratch_tree.rs` allows two against a row recording those two
+    // and denies the third, and the five production children of the `m3-rundir`
+    // split deny all three. Nothing was red; the entry exists so that the next
+    // one would be.
+    //
+    // All four funnels have a directory today, so no arm of the domain below is
+    // inert.
+    const FUNNELS: [&str; 4] = [
         "src/runner/container.rs",
         "src/agent/proc.rs",
         "src/runner/host.rs",
+        "src/rundir.rs",
     ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
@@ -3120,6 +3150,23 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         children.contains(&root.join("src/agent/proc/test_support/readiness.rs")),
         "the Process funnel's only child is not in the census domain: {children:#?}"
     );
+    // And the RunDir funnel's five production children, by name, for the same
+    // reason: a count would stay green if the walk lost the `src/rundir/` arm
+    // entirely, and those five are what this census was widened for. Named
+    // rather than counted, because *which* file stopped being graded is the
+    // finding -- a count survives a swap.
+    for child in [
+        "src/rundir/classify.rs",
+        "src/rundir/discovery.rs",
+        "src/rundir/names.rs",
+        "src/rundir/ownership.rs",
+        "src/rundir/retention.rs",
+    ] {
+        assert!(
+            children.contains(&root.join(child)),
+            "the RunDir funnel's child `{child}` is not in the census domain: {children:#?}"
+        );
+    }
 
     let mut missing = Vec::new();
     let mut unlisted = Vec::new();

@@ -125,22 +125,37 @@ effect_free = [
 # The five production children the `m3-rundir` split gave `src/rundir.rs`, added
 # in the same commit as the split. Seventeen externally reachable `fn`s left the
 # parent's file, and a name that leaves the domain is a name nobody has to
-# classify any more -- so the children join `CLASSIFIED_MODULES` by name (never
-# by turning that list's `src/rundir.rs` into a prefix; that is `C-002`'s change,
-# and this list's other consumer matches with `starts_with`) and the same names
-# are accounted for here on the other side of the move.
+# classify any more -- so the children join `CLASSIFIED_MODULES` by name, which
+# is the only form that list has: its census reads every entry as a source file,
+# so there is no prefix to widen `src/rundir.rs` into. `C-002` is the standing
+# finding that the roll-call is hand-maintained, and it is not this split's.
 #
-# Every one of them is `effect_free`, and that is what the split was arranged to
-# make true: no funnel and no effect site moved. Each child DENIES all three
+# THE REPOINT IS A NET WIDENING OF FOUR, and it is written down rather than
+# implied: 17 names leave the parent's block and 21 arrive in the children's,
+# because four names are classified here that the parent's block did not carry
+# separately.
+#
+#   * `first_line` and `first_line_within` were PRIVATE `fn`s of
+#     `src/rundir.rs`, below the classification threshold entirely. The
+#     extraction made them `pub(super)` in `classify.rs` so `rundir::tests` can
+#     still drive them by name, and a `pub(super) fn` is externally reachable, so
+#     they must be classified now. `pub(super)` here is `rundir` and its
+#     descendants and nothing wider.
+#   * `public_dir` and `fmt` each named TWO items inside the parent's file -- the
+#     free `public_dir` and `PrivateHalfProof::public_dir`, `RepoKey`'s `Display`
+#     and `RetainReason`'s -- and this record classifies by bare name, so one
+#     entry covered both. The split separates each pair into different files, so
+#     each half is now classified on its own. That is why they are not among the
+#     seventeen: the parent still derives its half.
+#
+# Both are widenings. No name that was classified before is unclassified now.
+#
+# Every one of the five is `effect_free`, and that is what the split was arranged
+# to make true: no funnel and no effect site moved. Each child DENIES all three
 # governed lints at file scope and takes no `effects/allowlist.toml` row -- the
 # whole run-directory, answer and lock funnel surface, its atomic publication
 # primitives and its platform locking stayed in the parent, which keeps the
 # allowlist identity.
-#
-# `first_line` and `first_line_within` are new to this record and not new to the
-# tree: they were private `fn`s of `src/rundir.rs`, and the extraction made them
-# `pub(super)` in `classify.rs` so `rundir::tests` can still drive them by name.
-# `pub(super)` here is `rundir` and its descendants and nothing wider.
 [[module]]
 path = "src/rundir/classify.rs"
 crate_path = "upstroke::rundir::classify"

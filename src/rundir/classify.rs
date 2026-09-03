@@ -111,10 +111,14 @@ fn first_committed_line(public: &Path) -> Option<RunStartedHeader> {
     // link's target** between the check and the open. Refusing the link itself
     // narrows the residual race to replacing a directory entry the census owns.
     // A symlinked `events.jsonl` is therefore a `Husk` whatever it points at,
-    // which is this module's stance elsewhere (`:764`, `:1595`) and is the safe
-    // direction: a husk is never deleted on shape alone — deletion additionally
-    // requires the ownership proof, which requires `committed.json` to be
-    // absent, and a run that reached `run_started` published one at P5b.
+    // which is this subsystem's stance wherever the filesystem is undecidable or
+    // a path is a link — `super::CommitRecordPresence::Unknown` is treated as
+    // `Present` by every caller, and `super::ownership` refuses a locator chain
+    // that passes through a reparse point and takes only `NotFound` as proof
+    // that `committed.json` is absent. It is the safe direction: a husk is never
+    // deleted on shape alone — deletion additionally requires the ownership
+    // proof, which requires `committed.json` to be absent, and a run that
+    // reached `run_started` published one at P5b.
     if !fs::symlink_metadata(&path).is_ok_and(|entry| entry.is_file()) {
         return None;
     }
