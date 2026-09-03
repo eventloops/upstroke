@@ -2329,36 +2329,53 @@ mod tests {
         // charge. Counting the calls is what makes a settlement that stops
         // charging a failing census rather than a silent undercount.
         //
-        // **The fold is a directory.** It was one file when this was written,
-        // and the read below was that file. The domain is unchanged — the
-        // fold's production code — but it is now the root plus its children,
-        // so reading `fold.rs` alone would count only the state types and the
+        // **The fold is a directory, and one level of it is not the subtree.**
+        // It was one file when this was written, and the read below was that
+        // file. The domain is unchanged — the fold's production code — but it
+        // is now the root plus everything beneath it, so reading `fold.rs`
+        // alone would count only the state types and the
         // `plan_transition`/`apply_delta` pair and would report zero for a
-        // charge that moved into a sibling. `fold/tests.rs` is the whole-file
-        // test module and was never in this domain.
-        let mut sources = vec![PathBuf::from("src/topology/fold.rs")];
-        let mut children: Vec<PathBuf> = std::fs::read_dir("src/topology/fold")
-            .expect("the fold's children")
-            .map(|entry| entry.expect("a directory entry").path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-            .filter(|path| !path.ends_with("tests.rs"))
-            .collect();
-        children.sort();
+        // charge that moved into a sibling.
+        //
+        // **The walk is [`production_sources`], not a one-level `read_dir`.**
+        // A `read_dir` of `src/topology/fold` claimed this whole domain while
+        // reaching only its direct children, so a helper in
+        // `fold/apply/debit.rs` charging a retained failure a second time left
+        // this count at two and this census green — measured, by planting
+        // exactly that. `CODING_STANDARDS.md` §12 states the rule it breaks: a
+        // positive control inside a truncated domain does not prove that the
+        // whole named domain was scanned. That is also why the mutation which
+        // binds this walk is planted in a GRANDCHILD; the earlier confirmation
+        // planted its third charge in `check_candidate.rs`, a direct child and
+        // so inside the truncated boundary, and confirmed the census fired
+        // without ever testing its depth.
+        //
+        // The shared walk recurses, and it drops whole-file test modules
+        // through `census_domain::whole_file_test_modules`, so `fold/tests.rs`
+        // — and any deeper one a later split adds — leaves this domain by
+        // derivation rather than by a `tests.rs` name check.
+        const FOLD_ROOT: &str = "src/topology/fold.rs";
+        const FOLD_SUBTREE: &str = "src/topology/fold/";
+        let walked = production_sources();
+        let children = walked
+            .iter()
+            .filter(|(path, _)| path.starts_with(FOLD_SUBTREE))
+            .count();
         // The control: a walk that found nothing would count zero charges in a
         // tree that has two, and the assertion below would then be about an
         // empty region rather than about the appliers.
         assert!(
-            children.len() >= 10,
-            "the walk found {} production children of the fold, so the count below is over \
-             almost nothing",
-            children.len()
+            children >= 10,
+            "the walk found {children} production children of the fold, so the count below is \
+             over almost nothing"
         );
-        sources.extend(children);
         let mut charges = 0;
-        for path in &sources {
-            let source = std::fs::read_to_string(path).expect("the fold reads");
+        for (path, code) in &walked {
+            if path.as_str() != FOLD_ROOT && !path.starts_with(FOLD_SUBTREE) {
+                continue;
+            }
             charges += crate::effects::census_domain::production_calls(
-                &crate::effects::production_code(&source),
+                code,
                 "self.charge_allowance",
                 crate::effects::census_domain::Call::Free,
             );
