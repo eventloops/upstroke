@@ -111,16 +111,38 @@ pub(super) mod oracles {
     /// this scan is a guard on a file this slice does not edit rather than a
     /// requirement on one it does.
     ///
-    /// The mappings live in **two** files since `topology::effects` was split into
-    /// per-concern child modules: `EffectSiteId::row` stayed in the root and the
-    /// eleven site enums' went to `sites.rs`. Both are scanned, so the population
-    /// is the same twelve mappings the single file used to hold, and the floor
-    /// below still means what it meant.
+    /// The mappings live in a **module** rather than a file since
+    /// `topology::effects` was split into per-concern child modules:
+    /// `EffectSiteId::row` stayed in the root and the eleven site enums' went to
+    /// `sites.rs`. What this census reads is therefore the root plus every
+    /// production child, not the one child today's mappings landed in — a path
+    /// is a domain here, not an address, and a twelfth group's `row()` added to
+    /// a sibling child is exactly what the single-file read used to catch.
+    /// `tests.rs` is excluded: it is the whole-file test module the root only
+    /// declares, so it is not production and `production_region` cannot cut it.
     pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {
+        let root = repo_root();
+        let mut sources = vec![root.join("src/topology/effects.rs")];
+        let mut child_paths: Vec<_> = fs::read_dir(root.join("src/topology/effects"))
+            .expect("the effects module directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_stem().is_some_and(|stem| stem != "tests")
+            })
+            .collect();
+        child_paths.sort();
+        let children = child_paths.len();
+        sources.extend(child_paths);
+        assert!(
+            children >= 7,
+            "only {children} production children of `topology::effects` walked, so this census \
+             is looking at the wrong directory"
+        );
         let mut scanned = 0_usize;
         let mut offenders = Vec::new();
-        for path in ["src/topology/effects.rs", "src/topology/effects/sites.rs"] {
-            let source = std::fs::read_to_string(path).expect("the frozen inventory");
+        for path in sources {
+            let source = fs::read_to_string(&path).expect("the frozen inventory");
             let production = blank_comments_and_strings(&production_region(&source));
             let mut rest = production.as_str();
             while let Some(at) = rest.find("fn row(") {
