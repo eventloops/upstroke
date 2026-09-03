@@ -32,6 +32,11 @@ use std::collections::BTreeSet;
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
 use super::fixture::{Fixture, git, git_out, scratch};
+// The observing scratch tree: its drop reclaims the directory and reports a
+// reclaim that failed, where `scratch` above hands back a bare path nothing
+// removes. The `canonical_prefix` tests below build no repository, so this is
+// the fixture they take.
+use crate::rundir::scratch_tree::acquire;
 // Named here rather than borrowed from the parent's import list. The split
 // moved the items that needed them into children -- the hook observers, the
 // residue classifier, the slot vocabulary and the changed-path decoder -- so
@@ -908,35 +913,146 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     assert_eq!(named.len(), 3, "three distinct call sites: {named:?}");
 }
 
-/// A run id that climbs out of the private root, or is absolute, gives
-/// `execution_root_of` a root with no plain chain below the anchor the
-/// reparse-point walk starts at. The walk answered "no reparse point" for it
-/// — true of a chain it never inspected — and on Linux `derive` then
-/// succeeded with `<private>/workspaces/<key>/../../../escape` as its
-/// execution root, which `create_execution_root` would have created outside
-/// the private root.
-///
-/// Both shapes, on every platform: `..` components survive `strip_prefix`
-/// lexically, and an absolute run id replaces the private root in `join`.
+/// The walk's own guarantee, driven directly: a root that is not plain
+/// components below the anchor — `..` in the remainder, or no common prefix
+/// at all — is refused rather than walked. The walk answered "no reparse
+/// point" for such a root, true of a chain it never inspected, and on Linux
+/// `derive` then succeeded with `<private>/workspaces/<key>/../../../escape`
+/// as its execution root. Through `derive` these shapes are now refused
+/// earlier, as run ids; this pins the arm behind that one.
 #[test]
 fn an_execution_root_with_no_plain_chain_below_the_private_root_refuses_before_any_effect() {
     let fixture = Fixture::new("root-not-below");
-    for run_id in ["../../../escape", "/escape"] {
-        let error = WorkspaceManager::derive(&fixture.base, &fixture.private, run_id, "inc-1")
-            .expect_err("a run id whose root leaves the private root refuses");
+    let anchor = fixture.manager.private_root().to_path_buf();
+    for root in [
+        anchor
+            .join("workspaces")
+            .join("k")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("escape"),
+        fixture.root.join("escape"),
+    ] {
+        let error = refuse_reparse_points(&anchor, &root)
+            .expect_err("a root with no plain chain below the anchor refuses");
         let message = refusal_of(&error);
         assert!(
             message.contains("does not lie below the authorized private root"),
-            "{run_id}: the refusal must name its reason: {message}"
-        );
-        assert!(
-            message.contains("escape"),
-            "{run_id}: and the root it refused: {message}"
+            "{}: the refusal must name its reason: {message}",
+            root.display()
         );
     }
     assert!(
-        !fixture.root.join("escape").exists() && !fixture.private.join("workspaces").exists(),
+        !fixture.root.join("escape").exists() && !anchor.join("workspaces").exists(),
         "and perform no effect"
+    );
+}
+
+/// A run id is one plain component, refused at `derive` before any path is
+/// built. `Path::join` lets an absolute id replace the whole prefix, so an
+/// absolute id naming a peer run's root aliased that root: `revalidate`
+/// treated the peer's worktree as this manager's slot and `remove_worktree`
+/// could have deleted its checkout and Git admin entry. `.` passed the walk
+/// because `components()` folds a non-leading `.` away, aliasing the repo-key
+/// directory. Every shape, on every platform.
+#[test]
+fn a_run_id_that_is_not_one_plain_component_is_refused_before_any_path_is_built() {
+    let victim = Fixture::created("alias-victim");
+    let slot = victim.add_task(&mut NoHooks, "k1", 1);
+    let victim_root = victim
+        .manager
+        .execution_root()
+        .to_str()
+        .expect("a UTF-8 scratch path")
+        .to_owned();
+    for run_id in [
+        victim_root.as_str(),
+        ".",
+        "..",
+        "",
+        "../../../escape",
+        "/escape",
+        "a/b",
+        "-run",
+        "run.",
+    ] {
+        let error = WorkspaceManager::derive(&victim.base, &victim.private, run_id, "inc-2")
+            .expect_err("a run id that is not one plain component refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("refusing the run id"),
+            "{run_id:?}: the refusal must name its reason: {message}"
+        );
+    }
+    assert!(
+        victim.manager.slot_path(&slot).is_dir(),
+        "and the peer's worktree is untouched"
+    );
+    assert!(
+        !victim.root.join("escape").exists(),
+        "and nothing was built"
+    );
+}
+
+/// `execution_root`: "every create/reclaim/delete revalidates". The walk
+/// pushed the first child before its first `symlink_metadata`, so the private
+/// root itself was never examined: renamed away after `derive` and replaced
+/// by a link to an unrelated directory, every component under it was read
+/// through the link and `create_execution_root` built the hierarchy under
+/// the link's target. A symlink here, a junction on Windows.
+#[test]
+fn a_private_root_replaced_by_a_link_after_derive_refuses_every_revalidation() {
+    let fixture = Fixture::new("anchor-link");
+    let private = fixture.manager.private_root().to_path_buf();
+    let elsewhere = fixture.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the unrelated directory");
+    let moved = fixture.root.join("private-moved");
+    fs::rename(&private, &moved).expect("move the real private root aside");
+    plant_directory_link(&elsewhere, &private);
+
+    let error = fixture
+        .manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("a private root that became a link refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !elsewhere.join("workspaces").exists() && !moved.join("workspaces").exists(),
+        "and nothing is built under the link's target"
+    );
+}
+
+/// The same exchange one level up: the private root is still a real
+/// directory at its recorded path, but an ancestor is now a link, so the
+/// recorded canonical root no longer resolves to itself. The anchored walk
+/// never looks above the anchor; the canonical pin does.
+#[test]
+fn a_link_planted_above_the_private_root_after_derive_refuses_every_revalidation() {
+    let fixture = Fixture::new("anchor-ancestor");
+    let holder = fixture.root.join("holder");
+    fs::create_dir_all(holder.join("private")).expect("the held private root");
+    let manager =
+        WorkspaceManager::derive(&fixture.base, &holder.join("private"), "run-7", "inc-1")
+            .expect("derive under the holder");
+    let moved = fixture.root.join("holder-moved");
+    fs::rename(&holder, &moved).expect("move the holder aside");
+    plant_directory_link(&moved, &holder);
+
+    let error = manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("a link above the private root refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !moved.join("private").join("workspaces").exists(),
+        "and nothing is built through the link"
     );
 }
 
@@ -1003,8 +1119,8 @@ fn an_absent_managed_base_or_private_root_refuses_as_not_a_real_directory() {
 #[cfg(unix)]
 #[test]
 fn canonical_prefix_propagates_a_resolution_failure_that_is_not_absence() {
-    let dir = scratch("canonical-loop");
-    let real = dir.canonicalize().expect("canonical scratch");
+    let tree = acquire(&std::env::temp_dir(), "canonical-loop").expect("acquire a scratch tree");
+    let real = tree.path().canonicalize().expect("canonical scratch");
     let link = real.join("loop");
     std::os::unix::fs::symlink(&link, &link).expect("plant the loop");
     let below = link.join("child");
@@ -1017,7 +1133,6 @@ fn canonical_prefix_propagates_a_resolution_failure_that_is_not_absence() {
         ),
         "the error names the path that could not be resolved and its reason: {error}"
     );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A `..` below a component that does not exist has no directory to refer
@@ -1030,8 +1145,8 @@ fn canonical_prefix_propagates_a_resolution_failure_that_is_not_absence() {
 #[cfg(unix)]
 #[test]
 fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically() {
-    let dir = scratch("canonical-dotdot");
-    let real = dir.canonicalize().expect("canonical scratch");
+    let tree = acquire(&std::env::temp_dir(), "canonical-dotdot").expect("acquire a scratch tree");
+    let real = tree.path().canonicalize().expect("canonical scratch");
     let path = real.join("missing").join("..").join("x");
     let error = canonical_prefix(&path).expect_err("no canonical form exists");
     let stopped_at = real.join("missing").join("..");
@@ -1043,7 +1158,22 @@ fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically
         ),
         "the error names the prefix the peel stopped at: {error}"
     );
-    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The relative-path terminal arm names the prefix that failed — the first
+/// component, the last one the peel tried — not the whole path.
+#[test]
+fn canonical_prefix_names_the_prefix_that_failed_for_a_relative_path() {
+    let first = PathBuf::from(format!("upstroke-absent-{}", std::process::id()));
+    let error = canonical_prefix(&first.join("x")).expect_err("nothing in it exists");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &first && source.kind() == std::io::ErrorKind::NotFound
+        ),
+        "the error names the prefix that failed: {error}"
+    );
 }
 
 /// The Windows half of the test above: Win32 resolves `..` lexically before
@@ -1052,14 +1182,13 @@ fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically
 #[cfg(windows)]
 #[test]
 fn windows_resolves_a_dot_dot_below_an_absent_component_before_the_filesystem_sees_it() {
-    let dir = scratch("canonical-dotdot");
-    let real = strip_verbatim(dir.canonicalize().expect("canonical scratch"));
+    let tree = acquire(&std::env::temp_dir(), "canonical-dotdot").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
     let path = real.join("missing").join("..").join("x");
     assert_eq!(
         canonical_prefix(&path).expect("Win32 resolves the `..`"),
         real.join("x")
     );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A **deletion** revalidates the chain, and refuses before it acts

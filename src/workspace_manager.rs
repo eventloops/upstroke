@@ -116,18 +116,20 @@ pub enum Refusal {
         at: PathBuf,
     },
 
-    /// `execution_root`: "`<private_root>/workspaces/<repo_key>/<run_id>`,
-    /// recorded exactly". The reparse-point walk is anchored at the authorized
-    /// private root and inspects the chain **below** it, one plain component
-    /// at a time. A root that does not lie below the private root as plain
-    /// components — no common prefix, or a prefix, a root, `.` or `..` in the
-    /// remainder, which is what a run id such as `../../x` or an absolute one
-    /// produces — has no such chain, and the walk refuses it rather than
-    /// answer "no reparse point" for a chain it never inspected.
+    /// `DESIGN.md` §15 places the execution root at
+    /// `<private root>/workspaces/<repo-key>/<run-id>`, recorded exactly. The
+    /// reparse-point walk is anchored at the authorized private root and
+    /// inspects the chain **below** it, one plain component at a time. A root
+    /// that does not lie below the private root as plain components — no
+    /// common prefix, or a prefix, a root or `..` in the remainder — has no
+    /// such chain, and the walk refuses it rather than answer "no reparse
+    /// point" for a chain it never inspected. [`Refusal::RunId`] refuses the
+    /// run ids that would build such a root before any path exists; this is
+    /// the walk's own guarantee behind that one.
     #[error(
         "refusing execution root {}: it does not lie below the authorized private root {} as a \
-         chain of plain components, and decisions.workspace_candidates.execution_root records \
-         every execution root at <private_root>/workspaces/<repo_key>/<run_id>",
+         chain of plain components, and DESIGN.md §15 places every execution root at \
+         <private root>/workspaces/<repo-key>/<run-id>",
         .root.display(),
         .private_root.display()
     )]
@@ -274,6 +276,27 @@ pub enum Refusal {
         why: &'static str,
     },
 
+    /// A run id that is not one plain path component.
+    ///
+    /// `DESIGN.md` §15 places the execution root at
+    /// `<private root>/workspaces/<repo-key>/<run-id>`, and `Path::join`
+    /// would let an absolute id replace that prefix while `.`, `..` and an
+    /// empty id alias the repo-key directory or a peer run's root — an
+    /// absolute id naming a peer's root made that root this manager's, with
+    /// the peer's worktrees as its slots. Refused before any path is built,
+    /// by the rule the slot components already obey: ASCII alphanumerics,
+    /// `-` and `_`, no leading `-`, which every engine-minted ULID satisfies.
+    #[error(
+        "refusing the run id `{name}`: {why}, and DESIGN.md §15 places every execution root at \
+         <private root>/workspaces/<repo-key>/<run-id>"
+    )]
+    RunId {
+        /// The id as it was offered.
+        name: String,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+
     /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
     /// intents **synced before** the add".
     ///
@@ -344,9 +367,40 @@ pub fn repo_key_v1(canonical_common_git_dir: &Path) -> String {
 }
 
 /// `<private_root>/workspaces/<repo_key>/<run_id>`, recorded exactly.
+///
+/// `run_id` is one plain component: [`WorkspaceManager::derive`] refuses any
+/// other shape with [`refuse_unplain_run_id`] before calling this, because
+/// `join` would let an absolute id replace the prefix and `.` or `..` name
+/// another directory.
 #[must_use]
 pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> PathBuf {
     private_root.join("workspaces").join(repo_key).join(run_id)
+}
+
+/// [`Refusal::RunId`] unless `run_id` is one plain path component.
+///
+/// The rule is `naming::safe_component`'s, restated for a run id so the
+/// refusal names what was offered: non-empty, ASCII alphanumerics, `-` and
+/// `_` only, no leading `-`. That excludes every separator on every
+/// platform, `.`, `..`, a prefix such as `C:` and the trailing dot or space
+/// Win32 rewrites.
+fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
+    let why = if run_id.is_empty() {
+        "it is empty"
+    } else if !run_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        "only ASCII alphanumerics, `-` and `_` are legal in a run id"
+    } else if run_id.starts_with('-') {
+        "a leading `-` would be read as an option by the Git commands the funnels run"
+    } else {
+        return Ok(());
+    };
+    Err(Refusal::RunId {
+        name: run_id.to_owned(),
+        why,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -541,16 +595,19 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
-    /// [`Refusal::ReparsePointOnChain`], [`Refusal::RootInsideRepositoryWorktree`],
-    /// and [`Refusal::WorktreeInsideRoot`], plus a Git error when the base is
-    /// not a repository.
+    /// [`Refusal::RunId`], [`Refusal::BaseIsNotADirectory`],
+    /// [`Refusal::RootOutsidePrivateRoot`], [`Refusal::ReparsePointOnChain`],
+    /// [`Refusal::RootInsideRepositoryWorktree`] and
+    /// [`Refusal::WorktreeInsideRoot`]; [`UpstrokeError::Io`] when the base,
+    /// the private root or a registered worktree cannot be read or resolved;
+    /// and a Git error when the base is not a repository.
     pub fn derive(
         base: &Path,
         private_root: &Path,
         run_id: &str,
         incarnation: &str,
     ) -> Result<Self, UpstrokeError> {
+        refuse_unplain_run_id(run_id)?;
         refuse_unreal_directory(base)?;
         refuse_unreal_directory(private_root)?;
 

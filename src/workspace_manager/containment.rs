@@ -81,10 +81,14 @@ pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 /// by plain components and nothing else.
 ///
 /// `None` when the two share no prefix, and when the remainder carries a
-/// prefix, a root, `.` or `..`. Such a path has no chain below the anchor to
+/// prefix, a root or `..`. Such a path has no chain below the anchor to
 /// walk, and the walk must not answer for one. `strip_prefix` is lexical: a
 /// `..` in the remainder passes it while climbing straight back out of the
 /// anchor, which is why the components are checked and not only the prefix.
+/// A `.` never reaches here: `components()` folds a non-leading `.` away, so
+/// a run id of `.` would alias the repo-key directory unseen, and the run id
+/// is refused at [`WorkspaceManager::derive`](super::WorkspaceManager::derive)
+/// before any path is built.
 fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>> {
     let Ok(relative) = path.strip_prefix(anchor) else {
         return None;
@@ -109,8 +113,11 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 /// how the packet anchors the same check on the other half of the same
 /// structure: `expected_failures_refusals[9]` requires "a locator chain without
 /// reparse points **canonicalizing to** `<authorized private root>/runs/
-/// <basename>`". The root is resolved and trusted; what must be reparse-free is
-/// everything the run itself builds beneath it.
+/// <basename>`". The root is resolved at `derive` and re-examined at every
+/// revalidation by [`refuse_reparse_points`]: it must still be a real
+/// directory and still canonicalize to itself, or the chain has moved under
+/// the run. What must be reparse-free is everything the run itself builds
+/// beneath it.
 ///
 /// The unanchored reading was tried and is wrong on a real platform, not just
 /// inconvenient: macOS ships `/var` as a symlink to `private/var` and its
@@ -158,23 +165,51 @@ fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf
     Ok(None)
 }
 
-/// Refuse `path` unless its chain below `anchor` is plain components with no
-/// reparse point among them.
+/// Refuse `path` unless `anchor` is still the real directory it was resolved
+/// as and `path`'s chain below it is plain components with no reparse point
+/// among them.
 ///
 /// `path` is the execution root and `anchor` the authorized private root at
-/// both call sites, and the refusals name them so. A path with no plain
-/// chain below the anchor — no common prefix, or a prefix, a root, `.` or
-/// `..` in the remainder — is refused rather than walked: the walk's answer
-/// for it would be "no reparse point below the anchor", true of a chain it
-/// never inspected, and a run id such as `../../x` reaches here through
-/// `execution_root_of` with exactly that shape.
+/// both call sites, and the refusals name them so.
+///
+/// **The anchor is examined too, not only what hangs from it.** The walk
+/// below starts by pushing the first child, so an anchor replaced after
+/// `derive` — renamed away and a link planted in its place — was never read,
+/// every component under it was read *through* the link, and
+/// `canonical_prefix` then resolved the execution root under the link's
+/// target with nothing to compare it against. So the anchor must still be a
+/// real directory, refused as [`Refusal::BaseIsNotADirectory`] otherwise,
+/// the answer `derive` gives, and it must still canonicalize to itself: the
+/// anchor is stored canonical, so any difference means a link now sits on
+/// its own chain — above it, where the anchored walk never looks — and that
+/// is refused as [`Refusal::ReparsePointOnChain`] naming the anchor.
+///
+/// A path with no plain chain below the anchor — no common prefix, or a
+/// prefix, a root or `..` in the remainder — is refused rather than walked:
+/// the walk's answer for it would be "no reparse point below the anchor",
+/// true of a chain it never inspected. `derive` refuses a run id of that
+/// shape before it builds a path, so this arm is the walk's own guarantee
+/// behind that one.
 ///
 /// # Errors
 ///
-/// [`Refusal::RootOutsidePrivateRoot`], [`Refusal::ReparsePointOnChain`], or
-/// the walk's own I/O error, which already names the component it could not
-/// read and is propagated as it is.
+/// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+/// [`Refusal::ReparsePointOnChain`], or an I/O error: the walk's own, which
+/// already names the component it could not read and is propagated as it
+/// is, or the anchor's resolution failing for a reason other than absence.
 pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
+    refuse_unreal_directory(anchor)?;
+    let resolved = fs::canonicalize(anchor).map_err(|source| UpstrokeError::Io {
+        path: anchor.to_path_buf(),
+        source,
+    })?;
+    if strip_verbatim(resolved) != anchor {
+        return Err(Refusal::ReparsePointOnChain {
+            chain: path.to_path_buf(),
+            at: anchor.to_path_buf(),
+        }
+        .into());
+    }
     let Some(chain) = plain_chain_below(anchor, path) else {
         return Err(Refusal::RootOutsidePrivateRoot {
             root: path.to_path_buf(),
@@ -287,18 +322,21 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// an error, because a comparison over a path the filesystem never verified
 /// proves nothing about containment.
 ///
-/// The rejoined tail is plain components. A `.` or `..` below a component
-/// that does not exist has no directory to refer to, and the platforms
+/// The rejoined tail is plain components. A `..` below a component that
+/// does not exist has no directory to refer to, and the platforms
 /// disagree about what it would name — Win32 resolves it lexically before the
 /// filesystem sees it, POSIX cannot traverse the absent directory — so there
 /// is no canonical form to hand back: where the filesystem fails on it the
 /// peel meets the `..`, finds no plain component left to peel, and returns
 /// that failure rather than the raw path. A path with no existing prefix at
-/// all — a relative one none of whose components exists — is the same case.
+/// all — a relative one none of whose components exists — is the same case,
+/// and the error names its first component, the prefix that failed last.
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Io`] naming the deepest prefix that could not be resolved.
+/// [`UpstrokeError::Io`] naming the prefix whose resolution failed: the whole
+/// path, the `..`-terminated head, or the first component of a relative path
+/// none of whose components exists.
 pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
     let mut tail = Vec::new();
     let mut head = path.to_path_buf();
@@ -322,15 +360,23 @@ pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
                 source: absent,
             });
         };
-        // `pop` truncates in place rather than copying the parent each step.
-        // A head with a file name always has a parent, so `false` is a
-        // defensive arm; the empty parent is a relative path none of whose
-        // components exists, and the end of the peel.
-        if !head.pop() || head.as_os_str().is_empty() {
+        // The empty parent is a relative path none of whose components
+        // exists: `head` is its first component, the prefix that just
+        // failed, and the error names it rather than the whole path.
+        if head
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+        {
             return Err(UpstrokeError::Io {
-                path: path.to_path_buf(),
+                path: head,
                 source: absent,
             });
+        }
+        // `pop` truncates in place rather than copying the parent each step.
+        // It answers false only when there is no parent, which the arm above
+        // excluded.
+        if !head.pop() {
+            unreachable!("a head with a parent pops to it");
         }
         tail.push(name);
     }
