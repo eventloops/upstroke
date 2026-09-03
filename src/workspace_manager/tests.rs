@@ -37,6 +37,14 @@ use super::fixture::{Fixture, git, git_out, scratch};
 // residue classifier, the slot vocabulary and the changed-path decoder -- so
 // `src/workspace_manager.rs` no longer imports these and `use super::*` no
 // longer carries them. Same names, same crate paths, no new dependency.
+//
+// `OsStr` carries the `cfg` of its only user. It is named here for the same
+// reason as the rest -- the root pruned `use std::ffi::{OsStr, OsString};` to
+// `OsString` -- but its one call site is inside a `#[cfg(unix)]` test, so on
+// Windows the item is compiled out and an ungated import is an `unused_imports`
+// error under the guest's `-D warnings`. The gate is on the import rather than
+// the call site so the moved line stays byte-identical.
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 
