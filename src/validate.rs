@@ -425,10 +425,11 @@ mod tests {
         plan
     }
 
-    /// A directory of one test's own for the plan it writes. Unique to the
-    /// process and the call, created with `create_dir` so an existing path is a
-    /// loud error rather than an adoption, never pre-deleted, and removed when
-    /// the test ends — on an unwind too — with a failed removal reported: a
+    /// A directory of one test's own for the plan it writes. Named by tag, pid
+    /// and a process-unique counter, created with `create_dir` so a path already
+    /// taken — a dead run's, or another pid namespace's — is never adopted: it
+    /// is stepped over to the next index, bounded, and never deleted. Never
+    /// pre-deleted, and removed when the test ends — on an unwind too — with a failed removal reported: a
     /// panic on the ordinary exit, a line on stderr while a panic is already
     /// travelling, because a second panic out of a destructor aborts the
     /// process and destroys the test's own report. A directory already gone is
@@ -441,12 +442,24 @@ mod tests {
     impl PlanDir {
         fn new(tag: &str) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = env::temp_dir().join(format!(
-                "upstroke-validate-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).expect("a plan directory of this test's own");
+            let mut tried = 0usize;
+            let path = loop {
+                let candidate = env::temp_dir().join(format!(
+                    "upstroke-validate-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                tried += 1;
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => assert!(
+                        tried < 64,
+                        "no free plan directory in {tried} names; the last tried was {}",
+                        candidate.display()
+                    ),
+                    Err(error) => panic!("plan directory {}: {error}", candidate.display()),
+                }
+            };
             Self { path }
         }
     }
@@ -469,6 +482,65 @@ mod tests {
                 panic!("{message}");
             }
         }
+    }
+
+    /// The plan directory is gone after an ordinary drop, and after an unwind
+    /// — the exit a failing assertion takes. Absence is proved with
+    /// `symlink_metadata`, where only `NotFound` means gone.
+    #[test]
+    fn a_plan_directory_is_reclaimed_on_every_exit_including_an_unwind() {
+        let gone = |path: &Path| matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound);
+        let ordinary = {
+            let dir = PlanDir::new("raii-ordinary");
+            write_plan(&dir.path, "one.md", "## One\n");
+            dir.path.clone()
+        };
+        assert!(
+            gone(&ordinary),
+            "{} outlived its guard on the ordinary exit",
+            ordinary.display()
+        );
+
+        let dir = PlanDir::new("raii-unwind");
+        let unwind = dir.path.clone();
+        write_plan(&unwind, "one.md", "## One\n");
+        let unwound = std::panic::catch_unwind(move || {
+            let _dir = dir;
+            panic!("a deliberate failure, mid-test");
+        });
+        assert!(unwound.is_err(), "the closure was supposed to unwind");
+        assert!(gone(&unwind), "{} survived the unwind", unwind.display());
+    }
+
+    /// A failed reclamation is reported, not discarded: the directory is made
+    /// unwritable so its plan cannot be unlinked and `remove_dir_all` fails, and
+    /// the report is the panic the guard raises on the ordinary exit, caught
+    /// here. Unix only — mode bits are the smallest drive there is, and the
+    /// Windows held-handle case is not driven by any test. It needs a user the
+    /// mode bits bind: under root the removal succeeds and this fails at
+    /// `expect_err` rather than passing for the wrong reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_directory_that_cannot_be_reclaimed_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PlanDir::new("raii-reported");
+        let path = dir.path.clone();
+        write_plan(&path, "one.md", "## One\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).expect("mode");
+        let reported = std::panic::catch_unwind(move || drop(dir))
+            .expect_err("the guard discarded a failed reclamation");
+        let left_behind = fs::symlink_metadata(&path).is_ok();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("mode back");
+        fs::remove_dir_all(&path).expect("the test reclaims its own tree");
+        assert!(left_behind, "the report was for a tree that is not there");
+        let message = reported
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("was not reclaimed") && message.contains("raii-reported"),
+            "the report must name the directory it could not reclaim: {message}"
+        );
     }
 
     #[test]
@@ -653,7 +725,12 @@ mod tests {
     fn the_preview_echoes_resolved_role_tier_pin_and_disabled_review_effort() {
         let root = env::temp_dir().join(format!("upstroke-validate-effort-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
-        let plan = write_plan(&root, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan_dir = PlanDir::new("effort");
+        let plan = write_plan(
+            &plan_dir.path,
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let cases = [
             (
                 "defaults",
@@ -710,7 +787,12 @@ mod tests {
              \"local-logs\"]\nprofile = \"personal\"\n",
         )
         .expect("pools");
-        let plan = write_plan(&dir, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan_dir = PlanDir::new("pools");
+        let plan = write_plan(
+            &plan_dir.path,
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let mut o = opts(&plan);
         o.pools_path = Some(pools);
         let rendered = run(&o).expect("validates").render();
@@ -750,7 +832,12 @@ mod tests {
         let root = env::temp_dir().join(format!("upstroke-validate-gates-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
         fs::write(root.join("Cargo.toml"), "[package]\nname='x'\n").expect("marker");
-        let plan = write_plan(&root, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan_dir = PlanDir::new("gates");
+        let plan = write_plan(
+            &plan_dir.path,
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let mut o = opts(&plan);
         o.config_root = root;
         let report = run(&o).expect("validates");
@@ -879,7 +966,12 @@ mod tests {
         );
 
         // The sample plan wires artifacts along its dependency chain — silent.
-        let plan = write_plan(&dir, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan_dir = PlanDir::new("wiring");
+        let plan = write_plan(
+            &plan_dir.path,
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let clean = run(&opts(&plan)).expect("sample validates");
         assert!(clean.warnings.is_empty(), "warnings: {:?}", clean.warnings);
     }
@@ -900,7 +992,12 @@ mod tests {
     fn emit_json_round_trips_through_the_ir() {
         let dir = env::temp_dir().join(format!("upstroke-emit-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
-        let plan = write_plan(&dir, "sample-plan.md", crate::plan::corpus::SAMPLE_PLAN);
+        let plan_dir = PlanDir::new("emit");
+        let plan = write_plan(
+            &plan_dir.path,
+            "sample-plan.md",
+            crate::plan::corpus::SAMPLE_PLAN,
+        );
         let report = run(&opts(&plan)).expect("sample plan validates");
         let json_path = dir.join("plan.normalized.json");
         report
