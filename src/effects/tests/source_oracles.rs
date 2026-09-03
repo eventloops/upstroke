@@ -1,4 +1,4 @@
-//! The **source oracles**: the eleven checks that hold this crate's own lexical
+//! The **source oracles**: the twelve checks that hold this crate's own lexical
 //! instruments against the tree they read.
 //!
 //! Four instruments, and every whole-tree census in this repository is built on
@@ -8,7 +8,7 @@
 //! [`crate::effects::production_code`] decide what it is allowed to *count*,
 //! and `census_domain::whole_file_test_modules` decides which files it skips
 //! entirely. A defect in any of them is silent by construction — the census
-//! stays green and its count is simply lower — so these eleven drive each
+//! stays green and its count is simply lower — so these twelve drive each
 //! instrument with input that reaches its failure path rather than measuring it
 //! only on compliant input.
 //!
@@ -25,9 +25,9 @@
 //! none of them, and it defines no region of its own — which is what
 //! `every_early_stop_is_at_a_module` counts two lines from its end.
 //!
-//! **No name here is a test name.** The eleven `#[test]` wrappers stay in
+//! **No name here is a test name.** The twelve `#[test]` wrappers stay in
 //! `super` under the harness names the contract, CI and `reviews/FINDINGS.md`
-//! know, and the eleven functions below are deliberately named otherwise — so
+//! know, and the twelve functions below are deliberately named otherwise — so
 //! `--list` over the test binary is unchanged and nothing nests under
 //! `effects::tests::source_oracles`. `effects/wrappers.toml` names
 //! `no_topology_module_calls_a_funnel_in_production` and `reviews/FINDINGS.md`
@@ -55,7 +55,7 @@
 //! over the file graph, so `super` being a test module itself does not make
 //! this one. No skip is derived and no file leaves any census. That matters
 //! more here than anywhere else in this directory:
-//! `the_whole_file_modules_are_read_from_the_declarations` is one of the eleven
+//! `the_whole_file_modules_are_read_from_the_declarations` is one of the twelve
 //! bodies below, and a declaration written the other way would make this file a
 //! member of the very set it is itself asserting the membership of.
 //!
@@ -85,13 +85,119 @@
 pub(super) mod oracles {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::path::{Path, PathBuf};
 
+    use crate::effects::census_domain::{candidates_for, scan_module_declarations, sole_present};
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
-    use crate::effects::tests::{is_the_literal_mod_tests_form, repo_root, scanned_sources};
+    use crate::effects::tests::{
+        crate_roots, is_the_literal_mod_tests_form, repo_root, scanned_sources,
+    };
     use crate::effects::{
         TOPOLOGY_MODULES, blank_comments, blank_comments_and_strings, externally_reachable_fns,
         production_code, production_region,
     };
+
+    /// The production module rooted at `declared_in`'s **declarations**: each
+    /// non-test `mod <name>;` it writes, with the two files that name can
+    /// resolve to.
+    ///
+    /// Derived rather than enumerated, for the reason
+    /// [`crate::effects::census_domain::declared_whole_file_test_modules`] gives
+    /// at length. A `read_dir` filtered to `*.rs` entries gets a census domain
+    /// wrong in both directions at once: a child written in the `<name>/mod.rs`
+    /// layout is a *directory* entry and is skipped, and a `#[cfg(test)] mod
+    /// row_cases;` child carries its `cfg` on the **declaration**, so
+    /// [`production_region`] cannot cut it out of `row_cases.rs` and a stem that
+    /// is not exactly `tests` is scanned as production.
+    ///
+    /// **What was checked about the machinery this reuses**, rather than assumed
+    /// from the fact that it exists:
+    ///
+    /// * [`scan_module_declarations`] reads a file's module *structure* — brace
+    ///   depth, the inline modules open at each point, and the `cfg` on each of
+    ///   them — over [`crate::effects::blank_comments_and_strings`], so a `mod`
+    ///   written in prose or in a string is spaces. That is what a text rule
+    ///   gets wrong, and `policy.rs` records a phantom skip once derived from a
+    ///   declaration written inside a comment.
+    /// * [`candidates_for`] names both out-of-line layouts and folds the inline
+    ///   path into the directory. It refuses a `#[path]` attribute rather than
+    ///   resolving it, which is the one construct that could point a declaration
+    ///   outside its own directory.
+    /// * [`sole_present`] refuses zero candidates and refuses two, rather than
+    ///   picking one. A domain that cannot name the file a declaration resolves
+    ///   to is not a domain.
+    /// * **The hole the precedent records, inherited knowingly**:
+    ///   `#[cfg_attr(all(), cfg(test))] mod hidden;` is applied by rustc as
+    ///   `#[cfg(test)]` and read here as unconditional, so such a child would be
+    ///   scanned as production. There is none in this tree, it predates this
+    ///   census, and widening the scan to decide `cfg_attr` predicates is its own
+    ///   change with its own review — the same disposition
+    ///   `declared_whole_file_test_modules` records for it.
+    /// * **The limitation that does *not* transfer.**
+    ///   `declared_whole_file_test_modules` deliberately does not close over the
+    ///   file graph, because there closing would *remove* a dozen files from
+    ///   every census's domain — a change to what every census can see. Here the
+    ///   walk below closes over production declarations, which only *adds* files
+    ///   to one census. Opposite direction, so the precedent's reason not to does
+    ///   not apply.
+    fn declared_production_children(
+        declared_in: &Path,
+        source: &str,
+    ) -> Vec<(String, [PathBuf; 2])> {
+        scan_module_declarations(source)
+            .unwrap_or_else(|refusal| panic!("{}: {refusal}", declared_in.display()))
+            .into_iter()
+            .filter(|declaration| !declaration.test_only)
+            .map(|declaration| {
+                let candidates = candidates_for(
+                    crate_roots(),
+                    declared_in,
+                    &declaration.inline_path,
+                    &declaration.name,
+                )
+                .unwrap_or_else(|refusal| panic!("{refusal}"));
+                (declaration.name, candidates)
+            })
+            .collect()
+    }
+
+    /// Every file of the production module rooted at `root`: the root, and
+    /// transitively each file its production `mod <name>;` declarations resolve
+    /// to.
+    ///
+    /// Transitive because a domain is the module, not its first level: a
+    /// `row()` mapping in `effects/sites/worktree.rs` is as much inside
+    /// `topology::effects` as one in `effects/sites.rs`. Bounded by the visited
+    /// set rather than by a depth limit — candidates descend into directories,
+    /// so the relation is a forest and a cycle is unreachable, which is the
+    /// reason to hold the set rather than a reason to trust the shape.
+    fn production_module_files(root: &Path) -> Vec<PathBuf> {
+        let mut queue = vec![root.to_path_buf()];
+        let mut seen = BTreeSet::new();
+        let mut files = Vec::new();
+        while let Some(path) = queue.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("a declared module file");
+            for (name, candidates) in declared_production_children(&path, &source) {
+                let resolved = sole_present(&candidates, &|candidate| candidate.is_file())
+                    .unwrap_or_else(|present| {
+                        panic!(
+                            "`{}` declares `mod {name};` and {present} of {candidates:?} exist. \
+                             A census domain that cannot name the file a declaration resolves \
+                             to is not a domain",
+                            path.display()
+                        )
+                    })
+                    .clone();
+                queue.push(resolved);
+            }
+            files.push(path);
+        }
+        files.sort();
+        files
+    }
 
     /// Every site enum's `row()` is **exhaustive by construction**: no wildcard
     /// arm (`PR5-EVENTS-063`, and the other half of `PR5-WORKSPACE-049`).
@@ -114,35 +220,22 @@ pub(super) mod oracles {
     /// The mappings live in a **module** rather than a file since
     /// `topology::effects` was split into per-concern child modules:
     /// `EffectSiteId::row` stayed in the root and the eleven site enums' went to
-    /// `sites.rs`. What this census reads is therefore the root plus every
-    /// production child, not the one child today's mappings landed in — a path
-    /// is a domain here, not an address, and a twelfth group's `row()` added to
-    /// a sibling child is exactly what the single-file read used to catch.
-    /// `tests.rs` is excluded: it is the whole-file test module the root only
-    /// declares, so it is not production and `production_region` cannot cut it.
+    /// `sites.rs`. So the domain is [`production_module_files`] — a path here is
+    /// a domain, not an address — and
+    /// `the_row_mapping_census_reads_the_declared_production_module` is what
+    /// measures membership in it, in both directions.
     pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {
-        let root = repo_root();
-        let mut sources = vec![root.join("src/topology/effects.rs")];
-        let mut child_paths: Vec<_> = fs::read_dir(root.join("src/topology/effects"))
-            .expect("the effects module directory")
-            .map(|entry| entry.expect("entry").path())
-            .filter(|path| {
-                path.extension().is_some_and(|ext| ext == "rs")
-                    && path.file_stem().is_some_and(|stem| stem != "tests")
-            })
-            .collect();
-        child_paths.sort();
-        let children = child_paths.len();
-        sources.extend(child_paths);
+        let sources = production_module_files(&repo_root().join("src/topology/effects.rs"));
         assert!(
-            children >= 7,
-            "only {children} production children of `topology::effects` walked, so this census \
-             is looking at the wrong directory"
+            sources.len() >= 8,
+            "only {} file(s) in the `topology::effects` production module, so this census is \
+             looking at the wrong module: {sources:?}",
+            sources.len()
         );
         let mut scanned = 0_usize;
         let mut offenders = Vec::new();
-        for path in sources {
-            let source = fs::read_to_string(&path).expect("the frozen inventory");
+        for path in &sources {
+            let source = fs::read_to_string(path).expect("the frozen inventory");
             let production = blank_comments_and_strings(&production_region(&source));
             let mut rest = production.as_str();
             while let Some(at) = rest.find("fn row(") {
@@ -169,6 +262,90 @@ pub(super) mod oracles {
             "only {scanned} `row()` mappings scanned, so this census is looking at the wrong files"
         );
         assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    /// The `row()` census's domain is the **declared** production module, and
+    /// membership in it is measured in both directions.
+    ///
+    /// The two witnesses the first repoint carried measured neither. Planting a
+    /// wildcard in `vocab.rs` proves that one already-included flat file is
+    /// scanned; filtering the walk to nothing proves that the count floor fires.
+    /// Both are true of a domain that is simply the wrong set. What follows
+    /// drives the membership rule itself, and it writes nothing: this module
+    /// restores the three effect denials (`#![deny]` above), so a fixture tree on
+    /// disk is not available to it and is not needed.
+    pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {
+        let effects = repo_root().join("src/topology/effects.rs");
+
+        // (1) DECLARED, NOT ENUMERATED, and both out-of-line layouts are named.
+        // The declaring file is the real one — only the text is synthetic — so
+        // the directory the candidates are resolved in is the real one too.
+        let synthetic =
+            "mod vocab;\n#[cfg(test)]\nmod row_cases;\nmod twelfth;\n#[cfg(test)]\nmod tests;\n";
+        let declared = declared_production_children(&effects, synthetic);
+        let names: Vec<&str> = declared.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["vocab", "twelfth"],
+            "the domain is read from the declarations. `row_cases` is `#[cfg(test)]` on the \
+             declaration, which is exactly what `production_region` cannot cut out of the file \
+             it names, and its stem is not `tests`, which is what a file-name rule reads instead"
+        );
+        assert_eq!(
+            declared[1].1,
+            [
+                repo_root().join("src/topology/effects/twelfth.rs"),
+                repo_root().join("src/topology/effects/twelfth/mod.rs"),
+            ],
+            "a production child in the `<name>/mod.rs` layout has to be a candidate; it is a \
+             directory entry, so a `read_dir` filtered to `*.rs` files never sees it"
+        );
+
+        // (2) AND THE `mod.rs` CANDIDATE IS THE ONE THAT RESOLVES when it is the
+        // one on disk. Measured on a real directory-layout module of this crate:
+        // `src/topology.rs` does not exist and `src/topology/mod.rs` does.
+        let lib = repo_root().join("src/lib.rs");
+        let lib_source = fs::read_to_string(&lib).expect("the crate root");
+        let topology = declared_production_children(&lib, &lib_source)
+            .into_iter()
+            .find(|(name, _)| name == "topology")
+            .expect("`src/lib.rs` declares `mod topology;`");
+        assert_eq!(
+            sole_present(&topology.1, &|candidate| candidate.is_file())
+                .expect("exactly one candidate for `topology` is on disk"),
+            &repo_root().join("src/topology/mod.rs"),
+            "the resolution has to name the `<name>/mod.rs` file, not merely list it"
+        );
+
+        // (3) THE REAL DOMAIN, named file by file — and `tests.rs` is outside it
+        // because its declaration carries `#[cfg(test)]`, not because of its stem.
+        let domain = production_module_files(&effects);
+        let mut expected: Vec<PathBuf> = [
+            "src/topology/effects.rs",
+            "src/topology/effects/bijection.rs",
+            "src/topology/effects/export.rs",
+            "src/topology/effects/harness.rs",
+            "src/topology/effects/registry.rs",
+            "src/topology/effects/residue_authority.rs",
+            "src/topology/effects/sites.rs",
+            "src/topology/effects/vocab.rs",
+        ]
+        .iter()
+        .map(|relative| repo_root().join(relative))
+        .collect();
+        // Sorted the same way the walk sorts, so the assertion is about the set
+        // and not about the order these eight were typed in: `PathBuf` orders by
+        // component, so `effects` precedes `effects.rs`.
+        expected.sort();
+        assert_eq!(
+            domain, expected,
+            "the `row()` census reads the root and the seven production children of \
+             `topology::effects`, and nothing else"
+        );
+        assert!(
+            !domain.contains(&repo_root().join("src/topology/effects/tests.rs")),
+            "`tests.rs` is declared `#[cfg(test)]` and is not production code: {domain:?}"
+        );
     }
 
     /// `decisions.pr_sequence[6].scope` ends "no topology production callers", and

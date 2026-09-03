@@ -332,12 +332,12 @@ impl fmt::Display for DurableEvent {
 ///
 /// `Before` means the effect is designed to be durable before the append is;
 /// `After` means the append is durable first. `None` is not "unknown": it is
-/// the answer for a site that *is* the append (the whole [`EventSite`] append
+/// the answer for a site that *is* the append (the whole [`EventSite`](crate::topology::effects::EventSite) append
 /// group), and for a site that runs outside any run's log at all — the husk
 /// census removes a run directory belonging to a run whose log it has refused
 /// to fold.
 ///
-/// The value decides [`EffectSiteId::observable_orders`], which is what the
+/// The value decides [`EffectSiteId::observable_orders`](crate::topology::effects::EffectSiteId::observable_orders), which is what the
 /// registry's order axis ranges over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]

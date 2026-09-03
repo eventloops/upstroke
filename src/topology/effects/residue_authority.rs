@@ -226,7 +226,7 @@ pub enum BeforeState {
     Absent,
     /// The artifact does not exist yet, and the first half of this site's own
     /// two-step protocol has already left a durable artifact that the row
-    /// [`EffectSiteId::row`] names accounts for: the intent behind an add, the
+    /// [`EffectSiteId::row`](crate::topology::effects::EffectSiteId::row) names accounts for: the intent behind an add, the
     /// staged temporary behind an atomic publication.
     ///
     /// The rows are [`Self::Present`]'s and the words are not, deliberately.
@@ -234,7 +234,7 @@ pub enum BeforeState {
     /// is not the target intact, so the entry must not say that either.
     PrecursorDurable,
     /// The artifact this site's primitive acts on is already durable and the
-    /// row [`EffectSiteId::row`] names holds it: every removal, every release,
+    /// row [`EffectSiteId::row`](crate::topology::effects::EffectSiteId::row) names holds it: every removal, every release,
     /// and every in-place replacement of an artifact that has to exist for the
     /// primitive to be issued at all.
     Present,
@@ -243,7 +243,7 @@ pub enum BeforeState {
 /// What a site's *after* phase leaves durable.
 ///
 /// The per-site half of the residue authority, and the reason
-/// [`EffectSiteId::semantics`] has no generic arm. `structure` does not give
+/// [`EffectSiteId::semantics`](crate::topology::effects::EffectSiteId::semantics) has no generic arm. `structure` does not give
 /// every site the same after-phase: an effect that publishes something leaves
 /// it referenced by the site's own row, a commit-tree leaves an object nothing
 /// references, "the pruning sites' after-phase entries record the released
@@ -255,7 +255,7 @@ pub enum BeforeState {
 pub enum AfterEffect {
     /// The site performs no effect at all, so its after phase leaves nothing.
     NoEffect,
-    /// The artifact is durable and the row [`EffectSiteId::row`] names
+    /// The artifact is durable and the row [`EffectSiteId::row`](crate::topology::effects::EffectSiteId::row) names
     /// references it.
     Referenced,
     /// The object is durable and nothing references it yet: R27.
@@ -275,9 +275,9 @@ pub enum AfterEffect {
 /// (refs/worktrees/pins/intents/containers/marker, owner-record, and
 /// commit-record files/objects and the row referencing them/administrative
 /// residue)". An entry free to write that prose itself is a second authority on
-/// the same question — the argument [`EffectSiteId::expected_rows`] already
+/// the same question — the argument [`EffectSiteId::expected_rows`](crate::topology::effects::EffectSiteId::expected_rows) already
 /// makes about the rows, and the rows were only half the claim. So the artifact
-/// is a value, [`Self::detail`] is its words, and [`ExpectedResidue`]'s own
+/// is a value, [`Self::detail`] is its words, and [`ExpectedResidue`](crate::topology::effects::ExpectedResidue)'s own
 /// detail is checked against them rather than being read by nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

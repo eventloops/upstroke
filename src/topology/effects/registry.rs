@@ -128,7 +128,7 @@ pub struct ExpectedResidue {
     /// The ledger rows still holding something. Empty is a real answer — the
     /// before phase of a creation, and a Windows containment point, each leave
     /// no row holding anything — but it is not the *only* answer a before phase
-    /// has: see [`BeforeState`].
+    /// has: see [`BeforeState`](crate::topology::effects::BeforeState).
     pub rows: Vec<ResourceRow>,
     /// The concrete artifacts, in the fault matrix's own words.
     pub detail: String,

@@ -2865,14 +2865,15 @@ fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {
 // "no topology production callers", and the source oracles under it
 // ---------------------------------------------------------------------------
 
-// The eleven bodies are in `source_oracles::oracles`, beside this file: the two
-// site censuses here, and, in the T-CONTAINER section further down, the five
+// The twelve bodies are in `source_oracles::oracles`, beside this file: the two
+// site censuses here and the witness for the first one's domain, and, in the
+// T-CONTAINER section further down, the five
 // that hold the two production regions and the whole-file module derivation.
 // The names in this file are the harness -- they are what the contract, CI,
 // `effects/wrappers.toml`, `reviews/FINDINGS.md` and `--list` know -- and each
 // one delegates and does nothing else.
 //
-// The boundary is drawn at "reads the tree, writes nothing". All eleven do
+// The boundary is drawn at "reads the tree, writes nothing". All twelve do
 // exactly that, so the child restores the three effect denials `super` allows
 // and takes no allowlist entry. The needles they carry -- a funnel table, a
 // `RunnerRequest {` in prose, the container-runtime literal -- are the reason
@@ -2887,6 +2888,11 @@ use source_oracles::oracles;
 #[test]
 fn no_site_enums_row_mapping_has_a_wildcard_arm() {
     oracles::site_row_mappings_have_no_wildcard_arm();
+}
+
+#[test]
+fn the_row_mapping_census_reads_the_declared_production_module() {
+    oracles::the_row_mapping_census_domain_is_the_declared_module();
 }
 
 #[test]

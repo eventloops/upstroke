@@ -21,7 +21,7 @@ use super::vocab::{InjectionMode, SubEffectPoint};
 ///
 /// There is deliberately no residue-class variant. A residue class is not an
 /// executed hook, and the type is the first of the two places this framework
-/// says so — the second is [`FaultRegistry::insert`], which refuses an entry
+/// says so — the second is [`FaultRegistry::insert`](crate::topology::effects::FaultRegistry::insert), which refuses an entry
 /// that claims otherwise even though this type made the claim unsayable to the
 /// harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

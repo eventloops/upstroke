@@ -1418,7 +1418,7 @@ impl ProcessSite {
     /// The parent-side sub-effect points this site exposes.
     ///
     /// All eight containment steps, Windows and Unix. Which of them a given
-    /// suite has to observe is decided by [`Platform::required_on`], not by
+    /// suite has to observe is decided by [`Platform::required_on`](crate::topology::effects::Platform::required_on), not by
     /// omitting the other platform's points from the inventory: a Windows CI
     /// run and a Unix one have to be checkable against the same enum.
     pub const fn sub_effects(self) -> &'static [SubEffectPoint] {
