@@ -9693,8 +9693,8 @@ fn no_read_only_public_entry_point_establishes_containment() {
 /// The step is a parameter here for the reason `dispatch` takes one: no machine
 /// can make the real join fail on demand, and on Unix it cannot fail at all.
 /// The seam is not a hole — `Contained`'s field is private to
-/// `crate::runner::host`, so a closure that returns one has established
-/// containment.
+/// `crate::runner::host::proof`, a module with no descendants, so a closure that
+/// returns one has established containment.
 #[test]
 fn a_facade_run_refuses_before_any_effect_when_containment_fails() {
     let repo = temp_engine_repo("containment-order");

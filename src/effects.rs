@@ -977,10 +977,53 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/workspace_manager/snapshot_ref.rs",
     "src/workspace_manager/worktree.rs",
     "src/rundir.rs",
+    // The five production children the `m3-rundir` split gave `src/rundir.rs`.
+    // They are named **one path each**, which is the only form this list has:
+    // `reachable_fns_are_classified` joins every entry onto the manifest root
+    // and reads it as a source file, so a directory prefix would name nothing
+    // and the entry above cannot be widened into one. `C-002` is the standing
+    // finding that this roll-call is hand-maintained rather than derived, and it
+    // is not this split's to repair. (`TOPOLOGY_MODULES` above is the list that
+    // *does* match with `starts_with`, and it does not name `src/rundir.rs` at
+    // all -- neither the ban it serves nor the prefix question reaches here.)
+    //
+    // They are here because the split moved seventeen externally reachable
+    // `fn`s out of `src/rundir.rs`, and a name that leaves the domain is a name
+    // nobody has to classify any more. Listing the children keeps the whole of
+    // the run-directory subsystem inside `mechanism` (3)'s classification with
+    // the same names accounted for on the other side of the move; the funnels,
+    // and every effect site, stayed in the parent.
+    "src/rundir/classify.rs",
+    "src/rundir/discovery.rs",
+    "src/rundir/names.rs",
+    "src/rundir/ownership.rs",
+    "src/rundir/retention.rs",
     "src/interaction.rs",
     "src/util.rs",
     "src/events/log.rs",
     "src/runner/host.rs",
+    // The three production children the `m5-host` split gave
+    // `src/runner/host.rs`: `environment.rs`, `naming.rs` and `probe.rs`, named
+    // **one path each**. That is the only form this list has:
+    // `reachable_fns_are_classified` joins every entry onto the manifest root
+    // and reads it as a source file, so a directory prefix would name nothing,
+    // and `"src/runner/host.rs"` is therefore left as an exact path rather than
+    // widened into `"src/runner/host"`. `C-002` is the standing finding that
+    // this roll-call is hand-maintained rather than derived, and it is not this
+    // split's to repair. (`TOPOLOGY_MODULES` is the list that *does* match with
+    // `starts_with`, and it already names `src/runner/`, so neither the ban it
+    // serves nor the prefix question reaches here.)
+    //
+    // They are named because the split moved ten externally reachable `fn`s out
+    // of `src/runner/host.rs`, and a name that leaves the domain is a name
+    // nobody has to classify any more. Naming the children keeps the whole of
+    // the host boundary inside `mechanism` (3)'s classification with the same
+    // names accounted for on the other side of the move; the funnel, both
+    // `ProcessSite` values, the `Contained` mint and the reserved-key
+    // vocabulary stayed in `src/runner/host.rs`.
+    "src/runner/host/environment.rs",
+    "src/runner/host/naming.rs",
+    "src/runner/host/probe.rs",
     "src/runner/invocation.rs",
     // The third of `mechanism` (2)'s `src/runner/{host,container,invocation}.rs`,
     // added by PR6. It is here rather than only in the allowlist because it
@@ -1006,6 +1049,30 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     "src/gates.rs",
     "src/review.rs",
     "src/agent/proc.rs",
+    // The three production children the `m6-proc` split gave
+    // `src/agent/proc.rs`: `hooks.rs` (the observation and injection surface),
+    // `ambient.rs` (the ambient Job Object and the reclaim scope) and `drain.rs`
+    // (the pipe reader), named **one path each**. That is the only form this
+    // list has: `reachable_fns_are_classified` joins every entry onto the
+    // manifest root and reads it as a source file, so a directory prefix would
+    // name nothing, and `"src/agent/proc.rs"` is therefore left as an exact path
+    // rather than widened into `"src/agent/proc"`. `C-002` is the standing
+    // finding that this roll-call is hand-maintained rather than derived, and it
+    // is not this split's to repair.
+    //
+    // They are named because the split moved externally reachable `fn`s out of
+    // `src/agent/proc.rs` and made previously private ones `pub(super)` in the
+    // children -- the same visibility a private item of `proc` had, and the
+    // visibility `externally_reachable_fns` counts. Naming the children keeps
+    // every one of those names accounted for on the other side of the move.
+    // Stated as a property and not as a tally: this list merges as a sorted
+    // union and a count beside it does not, so a number here would be wrong at
+    // the next edit to any of these files rather than at a merge anyone reads.
+    // The funnel entry point, both `ProcessSite` values, the no-degraded-mode
+    // memo, `windows_job` and `termination` stayed in `src/agent/proc.rs`.
+    "src/agent/proc/ambient.rs",
+    "src/agent/proc/drain.rs",
+    "src/agent/proc/hooks.rs",
     "src/agent/bin.rs",
     "src/agent/claude.rs",
     "src/agent/codex.rs",
