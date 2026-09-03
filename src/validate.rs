@@ -363,6 +363,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::env;
+    use std::io::{self, ErrorKind, Write};
     use std::sync::{Mutex, OnceLock};
 
     fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
@@ -455,6 +456,16 @@ mod tests {
         NEXT_INDEX.with(Cell::get)
     }
 
+    /// Names [`Corpus::of`] — and [`Leftover::plant`], which steps in lockstep
+    /// with it — try before giving up. Each attempt takes a fresh index, so the
+    /// only way to burn one is a directory a *previous* process left at the
+    /// same pid, thread id and index — and a run leaves at most as many per
+    /// thread as it built guards on it, which is single digits here. 64 is two
+    /// orders of magnitude past that and still bounded, and it is not the cap
+    /// that catches a broken temp directory: any error other than
+    /// `AlreadyExists` fails on the first attempt.
+    const ATTEMPTS: usize = 64;
+
     /// A directory holding [`crate::plan::corpus`] that **owns** its tree.
     ///
     /// The corpus is inline, but [`run`] reads its plan from a path, so these
@@ -509,16 +520,6 @@ mod tests {
         /// guard's own witnesses can drive a write that fails and then look for
         /// what it left under a tag nothing else uses.
         fn of(tag: &str, plans: &[(&str, &str)]) -> Self {
-            /// Names to try before giving up. Each attempt takes a fresh index,
-            /// so the only way to burn one is a directory a *previous* process
-            /// left at the same pid, thread id and index — and a run leaves at
-            /// most as many per thread as it built guards on it, which is
-            /// single digits here. 64 is two orders of magnitude past that and
-            /// still bounded, and it is not the cap that catches a broken temp
-            /// directory: any error other than `AlreadyExists` fails on the
-            /// first attempt.
-            const ATTEMPTS: usize = 64;
-
             let mut tried = 0usize;
             let dir = loop {
                 let candidate = candidate(tag, next_index());
@@ -558,17 +559,39 @@ mod tests {
 
     impl Drop for Corpus {
         fn drop(&mut self) {
-            let reclaimed = fs::remove_dir_all(&self.dir);
-            // A failed reclamation is the leak this type exists to close, so it
-            // is reported rather than discarded — but never while a panic is
-            // already travelling. A second panic out of a destructor aborts the
-            // process, which would replace the test's own failure with an abort
-            // and lose the report that says what actually broke.
-            assert!(
-                reclaimed.is_ok() || std::thread::panicking(),
-                "the corpus directory {} was not reclaimed: {reclaimed:?}",
-                self.dir.display()
-            );
+            reclaim("corpus directory", &self.dir);
+        }
+    }
+
+    /// Remove `dir`, and say so if that fails — on every path.
+    ///
+    /// Gone is the end state, whoever got there first: `NotFound` is success,
+    /// not a failure to report. Any other error is the leak the guards exist to
+    /// close, and it is reported on both exits. On the ordinary exit the report
+    /// is a panic, which fails the test. While a panic is already travelling it
+    /// is a line on stderr instead, because a second panic out of a destructor
+    /// aborts the process and replaces the test's own failure report with
+    /// nothing at all — the leak would cost the diagnosis of whatever actually
+    /// broke. `eprintln!` is not that line: it panics on a write error, which is
+    /// the abort again, and it is a denied macro in this file. `writeln!` to
+    /// stderr returns the write's error instead, and that is matched rather
+    /// than discarded, the way `rundir::scratch_tree`'s reporter matches its
+    /// own. There is genuinely nothing to do with it — the channel that would
+    /// carry a complaint is the one that just failed.
+    fn reclaim(what: &str, dir: &Path) {
+        let failure = match fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            Err(error) => error,
+        };
+        let message = format!("the {what} {} was not reclaimed: {failure}", dir.display());
+        if std::thread::panicking() {
+            match writeln!(io::stderr(), "{message}") {
+                Ok(()) => {}
+                Err(_reporting_failed) => {}
+            }
+        } else {
+            panic!("{message}");
         }
     }
 
@@ -587,7 +610,7 @@ mod tests {
         let prefix = format!("upstroke-validate-{tag}-{}-", std::process::id());
         let mut found: Vec<PathBuf> = fs::read_dir(env::temp_dir())
             .expect("the temp directory lists")
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .map(|entry| entry.expect("a temp directory entry reads").path())
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
@@ -596,6 +619,151 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    /// Whether `path` is gone — as distinct from "could not tell".
+    ///
+    /// `Path::exists` folds every error into `false`, so a permission error or
+    /// an unreadable parent reads as absence, and a witness for reclamation
+    /// would pass on the strength of a stat it never completed. `NotFound` is
+    /// the only answer that means gone; anything else fails the test that
+    /// asked. `symlink_metadata` rather than `metadata`, so a dangling symlink
+    /// is a thing that is there rather than a thing that is not.
+    fn is_gone(path: &Path) -> bool {
+        match fs::symlink_metadata(path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == ErrorKind::NotFound => true,
+            Err(error) => panic!("could not tell whether {} is gone: {error}", path.display()),
+        }
+    }
+
+    /// A directory this test planted to stand in for a killed run's leftover,
+    /// reclaimed by **the test's own guard** rather than by the [`Corpus`]
+    /// under test — which must leave it alone, and the witness that plants one
+    /// asserts exactly that.
+    ///
+    /// Plainly not a `Corpus`: it holds no plans, and it is planted with the
+    /// index the next `Corpus::of` on this thread will try, not consumed from
+    /// it. A panic anywhere in the test that owns one still reclaims it.
+    struct Leftover {
+        dir: PathBuf,
+    }
+
+    impl Leftover {
+        /// Plant the directory the next [`Corpus::of`] on this thread will try
+        /// first.
+        ///
+        /// The name is as predictable as the guard's, so a name already taken —
+        /// an actual leftover from an earlier run, which is the very thing this
+        /// stands in for — must not fail the test: it is stepped over the way
+        /// `Corpus::of` steps, and **in lockstep with it**. `peek_index` shows
+        /// the next index without consuming it and `Corpus::of` consumes one
+        /// per attempt, so a skip here consumes one too. The invariant the
+        /// witness rests on — that after planting, the next `Corpus::of` on this
+        /// thread selects precisely the planted directory — is asserted rather
+        /// than assumed, because a witness that got it wrong would go green
+        /// having driven no collision at all.
+        fn plant(tag: &str) -> Self {
+            let mut tried = 0usize;
+            let dir = loop {
+                let candidate = candidate(tag, peek_index());
+                tried += 1;
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                        // The index the guard would have skipped too.
+                        next_index();
+                        assert!(
+                            tried < ATTEMPTS,
+                            "no free name to plant in {tried} attempts on this thread; \
+                             the last one tried was {}",
+                            candidate.display()
+                        );
+                    }
+                    Err(error) => panic!("planting {}: {error}", candidate.display()),
+                }
+            };
+            let planted = Self { dir };
+            assert_eq!(
+                candidate(tag, peek_index()),
+                planted.dir,
+                "the next Corpus::of on this thread would not try the planted directory, \
+                 so no collision would be driven"
+            );
+            planted
+        }
+    }
+
+    impl Drop for Leftover {
+        fn drop(&mut self) {
+            reclaim("planted leftover", &self.dir);
+        }
+    }
+
+    /// A [`Corpus`] directory with its write permission taken away, so the
+    /// guard's own removal fails for a real reason, and the test's guard that
+    /// puts the permission back and reclaims the tree when the test ends —
+    /// on the panic path as well.
+    ///
+    /// Unix only, and the doc comments on the two witnesses that use it say
+    /// what that leaves undriven.
+    #[cfg(unix)]
+    struct Unwritable {
+        dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Unwritable {
+        /// Take write permission away from `dir`, so nothing inside it can be
+        /// unlinked and `remove_dir_all` fails with `PermissionDenied`.
+        ///
+        /// The prerequisite is checked rather than assumed, because mode bits
+        /// bind an ordinary user and not a privileged one, and a witness that
+        /// passed for the wrong reason under root would be worse than one that
+        /// fails with a diagnostic (§12).
+        fn new(dir: PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
+                .expect("the corpus directory takes new mode bits");
+            let held = Self { dir };
+            match fs::create_dir(held.dir.join("probe")) {
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => held,
+                Ok(()) => panic!(
+                    "this witness needs a user the mode bits bind: a create inside a 0o500 \
+                     directory succeeded (running as root?), so no genuine removal failure \
+                     can be driven here"
+                ),
+                Err(error) => panic!("probing {}: {error}", held.dir.display()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            // Put the permission back first, or the reclamation below fails
+            // for the very reason this type exists to cause.
+            match fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) if std::thread::panicking() => match writeln!(
+                    io::stderr(),
+                    "the mode bits on {} were not restored: {error}",
+                    self.dir.display()
+                ) {
+                    Ok(()) => {}
+                    Err(_reporting_failed) => {}
+                },
+                Err(error) => {
+                    panic!(
+                        "the mode bits on {} were not restored: {error}",
+                        self.dir.display()
+                    )
+                }
+            }
+            reclaim("unwritable corpus directory", &self.dir);
+        }
     }
 
     /// The guard reclaims its tree on every exit — the ordinary one and the
@@ -621,7 +789,7 @@ mod tests {
             corpus.dir.clone()
         };
         assert!(
-            !ordinary.exists(),
+            is_gone(&ordinary),
             "the corpus directory {} outlived its guard on the ordinary exit",
             ordinary.display()
         );
@@ -649,7 +817,7 @@ mod tests {
             .clone()
             .expect("the closure recorded its directory before it panicked");
         assert!(
-            !path.exists(),
+            is_gone(&path),
             "the corpus directory {} survived the unwind",
             path.display()
         );
@@ -724,19 +892,34 @@ mod tests {
     ///
     /// The leftover carries a file, because "stepped over" has to mean the
     /// directory survives with its contents rather than merely surviving.
+    ///
+    /// The leftover is a [`Leftover`], planted with the same step-over the
+    /// guard has and owned by a guard of the test's own: an earlier run's
+    /// actual leftover at this name cannot fail the witness for the scenario
+    /// it exists to cover, and a panic anywhere below still reclaims what was
+    /// planted — by the test, never by the `Corpus`. Two are planted, so that
+    /// the planter's own step-over and its lockstep with `Corpus::of` are
+    /// driven on every run rather than only when an earlier run happened to
+    /// leave something: the second plant finds the first's name taken, steps
+    /// past it consuming that index, and asserts the next `Corpus::of` will
+    /// now try the second — which it then does.
     #[test]
     fn a_corpus_steps_over_a_name_already_taken_and_leaves_it_alone() {
         const TAG: &str = "raii-taken";
         const LEFTOVER: &str = "left by a run that never dropped its guard\n";
 
-        let taken = candidate(TAG, peek_index());
-        fs::create_dir(&taken).expect("stand in for a killed run's leftover");
-        let marker = taken.join("not-ours.md");
+        let first = Leftover::plant(TAG);
+        let taken = Leftover::plant(TAG);
+        assert_ne!(
+            first.dir, taken.dir,
+            "the second plant did not step past the first"
+        );
+        let marker = taken.dir.join("not-ours.md");
         fs::write(&marker, LEFTOVER).expect("the leftover's contents");
 
         let corpus = Corpus::of(TAG, &ONE_PLAN);
         assert_ne!(
-            corpus.dir, taken,
+            corpus.dir, taken.dir,
             "the guard adopted the directory it found rather than stepping over it"
         );
         assert!(
@@ -758,29 +941,69 @@ mod tests {
             marker.is_file(),
             "the guard removed the leftover on its way out"
         );
-        // This test made the leftover, so this test removes it. The guard must
-        // not, and does not — which is the whole assertion above.
-        fs::remove_dir_all(&taken).expect("the test reclaims what the guard would not");
+        assert!(
+            !is_gone(&first.dir),
+            "the guard removed a leftover it never even collided with"
+        );
+        // Both leftovers reclaim themselves when this test ends, on every
+        // exit. That it is the test's guards and not the `Corpus` doing so is
+        // the assertion just above.
     }
 
-    /// A reclamation that fails is **reported**, not discarded.
+    /// A directory already gone when the guard drops is **not** a failed
+    /// reclamation.
+    ///
+    /// Gone is the end state the guard exists to reach, whoever got there
+    /// first, and a guard that panicked over it would fail a test whose
+    /// cleanup had already succeeded. The tree is reclaimed out from under the
+    /// live guard through the very call the guard will use, so its own removal
+    /// then finds `NotFound` for a real reason rather than an injected one —
+    /// and nothing is reported.
+    #[test]
+    fn a_corpus_directory_already_gone_is_not_a_failed_reclamation() {
+        let quiet = std::panic::catch_unwind(|| {
+            let corpus = Corpus::of("raii-gone", &ONE_PLAN);
+            fs::remove_dir_all(&corpus.dir).expect("the tree reclaims early");
+        });
+        assert!(
+            quiet.is_ok(),
+            "the guard reported an already-reclaimed tree as a failure: {:?}",
+            quiet
+                .err()
+                .and_then(|e| e.downcast_ref::<String>().cloned())
+        );
+    }
+
+    /// A reclamation that **genuinely** fails is reported, not discarded.
     ///
     /// `Drop` cannot return, so the alternative to reporting is silence — and
     /// silence here is the same leak the guard exists to close, with nothing to
-    /// say it happened. The review named this half explicitly: on Windows a
-    /// process holding a plan file without delete sharing makes
-    /// `remove_dir_all` fail, and a discarded error let the test report success
-    /// over a tree that was still there.
+    /// say it happened. The failure is real: the corpus directory has its write
+    /// permission taken away, so unlinking the plan inside it is refused and
+    /// `remove_dir_all` returns `PermissionDenied`; the panic that carries the
+    /// report is caught here rather than failing this test, and the tree is
+    /// then shown to be genuinely still there before the test's own guard puts
+    /// the permission back and reclaims it.
     ///
-    /// The tree is reclaimed out from under the live guard through the very
-    /// call the guard will use, so the removal it then attempts fails with
-    /// `NotFound` for a real reason rather than an injected one, and the panic
-    /// that carries the report is caught here rather than failing this test.
+    /// **Unix only, and this is an honest gap rather than a portable witness.**
+    /// The failure the review named is a Windows one — a process holding a plan
+    /// file open without delete sharing — and there is no portable way to drive
+    /// a removal failure. Mode bits are the Unix way. The Windows held-handle
+    /// case is **not driven by any test** in this file; on Windows this witness
+    /// is absent from the suite rather than passing for the wrong reason.
+    #[cfg(unix)]
     #[test]
     fn a_corpus_directory_that_cannot_be_reclaimed_is_reported_rather_than_discarded() {
+        const TAG: &str = "raii-reported";
+        let cleanup = Mutex::new(None);
         let reported = std::panic::catch_unwind(|| {
-            let corpus = Corpus::of("raii-reported", &ONE_PLAN);
-            fs::remove_dir_all(&corpus.dir).expect("the tree reclaims early");
+            let corpus = Corpus::of(TAG, &ONE_PLAN);
+            *cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Unwritable::new(corpus.dir.clone()));
+            // The corpus drops here, on the ordinary exit, and cannot unlink
+            // its plan.
         })
         .expect_err("the guard discarded a failed reclamation");
 
@@ -788,8 +1011,86 @@ mod tests {
             .downcast_ref::<String>()
             .map_or_else(String::new, Clone::clone);
         assert!(
-            message.contains("was not reclaimed") && message.contains("raii-reported"),
+            message.contains("was not reclaimed") && message.contains(TAG),
             "the report must name the directory it could not reclaim: {message}"
+        );
+
+        let held = cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the closure armed the test's own cleanup before the guard dropped");
+        let dir = held.dir.clone();
+        assert!(
+            !is_gone(&dir),
+            "the report was for a tree that is not there, so the failure was not genuine"
+        );
+        drop(held);
+        assert!(
+            is_gone(&dir),
+            "the test's own guard did not reclaim {}",
+            dir.display()
+        );
+    }
+
+    /// A reclamation that fails **while a panic is already travelling** is
+    /// reported without a second panic, and the primary failure is the one
+    /// that arrives.
+    ///
+    /// The other half of the report. On this path the report is a line on
+    /// stderr rather than a panic, because a second panic out of a destructor
+    /// mid-unwind aborts the process. This witness runs in-process and asserts
+    /// two things: that the primary panic's payload comes back intact, and that
+    /// the tree the guard could not reclaim is genuinely still there for the
+    /// test's own guard to take back. What it cannot assert is the stderr line
+    /// itself — no in-process hook captures it — and if the destructor ever
+    /// regressed to a second panic, this test would not fail so much as take
+    /// the whole binary down with an abort, which is loud in its own way.
+    ///
+    /// Unix only, for the reason the witness above gives.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclamation_that_fails_during_an_unwind_is_reported_without_a_second_panic() {
+        const PRIMARY: &str = "the primary failure this witness keeps observable";
+        let cleanup = Mutex::new(None);
+        let caught = std::panic::catch_unwind(|| {
+            let corpus = Corpus::of("raii-unwind-unreclaimable", &ONE_PLAN);
+            *cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Unwritable::new(corpus.dir.clone()));
+            panic!("{PRIMARY}");
+        })
+        .expect_err("the closure was supposed to unwind");
+
+        // Reached at all only because the destructor did not panic a second
+        // time.
+        let message = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default();
+        assert_eq!(
+            message, PRIMARY,
+            "the destructor's own report displaced the primary panic, so the failure a test \
+             would be diagnosing is the one that got lost"
+        );
+
+        let held = cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the closure armed the test's own cleanup before it panicked");
+        let dir = held.dir.clone();
+        assert!(
+            !is_gone(&dir),
+            "the guard reclaimed the tree after all, so no failure was reported on this path"
+        );
+        drop(held);
+        assert!(
+            is_gone(&dir),
+            "the test's own guard did not reclaim {}",
+            dir.display()
         );
     }
 
