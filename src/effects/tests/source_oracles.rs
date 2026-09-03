@@ -28,8 +28,8 @@
 //! **No name here is a test name.** The twelve `#[test]` wrappers stay in
 //! `super` under the harness names the contract, CI and `reviews/FINDINGS.md`
 //! know, and the twelve functions below are deliberately named otherwise — so
-//! `--list` over the test binary is unchanged and nothing nests under
-//! `effects::tests::source_oracles`. `effects/wrappers.toml` names
+//! every name `--list` reports for this file is one of those wrappers and
+//! nothing nests under `effects::tests::source_oracles`. `effects/wrappers.toml` names
 //! `no_topology_module_calls_a_funnel_in_production` and `reviews/FINDINGS.md`
 //! names three more; all four still resolve, because the harness did not move.
 //!
@@ -87,7 +87,9 @@ pub(super) mod oracles {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::effects::census_domain::{candidates_for, scan_module_declarations, sole_present};
+    use crate::effects::census_domain::{
+        Call, candidates_for, production_calls, scan_module_declarations, sole_present,
+    };
     use crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES;
     use crate::effects::tests::{
         crate_roots, is_the_literal_mod_tests_form, repo_root, scanned_sources,
@@ -196,7 +198,50 @@ pub(super) mod oracles {
             files.push(path);
         }
         files.sort();
+        // **The control that binds every caller**, placed here rather than at
+        // each of them, for the reason `census_domain::whole_file_test_modules`
+        // gives at `src/effects.rs:1392`. A walk that found nothing but the file
+        // it was handed is a domain that has stopped meaning anything, and a
+        // caller cannot reach the set without passing through this line. It is
+        // not sufficient on its own -- see
+        // `the_row_mapping_census_domain_is_the_declared_module` part (4) for
+        // the half placement cannot cover.
+        assert!(
+            files.len() > 1 && files.contains(&root.to_path_buf()),
+            "the walk of `{}` returned {:?}: a module domain is the root plus what it declares",
+            root.display(),
+            files
+        );
         files
+    }
+
+    /// The body of the item whose signature line contains `signature`, read out
+    /// of `source` with comments and string literals blanked.
+    ///
+    /// Blanked, because the question every caller asks is what the code *does*,
+    /// and a name written in a doc comment beside it is not a call. Blanking is
+    /// length-preserving, so the braces this matches are the braces the compiler
+    /// sees.
+    fn item_body(source: &str, signature: &str) -> String {
+        let blanked = blank_comments_and_strings(source);
+        let at = blanked
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is not in this file"));
+        let open = at + blanked[at..].find('{').expect("the item has a body");
+        let mut depth = 0_usize;
+        for (offset, byte) in blanked[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return blanked[open..=open + offset].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{signature}` has no closing brace")
     }
 
     /// Every site enum's `row()` is **exhaustive by construction**: no wildcard
@@ -213,9 +258,13 @@ pub(super) mod oracles {
     ///
     /// A source census rather than a compile fixture because it is the *absence* of
     /// a construct that has to be checked, and a fixture can only demonstrate that
-    /// something fails to compile today. `src/topology/effects.rs` is frozen, so
-    /// this scan is a guard on a file this slice does not edit rather than a
-    /// requirement on one it does.
+    /// something fails to compile today. The `topology::effects` inventory is
+    /// frozen in the sense that matters here — its seventy sites and their
+    /// mappings are PR3's and no slice adds to them — so this scan guards a
+    /// property no slice may change, whatever file the mappings sit in. They
+    /// have not always sat in one: the module was split into per-concern
+    /// children, which is what the domain below is derived rather than
+    /// enumerated for.
     ///
     /// The mappings live in a **module** rather than a file since
     /// `topology::effects` was split into per-concern child modules:
@@ -345,6 +394,61 @@ pub(super) mod oracles {
         assert!(
             !domain.contains(&repo_root().join("src/topology/effects/tests.rs")),
             "`tests.rs` is declared `#[cfg(test)]` and is not production code: {domain:?}"
+        );
+
+        // (4) AND THE CENSUS STILL CONSUMES THE WALKER.
+        //
+        // Parts (1) to (3) test the walker. They cannot tell whether the census
+        // calls it, and on today's tree nothing else can either: the module's
+        // seven production children are all flat `.rs`, so a root-plus-immediate-
+        // `*.rs` enumeration returns the identical eight files and every
+        // value-based assertion agrees. Measured by restoring that enumeration
+        // while leaving the walker and parts (1)-(3) intact: the whole suite
+        // stayed green, and it stayed green with a wildcard `row()` planted in
+        // `effects/twelfth/mod.rs` that the census could not see.
+        //
+        // `census_domain::whole_file_test_modules` records this defect class
+        // (`3a91626`, `R6-SETTLE-003`) and its remedy is placement — the control
+        // sits inside the helper so a caller cannot reach the set without it,
+        // which `production_module_files` above now does too. **That remedy does
+        // not cover a caller that stopped calling**, and its own comment says so:
+        // "it says nothing about whether a census calls it". So this last part is
+        // lexical, using the instrument this crate keeps for exactly the question
+        // of whether one named item calls another.
+        let body = item_body(
+            &fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"))
+                .expect("this file"),
+            "fn site_row_mappings_have_no_wildcard_arm",
+        );
+        // Non-vacuity, both directions: the extractor isolated that census and
+        // not the whole file, and the counter answers 0 for a name it does not
+        // call.
+        // The needles here are *identifiers*, not literals: `item_body` blanks
+        // string literals, so a control written as a quoted needle the census
+        // contains would be spaces by the time it is checked. `offenders` is
+        // code inside the census; `sole_present` is code inside the walker and
+        // inside part (2) above, so its absence is what says the extractor did
+        // not run past the census's own closing brace.
+        assert!(
+            body.contains("offenders") && !body.contains("sole_present"),
+            "`item_body` did not isolate the row-mapping census: {body}"
+        );
+        assert_eq!(
+            production_calls(&body, "declared_production_children", Call::Free),
+            0,
+            "control: the census does not call the walker's helper directly"
+        );
+        assert_eq!(
+            production_calls(&body, "production_module_files", Call::Free),
+            1,
+            "the row-mapping census must take its domain from `production_module_files`. \
+             Parts (1)-(3) pass whatever the census does, because an immediate-`*.rs` \
+             enumeration returns the same eight files on this tree — so this is the \
+             assertion that fails when the census stops consuming the walker"
+        );
+        assert!(
+            !body.contains("read_dir"),
+            "the row-mapping census is building its own domain again: {body}"
         );
     }
 
