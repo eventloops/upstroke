@@ -127,4 +127,4 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 
 | File | Swept at (commit) | Date | Notes |
 |---|---|---|---|
-| `src/workspace_manager/hooks.rs` | `f58747a` | 2026-09-03 | `Arc<Mutex<HookHarness>>`, the lock and the two ledger clones kept with their lifecycle, protected invariant and handle semantics stated; the three `?` in `funnel` kept as deliberate and documented at the site; `point` now applies a refusal at the mode that answered (it named `kill` whatever fired); a test module for the protocol itself. |
+| `src/workspace_manager/hooks.rs` | `f58747a` | 2026-09-03 | `Arc<Mutex<HookHarness>>`, the lock and the two ledger clones kept with their lifecycle, protected invariant and handle semantics stated; the three `?` in `funnel` kept as deliberate and documented at the site; `point` now applies a refusal at the mode that answered (it named `kill` whatever fired); a test module for the protocol itself. After review (PR #119): a poisoned harness refuses wherever a refusal is legal and proceeds unrecorded at a `Kill`-only point (`c265536`). |
