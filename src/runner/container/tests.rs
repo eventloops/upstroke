@@ -3132,13 +3132,12 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         }
         with_children += 1;
         // **Per arm, not in aggregate.** A union floor cannot see one arm go
-        // missing once another arm is large enough to cover for it: on this
-        // tree the four arms hold 12 / 1 / 1 / 10 files, so a `>= 9` over the
-        // union survives losing `src/runner/container/` entirely. The floor is
-        // therefore stated where the loss happens -- once per arm, over the
-        // class rather than over the two arms that happen to have a named
-        // assertion below -- so the next funnel root inherits the guard instead
-        // of needing its own.
+        // missing once the other arms are large enough to cover for it: the arms
+        // are of very unequal size, so a union floor set for the small ones
+        // survives losing the largest entirely. The floor is therefore stated
+        // where the loss happens -- once per arm, over the class rather than
+        // over the arms that happen to have a named assertion below -- so the
+        // next funnel root inherits the guard instead of needing its own.
         let arm = walk(&directory);
         assert!(
             !arm.is_empty(),
