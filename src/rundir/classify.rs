@@ -3,9 +3,15 @@
 //! `sequential_substrate.startup_census`: "every entry is classified by
 //! `rundir::classify_run_dir` as **Committed** (`events.jsonl` exists and its
 //! first newline-terminated line is a valid `run_started`) or **Husk**
-//! (anything else)". Read-only and total: the census holds the physical
-//! worktree lock across it, so an entry that never classifies is a lock held
-//! for ever, and every bound here exists for that.
+//! (anything else)". Read-only, and bounded rather than total: the census
+//! holds the physical worktree lock across it, so an entry that never
+//! classifies is a lock held for ever, and every bound here exists for that.
+//! What is not bounded is named where it lives — `first_committed_line`
+//! refuses to open anything that is not a regular file, and the window between
+//! that check and the `open` is still open, so a path swapped for a
+//! writer-less fifo inside it blocks in the kernel. That race is byte-identical
+//! to the parent's and out of this split's scope; asserting totality over it
+//! would not be.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree and not by the file, so an out-of-line
