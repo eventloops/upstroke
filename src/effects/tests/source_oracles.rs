@@ -270,6 +270,16 @@ pub(super) mod oracles {
         /// only the walk can put in the struct. Under that substitution there is
         /// no `ProductionModule` to call the scan on, and the census does not
         /// compile.
+        ///
+        /// **The type closes the substitution and not the sibling.** A census
+        /// that keeps the walk, keeps the call, and takes its answer from a
+        /// helper beside it that reads the files itself compiles perfectly well,
+        /// and no assertion whose domain is the census's *source text* sees it —
+        /// which is the bypass two lexical repairs were shown to admit. That one
+        /// is closed by [`RowMappingScan::scanned`]: the scan records the path of
+        /// every file it read, the census asserts that collection is
+        /// [`Self::files`], and a helper's stale eight against the walk's nine
+        /// fails on a set difference rather than on a name.
         pub(super) struct ProductionModule {
             sources: Vec<(PathBuf, String)>,
         }
@@ -329,12 +339,18 @@ pub(super) mod oracles {
                 self.sources.iter().map(|(path, _)| path.clone()).collect()
             }
 
-            /// How many `row()` mappings the module's production regions hold,
-            /// and which of them fall back through a wildcard arm.
-            pub(super) fn row_mapping_wildcards(&self) -> (usize, Vec<String>) {
-                let mut scanned = 0_usize;
-                let mut offenders = Vec::new();
-                for (_, source) in &self.sources {
+            /// Scan the module's production regions for `row()` mappings.
+            ///
+            /// **Returns the path of every file it read.** That is what lets a
+            /// caller state its domain as a claim about *values* rather than
+            /// about its own source text; see [`RowMappingScan`].
+            pub(super) fn row_mapping_wildcards(&self) -> RowMappingScan {
+                let mut scan = RowMappingScan {
+                    scanned: Vec::new(),
+                    offenders: Vec::new(),
+                };
+                for (path, source) in &self.sources {
+                    let mut mappings = 0_usize;
                     let production = blank_comments_and_strings(&production_region(source));
                     let mut rest = production.as_str();
                     while let Some(at) = rest.find("fn row(") {
@@ -344,20 +360,57 @@ pub(super) mod oracles {
                         // indentation that is exactly `    }`.
                         let body_end = rest.find("\n    }").unwrap_or(rest.len());
                         let body = &rest[..body_end];
-                        scanned += 1;
+                        mappings += 1;
                         for wildcard in ["_ =>", "_=>"] {
                             if body.contains(wildcard) {
-                                offenders.push(format!(
-                                    "a `row()` mapping falls back through `{wildcard}`, so a \
-                                     site added later compiles with no declared row: …{}",
+                                scan.offenders.push(format!(
+                                    "`{}`: a `row()` mapping falls back through `{wildcard}`, \
+                                     so a site added later compiles with no declared row: …{}",
+                                    path.display(),
                                     &body[..body.len().min(160)]
                                 ));
                             }
                         }
                     }
+                    // One entry per file of the domain, whether or not it held a
+                    // mapping, pushed at the end of the iteration that read it —
+                    // so the collection cannot be anything but the set this loop
+                    // walked.
+                    scan.scanned.push((path.clone(), mappings));
                 }
-                (scanned, offenders)
+                scan
             }
+        }
+
+        /// What [`ProductionModule::row_mapping_wildcards`] read, and what it
+        /// found in it.
+        ///
+        /// **`scanned` is the half that makes the census's domain checkable.**
+        /// Until it existed, whether the census scanned the walk's output was
+        /// answerable only by reading the census's *source* — first by counting
+        /// its call to the scan, then by banning the names that can obtain
+        /// source text — and a reviewer walked through both forms the same way:
+        /// a sibling helper that scans a stale list of paths leaves the census's
+        /// own body innocent of every needle, so the assertion's domain (that
+        /// body) was never the claim's domain (the files the census reads).
+        ///
+        /// Recording the paths moves the question to run time. A caller compares
+        /// this collection with [`ProductionModule::files`]; a scan that read
+        /// eight files while the walk produced nine fails on the set difference,
+        /// whatever any function body says.
+        pub(super) struct RowMappingScan {
+            /// Every file the scan read, in the order the walk sorted them, with
+            /// the number of `row()` mappings found in its production region.
+            ///
+            /// A file holding no mapping is still an entry: this is the
+            /// **domain**, not the hits. On this tree six of the eight hold
+            /// none, so the distinction is measured rather than stipulated —
+            /// `the_row_mapping_census_domain_is_the_declared_module` part (5)
+            /// is where.
+            pub(super) scanned: Vec<(PathBuf, usize)>,
+            /// Every mapping that falls back through a wildcard arm, named by
+            /// the file it was found in.
+            pub(super) offenders: Vec<String>,
         }
     }
 
@@ -443,23 +496,56 @@ pub(super) mod oracles {
     /// `EffectSiteId::row` stayed in the root and the eleven site enums' went to
     /// `sites.rs`. So the domain is a [`ProductionModule`] — a path here names a
     /// module, not a file — and
-    /// `the_row_mapping_census_reads_the_declared_production_module` is what
-    /// measures membership in it, in both directions.
+    /// `the_row_mapping_census_domain_is_the_declared_module` is what measures
+    /// membership in it, in both directions.
+    ///
+    /// **The domain is bound to the walk here, over values.** The scan returns
+    /// the path of every file it read, and the first assertion below is that
+    /// that collection *is* [`ProductionModule::files`]. Two earlier repairs
+    /// asserted the same intent over this function's **source text** — one
+    /// counted the call, one banned the names that can open a file — and both
+    /// were bypassed the same way, by a sibling helper that scans a stale list
+    /// of paths and leaves this body innocent. A set difference does not care
+    /// what the body says: a helper scanning yesterday's eight files while the
+    /// walk produces nine fails on the ninth path.
     pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {
         let module = ProductionModule::walk(&repo_root().join("src/topology/effects.rs"));
-        let sources = module.files();
+        let walked = module.files();
+        let scan = module.row_mapping_wildcards();
+
+        // THE DOMAIN, ASSERTED OVER VALUES: what was read equals what the walk
+        // produced. Not "the body of this function names no reader" — that is a
+        // claim about this text, and a helper beside it reading a stale list of
+        // paths satisfies it while scanning the wrong set.
+        let scanned: Vec<PathBuf> = scan.scanned.iter().map(|(path, _)| path.clone()).collect();
+        let unwalked: Vec<&PathBuf> = scanned
+            .iter()
+            .filter(|path| !walked.contains(path))
+            .collect();
+        let unscanned: Vec<&PathBuf> = walked
+            .iter()
+            .filter(|path| !scanned.contains(path))
+            .collect();
+        assert_eq!(
+            scanned, walked,
+            "this census read a different set of files from the one the walk produced, so its \
+             domain is not the declared production module. Read and not walked: {unwalked:?}; \
+             walked and not read: {unscanned:?}"
+        );
+
         assert!(
-            sources.len() >= 8,
+            walked.len() >= 8,
             "only {} file(s) in the `topology::effects` production module, so this census is \
-             looking at the wrong module: {sources:?}",
-            sources.len()
+             looking at the wrong module: {walked:?}",
+            walked.len()
         );
-        let (scanned, offenders) = module.row_mapping_wildcards();
+        let mappings: usize = scan.scanned.iter().map(|(_, found)| found).sum();
         assert!(
-            scanned >= 8,
-            "only {scanned} `row()` mappings scanned, so this census is looking at the wrong files"
+            mappings >= 8,
+            "only {mappings} `row()` mappings scanned, so this census is looking at the wrong \
+             files"
         );
-        assert!(offenders.is_empty(), "{offenders:#?}");
+        assert!(scan.offenders.is_empty(), "{:#?}", scan.offenders);
     }
 
     /// The `row()` census's domain is the **declared** production module, and
@@ -517,7 +603,8 @@ pub(super) mod oracles {
 
         // (3) THE REAL DOMAIN, named file by file — and `tests.rs` is outside it
         // because its declaration carries `#[cfg(test)]`, not because of its stem.
-        let walked = ProductionModule::walk(&effects).files();
+        let module = ProductionModule::walk(&effects);
+        let walked = module.files();
         let mut expected: Vec<PathBuf> = [
             "src/topology/effects.rs",
             "src/topology/effects/bijection.rs",
@@ -573,32 +660,76 @@ pub(super) mod oracles {
             "control: `mod hidden;` on its own is classified, so (4) measured the `cfg_attr`"
         );
 
-        // (5) AND THE CENSUS CANNOT SCAN ANYTHING THE WALK DID NOT HAND IT.
+        // (5) AND THE CENSUS'S DOMAIN IS A CLAIM ABOUT VALUES.
         //
-        // Parts (1) to (4) test the walk. They cannot say whether the census uses
-        // it, and on today's tree no assertion over *values* can either: the
-        // module's seven production children are all flat `.rs` files, so a
-        // root-plus-immediate-`*.rs` enumeration returns the identical eight
-        // paths and every comparison above agrees. A reviewer showed the same
-        // substitution surviving two successive lexical witnesses — keep the
-        // call, bind it to `_`, scan a hard-coded list of those eight — and it
-        // was reproduced against this file before this part was written: both
-        // row-mapping tests passed under exactly that mutation.
+        // Parts (1) to (4) test the walk. They cannot say whether the census
+        // uses it. Two repairs answered that lexically — count the census's call
+        // to the scan, then ban the names that can obtain source text — and a
+        // reviewer walked through both, for the same reason each time: **the
+        // domain of a lexical assertion is the census's source text, and the
+        // claim is about the files the census reads.** A sibling helper that
+        // scans a stale list of paths satisfies every such assertion while
+        // scanning the wrong set, and no further needle reaches it, because the
+        // reading it has to catch is not in the text it looks at.
         //
-        // What replaced the call count is `ProductionModule`: `sources` is
-        // private to `domain`, `walk` is its only constructor, and the scan is a
-        // method on it, so that substitution now has nothing to call the scan on
-        // and fails to compile. **That half is the compiler's and is not
-        // restated here** — an assertion repeating it would be the adjacent
-        // measurement all over again.
+        // So the claim is made where it can be made over values.
+        // `site_row_mappings_have_no_wildcard_arm` asserts that the paths
+        // `RowMappingScan::scanned` recorded *are* `ProductionModule::files`;
+        // a helper that scans eight files while the walk produces nine fails on
+        // the ninth path, whatever its body says.
         //
-        // The one bypass a type cannot reach is a census that abandons the method
-        // and re-reads the files itself. This part is that control. It bans the
-        // constructs that can obtain source text rather than counting a name:
-        // there is no adjacent identifier that reads a file, so unlike a call
-        // count it has no near-miss to slip through. Needles are matched with
-        // comments and string literals blanked, so one written in prose or in an
-        // assertion message is spaces by the time it is looked for.
+        // What this part measures is the property that assertion rests on, which
+        // nothing else states: **the recorded collection is the domain, not the
+        // hits.** Six of the module's eight files hold no `row()` at all — every
+        // mapping is in the root and in `sites.rs` — so a scan that recorded
+        // only the files it found something in would record two paths, and the
+        // census's equality would fail on the honest tree. That is also the
+        // stale-helper shape exactly: a helper reports the set it looked at, and
+        // the set it looked at is the wrong one.
+        let scan = module.row_mapping_wildcards();
+        let recorded: Vec<PathBuf> = scan.scanned.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            recorded, walked,
+            "the scan's record is not the walk's output, so the equality the census asserts is \
+             between something else and something else"
+        );
+        let barren: Vec<&PathBuf> = scan
+            .scanned
+            .iter()
+            .filter(|(_, found)| *found == 0)
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            barren.len() >= 5,
+            "only {} file(s) of the domain hold no `row()` mapping, so this part no longer \
+             measures that a file with no hit is still recorded: {barren:?}",
+            barren.len()
+        );
+        assert!(
+            scan.scanned.iter().any(|(_, found)| *found > 0),
+            "no file of the domain holds a `row()` mapping at all, so the scan found nothing \
+             and the count above is vacuous"
+        );
+
+        // (6) BELT AND BRACES: THE CENSUS'S OWN BODY NAMES NO READER.
+        //
+        // **The domain of this part is the census's text, and so is its claim.**
+        // It does not establish (5)'s property and is not written as though it
+        // did — a helper beside the census leaves this body innocent, which is
+        // why (5) exists and why a seventh needle would not help. What it closes
+        // is the cheap form, an edit that opens a file inside the census itself:
+        // it fails one step earlier than the set difference would, naming the
+        // construct rather than a set of paths. It bans constructs rather than
+        // counting a name, so unlike a call count it has no near-miss to slip
+        // through. Needles are matched with comments and string literals
+        // blanked, so one written in prose or in an assertion message is spaces
+        // by the time it is looked for.
+        //
+        // The other half of the old part (5) is the compiler's and stays there:
+        // `sources` is private to `domain`, `walk` is its only constructor and
+        // the scan is a method on it, so a census that keeps the call, binds it
+        // to `_` and scans a hard-coded list has nothing to call the scan on and
+        // does not compile.
         let this_file = fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"))
             .expect("this file");
         let body = item_body(&this_file, "fn site_row_mappings_have_no_wildcard_arm");
@@ -621,9 +752,10 @@ pub(super) mod oracles {
         for reader in READERS {
             assert!(
                 !body.contains(reader),
-                "the row-mapping census names `{reader}`, so it can read a file the walk did \
-                 not give it and its domain is no longer whatever `ProductionModule::walk` \
-                 derived: {body}"
+                "the row-mapping census names `{reader}`, so it obtains source text from \
+                 somewhere other than the walk it hands the scan — a second reader beside the \
+                 domain equality part (5) describes, which is a defect whether or not that \
+                 equality still holds: {body}"
             );
         }
         // And the needle set can fire at all: this witness's own body reads a
