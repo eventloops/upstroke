@@ -61,9 +61,15 @@ MODULE TREE and not by the file, so this file would otherwise have inherited \
 `src/workspace_manager.rs`'s inner allow of all three lints silently: that is \
 `PR6-LANEF-004`, and this is the first out-of-line child this funnel has had. \
 `runner::container::tests::every_child_module_of_the_container_funnel_states_\
-its_own_lint_level` is the census that refuses such a child, and its `FUNNELS` \
-domain does NOT reach this parent -- so nothing was red and the level is \
-written here because the hole is the same one, not because a gate caught it. \
+its_own_lint_level` is the census that refuses such a child. Its `FUNNELS` \
+domain did NOT reach this parent when this row was written, so nothing was red \
+and the level was written here because the hole was the same one, not because a \
+gate caught it. THAT IS NO LONGER TRUE, and the sentence is corrected rather \
+than left standing: the `m4-workspace` split added \
+`src/workspace_manager.rs` to that census's `FUNNELS` domain in the same \
+commit, so this file is now graded against all three governed lints and named \
+in the domain individually. The level below is unchanged; what changed is that \
+a gate now checks it. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
 all three lints; this row allows TWO of that three, so it is a strict subset \
@@ -212,10 +218,10 @@ that is `PR6-LANEF-004`, measured twice in the Container subtree, and this is \
 the first out-of-line child the Process funnel has ever had. \
 ALL THREE GOVERNED LINTS ARE DENIED AT FILE SCOPE, AND THE ALLOWANCE IS SIX \
 PER-SITE `#[expect]` ATTRIBUTES rather than a file-scope allow. That is \
-`PR72-PLACEMENT-001` and `decisions/2026-08-30-readiness-lint-placement.md` is \
-the amendment admitting it: `mechanism` (2) permits an allowance "only as \
-module-level attributes", and a per-site expectation is NARROWER than the \
-module-level allow it replaces, not a widening of it. \
+`PR72-PLACEMENT-001`, and `standards/02_standards_automated_baseline.md` \
+(the lints paragraph) admits it: this file's own mechanism otherwise permits an \
+allowance "only as module-level attributes", and a per-site expectation is \
+NARROWER than the module-level allow it replaces, not a widening of it. \
 MEASURED, and it is why the old shape was wrong rather than merely untidy: \
 deleting the previous `#![allow(clippy::disallowed_methods)]` changed nothing \
 at `cargo clippy --all-targets --all-features -- -D warnings`, because \
@@ -473,7 +479,7 @@ AND SINCE W1 IT CARRIES AN ATTRIBUTE AND A ROW OF ITS OWN. It was INLINE, so \
 the file-scope allow this row records WAS its lint level by the module tree; it \
 is now the sibling file `src/rundir/scratch_tree.rs`, which is exactly the \
 OUT-OF-LINE shape `PR72-PLACEMENT-001` and \
-`decisions/2026-08-30-readiness-lint-placement.md` are about -- a child \
+`standards/02_standards_automated_baseline.md` are about -- a child \
 inheriting a level nobody had written down -- so it states its own and its row \
 below records the two lints it needs of the three this file allows."""
 
@@ -490,9 +496,10 @@ the module tree; it is out of line since W1, so that paragraph now points here \
 and this file states its own level. `PR6-LANEF-004` is the shape it would \
 otherwise have taken. `runner::container::tests::every_child_module_of_the_\
 container_funnel_states_its_own_lint_level` is the census that refuses such a \
-child and its `FUNNELS` domain does NOT reach this parent -- so nothing was red, \
-and the level is written here because the hole is the same one, not because a \
-gate caught it. \
+child. Its `FUNNELS` domain did NOT reach this parent when this row was \
+written, so nothing was red and the level was written here because the hole was \
+the same one, not because a gate caught it; `src/rundir.rs` joined that domain \
+in W2 and the census now grades this file like any other child. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/rundir.rs`, under that file's own inner allow of all three \
 lints; this row allows TWO of that three, a strict subset, and the move changes \

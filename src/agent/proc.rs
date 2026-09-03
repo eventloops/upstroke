@@ -1920,11 +1920,8 @@ mod termination {
             // already have reused.
             self.phase = Phase::Finished;
             if !self.reaper.cleanup(pgid) {
-                let _ = PENDING_TERMINATION.compare_exchange(
-                    0,
-                    libc::SIGTERM,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                arm_fail_closed_termination(
+                    b"upstroke: fail-closed SIGTERM armed: cleanup reaper did not acknowledge CLEANUP\n",
                 );
                 return Err(UpstrokeError::Agent {
                     message: format!(
@@ -2262,11 +2259,8 @@ mod termination {
             return;
         }
         if unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } != 0 {
-            let _ = PENDING_TERMINATION.compare_exchange(
-                0,
-                libc::SIGTERM,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+            arm_fail_closed_termination(
+                b"upstroke: fail-closed SIGTERM armed: self-stop failed after a guard probe\n",
             );
             notify_guard(libc::SIGTERM);
         }
@@ -2320,6 +2314,26 @@ mod termination {
         let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
     }
 
+    /// Arm fail-closed termination with `SIGTERM`, and say so on fd 2.
+    ///
+    /// Every fallback that gives up on a private helper comes through here so
+    /// the process about to die names the site first. `C-004`: the macOS test
+    /// harness SIGTERMed itself for a day without a diagnostic — libtest
+    /// captures the failing test's panic and the raise pre-empts its report —
+    /// and four CI deaths were read backwards as a group-kill that never
+    /// happened. One raw `write` survives both, and it is async-signal-safe,
+    /// which the guard-probe handler needs. Only the site that wins the arm
+    /// writes; a later fallback that finds a termination already pending is
+    /// not the cause and says nothing.
+    fn arm_fail_closed_termination(site: &[u8]) {
+        if PENDING_TERMINATION
+            .compare_exchange(0, libc::SIGTERM, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let _ = write_raw(libc::STDERR_FILENO, site);
+        }
+    }
+
     fn monitor(state: Arc<Mutex<State>>) -> ! {
         loop {
             let terminating = PENDING_TERMINATION.load(Ordering::SeqCst);
@@ -2366,11 +2380,8 @@ mod termination {
                 if !guard.arm() {
                     SUSPEND_ARMED.store(false, Ordering::SeqCst);
                     let _ = end_suspend(&state);
-                    let _ = PENDING_TERMINATION.compare_exchange(
-                        0,
-                        libc::SIGTERM,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
+                    arm_fail_closed_termination(
+                        b"upstroke: fail-closed SIGTERM armed: job-control guard did not acknowledge ARM\n",
                     );
                     continue;
                 }
@@ -2411,11 +2422,8 @@ mod termination {
                         SUSPEND_ARMED.store(false, Ordering::SeqCst);
                         guard.disarm();
                         let _ = end_suspend(&state);
-                        let _ = PENDING_TERMINATION.compare_exchange(
-                            0,
-                            libc::SIGTERM,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
+                        arm_fail_closed_termination(
+                            b"upstroke: fail-closed SIGTERM armed: job-control guard lost the STOP handshake\n",
                         );
                         continue;
                     }
@@ -2530,22 +2538,38 @@ mod termination {
             let mut frame = [0_u8; 5];
             frame[0] = REAPER_CANCEL;
             let cancelled = write_raw(self.command_fd, &frame)
-                && read_guard_ack(self.ack_fd, Duration::from_secs(2)) == Some(REAPER_OK);
+                && acknowledged(self.ack_fd, REAPER_OK, Duration::from_secs(2));
             if !cancelled {
                 // The parent does not know whether pre_exec registered a group
                 // before spawn failed. Arm ordinary fail-closed termination;
                 // the independently polling reaper will observe reparenting
                 // and complete any registered cleanup without trusting EOF.
-                let _ = PENDING_TERMINATION.compare_exchange(
-                    0,
-                    libc::SIGTERM,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                arm_fail_closed_termination(
+                    b"upstroke: fail-closed SIGTERM armed: cleanup reaper did not acknowledge CANCEL\n",
                 );
                 close_fd(self.command_fd);
                 close_fd(self.ack_fd);
                 close_fd(self._command_keepalive_fd);
                 return;
+            }
+            self.close_and_wait();
+        }
+
+        /// Give up on a reaper that has not said READY.
+        ///
+        /// No agent has been spawned and no group registered — `prepare` runs
+        /// only after `begin` has returned — so there is nothing for this
+        /// reaper to settle and nothing to fail closed about. Kill it and reap
+        /// it; the launch fails with an ordinary error. Arming process-wide
+        /// `SIGTERM` here guarded a state that cannot exist yet, and on macOS,
+        /// where a forked helper's startup runs long under load, it killed the
+        /// test harness with no diagnostic (`C-004`).
+        fn abandon(self) {
+            // SAFETY: `pid` is the unreaped reaper this process forked. It is
+            // the only member of its own process group and holds nothing but
+            // its shared cleanup lease, which its exit releases.
+            unsafe {
+                let _ = libc::kill(self.pid, libc::SIGKILL);
             }
             self.close_and_wait();
         }
@@ -2586,6 +2610,13 @@ mod termination {
             .unwrap_or(0);
         #[cfg(not(test))]
         let cleanup_delay_ms = 0;
+        #[cfg(test)]
+        let ready_delay_ms = std::env::var("UPSTROKE_TEST_REAPER_READY_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        #[cfg(not(test))]
+        let ready_delay_ms = 0_u64;
         let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         if open_max <= 0 {
             return Err("reading the Unix open-file descriptor ceiling".to_owned());
@@ -2637,6 +2668,13 @@ mod termination {
             if !lock_cleanup_paths(&cleanup_paths) {
                 unsafe { libc::_exit(1) };
             }
+            // Test subprocesses can hold READY back past the parent's deadline
+            // so the late-reaper path is driven deterministically.
+            let mut delay_left = ready_delay_ms;
+            while delay_left > 0 {
+                raw_sleep_10ms();
+                delay_left = delay_left.saturating_sub(10);
+            }
             reaper_loop(
                 parent,
                 command[0],
@@ -2673,7 +2711,7 @@ mod termination {
             pid,
         };
         if read_guard_ack(ack[0], Duration::from_secs(2)) != Some(REAPER_READY) {
-            reaper.cancel();
+            reaper.abandon();
             return Err("Unix cleanup reaper did not initialize".to_owned());
         }
         #[cfg(test)]
@@ -3058,6 +3096,22 @@ mod termination {
             }
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 return None;
+            }
+        }
+    }
+
+    /// Whether `expected` arrives on `fd` within `timeout`, skipping any other
+    /// byte first. A reaper that came up after its READY deadline has that
+    /// stale byte queued ahead of its CANCEL acknowledgement; judging the first
+    /// byte alone failed a cancel the reaper had accepted (`C-004`).
+    fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match read_guard_ack(fd, remaining) {
+                Some(byte) if byte == expected => return true,
+                Some(_) => continue,
+                None => return false,
             }
         }
     }
@@ -4748,6 +4802,106 @@ mod termination {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        /// Subprocess entry for the two `C-004` handshake checks.
+        ///
+        /// In a fresh process because a regression of either arms process-wide
+        /// `SIGTERM`, which must fail this one test rather than the harness
+        /// running it — the exact shape `C-004` was.
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn reaper_handshake_helper() {
+            if std::env::var_os("UPSTROKE_REAPER_HANDSHAKE_HELPER").is_none() {
+                return;
+            }
+            // The parent holds READY back past the 2 s deadline, and past the
+            // further 2 s a cancel would then have waited, through
+            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`. The launch must fail
+            // promptly, arm nothing, and leave no child behind.
+            let started = Instant::now();
+            let launch = spawn_reaper();
+            let elapsed = started.elapsed();
+            assert!(
+                launch.is_err(),
+                "a reaper that missed its READY deadline was accepted as initialized"
+            );
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "the late reaper held the launch for {elapsed:?}, past its own deadline"
+            );
+            assert_eq!(
+                PENDING_TERMINATION.load(Ordering::SeqCst),
+                0,
+                "a reaper that missed its READY deadline armed process-wide termination"
+            );
+            // SAFETY: `waitpid(-1, WNOHANG)` inspects only this process's
+            // children, and the late reaper is the only child it has had.
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(
+                waited < 0 && !last_errno_is_interrupted(),
+                "the late reaper was left behind (waitpid(-1, WNOHANG) returned {waited})"
+            );
+
+            // A CANCEL acknowledged behind a stale READY is a cancel that
+            // succeeded: a reaper that came up late queues READY ahead of its
+            // OK, and judging the first byte alone failed it.
+            let command = create_cloexec_pipe().expect("a stand-in command pipe");
+            let ack = create_cloexec_pipe().expect("a stand-in acknowledgement pipe");
+            // SAFETY: the forked child calls only `_exit`.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            assert!(pid > 0, "fork a stand-in reaper for the cancel to reap");
+            assert!(write_raw(ack[1], &[REAPER_READY]), "queue the stale READY");
+            let answer = thread::spawn(move || {
+                let mut frame = [0_u8; 5];
+                read_raw_exact(command[0], &mut frame)
+                    && frame[0] == REAPER_CANCEL
+                    && write_raw(ack[1], &[REAPER_OK])
+            });
+            Reaper {
+                command_fd: command[1],
+                ack_fd: ack[0],
+                _command_keepalive_fd: command[0],
+                pid,
+            }
+            .cancel();
+            assert!(
+                answer.join().expect("the stand-in reaper thread"),
+                "the stand-in reaper never saw CANCEL"
+            );
+            close_fd(ack[1]);
+            assert_eq!(
+                PENDING_TERMINATION.load(Ordering::SeqCst),
+                0,
+                "a CANCEL acknowledged behind a stale READY armed process-wide termination"
+            );
+        }
+
+        /// `C-004`: a reaper that misses its READY deadline is an ordinary
+        /// failed launch, and a CANCEL acknowledged behind a stale READY is a
+        /// cancel that succeeded. Neither arms process-wide termination.
+        #[test]
+        fn a_late_reaper_fails_its_launch_without_arming_termination() {
+            use std::os::unix::process::CommandExt;
+
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["reaper_handshake_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_REAPER_HANDSHAKE_HELPER", "1")
+                .env("UPSTROKE_TEST_REAPER_READY_DELAY_MS", "4500")
+                .process_group(0)
+                .stdin(Stdio::null())
+                .output()
+                .expect("run the reaper handshake helper");
+            assert!(
+                output.status.success(),
+                "reaper handshake helper: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         #[cfg(target_os = "linux")]

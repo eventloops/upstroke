@@ -2,8 +2,9 @@
 name = "upstroke"
 # 0.1.0 because §21's definition of done was actually met, on 2026-08-10: a
 # five-task plan ran unattended against a scratch repository through every one
-# of its five criteria and the kill/resume test — `acceptance/RESULT.md` is the
-# evidence, including the three engine defects that run found. 0.0.1 was the
+# of its five criteria and the kill/resume test — the acceptance write-up, kept
+# in the repository history, is the evidence, including the three engine defects
+# that run found. 0.0.1 was the
 # crates.io name reservation and never claimed to be more.
 #
 # The 0.1.0 published to crates.io says "on a real repository" here, which is
