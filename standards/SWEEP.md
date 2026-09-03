@@ -27,7 +27,6 @@ after its children, since it keeps whatever the split did not move.
 
 | # | File | Lines | From | Merged |
 |---|---|---|---|---|
-| 1 | `src/workspace_manager/containment.rs` | 235 | #110 | 2026-09-03 |
 | 2 | `src/workspace_manager/hooks.rs` | 200 | #110 | 2026-09-03 |
 | 3 | `src/workspace_manager/naming.rs` | 254 | #110 | 2026-09-03 |
 | 4 | `src/workspace_manager/object.rs` | 68 | #110 | 2026-09-03 |
@@ -54,4 +53,4 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 
 | File | Swept at (commit) | Date | Notes |
 |---|---|---|---|
-| _none yet_ | | | |
+| `src/workspace_manager/containment.rs` | `2dd1350` | 2026-09-03 | the `?` in `refuse_reparse_points` is kept: it propagates the walk's own typed `Io` error, path attached; `refuse_unreal_directory` and `canonical_prefix` decide absence (`NotFound`, `NotADirectory`) from failure instead of `?` or a discarded `Err`; the walk refuses a chain that is not plain components below the anchor (new `Refusal::RootOutsidePrivateRoot`); no `Rc`, `Arc` or lock, the peel's per-step parent clone replaced by `PathBuf::pop`; the `strip_verbatim` and "every deletion" doc claims corrected |
