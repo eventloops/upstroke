@@ -1428,6 +1428,17 @@ mod termination {
     const GUARD_STOPPED: u8 = 0xb2;
     const GUARD_CANCELLED: u8 = 0xc1;
     const GUARD_DISARM: u8 = 0xd1;
+
+    /// How long a forked helper (the cleanup reaper, the job-control guard)
+    /// has to report READY. Before it does, the child closes every inherited
+    /// descriptor; Linux does that in one `close_range`, but Darwin and the
+    /// other hosts close them one syscall at a time up to the descriptor
+    /// ceiling, and on a loaded macOS CI runner that alone has taken more than
+    /// the two seconds this used to be. A helper that never comes up still
+    /// fails the launch, only later; nothing waits on this budget in the
+    /// ordinary case, since READY arrives as soon as the child has closed its
+    /// descriptors.
+    const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
     const GUARD_PROBE: u8 = 0xe1;
     const HANDLE_SIGINT: u8 = 1 << 0;
     const HANDLE_SIGTERM: u8 = 1 << 1;
@@ -2458,9 +2469,17 @@ mod termination {
             _command_keepalive_fd: command[0],
             pid,
         };
-        if read_guard_ack(ack[0], Duration::from_secs(2)) != Some(REAPER_READY) {
+        let ready_wait = std::time::Instant::now();
+        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
+            let waited = ready_wait.elapsed();
             reaper.abandon();
-            return Err("Unix cleanup reaper did not initialize".to_owned());
+            // The wait and the ceiling are the two facts a recurrence needs:
+            // a wait at the budget with a large ceiling is the per-descriptor
+            // close loop; a short wait is the child dying before READY.
+            return Err(format!(
+                "Unix cleanup reaper did not initialize (waited {waited:?} of \
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max})"
+            ));
         }
         #[cfg(test)]
         if let Some(path) = std::env::var_os("UPSTROKE_TEST_REAPER_PID_PATH") {
@@ -2801,7 +2820,7 @@ mod termination {
         }
 
         fn read_ack(self) -> Option<u8> {
-            read_guard_ack(self.ack_fd, Duration::from_secs(2))
+            read_guard_ack(self.ack_fd, HELPER_READY_BUDGET)
         }
     }
 
@@ -4563,8 +4582,8 @@ mod termination {
             if std::env::var_os("UPSTROKE_REAPER_HANDSHAKE_HELPER").is_none() {
                 return;
             }
-            // The parent holds READY back past the 2 s deadline, and past the
-            // further 2 s a cancel would then have waited, through
+            // The parent holds READY back past `HELPER_READY_BUDGET`, and past
+            // the further 2 s a cancel would then have waited, through
             // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`. The launch must fail
             // promptly, arm nothing, and leave no child behind.
             let started = Instant::now();
@@ -4575,7 +4594,7 @@ mod termination {
                 "a reaper that missed its READY deadline was accepted as initialized"
             );
             assert!(
-                elapsed < Duration::from_secs(4),
+                elapsed < HELPER_READY_BUDGET + Duration::from_secs(2),
                 "the late reaper held the launch for {elapsed:?}, past its own deadline"
             );
             assert_eq!(
@@ -4638,7 +4657,12 @@ mod termination {
             let output = Command::new(std::env::current_exe().expect("test executable"))
                 .args(["reaper_handshake_helper", "--ignored", "--nocapture"])
                 .env("UPSTROKE_REAPER_HANDSHAKE_HELPER", "1")
-                .env("UPSTROKE_TEST_REAPER_READY_DELAY_MS", "4500")
+                .env(
+                    "UPSTROKE_TEST_REAPER_READY_DELAY_MS",
+                    (HELPER_READY_BUDGET + Duration::from_millis(2500))
+                        .as_millis()
+                        .to_string(),
+                )
                 .process_group(0)
                 .stdin(Stdio::null())
                 .output()
