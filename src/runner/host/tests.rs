@@ -22,6 +22,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+// The split moved `SHELL_PROBE_TIMEOUT` -- the parent's one use of `Duration` --
+// into `super::probe`, so the parent's import list no longer carries the type
+// and `use super::*` no longer supplies it here. Named directly rather than
+// kept as a re-export the parent does not need. No test is renamed, no
+// assertion changes and no body moves; this line is the whole of what the
+// extraction owes this file.
+use std::time::Duration;
 
 use super::*;
 use crate::runner::invocation::{AttemptRole, InvocationId};

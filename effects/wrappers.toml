@@ -364,34 +364,114 @@ effectful = [
 ]
 effectful_unnameable = []
 effect_free = [
-    "base",
-    "case",
-    "compose",
     "contain_write_command",
     "containment_establishments",
     "credential_location",
-    "current",
     "default",
     "environment",
     "fmt",
-    "from_process",
     "new",
     "policy",
     "policy_digest",
-    "preflight",
     "program_resolutions",
     "program_searches",
     "reserved_keys",
-    "reserved_values",
     "run",
-    "run_shell_probe",
-    "same_key",
     "shell_probe",
     "shell_probe_request",
     "start_write_command",
-    "with_base",
     "with_environment",
     "with_hooks",
+]
+
+# The three production children the `m5-host` split gave `src/runner/host.rs`,
+# added in the same commit as the split. Ten externally reachable `fn`s left
+# the parent's file, and a name that leaves the domain is a name nobody has to
+# classify any more -- so the children join `CLASSIFIED_MODULES` by name, one
+# path each, which is the only form that list has: its census joins every entry
+# onto the manifest root and reads it as a source file, so there is no prefix to
+# widen `src/runner/host.rs` into. `C-002` is the standing finding that the
+# roll-call is hand-maintained, and it is not this split's.
+#
+# THE REPOINT IS A NET WIDENING OF SIX, written down rather than implied: 10
+# names leave the parent's block and 16 arrive in the children's.
+#
+#   * `lookup` (`HostEnvironment::lookup`), `is_bare_name` and `is_program`
+#     (`ProgramNaming`'s), `composed_value` and `resolve_program` were PRIVATE
+#     `fn`s of `src/runner/host.rs`, below the classification threshold
+#     entirely. The extraction makes them `pub(super)` in their children so the
+#     parent and `runner::host::tests` can still reach them by name, and a
+#     `pub(super) fn` is externally reachable, so they must be classified now.
+#     `pub(super)` here is `runner::host` and its descendants and nothing wider.
+#   * `current` named TWO items inside the parent's file -- `KeyCase::current`
+#     (`pub`) and `ProgramNaming::current` (private) -- and this record
+#     classifies by bare name, so one entry covered the reachable one. The split
+#     separates the pair into different files, and the private half becomes
+#     `pub(super)`, so each is now classified on its own.
+#
+# Every one is a widening. No name that was classified before is unclassified
+# now.
+#
+# All three children are `effect_free`, and that is what the split was arranged
+# to make true: no funnel, no effect site and no `cfg` moved. `HostRunner::run`
+# with its two `ProcessSite` values, `build_command_at` with the crate's one
+# host-side `std::process::Command`, the `Contained` mint and the reserved-key
+# vocabulary all stayed in the parent, which keeps the allowlist identity. Each
+# child DENIES all three governed lints at file scope and takes no
+# `effects/allowlist.toml` row.
+#
+# `crate_path` is recorded for each even though the modules are private: the
+# field is read only to build `{crate_path}::{name}` for a `funnel` or
+# `effectful` row, and all three classify neither.
+[[module]]
+path = "src/runner/host/environment.rs"
+crate_path = "upstroke::runner::host::environment"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "base",
+    "case",
+    "compose",
+    "current",
+    "from_process",
+    "lookup",
+    "preflight",
+    "reserved_values",
+    "same_key",
+    "with_base",
+]
+
+# `is_program` and `resolve_program` read the filesystem -- `Path::is_file` and,
+# on Unix, the execute bit -- and are classified EFFECT-FREE for the tree's own
+# reason: a read-only inspection is not an effect (`classify_object_residue` is
+# the precedent, and `ContainerRuntime`'s inspections are classified the same
+# way beside it). Nothing here creates, writes, renames or removes a path, and
+# the spawn that follows a resolution is the parent's `HostRunner::run`, which
+# `runner::tests::every_production_process_start_is_classified` accounts for
+# under `src/runner/host.rs`.
+[[module]]
+path = "src/runner/host/naming.rs"
+crate_path = "upstroke::runner::host::naming"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "composed_value",
+    "current",
+    "is_bare_name",
+    "is_program",
+    "resolve_program",
+]
+
+[[module]]
+path = "src/runner/host/probe.rs"
+crate_path = "upstroke::runner::host::probe"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "run_shell_probe",
 ]
 
 # PR6's Container funnel. The read-only inspections of `ContainerRuntime`
