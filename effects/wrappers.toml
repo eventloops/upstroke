@@ -351,6 +351,15 @@ effect_free = [
 path = "src/rundir/retention.rs"
 crate_path = "upstroke::rundir::retention"
 funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "fmt",
+    "kind",
+    "name",
+    "owner_field",
+]
+
 # The worktree record, the quiescence a reuse demands and the reasons the answer can be no. One `fn`: `VerifyFailure`'s `Display`. The verification that produces these values runs a Git child and is the parent's.
 [[module]]
 path = "src/workspace_manager/worktree.rs"
@@ -361,9 +370,6 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "fmt",
-    "kind",
-    "name",
-    "owner_field",
 ]
 
 [[module]]
