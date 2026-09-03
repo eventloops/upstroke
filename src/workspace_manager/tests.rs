@@ -17,6 +17,14 @@
 )]
 
 use super::*;
+// The `m4-workspace` split moved the path-hygiene predicates into a child, and
+// `use super::*` reaches the parent's namespace only. `is_reparse_point` is the
+// one item this suite drives that the parent does not call itself -- both
+// platform arms are asserted here directly -- so it is named through the
+// child's own `pub(super)` surface. No test is renamed, no assertion changes
+// and no body moves; this line is the whole of what the extraction owes this
+// file.
+use super::containment::is_reparse_point;
 
 use std::collections::BTreeSet;
 
@@ -24,9 +32,19 @@ use std::collections::BTreeSet;
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
 use super::fixture::{Fixture, git, git_out, scratch};
+// Named here rather than borrowed from the parent's import list. The split
+// moved the items that needed them into children -- the hook observers, the
+// residue classifier, the slot vocabulary and the changed-path decoder -- so
+// `src/workspace_manager.rs` no longer imports these and `use super::*` no
+// longer carries them. Same names, same crate paths, no new dependency.
+use std::ffi::OsStr;
+use std::sync::{Arc, Mutex};
+
 use crate::topology::effects::{
-    ClassHistogram, Evidence, EvidenceLabel, SamplingRecord, SyntheticRecord,
+    ClassHistogram, Evidence, EvidenceLabel, HookHarness, Injection, InjectionMode, ObjectResidue,
+    ResidueElement, ResourceRow, SamplingRecord, SnapshotSite, SyntheticRecord,
 };
+use crate::topology::paths::GitPath;
 
 /// A harness that answers `Proceed` and records everything.
 fn harness() -> (HarnessEffects, Arc<Mutex<HookHarness>>) {

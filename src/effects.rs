@@ -936,6 +936,14 @@ pub fn topology_modules_among<'a>(paths: &[&'a str]) -> Vec<&'a str> {
 pub const CLASSIFIED_MODULES: &[&str] = &[
     // shared
     "src/workspace_manager.rs",
+    "src/workspace_manager/containment.rs",
+    "src/workspace_manager/hooks.rs",
+    "src/workspace_manager/naming.rs",
+    "src/workspace_manager/object.rs",
+    "src/workspace_manager/parsers.rs",
+    "src/workspace_manager/residue.rs",
+    "src/workspace_manager/snapshot_ref.rs",
+    "src/workspace_manager/worktree.rs",
     "src/rundir.rs",
     "src/interaction.rs",
     "src/util.rs",

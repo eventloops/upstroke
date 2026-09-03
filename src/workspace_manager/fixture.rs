@@ -16,6 +16,9 @@
 
 use super::*;
 
+// `OsStr` came from the parent's import list until the `m4-workspace` split
+// moved its last production user into a child; named here for the same reason.
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // -----------------------------------------------------------------------
