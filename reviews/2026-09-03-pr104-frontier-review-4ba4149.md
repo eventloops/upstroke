@@ -2,7 +2,7 @@
 
 | field | value |
 |---|---|
-| **Binding verdict** | **CHANGES_REQUIRED**, at the head this pull request merges |
+| **Binding verdict** | **CHANGES_REQUIRED** at `4ba4149`. **This record does NOT bind to the head this pull request merges.** A `CHANGES_REQUIRED` pass is followed by a repair, so the current head is later than the reviewed SHA below; see the delta note for what changed and whether a further pass exists |
 | **Reviewed SHA** | `4ba41499cb2537215cb19d3c43260fc094d0fa81` |
 | Passes | 9 , each recorded below as it was returned |
 | Pull request | eventloops/upstroke#104, into `master` |
@@ -13,6 +13,12 @@
 This change went round 9 times. Every pass is recorded, in order, with
 its verdict as returned — a completed `CHANGES_REQUIRED` pass is not
 folded into the pass that followed it.
+
+**The final pass recorded here returned `CHANGES_REQUIRED`, so no reviewer has
+seen the tree at the current head.** The reviewed SHA is `4ba4149`; any
+commit after it carries the repair for the findings below and has not
+itself been reviewed. This record is evidence of what the reviewer said,
+not an attestation of the merge head.
 
 ## Pass 1 — `ca630af` — CHANGES_REQUIRED
 
