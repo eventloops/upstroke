@@ -423,14 +423,22 @@ mod tests {
     /// tests still need files on disk. §12's hermetic rule is what shapes the
     /// type: unique, exclusive, reclaimed.
     ///
-    /// *Unique* is the name — this process's id, a counter no two calls of this
-    /// process share, and a nanosecond timestamp, so neither a second call here
-    /// nor a later run after the pid is reused can land on a live directory.
-    /// *Exclusive* is [`fs::create_dir`] rather than `create_dir_all`: a leaf
-    /// that somehow already exists is an error rather than a directory this
-    /// test adopts, which is what a check-then-write cannot promise (§8).
-    /// *Reclaimed* is [`Drop`], so the ordinary success path leaves nothing for
-    /// a later run to find.
+    /// *Unique* is the name. It carries this process's id, a counter no two
+    /// calls in this process share, and a nanosecond timestamp. `Relaxed` is
+    /// the whole ordering that counter needs: uniqueness wants an atomic
+    /// increment, and no other memory is published through it.
+    ///
+    /// *Exclusive* is the arbitration point, and it is [`fs::create_dir`]
+    /// rather than `create_dir_all` (§8 and §10: a check followed by a write is
+    /// not exclusive). Whoever creates the leaf owns it until [`Drop`], and a
+    /// caller that finds one already there fails instead of sharing it. The
+    /// name is what makes a collision unreachable in practice; `create_dir` is
+    /// what makes a residual one, needing the same pid in another namespace at
+    /// the same nanosecond, an error rather than an adoption.
+    ///
+    /// *Reclaimed* is [`Drop`]. The crate keeps the `unwind` panic strategy in
+    /// every profile, so it runs for a failing test as well as a passing one
+    /// and neither leaves a directory behind.
     ///
     /// Every plan is written before [`Corpus::plan`] can hand out a path, for
     /// the reason [`opts`]'s pools file is written inside its `OnceLock`: a
