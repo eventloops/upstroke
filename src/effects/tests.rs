@@ -203,7 +203,7 @@ struct AllowlistEntry {
     /// How many **per-site** `#[expect(…)]` attributes of the recorded lints the
     /// file carries, or zero when its allowance is the module-level one.
     ///
-    /// `decisions/2026-08-30-readiness-lint-placement.md`. A per-site
+    /// `standards/02_standards_automated_baseline.md`. A per-site
     /// expectation is narrower than a module-level allow and the compiler owns
     /// its count in both directions; this is the reviewed number that count is
     /// checked against, so an annotation appearing or vanishing has to pass
@@ -392,7 +392,7 @@ fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
     const LINT: &str = "clippy::disallowed_methods";
     const SITES: usize = 6;
-    const DECISION: &str = "decisions/2026-08-30-readiness-lint-placement.md";
+    const DECISION: &str = "standards/02_standards_automated_baseline.md";
     // The records are prose and spell the count as a word. The two are bound
     // rather than restated: changing `SITES` without changing the word fails
     // here instead of quietly searching for a phrase no record contains.
@@ -829,6 +829,7 @@ fn the_legacy_section_never_contains_a_topology_module() {
         "src/topology/registry.rs",
         "src/runner/mod.rs",
         "src/workspace_manager.rs",
+        "src/workspace_manager/residue.rs",
         "src/engine/topology.rs",
         "src/engine/topology/create.rs",
     ];
@@ -873,6 +874,35 @@ fn the_legacy_section_never_contains_a_topology_module() {
             .any(|banned| submodule.starts_with(banned) || *banned == submodule),
         "the four shapes the packet sentence names already cover `{submodule}`, \
          so the fifth entry is dead weight and should be removed"
+    );
+
+    // And the gap the `src/workspace_manager/` shape closes, executed the same
+    // way. The sentence names `src/workspace_manager.rs`, a file, and the
+    // schema-4 workspace funnel grew a directory of production modules in W2 --
+    // so every shape that predates the `m4-workspace` split covers the parent
+    // and none of its children. Written out rather than derived from
+    // `TOPOLOGY_MODULES` minus an element, because the claim is about what the
+    // list looked like while the hole was open, and a derivation would follow
+    // the list wherever it went next.
+    let before_the_split = [
+        "src/topology/",
+        "src/runner/",
+        "src/workspace_manager.rs",
+        "src/engine/topology.rs",
+        "src/engine/topology/",
+    ];
+    let child = "src/workspace_manager/residue.rs";
+    assert!(
+        !child.starts_with("src/workspace_manager.rs"),
+        "the prefix relation this entry exists for no longer holds"
+    );
+    assert!(
+        !before_the_split
+            .iter()
+            .any(|banned| child.starts_with(banned) || *banned == child),
+        "the shapes that predate the `m4-workspace` split already cover \
+         `{child}`, so the `src/workspace_manager/` entry is dead weight and \
+         should be removed"
     );
 
     // The ban is on the LEGACY section alone: the same sentence puts
