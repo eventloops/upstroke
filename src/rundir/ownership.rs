@@ -21,12 +21,22 @@
 // level is scoped by the module tree and not by the file, and this module is
 // the crate's single deletion authority, so inheriting `src/rundir.rs`'s inner
 // `#![allow(clippy::disallowed_methods, disallowed_types, disallowed_macros)]`
-// is exactly the shape `PR6-LANEF-004` is about. The proof is read-only and
-// total -- `fs::read_to_string`, `fs::symlink_metadata` and `fs::canonicalize`,
-// none of them a governed primitive -- so all three are DENIED here and this
-// module takes no `effects/allowlist.toml` row. The deletion the token
-// authorises is `rundir::remove_private_husk`, in the parent, behind
+// is exactly the shape `PR6-LANEF-004` is about. The proof is read-only --
+// `fs::read_to_string`, `fs::symlink_metadata` and `fs::canonicalize`, none of
+// them a governed primitive -- so all three are DENIED here and this module
+// takes no `effects/allowlist.toml` row. The deletion the token authorises is
+// `rundir::remove_private_husk`, in the parent, behind
 // `RunDir.RemovePrivateHusk`, and it stays there.
+//
+// **Read-only is the whole of that argument, and it is not a claim of
+// totality.** The reads are unbounded: `.creating` or `owner.json` swapped for
+// a writer-less fifo blocks `read_to_string` in the kernel, and `husk_report`
+// calls this proof under the physical worktree lock, so an entry that never
+// proves is a lock held for ever. That code is byte-identical to the parent's
+// and out of this split's scope -- `prove_private_half_ownership`'s own older
+// doc sentence still says "total" and is carried unchanged for the same
+// reason. This prologue is what the split added, so this prologue is what
+// stops restating it.
 //
 // **Measured, not believed.** A probe of three lines -- a `std::fs::write`, a
 // `std::process::Command` and a `println!` -- is refused three times here, once
