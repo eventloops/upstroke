@@ -3130,14 +3130,39 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
             continue;
         }
         with_children += 1;
-        children.extend(walk(&directory));
+        // **Per arm, not in aggregate.** A union floor cannot see one arm go
+        // missing once the other arms are large enough to cover for it: the arms
+        // are of very unequal size, so a union floor set for the small ones
+        // survives losing the largest entirely. The floor is therefore stated
+        // where the loss happens -- once per arm, over the class rather than over
+        // the arms that happen to have a named assertion below -- so the next
+        // funnel root inherits the guard instead of needing its own.
+        let arm = walk(&directory);
+        assert!(
+            !arm.is_empty(),
+            "`{funnel}` has a child directory and the walk returned no file from it, so \
+             this funnel's arm of the census is measuring nothing"
+        );
+        children.extend(arm);
     }
     children.sort();
-    assert!(
-        with_children >= 2,
-        "only {with_children} funnel(s) have an out-of-line child directory; the census is \
-         scoped to fewer module trees than the tree has"
+    // Every funnel in the list, not a floor under it. The comment above says
+    // no arm is inert; this is that sentence asserted rather than believed, and
+    // a funnel that loses its directory is now the finding it always should
+    // have been rather than a silently skipped arm.
+    assert_eq!(
+        with_children,
+        FUNNELS.len(),
+        "only {with_children} of the {} funnels have an out-of-line child directory; the \
+         census is scoped to fewer module trees than the list names",
+        FUNNELS.len()
     );
+    // The union backstop stays, and it is a backstop: with the per-arm floor
+    // above it can no longer be the thing that catches a lost arm, and it is
+    // deliberately not raised to the true population, because every remaining
+    // W2 split adds files to one of these arms and a tightened union count
+    // would conflict at each merge while binding nothing the per-arm assertion
+    // does not already bind.
     assert!(
         children.len() >= 9,
         "the walk found only {} child modules; the census is measuring nothing",
