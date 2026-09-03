@@ -366,21 +366,14 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The hermetic config root every [`opts`] uses: created if absent, never
-    /// deleted, and inspected by [`run`] only for the three gate markers and
-    /// `upstroke.toml`.
-    fn hermetic_root() -> PathBuf {
-        let root =
-            env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("hermetic root");
-        root
-    }
-
     fn opts(plan: impl Into<PathBuf>) -> ValidateOptions {
+        let hermetic_root =
+            env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
+        fs::create_dir_all(&hermetic_root).expect("hermetic root");
         ValidateOptions {
             plan_path: plan.into(),
             config_path: None,
-            config_root: hermetic_root(),
+            config_root: hermetic_root,
             engine_limits: config::EngineLimits::Fresh,
             pools_path: Some({
                 // A real, empty pools file: an explicit `--pools` that does not
@@ -425,8 +418,7 @@ mod tests {
 
     /// One plan of [`crate::plan::corpus`], written under `root` by the name it
     /// carried under `fixtures/`, so [`run`] can read it from a path. It owns
-    /// nothing: the root is the caller's. It does not delete, and it is not
-    /// handed a root that was cleared by deleting — see [`hermetic_root`].
+    /// nothing: the root is the caller's, and it does not delete.
     fn write_plan(root: &Path, name: &str, text: &str) -> PathBuf {
         let plan = root.join(name);
         fs::write(&plan, text).expect("plan");
