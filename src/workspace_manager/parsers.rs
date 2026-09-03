@@ -1,12 +1,14 @@
 //! Decoders for the bytes Git's plumbing hands back.
 //!
-//! Three grammars, all NUL-delimited and none of them UTF-8 by assumption:
-//! `git worktree list --porcelain -z`, `git diff --name-status -M -z`, and the
-//! `gitdir` file of a linked-worktree registration. They are functions over
-//! bytes so that the hostile cases -- an undecodable path, an embedded newline,
-//! a truncated record, a registration that names something outside the root --
-//! can be exercised on every platform rather than only on the one whose
-//! filesystem can hold them.
+//! Three grammars, none of them UTF-8 by assumption. **Two are NUL-delimited**
+//! -- `git worktree list --porcelain -z` and `git diff --name-status -M -z`,
+//! both read by splitting on the zero byte -- and the third is not: the `gitdir`
+//! file of a linked-worktree registration holds **one textual path**, which
+//! [`registration_checkout`] trims of ASCII whitespace and decodes whole. They
+//! are functions over bytes so that the hostile cases -- an undecodable path, an
+//! embedded newline, a truncated record, a registration that names something
+//! outside the root -- can be exercised on every platform rather than only on
+//! the one whose filesystem can hold them.
 //!
 //! The commands whose output these read are run by the parent, inside its
 //! funnels; nothing here starts a process or touches a path.

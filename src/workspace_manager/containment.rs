@@ -80,10 +80,12 @@ pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 /// under `/var` — including every default temporary directory on that OS —
 /// would have every run refused for a link they did not create and cannot
 /// remove. No live passage asks for that, and the containment the refusal
-/// exists to protect is unaffected: every deletion in this module goes through
-/// [`WorkspaceManager::contained`](super::WorkspaceManager::contained), which
-/// compares **canonical** paths, so a
-/// resolved link cannot carry a removal outside the root.
+/// exists to protect is unaffected: every deletion **in this subsystem** goes
+/// through [`WorkspaceManager::contained`](super::WorkspaceManager::contained),
+/// which compares **canonical** paths, so a resolved link cannot carry a removal
+/// outside the root. (This module performs no deletion of its own -- the
+/// sentence said "in this module" when it lived in the parent, and the split is
+/// what made that reading vacuous rather than load-bearing.)
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
@@ -152,8 +154,10 @@ pub(super) fn refuse_unreal_directory(path: &Path) -> Result<(), UpstrokeError> 
 /// `\\?\C:\...`, and Git — an MSYS program — rewrites that to `//?/C:/...`
 /// and fails with `could not create leading directories … Invalid argument`.
 /// Every `git worktree add` under an execution root derived from a
-/// canonicalized private root failed with it. Whatever this module hands to Git
-/// has to be a path Git can open, so the verbatim prefix comes back off.
+/// canonicalized private root failed with it. Whatever **the parent** hands to
+/// Git has to be a path Git can open, so the verbatim prefix comes back off
+/// here, before the path leaves this module. (Nothing in this module invokes
+/// Git; it returns paths, and the parent's funnels are what run the children.)
 ///
 /// A path that genuinely *requires* the verbatim form — one longer than
 /// `MAX_PATH`, or carrying a component Win32 would reject — is left as it is:
