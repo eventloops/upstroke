@@ -32,7 +32,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::error::UpstrokeError;
-use crate::topology::effects::{EffectSiteId, HookHarness, HookPhase, Injection, SubEffectPoint};
+use crate::topology::effects::{
+    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, SubEffectPoint,
+};
 use crate::util::DurabilityLedger;
 
 /// What a funnel tells whoever is watching, at both hook phases and at the
@@ -64,6 +66,18 @@ pub trait EffectHooks {
     fn durability_ledger(&self) -> DurabilityLedger {
         DurabilityLedger::off()
     }
+
+    /// Why this observer answered [`Injection::Error`], when the reason is
+    /// its own state rather than an armed injection.
+    ///
+    /// `None`, the default, means the refusal is the injection it looks like
+    /// and [`apply`] words it as one. [`HarnessEffects`] answers with the
+    /// poison it found, and [`consult`] words the refusal from that instead,
+    /// so a caller reads "harness poisoned" and never a fault it believes it
+    /// armed itself.
+    fn refusal_cause(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What production passes: nothing is armed and nothing is recorded.
@@ -93,10 +107,24 @@ impl EffectHooks for NoHooks {
 /// [`DurabilityLedger`] gives: a test hands a clone into a funnel and still
 /// reads what the funnel recorded. `Default` is an observer on a fresh
 /// harness that only [`Self::harness`] can reach.
+///
+/// **A poisoned harness.** Poison means another thread panicked while
+/// holding the harness, and what it left cannot be trusted, so this observer
+/// never records into it again and remembers that it found it
+/// ([`Self::poisoned`]). At each coordinate it answers the one legal thing:
+/// a refusal wherever a refusal is a legal answer, which is `Before`,
+/// `After`, and a point in [`InjectionMode::ErrorReturn`], and `Proceed` at a
+/// point whose mode is [`InjectionMode::Kill`], where the only legal
+/// non-`Proceed` answer is death and an `Error` would invent an error-return
+/// contract the point does not declare. The refusal's message says the
+/// harness is poisoned; it never reads as an injected fault.
 #[derive(Debug, Clone, Default)]
 pub struct HarnessEffects {
     harness: Arc<Mutex<HookHarness>>,
     ledger: DurabilityLedger,
+    /// Set the first time [`EffectHooks::phase`] finds the harness poisoned;
+    /// [`Self::poisoned`] and [`EffectHooks::refusal_cause`] read it.
+    poisoned: bool,
 }
 
 impl HarnessEffects {
@@ -110,6 +138,7 @@ impl HarnessEffects {
         Self {
             harness,
             ledger: DurabilityLedger::off(),
+            poisoned: false,
         }
     }
 
@@ -126,6 +155,16 @@ impl HarnessEffects {
         self
     }
 
+    /// Whether this observer has found the harness poisoned.
+    ///
+    /// A coverage suite reads this after driving a funnel: a site that ran
+    /// past a `Kill`-only point while the harness was poisoned proceeded and
+    /// was not recorded, and this is the only place that fact survives.
+    #[must_use]
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// The durability ledger this observer records into.
     ///
     /// A handle clone: the ledger is an optional shared log and cloning it
@@ -137,8 +176,8 @@ impl HarnessEffects {
 }
 
 impl EffectHooks for HarnessEffects {
-    /// One `hook` call under the harness's lock, or a refusal if the lock is
-    /// poisoned.
+    /// One `hook` call under the harness's lock, or, if the lock is poisoned,
+    /// a refusal at a hook phase and `Proceed` at a point.
     ///
     /// **What the lock protects.** `HookHarness::hook` writes up to three of
     /// the harness's records in one call (the open fast sequence's touched
@@ -152,22 +191,60 @@ impl EffectHooks for HarnessEffects {
     /// ledger takes its own lock. The two locks are never held together, so
     /// there is no acquisition order to keep.
     ///
-    /// **A poisoned harness refuses.** Poison means another thread panicked
-    /// while holding the harness, and what it left cannot be trusted: a
-    /// `hook` call may have written some of its fields and not the rest, and
-    /// a fast sequence the panicking holder opened stays open, so anything
-    /// recorded next would be attributed to it. Recording into that would
-    /// manufacture coverage evidence, and this is production code that may
-    /// not panic, so the observer answers [`Injection::Error`] and the funnel
-    /// returns a refusal naming the site and the phase instead of running or
-    /// completing the primitive. The test driving the funnel fails there,
-    /// which is the defined outcome a worker panic must have; the panic
-    /// itself is reported by whoever joins the worker.
+    /// **A poisoned harness is never recorded into.** Poison means another
+    /// thread panicked while holding the harness, and what it left cannot be
+    /// trusted: a `hook` call may have written some of its fields and not
+    /// the rest, and a fast sequence the panicking holder opened stays open,
+    /// so anything recorded next would be attributed to it. Recording into
+    /// that would manufacture coverage evidence, and this is production code
+    /// that may not panic, so the guard is not recovered and the harness is
+    /// not touched.
+    ///
+    /// **Where a refusal is legal, it refuses.** `Before` and `After` exist
+    /// at every site and error-return is universal at them, and a point
+    /// consulted in [`InjectionMode::ErrorReturn`] declares that mode, so at
+    /// those coordinates the observer answers [`Injection::Error`] and
+    /// [`consult`] turns it into a refusal that names the site, the phase and
+    /// the poison, from [`EffectHooks::refusal_cause`]. The test driving the
+    /// funnel fails there, which is the defined outcome a worker panic must
+    /// have; the panic itself is reported by whoever joins the worker.
+    ///
+    /// **Where only `Kill` is legal, it proceeds.** A point consulted in
+    /// [`InjectionMode::Kill`] can legally answer `Proceed` or `Kill` and
+    /// nothing else: `IdUnread` declares `Kill` alone because the design
+    /// tables no recovery for it (`SubEffectPoint::modes` in
+    /// `crate::topology::effects`), and answering `Error` there would invent
+    /// that contract and report a `/kill` coordinate on a process still
+    /// alive. So the site proceeds, nothing is recorded, [`Self::poisoned`]
+    /// remembers it, and the refusal comes at the site's `After` with the
+    /// same cause.
     fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
         match self.harness.lock() {
             Ok(mut harness) => harness.hook(site, phase),
-            Err(_poisoned) => Injection::Error,
+            Err(_poisoned) => {
+                self.poisoned = true;
+                match phase {
+                    HookPhase::Before
+                    | HookPhase::After
+                    | HookPhase::Point {
+                        mode: InjectionMode::ErrorReturn,
+                        ..
+                    } => Injection::Error,
+                    HookPhase::Point {
+                        mode: InjectionMode::Kill,
+                        ..
+                    } => Injection::Proceed,
+                }
+            }
         }
+    }
+
+    fn refusal_cause(&self) -> Option<String> {
+        self.poisoned.then(|| {
+            "harness poisoned: another thread panicked while holding the shared HookHarness, so \
+             nothing more is recorded into it"
+                .to_owned()
+        })
     }
 
     /// The same handle clone as [`Self::ledger`].
@@ -198,6 +275,37 @@ pub(super) fn apply(
         Injection::Error => Err(UpstrokeError::Refused {
             message: format!("the `{site}` funnel was made to fail at its `{phase}` phase"),
         }),
+    }
+}
+
+/// Consult `phase` of `site` and do what the observer answered, with the
+/// observer's own reason appended to a refusal.
+///
+/// One function for what the funnel, [`point`] and the parent's hand-rolled
+/// commit-tree sequence all do, so a refusal reads the same everywhere and
+/// the phase passed to the observer is the phase the message names.
+pub(super) fn consult(
+    hooks: &mut dyn EffectHooks,
+    site: EffectSiteId,
+    phase: HookPhase,
+) -> Result<(), UpstrokeError> {
+    let answer = hooks.phase(site, phase);
+    refuse_or_apply(hooks, answer, site, phase)
+}
+
+/// [`apply`], except that an [`Injection::Error`] the observer gives a cause
+/// for is worded from the cause and not as an injected fault.
+fn refuse_or_apply(
+    hooks: &dyn EffectHooks,
+    answer: Injection,
+    site: EffectSiteId,
+    phase: HookPhase,
+) -> Result<(), UpstrokeError> {
+    match (answer, hooks.refusal_cause()) {
+        (Injection::Error, Some(cause)) => Err(UpstrokeError::Refused {
+            message: format!("the `{site}` funnel refused at its `{phase}` phase: {cause}"),
+        }),
+        (answer, _) => apply(answer, site, phase),
     }
 }
 
@@ -236,13 +344,9 @@ pub(super) fn funnel<T, F>(
 where
     F: FnOnce() -> Result<T, UpstrokeError>,
 {
-    apply(
-        hooks.phase(site, HookPhase::Before),
-        site,
-        HookPhase::Before,
-    )?;
+    consult(hooks, site, HookPhase::Before)?;
     let value = primitive()?;
-    apply(hooks.phase(site, HookPhase::After), site, HookPhase::After)?;
+    consult(hooks, site, HookPhase::After)?;
     Ok(value)
 }
 
@@ -274,7 +378,7 @@ pub(super) fn point(
         }
     }
     match decision {
-        Some((injection, phase)) => apply(injection, site, phase),
+        Some((injection, phase)) => refuse_or_apply(hooks, injection, site, phase),
         None => Ok(()),
     }
 }
@@ -284,7 +388,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::topology::effects::{InjectionMode, WorktreeSite};
+    use crate::topology::effects::WorktreeSite;
     use crate::util::DurableStep;
 
     /// Any site will do: the protocol under test does not read it, and the
@@ -470,6 +574,7 @@ mod tests {
         assert!(shared.is_poisoned(), "the harness is poisoned");
 
         let mut hooks = HarnessEffects::new(Arc::clone(&shared));
+        assert!(!hooks.poisoned(), "nothing has been consulted yet");
         assert_eq!(hooks.phase(SITE, HookPhase::Before), Injection::Error);
         let mut ran = false;
         let message = refusal(funnel(&mut hooks, SITE, || {
@@ -478,8 +583,93 @@ mod tests {
         }));
         assert!(!ran, "the primitive ran against a poisoned harness");
         assert!(
-            message.contains("`before` phase"),
-            "the refusal names the phase at which the harness was found poisoned: {message}"
+            message.contains("`before` phase")
+                && message.contains("harness poisoned")
+                && !message.contains("made to fail"),
+            "the refusal names the phase and the poison, never an armed fault: {message}"
+        );
+        assert!(hooks.poisoned(), "the observer remembers the poison");
+
+        // What the worker left is exactly what it left: nothing was recorded
+        // into the poisoned harness, at any phase, by any of the calls above.
+        let harness = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            harness.count(SITE, HookPhase::Before),
+            0,
+            "the refused coordinate's count changed"
+        );
+        assert_eq!(
+            harness.executions(),
+            0,
+            "a hook was recorded after the poison"
+        );
+        assert!(harness.reached().is_empty());
+        assert!(
+            harness
+                .fast_sequence("abandoned")
+                .is_some_and(|sequence| sequence.touched().is_empty()),
+            "the abandoned sequence was attributed a site"
+        );
+    }
+
+    /// The harness is poisoned while the primitive runs, between `Before`
+    /// and the points. At a point declared in `Kill` mode alone the site
+    /// proceeds, since refusing there would invent an error-return contract
+    /// the point does not have, and the refusal comes at `After` with the
+    /// cause; at a point consulted in `ErrorReturn` mode the refusal is
+    /// legal and comes there, at that coordinate.
+    #[test]
+    fn a_harness_poisoned_mid_funnel_proceeds_at_a_kill_only_point_and_refuses_where_it_may() {
+        let shared = Arc::new(Mutex::new(HookHarness::new()));
+        let mut hooks = HarnessEffects::new(Arc::clone(&shared));
+        assert_eq!(hooks.phase(SITE, HookPhase::Before), Injection::Proceed);
+        assert!(!hooks.poisoned());
+
+        let poisoner = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("not yet poisoned");
+            panic!("a worker dies while holding the harness");
+        });
+        assert!(worker.join().is_err());
+
+        assert_eq!(
+            SubEffectPoint::IdUnread.modes(),
+            &[InjectionMode::Kill],
+            "the point under test no longer declares Kill alone"
+        );
+        point(&mut hooks, SITE, SubEffectPoint::IdUnread)
+            .expect("a Kill-only point proceeds under poison");
+        assert!(
+            hooks.poisoned(),
+            "the observer remembers the poison it walked past"
+        );
+
+        let message = refusal(point(&mut hooks, SITE, TWO_MODES));
+        assert!(
+            message.contains("/error-return` phase")
+                && message.contains("harness poisoned")
+                && !message.contains("/kill"),
+            "a point consulted in ErrorReturn mode is refused there, with the cause: {message}"
+        );
+
+        let message = refusal(consult(&mut hooks, SITE, HookPhase::After));
+        assert!(
+            message.contains("`after` phase") && message.contains("harness poisoned"),
+            "the refusal comes at After and names the poison: {message}"
+        );
+        let harness = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            harness.executions(),
+            1,
+            "only the Before hook, recorded before the poison, is in the harness"
+        );
+        assert!(
+            harness.reached().is_empty(),
+            "a point was recorded as reached after the poison"
         );
     }
 
