@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn windows_crash_containment_docs_match_shipped_job_ownership() {
         let readme = include_str!("../README.md");
-        let design = include_str!("../DESIGN.md");
+        let design = include_str!("../design/15_design_event_log_resume_run_layout.md");
         assert!(readme.contains("kill-on-close Job Object"), "{readme}");
         assert!(readme.contains("before its primary"), "{readme}");
         assert!(readme.contains("thread runs"), "{readme}");
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn design_does_not_authorize_legacy_subject_only_adoption() {
-        let design = include_str!("../DESIGN.md");
+        let design = include_str!("../design/15_design_event_log_resume_run_layout.md");
         assert!(
             design.contains("never** adopted from parent plus subject alone"),
             "schema-1/2 recovery must stay fail-closed"

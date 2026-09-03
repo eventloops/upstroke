@@ -1,0 +1,16 @@
+## 16. Agent adapters (P2)
+
+**Claude Code** (v0.1): `claude -p` via stdin, `--output-format json` (result, session id, cost/usage parsed defensively), `--model`, `--max-turns`, `--resume <session-id>` for same-rung retries. Permissions: never the skip-all flag — the adapter materializes a per-run `.claude/settings.json` granting file tools plus `Bash(<each gate cmd>)` to edit profiles and read-only tools to reviewers. Docs: https://docs.claude.com/en/docs/claude-code/headless (flags verified Aug 2026).
+
+Both Claude Code and Copilot also state `--effort` on every attempt. Their probes validate the complete shared enum (`low`, `medium`, `high`, `xhigh`, `max`) in the option's own help block; merely advertising the flag is insufficient because an older CLI may expose a narrower choice set.
+
+**GitHub Copilot CLI** (v0.1): the multi-vendor pool — Claude, GPT, and Gemini models through one harness and one subscription. **Route A ships; ACP does not, and the reason is the same one that makes this the churniest adapter.** Neither `--acp` nor `--stdio` appears in GitHub's programmatic reference, so there is no documented surface to pin known-good behavior against — and pinning per version is precisely what this adapter must do. ACP also needs a persistent bidirectional JSON-RPC session, where the rest of v0.1 spawns a process, feeds it, and reads what came back. `probe()` records `acp` as a capability axis regardless, so Route B stays a change inside one file once it is documented and stable.
+
+Route A concretely: `-s` (response only, no decoration), `--no-ask-user`, `--model=`, and granular `--allow-tool='shell(cargo test)'` / `--deny-tool=` mapping one-to-one onto profile permissions — never the `--allow-all*` / `--yolo` class (§20). **The prompt goes on stdin and `-p` is never passed**: GitHub documents `echo … | copilot` as a programmatic form and documents that piped input is *ignored* when `-p` is also given, so passing both would silently discard the real prompt. Stdin is also the only delivery that survives Windows, where npm installs `copilot.cmd` and `cmd /C` caps the command line near 8 KB — far below a complete review prompt.
+
+What this route does not give us is recorded honestly rather than assumed: no JSON envelope, so no session id, no usage, and no cost — Copilot attempts appear in the ledger unpriced rather than free — and no documented session resume, so §11.4's same-rung retry starts fresh with accumulated feedback. Both are `Caps` axes the engine already dispatches on, and both default *pessimistic* here (advertised in `--help` or assumed absent), because claiming a capability this CLI lacks breaks every retry rather than merely degrading one. Its billing moved to AI Credits in June 2026 with legacy annual plans keeping request multipliers — both shapes are handled by the capacity engine, not the adapter. Docs: https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference.
+
+**Aider** (v0.2): `--yes`, `--model`; brings local models via OpenAI-compatible endpoints — the free pool for the home-server tier.
+
+Adapter rule inherited as an invariant: subprocess the real binary, official CLIs only, no spoofed headers — ToS safety is a feature, not a compliance chore.
+
