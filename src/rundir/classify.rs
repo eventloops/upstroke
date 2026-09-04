@@ -6,12 +6,24 @@
 //! (anything else)". Read-only, and bounded rather than total: the census
 //! holds the physical worktree lock across it, so an entry that never
 //! classifies is a lock held for ever, and every bound here exists for that.
-//! What is not bounded is named where it lives — `first_committed_line`
-//! refuses to open anything that is not a regular file, and the window between
-//! that check and the `open` is still open, so a path swapped for a
-//! writer-less fifo inside it blocks in the kernel. That race is byte-identical
-//! to the parent's and out of this split's scope; asserting totality over it
-//! would not be.
+//! What is not bounded is named where it lives, and it is one syscall.
+//! [`first_committed_line`] refuses to open anything whose *name* is not a
+//! regular file, and the window between that check and the `open` is still
+//! open, so a path swapped inside it for a writer-less fifo blocks in the
+//! kernel before any bound on the read can apply.
+//!
+//! **Measured rather than restated, and then decided.** The block is real
+//! (`SWEEP-CLASSIFY-003`, with the reproduction and its output in
+//! `reviews/FINDINGS.md`), and the usual close on Unix — open with
+//! `O_NONBLOCK` and take the file type from the descriptor — cannot be written
+//! here: every non-blocking open is a governed primitive. `clippy.toml` denies
+//! `std::fs::File::options` and the `std::fs::OpenOptions` it hands out, and
+//! `libc::open` and `libc::fcntl` beside them; an allowance is a module-level
+//! attribute in a file listed in `effects/allowlist.toml`, which is exactly the
+//! posture this module deliberately does not take (below). So the close belongs
+//! to the funnel parent, as a site-taking non-blocking read-only open, and it is
+//! a deferred row against `src/rundir.rs` rather than a sentence here saying the
+//! race is somebody else's.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree and not by the file, so an out-of-line
@@ -83,17 +95,46 @@ pub(super) const FIRST_LINE_WINDOW: u64 = 1 << 20;
 /// The fixed buffer [`newline_offset_from`] scans through. Never allocated per
 /// byte read and never grown, so a log with no newline at all — the shape the
 /// window exists for — costs one stack buffer however large the file is.
+///
+/// That is the *scan*'s memory, and not the probe's: a first line that is found
+/// is then materialised at its own length by [`first_line_within`], which the
+/// packet requires and this constant does not bound. See that function.
 pub(super) const SCAN_CHUNK: usize = 64 * 1024;
+
+/// How many `Interrupted` reads [`newline_offset_from`] retries in one scan
+/// before answering `None`.
+///
+/// `Interrupted` is `std::io`'s own convention for "this read did not happen",
+/// so answering an end of file on it would classify a committed run as a husk —
+/// the direction that must never be taken. It is also the one branch of the scan
+/// that spends no budget, and `startup_census` holds the physical worktree lock
+/// across this call, so retrying it without a bound is precisely the lock held
+/// for ever that every other bound in this module exists to prevent: before this
+/// constant, a source that answered `Interrupted` for ever was scanned for ever,
+/// and the loop's own doc claimed a termination it did not have.
+///
+/// A regular file does not produce `Interrupted` at all, so no log this probe is
+/// pointed at reaches even the first retry and the value cannot change what any
+/// real run directory classifies as. It bounds the pathological source and
+/// nothing else; sixty-four is far past any plausible signal storm and still a
+/// number a reader can hold in their head.
+pub(super) const INTERRUPTED_RETRIES: u32 = 64;
 
 /// Classify one run directory. Read-only, and bounded rather than total.
 ///
-/// The read is bounded; acquiring the handle is not. `first_committed_line`
-/// refuses anything that is not a regular file, and a path swapped for a
-/// writer-less fifo inside the window between that check and the `open`
-/// blocks in the kernel — under the physical worktree lock the census holds
-/// across this call. That race is byte-identical to the parent's and out of
-/// this split's scope; asserting totality over it would not be, which is why
-/// this sentence no longer does.
+/// The read is bounded; acquiring the handle is not. [`first_committed_line`]
+/// refuses anything whose name is not a regular file, and a path swapped for a
+/// writer-less fifo inside the window between that check and the `open` blocks
+/// in the kernel — under the physical worktree lock the census holds across
+/// this call. The module doc says what was measured, why the non-blocking open
+/// that would close it cannot be written in this module, and where the close
+/// belongs; this sentence asserts no totality it does not have.
+///
+/// **Every other way this answers `Husk` is bounded**, including the ones that
+/// are failures rather than verdicts: an `events.jsonl` that cannot be stat'd,
+/// opened or read is a `Husk`, which is `startup_census`'s "anything else" and
+/// not a claim that nothing is there. What the census does with each of those
+/// answers is in [`first_committed_line`].
 #[must_use]
 pub fn classify_run_dir(public: &Path) -> RunDirClass {
     match first_committed_line(public) {
@@ -108,6 +149,19 @@ pub fn classify_run_dir(public: &Path) -> RunDirClass {
 /// header and only *then* "select[s] the engine by schema", so classification
 /// cannot be schema-specific — a schema-4 log must classify through the same
 /// call as a schema-1 one, and each engine's own event type refuses the other's.
+///
+/// **`None` is two different facts, and this signature holds one.** Two of the
+/// folds below are honest absence: a first line that is not UTF-8 and one that
+/// is not this header are not a valid `run_started`, which is what the packet
+/// asks. The rest — the stat, the `open`, the fstat, the two reads and the seek
+/// — fold an I/O failure the filesystem declined to explain into the same
+/// `None`, so "I could not read it" and "there is nothing here" reach
+/// `startup_census` as one answer. That is what `startup_census`'s "anything
+/// else" licenses, and the paragraphs below say what the census then does with
+/// it, but the *reason* is lost at this return and no caller can recover it.
+/// Giving the census report a reason is `SWEEP-CLASSIFY-010`, a deferred row
+/// against `src/engine/topology/startup.rs`: it is a shape this signature
+/// cannot carry.
 fn first_committed_line(public: &Path) -> Option<RunStartedHeader> {
     let path = public.join(EVENT_LOG);
     // `open(2)` runs *before* the read, and the read's bound cannot defend it
@@ -129,10 +183,32 @@ fn first_committed_line(public: &Path) -> Option<RunStartedHeader> {
     // a path is a link — `super::CommitRecordPresence::Unknown` is treated as
     // `Present` by every caller, and `super::ownership` refuses a locator chain
     // that passes through a reparse point and takes only `NotFound` as proof
-    // that `committed.json` is absent. It is the safe direction: a husk is never
-    // deleted on shape alone — deletion additionally requires the ownership
-    // proof, which requires `committed.json` to be absent, and a run that
-    // reached `run_started` published one at P5b.
+    // that `committed.json` is absent.
+    //
+    // **What makes `Husk` the safe direction here is the directory listing, not
+    // the commit record**, and the sentence this one replaces had that wrong. Of
+    // `super::PrivateHalfOwnership`'s three answers, two reclaim. `Proven`
+    // reclaims both halves and does require `committed.json` to be absent
+    // (conjunct 12), which a run that reached `run_started` published at P5b.
+    // `NothingBound` reclaims the **public** half through
+    // `super::remove_public_husk` with no commit-record check anywhere on the
+    // path — and it is what the proof answers as soon as the marker cannot be
+    // read, which is every committed run, since the marker is removed at P6.
+    // What stops it is `super::ownership`'s `unbound_shape`, which reclaims only
+    // a bare directory or one holding the staging file alone: an `events.jsonl`
+    // this probe failed to read is an entry in that listing, so the answer is
+    // `RetainReason::MarkerlessWithContent`. Both halves are pinned by
+    // `proof_cases`' "marker-less husk carrying run-scoped content" and "bare
+    // public directory".
+    //
+    // The residual is that the listing is a *second* observation of a directory
+    // this probe already failed to read once, and `super::read_dir_names`
+    // answers `[]` for a `read_dir` that failed — which is the reclaiming
+    // answer. A transient whole-process failure (`EMFILE`, `ENFILE`) fails the
+    // `open` below, the marker read and that listing at the same moment, and
+    // `remove_public_husk` lists the directory again once it has passed. Neither
+    // fold is in this file; both are `SWEEP-CLASSIFY-009`, a deferred row
+    // against `src/rundir.rs` and `src/rundir/ownership.rs`.
     if !fs::symlink_metadata(&path).is_ok_and(|entry| entry.is_file()) {
         return None;
     }
@@ -188,6 +264,22 @@ pub(super) fn first_line(file: &mut File) -> Option<Vec<u8>> {
 /// two platforms this ships on and cannot be built at all on the other; over
 /// this signature the same source is a twenty-line reader, so the termination
 /// claim is measured on every host rather than on Linux only.
+///
+/// **The scan is constant memory and the answer is not.** A source with no
+/// newline in it costs one [`SCAN_CHUNK`] buffer however long it is, which is
+/// the shape the window exists for; a first line that *is* found is then
+/// materialised at its own length, because `startup_census` states no size
+/// exception and the parse needs the whole line. So the probe's peak memory is
+/// the length of the log's first line, and a census of a directory holding a
+/// hostile one pays it. Bounding that is a decision about what the census may
+/// spend rather than about what a first line is, so it is `SWEEP-CLASSIFY-012`,
+/// a deferred row, rather than a bound invented here.
+///
+/// **Two reads, and the second is not assumed to agree with the first.** The
+/// scan finds an offset in constant memory and then the line is re-read from
+/// the start; a source that changed in between could hand the re-read bytes
+/// that are not a first line at all. Every property the caller relies on is
+/// therefore re-established on the re-read itself, at the site.
 pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> Option<Vec<u8>> {
     let mut window = Vec::new();
     source
@@ -204,12 +296,24 @@ pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> O
     // only what the window did not.
     let scanned = window.len() as u64;
     let length = newline_offset_from(source, scanned, bound.saturating_sub(scanned))?;
+    // Re-read from the start and re-establish the whole contract on the bytes
+    // this function is about to return, rather than carrying the scan's view of
+    // a source that may have changed underneath it: `length + 1` bytes, the last
+    // of them the terminator and none of the others one. A log that shrank has
+    // fewer bytes; one rewritten so a newline lands earlier fails the third
+    // check and one rewritten so it lands later fails the second. `Husk` is the
+    // safe direction for all three, and it is the one the shrunk log already
+    // took — the other two used to return bytes that were not a first line at
+    // all, and the terminator requirement `startup_census` states is exactly
+    // what they broke.
+    let want = length.saturating_add(1);
     source.seek(SeekFrom::Start(0)).ok()?;
     let mut line = Vec::new();
-    source.by_ref().take(length).read_to_end(&mut line).ok()?;
-    // A log that shrank between the scan and the re-read has no first line this
-    // probe can vouch for; `Husk` is the safe direction.
-    (line.len() as u64 == length).then_some(line)
+    source.by_ref().take(want).read_to_end(&mut line).ok()?;
+    if line.len() as u64 != want || line.pop() != Some(b'\n') {
+        return None;
+    }
+    (!line.contains(&b'\n')).then_some(line)
 }
 
 /// The absolute offset of the first `\n` at or after `offset`, in constant
@@ -219,21 +323,39 @@ pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> O
 /// also the length of the line that precedes it, which is what the caller
 /// wants.
 ///
-/// **Termination**: every iteration either returns or spends at least one byte
-/// of `budget`, which is finite. The single branch that spends nothing is
-/// `Interrupted`, which is `std::io`'s own convention for "this read did not
-/// happen" and which a regular file does not produce; treating it as an end
-/// instead would classify a committed run as a husk, which is the direction
-/// that must never be taken.
+/// **Termination**: every iteration either returns, spends at least one byte of
+/// `budget`, or spends one of [`INTERRUPTED_RETRIES`]. All three are finite, so
+/// the loop is — which the sentence this replaces claimed while naming, two
+/// clauses later, the branch that made it false. `Interrupted` is `std::io`'s
+/// own convention for "this read did not happen" and a regular file does not
+/// produce it; treating it as an end would classify a committed run as a husk,
+/// which is the direction that must never be taken, so it is retried, and the
+/// allowance is what keeps retrying it finite.
 fn newline_offset_from<R: Read>(source: &mut R, mut offset: u64, mut budget: u64) -> Option<u64> {
     let mut chunk = [0_u8; SCAN_CHUNK];
+    let mut interrupted = 0_u32;
     while budget > 0 {
-        let want = usize::try_from(budget.min(SCAN_CHUNK as u64)).ok()?;
+        // The smaller of two `usize`s, and not a conversion that can fail: the
+        // `usize::try_from(..).ok()?` this replaces answered `Husk` for a case
+        // no target this crate builds for can reach, which is a `?` that decided
+        // nothing (§7).
+        let want = usize::try_from(budget)
+            .unwrap_or(SCAN_CHUNK)
+            .min(SCAN_CHUNK);
         // A short read is normal, not an end: only zero means end of file.
         let read = match source.read(&mut chunk[..want]) {
             Ok(0) => return None,
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // Clamped, so a `Read` implementation that answers more than it was
+            // given cannot index past the buffer or underflow the budget. `File`
+            // does not; this function is generic and reachable from a test.
+            Ok(read) => read.min(want),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if interrupted == INTERRUPTED_RETRIES {
+                    return None;
+                }
+                interrupted += 1;
+                continue;
+            }
             Err(_) => return None,
         };
         if let Some(at) = chunk[..read].iter().position(|byte| *byte == b'\n') {

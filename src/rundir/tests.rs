@@ -905,6 +905,55 @@ fn every_publication_prefix_classifies_as_the_packet_names_it() {
     );
 }
 
+/// A symlinked `events.jsonl` is a `Husk` **whatever it points at**, and the
+/// guard that makes it one is `symlink_metadata` rather than `metadata`.
+///
+/// That difference is the whole of what narrows the check-to-open race to a swap
+/// of a directory entry the census owns, and nothing measured it: the other test
+/// that plants a link points it at `/dev/zero`, which `metadata` refuses too
+/// because a character device is not a regular file, so both spellings pass it.
+/// This link points at a **valid committed log**, which is the one target the
+/// two spellings disagree about -- following it answers `Committed` and refusing
+/// it answers `Husk`.
+///
+/// Unix only: a symbolic *file* link on Windows needs a privilege the guest does
+/// not grant an ordinary test process, and the suite's other link is gated the
+/// same way.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_event_log_is_a_husk_however_valid_its_target() {
+    let root = scratch("symlinked-log");
+    let bytes = format!("{}\n", committed_line("01LINK", 3));
+
+    // The premise, stated rather than assumed: these exact bytes under this
+    // exact name are a committed run when the name is the file.
+    let direct = root.join("direct");
+    write(&direct.join(EVENT_LOG), bytes.as_bytes());
+    assert_eq!(
+        classify_run_dir(&direct),
+        RunDirClass::Committed,
+        "the target's own bytes are a committed run, or this measures nothing"
+    );
+
+    let target = root.join("a-real-log.jsonl");
+    write(&target, bytes.as_bytes());
+    let public = root.join("linked");
+    fs::create_dir_all(&public).expect("public");
+    std::os::unix::fs::symlink(&target, public.join(EVENT_LOG)).expect("symlink");
+    assert!(
+        fs::symlink_metadata(public.join(EVENT_LOG))
+            .expect("stat the link")
+            .file_type()
+            .is_symlink(),
+        "the planted entry must really be a symlink"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Husk,
+        "a symlinked events.jsonl is a husk whatever it points at"
+    );
+}
+
 #[test]
 fn a_missing_directory_and_a_missing_log_are_both_husks() {
     let root = scratch("absent");
@@ -1058,6 +1107,223 @@ fn the_probe_returns_the_lines_exact_bytes_on_both_paths() {
             line.len() - 1
         );
     }
+}
+
+/// A `Read + Seek` over a fixed buffer that answers `Interrupted` a scripted
+/// number of times once the cursor has passed `trigger`, and counts how many it
+/// really handed out.
+///
+/// Past `trigger` on purpose. The window read is `Take::read_to_end`, which
+/// retries `Interrupted` inside `std::io`, so a schedule firing from byte zero
+/// would be spent there and `newline_offset_from` -- the loop under test --
+/// would never see one.
+struct Interrupting {
+    bytes: Vec<u8>,
+    at: usize,
+    trigger: usize,
+    schedule: u32,
+    fired: u32,
+}
+
+impl Read for Interrupting {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at >= self.trigger && self.fired < self.schedule {
+            self.fired += 1;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        let at = self.at;
+        let take = buf.len().min(self.bytes.len().saturating_sub(at));
+        buf[..take].copy_from_slice(&self.bytes[at..at + take]);
+        self.at = at + take;
+        Ok(take)
+    }
+}
+
+impl Seek for Interrupting {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let SeekFrom::Start(at) = to else {
+            return Err(io::Error::other(
+                "only the probe's absolute rewind is scripted",
+            ));
+        };
+        self.at = usize::try_from(at).map_err(io::Error::other)?;
+        Ok(at)
+    }
+}
+
+/// The scan retries an interrupted read, and stops retrying.
+///
+/// `Interrupted` is `std::io`'s "this read did not happen": answering an end of
+/// file on it would classify a committed run as a husk, which is the direction
+/// that must never be taken, so the scan retries it. It is also the one branch
+/// of the loop that spends no budget, so retrying it without a bound is a scan
+/// that never returns -- under the physical worktree lock `startup_census` holds
+/// across `classify_run_dir`, which is the lock held for ever that every other
+/// bound in that module exists to prevent. Before `INTERRUPTED_RETRIES` the
+/// loop's own doc claimed a termination it did not have.
+///
+/// Both halves, and **both terminate under either mutation**, so neither can
+/// hang the suite: at the allowance the line is still found, which a scan that
+/// treated `Interrupted` as an end would answer `None` to; one past it the scan
+/// gives up, which a scan with no allowance would answer `Some` to, because this
+/// source stops interrupting and serves the line. The number of interruptions
+/// really handed out is asserted as well as the verdict, so neither outcome can
+/// be reached without the mechanism.
+#[test]
+fn the_scan_retries_an_interrupted_read_and_stops_retrying() {
+    let window = usize::try_from(FIRST_LINE_WINDOW).expect("the window fits a usize");
+    // Past the window, so the scan runs at all: inside it there is one read and
+    // no loop to interrupt.
+    let length = window + 100;
+    let mut bytes = vec![b'x'; length];
+    bytes.push(b'\n');
+    let bound = bytes.len() as u64;
+
+    let mut retried = Interrupting {
+        bytes: bytes.clone(),
+        at: 0,
+        trigger: window,
+        schedule: INTERRUPTED_RETRIES,
+        fired: 0,
+    };
+    assert_eq!(
+        first_line_within(&mut retried, bound),
+        Some(bytes[..length].to_vec()),
+        "an interruption is not an end of file: the whole allowance is spent and the line is \
+         still found"
+    );
+    assert_eq!(
+        retried.fired, INTERRUPTED_RETRIES,
+        "the interruptions were really handed out, or the line was found without meeting one"
+    );
+
+    let mut storm = Interrupting {
+        bytes,
+        at: 0,
+        trigger: window,
+        schedule: INTERRUPTED_RETRIES + 1,
+        fired: 0,
+    };
+    assert_eq!(
+        first_line_within(&mut storm, bound),
+        None,
+        "one interruption past the allowance gives up rather than scanning for ever"
+    );
+    assert_eq!(
+        storm.fired,
+        INTERRUPTED_RETRIES + 1,
+        "it gave up on the allowance rather than somewhere earlier"
+    );
+}
+
+/// A `Read + Seek` that serves one buffer until its first absolute seek and a
+/// different one afterwards -- the source that changed between the probe's two
+/// reads, which no single-threaded test can build out of a real file.
+struct Rewritten {
+    before: Vec<u8>,
+    after: Vec<u8>,
+    at: usize,
+    rewound: bool,
+}
+
+impl Read for Rewritten {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let at = self.at;
+        let bytes: &[u8] = if self.rewound {
+            &self.after
+        } else {
+            &self.before
+        };
+        let take = buf.len().min(bytes.len().saturating_sub(at));
+        buf[..take].copy_from_slice(&bytes[at..at + take]);
+        self.at = at + take;
+        Ok(take)
+    }
+}
+
+impl Seek for Rewritten {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let SeekFrom::Start(at) = to else {
+            return Err(io::Error::other(
+                "only the probe's absolute rewind is scripted",
+            ));
+        };
+        self.rewound = true;
+        self.at = usize::try_from(at).map_err(io::Error::other)?;
+        Ok(at)
+    }
+}
+
+/// Every property of the returned line is re-established on the **re-read**,
+/// and none of them carried over from the scan.
+///
+/// `first_line_within` reads twice: a constant-memory scan that finds the
+/// newline's offset, then a re-read of that many bytes from the start. What the
+/// scan proved is about bytes that may be gone by the time the second read
+/// happens, so a source that changed in between can hand the re-read something
+/// that is not a first line at all. Before this the only guard was the *length*,
+/// which catches a source that shrank and nothing else: a rewrite that kept the
+/// length returned bytes with a newline inside them, or bytes with none at the
+/// end, as "the first newline-terminated line".
+///
+/// One case per guard, so no guard is witnessed by another's, plus the
+/// unchanged-source control -- without it three refusals would also be what a
+/// probe that refused everything answers.
+#[test]
+fn a_source_rewritten_between_the_scan_and_the_reread_has_no_first_line() {
+    let window = usize::try_from(FIRST_LINE_WINDOW).expect("the window fits a usize");
+    // Past the window, so the seek happens at all.
+    let length = window + 100;
+    let mut before = vec![b'x'; length];
+    before.push(b'\n');
+    let bound = before.len() as u64;
+
+    // The newline moved earlier: the length and the terminator both still agree,
+    // so only "no newline inside the line" refuses this.
+    let mut earlier = vec![b'y'; length];
+    earlier[10] = b'\n';
+    earlier.push(b'\n');
+    // The newline moved later: the length still agrees, so only the terminator
+    // refuses this.
+    let mut later = vec![b'y'; length + 100];
+    later.push(b'\n');
+    // Shorter, and still newline-terminated, so only the length refuses this.
+    let mut shorter = vec![b'y'; length - 50];
+    shorter.push(b'\n');
+
+    for (label, after) in [
+        ("a newline moved earlier", earlier),
+        ("a newline moved later", later),
+        ("a source that shrank", shorter),
+    ] {
+        let mut source = Rewritten {
+            before: before.clone(),
+            after,
+            at: 0,
+            rewound: false,
+        };
+        assert_eq!(
+            first_line_within(&mut source, bound),
+            None,
+            "{label}: a first line the re-read cannot vouch for is a husk"
+        );
+        assert!(
+            source.rewound,
+            "{label}: the scan-and-re-read path was never reached, so nothing here is measured"
+        );
+    }
+
+    let mut steady = Rewritten {
+        before: before.clone(),
+        after: before.clone(),
+        at: 0,
+        rewound: false,
+    };
+    assert_eq!(
+        first_line_within(&mut steady, bound),
+        Some(before[..length].to_vec()),
+        "a source that did not change still has its first line"
+    );
 }
 
 /// A source that never ends: every read hands back non-newline bytes and
@@ -3813,6 +4079,41 @@ fn what_the_funnels_write_is_what_the_packet_says_they_write() {
     let written: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join(COMMIT_RECORD)).expect("read")).expect("json");
     assert_eq!(written, commit_json());
+}
+
+/// `run_started_sha256` and `events::log::first_line_digest` are two spellings
+/// of one number, and recovery compares a value produced by each.
+///
+/// `create.rs` writes `committed.json`'s `run_started_sha256` from
+/// `first_line_digest` at P5b; recovery step (a) recomputes it with
+/// `rundir::run_started_sha256` over the line it replayed and refuses the run if
+/// the two disagree. Nothing asserted that they agree, and every test on either
+/// side computes its oracle with the same function it is testing -- so either
+/// `format!` could change alone and every schema-4 recovery would start refusing
+/// with two digests that each looked correct where they were computed.
+///
+/// The newline is the whole of the difference between the two signatures:
+/// `first_line_digest` is given a log and finds the line, `run_started_sha256`
+/// is given the line. This asserts the pairing production actually makes.
+#[test]
+fn the_two_spellings_of_the_first_line_digest_agree() {
+    let line = committed_line("01DIGEST", 4);
+    let mut log = line.clone().into_bytes();
+    log.push(b'\n');
+    // A second event after it, so a digest over the whole file and a digest over
+    // the first line are different numbers.
+    log.extend_from_slice(b"{\"ts\":\"2026-08-20T00:00:01Z\",\"event\":\"noise\"}\n");
+    assert_eq!(
+        crate::events::log::first_line_digest(&log),
+        Some(run_started_sha256(line.as_bytes())),
+        "the digest the commit record is written from and the one recovery recomputes are one \
+         number"
+    );
+    assert_ne!(
+        crate::events::log::first_line_digest(&log),
+        Some(run_started_sha256(&log)),
+        "a digest over the whole log would satisfy the assertion above for the wrong reason"
+    );
 }
 
 #[test]
