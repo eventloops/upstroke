@@ -4901,6 +4901,9 @@ fn a_snapshot_ignores_a_replacement_object_and_materialises_the_judged_tree() {
         )
         .expect("the judged tree is a tree of this repository");
 
+    // The fixture pins `core.autocrlf=false` and `core.eol=lf`, so the bytes
+    // checked out are the bytes committed on every platform and this
+    // comparison is about which blob, not about line endings.
     assert_eq!(
         fs::read_to_string(snapshot.path().join("replaced.txt")).expect("the checkout"),
         "A\n",
