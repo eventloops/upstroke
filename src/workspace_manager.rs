@@ -2176,6 +2176,17 @@ impl WorkspaceManager {
     ///
     /// [`Refusal::SymbolicRef`] or [`Refusal::CheckedOutRef`].
     pub fn assert_publishable(&self, refname: &str) -> Result<(), UpstrokeError> {
+        // **Two limits of this check, neither of them closed here.** The
+        // comparison is exact bytes, so on a case-insensitive filesystem with
+        // the files ref backend a worktree holding another spelling of the
+        // same loose ref is not seen (`SWEEP-WORKTREE-015`); and this runs
+        // before its caller's funnel opens, so a checkout that happens
+        // between the answer and `git update-ref` is not seen either, which
+        // was reproduced on Git 2.43.0 (`SWEEP-WORKTREE-016`). Both are this
+        // module's to repair, in its own sweep (queue row 11): the first
+        // needs the repository's backend, the second needs the check to run
+        // inside the funnel after the Before hook and a statement of what the
+        // funnel then guarantees.
         self.refuse_symbolic(refname)?;
         for record in self.worktree_records()? {
             if record.has_checked_out(refname) {

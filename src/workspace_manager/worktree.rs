@@ -9,15 +9,13 @@
 //! and feeds each attribute to an [`OpenRecord`], and this module holds the
 //! grammar of the record itself.
 //!
-//! The words quoted here and on [`VerifyFailure`] -- "a worktree is reused
-//! across a process boundary or after an interrupted Git command … only after
-//! Worktree.Verify" and the four conditions that follow -- are
-//! `decisions.workspace_candidates.generation`'s own, from a decision record
-//! the repository retired on 2026-09-03. `DESIGN.md`'s retired-records table
-//! does not map that record to a section, so this module says where the words
-//! come from and claims nothing about which design sentence carries them now
-//! (`SWEEP-WORKTREE-014`); what the code does is stated by the code's own
-//! documentation below.
+//! **What this module does not state.** Which conditions a reuse must meet is
+//! the parent's `verify_worktree`, and where that rule comes from is
+//! `DESIGN.md`'s to say. The tree cites a decision record retired on
+//! 2026-09-03 for it, at 51 sites, and `DESIGN.md`'s retired-records table
+//! maps no such record to a section (`SWEEP-WORKTREE-014`, for the owner).
+//! Until it does, nothing here quotes that record: these types document what
+//! they are and what the code does with them, and no more.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -354,12 +352,27 @@ impl WorktreeRecord {
         self.branch.as_deref()
     }
 
-    /// Whether `refname` is the branch this worktree has checked out.
+    /// Whether `refname` is, byte for byte, the branch this worktree has
+    /// checked out.
     ///
-    /// Byte equality with the full refname: a short name is not the branch,
-    /// and a branch Git spells with bytes that are not UTF-8 equals no `&str`
-    /// at all rather than the `U+FFFD` spelling a lossy decode would give it.
-    /// A detached worktree has checked out nothing.
+    /// A short name is not the branch, and a branch Git spells with bytes that
+    /// are not UTF-8 equals no `&str` at all rather than the `U+FFFD` spelling
+    /// a lossy decode would give it. A detached worktree has checked out
+    /// nothing.
+    ///
+    /// **`false` is not proof that this worktree holds a different ref.**
+    /// Whether two spellings name one ref is the ref store's question, not
+    /// this value's: with the files backend on a case-insensitive filesystem
+    /// (Git documents Windows and macOS), `refs/heads/x` and `refs/heads/X`
+    /// can be one loose ref file while comparing unequal here, and Git prints
+    /// whichever spelling the worktree's symbolic HEAD carries. So a caller
+    /// refusing an action because a ref is checked out somewhere gets a
+    /// **necessary** condition from this predicate and not a sufficient one.
+    /// Answering it properly needs the repository and its backend, so it
+    /// belongs to the parent (`SWEEP-WORKTREE-015`); no case folding is done
+    /// here, because which spellings a store treats as one depends on the
+    /// backend and the filesystem and a guess would break publication in the
+    /// other direction.
     #[must_use]
     pub fn has_checked_out(&self, refname: &str) -> bool {
         self.branch.as_deref() == Some(refname.as_bytes())
@@ -419,27 +432,50 @@ fn reason(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
 }
 
-/// Whether `value` can be a refname at all: `git check-ref-format` forbids
-/// ASCII control characters, space, DEL and the seven bytes `~ ^ : ? * [ \`
-/// anywhere in one, and a refname is never empty. Not the whole rule (the
-/// `..`, `@{` and `.lock` clauses are not applied), but everything a stray or
-/// hostile byte could add to a name Git itself checked out.
+/// Whether `value` is a full refname, by every rule `git check-ref-format`
+/// documents for one.
+///
+/// The rules, in the documentation's own order: a slash-separated component
+/// may not begin with `.` or end with `.lock`; the name has at least one `/`
+/// (this is a full refname, not a one-level one); no `..`; no ASCII control
+/// character, space, DEL, `~`, `^` or `:`; no `?`, `*` or `[`; no leading or
+/// trailing `/` and no `//` (each is an empty component); no trailing `.`; no
+/// `@{`; not the single character `@` (subsumed by the `/` rule, and checked
+/// anyway); no `\`.
+///
+/// That is the whole documented list for a full refname, so a `branch`
+/// attribute this accepts is one Git would accept — which is what the
+/// publication check reads it as. It is a rule about the *spelling*: whether
+/// two well-formed spellings name one ref is the ref store's question, which
+/// [`WorktreeRecord::has_checked_out`] says this module does not answer.
 fn can_be_refname(value: &[u8]) -> bool {
-    !value.is_empty()
-        && !value
-            .iter()
-            .any(|byte| *byte <= b' ' || *byte == 0x7f || b"~^:?*[\\".contains(byte))
+    if value.is_empty() || value == b"@" || !value.contains(&b'/') {
+        return false;
+    }
+    if value
+        .iter()
+        .any(|byte| *byte <= b' ' || *byte == 0x7f || b"~^:?*[\\".contains(byte))
+    {
+        return false;
+    }
+    if value.windows(2).any(|pair| pair == b".." || pair == b"@{") {
+        return false;
+    }
+    if value.last() == Some(&b'.') {
+        return false;
+    }
+    value.split(|byte| *byte == b'/').all(|component| {
+        !component.is_empty() && component.first() != Some(&b'.') && !component.ends_with(b".lock")
+    })
 }
 
 /// Why [`WorkspaceManager::verify_worktree`](super::WorkspaceManager::verify_worktree)
 /// refused to reuse a worktree.
 ///
-/// `decisions.workspace_candidates.generation`: "a worktree is reused across a
-/// process boundary or after an interrupted Git command … only after
-/// Worktree.Verify: the recorded path is a linked worktree of this repository,
-/// HEAD equals the recorded base (or, for RetainedIdle, the worktree holds the
-/// retained cumulative tree), the index is unlocked, and no
-/// cherry-pick/merge/revert/sequencer/rebase state exists".
+/// One variant per observation that stops a reuse. Which observations are made,
+/// and in which order, is `verify_worktree`'s and not stated here twice; this
+/// enum is the vocabulary its answer is given in, and the module documentation
+/// says why it quotes no rule.
 ///
 /// The caller's action is decided by the generation's class, not by the
 /// variant: an open generation is removed with force and re-added, a retained
@@ -536,9 +572,11 @@ impl fmt::Display for VerifyFailure {
 /// asked; production passes a quiescence by reference and never copies one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Quiescence {
-    /// The ordinary case: HEAD equals the recorded base.
+    /// HEAD must equal this commit: the ordinary case, an open generation at
+    /// its recorded base.
     AtBase(String),
-    /// `RetainedIdle`: "the worktree holds the retained cumulative tree".
+    /// The worktree's index must hold this tree: a retained generation, whose
+    /// cumulative work no base can be re-cut into.
     HoldsTree(String),
 }
 
@@ -723,10 +761,76 @@ mod tests {
         assert_eq!(refused.len(), 8, "eight independent refusals");
     }
 
-    /// A `branch` is inside the byte set `git check-ref-format` allows, read
-    /// once, and kept as the bytes Git printed, not a spelling of them.
+    /// Every rule `git check-ref-format` documents for a full refname is
+    /// applied, one case per rule from that list, and every `branch` value
+    /// measured on Git 2.43.0 is still accepted.
     #[test]
-    fn a_branch_is_inside_the_refname_byte_set_read_once_and_kept_as_bytes() {
+    fn a_branch_is_a_full_refname_by_every_documented_rule() {
+        let refused: &[(&str, &[u8])] = &[
+            ("a component beginning with a dot", b"refs/heads/.hidden"),
+            ("a component ending in .lock", b"refs/heads/main.lock"),
+            (
+                "a middle component ending in .lock",
+                b"refs/heads.lock/main",
+            ),
+            ("no slash at all", b"main"),
+            ("two dots", b"refs/heads/a..b"),
+            ("a leading slash", b"/refs/heads/main"),
+            ("a trailing slash", b"refs/heads/main/"),
+            ("two slashes", b"refs//heads/main"),
+            ("a trailing dot", b"refs/heads/main."),
+            ("an at-brace", b"refs/heads/ma@{in"),
+            ("the single character at", b"@"),
+            ("a backslash", b"refs/heads/ma\\in"),
+            ("a tilde", b"refs/heads/ma~in"),
+            ("a caret", b"refs/heads/ma^in"),
+            ("a colon", b"refs/heads/ma:in"),
+            ("a question mark", b"refs/heads/ma?in"),
+            ("an asterisk", b"refs/heads/ma*in"),
+            ("an open bracket", b"refs/heads/ma[in"),
+            ("a space", b"refs/heads/ma in"),
+            ("DEL", b"refs/heads/ma\x7fin"),
+            ("a control byte", b"refs/heads/ma\x01in"),
+            ("nothing at all", b""),
+        ];
+        for (name, branch) in refused {
+            let mut open = detached();
+            assert_eq!(
+                open.branch(branch),
+                Err(MalformedRecord::Branch),
+                "{name} is not a full refname"
+            );
+        }
+        assert_eq!(refused.len(), 22, "one case per documented rule");
+
+        // Every `branch` value the twelve measured shapes printed on Git
+        // 2.43.0, so the rule cannot over-refuse what Git itself writes.
+        let accepted: &[(&str, &[u8])] = &[
+            ("the main worktree", b"refs/heads/master"),
+            ("a linked worktree", b"refs/heads/wt-branch"),
+            (
+                "an unborn branch in a fresh repository",
+                b"refs/heads/master",
+            ),
+            ("`worktree add -b`", b"refs/heads/newbr"),
+            (
+                "this engine's run branch",
+                b"refs/heads/upstroke/run-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ),
+            ("a branch with a dot inside a component", b"refs/heads/v1.2"),
+            ("a deep namespace", b"refs/remotes/origin/feature/x"),
+        ];
+        for (name, branch) in accepted {
+            let mut open = detached();
+            assert_eq!(open.branch(branch), Ok(()), "{name} is a full refname");
+        }
+        assert_eq!(accepted.len(), 7, "seven measured or engine-written names");
+    }
+
+    /// A `branch` is read once and kept as the bytes Git printed, not a
+    /// spelling of them.
+    #[test]
+    fn a_branch_is_read_once_and_kept_as_bytes() {
         let mut forbidden: Vec<u8> = (0..=b' ').collect();
         forbidden.push(0x7f);
         forbidden.extend_from_slice(b"~^:?*[\\");
@@ -751,11 +855,6 @@ mod tests {
                 "byte {byte:#04x} stored nothing"
             );
         }
-        assert_eq!(
-            open().branch(b""),
-            Err(MalformedRecord::Branch),
-            "a refname is never empty"
-        );
 
         let mut twice = open();
         twice.head(SHA1.as_bytes()).expect("one HEAD");
