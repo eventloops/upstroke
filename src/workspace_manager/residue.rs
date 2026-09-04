@@ -31,11 +31,18 @@
 //! a transient I/O error is an `Io` error naming the name. Before the sweep
 //! every name went through `Path::exists`, which answers `false` for all of
 //! those, so a git dir this process could not search classified as `None`.
-//! The parent's inspections hold the same line on their side: each answers
-//! only for the exit status that is Git's answer (`rev-parse --verify --quiet`
-//! exiting 1 in silence, `diff --quiet` exiting 0 or 1) and is the error for
-//! anything else, so a repository Git cannot open is never `None`, and never
-//! `After`.
+//!
+//! **What this module cannot promise, and where the promise belongs.** The
+//! line above holds for the names this module reads itself. It does not hold
+//! for what it reads *through*: the parent's inspections still fold some Git
+//! failures into an answer before the `?` here ever sees them — a failed
+//! `worktree list` or `cat-file`, a `show-ref` that could not run, a `fsck`
+//! that did not finish. Making those trustworthy means reading a repository
+//! the way Git reads it (its gitfile grammar, its linked-worktree reader, its
+//! trace-polluted streams, with a bound on every read of a
+//! repository-controlled file), which is the parent's work and not a child
+//! classifier's: `reviews/FINDINGS.md` §50 carries a row per case for the
+//! sweep of `src/workspace_manager.rs`, the queue's last row of this family.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -61,8 +68,8 @@ use crate::topology::effects::{
 };
 
 use super::{
-    Registration, git_dir_of, head_commit, index_differs_from_head, object_exists, record_for,
-    registration_of, temporary_object_files, unreachable_objects, worktree_has_unstaged_changes,
+    git_dir_of, head_commit, index_differs_from_head, object_exists, record_for,
+    temporary_object_files, unreachable_objects, worktree_has_unstaged_changes,
 };
 
 /// What the parent recorded of a site's after-phase publication.
@@ -188,15 +195,14 @@ pub fn residue_classified_sites() -> Vec<EffectSiteId> {
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Git`] from one of the parent's read-only inspections,
-/// naming the command, the directory it ran in and the status, or from a
-/// registration whose `gitdir` names no checkout; [`UpstrokeError::Io`] naming
-/// a path the classifier could not inspect — a residue name, a worktree's
-/// `.git` pointer, or a file under `worktrees/` (§7: only an actual not-found
-/// is absence, and a failed inspection is never an answer); or
-/// [`UpstrokeError::Refused`] for a site the frozen enums register no residue
-/// class for — the classifier is total over its domain and silent outside it,
-/// rather than answering `None` for a question nobody asked.
+/// [`UpstrokeError::Git`] from one of the parent's read-only inspections;
+/// [`UpstrokeError::Io`] naming a path this module could not inspect — a
+/// residue name in a git dir, or the worktree's `.git` pointer (§7: only an
+/// actual not-found is absence, and an inspection this module makes and
+/// cannot complete is never an answer); or [`UpstrokeError::Refused`] for a
+/// site the frozen enums register no residue class for — the classifier is
+/// total over its domain and silent outside it, rather than answering `None`
+/// for a question nobody asked.
 pub fn classify_object_residue(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
@@ -330,10 +336,9 @@ fn internal_residue_present(
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Git`] from one of the parent's read-only inspections,
-/// naming the command, the directory and the status, or [`UpstrokeError::Io`]
-/// naming a path that could not be inspected: a residue name, a worktree's
-/// `.git` pointer, or a file under `worktrees/`.
+/// [`UpstrokeError::Git`] from one of the parent's read-only inspections, or
+/// [`UpstrokeError::Io`] naming a path this module could not inspect: a
+/// residue name in a git dir, or the worktree's `.git` pointer.
 pub fn observed_residue_elements(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
@@ -464,19 +469,15 @@ enum AddState {
     Populated,
 }
 
+///
+/// What it reads is the parent's `record_for` and `git_dir_of`, so it is only
+/// as trustworthy as those are: `record_for` answers `None` for a `worktree
+/// list` that failed, and `git_dir_of` accepts any target text after
+/// `gitdir:`. Both are rows for the parent's sweep in `reviews/FINDINGS.md`
+/// §50; this function's own contribution is that the after phase and the
+/// residue element are two arms of one reading rather than two hand-written
+/// complements.
 fn add_state(repository: &Path, worktree: &Path) -> Result<AddState, UpstrokeError> {
-    // The registration is read from the filesystem before Git is asked to
-    // enumerate, because one of the states classified here is the state that
-    // makes the enumeration fail: `git worktree add` writes `commondir` after
-    // creating the administrative directory, and git 2.43 refuses to list
-    // *any* worktree while one registration is in between ("failed to read
-    // `…/commondir`", exit 128). That is an interrupted add, which is residue
-    // this site registers, not an inspection this process could not make.
-    // Measured by the `worktree.rs` sweep as `SWEEP-WORKTREE-012` on PR #131,
-    // where the sampling harness saw it as an unclassified sample.
-    if registration_of(repository, worktree)? == Registration::Unfinished {
-        return Ok(AddState::Unpopulated);
-    }
     let Some(record) = record_for(repository, worktree)? else {
         return Ok(AddState::Unregistered);
     };

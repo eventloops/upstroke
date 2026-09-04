@@ -312,7 +312,6 @@ effectful_unnameable = []
 effect_free = [
     "changed_path_records",
     "decode_changed_paths",
-    "decode_path",
     "parse_worktree_records",
     "registration_checkout",
 ]

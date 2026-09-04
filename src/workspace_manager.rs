@@ -2358,11 +2358,7 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`UpstrokeError::Git`] and only that: a Git command that failed, naming
-    /// the command, the directory and the status, or a spawn failure. "No such
-    /// object" is not an error but the `false` answer, and an object in a pack
-    /// this process cannot read is reported by Git as a missing object, which
-    /// this cannot distinguish (see [`read_only_verify`]).
+    /// A Git error other than "no such object", which is the `false` answer.
     pub fn object_exists(&self, object: &str) -> Result<bool, UpstrokeError> {
         object_exists(&self.base, object)
     }
@@ -2853,7 +2849,7 @@ impl WorkspaceManager {
 
 mod parsers;
 pub use self::parsers::decode_changed_paths;
-use self::parsers::{decode_path, parse_worktree_records, registration_checkout};
+use self::parsers::{parse_worktree_records, registration_checkout};
 
 mod snapshot_ref;
 pub use self::snapshot_ref::{Snapshot, SnapshotInput};
@@ -2882,69 +2878,14 @@ fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
             });
         }
     }
-    // Bytes, not a string (§8): a repository whose path is not UTF-8 is a
-    // repository, and git writes those bytes into the pointer. `read_to_string`
-    // made such a worktree an `Io` error.
-    let bytes = fs::read(&pointer).map_err(|source| UpstrokeError::Io {
+    let text = fs::read_to_string(&pointer).map_err(|source| UpstrokeError::Io {
         path: pointer.clone(),
         source,
     })?;
-    let Some(target) = bytes.strip_prefix(b"gitdir:") else {
-        return Ok(None);
-    };
-    let target = trim_ascii_space(target);
-    // `gitdir:` with nothing after it is what a kill between the pointer's
-    // creation and its write can leave; git 2.43 refuses it as "invalid
-    // gitfile format". It names no directory, so it is no git directory by
-    // name, never the directory `""` (which would join every later name onto
-    // the process's working directory): the same unpopulated state as a
-    // pointer whose target is not there, which is what the classifier's
-    // residue element is for.
-    if target.is_empty() {
-        return Ok(None);
-    }
-    let target = decode_path(target).map_err(|error| UpstrokeError::Git {
-        message: format!(
-            "the gitfile {} names a path that is not UTF-8 from byte {}, which this platform \
-             cannot represent exactly",
-            pointer.display(),
-            error.valid_up_to()
-        ),
-    })?;
-    // A relative target is relative to the pointer's directory, as Git
-    // resolves it.
-    let target = worktree.join(target);
-    // The pointer is a claim; the directory behind it is the fact. A target
-    // that is not there, or is not a directory, is not a git directory.
-    //
-    // `metadata`, which follows a link, and not `symlink_metadata`: a git
-    // directory moved and symlinked at its old name is one Git reads (`git
-    // status`, `rev-parse --git-dir` and `worktree list` all work there), so
-    // the question here is what the target *is*, not whether the path reaches
-    // it through a link. `symlink_metadata` is kept where refusing a link is
-    // the point: `residue::name_present`, where a name Git took with `O_EXCL`
-    // is the fact whatever it points at, and the containment walk.
-    match fs::metadata(&target) {
-        Ok(metadata) if metadata.is_dir() => Ok(Some(target)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(UpstrokeError::Io {
-            path: target,
-            source,
-        }),
-    }
-}
-
-/// Surrounding ASCII whitespace off a gitfile's path bytes, the way Git reads
-/// them: the line terminator and nothing else of the path.
-fn trim_ascii_space(mut bytes: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t' | b'\r' | b'\n', rest @ ..] = bytes {
-        bytes = rest;
-    }
-    while let [rest @ .., b' ' | b'\t' | b'\r' | b'\n'] = bytes {
-        bytes = rest;
-    }
-    bytes
+    Ok(text
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(|target| PathBuf::from(target.trim())))
 }
 
 fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
@@ -2956,109 +2897,32 @@ fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
         .stdin(Stdio::null())
         .output()
         .map_err(|error| UpstrokeError::Git {
-            message: format!(
-                "failed to run git {} in {}: {error}",
-                args.join(" "),
-                cwd.display()
-            ),
+            message: format!("failed to run git: {error}"),
         })
 }
 
 fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, UpstrokeError> {
     let output = read_only_git(cwd, args)?;
     if !output.status.success() {
-        return Err(read_only_git_failure(cwd, args, &output));
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                cwd.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
     }
     Ok(output.stdout)
 }
 
-/// The error a read-only Git command that exited non-zero is: the command, the
-/// directory it ran in, its exit status, and what it said on both streams.
-///
-/// Both streams, because Git does not keep its diagnosis to stderr: `fsck`
-/// reports `missing blob <id>` on stdout with nothing on stderr (exit 2,
-/// measured on git 2.43), and a message without it names no object. Each
-/// stream is trimmed and bounded to [`GIT_OUTPUT_BOUND`] characters so that a
-/// listing cannot become the error.
-fn read_only_git_failure(cwd: &Path, args: &[&str], output: &Output) -> UpstrokeError {
-    let status = match output.status.code() {
-        Some(code) => format!("exit status {code}"),
-        None => "no exit status (killed by a signal)".to_owned(),
-    };
-    let mut said = Vec::new();
-    for (stream, bytes) in [("stderr", &output.stderr), ("stdout", &output.stdout)] {
-        let text = String::from_utf8_lossy(bytes);
-        let text = text.trim();
-        if !text.is_empty() {
-            said.push(format!(
-                "{stream}: {}",
-                text.chars().take(GIT_OUTPUT_BOUND).collect::<String>()
-            ));
-        }
-    }
-    let said = if said.is_empty() {
-        "no output on either stream".to_owned()
-    } else {
-        said.join("; ")
-    };
-    UpstrokeError::Git {
-        message: format!(
-            "git {} failed in {} with {status}: {said}",
-            args.join(" "),
-            cwd.display()
-        ),
-    }
-}
-
-/// How much of each stream a failed Git command's error carries.
-const GIT_OUTPUT_BOUND: usize = 1024;
-
-/// `rev-parse --verify --quiet <spec>` as a read-only lookup: the id, `None`
-/// when Git says there is nothing at `spec`, and every other failure as the
-/// error it is.
-///
-/// `--verify --quiet` answers a missing object, an unpeelable spec and an
-/// unborn `HEAD` with exit status 1 and nothing on either stream (measured on
-/// git 2.43), and that is the absence taken here. Everything Git *says* — any
-/// other status, or output on either stream — is the error it is, which is
-/// what a repository Git cannot open, or a spawn failure, produces. The free
-/// twin of [`WorkspaceManager::quiet_object_lookup`], for the residue
-/// classifier's inspections, which run without a manager.
-///
-/// **What this cannot distinguish.** Git reports an object it cannot read as
-/// one it does not have: with a pack file unreadable, this exact command
-/// exits 1 in silence, exactly as for a missing object (measured on git
-/// 2.43). Proving a store readable means reading it the way Git does,
-/// `objects/info/alternates` included, which is the object store's own job
-/// and not a residue classifier's; so absence here is Git's answer, and
-/// nothing stronger is claimed of it.
-fn read_only_verify(cwd: &Path, spec: &str) -> Result<Option<String>, UpstrokeError> {
-    let args = ["rev-parse", "--verify", "--quiet", spec];
-    let output = read_only_git(cwd, &args)?;
-    if !output.status.success() {
-        if output.status.code() == Some(1) && output.stderr.is_empty() && output.stdout.is_empty() {
-            return Ok(None);
-        }
-        return Err(read_only_git_failure(cwd, &args, &output));
-    }
-    let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
-        message: format!("`git rev-parse --verify` returned non-UTF-8: {error}"),
-    })?;
-    Ok(Some(text.trim().to_owned()))
-}
-
 /// Every object `git fsck --unreachable` reports, and nothing else.
-///
-/// A fsck that did not finish reports nothing, so its exit status is read: an
-/// empty answer is the answer only when Git exited 0 (which it does with
-/// unreachable objects present; they are a report, not an error).
 ///
 /// # Errors
 ///
-/// A Git error, naming the command and the repository, for a fsck that
-/// failed or a repository Git could not open.
+/// A Git error.
 pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, UpstrokeError> {
-    let output = read_only_git_ok(
+    let output = read_only_git(
         worktree,
         &[
             "fsck",
@@ -3068,7 +2932,7 @@ pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, UpstrokeError
             "--connectivity-only",
         ],
     )?;
-    let listing = String::from_utf8_lossy(&output);
+    let listing = String::from_utf8_lossy(&output.stdout);
     Ok(listing
         .lines()
         .filter_map(|line| line.strip_prefix("unreachable "))
@@ -3130,33 +2994,25 @@ pub fn object_directory(worktree: &Path) -> Result<PathBuf, UpstrokeError> {
             "objects",
         ],
     )?;
-    // Bytes (§8): git prints the path it holds, and a repository whose path is
-    // not UTF-8 is a repository.
-    decode_path(trim_ascii_space(&output)).map_err(|error| UpstrokeError::Git {
-        message: format!(
-            "`git rev-parse --git-path objects` printed a path that is not UTF-8 from byte {}, \
-             which this platform cannot represent exactly",
-            error.valid_up_to()
-        ),
-    })
+    let text = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
+        message: format!("`git rev-parse --git-path objects` returned non-UTF-8: {error}"),
+    })?;
+    Ok(PathBuf::from(text.trim()))
 }
 
-/// Whether `object` is in the object store, through [`read_only_verify`] on
-/// the peeled spec: `cat-file -e <object>^{}` exits 128 for a missing object
-/// and for a repository it cannot open alike (measured on git 2.43), so it
-/// cannot tell absence from failure; `rev-parse --verify --quiet` can.
 fn object_exists(worktree: &Path, object: &str) -> Result<bool, UpstrokeError> {
-    Ok(read_only_verify(worktree, &format!("{object}^{{}}"))?.is_some())
+    let output = read_only_git(worktree, &["cat-file", "-e", &format!("{object}^{{}}")])?;
+    Ok(output.status.success())
 }
 
-/// The id `HEAD` names, or `None` on an unborn branch.
-///
-/// A ref read, not an object read: `rev-parse --verify --quiet HEAD` answers
-/// the id a detached `HEAD` holds without opening the object (measured on git
-/// 2.43, it answers for an id whose object is absent), so what it establishes
-/// is what `HEAD` says, which is the question the cherry-pick site asks.
 fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
-    read_only_verify(worktree, "HEAD")
+    let output = read_only_git(worktree, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
 }
 
 /// Whether anything in the working tree is not yet in the index.
@@ -3188,22 +3044,9 @@ fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, UpstrokeError>
 }
 
 /// Whether the index has anything staged against HEAD.
-///
-/// `diff --quiet` answers with its exit status, 0 for no difference and 1 for
-/// a difference, and those two are the answers; anything else (a directory
-/// that is not a repository answers 129, a usage error; an index this process
-/// cannot open answers 128 and says so) is the failure it is, never
-/// "differs". A `HEAD` tree in a pack this process cannot read also answers 1
-/// (measured on git 2.43), which this cannot distinguish from a difference,
-/// for the reason [`read_only_verify`] states.
 fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
-    let args = ["diff", "--cached", "--quiet"];
-    let output = read_only_git(worktree, &args)?;
-    match output.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => Err(read_only_git_failure(worktree, &args, &output)),
-    }
+    let output = read_only_git(worktree, &["diff", "--cached", "--quiet"])?;
+    Ok(!output.status.success())
 }
 
 /// The registration `repository` holds for `worktree`, if any.
@@ -3213,18 +3056,6 @@ fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
 /// exist, and asking a directory that is not there — or asking its parent, which
 /// is inside the execution root and is not a repository at all — would answer
 /// "nothing is registered" for exactly the residue this is here to see.
-///
-/// `None` is what a listing that succeeded does not contain. A listing that
-/// failed (a repository Git cannot open) is the error, not an empty
-/// registration: the three add sites would read that as "nothing registered"
-/// and classify a state they could not inspect.
-///
-/// And a listing that succeeded is complete only if every registration could
-/// be read: with a registration's `gitdir` at mode 000, `git worktree list`
-/// exits 0 and omits it (measured on git 2.43). So before "not in the list"
-/// is `None`, [`registration_of`] reads the registrations, and one this
-/// process cannot read, or one Git omitted although it binds this checkout,
-/// is the error naming it.
 fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
     // A non-zero exit is Git failing to enumerate (a zero-length `commondir`
     // left by an interrupted add makes it fail before any record), and that is
@@ -3239,113 +3070,7 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
             return Ok(Some(record));
         }
     }
-    match registration_of(repository, worktree)? {
-        Registration::Absent => Ok(None),
-        // The listing succeeded and did not name a registration that binds
-        // this checkout: Git read something this process could not, or the
-        // two disagree about what the registration binds. Either way it is
-        // not "nothing is registered".
-        Registration::Present | Registration::Unfinished => Err(UpstrokeError::Git {
-            message: format!(
-                "`git worktree list` in {} did not name {}, which has a registration under \
-                 `worktrees/`",
-                repository.display(),
-                worktree.display()
-            ),
-        }),
-    }
-}
-
-/// What the registrations under `worktrees/` say about one worktree, read
-/// from the filesystem rather than from `git worktree list`.
-///
-/// The listing is Git's answer and stays the authority for what is
-/// registered; this is here for the two states the listing cannot report: a
-/// registration Git omits because it could not read it, and one whose
-/// `commondir` has not been written, which makes Git refuse to enumerate at
-/// all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Registration {
-    /// No registration under `worktrees/` binds this checkout.
-    Absent,
-    /// A registration binds it and its `commondir` is absent or zero-length:
-    /// `git worktree add` creates the administrative directory and writes
-    /// `commondir` into it, so this is an add killed between the two. Git
-    /// 2.43 then fails the whole enumeration ("failed to read
-    /// `…/commondir`", exit 128), which is why this is read before the
-    /// listing rather than after it. `parsers::registration_checkout` calls
-    /// the same state "the one safe repairable state".
-    Unfinished,
-    /// A registration binds it and its `commondir` is written.
-    Present,
-}
-
-/// Which of [`Registration`]'s states `worktree` is in.
-///
-/// # Errors
-///
-/// [`UpstrokeError::Io`] naming a `gitdir`, a `commondir` or a directory this
-/// process could not read; the [`UpstrokeError::Git`] that
-/// `parsers::registration_checkout` refuses an empty, malformed or
-/// unrepresentable `gitdir` with, or that locating the common git dir failed
-/// with.
-fn registration_of(repository: &Path, worktree: &Path) -> Result<Registration, UpstrokeError> {
-    let worktrees = common_git_dir(repository)?.join("worktrees");
-    let entries = match fs::read_dir(&worktrees) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Registration::Absent);
-        }
-        Err(source) => {
-            return Err(UpstrokeError::Io {
-                path: worktrees,
-                source,
-            });
-        }
-    };
-    let wanted = canonical_prefix(worktree)?;
-    for entry in entries {
-        let admin = entry
-            .map_err(|source| UpstrokeError::Io {
-                path: worktrees.clone(),
-                source,
-            })?
-            .path();
-        let gitdir = admin.join("gitdir");
-        // Read, not stat: a `gitdir` at mode 000 stats fine and is exactly
-        // what Git omits from its listing, and an empty one names no
-        // checkout. `registration_checkout` refuses both, and refuses a
-        // `gitdir` this platform cannot represent.
-        let bytes = match fs::read(&gitdir) {
-            Ok(bytes) => bytes,
-            // A registration directory with no `gitdir` yet is an add killed
-            // before it wrote one; it binds no checkout, so it cannot bind
-            // this one.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(UpstrokeError::Io {
-                    path: gitdir,
-                    source,
-                });
-            }
-        };
-        if canonical_prefix(&registration_checkout(&admin, &bytes)?)? != wanted {
-            continue;
-        }
-        let commondir = admin.join("commondir");
-        return match fs::read(&commondir) {
-            Ok(bytes) if trim_ascii_space(&bytes).is_empty() => Ok(Registration::Unfinished),
-            Ok(_) => Ok(Registration::Present),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Registration::Unfinished)
-            }
-            Err(source) => Err(UpstrokeError::Io {
-                path: commondir,
-                source,
-            }),
-        };
-    }
-    Ok(Registration::Absent)
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -3535,17 +3260,10 @@ fn common_git_dir(inside: &Path) -> Result<PathBuf, UpstrokeError> {
         inside,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    // Bytes (§8), as in `object_directory`: git prints the path it holds, and
-    // a repository whose path is not UTF-8 is a repository. This helper is on
-    // the classifier's path since `registration_of` reads the common git dir,
-    // so its `String::from_utf8` would have failed there.
-    let path = decode_path(trim_ascii_space(&output)).map_err(|error| UpstrokeError::Git {
-        message: format!(
-            "`git rev-parse --git-common-dir` printed a path that is not UTF-8 from byte {}, \
-             which this platform cannot represent exactly",
-            error.valid_up_to()
-        ),
+    let text = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
+        message: format!("`git rev-parse --git-common-dir` returned non-UTF-8: {error}"),
     })?;
+    let path = PathBuf::from(text.trim());
     fs::canonicalize(&path)
         .map(strip_verbatim)
         .map_err(|source| UpstrokeError::Io { path, source })

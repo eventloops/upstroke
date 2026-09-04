@@ -302,17 +302,6 @@ record-before-authoritative-effect plus exact, narrow adoption:
 | After the ref moved, before `task_merged` | If the ref equals the recorded proposed SHA, append `task_merged`; any third SHA is foreign history and resume refuses. |
 | `task_merged` exists but the ref disagrees | Refuse; the log and integration branch no longer describe the same run. |
 
-Every read the engine makes of the repository to decide these rows (whether a recorded object
-exists, what a worktree's index holds against its `HEAD`, what `fsck` reports unreachable, which
-worktrees are registered) is an inspection, and an inspection that fails is an error, never an
-answer: a Git or filesystem failure while inspecting propagates as a Git or I/O error naming the
-command or the path that failed, and is not read as the object being absent, the index
-differing, the store holding nothing unreachable, or the worktree being unregistered. Absence is
-only what Git itself answers for absence. Where Git reports what it cannot read as what it does
-not have — an unreadable pack makes `rev-parse --verify --quiet` exit 1 in silence, exactly as a
-missing object does (git 2.43) — the two are indistinguishable to the engine's inspections, and
-establishing that a store is readable is the object store's own concern, not an inspection's.
-
 Worktree cleanup happens only after the event proving the corresponding state
 is terminal. Internal candidate/prepared refs remain until `run_finished`, then
 may be pruned after the report is durable. The run lock still excludes two
