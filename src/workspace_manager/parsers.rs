@@ -71,9 +71,10 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 /// |---|---:|---|
 /// | absolute UTF-8 or Unix path bytes | yes | revalidate containment, then act |
 /// | relative path bytes | yes, joined to `admin` | canonicalise, revalidate containment, then act |
-/// | absent or unreadable | no | refuse before mutation |
-/// | zero-length | no | refuse before mutation |
-/// | partial / not ending in `.git` | no | refuse before mutation |
+/// | unreadable | no | refuse before mutation |
+/// | absent | no | skipped by identification (`revalidate_removal`); convergence at the destructive boundary (`registration_still_names`) |
+/// | zero-length | no | skipped by identification, as Git's own enumerator skips it; refuse at the destructive boundary |
+/// | whitespace-only, or partial / not ending in `.git` | no | refuse before mutation |
 ///
 /// The bytes are read the way Git reads them: [`trim_gitdir`] takes off the
 /// trailing line terminator and nothing else, so a path Git would read as
@@ -102,7 +103,12 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 ///
 /// [`UpstrokeError::Git`] naming the registration and the row of the table it
 /// fell into. Every refusing row has the same action, refuse before mutation,
-/// so the message is the distinction and one variant carries it.
+/// so the message is the distinction and one variant carries it. The absent
+/// and zero-length rows never reach this function from identification: the
+/// caller skips them before decoding, because a `gitdir` Git reads nothing
+/// from is one `git worktree list` does not enumerate (measured on git 2.43;
+/// a whitespace-only one it lists, as a registration of an empty path, and
+/// that one is refused here).
 pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBuf, UpstrokeError> {
     let bytes = trim_gitdir(bytes);
     if bytes.is_empty() {
