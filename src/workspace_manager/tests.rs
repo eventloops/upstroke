@@ -8202,11 +8202,65 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         // anything derived from the tally, because a refusal is a different
         // failure from an unclassifiable residue and deserves to be reported
         // as itself.
+        //
+        // **The bound is asserted before the refusals it produced.** A retry
+        // is not a tolerance and must not become one: the attempt count of
+        // every sample is checked against `RESIDUE_INSPECTION_ATTEMPTS` here,
+        // and `1` is a floor for the same reason `unclassified == 0` is
+        // asserted beside the histogram — a sample whose inspection was never
+        // attempted is not a sample that answered.
+        //
+        // What this cannot catch, said here rather than left for a reader to
+        // find: **raising the constant**. Every attempt count stays inside a
+        // larger ceiling, so no assertion here fires. What stops that being
+        // silent is not an assertion but a report — the ceiling is printed
+        // beside the consumption and written into the evidence file, and both
+        // move together, so a bound raised to absorb a rising refusal rate is
+        // visible in the artifact of the run that raised it.
+        assert_eq!(
+            run.attempts.len(),
+            SAMPLING_N as usize,
+            "{site}: one inspection record per sample, or the retry accounting below is \
+                 over the wrong list"
+        );
+        let outside: Vec<u32> = run
+            .attempts
+            .iter()
+            .copied()
+            .filter(|attempts| *attempts < 1 || *attempts > RESIDUE_INSPECTION_ATTEMPTS)
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "{site}: {outside:?} attempts, outside the 1..={RESIDUE_INSPECTION_ATTEMPTS} \
+                 bound this test declares — a bound that is not the one being spent is not \
+                 a bound"
+        );
+
+        // **What the bound cost, reported whether or not it was exhausted.**
+        // A tolerance that hides its own consumption is how the swallowed
+        // refusal went silent the first time: a run one attempt short of
+        // failing and a run that never retried at all read identically until
+        // the day the first one goes red. Per sample rather than summed, so
+        // one sample spending the whole bound every run is distinguishable
+        // from the whole site spending one extra attempt.
+        let retried: u32 = run
+            .attempts
+            .iter()
+            .map(|attempts| attempts.saturating_sub(1))
+            .sum();
+        println!(
+            "residue inspection {site}: attempts {:?} (bound {RESIDUE_INSPECTION_ATTEMPTS} \
+             each, {retried} retries over {SAMPLING_N} samples)",
+            run.attempts
+        );
+
         assert!(
             run.refusals.is_empty(),
-            "{site}: the classifier refused {} of {SAMPLING_N} samples, which is not the \
-                 same thing as a residue in no class — it is an inspection that failed, and \
-                 the assertions below would have called it unclassified: {:?}",
+            "{site}: the classifier refused {} of {SAMPLING_N} samples through all \
+                 {RESIDUE_INSPECTION_ATTEMPTS} attempts each, which is not the same thing \
+                 as a residue in no class — it is an inspection that failed, and the \
+                 assertions below would have called it unclassified. Every attempt, with \
+                 the path it could not read: {:?}",
             run.refusals.len(),
             run.refusals
         );
@@ -8254,7 +8308,7 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             record.recovered,
             "every sample recovered by its classified action"
         );
-        records.push((site, record, run.budget, run.replayed));
+        records.push((site, record, run.budget, run.replayed, retried));
     }
     assert_eq!(
         records.len(),
@@ -8426,6 +8480,47 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 );
             }
 
+            // **Every kill went to the child's own process group**
+            // (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`). Both halves
+            // are asserted, per child, because they fail in different ways
+            // and one is the precondition of the other: `NotItsOwnGroup`
+            // means `process_group(0)` did not run, so there was no group of
+            // this child's own to aim at; a `Refused` errno means the aim was
+            // right and the signal did not land.
+            //
+            // What this is evidence about is *what changed*. Before this
+            // repair the sampler killed the bare child, `getpgid(pid) == pid`
+            // was **false** for every one of these children, and both arms
+            // below fail on that code — which is the discrimination a new
+            // assertion has to have and the reason it is not a restatement of
+            // the firing count above. What the group kill buys is the
+            // descendants `git worktree add` spawns: they survive a bare
+            // child kill and go on writing into the worktree
+            // `recover_sample` then forces the removal of, and a forced
+            // removal cannot converge against a live writer. Measured, fifty
+            // runs per arm on one machine under one load: 5/50 failures with
+            // the bare child, 0/50 with the group.
+            //
+            // Neither arm is a claim that the kill *emptied* the group. That
+            // is a statement about processes this harness never owned, and
+            // the honest oracle for it is the failure rate above rather than
+            // an assertion from inside this process.
+            #[cfg(unix)]
+            for launch in &shape {
+                let group = launch.group_kill.expect(
+                    "a kill fired at every one of this command's children, asserted just \
+                     above, and the group kill is written by that same statement",
+                );
+                assert_eq!(
+                    group,
+                    GroupKill::Delivered,
+                    "{label}: the process-group kill did not reach this child's own group \
+                         ({group:?}) — the descendants of the sampled command then survive \
+                         the kill and keep writing into the worktree the tabled recovery \
+                         forces the removal of"
+                );
+            }
+
             // How many of those N fired kills won their race with the
             // command. Machine-varying, so printed rather than asserted —
             // the same treatment, and for the same reason, as the class
@@ -8504,9 +8599,14 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                      the kill and Git -- so it is emitted here rather than pinned into \
                      effects/residue-classes.json, which carries the declarations.",
         "sampling_n": SAMPLING_N,
+        // The retry ceiling every site's inspections were held to, beside the
+        // consumption of it below. A reader of one run's artifact cannot tell
+        // "two retries" from "two retries away from red" without it, and the
+        // number is the whole difference between a bound and a tolerance.
+        "inspection_attempts": RESIDUE_INSPECTION_ATTEMPTS,
         "sites": records
             .iter()
-            .map(|(site, record, budget, replayed)| serde_json::json!({
+            .map(|(site, record, budget, replayed, retried)| serde_json::json!({
                 "site": site.name(),
                 "n": record.n,
                 // The timescale the kill ladder was cut from. A red run's
@@ -8521,6 +8621,11 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 "internal": record.histogram.internal,
                 "after": record.histogram.after,
                 "unclassified": record.unclassified,
+                // How much of `inspection_attempts` this site actually spent.
+                // Zero on a healthy machine; a number that climbs is the
+                // delete-pending removal race on its way back to being a red
+                // suite, and this is where it is visible first.
+                "inspection_retries": retried,
                 "recovered": record.recovered,
             }))
             .collect::<Vec<_>>(),
@@ -8533,7 +8638,14 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             .expect("the emitted histogram parses");
     let sites = back["sites"].as_array().expect("a sites array");
     assert_eq!(sites.len(), 4, "one histogram per sampled site");
-    for (entry, (site, record, budget, _)) in sites.iter().zip(&records) {
+    assert_eq!(
+        back["inspection_attempts"].as_u64(),
+        Some(u64::from(RESIDUE_INSPECTION_ATTEMPTS)),
+        "the artifact must carry the retry ceiling the run was held to; the per-site \
+         consumption below means nothing without the number it is a fraction of, and a \
+         raised ceiling is a thing this test reports rather than refuses"
+    );
+    for (entry, (site, record, budget, _, retried)) in sites.iter().zip(&records) {
         assert_eq!(
             entry["site"],
             site.name(),
@@ -8549,6 +8661,13 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             "{site}: the written histogram accounts for every sample"
         );
         assert_eq!(entry["unclassified"], record.unclassified);
+        assert_eq!(
+            entry["inspection_retries"].as_u64(),
+            Some(u64::from(*retried)),
+            "{site}: the artifact must carry what the retry bound cost, or a run one \
+                 attempt short of red is indistinguishable in the record from one that \
+                 never retried"
+        );
         assert_eq!(
             entry["budget_us"].as_u64(),
             u64::try_from(budget.as_micros()).ok(),
@@ -8580,13 +8699,24 @@ struct SamplingRun {
     /// What `classify_object_residue` answered for each sample, in order.
     /// `None` is a sample it could not classify at all.
     observed: Vec<Option<ObjectResidue>>,
-    /// What the classifier said when it *refused* a sample, one line each.
+    /// What the classifier said when it *refused* a sample, one line each,
+    /// carrying every attempt [`inspect_sample`] made at that sample.
     ///
     /// A refusal and an unclassifiable residue both arrive in `observed` as
     /// `None`, and the assertion they fail is worded for the second of them.
     /// The words that tell the two apart are here, so a red run says which it
     /// met instead of naming only the one it probably did not.
     refusals: Vec<String>,
+    /// How many attempts each sample's inspection took, in order.
+    ///
+    /// The consumption of the retry bound, kept per sample rather than
+    /// summed, because a bound that hides how much of itself is being spent
+    /// goes silent exactly the way the swallowed refusal did: one sample
+    /// costing three attempts every run is a rate on its way to the ceiling
+    /// and reads identically to eight samples costing one, once both are a
+    /// total. Asserted against [`RESIDUE_INSPECTION_ATTEMPTS`], printed, and
+    /// written to the evidence file.
+    attempts: Vec<u32>,
 }
 
 /// Tally per-sample observations into the packet's histogram.
@@ -8877,6 +9007,212 @@ impl WorkspaceManager {
     );
 }
 
+/// How many times one sample's residue inspection is attempted before the
+/// refusal **is** the answer.
+///
+/// # Why a failed inspection is retried at all, and why it is still fatal
+///
+/// The assertion this bound serves — a classifier refusal is not a residue in
+/// no class — is right on the merits and is the class this whole sweep has
+/// been about: an I/O failure is not evidence of absence. It is kept. What it
+/// cannot be is a *hard red for an environmental rate*: on the self-hosted
+/// Windows runner an inspection genuinely does fail, `failed to read <a temp
+/// object file>` while a delete-pending removal is still holding the name, at
+/// a rate around 2%, and this test's subject is classification rather than
+/// read reliability. Every branch and every pull request that merges master
+/// paid for that, and #137 paid a rerun.
+///
+/// So a refusal is retried rather than tolerated. The two shapes are not
+/// equivalent and this is the one that keeps the assertions: a tolerated
+/// refusal has to be excluded from the histogram, which costs
+/// `histogram.total() == SAMPLING_N`, the independent tally that crosses the
+/// classifier's answer against the bucket it was counted in, and the evidence
+/// file's own total. A retry costs none of them — the sample still gets
+/// exactly one class — and it is sound here for a reason worth writing down:
+/// after the repair above the sampled command's whole process group is dead
+/// before the first inspection runs, so re-reading is re-reading a tree at
+/// rest rather than sampling a race a second time.
+///
+/// **The bound is explicit, asserted and reported.** A tolerance with no
+/// ceiling is how this goes silent again. Exhausting it is still a failure of
+/// the same assertion, with the count and every attempt's own words; the
+/// attempt counts are asserted against this constant, printed per site, and
+/// written to `effects/residue-histogram.json`, so a rate climbing towards
+/// the ceiling is visible before it arrives there.
+///
+/// **This number is chosen, not measured.** The Windows delete-pending window
+/// cannot be measured from the Linux build host, and three attempts spanning
+/// [`RESIDUE_INSPECTION_BACKOFF`] then twice it is a bet that the window is
+/// shorter than 150 ms. If it is not, the red comes back — loudly, which is
+/// the correct outcome for a bound that turns out to be wrong.
+const RESIDUE_INSPECTION_ATTEMPTS: u32 = 3;
+
+/// A bound of one has no retry in it and a bound of zero inspects nothing,
+/// which would make a sample that was never looked at indistinguishable from
+/// one that refused. Checked where the constant is, so it is a build failure
+/// rather than a test that quietly stops testing anything.
+const _: () = assert!(
+    RESIDUE_INSPECTION_ATTEMPTS > 1,
+    "an inspection bound below two attempts has no retry in it"
+);
+
+/// The first wait between inspection attempts; the `n`-th wait is `n` times
+/// it.
+///
+/// Linear rather than flat so the same small bound covers a window several
+/// times its own length, and short enough that the cost of the retries a
+/// healthy run never needs is nothing: the sleeps happen only after a
+/// refusal.
+const RESIDUE_INSPECTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// One sample's inspection: what it answered, and what it cost.
+#[derive(Debug)]
+struct Inspection {
+    /// The class, or every attempt's refusal in order.
+    ///
+    /// `Err` is a **vector**, not the last error: which attempt failed and
+    /// how is the whole diagnosis of a run that exhausted the bound, and the
+    /// last one alone cannot say whether the failure was steady or moving.
+    answer: Result<ObjectResidue, Vec<String>>,
+    /// How many attempts were made, 1 through the bound.
+    attempts: u32,
+}
+
+/// Inspect one sample, retrying a refusal up to [`RESIDUE_INSPECTION_ATTEMPTS`]
+/// attempts.
+///
+/// Takes the inspection as a closure rather than calling
+/// [`classify_object_residue`] itself, so
+/// [`a_refused_inspection_is_never_scored_as_a_residue_in_no_class`] can drive
+/// it against an inspection that always refuses and one that stops refusing —
+/// neither of which a real sampler can be asked to produce on demand.
+///
+/// **The bound is read here and is not a parameter.** As a parameter it was
+/// the call site's number, and a call site passing `1` retries nothing while
+/// every assertion in the sampling test still holds: the attempt counts are
+/// all `1`, which is inside any ceiling, and the constant goes on being
+/// printed and written to the evidence file as though it were the one being
+/// spent. Measured against this code before the parameter was removed. Read
+/// here, the only way to change what is spent is to change what is reported.
+fn inspect_sample(mut inspect: impl FnMut() -> Result<ObjectResidue, UpstrokeError>) -> Inspection {
+    let bound = RESIDUE_INSPECTION_ATTEMPTS;
+    let mut refused = Vec::new();
+    for attempt in 1..=bound {
+        match inspect() {
+            Ok(class) => {
+                return Inspection {
+                    answer: Ok(class),
+                    attempts: attempt,
+                };
+            }
+            Err(error) => refused.push(format!("attempt {attempt}/{bound}: {error}")),
+        }
+        if attempt < bound {
+            std::thread::sleep(RESIDUE_INSPECTION_BACKOFF * attempt);
+        }
+    }
+    Inspection {
+        answer: Err(refused),
+        attempts: bound,
+    }
+}
+
+/// The bound's controls: what a retry rescues, what it does not, and the one
+/// property no retry may cost.
+///
+/// **The property.** A refusal that survives every attempt stays a refusal. It
+/// does not become `ObjectResidue::None`, and it is not counted into any
+/// class: [`tally`] puts it in `unclassified`, which is the bucket the
+/// sampling test asserts is empty and reports by its own assertion. That is
+/// what an inspection failure is — the absence of an answer, never an answer
+/// of absence — and it is asserted here over the pair, the answer and the
+/// tally of it, because the two can disagree.
+///
+/// **What each case says about the code that is not there.** A single
+/// unretried inspection answers case 2 with a refusal where this answers it
+/// with the class the residue actually had, which is the whole of the change;
+/// it answers cases 1 and 3 identically, which is the whole of what the
+/// change was not allowed to alter.
+#[test]
+fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
+    let refusal = || UpstrokeError::Io {
+        path: PathBuf::from("objects/tmp_object_deleted_under_the_read"),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    };
+
+    // 1. An inspection that never succeeds. The bound is spent, the answer is
+    //    every attempt's words, and the sample is unclassified rather than
+    //    classified `None`.
+    let mut calls = 0_u32;
+    let refused = inspect_sample(|| {
+        calls += 1;
+        Err(refusal())
+    });
+    assert_eq!(calls, RESIDUE_INSPECTION_ATTEMPTS, "every attempt is spent");
+    assert_eq!(refused.attempts, RESIDUE_INSPECTION_ATTEMPTS);
+    let words = refused
+        .answer
+        .as_ref()
+        .expect_err("an inspection that always refuses refuses")
+        .clone();
+    assert_eq!(
+        words.len() as u32,
+        RESIDUE_INSPECTION_ATTEMPTS,
+        "each attempt's own refusal is kept: {words:?}"
+    );
+    assert!(
+        words
+            .iter()
+            .all(|line| line.contains("tmp_object_deleted_under_the_read")),
+        "a red run has to name the path it could not read: {words:?}"
+    );
+    let (histogram, unclassified) = tally(&[refused.answer.ok()]);
+    assert_eq!(
+        (
+            histogram.none,
+            histogram.internal,
+            histogram.after,
+            unclassified
+        ),
+        (0, 0, 0, 1),
+        "a refusal that survived the bound is an inspection that failed, and it is counted \
+         in no class -- least of all in `None`, which is the answer that a residue was \
+         looked for and was not there"
+    );
+
+    // 2. An inspection that stops refusing. What the retry is for: the answer
+    //    is the class the residue really had, and no refusal is recorded.
+    let mut calls = 0_u32;
+    let rescued = inspect_sample(|| {
+        calls += 1;
+        if calls < RESIDUE_INSPECTION_ATTEMPTS {
+            Err(refusal())
+        } else {
+            Ok(ObjectResidue::Internal)
+        }
+    });
+    assert_eq!(
+        rescued.answer.as_ref().ok(),
+        Some(&ObjectResidue::Internal),
+        "the answer is the class the inspection finally gave, not a default"
+    );
+    assert_eq!(
+        rescued.attempts, RESIDUE_INSPECTION_ATTEMPTS,
+        "the attempts it cost are reported even though it succeeded"
+    );
+
+    // 3. An inspection that answers first time costs one attempt. The bound
+    //    is a ceiling on a failure, not a repetition of a healthy read.
+    let mut calls = 0_u32;
+    let clean = inspect_sample(|| {
+        calls += 1;
+        Ok(ObjectResidue::After)
+    });
+    assert_eq!(calls, 1, "a successful inspection is not repeated");
+    assert_eq!(clean.attempts, 1);
+    assert_eq!(clean.answer.as_ref().ok(), Some(&ObjectResidue::After));
+}
+
 /// Kill the Git child of one site `SAMPLING_N` times and classify what is
 /// left.
 fn sample_site(site: EffectSiteId) -> SamplingRun {
@@ -8902,6 +9238,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
     );
     let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
+    let mut attempts: Vec<u32> = Vec::new();
     let mut recovered = true;
 
     for run in 0..SAMPLING_N {
@@ -8924,17 +9261,24 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         kill_git_child(&cwd, &args, delay);
 
         let target = ResidueTarget::new(&base).at(&path).from_base(&fixture.head);
-        // `.ok()` is what the tally needs, and it is not what a reader of a
-        // red run needs: it folds "the classifier refused, and here is why"
-        // into the same `None` as "this residue is in no class", and the
-        // assertion those `None`s fail is worded for the second. §7 asks that
-        // a discard be best-effort with defined observability, so the error's
-        // own words are kept and go into that assertion's message.
-        let classified = classify_object_residue(site, &target);
-        if let Err(error) = &classified {
-            refusals.push(format!("run {run}: {error}"));
-        }
-        observed.push(classified.ok());
+        // Bounded retry, and then `.ok()`. The `.ok()` is what the tally
+        // needs, and it is not what a reader of a red run needs: it folds
+        // "the classifier refused, and here is why" into the same `None` as
+        // "this residue is in no class", and the assertion those `None`s fail
+        // is worded for the second. §7 asks that a discard be best-effort
+        // with defined observability, so every attempt's own words are kept
+        // and go into that assertion's message. The bound and the argument
+        // for retrying at all are at [`RESIDUE_INSPECTION_ATTEMPTS`].
+        let inspected = inspect_sample(|| classify_object_residue(site, &target));
+        attempts.push(inspected.attempts);
+        let classified = match inspected.answer {
+            Ok(class) => Some(class),
+            Err(refused) => {
+                refusals.push(format!("run {run}: {}", refused.join(" | ")));
+                None
+            }
+        };
+        observed.push(classified);
         if !recover_sample(&fixture, &slot) {
             recovered = false;
         }
@@ -8952,6 +9296,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         },
         observed,
         refusals,
+        attempts,
     }
 }
 
@@ -9299,6 +9644,15 @@ struct SampledLaunch {
     /// printed beside the per-shape counts. Pass 3 showed why it cannot be
     /// asserted on — see the note at that printing.
     kill_error: Option<String>,
+    /// What the process-group kill answered, or `None` if none ran at this
+    /// child.
+    ///
+    /// Written inside [`SampledChild::kill`] and carried out here for the
+    /// same reason `fired` is: a record of the group kill written beside the
+    /// call would survive the call's deletion. Unix only — see
+    /// [`SampledChild`] for why there is no Windows half.
+    #[cfg(unix)]
+    group_kill: Option<GroupKill>,
     end: LaunchEnd,
 }
 
@@ -9353,6 +9707,32 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// reaches it, so the per-command firing count in the sampling test cannot
 /// be defeated inside this type without first giving it one.
 ///
+/// # The child leads its own process group, and the group is what is killed
+///
+/// `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`. Killing the direct child
+/// only manufactures a fault **production does not produce**: the engine's
+/// sole kill path, [`crate::agent::proc`]'s `kill_tree`, sends `SIGKILL` to
+/// the process *group* after a pre-exec `setpgid(0, 0)`, and the workspace
+/// manager's own Git children are never killed at all — they run to
+/// completion. A bare child kill leaves `git worktree add`'s descendants
+/// alive and writing into the very worktree [`recover_sample`] then forces
+/// the removal of, and no contract promises a removal converges against a
+/// live writer. Measured, fifty runs per arm, same commit and same load:
+/// bare child 5/50 failed, process group 0/50.
+///
+/// So the sampled child is spawned with `process_group(0)` and the kill goes
+/// to `-pgid`, which is what production does. **Unix only**: `std` offers no
+/// portable group kill, and the Windows half of production's containment is
+/// a Job Object private to `agent::proc`.
+///
+/// What this does **not** establish, and no reader should take from it: that
+/// [`WorkspaceManager::remove_worktree`] converges against every residue an
+/// interrupted `git worktree add` can leave. It shows this harness was
+/// producing a state production's kill path does not, not that no such state
+/// exists — a crash of the engine itself orphans its Git children the same
+/// way, and nothing here measures that. That question is a finding of its
+/// own.
+///
 /// [`Child::kill`]: std::process::Child::kill
 struct SampledChild {
     child: std::process::Child,
@@ -9363,36 +9743,92 @@ struct SampledChild {
     /// What the clock said when a kill fired at this child, or `None` if
     /// none ever did. Written only by [`Self::kill`].
     fired: Option<std::time::Duration>,
+    /// Whether the kernel says this child leads its own process group, asked
+    /// once at the spawn instant.
+    ///
+    /// Through `agent::proc::child_leads_its_own_group` — production's own
+    /// witness for the same kernel fact, not a second copy of it. It is
+    /// asked at all because `process_group(0)` is a builder call that
+    /// returns nothing to check, so deleting it leaves every other record
+    /// here exactly as it was; `getpgid(pid) == pid` is the one observation
+    /// that moves.
+    #[cfg(unix)]
+    led_its_own_group: bool,
+    /// What the group kill answered, or `None` if no group kill ran at this
+    /// child. Written only by [`Self::kill`].
+    #[cfg(unix)]
+    group_kill: Option<GroupKill>,
+}
+
+/// What the process-group kill did to one sampled child.
+///
+/// Three outcomes and not two, because "the kill was not delivered" and "there
+/// was no group of this child's own to deliver it to" are different failures
+/// with different repairs, and the second is also the one that must never be
+/// *attempted*: with `process_group(0)` gone the child sits in this test
+/// binary's group, and `kill(-pid, SIGKILL)` would then name whatever group
+/// happens to carry that id.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKill {
+    /// `kill(-pgid, SIGKILL)` returned 0 at a group the kernel confirmed this
+    /// child leads.
+    Delivered,
+    /// It was attempted at that group and came back with this `errno`.
+    Refused(i32),
+    /// Not attempted: the kernel says this child does not lead its own group.
+    NotItsOwnGroup,
 }
 
 impl SampledChild {
     fn spawn(cwd: &Path, args: &[String]) -> Self {
-        let child = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(cwd)
             .args(["-c", "core.fsmonitor=false"])
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the sampled git child");
+            .stderr(Stdio::null());
+        // `setpgid(0, 0)` in the forked child before `exec`, which is where
+        // `agent::proc::run_with_timeout_at` puts it and what `std` does for
+        // this call. Without it the child shares this test binary's group and
+        // there is no group of the child's own for a kill to name.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn().expect("spawn the sampled git child");
+        let spawned = std::time::Instant::now();
+        #[cfg(unix)]
+        let led_its_own_group = crate::agent::proc::child_leads_its_own_group(child.id());
         Self {
             child,
-            spawned: std::time::Instant::now(),
+            spawned,
             fired: None,
+            #[cfg(unix)]
+            led_its_own_group,
+            #[cfg(unix)]
+            group_kill: None,
         }
     }
 
-    /// Kill the child, recording when the kill fired.
+    /// Kill the child's process group and then the child, recording when the
+    /// kill fired and what the group kill answered.
     ///
     /// The clock is read at the instant of the kill and stored *after* the
     /// kill has returned. Read at that instant, the value is the kill's
     /// actual timing rather than the timing it was asked for; stored after
     /// the call, the record cannot outlive the call's removal, because
     /// deleting `self.child.kill()` leaves `outcome` unbound and the module
-    /// stops compiling. The kill's own answer is returned and recorded by the
-    /// caller; nothing here decides what it means.
+    /// stops compiling. `group` is bound for the same reason and buys the
+    /// same thing: deleting the group kill, or the statement that records
+    /// it, is a compile error rather than a silently weaker sampler. The
+    /// kill's own answer is returned and recorded by the caller; nothing
+    /// here decides what it means.
+    ///
+    /// **The group first, the child second**, which is `kill_tree`'s order.
+    /// The group kill reaches the child too; `Child::kill` after it is what
+    /// leaves `std` holding a child it agrees is dead.
     ///
     /// What that still leaves reachable is a fake that keeps the call and
     /// throws its effect away. The kill floor at the end of the sampling
@@ -9400,9 +9836,49 @@ impl SampledChild {
     /// but a real kill produces.
     fn kill(&mut self) -> std::io::Result<()> {
         let fired = self.spawned.elapsed();
+        #[cfg(unix)]
+        let group = self.kill_group();
         let outcome = self.child.kill();
         self.fired = Some(fired);
+        #[cfg(unix)]
+        {
+            self.group_kill = Some(group);
+        }
         outcome
+    }
+
+    /// `SIGKILL` the whole process group this child leads.
+    ///
+    /// The group is still this child's own even if the child has already
+    /// exited: nothing has reaped it — [`Self::wait`] is the caller's next
+    /// statement — so the zombie leader holds the group id out of the
+    /// kernel's reuse pool, and the signal cannot land on a stranger. That is
+    /// also why the sampling test can assert on the answer where it cannot
+    /// assert on [`Child::kill`]'s: a signal to a group whose only surviving
+    /// member is a zombie still returns 0, where `TerminateProcess` on an
+    /// exited process does not.
+    ///
+    /// [`Child::kill`]: std::process::Child::kill
+    #[cfg(unix)]
+    fn kill_group(&self) -> GroupKill {
+        if !self.led_its_own_group {
+            return GroupKill::NotItsOwnGroup;
+        }
+        let pid = libc::pid_t::try_from(self.child.id()).expect("a child pid fits in a pid_t");
+        // SAFETY: `spawn` asked for `process_group(0)` and the branch above
+        // has the kernel's confirmation that it took, so this child leads the
+        // group whose id is its own pid and a negative pid names that group
+        // and nothing else. The child is unreaped, so the id is still its.
+        let sent = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if sent == 0 {
+            GroupKill::Delivered
+        } else {
+            GroupKill::Refused(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(sent),
+            )
+        }
     }
 
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -9429,6 +9905,8 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
             after,
             fired: child.fired,
             kill_error,
+            #[cfg(unix)]
+            group_kill: child.group_kill,
             end: launch_end(&status),
         });
 }
