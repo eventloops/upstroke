@@ -130,8 +130,10 @@ pub enum BijectionFailure {
         site: EffectSiteId,
         /// The frozen sample count.
         n: u32,
-        /// What the histogram and the unclassified count add up to.
-        counted: u32,
+        /// What the histogram and the unclassified count add up to, summed
+        /// without saturation; wider than `n` so that a histogram one sample
+        /// over a full `u32` reports as one sample over.
+        counted: u64,
     },
 
     #[error("`{site}` has a residue class but no sampling record: its frozen N is zero")]
@@ -253,8 +255,10 @@ pub enum BijectionFailure {
 /// everything. A slice that narrows the inventory narrows its own claim, which
 /// is why the self-test also runs the check over the *full* claimed inventory
 /// and asserts that it fails. Nothing here refuses an empty slice: a check over
-/// no sites reports no failures, and it is the caller that has to be the thing
-/// that knows which sites it meant.
+/// no sites requires nothing of the harness, every entry it is handed is then
+/// outside the inventory and reported as such, and an empty inventory with an
+/// empty entry slice reports nothing at all — it is the caller that has to know
+/// which sites it meant.
 ///
 /// `host` narrows the same way and is easier to miss, because it narrows
 /// silently in the middle of a claim that otherwise reads as total. A
@@ -606,11 +610,24 @@ fn check_evidence(
                     count: sampling.unclassified,
                 });
             }
-            let counted = sampling
-                .histogram
-                .total()
-                .saturating_add(sampling.unclassified);
-            if counted != sampling.n {
+            // Summed in `u64`, where four `u32`s cannot overflow, and compared
+            // with `n` widened. `ClassHistogram::total` saturates, and a
+            // saturating sum agrees with an `n` of `u32::MAX` whatever the
+            // histogram holds: `{ none: u32::MAX, internal: 1, after: 0 }`
+            // accounts for one sample more than `n` and used to pass this
+            // check. The checker reads the three fields itself rather than
+            // `total()` so that the arithmetic it decides by is its own.
+            let histogram = sampling.histogram;
+            let counted = [
+                histogram.none,
+                histogram.internal,
+                histogram.after,
+                sampling.unclassified,
+            ]
+            .into_iter()
+            .map(u64::from)
+            .sum::<u64>();
+            if counted != u64::from(sampling.n) {
                 failures.push(BijectionFailure::SamplingUnaccounted {
                     site,
                     n: sampling.n,

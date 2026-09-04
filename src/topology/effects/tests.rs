@@ -5607,6 +5607,41 @@ fn the_bijection_fails_on_every_missing_link() {
             expect: |failure| matches!(failure, BijectionFailure::SamplingUnaccounted { .. }),
         },
         Direction {
+            // The frontier reviewer's reproduction at `ffe26ca`. The check
+            // summed with `saturating_add`, and a saturating sum agrees with
+            // an `n` of `u32::MAX` whatever the histogram holds, so this
+            // record — one sample more than `n` accounts for — produced no
+            // `SamplingUnaccounted` and the document passed. `validate_entry`
+            // does not read these counts, so the bijection is the only check
+            // that can.
+            name: "a histogram whose saturating total equals n",
+            break_it: |_, entries| {
+                for entry in entries.iter_mut() {
+                    if let Evidence::RecoveryProven { sampling, .. } = &mut entry.evidence {
+                        sampling.n = u32::MAX;
+                        sampling.histogram = ClassHistogram {
+                            none: u32::MAX,
+                            internal: 1,
+                            after: 0,
+                        };
+                        sampling.unclassified = 0;
+                        sampling.recovered = true;
+                        break;
+                    }
+                }
+            },
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::SamplingUnaccounted {
+                        n: u32::MAX,
+                        counted,
+                        ..
+                    } if *counted == u64::from(u32::MAX) + 1
+                )
+            },
+        },
+        Direction {
             name: "a sampled residue that did not recover",
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
@@ -5689,7 +5724,7 @@ fn the_bijection_fails_on_every_missing_link() {
             direction.name
         );
     }
-    assert_eq!(directions.len(), 15, "every direction above is exercised");
+    assert_eq!(directions.len(), 16, "every direction above is exercised");
 
     // The unbroken state passes, so each direction above is the *only*
     // difference between passing and failing.
