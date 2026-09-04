@@ -1568,6 +1568,66 @@ mod tests {
         escaped
     }
 
+    /// `trim()` ate a trailing space from a path Git answered with, which is a
+    /// different path. Unix only: Windows strips a trailing space from a
+    /// directory name itself, so the case cannot be built there.
+    #[cfg(unix)]
+    #[test]
+    fn git_strips_the_line_terminator_and_not_a_trailing_space() {
+        let tree = scratch_tree("trailing-space");
+        let awkward = tree.path().join("repo with a trailing space ");
+        create_dir(&awkward);
+        git(&awkward, &["init", "-q", "-b", "main"]);
+        assert_eq!(
+            PathBuf::from(git(&awkward, &["rev-parse", "--show-toplevel"])),
+            awkward
+                .canonicalize()
+                .expect("canonicalize the awkwardly named repository"),
+            "the trailing space came off with the line terminator"
+        );
+    }
+
+    /// The capture is bounded and the reading is not: a child that keeps
+    /// writing must not be blocked on a full pipe, and must not be able to
+    /// exhaust this process either.
+    #[test]
+    fn a_childs_stream_is_captured_up_to_the_bound_and_read_past_it() {
+        use std::io::Read as _;
+
+        let written = CHILD_CAPTURE_LIMIT * 3;
+        let kept = read_capped(std::io::repeat(b'x').take(written as u64), "stdout");
+        let text = String::from_utf8_lossy(&kept);
+        assert!(
+            kept.len() > CHILD_CAPTURE_LIMIT && kept.len() < CHILD_CAPTURE_LIMIT + 512,
+            "the capture kept {} bytes, which is not the bound plus its own note",
+            kept.len()
+        );
+        assert!(
+            text.contains("were dropped at the"),
+            "the caller is not told that bytes were dropped: {text}"
+        );
+    }
+
+    /// The join is bounded too, because a grandchild holding the pipe would
+    /// otherwise hang the parent after the child itself is gone.
+    #[test]
+    fn a_reader_that_does_not_finish_inside_the_bound_is_reported() {
+        let (sender, receiver) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Ends when the test lets it, not on a timer, so nothing here
+            // sleeps as synchronisation.
+            let _ = receiver.recv();
+            Vec::new()
+        });
+        let reported = join_within(handle, std::time::Instant::now(), "stdout");
+        let text = String::from_utf8_lossy(&reported);
+        assert!(
+            text.contains("did not finish inside the bound"),
+            "an unfinished reader must be reported rather than waited on: {text}"
+        );
+        drop(sender);
+    }
+
     /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
     #[test]
     #[ignore = "spawned by `the_fixture_is_immune_to_an_ambient_config_and_template` with a \
