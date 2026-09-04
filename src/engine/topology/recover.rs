@@ -2121,7 +2121,10 @@ impl crate::engine::topology::candidate::CandidateJournal for RecoveryJournal<'_
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Refused`] when the recorded ref is symbolic, checked out in
+/// [`UpstrokeError::Refused`] when the recorded base is not a full hexadecimal
+/// object id or is the null id (`workspace_manager::Refusal::MalformedObjectId`,
+/// `NullNew`; `CommitSha` does not validate this, so a record carrying one
+/// reaches this refusal), or when the recorded ref is symbolic, checked out in
 /// some worktree, or already at any SHA other than the recorded base; a Git
 /// error from the creation itself, including the zero-old failure when the ref
 /// appeared between the read and the write.

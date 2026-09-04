@@ -1729,12 +1729,23 @@ fn the_null_object_id_is_never_an_expected_old_value() {
 /// a null **new** value means "must not exist afterwards", so raw Git turns a
 /// compare-and-swap whose expected-old matches into a delete, and a create of
 /// an absent ref into a success that creates nothing. Both primitives refuse
-/// it before Git is asked, at both hash lengths, and the raw measurement is
-/// executed here so the refusal guards a live hazard and not a hypothetical
-/// one.
+/// it before the mutating `update-ref`, at both hash lengths whatever the
+/// repository's format (the refusal is on the value, and the symbolic-ref
+/// and checked-out checks that run before it read Git without mutating), and
+/// the raw measurement is executed in a repository of each format, with the
+/// null id spelt at that format's length, so the refusal guards a live hazard
+/// and not a hypothetical one.
 #[test]
 fn the_null_object_id_is_never_a_new_value_through_create_or_compare_and_swap() {
-    let fixture = Fixture::created("null-new");
+    for fixture in [
+        Fixture::created("null-new-sha1"),
+        Fixture::created_sha256("null-new-sha256"),
+    ] {
+        null_new_value_refuses_and_raw_git_would_not(&fixture);
+    }
+}
+
+fn null_new_value_refuses_and_raw_git_would_not(fixture: &Fixture) {
     let existing = "refs/upstroke/runs/run-1/integration";
     let absent = "refs/upstroke/runs/run-1/candidates/kalpha/1";
     fixture
@@ -1791,18 +1802,14 @@ fn the_null_object_id_is_never_a_new_value_through_create_or_compare_and_swap() 
         );
     }
 
-    // The measurement the refusals are derived from: raw Git deletes through
-    // the swap when the old value matches, and creates nothing through the
-    // create when the ref is absent, exiting 0 both times.
+    // The measurement the refusals are derived from, in this repository's
+    // own format: raw Git deletes through the swap when the old value
+    // matches, and creates nothing through the create when the ref is
+    // absent, exiting 0 both times.
+    let null = "0".repeat(fixture.head.len());
     let raw = git_out(
         &fixture.base,
-        &[
-            "update-ref",
-            "--no-deref",
-            existing,
-            &"0".repeat(40),
-            &fixture.head,
-        ],
+        &["update-ref", "--no-deref", existing, &null, &fixture.head],
     );
     assert!(
         raw.status.success()
@@ -1811,12 +1818,12 @@ fn the_null_object_id_is_never_a_new_value_through_create_or_compare_and_swap() 
                 .direct_ref_target(existing)
                 .expect("read")
                 .is_none(),
-        "raw `git update-ref <ref> 0{{40}} <old>` deletes when the old value matches; that is why \
+        "raw `git update-ref <ref> <null> <old>` deletes when the old value matches; that is why \
          the primitive refuses it"
     );
     let raw = git_out(
         &fixture.base,
-        &["update-ref", "--no-deref", absent, &"0".repeat(40), ""],
+        &["update-ref", "--no-deref", absent, &null, ""],
     );
     assert!(
         raw.status.success()
@@ -1825,7 +1832,7 @@ fn the_null_object_id_is_never_a_new_value_through_create_or_compare_and_swap() 
                 .direct_ref_target(absent)
                 .expect("read")
                 .is_none(),
-        "raw `git update-ref <ref> 0{{40}} \"\"` exits 0 and creates nothing; that is why the \
+        "raw `git update-ref <ref> <null> \"\"` exits 0 and creates nothing; that is why the \
          primitive refuses it"
     );
 }

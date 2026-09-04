@@ -118,13 +118,18 @@ pub(super) fn refuse_expected_old(refname: &str, old: &str) -> Result<(), Refusa
 /// The new side of every create and compare-and-swap: a well-formed, non-null
 /// id.
 ///
+/// Crate-visible, not `pub(super)`: the engine's `ensure_integration_ref` and
+/// the test doubles that implement its `IntegrationRefs` apply the same
+/// refusal, so the contract is one function rather than a copy per
+/// implementation.
+///
 /// # Errors
 ///
 /// [`Refusal::MalformedObjectId`] when `new` is not a full hexadecimal id, and
 /// [`Refusal::NullNew`] when it is the null id of either length, which Git
 /// would read as "must not exist afterwards" (see the module doc). Nothing has
 /// run.
-pub(super) fn refuse_new(refname: &str, new: &str) -> Result<(), Refusal> {
+pub(crate) fn refuse_new(refname: &str, new: &str) -> Result<(), Refusal> {
     // Deliberate `?` (§7): as in `refuse_expected_old`, the refusal already
     // names the ref, the side (`new`) and the value as offered.
     refuse_malformed_object_id(refname, "new", new)?;

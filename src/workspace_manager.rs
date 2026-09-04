@@ -2423,8 +2423,9 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
 // ---------------------------------------------------------------------------
 
 mod object;
+use self::object::refuse_expected_old;
+pub(crate) use self::object::refuse_new;
 pub use self::object::{is_null_object_id, is_object_id};
-use self::object::{refuse_expected_old, refuse_new};
 
 // ---------------------------------------------------------------------------
 // Small filesystem helpers
