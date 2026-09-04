@@ -2321,38 +2321,44 @@ mod termination {
         /// `SIGTERM` here guarded a state that cannot exist yet, and on macOS,
         /// where a forked helper's startup runs long under load, it killed the
         /// test harness with no diagnostic (`C-004`).
-        ///
-        /// `presence` is what the snapshot just saw, and it gates both the
-        /// signal and the wait: see [`HelperPresence::may_signal`]. A pid the
-        /// kernel no longer holds is not this reaper's, and killing or
-        /// reaping it is the one act here that can reach an unrelated
-        /// process. The descriptors are this process's own and are closed
-        /// either way.
-        fn abandon(self, presence: HelperPresence) {
-            if !presence.may_signal() {
-                close_fd(self.command_fd);
-                close_fd(self.ack_fd);
-                close_fd(self._command_keepalive_fd);
-                return;
-            }
-            // SAFETY: `pid` is the unreaped reaper this process forked, which
-            // the kernel has just reported as a process it still holds. It is
+        /// Returns what the kill and the wait answered, for the failure
+        /// message. The order and the calls are master's; only the two
+        /// results are kept rather than discarded.
+        fn abandon(self) -> HelperEnd {
+            // SAFETY: `pid` is the unreaped reaper this process forked. It is
             // the only member of its own process group and holds nothing but
             // its shared cleanup lease, which its exit releases.
-            unsafe {
-                let _ = libc::kill(self.pid, libc::SIGKILL);
+            let killed = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let kill_errno = if killed == 0 { 0 } else { last_errno() };
+            let (waited, wait_errno, status) = self.close_and_wait_reporting();
+            HelperEnd {
+                kill_errno,
+                waited,
+                wait_errno,
+                status,
             }
-            self.close_and_wait();
         }
 
         fn close_and_wait(self) {
+            let _ = self.close_and_wait_reporting();
+        }
+
+        /// [`close_and_wait`](Self::close_and_wait), keeping what the final
+        /// `waitpid` answered: the pid it returned or `-1`, the errno it left
+        /// in that case, and the status it filled otherwise. The loop, the
+        /// descriptors it closes and the order are unchanged.
+        fn close_and_wait_reporting(self) -> (libc::pid_t, libc::c_int, libc::c_int) {
             close_fd(self.command_fd);
             close_fd(self.ack_fd);
             close_fd(self._command_keepalive_fd);
+            let mut status = 0;
             loop {
-                let waited = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
-                if waited == self.pid || (waited < 0 && !last_errno_is_interrupted()) {
-                    return;
+                let waited = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if waited == self.pid {
+                    return (waited, 0, status);
+                }
+                if waited < 0 && !last_errno_is_interrupted() {
+                    return (waited, last_errno(), 0);
                 }
             }
         }
@@ -2388,6 +2394,18 @@ mod termination {
             .unwrap_or(0);
         #[cfg(not(test))]
         let ready_delay_ms = 0_u64;
+        // A helper that ends before it writes READY, so the failure path is
+        // driven with no clock in it at all: the parent's wait ends on the
+        // pipe's end-of-file rather than on its budget, whatever the
+        // scheduler does with either process. `UPSTROKE_TEST_REAPER_READY_
+        // DELAY_MS` above drives the same path through the budget instead,
+        // and depends on the child outrunning it.
+        #[cfg(test)]
+        let exit_before_ready = std::env::var("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY")
+            .ok()
+            .and_then(|value| value.parse::<libc::c_int>().ok());
+        #[cfg(not(test))]
+        let exit_before_ready: Option<libc::c_int> = None;
         let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         if open_max <= 0 {
             return Err("reading the Unix open-file descriptor ceiling".to_owned());
@@ -2446,6 +2464,9 @@ mod termination {
                 raw_sleep_10ms();
                 delay_left = delay_left.saturating_sub(10);
             }
+            if let Some(code) = exit_before_ready {
+                unsafe { libc::_exit(code) };
+            }
             reaper_loop(
                 parent,
                 command[0],
@@ -2483,21 +2504,16 @@ mod termination {
         };
         let ready_wait_began = std::time::Instant::now();
         if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
-            // Read what the child was doing BEFORE anything is closed or
-            // killed. `abandon` kills and reaps it, so a snapshot taken after
-            // would report the state this diagnostic had itself caused rather
-            // than the one it exists to report (row
-            // `PR125-CLOSE-GUARD-TEARDOWN-BEFORE-THE-SNAPSHOT`). The snapshot
-            // also decides whether there is anything of ours left to signal.
             let waited = ready_wait_began.elapsed();
-            let snapshot = helper_snapshot(pid, ack[0]);
-            let note = snapshot.presence.teardown_note();
-            reaper.abandon(snapshot.presence);
+            // The teardown is master's, unchanged and in master's order; what
+            // it answered becomes the diagnostic. Nothing is asked of the pid
+            // before it, so this adds no window in which a number could be
+            // reaped elsewhere and reused (row
+            // `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`).
+            let end = describe_helper_end(reaper.abandon());
             return Err(format!(
                 "Unix cleanup reaper did not initialize; waited {waited:?} of \
-                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; the reaper \
-                 (pid {pid}) is {}{note}",
-                snapshot.description
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}"
             ));
         }
         #[cfg(test)]
@@ -2843,6 +2859,77 @@ mod termination {
         }
     }
 
+    /// What ending a helper that never acknowledged its startup actually
+    /// returned.
+    ///
+    /// This asks the kernel nothing it was not already going to be asked. The
+    /// teardown sends one `SIGKILL` and takes one `waitpid`, exactly as it
+    /// did before this existed and in the same order; all this does is keep
+    /// the two answers instead of discarding them, which is what §7 asks of a
+    /// signal whose result the caller depends on and what row
+    /// `PR125-CLOSE-DISCARDED-KILL-RESULT` asks for.
+    ///
+    /// **Nothing here is a claim about which process the number named.** A
+    /// pid cannot be tied to the helper that was forked with it while an
+    /// embedding host may reap this process's children — that is the open
+    /// design question of row
+    /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`, and no
+    /// observation the parent can make settles it. So these are the words for
+    /// what two system calls answered, and a reader draws the same inference
+    /// from them that they could draw from the calls themselves: no more.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct HelperEnd {
+        /// `0` if `kill` reported delivery, otherwise the errno it left.
+        kill_errno: libc::c_int,
+        /// The pid `waitpid` returned, or `-1`.
+        waited: libc::pid_t,
+        /// The errno `waitpid` left when it returned `-1`.
+        wait_errno: libc::c_int,
+        /// The status `waitpid` filled when it returned a pid.
+        status: libc::c_int,
+    }
+
+    /// The words a failure message carries for a [`HelperEnd`].
+    ///
+    /// Two outcomes are worth separating and this separates them: a child
+    /// that was **still there** and was killed, and one that had **already
+    /// ended** before the signal — either by exiting on its own, which its
+    /// exit status then names, or by being gone from the process table
+    /// altogether. A helper that exits before READY does so through one of
+    /// its own `_exit(1)` paths, so a status is the difference between "it
+    /// failed setting itself up" and "it was still working when we gave up".
+    fn describe_helper_end(end: HelperEnd) -> String {
+        let signalled = match end.kill_errno {
+            0 => "SIGKILL was delivered".to_owned(),
+            libc::ESRCH => "SIGKILL answered ESRCH, so nothing of that number was there".to_owned(),
+            errno => format!(
+                "SIGKILL failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+        };
+        let reaped = if end.waited > 0 {
+            if libc::WIFSIGNALED(end.status) {
+                format!(
+                    "and the wait collected it, killed by signal {}",
+                    libc::WTERMSIG(end.status)
+                )
+            } else if libc::WIFEXITED(end.status) {
+                format!(
+                    "and the wait collected it, having already exited with status {}",
+                    libc::WEXITSTATUS(end.status)
+                )
+            } else {
+                format!("and the wait collected it with raw status {}", end.status)
+            }
+        } else {
+            format!(
+                "and the wait collected nothing: {}",
+                std::io::Error::from_raw_os_error(end.wait_errno)
+            )
+        };
+        format!("{signalled}, {reaped}")
+    }
+
     fn read_guard_ack(fd: libc::c_int, timeout: Duration) -> Option<u8> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -2937,15 +3024,15 @@ mod termination {
     }
 
     fn spawn_guard(policy: SignalPolicy) -> Result<Guard, String> {
-        // Read before fork, as the reaper's own delay seam is: the
-        // multithreaded child may call only async-signal-safe primitives.
+        // A helper that ends before it writes READY; see the same seam in
+        // `spawn_reaper`. Read before fork: the multithreaded child may call
+        // only async-signal-safe primitives.
         #[cfg(test)]
-        let ready_delay_ms = std::env::var("UPSTROKE_TEST_GUARD_READY_DELAY_MS")
+        let exit_before_ready = std::env::var("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY")
             .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+            .and_then(|value| value.parse::<libc::c_int>().ok());
         #[cfg(not(test))]
-        let ready_delay_ms = 0_u64;
+        let exit_before_ready: Option<libc::c_int> = None;
         // Resolve the descriptor ceiling before fork: sysconf may take libc
         // locks, whereas the multithreaded child may call only async-safe
         // primitives until it enters the guard loop.
@@ -3040,13 +3127,8 @@ mod termination {
             close_fd(ack[0]);
             close_fd(probe[0]);
             close_inherited_fds(&[command[0], ack[1], wake[0], wake[1], probe[1]], open_max);
-            // Test subprocesses can hold READY back past the parent's
-            // deadline so the failed-guard path is driven deterministically,
-            // as `UPSTROKE_TEST_REAPER_READY_DELAY_MS` does for the reaper.
-            let mut delay_left = ready_delay_ms;
-            while delay_left > 0 {
-                raw_sleep_10ms();
-                delay_left = delay_left.saturating_sub(10);
+            if let Some(code) = exit_before_ready {
+                unsafe { libc::_exit(code) };
             }
             guard_loop(parent, command[0], ack[1], wake[0], probe[1], probe_pid);
         }
@@ -3079,34 +3161,28 @@ mod termination {
             || !read_raw_exact(ack[0], &mut probe_pid_bytes)
             || i32::from_ne_bytes(probe_pid_bytes) <= 0
         {
-            // Read the snapshot BEFORE any descriptor is closed and before
-            // the kill. Closing the command and acknowledgement descriptors
-            // first gives a guard that reaches its READY write just then an
-            // `EPIPE`, and the snapshot would report the exit this diagnostic
-            // caused (row `PR125-CLOSE-GUARD-TEARDOWN-BEFORE-THE-SNAPSHOT`).
             let waited = ready_wait_began.elapsed();
-            let snapshot = helper_snapshot(pid, ack[0]);
-            let note = snapshot.presence.teardown_note();
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
-            if snapshot.presence.may_signal() {
-                // SAFETY: `pid` is the child returned by fork, has not been
-                // reaped, and the kernel has just reported it as a process it
-                // still holds. A failed setup acknowledgement must not leave
-                // it alive. A pid the kernel does not hold is not this
-                // guard's and is left alone: see
-                // [`HelperPresence::may_signal`].
-                unsafe {
-                    let _ = libc::kill(pid, libc::SIGKILL);
-                    let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
-            }
+            // SAFETY: `pid` is the child returned by fork and has not been
+            // reaped. A failed setup acknowledgement must not leave it alive.
+            // The calls and their order are master's; only their answers are
+            // kept, for the message below.
+            let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let kill_errno = if killed == 0 { 0 } else { last_errno() };
+            let mut status = 0;
+            // SAFETY: as above.
+            let waited_pid = unsafe { libc::waitpid(pid, &mut status, 0) };
+            let end = describe_helper_end(HelperEnd {
+                kill_errno,
+                waited: waited_pid,
+                wait_errno: if waited_pid < 0 { last_errno() } else { 0 },
+                status: if waited_pid > 0 { status } else { 0 },
+            });
             return Err(format!(
                 "Unix job-control guard did not initialize; waited {waited:?} of \
-                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; the guard \
-                 (pid {pid}) is {}{note}",
-                snapshot.description
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}"
             ));
         }
         PROBE_PID.store(i32::from_ne_bytes(probe_pid_bytes), Ordering::SeqCst);
@@ -3767,384 +3843,6 @@ mod termination {
         };
         (read == std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int)
             .then_some(info.pbsi_status == libc::SSTOP)
-    }
-
-    /// Whether the pid a helper was forked with is still that helper's.
-    ///
-    /// A pid is free for the kernel to hand to an unrelated fork only once
-    /// the process holding it has been reaped. So a kernel that still reports
-    /// the number — running, stopped, or exited and not yet reaped — is
-    /// reporting *this* process's child, and one that does not know the
-    /// number at all is telling us the child has been reaped by something
-    /// other than us. Row
-    /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER` is why that
-    /// second case is real: the library anticipates an embedding host whose
-    /// SIGCHLD handler reaps with wildcard waits.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum HelperPresence {
-        /// The kernel reports the number as a process it still holds.
-        Present,
-        /// The kernel does not know the number. The helper has been reaped
-        /// elsewhere and the number is free to be reused.
-        Gone,
-        /// The query failed, so the parent cannot tell the two apart.
-        Unknown,
-    }
-
-    impl HelperPresence {
-        /// Whether this pid may be signalled or waited for.
-        ///
-        /// Only `Present`. Signalling is the one act on this path that can
-        /// reach a process that is not ours, and `waitpid` on a reused number
-        /// can reap an unrelated child of this process. Where the parent
-        /// cannot say the number is still the helper's, it does neither and
-        /// says so in the failure message.
-        ///
-        /// This is **not** a verification of the pid, and nothing here asks
-        /// `waitpid(pid, WNOHANG)`: a zero from that proves only that the
-        /// number names some unreaped child of this process, which is the
-        /// machinery row `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`
-        /// records as not settling the question. This uses what the snapshot
-        /// already had to read.
-        fn may_signal(self) -> bool {
-            matches!(self, HelperPresence::Present)
-        }
-
-        /// What the failure message says about the teardown, when there was
-        /// not one.
-        fn teardown_note(self) -> &'static str {
-            match self {
-                HelperPresence::Present => "",
-                HelperPresence::Gone => {
-                    "; it was neither signalled nor waited for, because the kernel no longer \
-                     knows this pid: the helper has been reaped by something other than this \
-                     code and the number is free to have been reused"
-                }
-                HelperPresence::Unknown => {
-                    "; it was neither signalled nor waited for, because the parent could not \
-                     confirm the pid is still this process's child"
-                }
-            }
-        }
-    }
-
-    /// What the parent could see of a forked helper that has not acknowledged
-    /// its startup, for the failure message that reports the miss — and the
-    /// one input the teardown is allowed to act on.
-    struct HelperSnapshot {
-        /// Whether the pid may still be signalled. See
-        /// [`HelperPresence::may_signal`].
-        presence: HelperPresence,
-        /// The words the failure message carries.
-        description: String,
-    }
-
-    /// Look at a helper that has not acknowledged its startup.
-    ///
-    /// Read this **before** the caller closes a descriptor or signals the
-    /// child. A teardown first can be the very thing the snapshot then
-    /// reports: closing the acknowledgement descriptor gives a helper that
-    /// reaches its READY write just then an `EPIPE`, and the diagnostic
-    /// describes the exit it caused (row
-    /// `PR125-CLOSE-GUARD-TEARDOWN-BEFORE-THE-SNAPSHOT`).
-    ///
-    /// **This is three observations at three instants, not one atomic
-    /// sample**, and the order is part of what the message means. Everything
-    /// here runs before the signal, so each query has to be worth its share
-    /// of the window in which a helper that has been reaped elsewhere could
-    /// have its number reused (row
-    /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`):
-    ///
-    /// 1. **the descriptor count**, first because it is the slowest and makes
-    ///    no claim the teardown acts on. It earns its place by being the only
-    ///    observation that separates a helper stuck *before* its descriptor
-    ///    scrub from one stuck *after* it — on Darwin that scrub is one
-    ///    `close` per descriptor number up to the ceiling, which is the
-    ///    leading hypothesis for the failure this exists to diagnose;
-    /// 2. **whether an acknowledgement arrived after the deadline**, a
-    ///    non-blocking look at the parent's own end of the pipe. The pipe is
-    ///    still open while this runs, so a helper can write READY just after
-    ///    the wait gave up and be sampled looking perfectly ordinary; this is
-    ///    what tells a reader that that is what happened, rather than leaving
-    ///    the rest of the message to be misread as a pre-READY state;
-    /// 3. **the state**, cheapest and last, because it is the only one the
-    ///    signal is gated on and a gate is worth least when it is stale.
-    ///
-    /// The residual is real and is not claimed away: a helper that is
-    /// `Present` here can exit, be reaped elsewhere and have its number
-    /// reused before the signal a few instructions later. Master has that
-    /// window too; this one is longer by the three queries above. What the
-    /// gate removes is the case where the reaping has *already* happened when
-    /// the parent looks, which is the likely one — master signalled that pid
-    /// regardless. Removing the residual needs the design decision in row
-    /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`, which is the
-    /// owner's and is not pre-empted here.
-    ///
-    /// A query that failed or answered short is reported as unknown, never as
-    /// a state and never as a count. Both host wrappers here answer zero for
-    /// a failed query, so zero from one of them is "not readable" and not "no
-    /// descriptors" (row `PR125-CLOSE-READDIR-ERRORS-COUNTED-AS-DESCRIPTORS`).
-    /// A count is a count of open descriptors and says nothing about how far
-    /// a close loop over every descriptor number had got.
-    ///
-    /// The two queries are not one capability. On Darwin
-    /// `PROC_PIDT_SHORTBSDINFO` is exempt from the same-user check while
-    /// `PROC_PIDLISTFDS` is subject to it *and* to a further
-    /// `PROC_INFO_CALL_PIDFDINFO` policy check, so a restricted host can
-    /// answer the state and refuse the count. That is not a new capability
-    /// for anyone: it lands in the unreadable arm, which is why the arm
-    /// exists.
-    fn helper_snapshot(pid: libc::pid_t, ack_fd: libc::c_int) -> HelperSnapshot {
-        let descriptors = helper_open_descriptors(pid);
-        let acknowledged = late_acknowledgement(ack_fd);
-        let (presence, state) = observed_helper_state(pid);
-        let counted = match descriptors {
-            Some(count) => format!(" with {count} descriptors open"),
-            None => ", its descriptors not readable".to_owned(),
-        };
-        let late = match acknowledged {
-            Some(byte) => {
-                format!(
-                    "; a {byte:#04x} byte arrived on its acknowledgement pipe after the deadline"
-                )
-            }
-            None => "; nothing had arrived on its acknowledgement pipe".to_owned(),
-        };
-        HelperSnapshot {
-            presence,
-            description: format!("{state}{counted}{late}"),
-        }
-    }
-
-    /// [`helper_state`], or what a test told this run to see instead.
-    ///
-    /// The gate's `Gone` and `Unknown` arms cannot be reached by arranging
-    /// the world: making a foreign reaper take this process's child, which is
-    /// what row `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`
-    /// describes, is not something a test can schedule. Forcing the
-    /// observation is what lets both arms be driven at their real call sites
-    /// rather than only in a unit test of the classification.
-    #[cfg(test)]
-    fn observed_helper_state(pid: libc::pid_t) -> (HelperPresence, String) {
-        match std::env::var("UPSTROKE_TEST_HELPER_STATE").ok().as_deref() {
-            Some("gone") => (HelperPresence::Gone, "gone".to_owned()),
-            Some("unknown") => (
-                HelperPresence::Unknown,
-                "in a state this host did not report".to_owned(),
-            ),
-            _ => helper_state(pid),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn observed_helper_state(pid: libc::pid_t) -> (HelperPresence, String) {
-        helper_state(pid)
-    }
-
-    /// The byte, if any, waiting on a helper's acknowledgement pipe now.
-    ///
-    /// Non-blocking, and it disturbs the helper in no way: it looks at the
-    /// parent's own end and closes nothing, so a helper still working towards
-    /// its READY write keeps its reader (row
-    /// `PR125-CLOSE-GUARD-TEARDOWN-BEFORE-THE-SNAPSHOT`). A zero timeout is
-    /// not a wall-clock wait: `poll` answers with what is already there.
-    fn late_acknowledgement(fd: libc::c_int) -> Option<u8> {
-        let mut waiting = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `waiting` is valid for exactly one entry, and a zero
-        // timeout returns immediately whatever the descriptor's state.
-        let ready = unsafe { libc::poll(&mut waiting, 1, 0) };
-        if ready <= 0 || waiting.revents & libc::POLLIN == 0 {
-            return None;
-        }
-        read_raw_byte(fd)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn helper_state(pid: libc::pid_t) -> (HelperPresence, String) {
-        describe_linux_stat(read_linux_stat_raw(pid))
-    }
-
-    /// The presence and the words for a `/proc/<pid>/stat` read.
-    ///
-    /// Every state the file reports is a process the kernel still holds,
-    /// `Z` and `X` included: an entry under `/proc` is not removed until the
-    /// process is reaped. `Vanished` is the reaped case and `Invalid` a read
-    /// that failed or that this host answered in a shape the parser does not
-    /// know, which is unknown rather than any particular state.
-    #[cfg(target_os = "linux")]
-    fn describe_linux_stat(snapshot: LinuxStatSnapshot) -> (HelperPresence, String) {
-        match snapshot {
-            LinuxStatSnapshot::Present { state, .. } => (
-                HelperPresence::Present,
-                match state {
-                    b'T' | b't' => "stopped".to_owned(),
-                    b'Z' => "exited and not yet reaped".to_owned(),
-                    b'X' | b'x' => "dead".to_owned(),
-                    other => format!("alive in state {}", char::from(other)),
-                },
-            ),
-            LinuxStatSnapshot::Vanished => (HelperPresence::Gone, "gone".to_owned()),
-            LinuxStatSnapshot::Invalid => (
-                HelperPresence::Unknown,
-                "in a state this host did not report".to_owned(),
-            ),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn helper_open_descriptors(pid: libc::pid_t) -> Option<usize> {
-        let table = PathBuf::from("/proc").join(pid.to_string()).join("fd");
-        // `?` deliberate: a directory that will not open is a query that
-        // failed, which is unreadable rather than a count of none.
-        count_readable_entries(std::fs::read_dir(table).ok()?)
-    }
-
-    /// How many entries a directory listing yielded, or `None` when any one
-    /// of them failed.
-    ///
-    /// `ReadDir` yields `Result<DirEntry>`. An entry that errored is not a
-    /// descriptor, and a listing that lost one is a partial answer, so the
-    /// whole count is unreadable rather than silently short by an unknown
-    /// amount (row `PR125-CLOSE-READDIR-ERRORS-COUNTED-AS-DESCRIPTORS`, which
-    /// the closed pull request's `entries.count()` is).
-    #[cfg(target_os = "linux")]
-    fn count_readable_entries<T, E>(entries: impl Iterator<Item = Result<T, E>>) -> Option<usize> {
-        let mut count = 0_usize;
-        for entry in entries {
-            // `?` deliberate on both: an entry that failed, and a count this
-            // host cannot represent, each make the answer unreadable.
-            entry.ok()?;
-            count = count.checked_add(1)?;
-        }
-        Some(count)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn helper_state(pid: libc::pid_t) -> (HelperPresence, String) {
-        // SAFETY: `proc_bsdshortinfo` is a C struct of integers and fixed
-        // byte arrays, for which all-zero bytes is a valid value; the kernel
-        // overwrites it below.
-        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-        // SAFETY: `info` is valid storage of exactly the size passed. The
-        // non-zero third argument searches the zombie table too, as
-        // `group_has_non_zombie_members` does, so a helper that has exited is
-        // told apart from one that is gone.
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDT_SHORTBSDINFO,
-                1,
-                (&mut info as *mut libc::proc_bsdshortinfo).cast(),
-                size,
-            )
-        };
-        describe_bsd_query(read, size, last_errno(), info.pbsi_status)
-    }
-
-    /// The presence and the words for a `PROC_PIDT_SHORTBSDINFO` answer.
-    ///
-    /// The wrapper answers zero for a failed query and leaves `errno`, so
-    /// only a pid the kernel cannot find is reported as gone; anything else
-    /// short of the whole structure is unknown, never a status. A partly
-    /// filled `info` holds whatever it was zeroed with, and `SIDL` is
-    /// numerically one, so a short answer read as a status would read as a
-    /// process being created.
-    #[cfg(target_os = "macos")]
-    fn describe_bsd_query(
-        read: libc::c_int,
-        size: libc::c_int,
-        errno: libc::c_int,
-        status: u32,
-    ) -> (HelperPresence, String) {
-        if read != size {
-            return if read == 0 && errno == libc::ESRCH {
-                (HelperPresence::Gone, "gone".to_owned())
-            } else {
-                (
-                    HelperPresence::Unknown,
-                    "in a state this host did not report".to_owned(),
-                )
-            };
-        }
-        (
-            HelperPresence::Present,
-            match status {
-                libc::SSTOP => "stopped".to_owned(),
-                libc::SZOMB => "exited and not yet reaped".to_owned(),
-                other => format!("alive with BSD status {other}"),
-            },
-        )
-    }
-
-    #[cfg(target_os = "macos")]
-    fn helper_open_descriptors(pid: libc::pid_t) -> Option<usize> {
-        // Asked with no buffer, `PROC_PIDLISTFDS` answers with the size of
-        // the descriptor table plus a margin rather than the count, which is
-        // what the closed pull request's first run of this reported. The
-        // count comes from the bytes the second call actually filled.
-        // SAFETY: a null buffer of length zero asks only for the size.
-        let needed =
-            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-        if needed <= 0 {
-            return None;
-        }
-        // `?` deliberate on both: a size this host cannot represent is a
-        // query this cannot answer.
-        let capacity = usize::try_from(needed).ok()?;
-        let mut buffer = vec![0_u8; capacity];
-        let length = libc::c_int::try_from(buffer.len()).ok()?;
-        // SAFETY: `buffer` is writable for exactly the length passed.
-        let filled = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDLISTFDS,
-                0,
-                buffer.as_mut_ptr().cast(),
-                length,
-            )
-        };
-        descriptors_from_listfds(filled, capacity)
-    }
-
-    /// `PROC_PIDLISTFDS` fills one `proc_fdinfo` per open descriptor and
-    /// answers with the bytes it filled, never with a count and never with an
-    /// indication that it stopped early.
-    ///
-    /// Three answers are therefore not counts:
-    ///
-    /// - a non-positive one, because the wrapper answers zero for a failed
-    ///   query, and a helper that has not said READY holds at least the pipes
-    ///   it was forked with;
-    /// - one that is not a whole number of records, which no complete answer
-    ///   is;
-    /// - one that fills the buffer, because XNU copies out what fits and
-    ///   reports only the bytes copied. The descriptor table can grow between
-    ///   the sizing call and this one — the reaper opens a lease descriptor
-    ///   per cleanup path while this is being asked — so a saturated buffer
-    ///   is a lower bound and not a count.
-    #[cfg(target_os = "macos")]
-    fn descriptors_from_listfds(filled: libc::c_int, capacity: usize) -> Option<usize> {
-        if filled <= 0 {
-            return None;
-        }
-        // `?` deliberate: a byte count this host cannot represent is a query
-        // this cannot answer.
-        let bytes = usize::try_from(filled).ok()?;
-        if bytes >= capacity {
-            return None;
-        }
-        let record = std::mem::size_of::<libc::proc_fdinfo>();
-        // `?` deliberate on both: a zero-sized record would make the
-        // remainder and the division meaningless, so it is unreadable too.
-        if bytes.checked_rem(record)? != 0 {
-            return None;
-        }
-        bytes.checked_div(record)
     }
 
     #[cfg(target_os = "linux")]
@@ -5020,22 +4718,17 @@ mod termination {
             // further 2 s a cancel would then have waited, through
             // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`. The launch must fail
             // promptly, arm nothing, and leave no child behind.
-            //
-            // "Promptly" is observed, not timed. This used to assert that the
-            // whole launch finished inside four seconds, which is a wall
-            // clock a descheduled thread can blow through while the code is
-            // perfectly correct — the class row
-            // `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS` records, and the
-            // snapshot this pull request adds now runs inside that same
-            // interval. What the bound was really checking is that the parent
-            // did not wait for the child's delayed READY, and the snapshot
-            // says that outright: it reports the acknowledgement pipe as
-            // still empty, which cannot be true of a parent that waited out a
-            // 4.5 s delay for a byte that is written at the end of it.
-            let Err(message) = spawn_reaper() else {
-                panic!("a reaper that missed its READY deadline was accepted as initialized")
-            };
-            assert_message_names_a_live_helper(&message, "Unix cleanup reaper", "the reaper");
+            let started = Instant::now();
+            let launch = spawn_reaper();
+            let elapsed = started.elapsed();
+            assert!(
+                launch.is_err(),
+                "a reaper that missed its READY deadline was accepted as initialized"
+            );
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "the late reaper held the launch for {elapsed:?}, past its own deadline"
+            );
             assert_eq!(
                 PENDING_TERMINATION.load(Ordering::SeqCst),
                 0,
@@ -5651,675 +5344,160 @@ mod termination {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// A child this test forked, killed and reaped on the way out.
+        /// The words a READY failure carries are the words for what `kill`
+        /// and `waitpid` answered, and the outcomes a reader needs told apart
+        /// are told apart: a helper that had already ended itself, one that
+        /// was still there and was killed, and one the parent could not
+        /// signal or could not collect.
         ///
-        /// A stopped or zombie child left behind holds the harness's pipes
-        /// open and the run never ends, so the reap belongs to `Drop` rather
-        /// than to a line at the end of a test body that a panic can skip.
-        struct ForkedChild(libc::pid_t);
-
-        impl ForkedChild {
-            /// Wait for a child this test has already ended. Idempotent: what
-            /// is reaped here is not reaped again by `Drop`.
-            fn reap(&mut self) {
-                let pid = std::mem::replace(&mut self.0, -1);
-                if pid <= 0 {
-                    return;
-                }
-                loop {
-                    // SAFETY: `pid` is this process's own unreaped child.
-                    let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-                    if waited == pid || (waited < 0 && !last_errno_is_interrupted()) {
-                        return;
-                    }
-                }
-            }
-        }
-
-        impl Drop for ForkedChild {
-            fn drop(&mut self) {
-                if self.0 > 0 {
-                    // SAFETY: `pid` is this process's own unreaped child.
-                    // SIGKILL also resumes a stopped one, so the wait returns.
-                    unsafe {
-                        let _ = libc::kill(self.0, libc::SIGKILL);
-                    }
-                    self.reap();
-                }
-            }
-        }
-
-        /// Block until `pid` has exited, leaving it unreaped.
+        /// An exit status is the difference that matters. A helper that ends
+        /// before READY does so through one of its own `_exit(1)` paths, so
+        /// "already exited with status 1" says it failed setting itself up,
+        /// where "killed by signal 9" says it was still working when the
+        /// parent gave up. Nothing here infers which process the number
+        /// named; that is row
+        /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`.
         ///
-        /// `waitid(WEXITED | WNOWAIT)` returns on the transition itself, so a
-        /// caller observes the zombie through the mechanism that creates it
-        /// rather than polling a clock the scheduler owns (row
-        /// `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`).
-        fn wait_for_exit_without_reaping(pid: libc::pid_t) {
-            loop {
-                // SAFETY: `info` is plain storage the kernel fills; `pid` is
-                // this process's own unreaped child and `WNOWAIT` leaves it
-                // unreaped.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let waited = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        libc::id_t::try_from(pid).expect("a child pid is an id_t"),
-                        &mut info,
-                        libc::WEXITED | libc::WNOWAIT,
-                    )
-                };
-                if waited == 0 {
-                    return;
-                }
-                assert!(
-                    last_errno_is_interrupted(),
-                    "waiting for the child to exit: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-
-        /// The pid a READY-failure message names, for a test that has to act
-        /// on the helper the failure left alone.
-        fn pid_in(message: &str) -> libc::pid_t {
-            let after = message
-                .split_once("(pid ")
-                .expect("the message names the child's pid")
-                .1;
-            let digits = after.split_once(')').expect("the pid is parenthesised").0;
-            digits.parse().expect("the pid is a number")
-        }
-
-        /// The shared assertions on a READY-failure message: it names the
-        /// budget, the descriptor ceiling and the child, it reports that
-        /// child as **alive**, and it says the acknowledgement pipe was still
-        /// empty.
-        ///
-        /// Alive is the ordering claim. Both callers hold READY back with a
-        /// delay seam more than twice the budget, so the child is sleeping
-        /// when the wait ends; a snapshot taken after the teardown each
-        /// caller performs would find it killed and reaped, and would say
-        /// gone.
-        ///
-        /// The empty pipe is the promptness claim that replaced a wall-clock
-        /// bound: the delayed child writes READY only at the end of a delay
-        /// more than twice the budget, so a parent that had waited for it
-        /// would find a byte there.
-        ///
-        /// A live helper is signalled, so the message carries no note about
-        /// having left it alone.
-        fn assert_message_names_a_live_helper(message: &str, prefix: &str, subject: &str) {
-            assert!(
-                message.starts_with(&format!("{prefix} did not initialize; waited ")),
-                "the READY failure said nothing about the child: {message}"
-            );
-            assert!(
-                message.contains(&format!(" of {HELPER_READY_BUDGET:?}; descriptor ceiling ")),
-                "the READY failure carried neither the budget nor the ceiling: {message}"
-            );
-            assert!(
-                message.contains(&format!("{subject} (pid ")),
-                "the READY failure did not name the child it forked: {message}"
-            );
-            assert!(
-                message.contains(") is alive"),
-                "the snapshot was taken after the teardown that ended the child: {message}"
-            );
-            assert!(
-                message.contains(" descriptors open")
-                    || message.contains(", its descriptors not readable"),
-                "the READY failure carried no descriptor clause at all: {message}"
-            );
-            assert!(
-                message.contains("; nothing had arrived on its acknowledgement pipe"),
-                "the parent waited for the delayed child's READY: {message}"
-            );
-            assert!(
-                !message.contains("neither signalled nor waited for"),
-                "a helper the kernel still held was left alone: {message}"
-            );
-            #[cfg(target_os = "linux")]
-            assert!(
-                message.contains(" descriptors open"),
-                "this host's `/proc` answers for a child of this process: {message}"
-            );
-        }
-
-        /// The snapshot a READY failure carries tells a running child from a
-        /// stopped one, from one that has exited and is not yet reaped, and
-        /// from one that is gone; a pid the kernel no longer knows has its
-        /// descriptors reported as unreadable rather than counted as none,
-        /// and is not a pid this code may signal.
-        ///
-        /// Every transition is observed through the mechanism that
-        /// establishes it — `waitpid(WUNTRACED)` for the stop,
-        /// `waitid(WEXITED | WNOWAIT)` for the exit — so no assertion here
-        /// depends on scheduling (row
-        /// `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`).
-        ///
-        /// Witnessed against the mutation that folds the zombie arm of
-        /// `describe_linux_stat` into the running one (delete
-        /// `b'Z' => "exited and not yet reaped".to_owned(),`): the exited
-        /// assertion fails with `alive in state Z`.
+        /// Witnessed against two mutations: the `WIFSIGNALED` and
+        /// `WIFEXITED` arms swapped, and `kill_errno` replaced by a constant
+        /// `0`. Each fails a named case below.
         #[test]
-        fn the_helper_snapshot_tells_a_running_child_from_a_stopped_and_an_exited_one() {
-            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-            assert!(open_max > 0, "invalid open-file descriptor ceiling");
-            let open_max = libc::c_int::try_from(open_max).expect("descriptor ceiling fits c_int");
-            let ready = create_cloexec_pipe().expect("a readiness pipe");
-            // SAFETY: the forked child closes its inherited descriptors,
-            // writes one byte and then calls only `pause` until it is
-            // signalled; all three are async-signal-safe, and `ForkedChild`
-            // kills and reaps it.
-            //
-            // Closing them is what a real helper does as its first work, so
-            // the count below is this fixture's own four and not whatever the
-            // harness happened to have open.
-            let pid = unsafe { libc::fork() };
-            if pid == 0 {
-                close_inherited_fds(
-                    &[
-                        libc::STDIN_FILENO,
-                        libc::STDOUT_FILENO,
-                        libc::STDERR_FILENO,
-                        ready[1],
-                    ],
-                    open_max,
-                );
-                let _ = write_raw(ready[1], &[1_u8]);
-                loop {
-                    unsafe { libc::pause() };
-                }
-            }
+        fn a_helper_ending_is_described_by_what_the_kill_and_the_wait_answered() {
+            // `waitpid` fills a status word, so the fixtures are built the
+            // way the kernel builds them rather than by the code under test.
+            let exited_one = 1 << 8;
+            let killed_by_nine = 9;
+            assert_eq!(
+                describe_helper_end(HelperEnd {
+                    kill_errno: 0,
+                    waited: 4321,
+                    wait_errno: 0,
+                    status: exited_one,
+                }),
+                "SIGKILL was delivered, and the wait collected it, having already exited with \
+                 status 1",
+                "a helper that had already failed its own setup"
+            );
+            assert_eq!(
+                describe_helper_end(HelperEnd {
+                    kill_errno: 0,
+                    waited: 4321,
+                    wait_errno: 0,
+                    status: killed_by_nine,
+                }),
+                "SIGKILL was delivered, and the wait collected it, killed by signal 9",
+                "a helper that was still there when the parent gave up"
+            );
+            let gone = describe_helper_end(HelperEnd {
+                kill_errno: libc::ESRCH,
+                waited: -1,
+                wait_errno: libc::ECHILD,
+                status: 0,
+            });
             assert!(
-                pid > 0,
-                "fork a child to observe: {}",
-                std::io::Error::last_os_error()
+                gone.contains("SIGKILL answered ESRCH, so nothing of that number was there")
+                    && gone.contains("the wait collected nothing"),
+                "a helper already gone and already collected elsewhere: {gone}"
             );
-            let mut child = ForkedChild(pid);
-            // The byte is the child saying its descriptor scrub is done. The
-            // parent's copy of the write end goes first, so a child that died
-            // instead is an end-of-file here and not a wait without an end;
-            // without this handshake the count below would race the child's
-            // own close loop and read whatever it had reached.
-            close_fd(ready[1]);
-            let mut scrubbed = [0_u8; 1];
+            let refused = describe_helper_end(HelperEnd {
+                kill_errno: libc::EPERM,
+                waited: -1,
+                wait_errno: libc::ECHILD,
+                status: 0,
+            });
             assert!(
-                read_raw_exact(ready[0], &mut scrubbed),
-                "the child did not finish closing its inherited descriptors"
-            );
-            close_fd(ready[0]);
-
-            let alive = helper_state(pid);
-            assert_eq!(alive.0, HelperPresence::Present, "a paused child");
-            assert!(alive.1.starts_with("alive"), "a paused child: {}", alive.1);
-            let counted = helper_open_descriptors(pid);
-            assert_ne!(counted, Some(0), "a live child was reported holding none");
-            // The child kept exactly four descriptors — the three standard
-            // ones and the write end it answered on — and the handshake above
-            // means it had finished closing before this was read, so the
-            // count is a count and not a stand-in for "not readable".
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                counted,
-                Some(4),
-                "the child kept the three standard descriptors and its own pipe"
-            );
-
-            // SAFETY: `pid` is this process's own unreaped child. `WUNTRACED`
-            // returns once it has actually stopped.
-            unsafe {
-                assert_eq!(libc::kill(pid, libc::SIGSTOP), 0);
-                let mut status = 0;
-                assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
-                assert!(libc::WIFSTOPPED(status), "the child did not stop");
-            }
-            let stopped = helper_state(pid);
-            assert_eq!(
-                stopped,
-                (HelperPresence::Present, "stopped".to_owned()),
-                "a stopped child"
-            );
-
-            // SAFETY: as above. SIGKILL ends a stopped child too.
-            unsafe { assert_eq!(libc::kill(pid, libc::SIGKILL), 0) };
-            wait_for_exit_without_reaping(pid);
-            assert_eq!(
-                helper_state(pid),
-                (
-                    HelperPresence::Present,
-                    "exited and not yet reaped".to_owned()
-                ),
-                "a killed, unreaped child is still this process's, and its pid is not free"
-            );
-
-            child.reap();
-            assert_eq!(
-                helper_open_descriptors(pid),
-                None,
-                "a reaped child's descriptors were counted"
-            );
-            assert_eq!(
-                helper_state(pid),
-                (HelperPresence::Gone, "gone".to_owned()),
-                "a reaped child"
+                refused.starts_with("SIGKILL failed:") && !refused.contains("ESRCH"),
+                "a signal the host refused is not the same as a helper that was gone: {refused}"
             );
         }
 
-        /// Only a pid the kernel still holds may be signalled, and the
-        /// message says why when one is left alone.
-        ///
-        /// A pid becomes free for the kernel to hand to an unrelated fork
-        /// only once the process holding it is reaped, so `Present` — running,
-        /// stopped, or exited and not yet reaped — is the whole set of states
-        /// in which the number is still this process's child.
-        ///
-        /// Witnessed against the mutation that widens the gate to
-        /// `!matches!(self, HelperPresence::Unknown)`: the `Gone` assertion
-        /// fails.
-        #[test]
-        fn only_a_pid_the_kernel_still_holds_may_be_signalled() {
-            assert!(HelperPresence::Present.may_signal());
-            assert!(!HelperPresence::Gone.may_signal());
-            assert!(!HelperPresence::Unknown.may_signal());
-            assert_eq!(HelperPresence::Present.teardown_note(), "");
-            assert!(
-                HelperPresence::Gone
-                    .teardown_note()
-                    .contains("neither signalled nor waited for")
-                    && HelperPresence::Gone
-                        .teardown_note()
-                        .contains("free to have been reused"),
-                "{}",
-                HelperPresence::Gone.teardown_note()
-            );
-            assert!(
-                HelperPresence::Unknown
-                    .teardown_note()
-                    .contains("neither signalled nor waited for")
-                    && HelperPresence::Unknown
-                        .teardown_note()
-                        .contains("could not confirm"),
-                "{}",
-                HelperPresence::Unknown.teardown_note()
-            );
-        }
-
-        /// The post-deadline look at the acknowledgement pipe answers with
-        /// what is already there and never waits.
-        ///
-        /// This is what tells a reader whether the rest of the message
-        /// describes a helper that missed READY or one that wrote it just
-        /// after the wait gave up: the pipe stays open while the snapshot
-        /// runs, so that boundary case is real and is reported rather than
-        /// left to be misread.
-        ///
-        /// Witnessed against the mutation that returns `None`
-        /// unconditionally: the byte assertion fails.
-        #[test]
-        fn a_late_acknowledgement_is_read_without_waiting() {
-            let empty = create_cloexec_pipe().expect("a pipe");
-            assert_eq!(
-                late_acknowledgement(empty[0]),
-                None,
-                "an empty pipe answered with a byte"
-            );
-            assert!(write_raw(empty[1], &[REAPER_READY]), "queue a late READY");
-            assert_eq!(
-                late_acknowledgement(empty[0]),
-                Some(REAPER_READY),
-                "a byte already in the pipe was not read"
-            );
-            assert_eq!(
-                late_acknowledgement(empty[0]),
-                None,
-                "the pipe was empty again"
-            );
-            close_fd(empty[1]);
-            // A writer that is gone is an end-of-file, not a byte: `poll`
-            // reports POLLHUP without POLLIN and nothing is read.
-            assert_eq!(
-                late_acknowledgement(empty[0]),
-                None,
-                "an end-of-file was read as a byte"
-            );
-            close_fd(empty[0]);
-        }
-
-        /// A descriptor listing with an entry that errored is unreadable, not
-        /// a count: `ReadDir` yields `Result<DirEntry>`, so an error entry is
-        /// not a descriptor and a listing that lost one is partial (row
-        /// `PR125-CLOSE-READDIR-ERRORS-COUNTED-AS-DESCRIPTORS`).
-        ///
-        /// Witnessed against the mutation that restores the closed pull
-        /// request's shape — the body replaced by `Some(entries.count())` —
-        /// which answers `Some(3)` for the partial listing and fails.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_descriptor_listing_with_an_error_entry_is_unreadable_not_a_count() {
-            let whole: Vec<Result<u8, std::io::Error>> = vec![Ok(1), Ok(2), Ok(3)];
-            assert_eq!(
-                count_readable_entries(whole.into_iter()),
-                Some(3),
-                "a listing that yielded three entries"
-            );
-            let partial: Vec<Result<u8, std::io::Error>> = vec![
-                Ok(1),
-                Err(std::io::Error::from_raw_os_error(libc::EACCES)),
-                Ok(3),
-            ];
-            assert_eq!(
-                count_readable_entries(partial.into_iter()),
-                None,
-                "an entry that errored was counted as a descriptor"
-            );
-            // An empty listing is a real count of none, which is why the
-            // count is never the thing that carries "not readable".
-            assert_eq!(
-                count_readable_entries(std::iter::empty::<Result<u8, std::io::Error>>()),
-                Some(0),
-                "an empty listing"
-            );
-        }
-
-        /// A `/proc` read that failed, or that this host answered in a shape
-        /// the parser does not know, is reported as unknown — not as a state,
-        /// not as gone, and not as a pid this code may signal. Every state
-        /// the file does report is a process the kernel still holds.
-        ///
-        /// Witnessed against the mutation that maps
-        /// `LinuxStatSnapshot::Invalid` to `(HelperPresence::Gone, "gone")`:
-        /// the first assertion fails.
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_stat_read_that_failed_is_unknown_rather_than_a_state() {
-            assert_eq!(
-                describe_linux_stat(LinuxStatSnapshot::Invalid),
-                (
-                    HelperPresence::Unknown,
-                    "in a state this host did not report".to_owned()
-                )
-            );
-            assert_eq!(
-                describe_linux_stat(LinuxStatSnapshot::Vanished),
-                (HelperPresence::Gone, "gone".to_owned())
-            );
-            for (state, expected) in [
-                (b'T', "stopped"),
-                (b't', "stopped"),
-                (b'Z', "exited and not yet reaped"),
-                (b'X', "dead"),
-                (b'R', "alive in state R"),
-                (b'S', "alive in state S"),
-                (b'D', "alive in state D"),
-            ] {
-                assert_eq!(
-                    describe_linux_stat(LinuxStatSnapshot::Present { pgid: 1, state }),
-                    (HelperPresence::Present, expected.to_owned()),
-                    "state {}",
-                    char::from(state)
-                );
-            }
-        }
-
-        /// A short or failed `proc_pidinfo` answer is unknown rather than a
-        /// status, and a descriptor answer that is zero, not a whole number
-        /// of records, or big enough to have filled the buffer is not a
-        /// count.
-        ///
-        /// Witnessed against four mutations: `if read != size` weakened to
-        /// `if read > size`; the `ESRCH` arm made unconditional; `if bytes >=
-        /// capacity` weakened to `if bytes > capacity`; and the remainder
-        /// check deleted. **Not run on this box**: this test compiles only on
-        /// Darwin, so CI's macOS legs are its first execution and none of the
-        /// four mutations was applied here.
-        #[cfg(target_os = "macos")]
-        #[test]
-        fn a_short_or_failed_darwin_query_is_unknown_and_a_partial_count_is_not_a_count() {
-            let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-            let unknown = (
-                HelperPresence::Unknown,
-                "in a state this host did not report".to_owned(),
-            );
-            assert_eq!(
-                describe_bsd_query(0, size, libc::ESRCH, 0),
-                (HelperPresence::Gone, "gone".to_owned())
-            );
-            assert_eq!(
-                describe_bsd_query(0, size, libc::EPERM, 0),
-                unknown,
-                "a query that failed for a reason other than a missing pid"
-            );
-            assert_eq!(
-                describe_bsd_query(size - 1, size, 0, libc::SRUN),
-                unknown,
-                "a short answer"
-            );
-            assert_eq!(
-                describe_bsd_query(size, size, 0, libc::SSTOP),
-                (HelperPresence::Present, "stopped".to_owned())
-            );
-            assert_eq!(
-                describe_bsd_query(size, size, 0, libc::SZOMB),
-                (
-                    HelperPresence::Present,
-                    "exited and not yet reaped".to_owned()
-                )
-            );
-            assert_eq!(
-                describe_bsd_query(size, size, 0, libc::SRUN),
-                (
-                    HelperPresence::Present,
-                    format!("alive with BSD status {}", libc::SRUN)
-                )
-            );
-
-            let record = std::mem::size_of::<libc::proc_fdinfo>();
-            let capacity = record * 8;
-            assert_eq!(
-                descriptors_from_listfds(0, capacity),
-                None,
-                "a failed query answers zero, which is not a count of none"
-            );
-            assert_eq!(
-                descriptors_from_listfds(-1, capacity),
-                None,
-                "a failed query"
-            );
-            let three = libc::c_int::try_from(record * 3).expect("a small byte count");
-            assert_eq!(descriptors_from_listfds(three, capacity), Some(3));
-            let saturated = libc::c_int::try_from(capacity).expect("a small byte count");
-            assert_eq!(
-                descriptors_from_listfds(saturated, capacity),
-                None,
-                "an answer that filled the buffer is a lower bound, not a count"
-            );
-            let ragged = libc::c_int::try_from(record * 2 + 1).expect("a small byte count");
-            assert_eq!(
-                descriptors_from_listfds(ragged, capacity),
-                None,
-                "an answer that is not a whole number of records is not a count"
-            );
-        }
-
-        /// Subprocess entry for the guard's READY-failure diagnostic.
+        /// Subprocess entry for the READY-failure message at both call sites.
         ///
         /// In a fresh process for the reason `reaper_handshake_helper` is:
-        /// `spawn_guard` forks a child that installs process-wide signal
-        /// dispositions, and publishes descriptors in process-wide statics.
+        /// both helpers install process-wide signal dispositions in their
+        /// children and publish descriptors in process-wide statics.
+        ///
+        /// `UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY` makes each helper end
+        /// itself before writing READY, so the parent's wait ends on the
+        /// pipe's end-of-file. **There is no clock in this test**: no sleep,
+        /// no budget to outrun and no elapsed time asserted, so no scheduling
+        /// outcome can make a correct implementation fail it (row
+        /// `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`).
         #[test]
         #[ignore = "subprocess helper"]
-        fn guard_ready_failure_helper() {
-            if std::env::var_os("UPSTROKE_GUARD_READY_FAILURE_HELPER").is_none() {
+        fn helper_ready_failure_helper() {
+            if std::env::var_os("UPSTROKE_HELPER_READY_FAILURE_HELPER").is_none() {
                 return;
             }
-            let Err(message) = spawn_guard(quiet_policy()) else {
-                panic!("a guard that missed its READY deadline was accepted as initialized")
-            };
-            assert_message_names_a_live_helper(&message, "Unix job-control guard", "the guard");
-            // SAFETY: `waitpid(-1, WNOHANG)` inspects only this process's
-            // children, and the late guard is the only child it has had.
-            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-            assert!(
-                waited < 0 && !last_errno_is_interrupted(),
-                "the late guard was left behind (waitpid(-1, WNOHANG) returned {waited})"
-            );
-        }
-
-        /// A policy that arms nothing, for a helper this test never lets
-        /// finish starting.
-        fn quiet_policy() -> SignalPolicy {
-            SignalPolicy {
+            let policy = SignalPolicy {
                 termination_mask: 0,
                 guard_wake_mask: 0,
                 stop_mask: 0,
                 job_control: false,
-            }
-        }
-
-        /// Subprocess entry for the signal gate at both call sites.
-        ///
-        /// `UPSTROKE_TEST_HELPER_STATE` forces what the snapshot is taken to
-        /// have seen. Nothing else can drive these arms: they are reached
-        /// when a helper has been reaped by an embedding host's wildcard
-        /// waiter, which is row
-        /// `PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`'s
-        /// hypothesis and is not something a test can schedule. What is under
-        /// test is everything downstream of that observation — the gate, the
-        /// teardown and the message — at its real call sites, and the
-        /// behavioural assertion is the one that matters: the child is still
-        /// there afterwards, neither killed nor reaped.
-        #[test]
-        #[ignore = "subprocess helper"]
-        fn helper_signal_gate_helper() {
-            let Some(forced) = std::env::var_os("UPSTROKE_HELPER_SIGNAL_GATE_HELPER") else {
-                return;
             };
-            let expected: &str = match forced.to_str() {
-                Some("gone") => "free to have been reused",
-                Some("unknown") => "could not confirm",
-                other => panic!("unexpected forced state {other:?}"),
-            };
-
-            for (label, launch) in [
-                (
-                    "the reaper",
-                    spawn_reaper().err().unwrap_or_else(|| {
-                        panic!("a reaper that missed its READY deadline was accepted")
-                    }),
-                ),
-                (
-                    "the guard",
-                    spawn_guard(quiet_policy()).err().unwrap_or_else(|| {
-                        panic!("a guard that missed its READY deadline was accepted")
-                    }),
-                ),
-            ] {
+            let launches = [
+                ("Unix cleanup reaper", spawn_reaper().err()),
+                ("Unix job-control guard", spawn_guard(policy).err()),
+            ];
+            for (prefix, launch) in launches {
+                let Some(message) = launch else {
+                    panic!("{prefix} was accepted as initialized after ending before READY")
+                };
                 assert!(
-                    launch.contains("neither signalled nor waited for")
-                        && launch.contains(expected),
-                    "{label} was not left alone, or the message did not say why: {launch}"
+                    message.starts_with(&format!("{prefix} did not initialize; waited ")),
+                    "the READY failure said nothing about the wait: {message}"
                 );
-                // The whole point: the child is still this process's, alive
-                // and unreaped. A signalled one would be a zombie this would
-                // collect, and a reaped one would leave no child at all.
-                //
-                // SAFETY: `waitpid(-1, WNOHANG)` inspects only this process's
-                // children.
-                let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-                assert_eq!(
-                    waited, 0,
-                    "{label} was signalled or reaped behind the gate \
-                     (waitpid(-1, WNOHANG) returned {waited}): {launch}"
-                );
-                // What happens to a helper the gate leaves alone: it ends
-                // itself. The parent closed both ends of the command pipe on
-                // its way out, so the helper's first look at that descriptor
-                // once it reaches its loop is an end-of-file, and both loops
-                // exit zero on that. This is waited for, not timed —
-                // `waitid(WEXITED | WNOWAIT)` returns on the transition
-                // itself — so the test observes the property rather than
-                // giving it a deadline. A helper that did not end itself
-                // would block here, which is the honest failure for a
-                // property whose whole content is "it ends".
-                //
-                // The residual, stated in the body: a helper wedged before it
-                // reaches its loop is not ended by this path, where master's
-                // unconditional SIGKILL would have ended it once the kernel
-                // could deliver. That is the price of not signalling a pid we
-                // cannot claim.
-                let mut child = ForkedChild(pid_in(&launch));
-                wait_for_exit_without_reaping(child.0);
-                child.reap();
-            }
-        }
-
-        /// The gate refuses to signal a pid the parent cannot say is still
-        /// its child, at both call sites, and the message says why.
-        ///
-        /// Witnessed against the mutation that removes the gate — the guard
-        /// arm's `if snapshot.presence.may_signal()` deleted so the kill and
-        /// wait always run, and `Reaper::abandon`'s early return deleted:
-        /// both runs fail on `waitpid(-1, WNOHANG)` returning -1, the child
-        /// having been killed and reaped behind the gate.
-        #[test]
-        fn a_helper_the_parent_cannot_claim_is_neither_signalled_nor_reaped() {
-            for forced in ["gone", "unknown"] {
-                let output = gate_helper_subprocess(forced);
                 assert!(
-                    output.status.success(),
-                    "helper signal gate helper ({forced}): {}\n{}\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                    message.contains(&format!(" of {HELPER_READY_BUDGET:?}; descriptor ceiling ")),
+                    "the READY failure carried neither the budget nor the ceiling: {message}"
+                );
+                // The seam's exit code, reported through the wait the teardown
+                // was already taking. This is the whole diagnostic: the child
+                // had ended itself, and the message says with what.
+                assert!(
+                    message.contains(
+                        "ending it: SIGKILL was delivered, and the wait collected \
+                                      it, having already exited with status 7"
+                    ),
+                    "the teardown's own answers did not reach the message: {message}"
                 );
             }
+            assert_eq!(
+                PENDING_TERMINATION.load(Ordering::SeqCst),
+                0,
+                "a helper that missed READY armed process-wide termination"
+            );
+            // SAFETY: `waitpid(-1, WNOHANG)` inspects only this process's
+            // children, and both helpers were collected by their own teardown.
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            assert!(
+                waited < 0 && !last_errno_is_interrupted(),
+                "a helper was left behind (waitpid(-1, WNOHANG) returned {waited})"
+            );
         }
 
-        /// Run `helper_signal_gate_helper` in a fresh process with the
-        /// observation forced to `forced`.
-        fn gate_helper_subprocess(forced: &str) -> std::process::Output {
-            use std::os::unix::process::CommandExt;
-
-            Command::new(std::env::current_exe().expect("test executable"))
-                .args(["helper_signal_gate_helper", "--ignored", "--nocapture"])
-                .env("UPSTROKE_HELPER_SIGNAL_GATE_HELPER", forced)
-                .env("UPSTROKE_TEST_HELPER_STATE", forced)
-                .env("UPSTROKE_TEST_REAPER_READY_DELAY_MS", "4500")
-                .env("UPSTROKE_TEST_GUARD_READY_DELAY_MS", "4500")
-                .process_group(0)
-                .stdin(Stdio::null())
-                .output()
-                .expect("run the helper signal gate helper")
-        }
-
-        /// The guard's READY failure says what the child was doing, and says
-        /// it before the descriptors are closed and the child killed. Both
-        /// halves are row `PR125-CLOSE-GUARD-TEARDOWN-BEFORE-THE-SNAPSHOT`:
-        /// the closed pull request tore the guard down first, and its guard
-        /// message omitted the descriptor ceiling its body claimed.
+        /// Both READY failures carry the elapsed wait, the budget, the
+        /// descriptor ceiling and what ending the helper answered.
         ///
-        /// Witnessed against two mutations, each of which fails it: moving
-        /// `let snapshot = helper_snapshot(pid, ack[0]);` below the
-        /// `close_fd` loop and the kill in `spawn_guard` (the message then
-        /// reports the guard as `gone`), and deleting
-        /// `descriptor ceiling {open_max}; ` from the guard's message.
+        /// Witnessed against three mutations, each of which fails it:
+        /// `close_and_wait_reporting` returning a zero status rather than the
+        /// one `waitpid` filled (the message loses the exit status), and
+        /// `descriptor ceiling {open_max}; ` deleted from either message.
         #[test]
-        fn a_late_guard_reports_what_the_child_was_doing_before_it_is_torn_down() {
+        fn a_helper_that_never_acknowledged_reports_what_ending_it_answered() {
             use std::os::unix::process::CommandExt;
 
             let output = Command::new(std::env::current_exe().expect("test executable"))
-                .args(["guard_ready_failure_helper", "--ignored", "--nocapture"])
-                .env("UPSTROKE_GUARD_READY_FAILURE_HELPER", "1")
-                .env("UPSTROKE_TEST_GUARD_READY_DELAY_MS", "4500")
+                .args(["helper_ready_failure_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_HELPER_READY_FAILURE_HELPER", "1")
+                .env("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY", "7")
                 .process_group(0)
                 .stdin(Stdio::null())
                 .output()
-                .expect("run the guard READY failure helper");
+                .expect("run the helper READY failure helper");
             assert!(
                 output.status.success(),
-                "guard READY failure helper: {}\n{}\n{}",
+                "helper READY failure helper: {}\n{}\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
