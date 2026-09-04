@@ -5,19 +5,23 @@
 //! site because the sites that have to agree on the byte string sit in
 //! different files: the funnels in `src/rundir.rs` publish them, the classifier
 //! in `classify.rs` and the ownership proof in `ownership.rs` read them back,
-//! and two tests in `tests.rs` pin them:
-//! `the_names_on_disk_are_the_names_the_packet_writes` binds every const to its
-//! literal, and `the_event_log_and_the_plan_are_reached_through_their_constants`
-//! binds the two `RunPaths` accessors to theirs.
+//! and `the_names_on_disk_are_the_names_the_packet_writes` in `tests.rs` binds
+//! every const to its literal. A second test,
+//! `the_event_log_and_the_plan_are_reached_through_their_constants`, fails when
+//! a `RunPaths` accessor and its const disagree; it cannot witness the
+//! substitution that put them in agreement, and its own doc says why.
 //!
 //! **One source of truth for `rundir`, not yet for the crate.** [`EVENT_LOG`]
 //! and [`PLAN`] name the two files a command outside this module opens by path
-//! rather than through `RunPaths`, and five such sites still spell the byte
-//! string for themselves: `export.rs`, `status.rs`, `capacity.rs`, `validate.rs`
-//! and `engine/resume.rs`. A rename of either const is therefore still a
-//! multi-file edit. The six names above them are not: no production code
-//! outside `rundir` spells any of the six as a path, and the one test that does
-//! (`engine/topology/emit/tests.rs`, joining `committed.json`) is recorded as
+//! rather than through `RunPaths`, and **seven production sites in five files**
+//! still spell the byte string for themselves: five of `events.jsonl`
+//! (`export.rs`, `validate.rs`, `engine/resume.rs`, `status.rs`, `capacity.rs`)
+//! and two of `plan.normalized.json` (`export.rs`, `engine/resume.rs`). One
+//! derivation, quoted the same way here, in `SWEEP-NAMES-002` and in the pull
+//! request body. A rename of either const is therefore still a multi-file edit.
+//! The six names above them are not: no production code outside `rundir` spells
+//! any of the six as a path, and the one test that does
+//! (`engine/topology/emit/tests.rs`, joining `committed.json`) is
 //! `SWEEP-NAMES-003`.
 //!
 //! **What the proof consults, exactly.** `prove_private_half_ownership` reads
@@ -28,18 +32,23 @@
 //! one. Four names, three kinds of use — a reader replacing the stat with a
 //! read would be weakening the deletion boundary, not tidying it.
 //!
-//! **How much authority stands behind each byte string.** `DESIGN.md` §15's
-//! run-directory drawing carries [`EVENT_LOG`] and [`PLAN`]; the other six
-//! appear in no `design/` section. Their packet,
-//! `decisions.workspace_candidates.run_creation`, left this repository on
-//! 2026-09-03 (`DESIGN.md`, "Retired records"), so its wording is checkable
-//! here only where the tree quotes it: `src/engine/topology/create.rs`'s
-//! verbatim P0-P8 order names `.creating`, `plan.normalized.json` and
-//! `events.jsonl`, and `rundir::tests`'s durability test quotes the staging
-//! rule the three `.tmp` siblings below follow, "write `<name>.tmp`, **fsync**,
-//! rename, **fsync the directory**". `owner.json` and `committed.json` are
-//! named in those quotations by role rather than by filename; their spelling is
-//! pinned by that one test and by nothing else.
+//! **What has product authority here, and what does not.** `DESIGN.md` §15's
+//! run-directory drawing carries [`EVENT_LOG`] and [`PLAN`]. The other six
+//! appear in no `design/` section at all, so this repository states no rule
+//! about renaming them — and for these six a rename is not a refactor. A run
+//! killed after old P5b still holds a file called `committed.json`; the proof
+//! would stat the *new* name, find it absent, mint a deletion token on that
+//! absence and delete a private half that had crossed the deletion boundary.
+//! The missing compatibility contract is `SWEEP-NAMES-008`, deferred: it
+//! belongs in §15 and `DESIGN.md` is the owner's.
+//!
+//! Nothing in `src/` stands in for that, and nothing here tries to. A retired
+//! decision record establishes no product contract, and neither does
+//! implementation or test code quoting one, so no citation of
+//! `decisions.workspace_candidates.run_creation` appears above. Until §15 says
+//! otherwise, the six byte strings below are pinned by
+//! `the_names_on_disk_are_the_names_the_packet_writes` and by nothing with
+//! design standing.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree and not by the file, so an out-of-line

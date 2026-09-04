@@ -2406,28 +2406,28 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
     );
 }
 
-/// Every spelling of the event log and the frozen plan **inside this module**
-/// goes through the constant (`SWEEP-NAMES-001`).
+/// The two `RunPaths` accessors reach their constant rather than an equal
+/// literal (`SWEEP-NAMES-001`).
 ///
-/// A separate claim from the test above, and a separate mutation. That one
-/// pins each const to its byte string; this one pins the two accessors to the
-/// const, and the two are independent: `RunPaths::events` spelt
-/// `"events.jsonl"` for itself until this sweep, so the const was load-bearing
-/// for `classify::first_committed_line` — which decides husk from committed —
-/// and decorative for the accessor naming the file it looks for.
+/// **What this test cannot do, said before what it can.** Substituting a
+/// constant for a literal of equal value is behaviour-neutral *by
+/// construction*, so no assertion over values can fail on the pre-repair code:
+/// revert both accessors to `"events.jsonl"` and `"plan.normalized.json"` and
+/// this test still passes. A test that could tell the two apart would have to
+/// assert over source text, and a sibling helper satisfies every text
+/// assertion. So this is not the repair's witness and is not offered as one.
 ///
-/// Two mutations, both run. `RunPaths::events` changed to `"events.json"`
-/// fails this test and leaves the test above passing. `EVENT_LOG` changed to
-/// `"events.jsonlx"` fails this test on master's accessor and passes on the
-/// routed one — which is what says the routing changed something, since with
-/// both spellings equal an accessor using the const and one using an identical
-/// literal are otherwise indistinguishable.
+/// **What it is.** A pin that fails the moment an accessor and its constant
+/// disagree — which, now that the accessors read the constant, takes a change
+/// to the constant. `EVENT_LOG` changed to `"events.jsonlx"` fails this test on
+/// master's accessor, which never read the constant, and passes here.
 ///
-/// **Not the only guard, and not claimed as one.** Much of the crate writes
-/// through the accessor and reads through the const, so either mutation also
-/// reddens tests across `engine`, `export` and `answer`. Those report a broken
-/// resume; this one reports the disagreement itself, in the module that owns
-/// both names.
+/// **What does witness the repair is a measurement, not an assertion.** With
+/// `EVENT_LOG` changed to `"events.jsonlx"`, the crate suite fails 100 tests at
+/// master and 92 at the repaired head; the eight-test difference is the sites
+/// this repair routed, and the 92 that remain are the seven production
+/// spellings outside this module (`SWEEP-NAMES-002`). The pull request body
+/// carries the command and both numbers.
 #[test]
 fn the_event_log_and_the_plan_are_reached_through_their_constants() {
     // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
