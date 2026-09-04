@@ -2319,6 +2319,77 @@ fn a_committed_private_half_is_never_provable_however_bound_it_is() {
 /// present and absent — are asserted through the whole proof by
 /// `a_committed_private_half_is_never_provable_however_bound_it_is` and by
 /// the wiring half below.
+/// Conjunct 8's expected value is a canonical path or a refusal — never the
+/// path it was handed.
+///
+/// `fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf())` was the
+/// one fold in this file that could turn an I/O failure into a **proving**
+/// answer rather than a reclaiming one: the fallback supplies the value the
+/// comparison uses, and `create.rs`'s `canonical_string` uses the identical
+/// fallback when *recording* `owner.public_dir`, so a recorder and a prover
+/// that both failed agreed on the un-canonical spelling and the conjunct
+/// passed — establishing nothing while minting the token that authorises
+/// deleting a private half. Pass 1 of this pull request's review found it, and
+/// found it missing from the audit table in the body, which is where it should
+/// have been.
+///
+/// Asserted directly for the same reason conjunct 12's predicate is: a
+/// `public` this proof has already read a marker out of canonicalizes, so
+/// making it fail here needs a race. The reachable shape — a canonicalization
+/// that succeeds, and a record that agrees or disagrees with it — goes through
+/// the whole proof in the grid.
+#[test]
+fn a_public_path_that_cannot_be_canonicalized_carries_no_conjunct() {
+    use std::io::{Error, ErrorKind};
+
+    let husk = BoundHusk::new("conjunct8");
+    husk.publish();
+    let public = husk.public();
+    let canonical = fs::canonicalize(&public).expect("the fixture canonicalizes");
+
+    // (1) A canonicalization that succeeded is the value the comparison uses.
+    assert_eq!(
+        ownership::canonical_public_or_refusal(&public, Ok(canonical.clone()), "anything")
+            .expect("a canonical path is not a refusal"),
+        canonical,
+        "the expected side of conjunct 8 is the canonical path, unchanged"
+    );
+
+    // (2) Every failure refuses, and none of them falls back to the path it
+    // was handed — which is what let a failed lookup carry the conjunct.
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotFound,
+        ErrorKind::Other,
+        ErrorKind::InvalidInput,
+    ] {
+        let recorded = public.to_string_lossy().into_owned();
+        let refusal =
+            ownership::canonical_public_or_refusal(&public, Err(Error::from(kind)), &recorded)
+                .expect_err("a canonicalization that failed establishes nothing");
+        assert_eq!(
+            refusal.kind(),
+            "owner-record-disagrees",
+            "{kind:?} must refuse, not carry the conjunct"
+        );
+        assert_eq!(
+            refusal.owner_field(),
+            Some(OwnerField::PublicDir),
+            "and refuse on the field it could not compare"
+        );
+        assert!(
+            refusal.to_string().contains(&recorded),
+            "the refusal quotes what the record said: {refusal}"
+        );
+    }
+
+    // (3) The wiring: the reachable shape still proves through the real proof.
+    assert!(
+        matches!(husk.prove(), PrivateHalfOwnership::Proven(_)),
+        "a public path that canonicalizes and a record that agrees still prove"
+    );
+}
+
 #[test]
 fn a_commit_record_stat_that_is_not_not_found_is_not_proof_of_absence() {
     use std::io::{Error, ErrorKind};
