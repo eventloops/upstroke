@@ -25,62 +25,66 @@
 //! fails anonymously turns a defect in the code under test into a confusing
 //! failure in the setup.
 //!
-//! # What the fixture pins, and what it deliberately inherits
+//! # The environment every Git command here runs in
 //!
 //! A fixture that leaves something to ambient configuration measures the
-//! machine as much as the code. `PR126-REVIEW2-NULL-TESTS-INHERIT-THE-HASH-\
-//! FORMAT` was one of these: `git init` reads `GIT_DEFAULT_HASH`, so a SHA-256
-//! environment silently invalidated a test whose premise was an object id's
-//! length. So the repository this module builds, and every Git command it runs
-//! over one, is a function of its inputs:
+//! machine as much as the code, and the supply of ambient settings is
+//! unbounded: `GIT_DEFAULT_HASH` invalidated an object-id test
+//! (`PR126-REVIEW2-NULL-TESTS-INHERIT-THE-HASH-FORMAT`), and pinning settings
+//! one at a time only moves the next one along — a template `config` carrying
+//! `core.worktree`, an `i18n.commitEncoding` that adds a header to every
+//! commit, an attributes file that rewrites what a checkout writes. So this
+//! module does not enumerate them. **[`git_command`] clears the environment and
+//! rebuilds it**, and every Git command it builds therefore sees:
 //!
-//! - **the object format**, `--object-format` on `git init` rather than the
-//!   environment's default ([`ObjectFormat`]);
-//! - **the initial branch**, `-b main` rather than `init.defaultBranch`;
-//! - **the line endings**, `core.autocrlf=false` and `core.eol=lf` in the
-//!   repository's own config, so that they bind the manager's checkouts too,
-//!   and `core.attributesFile` and `GIT_ATTR_NOSYSTEM` on the fixture's own
-//!   commands, because an attributes file's `text` or `eol` overrides that
-//!   config and would defeat the pin;
-//! - **the hooks**, `core.hooksPath` at a name nothing creates. Measured on git
-//!   2.43.0: a `post-checkout` hook reached through an ambient
-//!   `core.hooksPath` runs during `git worktree add` and `git checkout` and
-//!   writes into the new tree, which is an effect no site accounts for and a
-//!   file every later assertion sees. `init.templateDir` and `GIT_TEMPLATE_DIR`
-//!   reach the same place by copying hooks into `.git/hooks` at `git init`, and
-//!   the same pin refuses both;
-//! - **the fsmonitor**, `core.fsmonitor=false` both in the repository's config
-//!   and on each command, because the daemon an ambient setting starts holds
-//!   the worktree open and every removal this suite measures then fails for a
-//!   reason that is not the one under test;
-//! - **the committer**, the six `GIT_AUTHOR_*`/`GIT_COMMITTER_*` variables.
-//!   Environment identity overrides repository config, so the `user.name` and
-//!   `user.email` written into the repository are not what decides; with the
-//!   dates pinned as well, a fixture's `seed`, `head` and `side` are the same
-//!   object ids on every machine;
-//! - **Git's repository-locating environment**, removed rather than pinned
-//!   ([`LOCAL_ENV_VARS`]). Measured on git 2.43.0: with `GIT_DIR` set,
-//!   `git -C <fresh> init -b main` creates no repository at `<fresh>` at all —
-//!   it re-initialises the repository `GIT_DIR` names, exits 0, and every
-//!   command that follows reads and *commits into* that repository. A suite run
-//!   from a Git hook, `git rebase --exec` or `git bisect run` has those
-//!   variables set;
-//! - **signing**, `commit.gpgsign=false`, and **the ignore file**,
-//!   `core.excludesFile` at a name nothing creates: neither can change what a
-//!   test observes silently, but both fail the whole suite on a machine
-//!   configured for them, which §12 asks a hermetic test not to depend on.
+//! - **an allowlisted environment.** [`INHERITED`] is the whole of what a Git
+//!   child inherits, each name with its reason; everything else, `GIT_*`
+//!   included, is gone because the environment was cleared and not filtered.
+//! - **no configuration file.** `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`
+//!   name a path that does not exist, and `GIT_CONFIG_NOSYSTEM` is set, so
+//!   Git reads the repository's own config and nothing else. `HOME` and
+//!   `XDG_CONFIG_HOME` name that same absent path, so there is no `~` to find
+//!   one under either.
+//! - **no template.** `GIT_TEMPLATE_DIR` is empty, which beats
+//!   `init.templateDir` and the built-in default (measured, git 2.43.0: a
+//!   `git init` under it copies nothing at all, and a template `config`
+//!   setting `core.worktree` to another repository — which resolves the new
+//!   repository's worktree to that one — does not arrive).
+//! - **no system attributes.** `GIT_ATTR_NOSYSTEM` is set and
+//!   `core.attributesFile` names the absent path, so an `eol` or `text`
+//!   attribute cannot override the repository's own line-ending settings.
+//! - **a fixed identity and clock.** The six `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+//!   variables, because environment identity overrides repository config, so
+//!   the `user.name` and `user.email` written into the repository are not what
+//!   decides; and `LC_ALL` and `TZ`, so message language and timestamp
+//!   rendering are not the machine's.
+//! - **the settings this module states**, as `-c` on the command line: the
+//!   hooks path, the fsmonitor, the attributes and excludes files, and
+//!   signing, each at [`ABSENT`] or `false`.
 //!
-//! Three things are inherited on purpose. **The `git` binary** on `PATH`: these
-//! suites are explicitly integration tests against the installed Git, and the
-//! version is what several of the claims above are measured against. **The
-//! system config file**, because Git for Windows writes install-time settings
-//! there and `GIT_CONFIG_NOSYSTEM` would drop them all; the settings that
-//! matter are pinned individually above instead. **Object replacement**:
-//! `GIT_NO_REPLACE_OBJECTS` is stripped and not re-set, so the fixture reads
-//! the repository the way Git reads it, because one of these suites installs a
-//! replacement deliberately and asserts on it. The manager sets that variable
-//! on its own commands, for its own reason, which `WorkspaceManager::command`
-//! states.
+//! **So the claim is a construction rather than a list**: a Git command here
+//! runs under Git's own built-in defaults, plus the repository's config, plus
+//! the `-c` settings above. What is deliberately let through is exactly
+//! [`INHERITED`], and the reason for each name is on the constant.
+//!
+//! Two boundaries, because neither is closed here. **The `git` binary** is
+//! whatever `PATH` names: these suites are integration tests against the
+//! installed Git, and the version is what every measurement above was taken
+//! against. **This door covers the commands this module builds, and not the
+//! manager's.** `WorkspaceManager::command` composes its own environment and
+//! sets neither `core.attributesFile` nor `GIT_ATTR_NOSYSTEM`, so an ambient
+//! attributes file still rewrites what `git worktree add` checks out under
+//! [`Fixture::add_task`]. That is the parent's command builder and a deferred
+//! row against `standards/SWEEP.md` queue row 11, not a claim this module gets
+//! to make.
+//!
+//! # What the repository itself pins
+//!
+//! Three settings live in the repository's own config rather than on this
+//! module's commands, because they have to bind the manager's commands too:
+//! `core.autocrlf=false` and `core.eol=lf`, and `core.fsmonitor=false`. The
+//! object format is `--object-format` on `git init` ([`ObjectFormat`]) and the
+//! initial branch is `-b main`, both arguments rather than settings.
 
 use super::*;
 
@@ -89,13 +93,15 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU32, Ordering};
+
+// §8 names this token for exactly what `scratch_tree` does: recursive deletion
+// of a run-scoped tree is token-carried, and the `cfg(test)` scratch-tree token
+// is the one a test build carries.
+use crate::rundir::scratch_tree::{ScratchTree, acquire};
 
 // -----------------------------------------------------------------------
 // Fixtures
 // -----------------------------------------------------------------------
-
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
 // -----------------------------------------------------------------------
 // Observing the removal retry
@@ -193,91 +199,101 @@ pub(crate) fn note_removal_attempt(attempt: u32) {
     });
 }
 
-/// A scratch directory unique to this process *and* to this call, because
-/// the suite runs tests in parallel and two fixtures sharing a directory
-/// would each measure the other's Git repository.
+/// A scratch tree of this call's own, guarded, and reclaimed when the guard
+/// drops.
 ///
-/// `tag` is validated as one path component by the manager's own
-/// [`safe_component`], so a tag carrying a separator cannot put the fixture's
-/// tree somewhere [`Fixture::drop`] will not remove it from.
+/// **Through `rundir::scratch_tree`, which is the token §8 names**: recursive
+/// deletion of a run-scoped tree is token-carried, and that module's whole
+/// subject is this hazard. It replaces what stood here — a name built from a
+/// tag, the process id and an ordinal, pre-cleaned with `remove_dir_all`
+/// before anything was acquired — which after a process-id collision, or with
+/// two process-id namespaces sharing one temporary directory, destroyed a tree
+/// this process had no claim on. Creating exclusively afterwards did not
+/// authorise the deletion that preceded it. Now the name carries a fresh ULID
+/// so no two calls can collide, the root is created with an exclusive
+/// `create_dir` so "previously nonexistent" is the kernel's answer, nothing is
+/// pre-cleaned, and the removal is spent against a token bound to that exact
+/// root.
 ///
 /// # Panics
 ///
-/// If `tag` is not a safe component, or if the directory cannot be made —
-/// including the case [`scratch_at`] exists to refuse.
-pub(crate) fn scratch(tag: &str) -> PathBuf {
+/// If `tag` is not a [`safe_component`], or if the acquisition refuses,
+/// naming the root and what the filesystem said.
+pub(crate) fn scratch_tree(tag: &str) -> ScratchTree {
     if let Err(why) = safe_component(tag) {
         panic!("the fixture's scratch tag `{tag}` is not one path component: {why}");
     }
-    let ordinal = SCRATCH.fetch_add(1, Ordering::SeqCst);
-    scratch_at(std::env::temp_dir().join(format!(
-        "upstroke-wm-{tag}-{}-{ordinal}",
-        std::process::id()
-    )))
-}
-
-/// Make `dir` an empty directory of this call's own, or say why it is not.
-///
-/// **The name is predictable and the process id in it is reusable**, so a tree
-/// a previous run left behind — a kill child dies by `std::process::abort()`
-/// and its `Drop` never runs, so it always leaves one — can be sitting at this
-/// path. Removing it first is the whole point; what matters is that a removal
-/// that *failed* is not read as one that succeeded. `create_dir_all` returns
-/// `Ok` for a directory that is already there, so the two together used to hand
-/// back another run's residue as a fresh fixture and nothing said so. The
-/// removal's error is inspected (only `NotFound` is absence, §7) and the
-/// creation is `create_dir`, which is exclusive (§8): the directory this
-/// returns was made here.
-fn scratch_at(dir: PathBuf) -> PathBuf {
-    match fs::remove_dir_all(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!(
-            "a previous run left {} behind and this one could not remove it ({error}); \
-             remove it and re-run, because adopting it would measure that run's residue",
-            dir.display()
+    match acquire(&std::env::temp_dir(), tag) {
+        Ok(tree) => tree,
+        Err(refusal) => panic!(
+            "the fixture could not acquire a scratch tree at {}: {:?}",
+            refusal.root().display(),
+            refusal.source()
         ),
     }
-    if let Err(error) = fs::create_dir(&dir) {
-        panic!("creating the scratch directory {}: {error}", dir.display());
-    }
-    dir
+}
+
+/// [`scratch_tree`]'s root, for the one caller that wants a directory and not
+/// a fixture.
+///
+/// **The guard is spent here and the tree is not reclaimed.** A token cannot
+/// be minted outside `rundir::scratch_tree`, so a caller holding only a path
+/// has no authority to delete anything, and this hands back exactly that: an
+/// exclusively created, unpredictably named directory that nothing will
+/// remove. One directory per suite run, from the single test that calls this.
+/// The guard-returning [`scratch_tree`] is what a fixture uses, and moving the
+/// last caller onto it is a deferred row rather than an edit here, because the
+/// caller is in `src/workspace_manager/tests.rs`, which another pull request
+/// is repairing.
+pub(crate) fn scratch(tag: &str) -> PathBuf {
+    scratch_tree(tag).disarm().path().to_path_buf()
 }
 
 /// A name nothing under a fixture directory ever creates.
 ///
-/// `core.hooksPath`, `core.attributesFile` and `core.excludesFile` are all
-/// pointed at it. Git runs no hook from a path that does not exist and ignores
-/// an attributes or excludes file that is not there — the same "absence is
+/// `core.hooksPath`, `core.attributesFile` and `core.excludesFile` point at
+/// it, and so do `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME` and
+/// `XDG_CONFIG_HOME`. Git runs no hook from a path that does not exist, reads
+/// an absent config, attributes or excludes file as empty, and finds no `~`
+/// configuration under a home that is not there — the same "absence is
 /// allowed" `WorkspaceManager::revalidate_hooks_path` states for the manager's
 /// own hooks directory.
 const ABSENT: &str = "upstroke-fixture-absent";
 
-/// Git's repository-locating environment: `git rev-parse --local-env-vars` on
-/// git 2.43.0.
+/// The whole of what a Git child inherits from this process.
 ///
-/// Every one is removed from every command this module runs, so that a suite
-/// started from inside another repository's Git — a hook, `git rebase --exec`,
-/// `git bisect run` — builds its fixtures in the scratch tree and not in that
-/// repository. `the_variables_git_calls_local_are_the_ones_the_fixture_strips`
-/// asks the installed Git for its own list and fails if it has grown one this
-/// does not carry; a name Git has since retired stays here harmlessly.
-const LOCAL_ENV_VARS: [&str; 15] = [
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_IMPLICIT_WORK_TREE",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_NO_REPLACE_OBJECTS",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_PREFIX",
-    "GIT_SHALLOW_FILE",
-    "GIT_COMMON_DIR",
+/// [`git_command`] clears the environment and then copies these back, so the
+/// list is an allowlist rather than a filter: a name that is not here cannot
+/// reach Git however it is spelt, which is what makes the module doc's claim a
+/// construction rather than an enumeration of the settings anybody thought of.
+///
+/// Unix needs one name. Windows needs the operating system's own plumbing:
+/// `git.exe` and the tools it starts resolve through `PATH` and `PATHEXT`,
+/// load system libraries relative to `SystemRoot`/`windir`, start a shell
+/// through `COMSPEC`, and write scratch files under `TEMP`/`TMP`; Git for
+/// Windows also reads its installation and per-user directories through
+/// `USERPROFILE`, `LOCALAPPDATA`, `APPDATA` and `ProgramData`. None of them
+/// carries configuration this module has not already neutralised: the config,
+/// template and attributes sources are closed by the variables set below,
+/// which win over anything these could point at.
+#[cfg(unix)]
+const INHERITED: [&str; 1] = ["PATH"];
+
+/// See the Unix arm.
+#[cfg(not(unix))]
+const INHERITED: [&str; 12] = [
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "ProgramData",
 ];
 
 /// The one place every Git command this module runs is built, and so the one
@@ -294,7 +310,36 @@ const LOCAL_ENV_VARS: [&str; 15] = [
 fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
     let absent = dir.join(ABSENT);
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir);
+    // The door. Everything this process holds goes, and only the names on the
+    // allowlist come back, so no `GIT_*` variable and no pointer to a config,
+    // template or attributes file survives unless it is set below.
+    command.env_clear();
+    for name in INHERITED {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        // Empty rather than absent: measured on git 2.43.0, an empty value
+        // copies no template at all and warns about nothing, and it beats both
+        // `init.templateDir` and the built-in template directory.
+        .env("GIT_TEMPLATE_DIR", "")
+        .env("HOME", &absent)
+        .env("XDG_CONFIG_HOME", &absent)
+        .env("GIT_AUTHOR_NAME", COMMITTER_NAME)
+        .env("GIT_AUTHOR_EMAIL", COMMITTER_EMAIL)
+        .env("GIT_AUTHOR_DATE", COMMITTER_DATE)
+        .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
+        .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
+        .env("GIT_COMMITTER_DATE", COMMITTER_DATE)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .arg("-C")
+        .arg(dir);
     for key in ["core.hooksPath", "core.attributesFile", "core.excludesFile"] {
         let mut setting = OsString::from(key);
         setting.push("=");
@@ -304,18 +349,8 @@ fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
     command
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "commit.gpgsign=false"])
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", COMMITTER_NAME)
-        .env("GIT_AUTHOR_EMAIL", COMMITTER_EMAIL)
-        .env("GIT_AUTHOR_DATE", COMMITTER_DATE)
-        .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
-        .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
-        .env("GIT_COMMITTER_DATE", COMMITTER_DATE)
         .args(args)
         .stdin(Stdio::null());
-    for name in LOCAL_ENV_VARS {
-        command.env_remove(name);
-    }
     command
 }
 
@@ -343,15 +378,24 @@ pub(crate) fn git_out(dir: &Path, args: &[&str]) -> Output {
     })
 }
 
-/// Run `git` in `dir`, require it to succeed, and return its trimmed stdout.
+/// Run `git` in `dir`, require it to succeed, and return its stdout with the
+/// one line terminator Git ends an answer with removed, and nothing else.
+///
+/// **`trim()` is what this must not do**, and did: `rev-parse
+/// --show-toplevel` in a repository whose path ends in a space answers with
+/// that space and then the terminator, and trimming whitespace returns a
+/// different path. Only `\n`, and the `\r\n` Git writes on Windows, come off.
+///
+/// The answer is decoded strictly rather than lossily, so this validates UTF-8
+/// instead of assuming it: an identity — a commit, a ref name, a path — may
+/// not be a replacement character where Git put a byte (§8).
 ///
 /// # Panics
 ///
 /// If the command fails, quoting both streams because Git reports on stdout as
 /// often as on stderr (`git commit` with nothing staged says so on stdout and
-/// exits 1). If its answer is not UTF-8: this value is an identity — a commit,
-/// a ref name, a path — and §8 allows a lossy string for diagnostics only, so a
-/// byte Git meant is refused rather than replaced by `U+FFFD`.
+/// exits 1). If its answer is not UTF-8, naming the byte index where it stops
+/// being so.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     let output = git_out(dir, args);
     assert!(
@@ -363,7 +407,12 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     match String::from_utf8(output.stdout) {
-        Ok(text) => text.trim().to_owned(),
+        Ok(text) => text
+            .strip_suffix('\n')
+            .map_or(text.as_str(), |line| {
+                line.strip_suffix('\r').unwrap_or(line)
+            })
+            .to_owned(),
         Err(error) => panic!(
             "the fixture's `git {args:?}` in {} answered bytes that stop being UTF-8 at index {}, \
              and this answer is an identity rather than a diagnostic",
@@ -410,6 +459,10 @@ impl ObjectFormat {
 }
 
 pub(crate) struct Fixture {
+    /// The root of the scratch tree, as a field because six files read it that
+    /// way and an accessor would edit `src/workspace_manager/tests.rs`, which
+    /// another pull request is repairing. It is a copy of the guard's own path
+    /// and never the authority for anything: the authority is the token.
     pub(crate) root: PathBuf,
     pub(crate) base: PathBuf,
     pub(crate) private: PathBuf,
@@ -420,6 +473,14 @@ pub(crate) struct Fixture {
     pub(crate) head: String,
     /// A commit on a side branch, based on `seed`, for the cherry-picks.
     pub(crate) side: String,
+    /// The tree's ownership, and with it the authority to remove it.
+    ///
+    /// **Last field, so it drops last** and the tree outlives everything that
+    /// reads from it. `None` for [`Fixture::adopt`], which re-opens a tree
+    /// another process created and therefore holds no claim on it.
+    /// Underscored because nothing reads it: it is held for its `Drop`, which
+    /// is where the tree is reclaimed.
+    _scratch: Option<ScratchTree>,
 }
 
 impl Fixture {
@@ -434,7 +495,8 @@ impl Fixture {
 
     /// A repository of the given object format.
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
-        let root = scratch(tag);
+        let scratch = scratch_tree(tag);
+        let root = scratch.path().to_path_buf();
         let base = root.join("repo");
         let private = root.join("private");
         fs::create_dir_all(&base).expect("the fixture's repository directory");
@@ -494,6 +556,7 @@ impl Fixture {
             seed,
             head,
             side,
+            _scratch: Some(scratch),
         }
     }
 
@@ -511,10 +574,20 @@ impl Fixture {
     /// [`Self::new`], because an intent records both and a reclaim that
     /// derived a different pair would be reclaiming another run's residue.
     ///
-    /// `seed` is the repository's root commit and not `main~1`. The field is
-    /// documented as the first commit, and a child that committed on `main`
-    /// before it died — which is what several of these tests have it do —
-    /// moves `main~1` off it while leaving the root commit where it was.
+    /// `seed` is the repository's root commit and not the parent of `main`.
+    /// The field is documented as the first commit, and a child that committed
+    /// on `main` before it died — which is what several of these tests have it
+    /// do — moves that parent off it while leaving the root commit where it
+    /// was.
+    ///
+    /// **An adopted fixture removes nothing.** The tree was created by another
+    /// process, which held the only token for it and died without spending it;
+    /// a token cannot be minted from a path, and §8 does not let this process
+    /// recursively delete what it cannot prove it owns. So the tree a kill
+    /// child leaves behind stays until whoever owns the directory it sits in
+    /// reclaims it, and that owner is the kill-child plumbing in
+    /// `src/engine/topology/scaffold.rs` rather than this module — a deferred
+    /// row, and the same leak its own `kill_dir` already has.
     pub(crate) fn adopt(root: PathBuf) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
@@ -536,6 +609,7 @@ impl Fixture {
             seed,
             head,
             side,
+            _scratch: None,
         }
     }
 
@@ -590,15 +664,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    /// Best effort, and the observability §7 asks of a best-effort operation is
-    /// [`scratch_at`]: a tree this fails to remove is one the next run to
-    /// collide with the path reports rather than adopts.
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
 // -----------------------------------------------------------------------
 // The primitives a topology module's test cannot reach for itself
 // -----------------------------------------------------------------------
@@ -649,9 +714,85 @@ const SELECTED_ONE: &str = "running 1 test";
 /// What a Rust process exits with when a panic unwinds out of main.
 const PANIC_EXIT: i32 = 101;
 
-/// Run this test binary again, `--exact --ignored`, with `env` set, and
-/// return its exit status.
+/// How much of each of the child's streams is kept.
 ///
+/// §9 asks a subprocess integration to define its stdout and stderr size
+/// behaviour, and `Command::output` defines none: it buffers whatever arrives.
+/// A child that loops while logging would exhaust this process before its
+/// status could be reported, which is why the capture is bounded here and the
+/// reading continues past the bound so the child is never blocked on a full
+/// pipe. What a caller sees when the bound is hit is the first
+/// [`CHILD_CAPTURE_LIMIT`] bytes of each stream and a line saying so.
+const CHILD_CAPTURE_LIMIT: usize = 64 * 1024;
+
+/// How long a child is given before it is killed and reported.
+///
+/// §9 asks for a timeout, and this bounds a wedged child rather than timing a
+/// healthy one (§12): the longest of these children builds a fixture, runs a
+/// schema-4 run and dies at an injection, which is seconds. A child that
+/// reaches this bound is killed, reaped, and reported as having reached it,
+/// with whatever it had said quoted — never returned as an ordinary status.
+const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Read to end of stream, keeping at most [`CHILD_CAPTURE_LIMIT`] bytes.
+///
+/// Reading continues after the bound and the bytes are dropped, because a
+/// reader that stops reading leaves the child blocked on a full pipe, which
+/// turns a bounded capture into a hang.
+fn read_capped(mut stream: impl std::io::Read, what: &str) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut dropped = 0_usize;
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = CHILD_CAPTURE_LIMIT.saturating_sub(kept.len());
+                let take = read.min(room);
+                kept.extend_from_slice(&buffer[..take]);
+                dropped += read - take;
+            }
+            Err(error) => {
+                kept.extend_from_slice(
+                    format!("\n[reading the child's {what} failed: {error}]").as_bytes(),
+                );
+                break;
+            }
+        }
+    }
+    if dropped > 0 {
+        kept.extend_from_slice(
+            format!("\n[{dropped} further bytes of the child's {what} were dropped at the {CHILD_CAPTURE_LIMIT}-byte bound]")
+                .as_bytes(),
+        );
+    }
+    kept
+}
+
+/// Take a reader's bytes, or say that it did not finish inside the bound.
+///
+/// The join is bounded for the same reason the wait is: a grandchild that
+/// inherited the pipe can hold it open after the child is gone, and an
+/// unbounded join there is the hang the deadline exists to prevent.
+fn join_within(
+    handle: std::thread::JoinHandle<Vec<u8>>,
+    deadline: std::time::Instant,
+    what: &str,
+) -> Vec<u8> {
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return format!("[the reader for the child's {what} did not finish inside the bound]")
+                .into_bytes();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    handle
+        .join()
+        .unwrap_or_else(|_| format!("[the reader for the child's {what} panicked]").into_bytes())
+}
+
+/// Run this test binary again, `--exact --ignored`, with `env` set, and
+/// return its exit status.///
 /// The kill-test shape `src/rundir.rs` established: `Injection::Kill` is
 /// `std::process::abort()`, a real process death, so the child has to be a
 /// real process and the claim is what it left on disk. It is not only a kill
@@ -673,6 +814,9 @@ const PANIC_EXIT: i32 = 101;
 /// child's *setup* would otherwise reach the caller as a bare exit code with
 /// the diagnostic thrown away; no caller expects a panicking child, and
 /// [`died_by_abort`] excludes this code on both platforms.
+///
+/// **If the child did not end inside [`CHILD_DEADLINE`]**, having been killed
+/// and reaped first, quoting what it had said.
 pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process::ExitStatus {
     let mut command = Command::new(std::env::current_exe().expect("this test binary"));
     command
@@ -683,13 +827,45 @@ pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process
     for (key, value) in env {
         command.env(key, value);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .unwrap_or_else(|error| panic!("spawning the child that runs `{test}`: {error}"));
+    let stdout = child.stdout.take().expect("the child's piped stdout");
+    let stderr = child.stderr.take().expect("the child's piped stderr");
+    let reading_out = std::thread::spawn(move || read_capped(stdout, "stdout"));
+    let reading_err = std::thread::spawn(move || read_capped(stderr, "stderr"));
+
+    let deadline = std::time::Instant::now() + CHILD_DEADLINE;
+    let mut overran = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => panic!("waiting for the child that runs `{test}`: {error}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            overran = true;
+            let _ = child.kill();
+            break child.wait().unwrap_or_else(|error| {
+                panic!("reaping the child that runs `{test}` after its deadline: {error}")
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    // The readers are given the same deadline again, measured from here, so a
+    // grandchild holding the pipe bounds the report rather than the process.
+    let reap_by = std::time::Instant::now() + CHILD_DEADLINE;
     let said = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&join_within(reading_out, reap_by, "stdout")),
+        String::from_utf8_lossy(&join_within(reading_err, reap_by, "stderr"))
+    );
+
+    assert!(
+        !overran,
+        "the child running `{test}` did not end within {CHILD_DEADLINE:?} and was killed. It said: \
+         {said}"
     );
     assert!(
         said.contains(SELECTED_ONE),
@@ -698,10 +874,10 @@ pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process
          {said}"
     );
     assert!(
-        output.status.code() != Some(PANIC_EXIT),
+        status.code() != Some(PANIC_EXIT),
         "the child running `{test}` panicked rather than reaching its injection. It said: {said}"
     );
-    output.status
+    status
 }
 
 /// A `git` child a test can kill at a chosen moment.
@@ -934,58 +1110,54 @@ mod tests {
         );
     }
 
+    /// The pre-clean is gone, and what replaces it never touches a tree it did
+    /// not create: two acquisitions are two roots, and the first one's bytes
+    /// are still there after the second.
     #[test]
-    fn scratch_empties_a_directory_a_previous_run_left_at_the_same_name() {
-        let dir = scratch("stale-tree");
-        write_file(
-            &dir.join("residue").join("left-behind.txt"),
-            b"a previous run\n",
+    fn a_second_scratch_tree_is_a_second_root_and_pre_cleans_nothing() {
+        let first = scratch_tree("token-first");
+        let planted = first.path().join("planted.txt");
+        write_file(&planted, b"the first tree's own bytes\n");
+
+        let second = scratch_tree("token-second");
+        assert_ne!(
+            first.path(),
+            second.path(),
+            "a fresh ULID means two acquisitions cannot collide on a name"
         );
-        let again = scratch_at(dir.clone());
-        assert_eq!(again, dir, "the same name is returned");
-        let mut entries = fs::read_dir(&dir).expect("read the fresh scratch directory");
         assert!(
-            entries.next().is_none(),
-            "the tree the previous run left is gone rather than adopted: {}",
-            dir.display()
+            planted.exists(),
+            "the second acquisition removed the first tree's bytes at {}",
+            planted.display()
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The removal that fails is the one that used to be silent: `create_dir_all`
-    /// answers `Ok` for a directory that is already there, so the fixture went on
-    /// to measure another run's residue.
-    ///
-    /// Unix only, and it must not run as root: `remove_dir_all` needs write
-    /// permission on the *parent* to unlink the entry, and under a user for whom
-    /// mode bits do not bind the removal succeeds and the case is never reached.
-    /// The test says so rather than passing vacuously.
-    #[cfg(unix)]
+    /// The guard reclaims **its own** root and nothing above or beside it, and
+    /// it reclaims on drop rather than at the end of a passing body, so a
+    /// failing test leaves no tree behind.
     #[test]
-    fn a_stale_tree_that_cannot_be_removed_is_reported_and_not_adopted() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn a_dropped_scratch_guard_reclaims_its_own_tree_and_nothing_else() {
+        let neighbour = scratch_tree("token-neighbour");
+        let beside = neighbour.path().join("beside.txt");
+        write_file(&beside, b"a neighbouring tree\n");
 
-        let holder = scratch("stale-held");
-        let stale = holder.join("victim");
-        write_file(&stale.join("residue.txt"), b"a previous run\n");
-        fs::set_permissions(&holder, fs::Permissions::from_mode(0o555))
-            .expect("make the holding directory unwritable");
+        let root = {
+            let tree = scratch_tree("token-dropped");
+            let root = tree.path().to_path_buf();
+            write_file(&root.join("inside.txt"), b"inside the guarded tree\n");
+            root
+        };
 
-        let outcome = std::panic::catch_unwind(|| scratch_at(stale.clone()));
-        fs::set_permissions(&holder, fs::Permissions::from_mode(0o755))
-            .expect("restore the holding directory");
-        let error = outcome.expect_err(
-            "a stale tree that cannot be removed must be reported; if this run could remove it \
-             anyway, it is running as root and this test proves nothing",
-        );
-        let message = error
-            .downcast_ref::<String>()
-            .map_or_else(String::new, Clone::clone);
         assert!(
-            message.contains("could not remove it"),
-            "the refusal must say a previous run's tree is in the way: {message}"
+            !root.exists(),
+            "the guard's own tree survived its drop: {}",
+            root.display()
         );
-        let _ = fs::remove_dir_all(&holder);
+        assert!(
+            beside.exists(),
+            "the drop reached outside the token's root, to {}",
+            beside.display()
+        );
     }
 
     /// `init.templateDir` and `GIT_TEMPLATE_DIR` put hooks in `.git/hooks` at
@@ -1219,47 +1391,79 @@ mod tests {
         }
     }
 
-    /// The list is a constant so that no command pays for a `git` invocation,
-    /// and this is what keeps the constant from ageing: a variable the
-    /// installed Git calls local and this module does not strip is one an
-    /// ambient environment can still reach the fixture through. A name Git has
-    /// since retired stays in the constant harmlessly, so the check is
-    /// containment and not equality.
+    /// The door, asked of Git rather than of the constant: `config
+    /// --show-origin --list` names every source a command actually read, so a
+    /// global, a system or a template-installed config would appear here.
+    ///
+    /// This is the check that replaces enumerating variables. A list of names
+    /// to strip can only be as complete as whoever wrote it; this asserts the
+    /// property — the only configuration a fixture command sees is the
+    /// repository's own and this module's own `-c` — and it holds for a
+    /// setting nobody has thought of yet.
     #[test]
-    fn the_variables_git_calls_local_are_the_ones_the_fixture_strips() {
-        let dir = scratch("local-env-vars");
-        let listed = git(&dir, &["rev-parse", "--local-env-vars"]);
-        let named: Vec<&str> = listed
+    fn the_only_config_a_fixture_command_reads_is_the_repositorys_own() {
+        let fixture = Fixture::new("config-origins");
+        let listed = git(&fixture.base, &["config", "--show-origin", "--list"]);
+        let mut origins: Vec<&str> = listed
             .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter_map(|line| line.split_once('\t').map(|(origin, _)| origin))
             .collect();
+        origins.sort_unstable();
+        origins.dedup();
         assert!(
-            named.len() > 5,
-            "the installed Git named too few local variables to be its real list: {named:?}"
+            !origins.is_empty(),
+            "the probe read no configuration at all, so it is measuring nothing"
         );
-        let missing: Vec<&&str> = named
+        // Git spells a `file:` origin relative to the command's own directory,
+        // which `-C` made the repository, so each one is resolved against it
+        // and compared as a path rather than as text.
+        let repository = fixture
+            .base
+            .join(".git")
+            .join("config")
+            .canonicalize()
+            .expect("canonicalize the repository's own config");
+        let foreign: Vec<&&str> = origins
             .iter()
-            .filter(|name| !LOCAL_ENV_VARS.contains(*name))
+            .filter(|origin| {
+                if origin.starts_with("command line:") {
+                    return false;
+                }
+                origin.strip_prefix("file:").is_none_or(|named| {
+                    fixture
+                        .base
+                        .join(named)
+                        .canonicalize()
+                        .is_ok_and(|path| path != repository)
+                })
+            })
             .collect();
         assert!(
-            missing.is_empty(),
-            "the installed Git calls these local and this module does not strip them: {missing:?}"
+            foreign.is_empty(),
+            "a fixture command read configuration from outside its own repository: {foreign:?}"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The other half of the ambient claim: a **configuration file** this
+    /// The other half of the ambient claim, and the shape the first frontier
+    /// pass attacked: a **configuration file and a template directory** this
     /// process cannot replace for itself.
     ///
-    /// The child is given a global and a system config file pinning everything
-    /// the fixture pins — signing on, an ignore file that excludes the seed
-    /// files, an attributes file that rewrites their line endings on checkout,
-    /// a hooks directory holding a `post-checkout`, an fsmonitor, `autocrlf`
-    /// and another default branch — and must still produce this process's three
-    /// commit ids, this process's file content, and no hook.
+    /// The child is given a global and a system config file, and a template
+    /// directory, carrying every escape the pass found and the ones the sweep
+    /// had already pinned: signing on, another default branch, `autocrlf`, an
+    /// fsmonitor, an ignore file that excludes the seed files, an attributes
+    /// file and a template `info/attributes` that rewrite line endings on
+    /// checkout, a hooks directory and a template `post-checkout`, an
+    /// `i18n.commitEncoding` that puts an `encoding` header on every commit and
+    /// so changes every object id, and a template `config` setting
+    /// `core.worktree` to another directory — which, unclosed, makes the new
+    /// repository resolve its worktree to that one and stage its files
+    /// (measured, git 2.43.0).
+    ///
+    /// It asserts the property rather than the pins: the child's three commit
+    /// ids, its file content, its own worktree, and no hook.
     #[test]
-    fn the_fixture_is_immune_to_an_ambient_global_git_config() {
+    fn the_fixture_is_immune_to_an_ambient_config_and_template() {
         let clean = Fixture::new("config-clean");
         let expected = format!("{} {} {}", clean.seed, clean.head, clean.side);
 
@@ -1268,58 +1472,106 @@ mod tests {
         let attributes = hostile.join("attributes");
         let hooks = hostile.join("hooks");
         let hook = hooks.join("post-checkout");
+        let template = hostile.join("template");
+        let elsewhere = hostile.join("elsewhere");
         write_file(&excludes, b"*.txt\n");
         write_file(&attributes, b"* text eol=crlf\n");
         write_file(&hook, b"#!/bin/sh\n: > hook-ran.marker\n");
+        write_file(
+            &template.join("info").join("attributes"),
+            b"* text eol=crlf\n",
+        );
+        write_file(
+            &template.join("hooks").join("post-checkout"),
+            b"#!/bin/sh\n: > hook-ran.marker\n",
+        );
+        create_dir(&elsewhere);
+        let mut template_config = b"[core]\n\tworktree = ".to_vec();
+        template_config.extend_from_slice(&config_path_bytes(&elsewhere));
+        template_config.push(b'\n');
+        write_file(&template.join("config"), &template_config);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
-                .expect("make the hostile hook executable");
+            for script in [&hook, &template.join("hooks").join("post-checkout")] {
+                fs::set_permissions(script, fs::Permissions::from_mode(0o755))
+                    .expect("make the hostile hook executable");
+            }
         }
-        let config = hostile.join("config");
-        write_file(
-            &config,
-            format!(
-                "[commit]\n\tgpgsign = true\n\
-                 [init]\n\tdefaultBranch = trunk\n\
-                 [core]\n\tautocrlf = true\n\
-                 \tfsmonitor = {hook}\n\
-                 \texcludesFile = {excludes}\n\
-                 \tattributesFile = {attributes}\n\
-                 \thooksPath = {hooks}\n",
-                hook = escaped(&hook),
-                excludes = escaped(&excludes),
-                attributes = escaped(&attributes),
-                hooks = escaped(&hooks),
-            )
-            .as_bytes(),
+
+        let mut config = b"[commit]\n\tgpgsign = true\n[init]\n\tdefaultBranch = trunk\n".to_vec();
+        config.extend_from_slice(
+            b"[i18n]\n\tcommitEncoding = ISO-8859-1\n[core]\n\tautocrlf = true\n",
         );
+        for (key, value) in [
+            ("\tfsmonitor = ", &hook),
+            ("\texcludesFile = ", &excludes),
+            ("\tattributesFile = ", &attributes),
+            ("\thooksPath = ", &hooks),
+        ] {
+            config.extend_from_slice(key.as_bytes());
+            config.extend_from_slice(&config_path_bytes(value));
+            config.push(b'\n');
+        }
+        config.extend_from_slice(b"[init]\n\ttemplateDir = ");
+        config.extend_from_slice(&config_path_bytes(&template));
+        config.push(b'\n');
+        let config_path = hostile.join("config");
+        write_file(&config_path, &config);
 
         let status = run_child_test(
             CONFIG_CHILD,
             &[
                 (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
-                ("GIT_CONFIG_GLOBAL", config.as_os_str()),
-                ("GIT_CONFIG_SYSTEM", config.as_os_str()),
+                ("GIT_CONFIG_GLOBAL", config_path.as_os_str()),
+                ("GIT_CONFIG_SYSTEM", config_path.as_os_str()),
+                ("GIT_TEMPLATE_DIR", template.as_os_str()),
             ],
         );
         assert!(
             status.success(),
-            "the child built its fixture under a hostile Git configuration and ended {status:?}"
+            "the child built its fixture under a hostile Git configuration and template and \
+             ended {status:?}"
         );
     }
 
-    /// A path as a Git config value: the parser reads `\\` as an escape, so a
-    /// Windows path written verbatim is a bad config value.
-    fn escaped(path: &Path) -> String {
-        path.display().to_string().replace('\\', "\\\\")
+    /// `path` as the bytes a Git config value spells it with.
+    ///
+    /// A display conversion is for diagnostics (§8), and this value is written
+    /// into a file Git then reads as a path, so the conversion is exact where
+    /// it can be and a refusal where it cannot: on Unix the path's own bytes,
+    /// and elsewhere a path that is not Unicode is refused rather than having
+    /// its bytes replaced, because a Git config file there is UTF-8 and a
+    /// replacement character is a different path. Git's parser reads `\\` as an
+    /// escape, so each one is doubled — on the bytes, not on a `String`.
+    fn config_path_bytes(path: &Path) -> Vec<u8> {
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::ffi::OsStrExt as _;
+            path.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let bytes = match path.to_str() {
+            Some(text) => text.as_bytes().to_vec(),
+            None => panic!(
+                "the fixture cannot write {} into a Git config file: it is not Unicode",
+                path.display()
+            ),
+        };
+        let mut escaped = Vec::with_capacity(bytes.len());
+        for byte in bytes {
+            if byte == b'\\' {
+                escaped.push(b'\\');
+            }
+            escaped.push(byte);
+        }
+        escaped
     }
 
-    /// The child half of [`the_fixture_is_immune_to_an_ambient_global_git_config`].
+    /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
     #[test]
-    #[ignore = "spawned by `the_fixture_is_immune_to_an_ambient_global_git_config` with a \
-                hostile Git configuration"]
+    #[ignore = "spawned by `the_fixture_is_immune_to_an_ambient_config_and_template` with a \
+                hostile Git configuration and template"]
     fn ambient_config_child() {
         let expected =
             std::env::var(AMBIENT_EXPECT).expect("the parent's expected commit ids, in the child");
@@ -1334,6 +1586,14 @@ mod tests {
         // its blob did not change. Only a file a checkout actually writes goes
         // through the attribute filter, so asserting on `a.txt` alone passes
         // whether the pin holds or not (measured, with the pin deleted).
+        //
+        // **This is the fixture's own checkout and says nothing about the
+        // manager's.** `WorkspaceManager::command` sets neither
+        // `core.attributesFile` nor `GIT_ATTR_NOSYSTEM`, so an ambient
+        // attributes file still rewrites what `git worktree add` writes under
+        // `Fixture::add_task`. That is the parent's command builder and a
+        // deferred row against queue row 11; nothing here covers it, and the
+        // module doc says so rather than letting this assertion imply it.
         assert_eq!(
             fs::read(fixture.base.join("b.txt")).expect("read the checked-out file back"),
             b"two\n",
@@ -1346,7 +1606,15 @@ mod tests {
         );
         assert!(
             !fixture.base.join("hook-ran.marker").exists(),
-            "an ambient hooks path ran a hook during the fixture's own checkouts"
+            "an ambient hooks path, or a template hook, ran during the fixture's own checkouts"
+        );
+        assert_eq!(
+            PathBuf::from(git(&fixture.base, &["rev-parse", "--show-toplevel"])),
+            fixture
+                .base
+                .canonicalize()
+                .expect("canonicalize the fixture's own repository"),
+            "a template `core.worktree` moved the repository's worktree elsewhere"
         );
     }
 }
