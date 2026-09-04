@@ -155,6 +155,75 @@ pub fn prove_private_half_ownership(
     }
 
     let locator = PathBuf::from(&marker.private_dir);
+    let authorized_runs = authorized_root.join("runs");
+
+    // **Identity before existence, and this ordering is the fix for a P1.**
+    // The existence check below used to run first, and `TargetAbsent` is a
+    // reclaiming answer, so a recorded locator that names *some other path* was
+    // answered "the target is gone" before anything had established that the
+    // recorded path was this run's at all. The locator-identity conjuncts below
+    // would have refused it — they run too late to stop the reclaim.
+    //
+    // That is not hypothetical and it needs no hostile input and no failing
+    // syscall. A private root whose bytes are not valid UTF-8 — `\xff-private`
+    // is an ordinary Unix directory name — is recorded by `create.rs`'s marker
+    // write through `to_string_lossy()`, so the marker names `<U+FFFD>-private`
+    // and the real half lives at `\xff-private`. Measured on this crate at
+    // `cc202c8`: the proof answered `NothingBound(TargetAbsent)` with the real
+    // private half still on disk, and the reclaim that licenses deletes
+    // `.creating`, which is that half's only locator.
+    //
+    // So the recorded locator must first be shown to be a child of the
+    // authorized runs directory *by name*: its own file name is this run's
+    // basename, and its parent canonicalizes to the same directory as
+    // `<R>/runs`. Neither question needs the target to exist, which is what
+    // keeps the legitimate `TargetAbsent` answer reachable. A mangled locator
+    // has a parent that does not canonicalize at all and is refused here.
+    //
+    // The parent is compared *canonically* rather than textually because
+    // `prelock::authorized_private_root` canonicalizes the root and joins
+    // `runs/<id>`, while this side canonicalizes `<R>/runs` — the two spellings
+    // differ when `runs` is itself a link, which is legitimate, and both
+    // canonicalize to one directory.
+    //
+    // The **lossless** repair — recording a path that round-trips exactly — is
+    // deliberately not attempted here. `CreatingMarker.private_dir`,
+    // `OwnerRecord.public_dir` and `run_started.private_dir` in the committed
+    // event log all carry the same `String`, so it is three schema changes, and
+    // the policy question has a parked owner-level record in PR #39. What this
+    // conjunct does instead is refuse: a run whose private root is not valid
+    // UTF-8 is retained and reported for ever rather than wrongly reclaimed.
+    // The stat happens here, and only its **refusing** answer is acted on here.
+    // A stat that did not answer is a retention whatever else is true, and
+    // taking it first keeps its fixture portable: a locator the platform will
+    // not accept as a path fails this stat on every platform, and never reaches
+    // the identity questions below because it has no answer to give them.
+    let target_stat = fs::symlink_metadata(&locator);
+    if let Err(error) = &target_stat
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable {
+            detail: format!("{}: {error}", locator.display()),
+        });
+    }
+
+    // Two spellings are accepted and no third, because the two sides derive the
+    // path differently and both are legitimate. `prelock::authorized_private_root`
+    // canonicalizes the **root** — the run directory does not exist during the
+    // pre-lock checks, so there is nothing else it could canonicalize — and joins
+    // `runs/<id>`; this side canonicalizes `<R>/runs` when that directory exists
+    // and joins the basename. The canonical spelling is the one to prefer, and
+    // the raw one has to be accepted too: at P1 the marker is published and
+    // `<R>/runs` may not exist yet, which is exactly the state whose legitimate
+    // answer is `TargetAbsent`.
+    let expected_raw = authorized_runs.join(&basename);
+    let expected_canonical = fs::canonicalize(&authorized_runs).map(|runs| runs.join(&basename));
+    if locator != expected_raw && expected_canonical.as_ref().is_ok_and(|it| *it != locator) {
+        return PrivateHalfOwnership::Retained(RetainReason::LocatorOutsideAuthorizedRoot {
+            locator,
+            expected: expected_canonical.unwrap_or(expected_raw),
+        });
+    }
 
     // The census's own step between the marker conjuncts and the locator
     // ones: "if the marker's private target does not exist the public husk
@@ -182,20 +251,15 @@ pub fn prove_private_half_ownership(
     // 12 — only `io::ErrorKind::NotFound` proves a path is not there — spelled
     // again here rather than shared, so that each conjunct keeps refusing on
     // its own and a mutation to one is not a mutation to both.
-    match fs::symlink_metadata(&locator) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return PrivateHalfOwnership::NothingBound(UnboundShape::TargetAbsent);
-        }
-        Err(error) => {
-            return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable {
-                detail: format!("{}: {error}", locator.display()),
-            });
-        }
+    // **`TargetAbsent` at last, and only now.** The stat above said `NotFound`
+    // and the two questions between said the recorded locator is this run's
+    // child of the authorized runs directory. Both are needed: `NotFound` alone
+    // was the P1.
+    if target_stat.is_err() {
+        return PrivateHalfOwnership::NothingBound(UnboundShape::TargetAbsent);
     }
 
     // Conjunct 4: no symlink or reparse point below the runs directory.
-    let authorized_runs = authorized_root.join("runs");
     if let Some(component) = first_reparse_point(&authorized_runs, &locator) {
         return PrivateHalfOwnership::Retained(RetainReason::LocatorThroughReparsePoint {
             component,
@@ -259,17 +323,36 @@ pub fn prove_private_half_ownership(
             Ok(path) => path,
             Err(reason) => return PrivateHalfOwnership::Retained(reason),
         };
+    // **Conjunct 8 compares paths, not renderings of them.** This built the
+    // expected side with `canonical_public.to_string_lossy()` and compared it as
+    // a `String`, and `create.rs`'s `canonical_string` records the same way, so
+    // two canonical roots differing only in bytes that are not valid UTF-8 —
+    // `\x80` against `\x81` — collapse to one string on both sides and the
+    // conjunct passes for a husk that is not this one. That answer is `Proven`,
+    // which mints the token authorising a private-half deletion, so the lossy
+    // comparison could hand run B a token for run A's private half.
+    //
+    // The recorded value is still the `String` the record carries, and it is
+    // still rendered lossily in the refusal — a lossy string is a diagnostic.
+    // What it is no longer is the thing compared: `Path::new` over the recorded
+    // bytes against the canonical path answers identity. With the recorder left
+    // lossy (see the note above conjunct 3 on why), a public path that is not
+    // valid UTF-8 now never satisfies this conjunct, so such a run is retained
+    // and reported rather than proven — fail-closed, and permanent until the
+    // recorder question is settled.
+    if Path::new(&owner.public_dir) != canonical_public {
+        return PrivateHalfOwnership::Retained(RetainReason::OwnerRecordDisagrees {
+            field: OwnerField::PublicDir,
+            recorded: owner.public_dir,
+            expected: canonical_public.to_string_lossy().into_owned(),
+        });
+    }
     let disagreements = [
         (OwnerField::RunId, owner.run_id.clone(), basename.clone()),
         (
             OwnerField::RepoKey,
             owner.repo_key.clone(),
             repo_key.as_str().to_owned(),
-        ),
-        (
-            OwnerField::PublicDir,
-            owner.public_dir.clone(),
-            canonical_public.to_string_lossy().into_owned(),
         ),
         (
             OwnerField::Incarnation,

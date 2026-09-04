@@ -2791,6 +2791,191 @@ fn two_entries_with_one_lossy_rendering_stay_two_entries() {
     assert!(!public.exists(), "and the husk is gone");
 }
 
+/// A private root whose bytes are not valid UTF-8 is **retained**, never
+/// reclaimed — the P1 pass 2 found, and the cost of not fixing it losslessly.
+///
+/// The sequence needs no hostile input and no failing syscall. `\xff-private`
+/// is an ordinary Unix directory name; `create.rs` records the marker's
+/// `private_dir` through `to_string_lossy()`, so the marker names
+/// `<U+FFFD>-private` while the real private half lives at `\xff-private`. The
+/// census then stated the mangled locator, got `NotFound`, and answered
+/// `NothingBound(TargetAbsent)` — the reclaiming answer, whose reclaim deletes
+/// `.creating` and orphans a private half that is still on disk. Measured on
+/// this crate at `cc202c8` before the repair, with `real_still_there=true`.
+///
+/// The repair is an ordering one: `TargetAbsent` is now reachable only after
+/// the recorded locator has been shown to be this run's child of the authorized
+/// runs directory, which a mangled locator is not. **The refusal is the cost as
+/// well as the fix**: with the recorder still lossy — three persisted records
+/// carry that `String`, and PR #39 parks the policy — a run under such a root
+/// can never be reclaimed at all. That is the fail-closed direction, and this
+/// test is what makes it a property rather than a sentence in a risk section.
+///
+/// Linux only, measured: macOS refuses to create the name at all (`Illegal byte
+/// sequence`), and Windows names are UTF-16.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_private_root_that_is_not_utf8_is_retained_rather_than_reclaimed() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut husk = BoundHusk::new("nonutf8-root");
+    let raw_root = std::ffi::OsString::from_vec(b"\xff-private".to_vec());
+    let real_root = husk.root.join(&raw_root);
+    fs::create_dir_all(real_root.join("runs")).expect("the raw private root");
+    let real_root = fs::canonicalize(&real_root).expect("canonical raw root");
+    husk.private = real_root.join("runs").join(BOUND_RUN);
+    husk.private_root = real_root;
+    // Recorded the way `create.rs` records it, which is where the identity dies.
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "the real private half is on disk at the raw path"
+    );
+    assert_ne!(
+        Path::new(&husk.marker.private_dir),
+        husk.private.as_path(),
+        "and the marker does not name it: the fixture needs a mangled record"
+    );
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "locator-outside-authorized-root",
+            "a locator that is not this run's child of the runs directory is refused \
+             before any question about whether it exists: {reason}"
+        ),
+        other => panic!(
+            "a mangled locator answered {other:?}; the real private half is {}",
+            if husk.private.join(OWNER_RECORD).is_file() {
+                "still there and would now be orphaned"
+            } else {
+                "gone"
+            }
+        ),
+    }
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and nothing was touched"
+    );
+}
+
+/// Conjunct 8 compares **paths**, so two canonical paths that render to one
+/// lossy string do not prove each other.
+///
+/// `create.rs`'s `canonical_string` records `owner.public_dir` through
+/// `to_string_lossy()`, and this conjunct used to compare the recorded string
+/// against `canonicalize(<public>).to_string_lossy()`. Both sides degrade
+/// identically, so a husk whose canonical path is not valid UTF-8 satisfied the
+/// conjunct against a record written for a *different* path with the same lossy
+/// rendering — and the answer at the end of that is `Proven`, which mints the
+/// token authorising a private-half deletion.
+///
+/// The fixture is the smallest form of that: a public directory whose canonical
+/// path carries a byte that is not valid UTF-8, and an owner record holding the
+/// lossy rendering of it — which is what the recorder writes. The strings are
+/// equal; the paths are not.
+///
+/// Linux only, for the reason given on the test above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lossy_public_path_does_not_satisfy_the_owner_record() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    // Only the *public* side is under the non-UTF-8 path: the private half
+    // stays where it is, so this fixture exercises conjunct 8 rather than the
+    // locator identity the test above covers.
+    let mut husk = BoundHusk::new("nonutf8-public");
+    let raw = std::ffi::OsString::from_vec(b"\xff-repo".to_vec());
+    let raw_repo = husk.root.join(&raw);
+    fs::create_dir_all(&raw_repo).expect("the raw repo root");
+    husk.repo = fs::canonicalize(&raw_repo).expect("canonical raw repo");
+    let public = husk.public();
+    fs::create_dir_all(&public).expect("the public directory");
+    let canonical_public = fs::canonicalize(&public).expect("canonical public");
+    // What `create.rs`'s recorder writes for that path.
+    husk.owner.public_dir = canonical_public.to_string_lossy().into_owned();
+    husk.publish();
+    assert!(
+        canonical_public.to_str().is_none(),
+        "the fixture needs a public path that is not valid UTF-8"
+    );
+    // What the recorder writes, and what the record on disk already holds.
+    assert_eq!(
+        husk.owner.public_dir,
+        canonical_public.to_string_lossy(),
+        "the record holds the lossy rendering, which is the whole defect"
+    );
+    assert_ne!(
+        Path::new(&husk.owner.public_dir),
+        canonical_public.as_path(),
+        "and the lossy rendering is not that path"
+    );
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "owner-record-disagrees", "{reason}");
+            assert_eq!(
+                reason.owner_field(),
+                Some(OwnerField::PublicDir),
+                "and it is the public directory that could not be shown to agree"
+            );
+        }
+        other => panic!("a lossy public path proved {other:?} — that answer mints a token"),
+    }
+}
+
+/// A directory whose name is not valid UTF-8 is **skipped**, not enumerated as
+/// a mangled twin of its neighbour.
+///
+/// `run_dir_names` mapped each entry through `to_string_lossy()` and
+/// `engine::topology::startup::scan` rebuilds a path from the result, so a
+/// directory named `x` + `0xff` was enumerated as `x` + `U+FFFD`: the census
+/// inspected a directory that does not exist while the real one was never
+/// inspected, and where both names existed the valid one was scanned twice and
+/// the other not at all. A run id is a ULID, so a name that does not round-trip
+/// is not a run directory, and skipping it is what makes every name the
+/// enumeration returns one that names the directory it came from.
+///
+/// Linux only, for the reason given above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_directory_name_that_is_not_utf8_is_skipped_rather_than_mangled() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = scratch("nonutf8-enumeration");
+    let repo = root.join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(&runs).expect("the runs root");
+    let raw = OsStr::from_bytes(b"x\xff");
+    fs::create_dir(runs.join(raw)).expect("the raw-named directory");
+    fs::create_dir(runs.join("x\u{FFFD}")).expect("its lossy twin");
+    fs::create_dir(runs.join("01REALRUN00000000000000000")).expect("an ordinary run directory");
+
+    let names = run_dir_names(&repo);
+    assert!(
+        names.iter().all(|name| runs.join(name).is_dir()),
+        "every name the enumeration returns must name the directory it came from: {names:?}"
+    );
+    let mut distinct = names.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        names.len(),
+        "two directories collapsed to one name: {names:?}"
+    );
+    assert_eq!(
+        names,
+        vec![
+            "01REALRUN00000000000000000".to_owned(),
+            "x\u{FFFD}".to_owned()
+        ],
+        "the raw-named directory is skipped, and its valid twin is returned once"
+    );
+}
+
 /// A private target the census cannot ask about is not a target that is
 /// gone, and the marker that locates it survives.
 ///

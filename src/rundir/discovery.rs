@@ -63,13 +63,32 @@ pub fn list_runs(repo_root: &Path) -> Vec<String> {
     runs
 }
 
-/// Every directory under `<repo>/.upstroke/runs`, committed or not, oldest first.
+/// Every directory under `<repo>/.upstroke/runs` **whose name is a name this
+/// engine could have written**, committed or not, oldest first.
 ///
 /// Not a reader in `startup_census`'s sense and deliberately not filtered by
 /// commitment: this is the enumeration a census walks and the one the worktree
 /// lease's R28 check scans. A crashed run whose log never committed is exactly
 /// the run whose reaper is most likely still holding its cleanup lease, so
 /// filtering here would hide the hold that check exists to observe.
+///
+/// **The name is taken exactly or not at all.** This mapped each entry through
+/// `to_string_lossy()` and `engine::topology::startup::scan` rebuilds a path
+/// from the result, so a directory named with the bytes `x\xff` was enumerated
+/// as `x` + `U+FFFD`: the census then inspected a directory that does not
+/// exist while the real one was never inspected and never reported, and where
+/// both names existed the valid one was scanned twice and the other not at all.
+/// A lossy name is a diagnostic and never an identity, and this one is handed
+/// to a census that deletes.
+///
+/// A name that does not round-trip is therefore **skipped rather than
+/// mangled**, which narrows the enumeration by exactly the directories that
+/// cannot be run directories: a run id is a ULID, 26 characters of Crockford
+/// base32, so every directory this engine creates has an ASCII name. Skipping
+/// one is strictly better than inspecting a phantom in its place, and the
+/// alternative — carrying `OsString` out of here — reaches `list_runs`,
+/// `resolve_run_id`, `status` and the event log's own run ids, which is a
+/// different change in a file whose sweep has not run (queue row 13).
 #[must_use]
 pub fn run_dir_names(repo_root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(runs_root(repo_root)) else {
@@ -78,7 +97,7 @@ pub fn run_dir_names(repo_root: &Path) -> Vec<String> {
     let mut runs: Vec<String> = entries
         .flatten()
         .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .collect();
     runs.sort();
     runs
