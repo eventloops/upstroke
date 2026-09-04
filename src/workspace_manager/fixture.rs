@@ -652,6 +652,11 @@ impl KillableGitChild {
 
     /// The child's process id, for a test that has to ask the operating system
     /// whether it is still there.
+    ///
+    /// `#[cfg(unix)]` because its only caller is, and an accessor nothing calls
+    /// is `dead_code`, which the Windows Clippy leg refuses under `-D warnings`
+    /// (measured on this pull request: `lint (windows)` at `a1d3e6a`).
+    #[cfg(unix)]
     pub(crate) fn id(&self) -> u32 {
         self.child.id()
     }
