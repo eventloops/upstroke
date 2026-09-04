@@ -6133,12 +6133,20 @@ holder was still holding when the assertion ran — did not discriminate, becaus
 removal returns error 32 while the holder is normally still inside its hold, exactly like the
 starvation case.
 
-**So there is now one instruction, and it is short.** A red on this test is a regression. The
-assertions quote the attempt count, and that is the discriminator the earlier record could not
-supply: `the removal must have retried: the loop reported 1 attempt(s)` is a retry that is gone;
-a refusal in the closing case after more than one attempt is a removal that could not cross a
-window it used to cross. Neither reading needs a rate, a soak, or a judgement about how loaded the
-runner was.
+**So the instruction is short, with one exception that is named rather than buried.** A red on
+this test is a regression, and the assertions quote the attempt count, which is the discriminator
+the earlier record could not supply: a count at or below the derived floor is a retry budget that
+no longer covers the closing window this control is sized against, and at one attempt it is a retry
+that is gone. Neither reading needs a rate, a soak, or a judgement about how loaded the runner was.
+
+**The exception is the fail-safe, and it is not a regression by default.** That assertion measures
+the *case*, which begins before the removal does, so it can expire because this thread was never
+scheduled to reach the retry at all. The pass on `8d45582` found the old wording asserting a slow
+removal from a bare fire, which is not sound. The assertion now reports which of the two happened,
+from the millisecond at which the removal's first attempt completed: **no attempt recorded** is a
+scheduling failure of the test and says nothing about any removal's duration; **an attempt
+recorded** says the bound was spent inside the funnel and quotes when it was entered. Read the
+message, not the fingerprint.
 
 ### FIND-109-FAIL-SAFE-DIAGNOSES-ONLY-ITS-BOUND
 
