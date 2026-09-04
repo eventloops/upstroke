@@ -1,6 +1,11 @@
-# Standing finding ledger
+# Standing finding ledger, to 2026-09-04
 
 Every review finding across every slice, with its disposition and whether it has recurred.
+
+> **Closed to new sections.** A finding recorded after 2026-09-04 is its own file under
+> `reviews/findings/`, which ends the merge conflicts this single file caused. Nothing here is
+> migrated and no section is renumbered: source comments and design sections cite these
+> sections by number. See `reviews/findings/README.md`.
 Accumulative and append-only. This file is **an input to every review**, not a record written
 after one.
 

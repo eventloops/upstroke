@@ -29,7 +29,10 @@ source, documentation, workflows, release machinery and this file.
      repaired head gets a fresh pass.
    - A relevant finding that is not serious is fixed at the author's discretion or logged as tech
      debt: a ledger row with a stable id, an honest failure sequence, and disposition `deferred`
-     or `accepted-risk`. Rows that outlive the pull request move to `reviews/FINDINGS.md`.
+     or `accepted-risk`. Rows that outlive the pull request become one file each under `reviews/findings/`, named and
+     shaped as `reviews/findings/README.md` states. `reviews/FINDINGS.md` is the historical ledger
+     up to 2026-09-04 and is closed to new sections; its section numbers are cited from source and
+     design and do not move.
    - A finding that is **not relevant to the change** — pre-existing, out of scope, or against an
      unswept file under a transitional standard (`standards/SWEEP.md`) — is logged the same way or
      `rejected` with the reason, and blocks nothing.
@@ -42,7 +45,7 @@ source, documentation, workflows, release machinery and this file.
    A repair-only push after a pass that found no serious P1 needs no second pass: the owner reads
    `git diff <reviewed> <head>`, confirms it contains those repairs and nothing else — never a
    workflow, gate script or validator edit — and says so in the body. A push confined to
-   `reviews/FINDINGS.md`, or a conflict-free merge of `master` that leaves `git diff master...HEAD`
+   the finding ledger (`reviews/findings/`, or `reviews/FINDINGS.md`), or a conflict-free merge of `master` that leaves `git diff master...HEAD`
    byte-identical with CI green on the merged head and no gate edited by the pull request, keeps
    the review as well; record both SHAs, and for the merge-in both base SHAs and the diff hash
    before and after. Anything wider is a new change and is reviewed again. A panel-reviewed
