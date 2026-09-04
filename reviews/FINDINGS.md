@@ -6339,8 +6339,10 @@ any frontier pass; the passes the coordinator launches append their rows below t
 findings are fixed and P3 and lower are recorded; the P3 rows marked `fixed` are ones the sweep
 itself repairs in the same commit, and the `deferred` rows each name the file that owns them.
 
-**The section number.** Master carries §52 (PR #131, merged as `c61880f`), and PR #109's body
-claims §53, so this section takes §54. `origin/master` `c61880f` is merged into this branch.
+**The section number.** §52 landed on master with PR #131 (`c61880f`) and §53 with PR #109
+(`5f661fa`), so this section takes §54. Both merges are in this branch: `origin/master` `c61880f`
+was merged in first, and `5f661fa` after, the second with one append-at-the-tail conflict in this
+file, resolved as the union with master's §53 before this §54.
 
 **§6 and §7 in this file.** No `Rc`, no `Arc` and no lock the file owns: the one `Arc<Mutex<_>>`
 is `HookHarness`', constructed by the `harness()` helper because `HarnessEffects::new` takes one,
