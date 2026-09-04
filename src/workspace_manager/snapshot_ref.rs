@@ -7,17 +7,28 @@
 //! [`Snapshot`] is what the funnel returns; the funnel, the ephemeral
 //! commit-tree it may run, and the ref discipline around it are the parent's.
 //!
-//! **Every id here is an [`ObjectId`]** (§5): a full hexadecimal object id
-//! that is not the null id, checked once where the value enters and carried
-//! as a type after that. The funnel hands `git commit-tree` and
-//! `git worktree add` these values as arguments, and Git resolves whatever it
-//! is given -- a ref name would check out wherever that ref points at the
-//! moment, which is not an *exact* snapshot, and a short or option-shaped
-//! string is parsed as something else. So neither an input nor a snapshot can
-//! be built from a value that is not an object id. The predicate is the
-//! parent's [`is_object_id`], the well-formedness half of `design/26` step 5;
-//! the null id is refused too, because that step measures it as a condition
-//! rather than an id, and no object can be snapshotted at it.
+//! **Every id here is an [`ObjectId`]** (§5): the spelling of a full
+//! hexadecimal object id of either hash length that is not the null id,
+//! checked once where the value enters and carried as a type after that. The
+//! funnel hands `git commit-tree` and `git worktree add` these values as
+//! arguments, and Git resolves whatever it is given -- a ref name checks out
+//! wherever that ref points at the moment, which is not an *exact* snapshot,
+//! and a short or option-shaped string is parsed as something else. The type
+//! removes those spellings. It cannot remove a ref *spelt* as hexadecimal of
+//! the other object format's length (a branch named with forty hexadecimal
+//! characters in a SHA-256 repository, and the inverse), because the type
+//! does not know the repository; measured on git 2.43, `git worktree add
+//! --detach <that name>` checks out wherever the branch points. So the funnel
+//! resolves each input once against the repository (`rev-parse --verify
+//! --quiet <id>^{commit}` or `^{tree}`) and accepts only an answer equal to
+//! the input: a ref, an abbreviation, an id of the other format's length and
+//! a missing object all resolve to something else or to nothing, and are
+//! refused by name ([`Refusal::SnapshotInputResolvesElsewhere`]) before any
+//! intent is written. What a [`Snapshot`] holds is therefore what Git
+//! resolved to itself. The predicate is the parent's [`is_object_id`], the
+//! well-formedness half of `design/26` step 5; the null id is refused too,
+//! because that step measures it as a condition rather than an id, and no
+//! object can be snapshotted at it.
 //!
 //! **What a [`Snapshot`] holds together** (§5, §6): its fields are private
 //! and it has one constructor, [`Snapshot::new`], visible to the parent only.
@@ -35,8 +46,8 @@
 //! is built once and may be offered to more than one add. [`Snapshot`] does
 //! not: it names one live checkout, and a copy of it would be two values for
 //! one resource, of which `remove_snapshot` can only ever remove one. Equality
-//! on all three is equality of what they name, which is honest, and the tests
-//! use it.
+//! on all three is equality of the canonical spelling, which after the
+//! funnel's resolution is equality of the object; the tests use it.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -58,14 +69,15 @@ use std::path::{Path, PathBuf};
 
 use super::{Refusal, Slot, SnapshotName, is_null_object_id, is_object_id};
 
-/// A full hexadecimal object id of either hash length that is not the null
-/// id: a value that names an object.
+/// The spelling of a full hexadecimal object id of either hash length that is
+/// not the null id.
 ///
 /// Validated once, at [`ObjectId::new`]; the field is private, so every value
 /// of this type passed that check. It is spelt lowercase, as Git prints ids,
 /// whatever case it was offered in: Git accepts either case for the same
-/// object (measured in `object.rs`), so two values naming one object are
-/// equal and hash alike, which is what the derived `Eq` and `Hash` promise.
+/// object (measured in `object.rs`), so two spellings of one id are equal and
+/// hash alike. Whether the spelling names an object of a given repository is
+/// not this type's to know: the funnel resolves it (see the module doc).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectId(String);
 
@@ -105,6 +117,39 @@ impl ObjectId {
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Which id of a [`SnapshotInput`] a refusal is about, and what the funnel
+/// peels it to when it asks the repository to resolve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotObject {
+    /// [`SnapshotInput::Commit`]: peeled to a commit.
+    Commit,
+    /// [`SnapshotInput::Tree`]'s `tree`: peeled to a tree.
+    Tree,
+    /// [`SnapshotInput::Tree`]'s `parent`: peeled to a commit.
+    Parent,
+}
+
+impl SnapshotObject {
+    /// The `rev-parse` peel that names the object type this id must be.
+    #[must_use]
+    pub fn peel(self) -> &'static str {
+        match self {
+            Self::Commit | Self::Parent => "^{commit}",
+            Self::Tree => "^{tree}",
+        }
+    }
+}
+
+impl fmt::Display for SnapshotObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Commit => "commit",
+            Self::Tree => "tree",
+            Self::Parent => "parent",
+        })
     }
 }
 

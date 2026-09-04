@@ -337,7 +337,7 @@ effect_free = [
     "worktree",
 ]
 
-# Three value types and their constructors and accessors: `ObjectId` (validated once, at `new`), `SnapshotInput` and `Snapshot` (private fields, built by the parent's funnel through `new`, read through accessors). Every function is a check or a field read over owned values; the funnel that checks a snapshot out is the parent's.
+# Four value types and their constructors and accessors: `ObjectId` (validated once, at `new`), `SnapshotObject` (the role of an input id and its `rev-parse` peel), `SnapshotInput` and `Snapshot` (private fields, built by the parent's funnel through `new`, read through accessors). Every function is a check or a field read over owned values; the funnel that resolves an input against the repository and checks a snapshot out is the parent's.
 [[module]]
 path = "src/workspace_manager/snapshot_ref.rs"
 crate_path = "upstroke::workspace_manager::snapshot_ref"
@@ -353,6 +353,7 @@ effect_free = [
     "id",
     "new",
     "path",
+    "peel",
     "slot",
 ]
 

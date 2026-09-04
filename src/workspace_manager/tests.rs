@@ -4534,6 +4534,187 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
     }
 }
 
+/// A snapshot input the repository does not resolve to itself is refused by
+/// name, before the ephemeral commit and before the intent (PR #130, pass 1).
+///
+/// `ObjectId` is a spelling, and a ref spelt as hexadecimal of the *other*
+/// object format's length is one: measured on git 2.43, in a SHA-256
+/// repository `git worktree add --detach <forty hex characters>` follows a
+/// branch of that name to wherever it points, and the inverse in a SHA-1
+/// repository. The branch here is created at the seed and moved to the head,
+/// so that a checkout that followed it would be observable as one at the head.
+/// The funnel resolves each id to the object type its role requires and
+/// accepts only an answer equal to the input; the refusal carries what Git
+/// answered. Witnessed failing with the resolution removed from
+/// `add_snapshot` (the head's lexical-only check) in both repositories.
+#[test]
+fn a_snapshot_input_spelt_as_hexadecimal_of_the_other_formats_length_is_refused_by_name() {
+    for (fixture, other_len, own_len) in [
+        (Fixture::created("resolve-sha1"), 64, 40),
+        (Fixture::created_sha256("resolve-sha256"), 40, 64),
+    ] {
+        assert_eq!(
+            fixture.head.len(),
+            own_len,
+            "the fixture's object format is pinned"
+        );
+        let name: String = "0123456789abcdef".chars().cycle().take(other_len).collect();
+        git(&fixture.base, &["branch", &name, &fixture.seed]);
+        git(&fixture.base, &["branch", "-f", &name, &fixture.head]);
+        assert_eq!(
+            git(
+                &fixture.base,
+                &["rev-parse", "--verify", &format!("{name}^{{commit}}")]
+            ),
+            fixture.head,
+            "Git resolves the hexadecimal name to the head the branch was moved to"
+        );
+        let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+        let common = PathBuf::from(git(
+            &fixture.base,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let objects_before = loose_objects(&common);
+        let worktrees_before = git(&fixture.base, &["worktree", "list", "--porcelain"]);
+        let missing: String = "f".repeat(own_len);
+
+        let cases = [
+            (
+                1,
+                SnapshotInput::Commit(oid(&name)),
+                SnapshotObject::Commit,
+                Some(fixture.head.clone()),
+                name.clone(),
+            ),
+            (
+                2,
+                SnapshotInput::Tree {
+                    tree: oid(&name),
+                    parent: oid(&fixture.head),
+                },
+                SnapshotObject::Tree,
+                Some(tree.clone()),
+                name.clone(),
+            ),
+            (
+                3,
+                SnapshotInput::Tree {
+                    tree: oid(&tree),
+                    parent: oid(&name),
+                },
+                SnapshotObject::Parent,
+                Some(fixture.head.clone()),
+                name.clone(),
+            ),
+            (
+                4,
+                SnapshotInput::Commit(oid(&missing)),
+                SnapshotObject::Commit,
+                None,
+                missing.clone(),
+            ),
+        ];
+        for (attempt, input, role, resolved, value) in cases {
+            let slot_name = SnapshotName::gates(1, attempt);
+            let error = fixture
+                .manager
+                .add_snapshot(&mut NoHooks, &slot_name, &input)
+                .expect_err("an input the repository does not resolve to itself is refused");
+            let expected = Refusal::SnapshotInputResolvesElsewhere {
+                role,
+                value,
+                resolved,
+            };
+            assert!(
+                matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+                "{role} at {own_len}: expected `{expected}`, got `{error}`"
+            );
+            let slot = Slot::Snapshot { name: slot_name };
+            assert!(
+                !fixture.manager.intent_path(&slot).exists(),
+                "{role} at {own_len}: the refusal precedes the intent"
+            );
+        }
+        assert_eq!(
+            git(&fixture.base, &["worktree", "list", "--porcelain"]),
+            worktrees_before,
+            "at {own_len}: nothing was checked out, so nothing followed the branch"
+        );
+        assert_eq!(
+            loose_objects(&common),
+            objects_before,
+            "at {own_len}: the refusal precedes the ephemeral commit"
+        );
+    }
+}
+
+/// A full id of the repository's own format is accepted, and the snapshot's
+/// HEAD is what Git reports for the checkout, in a repository of each object
+/// format (PR #130, pass 1). The branch spelt as the head's own id points at
+/// the seed: Git resolves the full id to the object, not to the ref, so the
+/// snapshot is at the head and not where the branch points.
+#[test]
+fn a_full_id_of_the_repositorys_own_format_is_accepted_and_the_head_is_what_git_reports() {
+    for (fixture, own_len) in [
+        (Fixture::created("own-format-sha1"), 40),
+        (Fixture::created_sha256("own-format-sha256"), 64),
+    ] {
+        assert_eq!(
+            fixture.head.len(),
+            own_len,
+            "the fixture's object format is pinned"
+        );
+        git(&fixture.base, &["branch", &fixture.head, &fixture.seed]);
+
+        let integration = fixture
+            .manager
+            .add_snapshot(
+                &mut NoHooks,
+                &SnapshotName::integration(1),
+                &SnapshotInput::Commit(oid(&fixture.head)),
+            )
+            .expect("a full id of the repository's own format is accepted");
+        assert_eq!(integration.head().as_str(), fixture.head);
+        assert_eq!(
+            git(integration.path(), &["rev-parse", "HEAD"]),
+            fixture.head,
+            "at {own_len}: the checkout is at the object, not where the same-named branch points"
+        );
+        assert_ne!(fixture.seed, fixture.head, "the branch points elsewhere");
+
+        let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+        let gates = fixture
+            .manager
+            .add_snapshot(
+                &mut NoHooks,
+                &SnapshotName::gates(1, 1),
+                &SnapshotInput::Tree {
+                    tree: oid(&tree),
+                    parent: oid(&fixture.head),
+                },
+            )
+            .expect("a tree and parent of the repository's own format are accepted");
+        assert_eq!(
+            gates.head().as_str().len(),
+            own_len,
+            "the ephemeral commit is of the repository's format"
+        );
+        assert_eq!(
+            git(gates.path(), &["rev-parse", "HEAD"]),
+            gates.head().as_str(),
+            "at {own_len}: the snapshot's HEAD is what Git reports for the checkout"
+        );
+        assert_eq!(gates.ephemeral(), Some(gates.head()));
+
+        for snapshot in [&integration, &gates] {
+            fixture
+                .manager
+                .remove_snapshot(&mut NoHooks, snapshot)
+                .expect("Snapshot.Remove + Snapshot.RemoveIntent");
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Worktree.Verify and forced removal
 // -----------------------------------------------------------------------
