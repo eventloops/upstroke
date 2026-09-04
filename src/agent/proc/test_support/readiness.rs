@@ -1,5 +1,9 @@
 //! Extended notes: `docs/internals/agent/proc/test_support/readiness.md`
 
+// Per-site `#[expect(clippy::disallowed_methods)]` allowances, admitted by the
+// lints paragraph of `standards/02_standards_automated_baseline.md` and recorded
+// in `effects/allowlist.toml`: five distinct denied paths across six sites.
+// `effects::tests` and `runner::container::tests` read this sentence.
 #![deny(
     clippy::disallowed_methods,
     clippy::disallowed_types,

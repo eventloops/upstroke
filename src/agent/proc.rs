@@ -2793,14 +2793,13 @@ mod termination {
                 }
             }
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-                if policy.wakes_guard(signal) {
-                    if libc::signal(
+                if policy.wakes_guard(signal)
+                    && libc::signal(
                         signal,
                         record_guard_signal as *const () as libc::sighandler_t,
                     ) == libc::SIG_ERR
-                    {
-                        return false;
-                    }
+                {
+                    return false;
                 }
             }
         }

@@ -2898,16 +2898,13 @@ struct BuildRefusal {
 }
 
 fn declared_build_refusals() -> Vec<BuildRefusal> {
-    let source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/events/log.rs"))
-            .expect("the funnel");
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/internals/events/log.md"),
+    )
+    .expect("the funnel's notes");
     let mut refusals = Vec::new();
     let mut open: Option<BuildRefusal> = None;
-    for (index, raw) in source.lines().enumerate() {
-        let Some(doc) = raw.trim_start().strip_prefix("///") else {
-            continue;
-        };
-        let doc = doc.strip_prefix(' ').unwrap_or(doc);
+    for (index, doc) in source.lines().enumerate() {
         if let Some(refusal) = open.as_mut() {
             if doc.trim_end() == "```" {
                 refusals.push(open.take().expect("a block is open"));
@@ -2921,7 +2918,7 @@ fn declared_build_refusals() -> Vec<BuildRefusal> {
             let code = info.trim_start_matches(',').trim().to_owned();
             assert!(
                 code.len() == 5 && code.starts_with('E') && code[1..].chars().all(char::is_numeric),
-                "a compile_fail fence at src/events/log.rs:{} declares `{code}`, which is not an \
+                "a compile_fail fence at docs/internals/events/log.md:{} declares `{code}`, which is not an \
                  error code — a fence with no code is green whether it failed for the intended \
                  reason or a typo",
                 index + 1
@@ -2935,7 +2932,7 @@ fn declared_build_refusals() -> Vec<BuildRefusal> {
     }
     assert!(
         open.is_none(),
-        "an unterminated compile_fail block in src/events/log.rs"
+        "an unterminated compile_fail block in docs/internals/events/log.md"
     );
     refusals
 }
@@ -3066,13 +3063,13 @@ fn every_declared_build_refusal_fails_for_the_reason_it_declares() {
         let (compiled, stderr) = typecheck(&dir, &name, &refusal.body);
         assert!(
             !compiled,
-            "src/events/log.rs:{} declares `{}` and the fixture compiled",
+            "docs/internals/events/log.md:{} declares `{}` and the fixture compiled",
             refusal.line, refusal.code
         );
         assert_eq!(
             error_codes(&stderr),
             BTreeSet::from([refusal.code.clone()]),
-            "src/events/log.rs:{} must fail with exactly `{}` — anything else means it failed for \
+            "docs/internals/events/log.md:{} must fail with exactly `{}` — anything else means it failed for \
              a reason the fixture is not about:\n{stderr}",
             refusal.line,
             refusal.code
