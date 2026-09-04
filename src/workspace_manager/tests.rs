@@ -39,7 +39,6 @@ use super::fixture::{Fixture, git, git_out, scratch};
 use crate::rundir::scratch_tree::acquire;
 // The slot-component grammar, named so the run-id restatement of it can be
 // held to the same verdicts.
-use super::naming::safe_component;
 // Named here rather than borrowed from the parent's import list. The split
 // moved the items that needed them into children -- the hook observers, the
 // residue classifier, the slot vocabulary and the changed-path decoder -- so
@@ -172,8 +171,13 @@ fn the_repo_key_is_the_repositorys_and_not_the_worktrees() {
             &fixture.head,
         ],
     );
-    let from_linked =
-        WorkspaceManager::derive(&linked, &fixture.private, "run-2", "inc-1").expect("derive");
+    let from_linked = WorkspaceManager::derive(
+        &linked,
+        &fixture.private,
+        "01KZSWEEP00000000000000002",
+        "inc-1",
+    )
+    .expect("derive");
     assert_eq!(
         from_linked.repo_key(),
         fixture.manager.repo_key(),
@@ -210,7 +214,7 @@ fn the_execution_root_is_the_path_the_packet_names() {
     )
     .join("workspaces")
     .join(fixture.manager.repo_key())
-    .join("run-1");
+    .join(super::fixture::RUN_ID);
     assert_eq!(fixture.manager.execution_root(), expected.as_path());
     assert!(
         !fixture
@@ -873,8 +877,13 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     let real = fixture.base.canonicalize().expect("canonical base");
     let link = fixture.root.join("base-link");
     plant_directory_link(&real, &link);
-    let error = WorkspaceManager::derive(&link, &fixture.private, "run-9", "inc-1")
-        .expect_err("a managed base that is a link refuses");
+    let error = WorkspaceManager::derive(
+        &link,
+        &fixture.private,
+        "01KZSWEEP00000000000000009",
+        "inc-1",
+    )
+    .expect_err("a managed base that is a link refuses");
     refused.push(("derive/base", refusal_of(&error)));
 
     // (2) derive's private root.
@@ -882,8 +891,9 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     let real = fixture.private.canonicalize().expect("canonical private");
     let link = fixture.root.join("private-link");
     plant_directory_link(&real, &link);
-    let error = WorkspaceManager::derive(&fixture.base, &link, "run-9", "inc-1")
-        .expect_err("a private root that is a link refuses");
+    let error =
+        WorkspaceManager::derive(&fixture.base, &link, "01KZSWEEP00000000000000009", "inc-1")
+            .expect_err("a private root that is a link refuses");
     refused.push(("derive/private-root", refusal_of(&error)));
 
     // (3) revalidate's base — the link arrives *after* derive succeeded.
@@ -1038,9 +1048,13 @@ fn a_link_planted_above_the_private_root_after_derive_refuses_every_revalidation
     let fixture = Fixture::new("anchor-ancestor");
     let holder = fixture.root.join("holder");
     fs::create_dir_all(holder.join("private")).expect("the held private root");
-    let manager =
-        WorkspaceManager::derive(&fixture.base, &holder.join("private"), "run-7", "inc-1")
-            .expect("derive under the holder");
+    let manager = WorkspaceManager::derive(
+        &fixture.base,
+        &holder.join("private"),
+        "01KZSWEEP00000000000000007",
+        "inc-1",
+    )
+    .expect("derive under the holder");
     let moved = fixture.root.join("holder-moved");
     fs::rename(&holder, &moved).expect("move the holder aside");
     plant_directory_link(&moved, &holder);
@@ -1168,7 +1182,7 @@ fn an_absent_managed_base_or_private_root_refuses_as_not_a_real_directory() {
             absent.as_path(),
         ),
     ] {
-        let error = WorkspaceManager::derive(base, private, "run-9", "inc-1")
+        let error = WorkspaceManager::derive(base, private, "01KZSWEEP00000000000000009", "inc-1")
             .expect_err("an absent leaf refuses");
         let message = refusal_of(&error);
         assert!(
@@ -1297,34 +1311,49 @@ fn an_absent_anchor_refuses_as_not_a_real_directory() {
     );
 }
 
-/// `refuse_unplain_run_id` restates `naming::safe_component`'s grammar with
-/// its own messages until the parent's sweep folds the two into one helper.
-/// Held to the same verdicts here, on the same inputs, so the restatement
-/// cannot drift from the rule it restates.
+/// A run id is the canonical ULID `DESIGN.md` §15 specifies, as this crate's
+/// generator spells it, and nothing else by shape: a lowercase or mixed-case
+/// spelling names the same root as its uppercase twin on a case-insensitive
+/// filesystem, so two managers of one root cannot be derived through a case
+/// variant, and the "manager's own slot" classification cannot be reached
+/// through a non-canonical id at all.
 #[test]
-fn a_run_id_and_a_slot_component_are_refused_by_the_same_rule() {
-    for input in [
-        "run-1",
-        "01KZCAND00000000000000000G",
-        "a_b",
-        "",
-        ".",
-        "..",
-        "/x",
-        "a/b",
-        "a\\b",
-        "-x",
-        "x.",
-        "x ",
-        "C:x",
-        "é",
+fn a_run_id_is_the_canonical_ulid_and_a_case_variant_is_refused() {
+    let fixture = Fixture::new("run-id-canonical");
+    let generated = crate::ulid::ulid();
+    WorkspaceManager::derive(&fixture.base, &fixture.private, &generated, "inc-1")
+        .expect("a generated id is the canonical spelling");
+    let lowered = generated.to_ascii_lowercase();
+    let mixed: String = generated
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    for run_id in [
+        "run1",
+        "RUN1",
+        lowered.as_str(),
+        mixed.as_str(),
+        "8ZZZZZZZZZZZZZZZZZZZZZZZZZ",
     ] {
-        assert_eq!(
-            safe_component(input).is_err(),
-            refuse_unplain_run_id(input).is_err(),
-            "{input:?}: the run-id rule and the slot-component rule must agree"
+        let error = WorkspaceManager::derive(&fixture.base, &fixture.private, run_id, "inc-1")
+            .expect_err("a non-canonical run id refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("refusing the run id"),
+            "{run_id:?}: the refusal must name its reason: {message}"
         );
     }
+    assert!(
+        !fixture.private.join("workspaces").exists(),
+        "and nothing was built for any of them"
+    );
 }
 
 /// The Windows half of the test above: Win32 resolves `..` lexically before
@@ -1667,6 +1696,7 @@ fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
         .manager
         .reclaim_intents(&mut NoHooks)
         .expect("reclaim")
+        .slots
         .len();
     assert_eq!(
         (recorded, reclaimed),
@@ -1754,10 +1784,10 @@ fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook
         "every primitive was driven: {driven_primitives:?}"
     );
     // The pinned count: the table's paths, resolved. Scaffolding is five
-    // paths and Registration three, so the fifteen primitives resolve to
-    // twelve root cases, four intent, one orphan, five add, ten Git working
-    // directory, five removal and three ref cases.
-    let expected_total = 40;
+    // paths and Registration three, so the fourteen primitives resolve to
+    // twelve root cases, four intent, five add, ten Git working directory,
+    // five removal and three ref cases.
+    let expected_total = 39;
     assert_eq!(
         driven + skipped,
         expected_total,
@@ -1780,7 +1810,6 @@ fn every_primitive() -> Vec<Primitive> {
         P::RemoveExecutionRoot,
         P::WriteIntent,
         P::RemoveIntent,
-        P::ReclaimStagingOrphan,
         P::AddWorktree,
         P::VerifyWorktree,
         P::RemoveWorktree,
@@ -1798,7 +1827,6 @@ fn every_primitive() -> Vec<Primitive> {
             | P::RemoveExecutionRoot
             | P::WriteIntent
             | P::RemoveIntent
-            | P::ReclaimStagingOrphan
             | P::AddWorktree
             | P::VerifyWorktree
             | P::RemoveWorktree
@@ -1811,7 +1839,7 @@ fn every_primitive() -> Vec<Primitive> {
             | P::DeleteRef => {}
         }
     }
-    assert_eq!(all.len(), 15, "one entry per variant");
+    assert_eq!(all.len(), 14, "one entry per variant");
     all
 }
 
@@ -1843,14 +1871,6 @@ impl SubstitutionCase {
                     .manager
                     .write_intent(&mut NoHooks, &slot)
                     .expect("write the intent");
-            }
-            P::ReclaimStagingOrphan => {
-                let orphan = fixture
-                    .manager
-                    .execution_root()
-                    .join("intents")
-                    .join(format!(".stage-task-{}.tmp", crate::ulid::ulid()));
-                fs::write(&orphan, b"{}").expect("plant the orphan");
             }
             P::VerifyWorktree
             | P::RemoveWorktree
@@ -1885,7 +1905,7 @@ impl SubstitutionCase {
             P::CreateExecutionRoot => EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
             P::RemoveExecutionRoot => EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
             P::WriteIntent => slot.write_intent_site(),
-            P::RemoveIntent | P::ReclaimStagingOrphan => slot.remove_intent_site(),
+            P::RemoveIntent => slot.remove_intent_site(),
             P::AddWorktree => slot.add_site(),
             P::VerifyWorktree => EffectSiteId::Worktree(WorktreeSite::Verify),
             P::RemoveWorktree => slot.remove_site(),
@@ -1901,7 +1921,6 @@ impl SubstitutionCase {
             primitive,
             P::CreateExecutionRoot
                 | P::RemoveExecutionRoot
-                | P::ReclaimStagingOrphan
                 | P::CreateRef
                 | P::CompareAndSwapRef
                 | P::DeleteRef
@@ -1943,7 +1962,6 @@ impl SubstitutionCase {
             P::RemoveExecutionRoot => manager.remove_execution_root(hooks).map(drop),
             P::WriteIntent => manager.write_intent(hooks, slot_of()),
             P::RemoveIntent => manager.remove_intent(hooks, slot_of()),
-            P::ReclaimStagingOrphan => manager.reclaim_intents(hooks).map(drop),
             P::AddWorktree => manager.add_worktree(hooks, slot_of(), head).map(drop),
             P::VerifyWorktree => manager
                 .verify_worktree(hooks, slot_of(), &Quiescence::AtBase(head.clone()))
@@ -2164,12 +2182,13 @@ fn a_slot_name_at_the_old_maximum_still_lands_its_intent() {
 }
 
 /// The §8 staging protocol's recovery rule: a staging file is never an
-/// intent. An orphan a crash left behind used to fail `intents()` forever,
-/// which blocked every reclaim; now `intents()` ignores it, `reclaim_intents`
-/// removes it, and a retry of the write lands. The orphan has the exact
-/// shape `write_intent` produces, a real ULID included.
+/// intent, and no filename proves who wrote a file. An orphan a crash left
+/// behind used to fail `intents()` forever, which blocked every reclaim;
+/// `intents()` ignores it, `reclaim_intents` reports it on its outcome and
+/// leaves it in place, and a retry of the write lands beside it. The orphan
+/// has the exact shape `write_intent` produces, a real ULID included.
 #[test]
-fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
+fn a_staging_orphan_is_ignored_by_intents_reported_by_reclaim_and_never_removed() {
     let fixture = Fixture::created("staging-orphan");
     let slot = fixture.task("alpha", 1);
     fixture
@@ -2191,14 +2210,23 @@ fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
     let reclaimed = fixture
         .manager
         .reclaim_intents(&mut NoHooks)
-        .expect("reclaim removes the orphan with the rest");
-    assert_eq!(reclaimed, vec![slot.clone()]);
-    assert!(!orphan.exists(), "the orphan is gone");
+        .expect("reclaim reports the orphan and removes the rest");
+    assert_eq!(reclaimed.slots, vec![slot.clone()]);
+    assert_eq!(
+        reclaimed.staging_leftovers,
+        vec![orphan.clone()],
+        "the orphan is reported on the outcome"
+    );
+    assert!(
+        orphan.exists(),
+        "and left where it was: no filename proves who wrote it"
+    );
     fixture
         .manager
         .write_intent(&mut NoHooks, &slot)
-        .expect("a retry of the write lands");
+        .expect("a retry of the write lands beside it");
     assert!(fixture.manager.intent_path(&slot).is_file());
+    assert!(orphan.exists(), "the retry staged under its own fresh name");
 }
 
 /// `hooks-none` must be empty, not only a real link-free directory: a hook
@@ -2320,53 +2348,84 @@ fn a_name_that_merely_resembles_a_staging_file_is_neither_hidden_nor_removed() {
     );
 }
 
-/// An orphan of each kind is removed under the site of its kind — the row
-/// the record would have joined — so the hooks, fault row and accounting are
-/// the right ones. The harness records which sites executed.
+/// An orphan of each kind is reported and left in place, whatever its
+/// spelling within the generator's range, and no removal site fires for it:
+/// deleting it would be cleanup that infers ownership from a filename (§8).
 #[test]
-fn a_staging_orphan_of_each_kind_is_removed_under_its_own_site() {
+fn a_staging_orphan_of_each_kind_is_reported_and_no_removal_site_fires() {
     let fixture = Fixture::created("staging-orphan-kinds");
     let intents = fixture.manager.execution_root().join("intents");
-    let kinds = [
-        ("task", EffectSiteId::Worktree(WorktreeSite::RemoveIntent)),
-        (
-            "staging",
-            EffectSiteId::Worktree(WorktreeSite::RemoveStagingIntent),
-        ),
-        (
-            "snapshot",
-            EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
-        ),
-    ];
     let mut orphans = Vec::new();
-    for (kind, _) in &kinds {
+    for kind in ["task", "staging", "snapshot"] {
         let orphan = intents.join(format!(".stage-{kind}-{}.tmp", crate::ulid::ulid()));
         fs::write(&orphan, b"{").expect("plant the orphan");
         orphans.push(orphan);
     }
+    orphans.sort();
     let (mut hooks, shared) = harness();
 
     let reclaimed = fixture
         .manager
         .reclaim_intents(&mut hooks)
-        .expect("reclaim removes every orphan");
+        .expect("reclaim reports every orphan");
     assert!(
-        reclaimed.is_empty(),
+        reclaimed.slots.is_empty(),
         "no intent was recorded, so none is reclaimed"
     );
+    assert_eq!(
+        reclaimed.staging_leftovers, orphans,
+        "every orphan is reported, in order"
+    );
     for orphan in &orphans {
-        assert!(!orphan.exists(), "{} is gone", orphan.display());
+        assert!(orphan.exists(), "{} is still there", orphan.display());
     }
     let observed = shared.lock().expect("harness").coverage().to_vec();
-    for (kind, site) in &kinds {
-        for phase in [HookPhase::Before, HookPhase::After] {
-            assert!(
-                observed
-                    .iter()
-                    .any(|seen| seen.site == *site && seen.phase == phase),
-                "the {kind} orphan's removal ran {site} {phase}: {observed:?}"
-            );
-        }
+    for site in [
+        EffectSiteId::Worktree(WorktreeSite::RemoveIntent),
+        EffectSiteId::Worktree(WorktreeSite::RemoveStagingIntent),
+        EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
+    ] {
+        assert!(
+            !observed.iter().any(|seen| seen.site == site),
+            "no removal ran under {site} for a leftover nobody can prove they own: {observed:?}"
+        );
+    }
+}
+
+/// `commit_parent` and `commit_tree_sha` used to fold every failure of the
+/// command into `None` through `git_ok(..).ok()`, a containment refusal
+/// included: the outer `revalidate()` does not read `hooks-none`'s entries,
+/// so a hook planted there after the gate reached the runner's check and
+/// its refusal came back as "not a commit". Only Git's own quiet "no such
+/// object" is `None`; the refusal propagates.
+#[test]
+fn a_hook_planted_in_hooks_none_makes_the_object_lookups_refuse_rather_than_answer_none() {
+    let fixture = Fixture::created("lookup-refuses");
+    fs::write(
+        fixture
+            .manager
+            .execution_root()
+            .join("hooks-none")
+            .join("post-checkout"),
+        b"#!/bin/sh\nexit 0\n",
+    )
+    .expect("plant a hook");
+    for (name, result) in [
+        (
+            "commit_parent",
+            fixture.manager.commit_parent(&fixture.head),
+        ),
+        (
+            "commit_tree_sha",
+            fixture.manager.commit_tree_sha(&fixture.head),
+        ),
+    ] {
+        let error = result.expect_err(&format!("{name} must refuse, not answer None"));
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("hook-free") && message.contains("post-checkout"),
+            "{name}: the refusal must name its reason: {message}"
+        );
     }
 }
 
@@ -2617,8 +2676,13 @@ fn a_root_inside_a_repository_worktree_refuses() {
     let fixture = Fixture::new("root-inside");
     // The private root *is* the repository checkout: the execution root
     // would then live inside a worktree of the repository it manages.
-    let error = WorkspaceManager::derive(&fixture.base, &fixture.base, "run-3", "inc-1")
-        .expect_err("a root inside a repository worktree refuses");
+    let error = WorkspaceManager::derive(
+        &fixture.base,
+        &fixture.base,
+        "01KZSWEEP00000000000000003",
+        "inc-1",
+    )
+    .expect_err("a root inside a repository worktree refuses");
     let message = refusal_of(&error);
     assert!(
         message.contains("inside the repository worktree"),
@@ -2996,7 +3060,7 @@ fn an_add_without_a_durable_intent_refuses_and_leaves_nothing_registered() {
         .reclaim_intents(&mut NoHooks)
         .expect("reclaim");
     assert_eq!(
-        reclaimed.iter().collect::<BTreeSet<_>>(),
+        reclaimed.slots.iter().collect::<BTreeSet<_>>(),
         slots.iter().collect::<BTreeSet<_>>(),
         "reclaim walks intents, so an add without one would leave a worktree it never sees"
     );
@@ -3534,7 +3598,7 @@ fn the_intent_is_durable_before_the_add_and_reclaim_removes_it() {
         .manager
         .reclaim_intents(&mut hooks)
         .expect("reclaim");
-    assert_eq!(reclaimed, vec![slot.clone()]);
+    assert_eq!(reclaimed.slots, vec![slot.clone()]);
     assert!(!fixture.manager.intent_path(&slot).exists());
     assert!(fixture.manager.intents().expect("intents").is_empty());
 

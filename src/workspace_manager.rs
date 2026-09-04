@@ -293,16 +293,16 @@ pub enum Refusal {
         why: &'static str,
     },
 
-    /// A run id that is not one plain path component.
+    /// A run id that is not the canonical ULID `DESIGN.md` §15 specifies.
     ///
-    /// `DESIGN.md` §15 places the execution root at
-    /// `<private root>/workspaces/<repo-key>/<run-id>`, and `Path::join`
-    /// would let an absolute id replace that prefix while `.`, `..` and an
-    /// empty id alias the repo-key directory or a peer run's root — an
-    /// absolute id naming a peer's root made that root this manager's, with
-    /// the peer's worktrees as its slots. Refused before any path is built,
-    /// by the rule the slot components already obey: ASCII alphanumerics,
-    /// `-` and `_`, no leading `-`, which every engine-minted ULID satisfies.
+    /// §15 places the execution root at
+    /// `<private root>/workspaces/<repo-key>/<run-id>` with "run-id = ULID".
+    /// `Path::join` would let an absolute id replace that prefix while `.`,
+    /// `..` and an empty id alias the repo-key directory or a peer run's
+    /// root, and a lowercase spelling of an uppercase id names the same root
+    /// on a case-insensitive filesystem. So only the generator's own spelling
+    /// is accepted — twenty-six uppercase Crockford base32 characters, the
+    /// first `0` to `7` — refused before any path is built.
     #[error(
         "refusing the run id `{name}`: {why}, and DESIGN.md §15 places every execution root at \
          <private root>/workspaces/<repo-key>/<run-id>"
@@ -385,39 +385,37 @@ pub fn repo_key_v1(canonical_common_git_dir: &Path) -> String {
 
 /// `<private_root>/workspaces/<repo_key>/<run_id>`, recorded exactly.
 ///
-/// `run_id` is one plain component: [`WorkspaceManager::derive`] refuses any
-/// other shape with [`refuse_unplain_run_id`] before calling this, because
-/// `join` would let an absolute id replace the prefix and `.` or `..` name
-/// another directory.
+/// `run_id` is the canonical ULID: [`WorkspaceManager::derive`] refuses any
+/// other spelling with [`refuse_unplain_run_id`] before calling this, because
+/// `join` would let an absolute id replace the prefix, `.` or `..` would name
+/// another directory, and a case variant would name this one twice.
 #[must_use]
 pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> PathBuf {
     private_root.join("workspaces").join(repo_key).join(run_id)
 }
 
-/// [`Refusal::RunId`] unless `run_id` is one plain path component.
+/// [`Refusal::RunId`] unless `run_id` is the canonical run id.
 ///
-/// The rule is `naming::safe_component`'s, restated for a run id so the
-/// refusal names what was offered: non-empty, ASCII alphanumerics, `-` and
-/// `_` only, no leading `-`. That excludes every separator on every
-/// platform, `.`, `..`, a prefix such as `C:` and the trailing dot or space
-/// Win32 rewrites. It is a restatement rather than a call so that the
-/// refusal names a run id and not a slot component; the two fold into one
-/// helper in the parent's own sweep (`src/workspace_manager.rs` in
-/// `standards/SWEEP.md`'s queue), and until then
-/// `a_run_id_and_a_slot_component_are_refused_by_the_same_rule` holds them
-/// to the same verdicts so the restatement cannot drift.
+/// `DESIGN.md` §15: "run-id = ULID". The canonical spelling is the one
+/// [`crate::ulid::ulid`] produces — twenty-six uppercase Crockford base32
+/// characters, the first `0` to `7` — and nothing else is accepted, by
+/// shape: not a lowercase or mixed-case spelling of the same id, which on a
+/// case-insensitive filesystem names the same root as its uppercase twin and
+/// would make two managers of one root; not a shorter or longer string; not
+/// a path. Refused before any path is built.
 fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
+    if is_canonical_ulid(run_id) {
+        return Ok(());
+    }
     let why = if run_id.is_empty() {
         "it is empty"
-    } else if !run_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        "only ASCII alphanumerics, `-` and `_` are legal in a run id"
-    } else if run_id.starts_with('-') {
-        "a leading `-` would be read as an option by the Git commands the funnels run"
+    } else if run_id.len() != 26 {
+        "a run id is a ULID of twenty-six characters (DESIGN.md §15)"
+    } else if run_id.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        "a run id is spelt in uppercase Crockford base32, since a case-insensitive filesystem \
+         would give two spellings one root"
     } else {
-        return Ok(());
+        "a run id is a ULID: uppercase Crockford base32, the first character 0 to 7"
     };
     Err(Refusal::RunId {
         name: run_id.to_owned(),
@@ -480,6 +478,18 @@ pub(crate) enum ActedThrough {
     Registration,
 }
 
+/// What [`WorkspaceManager::reclaim_intents`] did and what it left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// The slots whose intents were found and whose worktree and intent were
+    /// removed, in directory order.
+    pub slots: Vec<Slot>,
+    /// Leftovers of the staging shape `write_intent` produces, reported and
+    /// left in place: a write interrupted before its rename was not durable,
+    /// but no filename proves who wrote a file, so this crate deletes none.
+    pub staging_leftovers: Vec<PathBuf>,
+}
+
 /// The funnel primitives, each with the paths it acts through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Primitive {
@@ -487,8 +497,6 @@ pub(crate) enum Primitive {
     RemoveExecutionRoot,
     WriteIntent,
     RemoveIntent,
-    /// The removal of a staging orphan by [`WorkspaceManager::reclaim_intents`].
-    ReclaimStagingOrphan,
     AddWorktree,
     VerifyWorktree,
     RemoveWorktree,
@@ -514,7 +522,6 @@ impl Primitive {
                 &[A::ExecutionRoot, A::Scaffolding]
             }
             Self::WriteIntent | Self::RemoveIntent => &[A::IntentsDirectory, A::IntentFile],
-            Self::ReclaimStagingOrphan => &[A::IntentsDirectory],
             Self::AddWorktree => &[
                 A::SlotParent,
                 A::SlotCheckoutEntry,
@@ -1237,14 +1244,19 @@ impl WorkspaceManager {
     ///
     /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
     /// intents **synced before add**". The record is written to a staging
-    /// file under a fresh `.stage-<ULID>.tmp` name, fsynced, renamed, and the
+    /// file under a fresh `.stage-<kind>-<ULID>.tmp` name — the slot's kind
+    /// (`task`, `staging` or `snapshot`) and a ULID as this crate's generator
+    /// spells it, at most 46 bytes whatever the slot is called, so no valid
+    /// slot name is narrowed against `NAME_MAX` — fsynced, renamed, and the
     /// directory fsynced, so an interrupted write leaves either nothing, a
-    /// complete record, or a staging file — never a half-parsed record that
-    /// reclaim would refuse. A staging file is never an intent: `intents`
-    /// ignores the shape and `reclaim_intents` removes it, since a write
-    /// interrupted before its rename was not durable. The staging name is
-    /// 37 bytes whatever the slot is called, so no valid slot name is
-    /// narrowed against `NAME_MAX`.
+    /// complete record, or a staging file, never a half-parsed record that
+    /// reclaim would refuse. **The recovery rule for that leftover lives
+    /// here.** A file of exactly the staging shape is never an intent:
+    /// [`Self::intents`] ignores it, so it cannot poison recovery, and
+    /// [`Self::reclaim_intents`] reports it on its outcome and leaves it in
+    /// place, because no filename proves who wrote a file and this crate
+    /// deletes nothing it cannot prove it owns (§8). A retried write stages
+    /// under a fresh name beside it.
     ///
     /// # Errors
     ///
@@ -1350,7 +1362,7 @@ impl WorkspaceManager {
     }
 
     /// Reclaim every intent this execution root carries: forced removal of the
-    /// worktree, then the intent.
+    /// worktree, then the intent; staging leftovers are reported, not removed.
     ///
     /// `enforcement_domains.external_physical`: intents are "reclaimed at
     /// process start (never 'empty')".
@@ -1363,7 +1375,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals or a Git or I/O error.
-    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, UpstrokeError> {
+    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Reclaimed, UpstrokeError> {
         let slots = self.intents()?;
         // Revalidate even when there are no intents: callers rely on reclaim
         // as a fresh containment check. With nothing to remove, Git's ordinary
@@ -1377,23 +1389,26 @@ impl WorkspaceManager {
             self.remove_worktree(hooks, slot)?;
             self.remove_intent(hooks, slot)?;
         }
-        self.reclaim_staging_orphans(hooks)?;
-        Ok(slots)
+        let staging_leftovers = self.staging_leftovers()?;
+        Ok(Reclaimed {
+            slots,
+            staging_leftovers,
+        })
     }
 
-    /// Remove every staging file a crashed `write_intent` left in `intents/`.
+    /// Every file of the staging shape `write_intent` produces that is still
+    /// in `intents/`, in directory order — reported, never removed.
     ///
     /// The §8 staging protocol's recovery rule (see `staging_kind`): a write
-    /// interrupted before its rename was not durable, and its leftover is not
-    /// an intent. Each removal runs under the intent-removal site of the kind
-    /// the name carries, the row the record would have joined. Only the exact
-    /// shape `write_intent` produces is a staging file; any other name in
-    /// `intents/` is reported by [`Self::intents`] as the malformed file it is.
-    fn reclaim_staging_orphans(&self, hooks: &mut dyn EffectHooks) -> Result<(), UpstrokeError> {
+    /// interrupted before its rename was not durable, so its leftover is not
+    /// an intent and [`Self::intents`] never lists it; and no filename proves
+    /// who wrote a file, so this crate does not delete it either. Reclaim
+    /// reports the names on its outcome and leaves them where they are.
+    fn staging_leftovers(&self) -> Result<Vec<PathBuf>, UpstrokeError> {
         let directory = self.execution_root.join("intents");
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
                 return Err(UpstrokeError::Io {
                     path: directory,
@@ -1401,39 +1416,18 @@ impl WorkspaceManager {
                 });
             }
         };
-        let ledger = hooks.durability_ledger();
+        let mut leftovers = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: directory.clone(),
                 source,
             })?;
-            let name = entry.file_name();
-            let Some(kind) = name.to_str().and_then(staging_kind) else {
-                continue;
-            };
-            // The name carries the kind, so the removal runs under the site
-            // the record would have been removed under: the right hooks,
-            // fault row and accounting for a task, staging or snapshot intent.
-            let site = match kind {
-                "staging" => EffectSiteId::Worktree(WorktreeSite::RemoveStagingIntent),
-                "snapshot" => EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
-                _ => EffectSiteId::Worktree(WorktreeSite::RemoveIntent),
-            };
-            let orphan = entry.path();
-            funnel(hooks, site, || {
-                self.revalidate_acted_through(Primitive::ReclaimStagingOrphan, None, None)?;
-                match fs::remove_file(&orphan) {
-                    Ok(()) => sync_directory(&directory, &ledger),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(source) => Err(UpstrokeError::Filesystem {
-                        operation: "remove",
-                        path: orphan.clone(),
-                        source,
-                    }),
-                }
-            })?;
+            if entry.file_name().to_str().and_then(staging_kind).is_some() {
+                leftovers.push(entry.path());
+            }
         }
-        Ok(())
+        leftovers.sort();
+        Ok(leftovers)
     }
 
     // -----------------------------------------------------------------------
@@ -2457,7 +2451,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// The containment refusals.
+    /// The containment refusals, the hooks path's among them, a Git failure
+    /// other than "no such object", or non-UTF-8 output.
     pub fn commit_parent(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
         self.revalidate()?;
         let argv = [
@@ -2466,12 +2461,7 @@ impl WorkspaceManager {
             OsString::from("--quiet"),
             OsString::from(format!("{commit}^{{commit}}^")),
         ];
-        Ok(self
-            .git_ok(self.base(), &argv)
-            .ok()
-            .and_then(|out| String::from_utf8(out).ok())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty()))
+        self.quiet_object_lookup(&argv)
     }
 
     /// The tree a commit points at, or `None` if it is not a commit.
@@ -2488,7 +2478,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// The containment refusals.
+    /// The containment refusals, the hooks path's among them, a Git failure
+    /// other than "no such object", or non-UTF-8 output.
     pub fn commit_tree_sha(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
         self.revalidate()?;
         let argv = [
@@ -2497,21 +2488,62 @@ impl WorkspaceManager {
             OsString::from("--quiet"),
             OsString::from(format!("{commit}^{{commit}}^{{tree}}")),
         ];
-        Ok(self
-            .git_ok(self.base(), &argv)
-            .ok()
-            .and_then(|out| String::from_utf8(out).ok())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty()))
+        self.quiet_object_lookup(&argv)
+    }
+
+    /// `rev-parse --verify --quiet <spec>`, as an object lookup: the object's
+    /// id, `None` when Git says there is no such object, and every other
+    /// failure as the error it is.
+    ///
+    /// `--verify --quiet` answers a missing or unpeelable object with exit
+    /// status 1 and nothing on stderr; that, and only that, is absence. A
+    /// containment refusal from the runner (the hooks path exchanged or
+    /// holding a hook), a spawn failure, or a Git failure that speaks is
+    /// propagated, where `git_ok(..).ok()` used to fold all of them into
+    /// `None` and a candidate check read a refusal as "not a commit".
+    fn quiet_object_lookup(&self, argv: &[OsString]) -> Result<Option<String>, UpstrokeError> {
+        let output = self.git(self.base(), argv)?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) && output.stderr.is_empty() {
+                return Ok(None);
+            }
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "git {} failed in {}: {}",
+                    argv.iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    self.base().display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
+            message: format!("`git rev-parse` returned non-UTF-8: {error}"),
+        })?;
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 
     // -----------------------------------------------------------------------
     // Git plumbing
     // -----------------------------------------------------------------------
 
-    /// The hooks path, walked immediately before every Git command.
+    /// The hooks path, walked immediately before every command the manager
+    /// runs through [`Self::git`] and [`Self::git_with_identity`].
     ///
-    /// Every command runs with `core.hooksPath` at [`Self::hooks_dir`], and a
+    /// That set is the funnel primitives' commands (`worktree add`, `worktree
+    /// prune`, `add`, `write-tree`, `cherry-pick`, `commit-tree`, `update-ref`)
+    /// and the manager's reads through the same runner (`worktree list`,
+    /// `for-each-ref`, `show-ref`, `rev-parse`, `diff`). The two free
+    /// functions `read_only_git` and `read_only_git_ok` are not in it: they
+    /// have no manager and set no `core.hooksPath`, and the plumbing they run
+    /// (`rev-parse`, `cat-file`, `fsck`, `diff`, `status`, `worktree list`) invokes no
+    /// hook, so there is nothing for the check to guard there; a check would
+    /// need the private root they do not have, and is not added.
+    ///
+    /// Every command run here uses `core.hooksPath` at [`Self::hooks_dir`], and a
     /// hook that ran from there would be an effect no site accounts for. The
     /// in-funnel chain check walks the effect's own target and not this path,
     /// so a `hooks-none` exchanged for a link to a directory holding an
@@ -3120,20 +3152,21 @@ fn staging_name(kind: &'static str) -> String {
 /// The intent kind a name of exactly the shape [`staging_name`] produces
 /// carries, or `None` for any other name.
 ///
-/// Exact: the prefix, one of the three kinds, one `-`, twenty-six Crockford
-/// base32 characters, the suffix. The §8 staging protocol's recovery rule
-/// rests on this being a name only `write_intent` writes: a staging file is
-/// never an intent, `WorkspaceManager::intents` ignores it and
-/// `WorkspaceManager::reclaim_intents` removes it under the kind's own site
-/// — a write interrupted before its rename was not durable, by
-/// `write_intent`'s contract. A name that merely resembles one, such as
-/// `.stage-report.tmp`, is nobody's to hide or delete, and is reported by
-/// `intents` as the malformed file it is.
+/// Exact: the prefix, one of the three kinds, one `-`, a ULID as this
+/// crate's generator spells it — twenty-six uppercase Crockford base32
+/// characters, the first `0` to `7` because 128 bits fill 26 characters
+/// with two bits to spare — and the suffix. The §8 staging protocol's
+/// recovery rule: a staging file is never an intent, so
+/// `WorkspaceManager::intents` ignores this shape and a leftover can never
+/// poison recovery; and no filename proves who wrote a file, so
+/// `WorkspaceManager::reclaim_intents` reports leftovers on its outcome and
+/// this crate deletes none of them. A name that merely resembles one, such
+/// as `.stage-report.tmp`, is reported by `intents` as the malformed file it
+/// is.
 fn staging_kind(name: &str) -> Option<&'static str> {
-    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let rest = name.strip_prefix(".stage-")?.strip_suffix(".tmp")?;
     let (kind, ulid) = rest.rsplit_once('-')?;
-    if ulid.len() != 26 || !ulid.bytes().all(|byte| CROCKFORD.contains(&byte)) {
+    if !is_canonical_ulid(ulid) {
         return None;
     }
     match kind {
@@ -3142,6 +3175,18 @@ fn staging_kind(name: &str) -> Option<&'static str> {
         "snapshot" => Some("snapshot"),
         _ => None,
     }
+}
+
+/// Whether `text` is a ULID as this crate's generator spells it: twenty-six
+/// uppercase Crockford base32 characters, the first `0` to `7`.
+fn is_canonical_ulid(text: &str) -> bool {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    text.len() == 26
+        && text.bytes().all(|byte| CROCKFORD.contains(&byte))
+        && text
+            .as_bytes()
+            .first()
+            .is_some_and(|first| (b'0'..=b'7').contains(first))
 }
 
 /// fsync `file` and record what was made durable, in one call.

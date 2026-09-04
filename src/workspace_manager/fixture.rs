@@ -62,6 +62,10 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// A real repository, a real private root, and a manager over both.
+/// The fixture's run id: a canonical ULID, as `derive` requires
+/// (`DESIGN.md` §15, "run-id = ULID"), spelt to be recognisable in a path.
+pub(crate) const RUN_ID: &str = "01KZSWEEP00000000000000001";
+
 pub(crate) struct Fixture {
     pub(crate) root: PathBuf,
     pub(crate) base: PathBuf,
@@ -106,8 +110,8 @@ impl Fixture {
         let side = git(&base, &["rev-parse", "HEAD"]);
         git(&base, &["checkout", "-q", "main"]);
 
-        let manager = WorkspaceManager::derive(&base, &private, "run-1", "inc-1")
-            .expect("derive the manager");
+        let manager =
+            WorkspaceManager::derive(&base, &private, RUN_ID, "inc-1").expect("derive the manager");
         Self {
             root,
             base,
@@ -138,7 +142,7 @@ impl Fixture {
         let head = git(&base, &["rev-parse", "main"]);
         let seed = git(&base, &["rev-parse", "main~1"]);
         let side = git(&base, &["rev-parse", "side"]);
-        let manager = WorkspaceManager::derive(&base, &private, "run-1", "inc-1")
+        let manager = WorkspaceManager::derive(&base, &private, RUN_ID, "inc-1")
             .expect("derive the manager over an adopted fixture");
         Self {
             root,
