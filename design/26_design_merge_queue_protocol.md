@@ -29,6 +29,11 @@ The coordinator alone writes the event log and Git refs.
    `merge_prepared { expected_head, proposed_sha, ... }`, then advances the run
    ref with Git's compare-and-swap `update-ref <ref> <new> <expected-old>`, then
    records `task_merged`. Dependencies become ready only after `task_merged`.
+   The engine's ref primitives take a full hexadecimal object id on both sides
+   and refuse the null id on either before Git is asked: as the expected old,
+   Git reads it as "must not exist" and deletes unconditionally; as the new
+   value, as "must not exist afterwards", deleting the ref when the expected
+   old matches and creating nothing, with exit 0, when the ref is absent.
 6. A textual conflict, code-attributed integration-gate failure, or review
    rejection atomically records a fully frozen synthetic `Fix` task inside the
    rejection event. Provider/rate-limit, process-spawn, and runner failures keep

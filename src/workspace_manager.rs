@@ -228,15 +228,18 @@ pub enum Refusal {
     /// was the null object id.
     ///
     /// Measured, git 2.43: `git update-ref --no-deref <ref> 0{40} <old>`
-    /// **succeeds and deletes the ref**, and with `""` as the old value
-    /// succeeds and creates nothing, because a null new value means "must not
-    /// exist afterwards". A compare-and-swap that deletes the integration ref,
-    /// or a create that reports success with no ref behind it, is not what
-    /// either primitive's name promises, so it is refused here.
+    /// **succeeds and deletes the ref** when `<old>` matches, and with `""`
+    /// as the old value succeeds and creates nothing when the ref is absent,
+    /// because a null new value means "must not exist afterwards" (a
+    /// mismatched old value, or an existing ref on the create path, exits 128
+    /// and preserves the ref, as for any new value). A compare-and-swap that
+    /// deletes the integration ref, or a create that reports success with no
+    /// ref behind it, is not what either primitive's name promises, so it is
+    /// refused here. `design/26` step 5 states the rule.
     #[error(
         "refusing to create or swap `{refname}` to the null object id: `git update-ref` reads it \
-         as \"must not exist afterwards\" and would delete the ref, or create nothing while \
-         reporting success"
+         as \"must not exist afterwards\", so it would delete the ref when the expected old \
+         matches, or create nothing while reporting success when the ref is absent"
     )]
     NullNew {
         /// The ref that was to be created or swapped.
@@ -1356,7 +1359,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::SymbolicRef`], or a Git error — including the zero-old
+    /// [`Refusal::SymbolicRef`]; [`Refusal::MalformedObjectId`] or
+    /// [`Refusal::NullNew`] for `new`; or a Git error — including the zero-old
     /// failure when the ref already exists.
     pub fn create_ref_zero_old(
         &self,
@@ -1376,8 +1380,10 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::SymbolicRef`], [`Refusal::CheckedOutRef`], or a Git error
-    /// when the old value does not match.
+    /// [`Refusal::SymbolicRef`] or [`Refusal::CheckedOutRef`];
+    /// [`Refusal::MalformedObjectId`] or [`Refusal::NullNew`] for `new`;
+    /// [`Refusal::MalformedObjectId`] or [`Refusal::NullExpectedOld`] for
+    /// `old`; or a Git error when the old value does not match.
     pub fn compare_and_swap_ref(
         &self,
         hooks: &mut dyn EffectHooks,

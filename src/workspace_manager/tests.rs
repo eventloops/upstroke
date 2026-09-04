@@ -1725,6 +1725,111 @@ fn the_null_object_id_is_never_an_expected_old_value() {
     );
 }
 
+/// The other side of the same trap (`PR126-OBJECT-NEW-SIDE-ACCEPTS-NULL-ID`):
+/// a null **new** value means "must not exist afterwards", so raw Git turns a
+/// compare-and-swap whose expected-old matches into a delete, and a create of
+/// an absent ref into a success that creates nothing. Both primitives refuse
+/// it before Git is asked, at both hash lengths, and the raw measurement is
+/// executed here so the refusal guards a live hazard and not a hypothetical
+/// one.
+#[test]
+fn the_null_object_id_is_never_a_new_value_through_create_or_compare_and_swap() {
+    let fixture = Fixture::created("null-new");
+    let existing = "refs/upstroke/runs/run-1/integration";
+    let absent = "refs/upstroke/runs/run-1/candidates/kalpha/1";
+    fixture
+        .manager
+        .create_ref_zero_old(
+            &mut NoHooks,
+            RefSite::CreateIntegration,
+            existing,
+            &fixture.head,
+        )
+        .expect("create");
+
+    for null in ["0".repeat(40), "0".repeat(64)] {
+        let message = refusal_of(
+            &fixture
+                .manager
+                .compare_and_swap_ref(
+                    &mut NoHooks,
+                    RefSite::CompareAndSwapIntegration,
+                    existing,
+                    &fixture.head,
+                    &null,
+                )
+                .expect_err("a null new value refuses the swap"),
+        );
+        assert!(
+            message.contains("null object id") && message.contains("must not exist afterwards"),
+            "the refusal must name its reason: {message}"
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .direct_ref_target(existing)
+                .expect("read")
+                .as_deref(),
+            Some(fixture.head.as_str()),
+            "and the ref is still there"
+        );
+
+        let message = refusal_of(
+            &fixture
+                .manager
+                .create_ref_zero_old(&mut NoHooks, RefSite::CreateCandidates, absent, &null)
+                .expect_err("a null new value refuses the create"),
+        );
+        assert!(
+            message.contains("null object id"),
+            "the refusal must name its reason: {message}"
+        );
+        assert_eq!(
+            fixture.manager.direct_ref_target(absent).expect("read"),
+            None,
+            "and nothing was created"
+        );
+    }
+
+    // The measurement the refusals are derived from: raw Git deletes through
+    // the swap when the old value matches, and creates nothing through the
+    // create when the ref is absent, exiting 0 both times.
+    let raw = git_out(
+        &fixture.base,
+        &[
+            "update-ref",
+            "--no-deref",
+            existing,
+            &"0".repeat(40),
+            &fixture.head,
+        ],
+    );
+    assert!(
+        raw.status.success()
+            && fixture
+                .manager
+                .direct_ref_target(existing)
+                .expect("read")
+                .is_none(),
+        "raw `git update-ref <ref> 0{{40}} <old>` deletes when the old value matches; that is why \
+         the primitive refuses it"
+    );
+    let raw = git_out(
+        &fixture.base,
+        &["update-ref", "--no-deref", absent, &"0".repeat(40), ""],
+    );
+    assert!(
+        raw.status.success()
+            && fixture
+                .manager
+                .direct_ref_target(absent)
+                .expect("read")
+                .is_none(),
+        "raw `git update-ref <ref> 0{{40}} \"\"` exits 0 and creates nothing; that is why the \
+         primitive refuses it"
+    );
+}
+
 #[test]
 fn a_malformed_object_id_never_reaches_the_ref_command() {
     let fixture = Fixture::created("malformed-oid");

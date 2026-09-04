@@ -6,10 +6,12 @@
 //! does not mean "this id" on either. As the expected-old,
 //! `update-ref -d <ref> 0{40}` deletes *unconditionally* rather than failing the
 //! compare-and-swap the caller believed it had written. As the new value,
-//! `update-ref <ref> 0{40} <old>` succeeds and **deletes** the ref, and
-//! `update-ref <ref> 0{40} ""` succeeds and creates nothing: the null id there
-//! means "must not exist afterwards", which turns a compare-and-swap into a
-//! guarded delete and a create into a reported success with no ref behind it.
+//! `update-ref <ref> 0{40} <old>` succeeds and **deletes** the ref when `<old>`
+//! matches, and `update-ref <ref> 0{40} ""` succeeds and creates nothing when
+//! the ref is absent (a mismatched old value, or an existing ref on the create
+//! path, exits 128 and preserves the ref, as for any new value): the null id
+//! there means "must not exist afterwards", which turns a compare-and-swap into
+//! a guarded delete and a create into a reported success with no ref behind it.
 //! The transitions themselves -- create, move, delete, and the merge-queue
 //! CAS -- are the parent's funnels.
 //!
