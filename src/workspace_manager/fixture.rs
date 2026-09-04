@@ -141,10 +141,7 @@ fn scratch_at(dir: PathBuf) -> PathBuf {
         ),
     }
     if let Err(error) = fs::create_dir(&dir) {
-        panic!(
-            "creating the scratch directory {}: {error}",
-            dir.display()
-        );
+        panic!("creating the scratch directory {}: {error}", dir.display());
     }
     dir
 }
@@ -531,8 +528,9 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8]) {
 
 /// Create `path` and every missing parent.
 pub(crate) fn create_dir(path: &Path) {
-    fs::create_dir_all(path)
-        .unwrap_or_else(|error| panic!("creating the fixture directory {}: {error}", path.display()));
+    fs::create_dir_all(path).unwrap_or_else(|error| {
+        panic!("creating the fixture directory {}: {error}", path.display())
+    });
 }
 
 /// Remove `path` if it is there. Idempotent, like every reclaim.
@@ -622,13 +620,18 @@ pub(crate) struct KillableGitChild {
     /// Started once the spawn has returned, so what [`Self::kill`] reads
     /// off it is time the child was left *running*.
     spawned: std::time::Instant,
-    /// What the clock said when a kill fired at this child, or `None` if
-    /// none ever did. Written only by [`Self::kill`].
+    /// What the clock said when a kill was fired **at** this child, or `None`
+    /// if none ever was. Written only by [`Self::kill`], and it counts
+    /// attempts: whether a kill landed is the wait status's answer, which is
+    /// what [`died_by_kill`] reads.
     fired: Option<std::time::Duration>,
 }
 
 impl KillableGitChild {
-    /// Spawn `git -C cwd <args>` with its streams discarded.
+    /// Spawn `git -C cwd <args>` through [`git_command`], with its streams
+    /// discarded. `cwd` is usually a linked worktree and need not be a
+    /// fixture's, which is why the pins are on the command rather than in a
+    /// repository's config.
     pub(crate) fn spawn(cwd: &Path, args: &[String]) -> Self {
         let child = git_command(cwd, args)
             .stdout(Stdio::null())
@@ -831,7 +834,10 @@ mod tests {
     #[test]
     fn scratch_empties_a_directory_a_previous_run_left_at_the_same_name() {
         let dir = scratch("stale-tree");
-        write_file(&dir.join("residue").join("left-behind.txt"), b"a previous run\n");
+        write_file(
+            &dir.join("residue").join("left-behind.txt"),
+            b"a previous run\n",
+        );
         let again = scratch_at(dir.clone());
         assert_eq!(again, dir, "the same name is returned");
         let mut entries = fs::read_dir(&dir).expect("read the fresh scratch directory");
@@ -891,7 +897,11 @@ mod tests {
     #[test]
     fn a_hook_in_the_repositorys_own_hooks_directory_never_runs() {
         let fixture = Fixture::new("hook-planted");
-        let hook = fixture.base.join(".git").join("hooks").join("post-checkout");
+        let hook = fixture
+            .base
+            .join(".git")
+            .join("hooks")
+            .join("post-checkout");
         write_file(&hook, b"#!/bin/sh\n: > hook-ran.marker\n");
         #[cfg(unix)]
         {
@@ -1116,7 +1126,11 @@ mod tests {
     fn the_variables_git_calls_local_are_the_ones_the_fixture_strips() {
         let dir = scratch("local-env-vars");
         let listed = git(&dir, &["rev-parse", "--local-env-vars"]);
-        let named: Vec<&str> = listed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let named: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
         assert!(
             named.len() > 5,
             "the installed Git named too few local variables to be its real list: {named:?}"
