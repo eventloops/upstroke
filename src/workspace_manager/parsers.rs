@@ -45,7 +45,7 @@ use std::str::Utf8Error;
 use crate::error::UpstrokeError;
 use crate::topology::paths::{GitPath, PathSet};
 
-use super::worktree::{Attributes, WorktreeRecord};
+use super::worktree::{OpenRecord, WorktreeRecord};
 
 /// Trim what Git trims when it reads a `gitdir` file, and nothing more.
 ///
@@ -454,15 +454,16 @@ fn status_endpoints(status: &[u8]) -> Option<usize> {
 /// The path is taken as bytes through [`decode_path`], because a repository
 /// path need not be UTF-8 on Unix and a lossy spelling is not the path; under
 /// `-z` it is verbatim, and a space is a legal byte of one. This parser owns
-/// the framing: `HEAD` and `branch` carry a value, `detached` and `bare` are
-/// labels with no value, and none of the four appears twice in a record. The
-/// grammar of the values is the record's own, applied once when the record
-/// closes ([`WorktreeRecord::from_porcelain`]): `HEAD` is an object id,
-/// `branch` is a refname's byte set (which forbids whitespace) and is kept as
-/// the bytes Git printed, and `locked` and `prunable` are Git's own reasons,
-/// verbatim (a lock reason may carry a newline, which is why `-z` exists),
-/// consulted only for the word `initializing`. A label this parser does not
-/// know is skipped, since Git may add one.
+/// the framing: `HEAD` and `branch` carry a value and `detached` and `bare`
+/// are labels with no value. Every other rule is the record's own, applied
+/// by [`OpenRecord`] as each attribute is fed to it, in attribute order, so
+/// a record with two attributes outside the grammar is refused for the first
+/// one read: `HEAD` is an object id, `branch` is a refname's byte set (which
+/// forbids whitespace) and is kept as the bytes Git printed, no attribute
+/// appears twice in a record, and `locked` and `prunable` are Git's own
+/// reasons, verbatim (a lock reason may carry a newline, which is why `-z`
+/// exists), consulted only for the word `initializing`. A label this parser
+/// does not know is skipped, since Git may add one.
 ///
 /// # Errors
 ///
@@ -484,18 +485,14 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
         });
     };
     let mut records: Vec<WorktreeRecord> = Vec::new();
-    let mut current: Option<Attributes<'_>> = None;
+    let mut current: Option<OpenRecord<'_>> = None;
     for field in body.split(|byte| *byte == 0) {
         let index = records.len();
         if field.is_empty() {
             let Some(open) = current.take() else {
                 return Err(refuse(index, "is closed before it is opened"));
             };
-            let record = match WorktreeRecord::from_porcelain(open) {
-                Ok(record) => record,
-                Err(malformed) => return Err(refuse(index, &malformed.to_string())),
-            };
-            records.push(record);
+            records.push(open.close());
             continue;
         }
         if let Some(path) = field.strip_prefix(b"worktree ") {
@@ -517,13 +514,7 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
                     });
                 }
             };
-            current = Some(Attributes {
-                path,
-                head: None,
-                branch: None,
-                locked: None,
-                prunable: None,
-            });
+            current = Some(OpenRecord::at(path));
             continue;
         }
         let Some(open) = current.as_mut() else {
@@ -533,25 +524,23 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
             Some(space) => (&field[..space], Some(&field[space + 1..])),
             None => (field, None),
         };
-        match (label, value) {
-            (b"HEAD", Some(value)) if open.head.is_none() => open.head = Some(value),
-            (b"HEAD", _) => return Err(refuse(index, "has a HEAD that is not one object id")),
-            (b"branch", Some(value)) if open.branch.is_none() => open.branch = Some(value),
-            (b"branch", _) => return Err(refuse(index, "has a branch that is not one refname")),
-            (b"detached" | b"bare", None) => {}
+        // A label with no value is fed as the empty slice: for `HEAD` and
+        // `branch` that is outside their grammar, for the reasons it is the
+        // bare label.
+        let read = match (label, value) {
+            (b"HEAD", value) => open.head(value.unwrap_or(&[])),
+            (b"branch", value) => open.branch(value.unwrap_or(&[])),
             (b"detached" | b"bare", Some(_)) => {
                 return Err(refuse(index, "has a boolean attribute carrying a value"));
             }
-            (b"locked", value) if open.locked.is_none() => {
-                open.locked = Some(value.unwrap_or(&[]));
-            }
-            (b"prunable", value) if open.prunable.is_none() => {
-                open.prunable = Some(value.unwrap_or(&[]));
-            }
-            (b"locked" | b"prunable", _) => {
-                return Err(refuse(index, "has a reason attribute twice"));
-            }
-            _ => {}
+            (b"detached", None) => open.detached(),
+            (b"bare", None) => open.bare(),
+            (b"locked", value) => open.locked(value.unwrap_or(&[])),
+            (b"prunable", value) => open.prunable(value.unwrap_or(&[])),
+            _ => Ok(()),
+        };
+        if let Err(malformed) = read {
+            return Err(refuse(index, &malformed.to_string()));
         }
     }
     if current.is_some() {
@@ -602,7 +591,7 @@ mod tests {
         error.to_string()
     }
 
-    /// The record the porcelain spells, built through the one constructor.
+    /// The record the porcelain spells, built the one way a record is built.
     fn worktree_record(
         path: &str,
         head: Option<&str>,
@@ -610,14 +599,20 @@ mod tests {
         locked: Option<&[u8]>,
         prunable: Option<&[u8]>,
     ) -> WorktreeRecord {
-        WorktreeRecord::from_porcelain(Attributes {
-            path: platform(path),
-            head: head.map(str::as_bytes),
-            branch,
-            locked,
-            prunable,
-        })
-        .expect("a record inside the grammar")
+        let mut open = OpenRecord::at(platform(path));
+        if let Some(head) = head {
+            open.head(head.as_bytes()).expect("one HEAD");
+        }
+        if let Some(branch) = branch {
+            open.branch(branch).expect("one branch");
+        }
+        if let Some(locked) = locked {
+            open.locked(locked).expect("one lock");
+        }
+        if let Some(prunable) = prunable {
+            open.prunable(prunable).expect("one prunable");
+        }
+        open.close()
     }
 
     /// `path`, spelled with this platform's separator.
@@ -1177,6 +1172,16 @@ mod tests {
             message(parse_worktree_records(&locked_twice).expect_err("locked twice"))
                 .contains("record 0 has a reason attribute twice")
         );
+        let detached_twice = porcelain(&[b"worktree /repo", HEAD, b"detached", b"detached", b""]);
+        assert!(
+            message(parse_worktree_records(&detached_twice).expect_err("detached twice"))
+                .contains("record 0 has a boolean attribute twice")
+        );
+        let bare_twice = porcelain(&[b"worktree /repo", b"bare", b"bare", b""]);
+        assert!(
+            message(parse_worktree_records(&bare_twice).expect_err("bare twice"))
+                .contains("record 0 has a boolean attribute twice")
+        );
 
         let verbatim = porcelain(&[b"worktree /repo", HEAD, b"locked initializing ", b""]);
         let records = parse_worktree_records(&verbatim).expect("a reason is verbatim");
@@ -1189,6 +1194,24 @@ mod tests {
         assert!(
             parse_worktree_records(&sha256).is_ok(),
             "a SHA-256 object id is sixty-four hexadecimal digits"
+        );
+    }
+
+    /// The grammar is applied as each attribute is read, so a record with two
+    /// attributes outside it is refused for the first one, whichever that is.
+    #[test]
+    fn a_record_with_two_malformed_attributes_is_refused_for_the_first_read() {
+        let branch_then_head = porcelain(&[b"worktree /repo", b"branch ", b"HEAD abc", b""]);
+        assert!(
+            message(parse_worktree_records(&branch_then_head).expect_err("two defects"))
+                .contains("record 0 has a branch that is not one refname"),
+            "the branch came first"
+        );
+        let head_then_branch = porcelain(&[b"worktree /repo", b"HEAD abc", b"branch ", b""]);
+        assert!(
+            message(parse_worktree_records(&head_then_branch).expect_err("two defects"))
+                .contains("record 0 has a HEAD that is not one object id"),
+            "the HEAD came first"
         );
     }
 

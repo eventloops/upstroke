@@ -8,8 +8,9 @@
 //! These are the three values that conversation is held in -- the record Git
 //! hands back, the quiescence the caller asks for, and the reasons the answer
 //! can be no. The verification itself runs a Git child and is the parent's; the
-//! record is produced by `parsers.rs`, which reads the `--porcelain -z` framing,
-//! and this module holds the grammar of the record's own attributes.
+//! record is produced by `parsers.rs`, which reads the `--porcelain -z` framing
+//! and feeds each attribute to an [`OpenRecord`], and this module holds the
+//! grammar of the record's own attributes.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -35,12 +36,15 @@ use crate::topology::effects::ResidueElement;
 /// A registered worktree of the managed repository, as
 /// `git worktree list --porcelain -z` reports it.
 ///
-/// The value holds the grammar of its structural attributes: a `HEAD` is a
-/// full hexadecimal object id and a `branch` is inside the refname byte set.
-/// Both are applied once, in [`WorktreeRecord::from_porcelain`], which is the
-/// one way to build a record; the fields are private so that nothing
-/// constructs one around it (`locked` is readable by the parent module for
-/// now, and says why). The path and the two reasons are verbatim.
+/// The value holds the grammar of its attributes: a `HEAD` is a full
+/// hexadecimal object id, a `branch` is inside the refname byte set, and no
+/// attribute is read twice. Each rule is applied once, by [`OpenRecord`] as
+/// the attribute arrives, and [`OpenRecord::close`] is the one way to build a
+/// record; the fields are private so that nothing constructs one around it
+/// (`locked` is readable by the parent module for now, and says why). The
+/// path and the two reasons are verbatim. `detached` and `bare` are not
+/// stored: the shape says it, a bare worktree having no HEAD and a detached
+/// one no branch.
 ///
 /// No `Clone`: nothing copies a record. The parent iterates the list Git
 /// returned by value and moves the path into the refusal that names it
@@ -70,94 +74,191 @@ pub struct WorktreeRecord {
     prunable: Option<String>,
 }
 
-/// One record's attributes as `git worktree list --porcelain -z` printed them,
-/// before the grammar is applied: the parser's accumulator, and
-/// [`WorktreeRecord::from_porcelain`]'s input.
+/// One record of `git worktree list --porcelain -z` while its attributes are
+/// being read: from its `worktree` line to the empty attribute that closes it.
+///
+/// The parser feeds each attribute as it arrives and every rule of the
+/// record is applied here, in attribute order, so a refusal names the first
+/// attribute outside the grammar, exactly as the parser did when it held the
+/// rules itself; [`OpenRecord::close`] is the one way to make a
+/// [`WorktreeRecord`], and it cannot fail, because nothing outside the grammar
+/// was ever stored.
 ///
 /// The path is already decoded, because which bytes can be a path is the
 /// platform's question and the parser answers it per platform. Every other
 /// attribute is the bytes after the label's one space, borrowed from the
-/// answer; `Some(b"")` is a label Git printed with no value, which is how a
-/// lock or a prunable entry without a reason is listed (measured, Git 2.43.0:
-/// `git worktree lock <path>` lists as `locked`, and `--reason "why  "` as
-/// `locked why`, Git having trimmed its own file). `None` is an attribute the
-/// record does not carry.
+/// answer; the empty slice is a label Git printed with no value, which is how
+/// a lock or a prunable entry without a reason is listed (measured, Git
+/// 2.43.0: `git worktree lock <path>` lists as `locked`, and
+/// `--reason "why  "` as `locked why`, Git having trimmed its own file).
 #[derive(Debug)]
-pub(super) struct Attributes<'a> {
+pub(super) struct OpenRecord<'a> {
     /// `worktree <path>`, decoded.
-    pub(super) path: PathBuf,
-    /// `HEAD <sha>`.
-    pub(super) head: Option<&'a [u8]>,
-    /// `branch <refname>`.
-    pub(super) branch: Option<&'a [u8]>,
+    path: PathBuf,
+    /// `HEAD <sha>`, already an object id.
+    head: Option<&'a str>,
+    /// `branch <refname>`, already inside the byte set.
+    branch: Option<&'a [u8]>,
+    /// Whether `detached` was read.
+    detached: bool,
+    /// Whether `bare` was read.
+    bare: bool,
     /// `locked` or `locked <reason>`.
-    pub(super) locked: Option<&'a [u8]>,
+    locked: Option<&'a [u8]>,
     /// `prunable` or `prunable <reason>`.
-    pub(super) prunable: Option<&'a [u8]>,
+    prunable: Option<&'a [u8]>,
 }
 
-/// Why [`WorktreeRecord::from_porcelain`] refused a record: the attribute
-/// that is outside its grammar.
+/// Why an [`OpenRecord`] refused an attribute: it is outside the grammar, or
+/// it was read before.
 ///
 /// The text is a predicate of the record, for the parser to join after the
 /// record's number: "record 0 has a HEAD that is not one object id".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum MalformedAttribute {
-    /// `HEAD` is not forty or sixty-four hexadecimal digits.
+    /// `HEAD` is not forty or sixty-four hexadecimal digits, or is a second
+    /// `HEAD`: either way the record does not have one object id.
     #[error("has a HEAD that is not one object id")]
     Head,
-    /// `branch` is empty or carries a byte no refname can.
+    /// `branch` is empty or carries a byte no refname can, or is a second
+    /// `branch`.
     #[error("has a branch that is not one refname")]
     Branch,
+    /// `detached` or `bare` a second time.
+    #[error("has a boolean attribute twice")]
+    BooleanTwice,
+    /// `locked` or `prunable` a second time.
+    #[error("has a reason attribute twice")]
+    ReasonTwice,
 }
 
-impl WorktreeRecord {
-    /// Apply the grammar to one record's attributes.
-    ///
-    /// `HEAD` is a full hexadecimal object id of either hash length, decided
-    /// by the same predicate the ref transitions apply
+impl<'a> OpenRecord<'a> {
+    /// Open the record whose `worktree` line named `path`.
+    pub(super) fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            head: None,
+            branch: None,
+            detached: false,
+            bare: false,
+            locked: None,
+            prunable: None,
+        }
+    }
+
+    /// `HEAD <value>`: a full hexadecimal object id of either hash length,
+    /// decided by the same predicate the ref transitions apply
     /// ([`is_object_id`](super::is_object_id)); an object id is ASCII, so a
     /// value that is not UTF-8 fails that same test and the offset at which
-    /// it stopped being UTF-8 would add nothing. `branch` is kept as the bytes
-    /// Git printed, which [`can_be_refname`] holds to the byte set of
-    /// `git check-ref-format`: a refname is bytes to Git and need not be UTF-8
-    /// on Unix, and [`WorktreeRecord::has_checked_out`] compares those bytes,
-    /// so no spelling of one refname is mistaken for another. The two reasons
-    /// are decoded lossily: they are consulted for the one word
-    /// `initializing` and shown to an operator, never used as identity (§8).
+    /// it stopped being UTF-8 would add nothing.
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute`] naming the attribute outside its grammar.
-    pub(super) fn from_porcelain(attributes: Attributes<'_>) -> Result<Self, MalformedAttribute> {
-        let Attributes {
-            path,
-            head,
-            branch,
-            locked,
-            prunable,
-        } = attributes;
-        let head = match head {
-            None => None,
-            Some(value) => match std::str::from_utf8(value) {
-                Ok(text) if is_object_id(text) => Some(text.to_owned()),
-                Ok(_) | Err(_) => return Err(MalformedAttribute::Head),
-            },
-        };
-        let branch = match branch {
-            None => None,
-            Some(value) if can_be_refname(value) => Some(value.to_vec()),
-            Some(_) => return Err(MalformedAttribute::Branch),
-        };
-        Ok(Self {
-            path,
-            head,
-            branch,
-            locked: locked.map(reason),
-            prunable: prunable.map(reason),
-        })
+    /// [`MalformedAttribute::Head`] for a value outside the grammar or a
+    /// second `HEAD`.
+    pub(super) fn head(&mut self, value: &'a [u8]) -> Result<(), MalformedAttribute> {
+        if self.head.is_some() {
+            return Err(MalformedAttribute::Head);
+        }
+        match std::str::from_utf8(value) {
+            Ok(text) if is_object_id(text) => {
+                self.head = Some(text);
+                Ok(())
+            }
+            Ok(_) | Err(_) => Err(MalformedAttribute::Head),
+        }
     }
 
+    /// `branch <value>`: the bytes Git printed, held by [`can_be_refname`] to
+    /// the byte set of `git check-ref-format`. A refname is bytes to Git and
+    /// need not be UTF-8 on Unix, and [`WorktreeRecord::has_checked_out`]
+    /// compares those bytes, so no spelling of one refname is mistaken for
+    /// another.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedAttribute::Branch`] for a value outside the byte set or a
+    /// second `branch`.
+    pub(super) fn branch(&mut self, value: &'a [u8]) -> Result<(), MalformedAttribute> {
+        if self.branch.is_some() || !can_be_refname(value) {
+            return Err(MalformedAttribute::Branch);
+        }
+        self.branch = Some(value);
+        Ok(())
+    }
+
+    /// `detached`, a label with no value.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedAttribute::BooleanTwice`] for a second `detached`.
+    pub(super) fn detached(&mut self) -> Result<(), MalformedAttribute> {
+        if self.detached {
+            return Err(MalformedAttribute::BooleanTwice);
+        }
+        self.detached = true;
+        Ok(())
+    }
+
+    /// `bare`, a label with no value.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedAttribute::BooleanTwice`] for a second `bare`.
+    pub(super) fn bare(&mut self) -> Result<(), MalformedAttribute> {
+        if self.bare {
+            return Err(MalformedAttribute::BooleanTwice);
+        }
+        self.bare = true;
+        Ok(())
+    }
+
+    /// `locked` or `locked <reason>`, the reason verbatim and empty for the
+    /// bare label.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedAttribute::ReasonTwice`] for a second `locked`.
+    pub(super) fn locked(&mut self, reason: &'a [u8]) -> Result<(), MalformedAttribute> {
+        if self.locked.is_some() {
+            return Err(MalformedAttribute::ReasonTwice);
+        }
+        self.locked = Some(reason);
+        Ok(())
+    }
+
+    /// `prunable` or `prunable <reason>`, the reason verbatim and empty for
+    /// the bare label.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedAttribute::ReasonTwice`] for a second `prunable`.
+    pub(super) fn prunable(&mut self, reason: &'a [u8]) -> Result<(), MalformedAttribute> {
+        if self.prunable.is_some() {
+            return Err(MalformedAttribute::ReasonTwice);
+        }
+        self.prunable = Some(reason);
+        Ok(())
+    }
+
+    /// The empty attribute: the record is complete.
+    ///
+    /// The borrowed attributes become the owned record here, the one copy
+    /// this module makes. The two reasons are decoded lossily: they are
+    /// consulted for the one word `initializing` and shown, never used as
+    /// identity (§8).
+    pub(super) fn close(self) -> WorktreeRecord {
+        WorktreeRecord {
+            path: self.path,
+            head: self.head.map(str::to_owned),
+            branch: self.branch.map(<[u8]>::to_vec),
+            locked: self.locked.map(reason),
+            prunable: self.prunable.map(reason),
+        }
+    }
+}
+
+impl WorktreeRecord {
     /// The checkout path, as the parser decoded it.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -206,15 +307,26 @@ impl WorktreeRecord {
         self.locked.as_deref()
     }
 
-    /// Whether `git worktree add` is populating this worktree, or died before
-    /// it had.
+    /// Whether the lock reason is Git's word `initializing`, compared exactly.
     ///
-    /// `git worktree add` holds the lock reason `initializing` for the whole of
-    /// its run and releases it only once the checkout is populated, so this is
-    /// how a registered-but-unpopulated worktree announces itself, and it is
-    /// exactly that word: a lock without a reason is somebody's lock on a
-    /// populated worktree, and `git worktree lock --reason` on one is theirs
-    /// too.
+    /// `git worktree add` writes that reason to the lock for the whole of its
+    /// run and removes the lock (or, under `--lock`, replaces the reason) only
+    /// once the checkout is populated, so a surviving `initializing` is how a
+    /// registered-but-unpopulated worktree announces itself; a lock without a
+    /// reason, or with any other, is somebody's lock on a worktree Git
+    /// finished, and the parent reads it as populated.
+    ///
+    /// This is not provenance. The record cannot tell Git's `initializing`
+    /// from the same word a repository writer puts there with
+    /// `git worktree lock --reason initializing` on a populated worktree: both
+    /// read `true`, and the parent's verification answers `Unpopulated` for
+    /// both, after which an open generation is removed and re-added and a
+    /// retained one is closed. The engine writes no marker of its own at the
+    /// add funnel (`worktree add --detach --quiet`), so a marker only it
+    /// produces is the parent's to add (`SWEEP-WORKTREE-013`); until then a
+    /// writer to the execution root who forges Git's word is inside the trust
+    /// boundary the root already assumes (§14): the same writer can delete the
+    /// checkout outright.
     #[must_use]
     pub fn is_initializing(&self) -> bool {
         self.locked.as_deref() == Some("initializing")
@@ -259,8 +371,10 @@ fn can_be_refname(value: &[u8]) -> bool {
 ///
 /// The caller's action is decided by the generation's class, not by the
 /// variant: an open generation is removed with force and re-added, a retained
-/// one is closed. The variant and its `Display` are what an operator is told
-/// afterwards, so each names the observation and carries what it compared.
+/// one is closed. The variant is what a caller reads today
+/// (`Reuse::Recreated`, `RetryOutcome::Close`); nothing renders the `Display`
+/// to an operator yet (`SWEEP-WORKTREE-007`, the engine's), and each arm
+/// carries what it compared so that a renderer has it.
 ///
 /// `Clone` because [`Reuse`](crate::engine::topology::dispatch::Reuse) derives
 /// it and carries a failure, and the engine's test doubles answer one recorded
@@ -272,7 +386,9 @@ pub enum VerifyFailure {
     /// Nothing is registered at the recorded path.
     NotRegistered,
     /// Registered, and `git worktree add` never finished populating it — the
-    /// `registered-but-unpopulated` residue element.
+    /// `registered-but-unpopulated` residue element. Or somebody locked a
+    /// populated worktree with Git's own word; the record cannot tell
+    /// ([`WorktreeRecord::is_initializing`]).
     Unpopulated,
     /// Registered at the path but belonging to a different repository.
     ForeignRepository,
@@ -357,50 +473,51 @@ mod tests {
     const SHA1: &str = "88663d58b63b0acaf3c31e98aa723336b24f1510";
     const SHA256: &str = "88663d58b63b0acaf3c31e98aa723336b24f151088663d58b63b0acaf3c31e98";
 
-    fn attributes<'a>(
-        head: Option<&'a [u8]>,
-        branch: Option<&'a [u8]>,
-        locked: Option<&'a [u8]>,
-        prunable: Option<&'a [u8]>,
-    ) -> Attributes<'a> {
-        Attributes {
-            path: PathBuf::from("slot"),
-            head,
-            branch,
-            locked,
-            prunable,
-        }
+    fn open() -> OpenRecord<'static> {
+        OpenRecord::at(PathBuf::from("slot"))
     }
 
-    fn record(attributes: Attributes<'_>) -> WorktreeRecord {
-        WorktreeRecord::from_porcelain(attributes).expect("a record inside the grammar")
+    /// A record with one lock reason and, optionally, one prunable reason.
+    fn locked_with(lock: Option<&[u8]>, prunable: Option<&[u8]>) -> WorktreeRecord {
+        let mut open = open();
+        if let Some(reason) = lock {
+            open.locked(reason).expect("one lock");
+        }
+        if let Some(reason) = prunable {
+            open.prunable(reason).expect("one prunable");
+        }
+        open.close()
+    }
+
+    /// A record checking out `branch`.
+    fn on_branch(branch: &[u8]) -> WorktreeRecord {
+        let mut open = open();
+        open.branch(branch).expect("a branch inside the byte set");
+        open.close()
     }
 
     /// The path is the parser's decoding, taken as given and handed back
-    /// owned for the refusal that names it.
+    /// owned for the refusal that names it; a record with no attribute has
+    /// nothing else.
     #[test]
     fn the_path_is_taken_as_decoded_and_handed_back_owned() {
         let path = PathBuf::from("root").join("tasks").join("kalpha-g1");
-        let bare = record(Attributes {
-            path: path.clone(),
-            head: None,
-            branch: None,
-            locked: None,
-            prunable: None,
-        });
+        let bare = OpenRecord::at(path.clone()).close();
         assert_eq!(bare.path(), path.as_path());
         assert_eq!(bare.head(), None);
         assert_eq!(bare.branch(), None);
         assert_eq!(bare.lock_reason(), None);
         assert_eq!(bare.prunable_reason(), None);
+        assert!(!bare.is_initializing());
         assert_eq!(bare.into_path(), path);
     }
 
     /// A `HEAD` is forty or sixty-four hexadecimal digits in either case and
-    /// nothing else: the record refuses what `is_object_id` refuses, and a
-    /// value that is not UTF-8 is refused by the same test.
+    /// nothing else, read once: the record refuses what `is_object_id`
+    /// refuses, a value that is not UTF-8 by the same test, and a second
+    /// `HEAD` by the same name.
     #[test]
-    fn a_head_is_a_full_hexadecimal_object_id_of_either_length() {
+    fn a_head_is_a_full_hexadecimal_object_id_of_either_length_read_once() {
         let sha1_upper = SHA1.to_ascii_uppercase();
         let accepted: &[(&str, &[u8])] = &[
             ("a SHA-1", SHA1.as_bytes()),
@@ -408,9 +525,15 @@ mod tests {
             ("an uppercase SHA-1", sha1_upper.as_bytes()),
         ];
         for (name, head) in accepted {
-            let kept = record(attributes(Some(head), None, None, None));
+            let mut open = open();
+            assert_eq!(open.head(head), Ok(()), "{name} is one object id");
             assert_eq!(
-                kept.head().map(str::as_bytes),
+                open.head(SHA1.as_bytes()),
+                Err(MalformedAttribute::Head),
+                "{name}: a second HEAD is not one object id"
+            );
+            assert_eq!(
+                open.close().head().map(str::as_bytes),
                 Some(*head),
                 "{name} is kept as printed"
             );
@@ -434,19 +557,21 @@ mod tests {
             ("forty bytes that are not UTF-8", &not_utf8),
         ];
         for (name, head) in refused {
+            let mut open = open();
             assert_eq!(
-                WorktreeRecord::from_porcelain(attributes(Some(head), None, None, None)),
+                open.head(head),
                 Err(MalformedAttribute::Head),
                 "{name} is not one object id"
             );
+            assert_eq!(open.close().head(), None, "{name} stored nothing");
         }
         assert_eq!(refused.len(), 8, "eight independent refusals");
     }
 
-    /// A `branch` is inside the byte set `git check-ref-format` allows and is
-    /// kept as the bytes Git printed, not a spelling of them.
+    /// A `branch` is inside the byte set `git check-ref-format` allows, read
+    /// once, and kept as the bytes Git printed, not a spelling of them.
     #[test]
-    fn a_branch_is_inside_the_refname_byte_set_and_kept_as_bytes() {
+    fn a_branch_is_inside_the_refname_byte_set_read_once_and_kept_as_bytes() {
         let mut forbidden: Vec<u8> = (0..=b' ').collect();
         forbidden.push(0x7f);
         forbidden.extend_from_slice(b"~^:?*[\\");
@@ -459,28 +584,60 @@ mod tests {
             let mut branch = b"refs/heads/ma".to_vec();
             branch.push(byte);
             branch.extend_from_slice(b"in");
+            let mut open = open();
             assert_eq!(
-                WorktreeRecord::from_porcelain(attributes(None, Some(&branch), None, None)),
+                open.branch(&branch),
                 Err(MalformedAttribute::Branch),
                 "byte {byte:#04x} cannot be in a refname"
             );
+            assert_eq!(
+                open.close().branch(),
+                None,
+                "byte {byte:#04x} stored nothing"
+            );
         }
         assert_eq!(
-            WorktreeRecord::from_porcelain(attributes(None, Some(b""), None, None)),
+            open().branch(b""),
             Err(MalformedAttribute::Branch),
             "a refname is never empty"
         );
 
-        let latin1: &[u8] = b"refs/heads/caf\xe9";
-        let kept = record(attributes(None, Some(latin1), None, None));
+        let mut twice = open();
+        assert_eq!(twice.branch(b"refs/heads/main"), Ok(()));
         assert_eq!(
-            kept.branch(),
+            twice.branch(b"refs/heads/other"),
+            Err(MalformedAttribute::Branch),
+            "a second branch is not one refname"
+        );
+        assert_eq!(twice.close().branch(), Some(&b"refs/heads/main"[..]));
+
+        let latin1: &[u8] = b"refs/heads/caf\xe9";
+        assert_eq!(
+            on_branch(latin1).branch(),
             Some(latin1),
             "bytes that are not UTF-8 are a refname to Git and are kept as printed"
         );
         let utf8 = "refs/heads/café".as_bytes();
-        let kept = record(attributes(None, Some(utf8), None, None));
-        assert_eq!(kept.branch(), Some(utf8));
+        assert_eq!(on_branch(utf8).branch(), Some(utf8));
+    }
+
+    /// `detached` and `bare` are labels read once each; a second is refused
+    /// by name, as the other attributes are.
+    #[test]
+    fn a_boolean_attribute_is_read_once() {
+        let mut open = open();
+        assert_eq!(open.detached(), Ok(()));
+        assert_eq!(
+            open.detached(),
+            Err(MalformedAttribute::BooleanTwice),
+            "detached twice"
+        );
+        assert_eq!(open.bare(), Ok(()), "bare is a different label");
+        assert_eq!(
+            open.bare(),
+            Err(MalformedAttribute::BooleanTwice),
+            "bare twice"
+        );
     }
 
     /// `has_checked_out` is byte equality with the full refname: no short
@@ -488,7 +645,7 @@ mod tests {
     /// worktree.
     #[test]
     fn checked_out_is_byte_equality_with_the_full_refname() {
-        let main = record(attributes(None, Some(b"refs/heads/main"), None, None));
+        let main = on_branch(b"refs/heads/main");
         assert!(main.has_checked_out("refs/heads/main"));
         assert!(
             !main.has_checked_out("main"),
@@ -498,7 +655,7 @@ mod tests {
         assert!(!main.has_checked_out("refs/heads/mai"));
         assert!(!main.has_checked_out(""));
 
-        let latin1 = record(attributes(None, Some(b"refs/heads/caf\xe9"), None, None));
+        let latin1 = on_branch(b"refs/heads/caf\xe9");
         assert!(
             !latin1.has_checked_out("refs/heads/caf\u{FFFD}"),
             "the lossy spelling of a branch is not the branch"
@@ -507,37 +664,38 @@ mod tests {
             !latin1.has_checked_out("refs/heads/café"),
             "the UTF-8 spelling of the same letters is a different refname to Git"
         );
-        let utf8 = record(attributes(
-            None,
-            Some("refs/heads/café".as_bytes()),
-            None,
-            None,
-        ));
-        assert!(utf8.has_checked_out("refs/heads/café"));
+        assert!(on_branch("refs/heads/café".as_bytes()).has_checked_out("refs/heads/café"));
 
-        let detached = record(attributes(Some(SHA1.as_bytes()), None, None, None));
+        let mut detached = open();
+        detached.head(SHA1.as_bytes()).expect("one HEAD");
+        detached.detached().expect("detached once");
+        let detached = detached.close();
         assert!(!detached.has_checked_out("refs/heads/main"));
         assert!(!detached.has_checked_out(""));
     }
 
     /// A lock without a reason is a lock (`Some("")`), not an absent
-    /// attribute (`None`); only the one word `initializing` is `git worktree
-    /// add`'s lock; and the prunable reason is read the same way and never
-    /// mistaken for the lock.
+    /// attribute (`None`); only the one word `initializing` is read as
+    /// initializing, and it is read as such whoever wrote it, which the doc
+    /// says the record cannot tell; the prunable reason is read the same way
+    /// and never mistaken for the lock; neither is read twice.
     #[test]
     fn a_bare_lock_is_a_lock_without_a_reason_and_only_initializing_is_initializing() {
-        let unlocked = record(attributes(None, None, None, None));
+        let unlocked = locked_with(None, None);
         assert_eq!(unlocked.lock_reason(), None);
         assert!(!unlocked.is_initializing());
 
-        let bare = record(attributes(None, None, Some(b""), None));
+        let bare = locked_with(Some(b""), None);
         assert_eq!(bare.lock_reason(), Some(""), "locked, with no reason");
         assert!(
             !bare.is_initializing(),
             "somebody's lock on a populated worktree"
         );
 
-        let initializing = record(attributes(None, None, Some(b"initializing"), None));
+        // Git's own `worktree add` lock, and a writer's
+        // `git worktree lock --reason initializing` on a populated worktree,
+        // print the same attribute: the record reads both as initializing.
+        let initializing = locked_with(Some(b"initializing"), None);
         assert_eq!(initializing.lock_reason(), Some("initializing"));
         assert!(initializing.is_initializing());
 
@@ -549,7 +707,7 @@ mod tests {
             ("a suffix", b"still initializing"),
         ];
         for (name, reason) in not_quite {
-            let locked = record(attributes(None, None, Some(reason), None));
+            let locked = locked_with(Some(reason), None);
             assert!(!locked.is_initializing(), "{name} is not Git's own lock");
             assert_eq!(
                 locked.lock_reason().map(str::as_bytes),
@@ -558,7 +716,7 @@ mod tests {
             );
         }
 
-        let verbatim = record(attributes(None, None, Some(b"why\nnot"), Some(b"")));
+        let verbatim = locked_with(Some(b"why\nnot"), Some(b""));
         assert_eq!(verbatim.lock_reason(), Some("why\nnot"));
         assert_eq!(
             verbatim.prunable_reason(),
@@ -566,7 +724,7 @@ mod tests {
             "prunable, with no reason"
         );
 
-        let lossy = record(attributes(None, None, Some(b"caf\xe9"), Some(b"caf\xe9")));
+        let lossy = locked_with(Some(b"caf\xe9"), Some(b"caf\xe9"));
         assert_eq!(
             lossy.lock_reason(),
             Some("caf\u{FFFD}"),
@@ -574,12 +732,29 @@ mod tests {
         );
         assert_eq!(lossy.prunable_reason(), Some("caf\u{FFFD}"));
 
-        let prunable = record(attributes(None, None, None, Some(b"initializing")));
+        let prunable = locked_with(None, Some(b"initializing"));
         assert_eq!(prunable.prunable_reason(), Some("initializing"));
         assert!(
             !prunable.is_initializing(),
             "the prunable reason is not the lock"
         );
+
+        let mut twice = open();
+        assert_eq!(twice.locked(b""), Ok(()));
+        assert_eq!(
+            twice.locked(b"again"),
+            Err(MalformedAttribute::ReasonTwice),
+            "locked twice"
+        );
+        assert_eq!(twice.prunable(b""), Ok(()), "prunable is a different label");
+        assert_eq!(
+            twice.prunable(b"again"),
+            Err(MalformedAttribute::ReasonTwice),
+            "prunable twice"
+        );
+        let twice = twice.close();
+        assert_eq!(twice.lock_reason(), Some(""), "the first reason stands");
+        assert_eq!(twice.prunable_reason(), Some(""));
     }
 
     /// The refusal's text is the predicate the parser joins after the
@@ -593,6 +768,14 @@ mod tests {
         assert_eq!(
             MalformedAttribute::Branch.to_string(),
             "has a branch that is not one refname"
+        );
+        assert_eq!(
+            MalformedAttribute::BooleanTwice.to_string(),
+            "has a boolean attribute twice"
+        );
+        assert_eq!(
+            MalformedAttribute::ReasonTwice.to_string(),
+            "has a reason attribute twice"
         );
     }
 

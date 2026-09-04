@@ -379,7 +379,7 @@ effect_free = [
     "owner_field",
 ]
 
-# The worktree record, the quiescence a reuse demands and the reasons the answer can be no. The record's one constructor applies the attribute grammar to bytes the parser hands it, and the rest read fields; `fmt` is `VerifyFailure`'s `Display`. The verification that produces these values runs a Git child and is the parent's.
+# The worktree record, the quiescence a reuse demands and the reasons the answer can be no. `OpenRecord` (`at`, one reader per attribute, `close`) applies the attribute grammar to the bytes the parser feeds it and is the one way a record is built; the record's methods read fields; `fmt` is `VerifyFailure`'s `Display`. The verification that produces these values runs a Git child and is the parent's.
 [[module]]
 path = "src/workspace_manager/worktree.rs"
 crate_path = "upstroke::workspace_manager::worktree"
@@ -388,15 +388,20 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "at",
+    "bare",
     "branch",
+    "close",
+    "detached",
     "fmt",
-    "from_porcelain",
     "has_checked_out",
     "head",
     "into_path",
     "is_initializing",
     "lock_reason",
+    "locked",
     "path",
+    "prunable",
     "prunable_reason",
 ]
 
