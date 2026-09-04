@@ -198,13 +198,16 @@ pub fn prove_private_half_ownership(
     // taking it first keeps its fixture portable: a locator the platform will
     // not accept as a path fails this stat on every platform, and never reaches
     // the identity questions below because it has no answer to give them.
+    // A `match` rather than a let-chain: let-chains are not stable at this
+    // crate's MSRV, and `cargo +1.85.0 check` is the gate that says so.
     let target_stat = fs::symlink_metadata(&locator);
-    if let Err(error) = &target_stat
-        && error.kind() != io::ErrorKind::NotFound
-    {
-        return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable {
-            detail: format!("{}: {error}", locator.display()),
-        });
+    match &target_stat {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable {
+                detail: format!("{}: {error}", locator.display()),
+            });
+        }
+        _ => {}
     }
 
     // Two spellings are accepted and no third, because the two sides derive the

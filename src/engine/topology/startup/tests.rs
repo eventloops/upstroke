@@ -1092,7 +1092,10 @@ fn scan_plans_a_retention_for_a_listing_that_did_not_answer_and_a_reclaim_for_a_
         other => panic!("`scan` refused to reclaim a bare husk: {other:?}"),
     }
     let outcome = apply(&mut rundir::NoHooks, &scanned.public, scanned.plan);
-    assert_eq!(outcome, RunDirOutcome::ReclaimedPublicOnly(UnboundShape::Bare));
+    assert_eq!(
+        outcome,
+        RunDirOutcome::ReclaimedPublicOnly(UnboundShape::Bare)
+    );
     assert!(!exists(&husk.public()), "and the bare husk is gone");
 }
 
