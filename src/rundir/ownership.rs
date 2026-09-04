@@ -210,22 +210,18 @@ pub fn prove_private_half_ownership(
         _ => {}
     }
 
-    // Two spellings are accepted and no third, because the two sides derive the
-    // path differently and both are legitimate. `prelock::authorized_private_root`
-    // canonicalizes the **root** — the run directory does not exist during the
-    // pre-lock checks, so there is nothing else it could canonicalize — and joins
-    // `runs/<id>`; this side canonicalizes `<R>/runs` when that directory exists
-    // and joins the basename. The canonical spelling is the one to prefer, and
-    // the raw one has to be accepted too: at P1 the marker is published and
-    // `<R>/runs` may not exist yet, which is exactly the state whose legitimate
-    // answer is `TargetAbsent`.
-    let expected_raw = authorized_runs.join(&basename);
-    let expected_canonical = fs::canonicalize(&authorized_runs).map(|runs| runs.join(&basename));
-    if locator != expected_raw && expected_canonical.as_ref().is_ok_and(|it| *it != locator) {
-        return PrivateHalfOwnership::Retained(RetainReason::LocatorOutsideAuthorizedRoot {
-            locator,
-            expected: expected_canonical.unwrap_or(expected_raw),
-        });
+    // Three answers, and only one of them continues.
+    match locator_identity(&locator, &authorized_runs, &basename) {
+        LocatorIdentity::Established => {}
+        LocatorIdentity::Refused { expected } => {
+            return PrivateHalfOwnership::Retained(RetainReason::LocatorOutsideAuthorizedRoot {
+                locator,
+                expected,
+            });
+        }
+        LocatorIdentity::Undetermined { detail } => {
+            return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable { detail });
+        }
     }
 
     // The census's own step between the marker conjuncts and the locator
@@ -460,6 +456,65 @@ pub(super) fn canonical_public_or_refusal(
                 public.display()
             ),
         }),
+    }
+}
+
+/// What the recorded locator was shown to be: the three-way answer conjunct 3a
+/// needs, with only one arm that continues.
+///
+/// **This is a `enum` and not a `bool` because the boolean was the defect.**
+/// The first version of this gate read
+/// `locator != expected_raw && expected_canonical.as_ref().is_ok_and(|it| *it != locator)`,
+/// and `is_ok_and` answers `false` for `Err` — so a canonicalization that
+/// *failed* was indistinguishable from one that agreed, every locator unequal
+/// to the raw spelling walked past the refusal, and a `NotFound` stat then
+/// produced the reclaiming `TargetAbsent`. It is the same class this whole pull
+/// request is about, in the fix for the first four instances of it: an error
+/// folded into the answer that proceeds.
+///
+/// A three-way answer removes the shape rather than adding a condition. There
+/// is no expression here that can turn an error into [`Self::Established`],
+/// because the only place that variant is constructed is a successful equality,
+/// and the caller's `match` is exhaustive over the other two.
+///
+/// **Two spellings are established and no third.** The two sides derive the
+/// path differently and both are legitimate:
+/// `prelock::authorized_private_root` canonicalizes the **root** — the run
+/// directory does not exist during the pre-lock checks, so there is nothing
+/// else it could canonicalize — and joins `runs/<id>`, while this side
+/// canonicalizes `<R>/runs` when it can. The raw spelling is checked first and
+/// needs no I/O at all, which is what keeps the legitimate `TargetAbsent`
+/// answer reachable at P1, when the marker is published and `<R>/runs` may not
+/// exist yet.
+enum LocatorIdentity {
+    /// The recorded locator is this run's child of the authorized runs
+    /// directory, in one of the two spellings that name it.
+    Established,
+    /// It is some other path, and this is the one it should have been.
+    Refused { expected: PathBuf },
+    /// The question was not answered: the authorized runs directory could not
+    /// be resolved, so where this run's private half *should* be is unknown
+    /// and no locator can be placed against it.
+    Undetermined { detail: String },
+}
+
+fn locator_identity(locator: &Path, authorized_runs: &Path, basename: &str) -> LocatorIdentity {
+    let expected_raw = authorized_runs.join(basename);
+    if locator == expected_raw {
+        return LocatorIdentity::Established;
+    }
+    match fs::canonicalize(authorized_runs) {
+        Ok(runs) => {
+            let expected = runs.join(basename);
+            if locator == expected {
+                LocatorIdentity::Established
+            } else {
+                LocatorIdentity::Refused { expected }
+            }
+        }
+        Err(error) => LocatorIdentity::Undetermined {
+            detail: format!("{}: {error}", authorized_runs.display()),
+        },
     }
 }
 

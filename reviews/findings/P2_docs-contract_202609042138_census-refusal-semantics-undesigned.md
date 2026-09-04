@@ -8,13 +8,17 @@ reviewed_sha: cc202c81ab289ec74ee6ee527534bb543735a7f8
 location: design/15_design_event_log_resume_run_layout.md:30
 provenance: introduced_by_feature
 first_bad:
-guard: an owner change to `DESIGN.md` §15 stating the three refusal semantics below; until then the behaviour's only record is PR #139's body and the doc comments in `src/rundir/ownership.rs` and `src/rundir.rs`
+guard: an owner change to `DESIGN.md` §15 stating the three refusal semantics below. **Escalated to the project owner and merge-blocking**: no session edits `DESIGN.md`, so there is no head at which PR #139 could close this, and the sweep coordinator is holding the merge until the ruling returns. Until then the behaviour's only record is PR #139's body and the doc comments in `src/rundir/ownership.rs` and `src/rundir.rs`
 ---
 
 ## Failure sequence
 
 `CODING_STANDARDS.md` §13 requires the design to change in the same pull request as the behaviour
-it describes, and forbids a code comment being the sole record of a design decision. PR #139
+it describes, and forbids a code comment being the sole record of a design decision. Review pass 3
+of PR #139 raised this again as an **authority** question rather than a documentation one, and it
+is the sharper framing: a review finding cannot substitute for the design update the rule requires,
+so this is beyond that pull request's reach rather than outside its scope. The distinction decides
+the disposition — it is escalated and merge-blocking, not ordinary deferred debt. PR #139
 changes what the startup census does with three classes of I/O answer, and `DESIGN.md` is the
 owner's — no session edits it — so the change landed with its only durable record in a pull request
 body and in doc comments. A reader of §15 alone now has an incomplete account of when a run

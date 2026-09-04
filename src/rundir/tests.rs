@@ -3026,6 +3026,117 @@ fn a_private_root_that_is_not_utf8_is_retained_rather_than_reclaimed() {
     );
 }
 
+/// A runs directory that cannot be resolved does not establish a locator —
+/// the reviewer's own sequence, which the fail-open gate walked straight past.
+///
+/// Pass 3 found the fifth instance of this pull request's class **inside the
+/// fix for the first four**: the identity gate read
+/// `locator != expected_raw && expected_canonical.as_ref().is_ok_and(…)`, and
+/// `is_ok_and` answers `false` for `Err`. So a canonicalization that failed was
+/// indistinguishable from one that agreed, and every locator unequal to the raw
+/// spelling walked past the refusal into a `NotFound` stat and the reclaiming
+/// `TargetAbsent`.
+///
+/// This is the sequence the reviewer wrote, built exactly: the real private
+/// root carries bytes that are not valid UTF-8, the marker records the lossy
+/// path the way `create.rs` does, and the real root is then made unsearchable —
+/// so canonicalizing `<R>/runs` returns `EACCES` while statting the distinct
+/// lossy locator returns `NotFound`. Under the fail-open gate the proof
+/// answered `NothingBound(TargetAbsent)` and the reclaim it licenses deletes
+/// `.creating`, orphaning a private half that is still on disk.
+///
+/// The added non-UTF-8 test above cannot see this: it leaves `runs` readable,
+/// so it only ever exercises the successful canonicalization. That is why this
+/// test exists beside it rather than instead of it — one covers the answer, the
+/// other covers the error branch that produces it.
+///
+/// Linux only: it needs a name that is not valid UTF-8 *and* a mode bit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runs_directory_that_cannot_be_resolved_does_not_establish_a_locator() {
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut husk = BoundHusk::new("unresolvable-runs");
+    let raw_root = std::ffi::OsString::from_vec(b"\xff-private".to_vec());
+    let real_root = husk.root.join(&raw_root);
+    fs::create_dir_all(real_root.join("runs")).expect("the raw private root");
+    let real_root = fs::canonicalize(&real_root).expect("canonical raw root");
+    husk.private = real_root.join("runs").join(BOUND_RUN);
+    husk.private_root = real_root.clone();
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    // The transient: the real root cannot be searched, so `<R>/runs` cannot be
+    // canonicalized — while the lossy locator, whose parent never existed,
+    // still stats `NotFound`.
+    fs::set_permissions(&real_root, fs::Permissions::from_mode(0o000)).expect("close the root");
+    let readable_again =
+        || fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700)).expect("open it");
+    let runs_resolves = fs::canonicalize(real_root.join("runs")).is_ok();
+    let locator_stat = fs::symlink_metadata(Path::new(&husk.marker.private_dir))
+        .err()
+        .map(|error| error.kind());
+    if runs_resolves || locator_stat != Some(std::io::ErrorKind::NotFound) {
+        readable_again();
+        panic!(
+            "this fixture needs an unresolvable runs directory and a locator that stats \
+             NotFound, and here it has runs_resolves={runs_resolves} locator_stat={locator_stat:?} \
+             — a process with the privilege to ignore the permission bits cannot measure this"
+        );
+    }
+
+    let answer = husk.prove();
+    readable_again();
+
+    match answer {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "target-undecidable",
+            "a runs directory that could not be resolved establishes no locator: {reason}"
+        ),
+        other => panic!(
+            "an unresolvable runs directory answered {other:?}; the real private half is {}",
+            if husk.private.join(OWNER_RECORD).is_file() {
+                "still there and would now be orphaned"
+            } else {
+                "gone"
+            }
+        ),
+    }
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and the real private half is untouched"
+    );
+}
+
+/// The same three-way answer, reached without a permission bit: a runs
+/// directory that is **not there** resolves no better than one that cannot be
+/// read, and a locator that is not the raw expected path is therefore not
+/// established either.
+///
+/// Portable, and it is the arm that says the refusal is about the *answer*
+/// rather than about `EACCES` in particular.
+#[test]
+fn a_runs_directory_that_is_absent_establishes_no_locator_either() {
+    let mut husk = BoundHusk::new("absent-runs");
+    // A private root that was never created, and a locator that is not the raw
+    // expected path under it.
+    husk.private_root = husk.root.join("never-created");
+    husk.private = husk.private_root.join("elsewhere").join(BOUND_RUN);
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "target-undecidable",
+            "the runs directory does not resolve, so nothing places the locator: {reason}"
+        ),
+        other => panic!("an unresolvable runs directory answered {other:?}"),
+    }
+}
+
 /// Conjunct 8 compares **paths**, so two canonical paths that render to one
 /// lossy string do not prove each other.
 ///
@@ -3099,9 +3210,11 @@ fn a_lossy_public_path_does_not_satisfy_the_owner_record() {
 /// directory named `x` + `0xff` was enumerated as `x` + `U+FFFD`: the census
 /// inspected a directory that does not exist while the real one was never
 /// inspected, and where both names existed the valid one was scanned twice and
-/// the other not at all. A run id is a ULID, so a name that does not round-trip
-/// is not a run directory, and skipping it is what makes every name the
-/// enumeration returns one that names the directory it came from.
+/// the other not at all. The filter is UTF-8 validity and nothing more —
+/// `x` + `U+FFFD` is a perfectly good return value here and is not a run id —
+/// so what this asserts is the property the census actually needs: every name
+/// the enumeration returns opens the entry it was read from. A run id is a
+/// ULID, so nothing this engine created is ever skipped.
 ///
 /// Linux only, for the reason given above.
 #[cfg(target_os = "linux")]

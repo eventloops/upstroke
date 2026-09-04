@@ -63,8 +63,8 @@ pub fn list_runs(repo_root: &Path) -> Vec<String> {
     runs
 }
 
-/// Every directory under `<repo>/.upstroke/runs` **whose name is a name this
-/// engine could have written**, committed or not, oldest first.
+/// Every directory under `<repo>/.upstroke/runs` **whose name the filesystem
+/// and this crate spell the same way**, committed or not, oldest first.
 ///
 /// Not a reader in `startup_census`'s sense and deliberately not filtered by
 /// commitment: this is the enumeration a census walks and the one the worktree
@@ -82,13 +82,21 @@ pub fn list_runs(repo_root: &Path) -> Vec<String> {
 /// to a census that deletes.
 ///
 /// A name that does not round-trip is therefore **skipped rather than
-/// mangled**, which narrows the enumeration by exactly the directories that
-/// cannot be run directories: a run id is a ULID, 26 characters of Crockford
-/// base32, so every directory this engine creates has an ASCII name. Skipping
-/// one is strictly better than inspecting a phantom in its place, and the
-/// alternative — carrying `OsString` out of here — reaches `list_runs`,
-/// `resolve_run_id`, `status` and the event log's own run ids, which is a
-/// different change in a file whose sweep has not run (queue row 13).
+/// mangled**. The filter is exactly that and nothing more: it asks whether the
+/// name is valid UTF-8, not whether it is a run id. So this still returns names
+/// no run ever had — `x` + `U+FFFD` is returned, and it is not a ULID — and
+/// callers filter as they always did (`list_runs` by commitment,
+/// `resolve_run_id` by prefix). What it no longer does is return a name that
+/// does **not** name the directory it came from, which is the property the
+/// census needs: every name here opens the entry it was read from.
+///
+/// The narrowing is real and it is bounded: a run id is a ULID, 26 characters
+/// of Crockford base32, so no directory this engine creates is ever skipped.
+/// One that is skipped was not this engine's, and skipping it is strictly
+/// better than inspecting a phantom in its place. The alternative — carrying
+/// `OsString` out of here — reaches `list_runs`, `resolve_run_id`, `status` and
+/// the event log's own run ids, which is a different change in a file whose
+/// sweep has not run (queue row 13).
 #[must_use]
 pub fn run_dir_names(repo_root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(runs_root(repo_root)) else {
