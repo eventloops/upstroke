@@ -1113,10 +1113,17 @@ fn the_probe_returns_the_lines_exact_bytes_on_both_paths() {
 /// number of times once the cursor has passed `trigger`, and counts how many it
 /// really handed out.
 ///
-/// Past `trigger` on purpose. The window read is `Take::read_to_end`, which
-/// retries `Interrupted` inside `std::io`, so a schedule firing from byte zero
-/// would be spent there and `newline_offset_from` -- the loop under test --
-/// would never see one.
+/// Past `trigger` on purpose, and the reason changed with the repair. The
+/// window read is bounded now, so a schedule firing from byte zero is spent
+/// *there* and the scan never sees one; `trigger` is what puts the
+/// interruptions inside `newline_offset_from`, which is this test's subject.
+///
+/// **This comment used to say the window read was `Take::read_to_end`, which
+/// retries `Interrupted` inside `std::io` without limit -- and left it at
+/// that.** That was the defect, written down in the fixture that worked around
+/// it: the probe hung on any source interrupted before the scan, and this test
+/// stepped over the hole rather than falling into it. The two tests below fall
+/// into it.
 struct Interrupting {
     bytes: Vec<u8>,
     at: usize,
@@ -1213,6 +1220,134 @@ fn the_scan_retries_an_interrupted_read_and_stops_retrying() {
         storm.fired,
         INTERRUPTED_RETRIES + 1,
         "it gave up on the allowance rather than somewhere earlier"
+    );
+}
+
+/// A `Read + Seek` whose every read is `Interrupted`, counting them.
+///
+/// The shape `Read::read_to_end` cannot survive: it retries `Interrupted`
+/// inside `std::io` without limit, and an interrupted read consumes none of a
+/// `Take`'s byte budget, so the probe's first read never returned at all.
+struct AlwaysInterrupted {
+    interruptions: u64,
+}
+
+impl Read for AlwaysInterrupted {
+    fn read(&mut self, _into: &mut [u8]) -> io::Result<usize> {
+        self.interruptions += 1;
+        Err(io::Error::from(io::ErrorKind::Interrupted))
+    }
+}
+
+impl Seek for AlwaysInterrupted {
+    fn seek(&mut self, _to: SeekFrom) -> io::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// A `Read + Seek` that serves its bytes until the probe rewinds and then
+/// answers `Interrupted` for ever.
+///
+/// The second read spinning where the first did not: the window read completes,
+/// the scan finds the newline, and only the re-read meets the hostile source. A
+/// bound applied to the scan alone does not reach this.
+struct InterruptedAfterRewind {
+    bytes: Vec<u8>,
+    at: usize,
+    rewound: bool,
+    interruptions: u64,
+}
+
+impl Read for InterruptedAfterRewind {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        if self.rewound {
+            self.interruptions += 1;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        let at = self.at;
+        let take = into.len().min(self.bytes.len().saturating_sub(at));
+        into[..take].copy_from_slice(&self.bytes[at..at + take]);
+        self.at = at + take;
+        Ok(take)
+    }
+}
+
+impl Seek for InterruptedAfterRewind {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let SeekFrom::Start(at) = to else {
+            return Err(io::Error::other(
+                "only the probe's absolute rewind is scripted",
+            ));
+        };
+        self.rewound = true;
+        self.at = usize::try_from(at).map_err(io::Error::other)?;
+        Ok(at)
+    }
+}
+
+/// The probe answers rather than spinning when its **first** read is
+/// interrupted.
+///
+/// `INTERRUPTED_RETRIES` was introduced bounding the scan between the two reads,
+/// and the two reads themselves went through `Read::read_to_end`, which retries
+/// `Interrupted` inside `std::io` without limit and spends none of a `Take`'s
+/// byte budget doing it. So the allowance was never reached: measured at rustc
+/// 1.85, a reader answering `Interrupted` unconditionally was still being called
+/// after five million reads with the `Take` limit untouched. `classify_run_dir`
+/// is called by `startup_census` with the physical worktree lock held, so that
+/// is the lock never released.
+///
+/// The verdict of value is the returned one, not an elapsed time: at the code
+/// this repairs, this test does not fail, it does not return.
+#[test]
+fn an_unconditionally_interrupted_source_has_no_first_line() {
+    let mut source = AlwaysInterrupted { interruptions: 0 };
+    assert_eq!(
+        first_line_within(&mut source, FIRST_LINE_WINDOW * 4),
+        None,
+        "a source that never lets a read happen has no first line to vouch for"
+    );
+    assert_eq!(
+        source.interruptions,
+        u64::from(INTERRUPTED_RETRIES) + 1,
+        "it gave up on the allowance rather than somewhere else, and spent all of it"
+    );
+}
+
+/// And when only the **re-read** is interrupted, which a bound on the scan alone
+/// does not reach.
+///
+/// The window read completes, the scan finds the newline and spends nothing of
+/// its allowance, and the source turns hostile only at the rewind. That path had
+/// its own `read_to_end` and hung in the same way, one read later, so a repair
+/// that bounded the first read and the scan would still leave the census holding
+/// the lock here.
+#[test]
+fn a_source_that_is_interrupted_for_ever_after_the_rewind_has_no_first_line() {
+    let window = usize::try_from(FIRST_LINE_WINDOW).expect("the window fits a usize");
+    // Past the window, so the scan runs and the rewind happens at all.
+    let mut bytes = vec![b'x'; window + 100];
+    bytes.push(b'\n');
+    let bound = bytes.len() as u64;
+    let mut source = InterruptedAfterRewind {
+        bytes,
+        at: 0,
+        rewound: false,
+        interruptions: 0,
+    };
+    assert_eq!(
+        first_line_within(&mut source, bound),
+        None,
+        "a line the re-read cannot deliver is a husk, not a wait"
+    );
+    assert!(
+        source.rewound,
+        "the rewind never happened, so the re-read was never the thing measured"
+    );
+    assert_eq!(
+        source.interruptions,
+        u64::from(INTERRUPTED_RETRIES) + 1,
+        "the re-read spent its own allowance, not one the scan had already drawn down"
     );
 }
 
