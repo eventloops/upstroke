@@ -1535,16 +1535,81 @@ fn only_a_retained_generation_is_retried_in_place() {
 
 static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
+/// How many names [`scratch_in`] tries before giving up. A temp directory
+/// carries one leftover per `(process id, label)` for every harness that
+/// died holding that id, so reaching this is a directory that needs
+/// emptying, and the panic says which.
+const SCRATCH_LEFTOVER_BOUND: u32 = 64;
+
+/// The name of this process's `nth` scratch directory for `label`.
+fn scratch_name(label: &str, nth: u32) -> String {
+    format!("upstroke-pr7h-{label}-{}-{nth}", std::process::id())
+}
+
 /// A scratch directory, created through the run-directory funnel because
 /// this module may not name `std::fs`.
+///
+/// The name carries the process id, and a process id is unique only among
+/// **live** processes. Nothing here removes a scratch directory — the kill
+/// tests' claim is what a coordinator that runs no cleanup leaves on disk
+/// — so a harness handed a dead harness's id finds that harness's
+/// directory, and the funnel's `create_dir_all` accepts it. The kill child
+/// then opens the log the dead harness's child left, appends a second run
+/// to it, and `replay` refuses the second `RunStarted` with
+/// `AlreadyStarted`: both kill tests fail together, at their
+/// `the log replays` expectations, with every earlier assertion passing.
+/// Windows hands a freed id out again within hours, and the `test
+/// (winguest)` image's temp directory carries one such pair per harness
+/// that ever ran on it, so that is what the pair of reds on that leg was.
+/// [`scratch_in`] passes an existing name over: no live process shares
+/// this id, so an existing name is always a leftover, never a neighbour.
 fn scratch(label: &str) -> PathBuf {
-    let nth = SCRATCH.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "upstroke-pr7h-{label}-{}-{nth}",
+    scratch_in(&std::env::temp_dir(), label)
+}
+
+/// [`scratch`] under `root`, which is what lets its witness plant leftovers
+/// in a root of its own.
+fn scratch_in(root: &Path, label: &str) -> PathBuf {
+    for _ in 0..SCRATCH_LEFTOVER_BOUND {
+        let nth = SCRATCH.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(scratch_name(label, nth));
+        if dir.exists() {
+            continue;
+        }
+        rundir::create_public_dir(&dir, &mut rundir::NoHooks).expect("a scratch directory");
+        return dir;
+    }
+    panic!(
+        "{SCRATCH_LEFTOVER_BOUND} scratch names for `{label}` under {} already exist for process {}",
+        root.display(),
         std::process::id()
-    ));
-    rundir::create_public_dir(&dir, &mut rundir::NoHooks).expect("a scratch directory");
-    dir
+    );
+}
+
+/// [`scratch_in`] never hands a test a directory a dead process left: a
+/// name that already exists under this process's id is passed over, not
+/// reused. Without the `exists` check the fixture returns the first planted
+/// name, on every platform.
+#[test]
+fn a_scratch_directory_is_never_a_leftover() {
+    let root = scratch("leftover-root");
+    // The names this process would choose next, planted as leftovers. Eight,
+    // because each of the two kill tests may advance the counter once between
+    // the read and the call.
+    let next = SCRATCH.load(Ordering::Relaxed);
+    let planted: Vec<PathBuf> = (next..next + 8)
+        .map(|nth| root.join(scratch_name("leftover", nth)))
+        .collect();
+    for dir in &planted {
+        rundir::create_public_dir(dir, &mut rundir::NoHooks).expect("a leftover");
+    }
+    let fresh = scratch_in(&root, "leftover");
+    assert!(
+        !planted.contains(&fresh),
+        "the fixture reused a leftover: {}",
+        fresh.display()
+    );
+    assert!(fresh.starts_with(&root));
 }
 
 /// A [`RunDirHooks`] that records into the shared harness **and** answers
