@@ -70,14 +70,18 @@ pub trait EffectHooks {
     /// Why this observer answered [`Injection::Error`], when the reason is
     /// its own state rather than an armed injection.
     ///
-    /// `None`, the default, means the refusal is the injection it looks like
-    /// and [`apply`] words it as one. [`HarnessEffects`] answers with the
-    /// poison it found, and [`consult`] words the refusal from that instead,
-    /// so a caller reads "harness poisoned" and never a fault it believes it
-    /// armed itself.
-    fn refusal_cause(&self) -> Option<String> {
-        None
-    }
+    /// `None` means the refusal is the injection it looks like and [`apply`]
+    /// words it as one. [`HarnessEffects`] answers with the poison it found,
+    /// and [`consult`] words the refusal from that instead, so a caller reads
+    /// "harness poisoned" and never a fault it believes it armed itself.
+    ///
+    /// **Not defaulted, on purpose.** An observer that wraps another and
+    /// forwards `phase` to it must forward this too, or the poison the inner
+    /// observer found is reported as an armed fault; with a default, nothing
+    /// would make a wrapper say so, and the compiler is the only thing that
+    /// reaches every wrapper. An observer with no state of its own answers
+    /// `None`.
+    fn refusal_cause(&self) -> Option<String>;
 }
 
 /// What production passes: nothing is armed and nothing is recorded.
@@ -87,6 +91,10 @@ pub struct NoHooks;
 impl EffectHooks for NoHooks {
     fn phase(&mut self, _site: EffectSiteId, _phase: HookPhase) -> Injection {
         Injection::Proceed
+    }
+
+    fn refusal_cause(&self) -> Option<String> {
+        None
     }
 }
 
@@ -108,10 +116,19 @@ impl EffectHooks for NoHooks {
 /// reads what the funnel recorded. `Default` is an observer on a fresh
 /// harness that only [`Self::harness`] can reach.
 ///
-/// **A poisoned harness.** Poison means another thread panicked while
-/// holding the harness, and what it left cannot be trusted, so this observer
-/// never records into it again and remembers that it found it
-/// ([`Self::poisoned`]). At each coordinate it answers the one legal thing:
+/// **A poisoned harness, as this observer treats it.** Poison means another
+/// thread panicked while holding the harness, and what it left cannot be
+/// trusted, so *this observer* never records into it again once it has seen
+/// the poison, and remembers that it saw it ([`Self::poisoned`]); the latch
+/// is what it consults, so clearing the mutex's poison through
+/// [`Self::harness`] does not reopen recording. That is the whole of the
+/// invariant: it binds `HarnessEffects` and nothing else. The other four
+/// family adapters that share the same mutex (`crate::rundir::HarnessHooks`,
+/// `crate::events::log::HarnessEventHooks`,
+/// `crate::runner::container::HarnessHooks` and
+/// `crate::runner::HarnessHooks`) still recover a poisoned guard and record
+/// into it, until their own files are swept. At each coordinate this
+/// observer answers the one legal thing:
 /// a refusal wherever a refusal is a legal answer, which is `Before`,
 /// `After`, and a point in [`InjectionMode::ErrorReturn`], and `Proceed` at a
 /// point whose mode is [`InjectionMode::Kill`], where the only legal
@@ -143,6 +160,11 @@ impl HarnessEffects {
     }
 
     /// The harness this observer records into.
+    ///
+    /// The raw mutex, so a suite can arm, read coverage, or clear a poison
+    /// it caused on purpose. Clearing it does not reset this observer's
+    /// [`Self::poisoned`] latch: once this observer has seen the poison, it
+    /// records nothing more, whatever the lock says afterwards.
     #[must_use]
     pub fn harness(&self) -> &Arc<Mutex<HookHarness>> {
         &self.harness
@@ -191,14 +213,18 @@ impl EffectHooks for HarnessEffects {
     /// ledger takes its own lock. The two locks are never held together, so
     /// there is no acquisition order to keep.
     ///
-    /// **A poisoned harness is never recorded into.** Poison means another
-    /// thread panicked while holding the harness, and what it left cannot be
-    /// trusted: a `hook` call may have written some of its fields and not
-    /// the rest, and a fast sequence the panicking holder opened stays open,
-    /// so anything recorded next would be attributed to it. Recording into
-    /// that would manufacture coverage evidence, and this is production code
-    /// that may not panic, so the guard is not recovered and the harness is
-    /// not touched.
+    /// **A poisoned harness is never recorded into by this observer.**
+    /// Poison means another thread panicked while holding the harness, and
+    /// what it left cannot be trusted: a `hook` call may have written some
+    /// of its fields and not the rest, and a fast sequence the panicking
+    /// holder opened stays open, so anything recorded next would be
+    /// attributed to it. Recording into that would manufacture coverage
+    /// evidence, and this is production code that may not panic, so the
+    /// guard is not recovered and the harness is not touched. The latch
+    /// ([`Self::poisoned`]) is consulted before the lock, so a poison this
+    /// observer has already seen keeps it out even after `clear_poison`.
+    /// The invariant is this observer's alone: the other family adapters
+    /// sharing the mutex still recover and record, as the type's doc says.
     ///
     /// **Where a refusal is legal, it refuses.** `Before` and `After` exist
     /// at every site and error-return is universal at them, and a point
@@ -219,23 +245,23 @@ impl EffectHooks for HarnessEffects {
     /// remembers it, and the refusal comes at the site's `After` with the
     /// same cause.
     fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-        match self.harness.lock() {
-            Ok(mut harness) => harness.hook(site, phase),
-            Err(_poisoned) => {
-                self.poisoned = true;
-                match phase {
-                    HookPhase::Before
-                    | HookPhase::After
-                    | HookPhase::Point {
-                        mode: InjectionMode::ErrorReturn,
-                        ..
-                    } => Injection::Error,
-                    HookPhase::Point {
-                        mode: InjectionMode::Kill,
-                        ..
-                    } => Injection::Proceed,
-                }
+        if !self.poisoned {
+            match self.harness.lock() {
+                Ok(mut harness) => return harness.hook(site, phase),
+                Err(_poisoned) => self.poisoned = true,
             }
+        }
+        match phase {
+            HookPhase::Before
+            | HookPhase::After
+            | HookPhase::Point {
+                mode: InjectionMode::ErrorReturn,
+                ..
+            } => Injection::Error,
+            HookPhase::Point {
+                mode: InjectionMode::Kill,
+                ..
+            } => Injection::Proceed,
         }
     }
 
@@ -433,6 +459,10 @@ mod tests {
             } else {
                 Injection::Proceed
             }
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
 
@@ -670,6 +700,104 @@ mod tests {
         assert!(
             harness.reached().is_empty(),
             "a point was recorded as reached after the poison"
+        );
+    }
+
+    /// An observer that wraps `HarnessEffects` and forwards everything, the
+    /// shape the coverage suites' `ArmedEffects` doubles have. With no fault
+    /// of its own armed, a poison the inner observer found must reach the
+    /// funnel's message through it, which is what makes `refusal_cause` a
+    /// required method rather than a defaulted one.
+    struct Forwarding {
+        inner: HarnessEffects,
+    }
+
+    impl EffectHooks for Forwarding {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            self.inner.phase(site, phase)
+        }
+
+        fn durability_ledger(&self) -> DurabilityLedger {
+            self.inner.durability_ledger()
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            self.inner.refusal_cause()
+        }
+    }
+
+    #[test]
+    fn a_forwarding_observer_reports_the_inner_poison_as_poison() {
+        let shared = Arc::new(Mutex::new(HookHarness::new()));
+        let poisoner = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("not yet poisoned");
+            panic!("a worker dies while holding the harness");
+        });
+        assert!(worker.join().is_err());
+
+        let mut hooks = Forwarding {
+            inner: HarnessEffects::new(Arc::clone(&shared)),
+        };
+        let message = refusal(funnel(&mut hooks, SITE, || Ok(())));
+        assert!(
+            message.contains("harness poisoned") && !message.contains("made to fail"),
+            "the wrapper passed the inner observer's answer on without its cause: {message}"
+        );
+    }
+
+    /// The observer's latch, not the mutex, decides. A suite that clears the
+    /// poison through the exposed handle after this observer has seen it
+    /// still gets nothing recorded, at any coordinate.
+    #[test]
+    fn clearing_the_poison_does_not_reopen_recording() {
+        let shared = Arc::new(Mutex::new(HookHarness::new()));
+        let poisoner = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let mut harness = poisoner.lock().expect("not yet poisoned");
+            harness.begin_fast_sequence("abandoned");
+            panic!("a worker dies while holding the harness");
+        });
+        assert!(worker.join().is_err());
+
+        let mut hooks = HarnessEffects::new(Arc::clone(&shared));
+        assert_eq!(hooks.phase(SITE, HookPhase::Before), Injection::Error);
+        assert!(hooks.poisoned());
+
+        hooks.harness().clear_poison();
+        assert!(!shared.is_poisoned(), "the mutex's poison is cleared");
+        assert_eq!(
+            hooks.phase(SITE, HookPhase::Before),
+            Injection::Error,
+            "the latch, not the lock, decides"
+        );
+        assert_eq!(
+            hooks.phase(
+                SITE,
+                HookPhase::Point {
+                    point: SubEffectPoint::IdUnread,
+                    mode: InjectionMode::Kill,
+                },
+            ),
+            Injection::Proceed,
+            "a Kill-only point still proceeds, unrecorded"
+        );
+        let message = refusal(consult(&mut hooks, SITE, HookPhase::After));
+        assert!(message.contains("harness poisoned"), "{message}");
+        assert!(hooks.poisoned(), "the latch stays set");
+
+        let harness = shared.lock().expect("cleared, so it locks");
+        assert_eq!(
+            harness.executions(),
+            0,
+            "a hook was recorded after the clear"
+        );
+        assert!(harness.reached().is_empty());
+        assert!(
+            harness
+                .fast_sequence("abandoned")
+                .is_some_and(|sequence| sequence.touched().is_empty()),
+            "the abandoned sequence was attributed a site after the clear"
         );
     }
 
