@@ -32,6 +32,12 @@ use std::collections::BTreeSet;
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
 use super::fixture::{Fixture, git, git_out, scratch};
+
+/// `value`, which the fixture read from Git, as the [`ObjectId`] every
+/// snapshot input is built from.
+fn oid(value: &str) -> ObjectId {
+    ObjectId::new(value.to_owned()).expect("an id the fixture read from Git")
+}
 // The observing scratch tree: its drop reclaims the directory and reports a
 // reclaim that failed, where `scratch` above hands back a bare path nothing
 // removes. The `canonical_prefix` tests below build no repository, so this is
@@ -4342,8 +4348,8 @@ fn an_ephemeral_snapshot_commit_created_before_the_intent_is_left_to_git() {
             &mut measured,
             &SnapshotName::gates(2, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("snapshot");
@@ -4375,11 +4381,11 @@ fn an_ephemeral_snapshot_commit_created_before_the_intent_is_left_to_git() {
         1,
         "this add's commit-tree fired exactly once, on a log that began empty"
     );
-    assert_eq!(snapshot.ephemeral.as_deref(), Some(snapshot.head.as_str()));
+    assert_eq!(snapshot.ephemeral(), Some(snapshot.head()));
     assert!(
         !unreachable_objects(&fixture.base)
             .expect("fsck")
-            .contains(&snapshot.head),
+            .contains(&snapshot.head().to_string()),
         "and the add makes it the snapshot HEAD: R24, no longer R27"
     );
 }
@@ -4426,15 +4432,17 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
         .add_snapshot(
             &mut NoHooks,
             &SnapshotName::integration(1),
-            &SnapshotInput::Commit(fixture.head.clone()),
+            &SnapshotInput::Commit(oid(&fixture.head)),
         )
         .expect("Snapshot.WriteIntent + Snapshot.Add");
     assert_eq!(
-        integration.head, fixture.head,
+        integration.head().as_str(),
+        fixture.head,
         "an integration snapshot checks out the commit it was given"
     );
     assert_eq!(
-        integration.ephemeral, None,
+        integration.ephemeral(),
+        None,
         "…and records no ephemeral commit, because it created none"
     );
     assert_eq!(
@@ -4444,7 +4452,7 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
              checks out the proposal or head commit and **creates no object**"
     );
     assert_eq!(
-        git(&integration.path, &["rev-parse", "HEAD"]),
+        git(integration.path(), &["rev-parse", "HEAD"]),
         fixture.head,
         "and the checkout really is at that commit"
     );
@@ -4458,8 +4466,8 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::gates(1, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("the gate snapshot");
@@ -4469,33 +4477,34 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::review(1, 1, 0),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("a reviewer's snapshot on the same judged tree");
 
     assert_ne!(
-        gates.slot, reviewer.slot,
+        gates.slot(),
+        reviewer.slot(),
         "the gate set and a reviewer are different roles and must not share a slot"
     );
     assert_ne!(
-        gates.path,
-        reviewer.path,
+        gates.path(),
+        reviewer.path(),
         "…and therefore not a checkout either: {} vs {}",
-        gates.path.display(),
-        reviewer.path.display()
+        gates.path().display(),
+        reviewer.path().display()
     );
     assert!(
-        gates.path.is_dir() && reviewer.path.is_dir(),
+        gates.path().is_dir() && reviewer.path().is_dir(),
         "both snapshots are live at once; that is what 'never reused across roles \
              or attempts' means and what no fixture built"
     );
     // Not merely different names for one directory: each is separately
     // registered, and the kernel agrees they are two.
     assert_ne!(
-        git(&gates.path, &["rev-parse", "--absolute-git-dir"]),
-        git(&reviewer.path, &["rev-parse", "--absolute-git-dir"]),
+        git(gates.path(), &["rev-parse", "--absolute-git-dir"]),
+        git(reviewer.path(), &["rev-parse", "--absolute-git-dir"]),
         "two registered worktrees, not one directory under two names"
     );
 
@@ -4506,13 +4515,14 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::gates(1, 2),
             &SnapshotInput::Tree {
-                tree,
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("the gate snapshot of the next attempt");
     assert_ne!(
-        retry.path, gates.path,
+        retry.path(),
+        gates.path(),
         "attempt 2's gate snapshot must not be attempt 1's checkout"
     );
 
@@ -7658,8 +7668,8 @@ fn every_site_this_lane_owns_executes_both_hook_phases() {
             &mut hooks,
             &SnapshotName::gates(1, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("Object.SnapshotCommitTree + Snapshot.WriteIntent + Snapshot.Add");

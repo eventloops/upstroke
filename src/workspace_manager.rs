@@ -301,6 +301,19 @@ pub enum Refusal {
         value: String,
     },
 
+    /// A value offered as an [`ObjectId`] that is not one: not a full
+    /// hexadecimal id of either hash length, or the null id, which
+    /// `design/26` step 5 measures as a condition rather than an id. An exact
+    /// snapshot is taken of, and checked out at, values that name an object,
+    /// so [`SnapshotInput`] and [`Snapshot`] are built from this type only.
+    #[error("refusing `{value}` as an object id: {why}")]
+    NotAnObjectId {
+        /// The value as it was offered.
+        value: String,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+
     /// A slot name that is not the shape `workspace_candidates` gives it.
     /// Containment is by construction: a name that could carry a separator or
     /// `..` would put a worktree outside the execution root without any
@@ -1884,22 +1897,32 @@ impl WorkspaceManager {
         name: &SnapshotName,
         input: &SnapshotInput,
     ) -> Result<Snapshot, UpstrokeError> {
+        // The name is cloned twice, and both are small owned values (§6): the
+        // intent and the add take the slot before the snapshot exists, and
+        // the snapshot builds its own slot from the name so that it is a
+        // snapshot slot by construction.
         let slot = Slot::Snapshot { name: name.clone() };
-        let (head, ephemeral) = match input {
-            SnapshotInput::Commit(commit) => (commit.clone(), None),
+        let head = match input {
+            // The input is borrowed and the snapshot owns its HEAD (§6).
+            SnapshotInput::Commit(commit) => SnapshotHead::Existing(commit.clone()),
             SnapshotInput::Tree { tree, parent } => {
-                let commit = self.snapshot_commit_tree(hooks, tree, parent)?;
-                (commit.clone(), Some(commit))
+                let commit = self.snapshot_commit_tree(hooks, tree.as_str(), parent.as_str())?;
+                // `git commit-tree` prints the id of the object it wrote, and
+                // that line is checked to be one before anything is checked
+                // out at it. A line that is not is Git misbehaving, so it is
+                // reported as a Git error naming the command, not as a refusal
+                // of a caller's value.
+                let commit = ObjectId::new(commit).map_err(|refusal| UpstrokeError::Git {
+                    message: format!(
+                        "`git commit-tree` printed something other than an object id: {refusal}"
+                    ),
+                })?;
+                SnapshotHead::Ephemeral(commit)
             }
         };
         self.write_intent(hooks, &slot)?;
-        let path = self.add_worktree(hooks, &slot, &head)?;
-        Ok(Snapshot {
-            slot,
-            path,
-            head,
-            ephemeral,
-        })
+        let path = self.add_worktree(hooks, &slot, head.id().as_str())?;
+        Ok(Snapshot::new(name.clone(), path, head))
     }
 
     /// Remove an exact snapshot: forced worktree removal, then the intent.
@@ -1912,8 +1935,8 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         snapshot: &Snapshot,
     ) -> Result<(), UpstrokeError> {
-        self.remove_worktree(hooks, &snapshot.slot)?;
-        self.remove_intent(hooks, &snapshot.slot)
+        self.remove_worktree(hooks, snapshot.slot())?;
+        self.remove_intent(hooks, snapshot.slot())
     }
 
     // -----------------------------------------------------------------------
@@ -2852,7 +2875,8 @@ pub use self::parsers::decode_changed_paths;
 use self::parsers::{parse_worktree_records, registration_checkout};
 
 mod snapshot_ref;
-pub use self::snapshot_ref::{Snapshot, SnapshotInput};
+use self::snapshot_ref::SnapshotHead;
+pub use self::snapshot_ref::{ObjectId, Snapshot, SnapshotInput};
 
 // ---------------------------------------------------------------------------
 // Residue classification

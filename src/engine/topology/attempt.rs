@@ -89,7 +89,9 @@ use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, AttemptStarted4, Materialization, RungBinding, SessionId,
     TopologyEventBody,
 };
-use crate::workspace_manager::{Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager};
+use crate::workspace_manager::{
+    ObjectId, Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager,
+};
 
 use super::dispatch::{self, Dispatched, EventEmitter};
 use super::identity::{AttemptIdentities, InvocationLedger, SlotAssertion, SlotPair, is_slotted};
@@ -896,7 +898,7 @@ impl AttemptContext<'_> {
                     .gate(u32::try_from(index).unwrap_or(u32::MAX), 0);
                 let request = gate_request(
                     gate.command.clone(),
-                    snapshot.path.clone(),
+                    snapshot.path().to_path_buf(),
                     gate.timeout,
                     invocation,
                 );
@@ -981,7 +983,7 @@ impl AttemptContext<'_> {
                     diff: &inputs.diff,
                     artifacts: &inputs.artifacts,
                     decisions: &inputs.decisions,
-                    workspace: &snapshot.path,
+                    workspace: snapshot.path(),
                     settings_dir: &self.paths.settings(),
                     reviews_dir: &self.paths.reviews(),
                     stem: format!("{}-{}", inputs.stem, attempt),
@@ -1064,9 +1066,13 @@ impl AttemptContext<'_> {
         self.manager.add_snapshot(
             self.hooks.effects(),
             &name,
+            // The capture is `git write-tree` and `rev-parse` output held as
+            // strings; each becomes an `ObjectId` here, and the refusal it
+            // returns names the value and why, which is all a reader of the
+            // failure needs (§7).
             &SnapshotInput::Tree {
-                tree: capture.tree.clone(),
-                parent: capture.parent.clone(),
+                tree: ObjectId::new(capture.tree.clone())?,
+                parent: ObjectId::new(capture.parent.clone())?,
             },
         )
     }
