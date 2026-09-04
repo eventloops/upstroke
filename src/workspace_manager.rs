@@ -301,6 +301,50 @@ pub enum Refusal {
         value: String,
     },
 
+    /// A value offered as an [`ObjectId`] that is not one: not a full
+    /// hexadecimal id of either hash length, or the null id, which
+    /// `design/26` step 5 measures as a condition rather than an id. An exact
+    /// snapshot is taken of, and checked out at, values that name an object,
+    /// so [`SnapshotInput`] and [`Snapshot`] are built from this type only.
+    #[error("refusing `{value}` as an object id: {why}")]
+    NotAnObjectId {
+        /// The value as it was offered.
+        value: String,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+
+    /// A snapshot input the repository does not resolve to itself. An
+    /// [`ObjectId`] is a spelling; a ref spelt as hexadecimal of the other
+    /// object format's length is one too, and `git worktree add` follows it
+    /// (measured, git 2.43: in a SHA-256 repository a branch named with forty
+    /// hexadecimal characters checks out wherever the branch points, and the
+    /// inverse in a SHA-1 repository). So `add_snapshot` asks the repository
+    /// to resolve each input to the object type its role requires and accepts
+    /// only an answer equal to the input; anything else is not an exact
+    /// snapshot input.
+    #[error(
+        "refusing `{value}` as the snapshot {role}: the repository peels it to {}, not to \
+         itself, so it does not name a {} of this repository as it stands{} -- a ref spelt in \
+         hexadecimal, an object of another type, an id of the other object format's length, or \
+         no object at all",
+        .resolved.as_deref().unwrap_or("nothing"),
+        .role.object_type(),
+        .found_type.as_deref().map_or_else(String::new, |found| format!(" (it names a {found})"))
+    )]
+    SnapshotInputResolvesElsewhere {
+        /// Which id of the input.
+        role: SnapshotObject,
+        /// The id as it was offered.
+        value: String,
+        /// What the repository resolved it to, when it resolved it at all.
+        resolved: Option<String>,
+        /// The object type the value does name, when the repository was asked
+        /// (only the unpeelable case asks: see
+        /// [`WorkspaceManager::refuse_unless_resolves_to_itself`]).
+        found_type: Option<String>,
+    },
+
     /// A slot name that is not the shape `workspace_candidates` gives it.
     /// Containment is by construction: a name that could carry a separator or
     /// `..` would put a worktree outside the execution root without any
@@ -1875,31 +1919,165 @@ impl WorkspaceManager {
     /// ephemeral snapshot commit created *before* the intent is left to Git" —
     /// so the object exists before anything durable claims it.
     ///
+    /// **The input is resolved first.** An [`ObjectId`] is a spelling, and a
+    /// ref spelt as hexadecimal of the other object format's length is one
+    /// Git follows (see [`Refusal::SnapshotInputResolvesElsewhere`]). Each id
+    /// of the input is resolved against the repository, peeled to the object
+    /// type its role requires, and accepted only when the answer is the input
+    /// itself; the check runs before the ephemeral commit and before the
+    /// intent, so a refused input leaves nothing behind.
+    ///
     /// # Errors
     ///
-    /// A slot refusal, the containment refusals, or a Git error.
+    /// [`Refusal::SnapshotInputResolvesElsewhere`] for an input the
+    /// repository does not resolve to itself, a slot refusal, the containment
+    /// refusals, or a Git error.
     pub fn add_snapshot(
         &self,
         hooks: &mut dyn EffectHooks,
         name: &SnapshotName,
         input: &SnapshotInput,
     ) -> Result<Snapshot, UpstrokeError> {
-        let slot = Slot::Snapshot { name: name.clone() };
-        let (head, ephemeral) = match input {
-            SnapshotInput::Commit(commit) => (commit.clone(), None),
+        self.revalidate()?;
+        match input {
+            SnapshotInput::Commit(commit) => {
+                self.refuse_unless_resolves_to_itself(SnapshotObject::Commit, commit)?;
+            }
             SnapshotInput::Tree { tree, parent } => {
-                let commit = self.snapshot_commit_tree(hooks, tree, parent)?;
-                (commit.clone(), Some(commit))
+                self.refuse_unless_resolves_to_itself(SnapshotObject::Tree, tree)?;
+                self.refuse_unless_resolves_to_itself(SnapshotObject::Parent, parent)?;
+            }
+        }
+        // The name is cloned twice, and both are small owned values (§6): the
+        // intent and the add take the slot before the snapshot exists, and
+        // the snapshot builds its own slot from the name so that it is a
+        // snapshot slot by construction.
+        let slot = Slot::Snapshot { name: name.clone() };
+        let head = match input {
+            // The input is borrowed and the snapshot owns its HEAD (§6).
+            SnapshotInput::Commit(commit) => SnapshotHead::Existing(commit.clone()),
+            SnapshotInput::Tree { tree, parent } => {
+                let commit = self.snapshot_commit_tree(hooks, tree.as_str(), parent.as_str())?;
+                // `git commit-tree` prints the id of the object it wrote, and
+                // that line is checked to be one before anything is checked
+                // out at it. A line that is not is Git misbehaving, so it is
+                // reported as a Git error naming the command, not as a refusal
+                // of a caller's value.
+                let commit = ObjectId::new(commit).map_err(|refusal| UpstrokeError::Git {
+                    message: format!(
+                        "`git commit-tree` printed something other than an object id: {refusal}"
+                    ),
+                })?;
+                SnapshotHead::Ephemeral(commit)
             }
         };
         self.write_intent(hooks, &slot)?;
-        let path = self.add_worktree(hooks, &slot, &head)?;
-        Ok(Snapshot {
-            slot,
-            path,
-            head,
-            ephemeral,
-        })
+        let path = self.add_worktree(hooks, &slot, head.id().as_str())?;
+        Ok(Snapshot::new(name.clone(), path, head))
+    }
+
+    /// `rev-parse --verify --quiet <id><peel>` in the base, accepted only when
+    /// the answer is `id` itself.
+    ///
+    /// The peel is the role's ([`SnapshotObject::peel`]), so a commit offered
+    /// as the tree peels to that commit's tree and is refused. A full id of
+    /// the repository's own format that names an object of the required type
+    /// resolves to itself, even when a ref of the same spelling exists (Git
+    /// prefers the object and warns on stderr, which `--verify` tolerates).
+    ///
+    /// **Both kinds of wrong type are the caller's mistake, and both refuse**
+    /// with this refusal (§7: the classification follows the decision the
+    /// caller can make, not Git's stderr behaviour). A peel Git can perform to
+    /// another object -- a commit offered as the tree -- answers with that
+    /// other id and is refused directly. A peel it cannot perform at all -- a
+    /// tree offered where a commit is required -- is a Git failure that
+    /// speaks: measured on git 2.43, `rev-parse --verify --quiet
+    /// <tree>^{commit}` exits non-zero with "expected commit type, but the
+    /// object dereferences to tree type" on stderr, which is not the silent
+    /// exit 1 [`Self::quiet_object_lookup`] reads as absence. That failure is
+    /// therefore classified rather than propagated: the object's type is asked
+    /// for once (`cat-file -t`), and an answer that is not the type this role
+    /// requires makes it the same refusal, naming the type the value does
+    /// name. Only a repository that will not say -- no such object, or a Git
+    /// failure of any other kind -- keeps the Git error, which is Git
+    /// misbehaving or a value naming nothing rather than a decision the caller
+    /// can act on differently. A bare `rev-parse --verify --quiet <full id>`
+    /// cannot make this distinction: measured, it echoes an absent id and
+    /// exits 0. Nothing has run either way.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::SnapshotInputResolvesElsewhere`], carrying what the
+    /// repository peeled the value to and, for the unpeelable case, the type
+    /// it does name; or a Git failure this cannot classify, which
+    /// [`Self::quiet_object_lookup`] reports as the error it is.
+    fn refuse_unless_resolves_to_itself(
+        &self,
+        role: SnapshotObject,
+        id: &ObjectId,
+    ) -> Result<(), UpstrokeError> {
+        let argv = [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{id}{}", role.peel())),
+        ];
+        let resolved = match self.quiet_object_lookup(&argv) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // The peel failed with something to say. If the repository
+                // names the object's type and it is not this role's, the
+                // caller offered the wrong kind of object and gets the
+                // refusal; otherwise the Git error stands.
+                let Some(found) = self.object_type(id)? else {
+                    return Err(error);
+                };
+                if found == role.object_type() {
+                    return Err(error);
+                }
+                return Err(Refusal::SnapshotInputResolvesElsewhere {
+                    role,
+                    value: id.as_str().to_owned(),
+                    resolved: None,
+                    found_type: Some(found),
+                }
+                .into());
+            }
+        };
+        if resolved.as_deref() == Some(id.as_str()) {
+            return Ok(());
+        }
+        Err(Refusal::SnapshotInputResolvesElsewhere {
+            role,
+            value: id.as_str().to_owned(),
+            resolved,
+            found_type: None,
+        }
+        .into())
+    }
+
+    /// The type of the object `id` names, or `None` when the repository will
+    /// not say.
+    ///
+    /// `cat-file -t` on a full id, so no revision syntax is involved: an
+    /// absent object exits 128 (measured, git 2.43), which is the `None` here
+    /// rather than an error, because the caller of this is already reporting a
+    /// failure and this only sharpens it.
+    fn object_type(&self, id: &ObjectId) -> Result<Option<String>, UpstrokeError> {
+        let argv = [
+            OsString::from("cat-file"),
+            OsString::from("-t"),
+            OsString::from(id.as_str()),
+        ];
+        let output = self.git(self.base(), &argv)?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
+            message: format!("`git cat-file -t` returned non-UTF-8: {error}"),
+        })?;
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 
     /// Remove an exact snapshot: forced worktree removal, then the intent.
@@ -1912,8 +2090,8 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         snapshot: &Snapshot,
     ) -> Result<(), UpstrokeError> {
-        self.remove_worktree(hooks, &snapshot.slot)?;
-        self.remove_intent(hooks, &snapshot.slot)
+        self.remove_worktree(hooks, snapshot.slot())?;
+        self.remove_intent(hooks, snapshot.slot())
     }
 
     // -----------------------------------------------------------------------
@@ -2590,7 +2768,8 @@ impl WorkspaceManager {
         self.refuse_hooks_entries()
     }
 
-    /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
+    /// Run Git in `cwd` with every repository hook, the fsmonitor and the
+    /// replacement mechanism disabled.
     ///
     /// The hooks path is walked first ([`Self::revalidate_hooks_path`]).
     fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
@@ -2602,6 +2781,42 @@ impl WorkspaceManager {
             })
     }
 
+    /// The one place every command this manager runs is built, and so the one
+    /// place its environment is set.
+    ///
+    /// **`GIT_NO_REPLACE_OBJECTS=1` on all of them.** `git replace A B` makes
+    /// Git read `B` wherever `A` is named, while `rev-parse` still prints `A`:
+    /// measured on git 2.43, with a replacement in place `rev-parse --verify
+    /// --quiet A^{tree}` prints `A`, `commit-tree A -p P` records the raw tree
+    /// `A`, and `worktree add --detach` on that commit materialises the
+    /// *contents of `B`*. So [`Self::add_snapshot`]'s resolve-once check, which
+    /// compares `rev-parse`'s answer with the input, cannot see it, and a
+    /// snapshot of the judged tree would run gates and reviewers over another
+    /// tree entirely -- against `DESIGN.md` §15's exact snapshot. The
+    /// mechanism is refused rather than detected: with the variable set Git
+    /// ignores every replacement, and the same command materialises `A`
+    /// (measured, both ways). It is set here rather than in the snapshot
+    /// funnel because this is where the commands are built, and the reason
+    /// holds for all of them: every funnel primitive (`worktree add`, `worktree
+    /// prune`, `add`, `write-tree`, `cherry-pick`, `commit-tree`,
+    /// `update-ref`) and every read the manager makes through
+    /// [`Self::git`] and [`Self::git_with_identity`] (`rev-parse`, `worktree
+    /// list`, `for-each-ref`, `show-ref`, `diff`) is about the objects the
+    /// repository actually holds.
+    ///
+    /// **What it does not cover, stated precisely.** Only children this
+    /// builder spawns. A gate or a reviewer running inside a snapshot gets the
+    /// environment the host runner composes, which clears the ambient one and
+    /// does not include this; the free functions `read_only_git` and
+    /// `read_only_git_ok`, which `quiescence` uses, are outside this builder
+    /// as they are outside the hooks-path walk. Measured on git 2.43: a role
+    /// process running `git show HEAD:f` in a snapshot of a tree with a
+    /// replacement installed reads the replacement. So the snapshot's
+    /// filesystem is the judged tree while a process inspecting it through Git
+    /// may not see that tree, and this doc claims only the first. Closing the
+    /// second is product-wide behaviour needing a `design/` sentence about
+    /// what an exact snapshot is defined against, and is a deferred row in
+    /// `reviews/FINDINGS.md` §50 awaiting the owner's design ruling.
     fn command(&self, cwd: &Path, args: &[OsString]) -> Command {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(self.hooks_dir());
@@ -2613,6 +2828,7 @@ impl WorkspaceManager {
             .arg(hooks_config)
             .args(["-c", "core.fsmonitor=false"])
             .args(["-c", "protocol.file.allow=never"])
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(args)
             .stdin(Stdio::null());
         command
@@ -2852,7 +3068,8 @@ pub use self::parsers::decode_changed_paths;
 use self::parsers::{parse_worktree_records, registration_checkout};
 
 mod snapshot_ref;
-pub use self::snapshot_ref::{Snapshot, SnapshotInput};
+use self::snapshot_ref::SnapshotHead;
+pub use self::snapshot_ref::{ObjectId, Snapshot, SnapshotInput, SnapshotObject};
 
 // ---------------------------------------------------------------------------
 // Residue classification
@@ -3013,10 +3230,6 @@ fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
     Ok(Some(
         String::from_utf8_lossy(&output.stdout).trim().to_owned(),
     ))
-}
-
-fn index_lock_present(worktree: &Path) -> Result<bool, UpstrokeError> {
-    Ok(git_dir_of(worktree)?.is_some_and(|dir| dir.join("index.lock").exists()))
 }
 
 /// Whether anything in the working tree is not yet in the index.
