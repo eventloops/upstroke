@@ -207,6 +207,21 @@ pub fn classify_object_residue(
             ),
         });
     }
+    // The three adds are one reading: `add_state` is read once here, and its
+    // three states are the three classes, so no transition between an
+    // after-phase read and a residue read can yield `None` for a registered
+    // worktree. (`observed_residue_elements` reads it again for its own
+    // callers; a caller that calls both reads twice, and this function does
+    // not.)
+    if let EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
+    | EffectSiteId::Snapshot(SnapshotSite::Add) = site
+    {
+        return Ok(match add_state(target.repository, target.worktree)? {
+            AddState::Populated => ObjectResidue::After,
+            AddState::Unpopulated => ObjectResidue::Internal,
+            AddState::Unregistered => ObjectResidue::None,
+        });
+    }
     if after_reference_present(site, target)? {
         return Ok(ObjectResidue::After);
     }
@@ -216,7 +231,11 @@ pub fn classify_object_residue(
     Ok(ObjectResidue::None)
 }
 
-/// Whether the site's after-phase reference is present.
+/// Whether the site's after-phase reference is present, for the Object sites.
+///
+/// The three adds are classified in [`classify_object_residue`] from one
+/// `add_state` reading and never reach here; an add site here is the refusal
+/// at the bottom, as any site without an arm is.
 fn after_reference_present(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
@@ -227,12 +246,6 @@ fn after_reference_present(
     // already names its git command and worktree, or its path (module doc,
     // §7).
     match site {
-        // The three adds: the after phase is the populated state of
-        // `add_state`, and their one residue element is its unpopulated state.
-        EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
-        | EffectSiteId::Snapshot(SnapshotSite::Add) => {
-            Ok(add_state(repository, worktree)? == AddState::Populated)
-        }
         // `git add -A` publishes its blobs by renaming index.lock over index.
         // A surviving lock is proof the publication did not happen; otherwise
         // the after state is an index that reflects the working tree.
@@ -426,13 +439,13 @@ pub(super) fn administrative_residue_at(
     Ok(present)
 }
 
-/// What one of the three adds left behind, read once for both the after phase
-/// and the residue element.
+/// What one of the three adds left behind: their three residue classes.
 ///
 /// The after phase is `Populated` and the site's one residue element,
-/// `RegisteredUnpopulatedWorktree`, is `Unpopulated`: the two are arms of one
-/// reading rather than two readings that happen to be complementary, so no
-/// state can be both, or neither while registered.
+/// `RegisteredUnpopulatedWorktree`, is `Unpopulated`: [`classify_object_residue`]
+/// reads this once and maps the three states to the three classes, so no
+/// state can be both, or neither while registered, and no transition between
+/// two reads can be read as `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddState {
     /// `git worktree list` does not name the worktree.

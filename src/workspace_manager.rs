@@ -2882,10 +2882,34 @@ fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
         path: pointer.clone(),
         source,
     })?;
-    Ok(text
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(|target| PathBuf::from(target.trim())))
+    let Some(target) = text.trim().strip_prefix("gitdir:") else {
+        return Ok(None);
+    };
+    let target = target.trim();
+    // `gitdir:` with nothing after it is what a kill between the pointer's
+    // creation and its write can leave; git 2.43 refuses it as "invalid
+    // gitfile format". It names no directory, so it is no git directory by
+    // name, never the directory `""` (which would join every later name onto
+    // the process's working directory): the same unpopulated state as a
+    // pointer whose target is not there, which is what the classifier's
+    // residue element is for.
+    if target.is_empty() {
+        return Ok(None);
+    }
+    // A relative target is relative to the pointer's directory, as Git
+    // resolves it.
+    let target = worktree.join(target);
+    // The pointer is a claim; the directory behind it is the fact. A target
+    // that is not there, or is not a directory, is not a git directory.
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(target)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(UpstrokeError::Io {
+            path: target,
+            source,
+        }),
+    }
 }
 
 fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
@@ -2897,7 +2921,11 @@ fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
         .stdin(Stdio::null())
         .output()
         .map_err(|error| UpstrokeError::Git {
-            message: format!("failed to run git: {error}"),
+            message: format!(
+                "failed to run git {} in {}: {error}",
+                args.join(" "),
+                cwd.display()
+            ),
         })
 }
 
@@ -2910,16 +2938,109 @@ fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, UpstrokeError>
 }
 
 /// The error a read-only Git command that exited non-zero is: the command, the
-/// directory it ran in, and what it said.
+/// directory it ran in, its exit status, and what it said on both streams.
+///
+/// Both streams, because Git does not keep its diagnosis to stderr: `fsck`
+/// reports `missing blob <id>` on stdout with nothing on stderr (exit 2,
+/// measured on git 2.43), and a message without it names no object. Each
+/// stream is trimmed and bounded to [`GIT_OUTPUT_BOUND`] characters so that a
+/// listing cannot become the error.
 fn read_only_git_failure(cwd: &Path, args: &[&str], output: &Output) -> UpstrokeError {
+    let status = match output.status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => "no exit status (killed by a signal)".to_owned(),
+    };
+    let mut said = Vec::new();
+    for (stream, bytes) in [("stderr", &output.stderr), ("stdout", &output.stdout)] {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim();
+        if !text.is_empty() {
+            said.push(format!(
+                "{stream}: {}",
+                text.chars().take(GIT_OUTPUT_BOUND).collect::<String>()
+            ));
+        }
+    }
+    let said = if said.is_empty() {
+        "no output on either stream".to_owned()
+    } else {
+        said.join("; ")
+    };
     UpstrokeError::Git {
         message: format!(
-            "git {} failed in {}: {}",
+            "git {} failed in {} with {status}: {said}",
             args.join(" "),
-            cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            cwd.display()
         ),
     }
+}
+
+/// How much of each stream a failed Git command's error carries.
+const GIT_OUTPUT_BOUND: usize = 1024;
+
+/// Refuse an object store this process cannot read, so that "no such object"
+/// is an answer and not a symptom.
+///
+/// Git reports an object it cannot read as an object it does not have: with a
+/// pack file at mode 000 (its `.idx` still readable), `rev-parse --verify
+/// --quiet <id>^{}` exits 1 in silence, `cat-file --batch-check` prints
+/// `<id> missing`, `cat-file -e` says "Not a valid object name", and `diff
+/// --cached --quiet` exits 1 as for a difference (each measured on git 2.43);
+/// only an unreadable pack *directory* makes Git speak. So an answer of
+/// absence is trusted only after the store is found readable here: the
+/// objects directory, each of its fan-out directories and the pack directory
+/// can be listed, and every `.pack` and `.idx` in it can be opened. A single
+/// unreadable loose object file is outside this check, as is an alternate
+/// object store; Git reports both as missing, and the check does not claim
+/// them.
+///
+/// Called only on the absent or differing answer, so a healthy lookup pays
+/// nothing.
+///
+/// # Errors
+///
+/// `Io` naming the first path that could not be read, or a Git error from
+/// locating the objects directory.
+fn refuse_unreadable_object_store(worktree: &Path) -> Result<(), UpstrokeError> {
+    let objects = object_directory(worktree)?;
+    let listable = |directory: &Path| -> Result<Vec<PathBuf>, UpstrokeError> {
+        let entries = fs::read_dir(directory).map_err(|source| UpstrokeError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        entries
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| UpstrokeError::Io {
+                        path: directory.to_path_buf(),
+                        source,
+                    })
+            })
+            .collect()
+    };
+    for entry in listable(&objects)? {
+        let name = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let Some(name) = name else { continue };
+        let fan_out = name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if fan_out {
+            listable(&entry)?;
+        } else if name == "pack" {
+            for file in listable(&entry)? {
+                let packed = matches!(
+                    file.extension().and_then(|extension| extension.to_str()),
+                    Some("pack" | "idx")
+                );
+                if packed {
+                    fs::File::open(&file)
+                        .map_err(|source| UpstrokeError::Io { path: file, source })?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `rev-parse --verify --quiet <spec>` as a read-only lookup: the id, `None`
@@ -2927,16 +3048,19 @@ fn read_only_git_failure(cwd: &Path, args: &[&str], output: &Output) -> Upstroke
 /// error it is.
 ///
 /// `--verify --quiet` answers a missing object, an unpeelable spec and an
-/// unborn `HEAD` with exit status 1 and nothing on stderr (measured on git
-/// 2.43); that, and only that, is absence. A repository Git cannot open, an
-/// object store it cannot read, or a spawn failure is the error. The free
+/// unborn `HEAD` with exit status 1 and nothing on either stream (measured on
+/// git 2.43). It answers an object in a pack this process cannot read the
+/// same way, so that answer is absence only once
+/// [`refuse_unreadable_object_store`] has found the store readable. A
+/// repository Git cannot open, or a spawn failure, is the error. The free
 /// twin of [`WorkspaceManager::quiet_object_lookup`], for the residue
 /// classifier's inspections, which run without a manager.
 fn read_only_verify(cwd: &Path, spec: &str) -> Result<Option<String>, UpstrokeError> {
     let args = ["rev-parse", "--verify", "--quiet", spec];
     let output = read_only_git(cwd, &args)?;
     if !output.status.success() {
-        if output.status.code() == Some(1) && output.stderr.is_empty() {
+        if output.status.code() == Some(1) && output.stderr.is_empty() && output.stdout.is_empty() {
+            refuse_unreadable_object_store(cwd)?;
             return Ok(None);
         }
         return Err(read_only_git_failure(cwd, &args, &output));
@@ -3044,7 +3168,12 @@ fn object_exists(worktree: &Path, object: &str) -> Result<bool, UpstrokeError> {
     Ok(read_only_verify(worktree, &format!("{object}^{{}}"))?.is_some())
 }
 
-/// The commit `HEAD` names, or `None` on an unborn branch.
+/// The id `HEAD` names, or `None` on an unborn branch.
+///
+/// A ref read, not an object read: `rev-parse --verify --quiet HEAD` answers
+/// the id a detached `HEAD` holds without opening the object (measured on git
+/// 2.43, it answers for an id whose object is absent), so what it establishes
+/// is what `HEAD` says, which is the question the cherry-pick site asks.
 fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
     read_only_verify(worktree, "HEAD")
 }
@@ -3081,14 +3210,20 @@ fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, UpstrokeError>
 ///
 /// `diff --quiet` answers with its exit status, 0 for no difference and 1 for
 /// a difference, and those two are the answers; anything else (a directory
-/// that is not a repository answers 129, a usage error) is the failure it is,
-/// never "differs".
+/// that is not a repository answers 129, a usage error; an index this process
+/// cannot open answers 128 and says so) is the failure it is, never
+/// "differs". A `HEAD` tree in a pack this process cannot read also answers
+/// 1 (measured on git 2.43), so the difference is an answer only once
+/// [`refuse_unreadable_object_store`] has found the store readable.
 fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
     let args = ["diff", "--cached", "--quiet"];
     let output = read_only_git(worktree, &args)?;
     match output.status.code() {
         Some(0) => Ok(false),
-        Some(1) => Ok(true),
+        Some(1) => {
+            refuse_unreadable_object_store(worktree)?;
+            Ok(true)
+        }
         _ => Err(read_only_git_failure(worktree, &args, &output)),
     }
 }
@@ -3105,6 +3240,12 @@ fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
 /// failed (a repository Git cannot open) is the error, not an empty
 /// registration: the three add sites would read that as "nothing registered"
 /// and classify a state they could not inspect.
+///
+/// And a listing that succeeded is complete only if every registration could
+/// be read: with a registration's administrative directory at mode 000,
+/// `git worktree list` exits 0 and omits it (measured on git 2.43). So before
+/// "not in the list" is `None`, every registration under `worktrees/` is
+/// read; one this process cannot read is the error naming it.
 fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
     let listing = read_only_git_ok(repository, &["worktree", "list", "--porcelain", "-z"])?;
     let wanted = canonical_prefix(worktree)?;
@@ -3113,7 +3254,48 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
             return Ok(Some(record));
         }
     }
+    refuse_unlistable_registrations(repository)?;
     Ok(None)
+}
+
+/// Refuse a `worktrees/` directory holding a registration this process
+/// cannot read, which `git worktree list` would have omitted rather than
+/// reported.
+///
+/// # Errors
+///
+/// `Io` naming the `gitdir` file that could not be read, or the directory
+/// that could not be listed; a Git error from locating the common git dir.
+fn refuse_unlistable_registrations(repository: &Path) -> Result<(), UpstrokeError> {
+    let worktrees = common_git_dir(repository)?.join("worktrees");
+    let entries = match fs::read_dir(&worktrees) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(UpstrokeError::Io {
+                path: worktrees,
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| UpstrokeError::Io {
+            path: worktrees.clone(),
+            source,
+        })?;
+        let gitdir = entry.path().join("gitdir");
+        match fs::symlink_metadata(&gitdir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(UpstrokeError::Io {
+                    path: gitdir,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
