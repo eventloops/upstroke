@@ -478,26 +478,6 @@ pub(crate) enum Primitive {
 }
 
 impl Primitive {
-    /// Every primitive, for a test to iterate.
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 15] = [
-        Self::CreateExecutionRoot,
-        Self::RemoveExecutionRoot,
-        Self::WriteIntent,
-        Self::RemoveIntent,
-        Self::ReclaimStagingOrphan,
-        Self::AddWorktree,
-        Self::VerifyWorktree,
-        Self::RemoveWorktree,
-        Self::CandidateStage,
-        Self::CandidateWriteTree,
-        Self::ProposalCherryPick,
-        Self::RepairMaterialize,
-        Self::CreateRef,
-        Self::CompareAndSwapRef,
-        Self::DeleteRef,
-    ];
-
     /// The paths this primitive acts through after its `Before` hook, in the
     /// order they are walked. The Git-running primitives list `HooksPath`
     /// even though the Git runner walks it again for every command

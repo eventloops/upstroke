@@ -1677,7 +1677,7 @@ fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook
     let mut driven = 0_usize;
     let mut skipped = 0_usize;
     let mut driven_primitives = BTreeSet::new();
-    for primitive in Primitive::ALL {
+    for primitive in every_primitive() {
         let count = SubstitutionCase::new(primitive).paths().len();
         assert!(count > 0, "{primitive:?} acts through nothing?");
         for index in 0..count {
@@ -1736,7 +1736,7 @@ fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook
     }
     assert_eq!(
         driven_primitives.len(),
-        Primitive::ALL.len(),
+        every_primitive().len(),
         "every primitive was driven: {driven_primitives:?}"
     );
     // The pinned count: the table's paths, resolved. Scaffolding is five
@@ -1753,6 +1753,52 @@ fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook
     if cfg!(unix) {
         assert_eq!(skipped, 0, "every case runs on Unix");
     }
+}
+
+/// Every funnel primitive, listed here rather than in production (§12: a
+/// test-only item mid-file cuts the effects census's production region) and
+/// pinned complete by the exhaustive match below, which stops compiling when
+/// a variant is added without a place in the list.
+fn every_primitive() -> Vec<Primitive> {
+    use Primitive as P;
+    let all = vec![
+        P::CreateExecutionRoot,
+        P::RemoveExecutionRoot,
+        P::WriteIntent,
+        P::RemoveIntent,
+        P::ReclaimStagingOrphan,
+        P::AddWorktree,
+        P::VerifyWorktree,
+        P::RemoveWorktree,
+        P::CandidateStage,
+        P::CandidateWriteTree,
+        P::ProposalCherryPick,
+        P::RepairMaterialize,
+        P::CreateRef,
+        P::CompareAndSwapRef,
+        P::DeleteRef,
+    ];
+    for primitive in &all {
+        match primitive {
+            P::CreateExecutionRoot
+            | P::RemoveExecutionRoot
+            | P::WriteIntent
+            | P::RemoveIntent
+            | P::ReclaimStagingOrphan
+            | P::AddWorktree
+            | P::VerifyWorktree
+            | P::RemoveWorktree
+            | P::CandidateStage
+            | P::CandidateWriteTree
+            | P::ProposalCherryPick
+            | P::RepairMaterialize
+            | P::CreateRef
+            | P::CompareAndSwapRef
+            | P::DeleteRef => {}
+        }
+    }
+    assert_eq!(all.len(), 15, "one entry per variant");
+    all
 }
 
 /// One generated case's fixture, in the state its primitive needs.
