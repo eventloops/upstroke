@@ -4167,6 +4167,33 @@ fn a_relative_registration_still_binds_its_checkout() {
         .manager
         .revalidate_removal(&path)
         .expect_err("a registration resolving to a foreign directory inside the root refuses");
+
+    // A relative registration whose checkout does not exist and which climbs
+    // above the filesystem root refuses by name at the decoder, where before
+    // the join was handed to canonicalisation with its `..` intact and the
+    // absent checkout was read as "not this registration".
+    let depth = fs::canonicalize(&admin)
+        .expect("admin exists")
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count();
+    let mut climb = PathBuf::new();
+    for _ in 0..=depth {
+        climb.push("..");
+    }
+    climb.push("absent");
+    climb.push(".git");
+    fs::write(admin.join("gitdir"), format!("{}\n", climb.display())).expect("climbing gitdir");
+    let refused = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect_err("a relative registration that climbs above the root refuses by name");
+    assert!(
+        refused
+            .to_string()
+            .contains("climbs above the filesystem root"),
+        "{refused}"
+    );
 }
 
 /// Git failing to enumerate is an error, never "not registered": a zero-length

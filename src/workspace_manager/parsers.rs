@@ -86,9 +86,13 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 /// writes the linking files relative, and Git's reader joins the recorded path
 /// to the directory holding the `gitdir` file and resolves it with realpath
 /// (`worktree.c`, `get_linked_worktree`). This does the join, against `admin`,
-/// which is that directory; the caller's canonicalisation is the realpath. The
-/// `..` components such a path is made of are the join's, so they are allowed
-/// there and only there; an absolute registration still refuses them.
+/// which is that directory, and resolves the `..` such a path is made of
+/// lexically ([`resolve_relative`]), so the checkout handed out is always one
+/// normalised absolute path and no caller has to canonicalise it before a
+/// component-wise comparison; the caller's canonicalisation is then Git's
+/// realpath over an already normalised path. A relative path that climbs above
+/// the filesystem root, or is not normalised in itself, refuses by name; an
+/// absolute registration refuses `..` as before.
 ///
 /// `commondir` is deliberately not an input to this binding. A valid `gitdir`
 /// plus an empty `commondir` is the one safe repairable state: it identifies
@@ -122,8 +126,9 @@ pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBu
             });
         }
     };
-    let relative = !recorded.is_absolute();
-    let recorded = if relative {
+    let recorded = if recorded.is_absolute() {
+        recorded
+    } else {
         if recorded.has_root() {
             return Err(UpstrokeError::Git {
                 message: format!(
@@ -141,15 +146,30 @@ pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBu
                 ),
             });
         }
-        admin.join(recorded)
-    } else {
-        recorded
+        let normalized: PathBuf = recorded.components().collect();
+        if normalized.as_os_str() != recorded.as_os_str() {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "worktree registration {} has a gitdir that is not a normalized relative path",
+                    admin.display()
+                ),
+            });
+        }
+        let Some(resolved) = resolve_relative(admin, &recorded) else {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "worktree registration {} has a relative gitdir that climbs above the \
+                     filesystem root",
+                    admin.display()
+                ),
+            });
+        };
+        resolved
     };
     let normalized: PathBuf = recorded.components().collect();
-    if (!relative
-        && recorded
-            .components()
-            .any(|component| component == Component::ParentDir))
+    if recorded
+        .components()
+        .any(|component| component == Component::ParentDir)
         || normalized.as_os_str() != recorded.as_os_str()
     {
         return Err(UpstrokeError::Git {
@@ -176,6 +196,32 @@ pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBu
         });
     };
     Ok(checkout.to_path_buf())
+}
+
+/// `relative` joined to `admin` with every `..` resolved lexically, or `None`
+/// when a `..` would climb above the filesystem root.
+///
+/// Lexical on purpose: this module touches no path, and the caller's
+/// canonicalisation resolves links afterwards over a path that no longer has
+/// a `..` for a component-wise comparison to misread. `admin` is absolute, so
+/// [`PathBuf::pop`] answers `false` only at the root; `relative` has no root
+/// and is normalised in itself, so its components are `..`, names, and at
+/// most a leading `.`.
+fn resolve_relative(admin: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut resolved = admin.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(resolved)
 }
 
 /// A path as Git's plumbing spells it, as this platform's [`PathBuf`].
@@ -668,17 +714,25 @@ mod tests {
 
     /// Git 2.48's `worktree.useRelativePaths`: the path is relative to the
     /// directory holding the `gitdir` file, and the `..` it is made of are
-    /// the join's, resolved by the caller's canonicalisation.
+    /// resolved here, so the checkout handed out is one normalised absolute
+    /// path; a climb above the filesystem root refuses by name.
     #[test]
-    fn a_relative_registration_is_joined_to_its_registration_directory() {
+    fn a_relative_registration_is_resolved_against_its_registration_directory() {
         let admin = absolute("/repo/.git/worktrees/example");
         let decoded = registration_checkout(&admin, b"../../../wt/.git\n")
             .expect("a relative gitdir is Git's own form");
-        assert_eq!(decoded, admin.join(platform("../../../wt")));
+        assert_eq!(decoded, absolute("/repo/wt"), "resolved, with no `..` left");
         assert!(
-            decoded.is_absolute(),
-            "the join is absolute because admin is"
+            decoded.components().all(|c| c != Component::ParentDir),
+            "no caller has to normalise it"
         );
+
+        let refused = registration_checkout(&admin, b"../../../../../x/.git\n")
+            .expect_err("five `..` from a four-deep registration climb above the root");
+        assert!(message(refused).contains("climbs above the filesystem root"));
+        let decoded = registration_checkout(&admin, b"../../../../x/.git\n")
+            .expect("four `..` reach the root exactly");
+        assert_eq!(decoded, absolute("/x"));
 
         let refused = registration_checkout(&admin, b"../../../wt\n")
             .expect_err("a relative gitdir still names a checkout .git");
@@ -686,7 +740,7 @@ mod tests {
 
         let refused = registration_checkout(&admin, b"../../.././wt/.git\n")
             .expect_err("a relative gitdir is still normalised");
-        assert!(message(refused).contains("not an absolute normalized path"));
+        assert!(message(refused).contains("not a normalized relative path"));
 
         let refused = registration_checkout(&platform("relative/admin"), b"../wt/.git\n")
             .expect_err("nothing to resolve a relative gitdir against");
