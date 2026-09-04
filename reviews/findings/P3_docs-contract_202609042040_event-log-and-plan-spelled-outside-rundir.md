@@ -35,21 +35,27 @@ Seven sites in five files. So a rename of either constant is a multi-file edit
 whose omissions surface as a run whose log the exporter, `status`, `resume`,
 `validate` and the capacity read cannot find, rather than as a compile error.
 
-Measured by mutating `EVENT_LOG` to `"events.jsonlx"` and running
-`cargo test --lib`, every run under `flock /tmp/w1-eight.lock`: 92 failures on
-this branch against 100 at master, at `7724ed1d628070b35948819095a68a38cd0c5d0a`
-versus `74537be` and again after the merge-in of master `93d6337`.
+**No mutation evidence is offered for this row, deliberately.** An earlier version cited the
+`EVENT_LOG` mutation — 100 crate-suite failures at master against 92 on the branch — as this
+finding's witness. That was wrong twice over and the citation is withdrawn rather than reworded:
 
-The net 8 is 13 against 5, and the 5 are this finding's own argument. Thirteen
-tests stop failing once `rundir`'s accessor reads the constant, because the
-writer and the census agree again. Five **start** failing, and they are literal
-readers this repair did not reach: `src/engine/topology/settle/tests.rs:1729`'s
-`committed()` helper joins `"events.jsonl"` by hand, and `src/rundir/tests.rs:105`
-spells `".upstroke/runs/RUN1/events.jsonl"`. That is what a half-routed name
-costs — moving the writer breaks every reader still spelling the string. Routing `rundir`'s own two accessors through the constants
-closed 8 of those; the remaining gap is these five files. Nothing is broken
-today — the strings agree — and the drift is loudly caught if it ever happens,
-which is why this is P3 and not higher.
+* It mutates `EVENT_LOG` only, so it measures nothing at all about the two `plan.normalized.json`
+  sites in the table above.
+* The tests it newly reddens are **literal readers inside the suite** —
+  `src/engine/topology/settle/tests.rs`'s `committed()` helper and `src/rundir/tests.rs:105` —
+  not the seven production sites. Route all seven and those tests still fail, because they spell
+  the byte string themselves. So the experiment demonstrates writer/test coupling; it does not
+  isolate this census finding, and "the 92 that remain are the seven production spellings" was
+  false.
+
+That measurement belongs where it does witness something: the repair in `SWEEP-NAMES-001`, which is
+where the pull request body now keeps it. This row stands on the census — seven sites, listed above,
+each one greppable — and on nothing else.
+
+`MAINTAINING.md`'s rule that a finding carrying a mutation witness is fixed whatever its severity is
+the reason this matters rather than being a wording preference: citing that measurement here would
+have obliged a fix of seven sites across five files outside `rundir`, which is a different pull
+request. The row exists to say so.
 
 `src/main.rs:380` also spells `"plan.normalized.json"`, for `upstroke validate
 --emit-json`. That is a **different file**: it is written into the current

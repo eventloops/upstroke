@@ -1,15 +1,27 @@
-//! The names the `rundir` funnels write on disk, as constants.
+//! The names one run's files carry on disk, as constants.
 //!
 //! The marker, the two private records and their staging siblings, the event
 //! log and the frozen plan. They are consts rather than a literal at each call
 //! site because the sites that have to agree on the byte string sit in
-//! different files: the funnels in `src/rundir.rs` publish them, the classifier
-//! in `classify.rs` and the ownership proof in `ownership.rs` read them back,
-//! and `the_names_on_disk_are_the_names_the_packet_writes` in `tests.rs` binds
+//! different files.
+//!
+//! **Who writes each, exactly.** Seven of the eight are published by a funnel
+//! in `src/rundir.rs`: `stage_marker` and `publish_marker`, the owner and
+//! commit-record pairs, and `write_plan` for [`PLAN`]. [`EVENT_LOG`] is the
+//! exception and is worth knowing about — `src/rundir.rs` only *names* it, in
+//! `RunPaths::events` and in the re-export; the log itself is opened and
+//! appended by `EventLog` in `src/events/log.rs`, which takes the path it is
+//! given. So this module names a file that `rundir` does not write.
+//!
+//! Reading them back: the classifier in `classify.rs` (`EVENT_LOG`), and the
+//! ownership proof in `ownership.rs`, below. Pinning them:
+//! `the_names_on_disk_are_the_names_the_packet_writes` in `tests.rs` binds
 //! every const to its literal. A second test,
-//! `the_event_log_and_the_plan_are_reached_through_their_constants`, fails when
-//! a `RunPaths` accessor and its const disagree; it cannot witness the
-//! substitution that put them in agreement, and its own doc says why.
+//! `the_event_log_and_the_plan_are_reached_through_their_constants`, fails on
+//! an **accessor drift** — a `RunPaths` accessor spelling something other than
+//! its const. It does not fail on a change to the const, which moves both sides
+//! of its assertion, and it cannot witness the substitution that put accessor
+//! and const in agreement at all; its own doc says why.
 //!
 //! **One source of truth for `rundir`, not yet for the crate.** [`EVENT_LOG`]
 //! and [`PLAN`] name the two files a command outside this module opens by path
@@ -20,9 +32,9 @@
 //! derivation, quoted the same way here, in `SWEEP-NAMES-002` and in the pull
 //! request body. A rename of either const is therefore still a multi-file edit.
 //! The six names above them are not: no production code outside `rundir` spells
-//! any of the six as a path, and the one test that does
-//! (`engine/topology/emit/tests.rs`, joining `committed.json`) is
-//! `SWEEP-NAMES-003`.
+//! any of the six as a path. One test does — `engine/topology/emit/tests.rs`,
+//! joining `committed.json` — and that one is load-bearing rather than untidy;
+//! see below and `SWEEP-NAMES-003`.
 //!
 //! **What the proof consults, exactly.** `prove_private_half_ownership` reads
 //! two of these back and parses each ([`MARKER`], then [`OWNER_RECORD`] at the
@@ -36,11 +48,18 @@
 //! run-directory drawing carries [`EVENT_LOG`] and [`PLAN`]. The other six
 //! appear in no `design/` section at all, so this repository states no rule
 //! about renaming them — and for these six a rename is not a refactor. A run
-//! killed after old P5b still holds a file called `committed.json`; the proof
-//! would stat the *new* name, find it absent, mint a deletion token on that
-//! absence and delete a private half that had crossed the deletion boundary.
-//! The missing compatibility contract is `SWEEP-NAMES-008`, deferred: it
-//! belongs in §15 and `DESIGN.md` is the owner's.
+//! killed after old P5b still holds a file called `committed.json`; a proof
+//! built on the new name would stat it, find it absent, mint a deletion token
+//! on that absence and delete a private half that had crossed the deletion
+//! boundary. The missing compatibility contract is `SWEEP-NAMES-008`, deferred:
+//! it belongs in §15 and `DESIGN.md` is the owner's.
+//!
+//! What stands between that and a green suite today is **one test**, measured:
+//! rename [`COMMIT_RECORD`] and its staged sibling, update the literal-pinning
+//! test the way a renamer would, and exactly one test of 1,924 fails —
+//! `engine::topology::emit::tests::torn_first_line_is_husk_or_possibly_committed_per_commit_record`,
+//! which joins `"committed.json"` by hand. `SWEEP-NAMES-003` records that
+//! literal as a guard to keep rather than a duplicate to tidy away.
 //!
 //! Nothing in `src/` stands in for that, and nothing here tries to. A retired
 //! decision record establishes no product contract, and neither does

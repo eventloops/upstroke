@@ -2417,17 +2417,24 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
 /// assert over source text, and a sibling helper satisfies every text
 /// assertion. So this is not the repair's witness and is not offered as one.
 ///
-/// **What it is.** A pin that fails the moment an accessor and its constant
-/// disagree — which, now that the accessors read the constant, takes a change
-/// to the constant. `EVENT_LOG` changed to `"events.jsonlx"` fails this test on
-/// master's accessor, which never read the constant, and passes here.
+/// **What it is.** A pin against an **accessor drift**: it fails when a
+/// `RunPaths` accessor spells something other than its constant.
+/// `RunPaths::events` changed to `"events.json"` fails it, while
+/// `the_names_on_disk_are_the_names_the_packet_writes` passes, so the two are
+/// not redundant. A change to the *constant* does **not** fail it here — both
+/// sides of the assertion move together — though it did on master's accessor,
+/// which never read the constant. That asymmetry is the only sense in which the
+/// routing is observable from a test at all.
 ///
 /// **What does witness the repair is a measurement, not an assertion.** With
 /// `EVENT_LOG` changed to `"events.jsonlx"`, the crate suite fails 100 tests at
-/// master and 92 at the repaired head; the eight-test difference is the sites
-/// this repair routed, and the 92 that remain are the seven production
-/// spellings outside this module (`SWEEP-NAMES-002`). The pull request body
-/// carries the command and both numbers.
+/// master and 92 at the repaired head. The eight-test difference is what
+/// routing these two accessors changed, and that is the whole of what the
+/// experiment shows: it mutates one constant, so it says nothing about the two
+/// `PLAN` sites, and the tests it newly reddens are literal readers in the
+/// suite rather than the production sites of `SWEEP-NAMES-002`. It is a
+/// measurement of writer/test coupling, not a census. The pull request body
+/// carries the command, both numbers and that boundary.
 #[test]
 fn the_event_log_and_the_plan_are_reached_through_their_constants() {
     // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
