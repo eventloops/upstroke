@@ -148,7 +148,7 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 | `.clone()` | 1,941 | 84 |
 | `?` (propagation) | ≈1,200 | 71 |
 
-Baseline at the panic-surface tightening, measured at master `74537be` over 166 Rust files under
+Baseline at the panic-surface tightening, measured at master `93d6337` over 166 Rust files under
 `src/` and `examples/` by running the two lints themselves —
 `cargo clippy --all-targets --all-features -- -W clippy::unreachable -W clippy::indexing_slicing`,
 counting each warning's primary span once:
@@ -156,7 +156,13 @@ counting each warning's primary span once:
 | Construct | Sites | Files | In a `tests.rs` | Elsewhere |
 |---|---|---|---|---|
 | `unreachable!` | 65 | 20 | 43 | 22 |
-| indexing and slicing | 1,030 | 72 | 438 | 592 |
+| indexing and slicing | 1,034 | 72 | 442 | 592 |
+
+**This is a measurement at a named head, not a property of the tree, and the sweep moves it.**
+Merging master in twice while this section was being written took `unreachable!` from a claimed 77
+to a claimed 79 and indexing from 1,030 to 1,034 — the second of those from one merge, `93d6337`,
+which added four indexing sites in a suite. The command above is recorded so the number can be
+taken again rather than argued about; a stale figure here is a re-run, not a finding.
 
 **Neither construct can be counted by text, and the earlier figures in this section were a text
 census that was wrong.** `grep` finds 79 mentions of `unreachable!` across 23 files at this head;
