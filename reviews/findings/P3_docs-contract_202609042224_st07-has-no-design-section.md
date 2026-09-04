@@ -40,8 +40,9 @@ must be placed in `DESIGN.md` before this file can be marked swept.** PR #146 ac
 claim `src/topology/effects/bijection.rs` swept: the row stays in the review queue with a note,
 and the code improvements land on their own.
 
-The remedy is a `DESIGN.md` change, which is the owner's, and this is the third pull request on
-2026-09-04 blocked on the same rule (#139 and #143 are the others). The coordinator is
+The remedy is a `DESIGN.md` change, which is the owner's, and this is one of four pull requests
+on 2026-09-04 blocked on the same rule (#139, #143 and the `apply.rs` sweep are the others; pass 2
+on `2421651` restated it as finding 4). The coordinator is
 consolidating the three into one decision for the owner. **Beyond reach, not out of scope:** no
 sweep session can settle it, so if a later pass labels this P1 or P2 the disposition becomes
 escalate-to-owner rather than still-deferred.
