@@ -211,7 +211,7 @@ pub fn prove_private_half_ownership(
     }
 
     // Three answers, and only one of them continues.
-    match locator_identity(&locator, &authorized_runs, &basename) {
+    match locator_identity(&locator, authorized_root, &authorized_runs, &basename) {
         LocatorIdentity::Established => {}
         LocatorIdentity::Refused { expected } => {
             return PrivateHalfOwnership::Retained(RetainReason::LocatorOutsideAuthorizedRoot {
@@ -498,21 +498,47 @@ enum LocatorIdentity {
     Undetermined { detail: String },
 }
 
-fn locator_identity(locator: &Path, authorized_runs: &Path, basename: &str) -> LocatorIdentity {
-    let expected_raw = authorized_runs.join(basename);
-    if locator == expected_raw {
+fn locator_identity(
+    locator: &Path,
+    authorized_root: &Path,
+    authorized_runs: &Path,
+    basename: &str,
+) -> LocatorIdentity {
+    // (1) The raw spelling, and it costs no I/O. This is the one that carries
+    // P1 on a machine whose configured root is already canonical.
+    if locator == authorized_runs.join(basename) {
         return LocatorIdentity::Established;
     }
-    match fs::canonicalize(authorized_runs) {
-        Ok(runs) => {
-            let expected = runs.join(basename);
-            if locator == expected {
-                LocatorIdentity::Established
-            } else {
-                LocatorIdentity::Refused { expected }
-            }
-        }
-        Err(error) => LocatorIdentity::Undetermined {
+    // (2) The **root** canonicalized, which is precisely what
+    // `prelock::authorized_private_root` records: it canonicalizes the root,
+    // because the run directory does not exist during the pre-lock checks, and
+    // joins `runs/<id>`. On any machine where the configured root reaches the
+    // real one through a link — `/var` to `/private/var` on macOS, a verbatim
+    // prefix on Windows — this is the only spelling that matches at P1, and CI
+    // is what taught this function so: the first version checked (1) and (3)
+    // alone and turned the legitimate `TargetAbsent` at P1 into a refusal on
+    // the macOS and Windows legs while passing on Linux.
+    let canonical_root = fs::canonicalize(authorized_root);
+    if matches!(&canonical_root, Ok(root) if locator == root.join("runs").join(basename)) {
+        return LocatorIdentity::Established;
+    }
+    // (3) `<R>/runs` canonicalized, which differs from (2) when `runs` is
+    // itself a link — legitimate, and refused by neither.
+    let canonical_runs = fs::canonicalize(authorized_runs);
+    if matches!(&canonical_runs, Ok(runs) if locator == runs.join(basename)) {
+        return LocatorIdentity::Established;
+    }
+    // Nothing matched. That is a refusal only if every spelling was actually
+    // computed; a canonicalization that failed is a spelling this function
+    // never saw, so it cannot say the locator is not that one.
+    match (&canonical_root, &canonical_runs) {
+        (Ok(_), Ok(runs)) => LocatorIdentity::Refused {
+            expected: runs.join(basename),
+        },
+        (Err(error), _) => LocatorIdentity::Undetermined {
+            detail: format!("{}: {error}", authorized_root.display()),
+        },
+        (_, Err(error)) => LocatorIdentity::Undetermined {
             detail: format!("{}: {error}", authorized_runs.display()),
         },
     }

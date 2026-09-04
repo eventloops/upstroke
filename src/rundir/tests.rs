@@ -3026,6 +3026,68 @@ fn a_private_root_that_is_not_utf8_is_retained_rather_than_reclaimed() {
     );
 }
 
+/// A configured private root reached through a **link** still reclaims at P1
+/// — the macOS and Windows shape, reproduced where this box can run it.
+///
+/// `prelock::authorized_private_root` canonicalizes the root and records
+/// `<canonical R>/runs/<id>`, while the census is configured with the root as
+/// the operator spelled it. On a machine where those differ — `/var` reaching
+/// `/private/var` on macOS, a verbatim `\\?\` prefix on Windows — the recorded
+/// locator matches neither the raw spelling nor `canonicalize(<R>/runs)` at P1,
+/// because `<R>/runs` does not exist yet and cannot be canonicalized at all.
+///
+/// The first version of the identity gate checked exactly those two spellings,
+/// so it turned the legitimate `TargetAbsent` into a refusal — green on Linux,
+/// red on `test (macos-latest)` and `test (winguest)` with `the census does not
+/// converge on ST-19's answer`. CI caught it; this test is what would have.
+/// The third spelling — the root canonicalized, which is the one the recorder
+/// uses — is now checked, and a symlinked root reproduces the shape here.
+///
+/// Unix, because it needs a symlink; the property it guards is a Windows one
+/// too, and there the verbatim prefix plays the link's part.
+#[cfg(unix)]
+#[test]
+fn a_private_root_reached_through_a_link_still_reclaims_a_husk_at_p1() {
+    let husk = BoundHusk::new("linked-root");
+    // The real root, and a link to it that is what the census is configured
+    // with. `BoundHusk` records the marker from the canonical path, which is
+    // what `prelock` does.
+    let real_root = husk.private_root.clone();
+    let linked_root = husk.root.join("configured-root");
+    std::os::unix::fs::symlink(&real_root, &linked_root).expect("the link");
+    assert_ne!(
+        linked_root, real_root,
+        "the fixture needs two spellings of one root"
+    );
+
+    // P1: the marker is published and the private half was never created, so
+    // `<R>/runs` does not exist — this is the state whose answer is
+    // `TargetAbsent`.
+    fs::remove_dir_all(real_root.join("runs")).expect("no runs directory yet");
+    let public = husk.public();
+    create_public_dir(&public, &mut NoHooks).expect("P0");
+    stage_marker(&public, &husk.marker, &mut NoHooks).expect("P1a");
+    publish_marker(&public, &mut NoHooks).expect("P1b");
+    assert!(
+        fs::canonicalize(linked_root.join("runs")).is_err(),
+        "the fixture needs a runs directory that cannot be canonicalized"
+    );
+
+    let answer = prove_private_half_ownership(&public, &husk.repo_key, &linked_root);
+    match answer {
+        PrivateHalfOwnership::NothingBound(shape) => assert_eq!(
+            shape,
+            UnboundShape::TargetAbsent,
+            "the recorded target was never created, and the census reclaims the public husk"
+        ),
+        other => panic!(
+            "a root reached through a link refused its own marker at P1: {other:?} — this is \
+             the macOS and Windows shape, and refusing here disables the one state \
+             `TargetAbsent` exists for"
+        ),
+    }
+}
+
 /// A runs directory that cannot be resolved does not establish a locator —
 /// the reviewer's own sequence, which the fail-open gate walked straight past.
 ///
