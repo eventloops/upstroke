@@ -249,7 +249,7 @@ effect_free = [
     "refusal_cause",
 ]
 
-# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
+# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
 [[module]]
 path = "src/workspace_manager/naming.rs"
 crate_path = "upstroke::workspace_manager::naming"
@@ -260,15 +260,28 @@ effectful_unnameable = []
 effect_free = [
     "as_str",
     "fmt",
+    "from",
     "from_intent_name",
     "gates",
+    "deserialize",
+    "expecting",
+    "id",
+    "incarnation",
     "integration",
+    "intent_kind",
     "intent_name",
     "kind",
+    "new",
     "relative",
     "review",
+    "run_id",
     "safe_component",
+    "serialize",
+    "slot",
+    "try_from",
     "validate",
+    "visit_map",
+    "visit_str",
 ]
 
 # Object-id well-formedness and the two refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
