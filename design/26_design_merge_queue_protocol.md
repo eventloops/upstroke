@@ -300,17 +300,18 @@ record-before-authoritative-effect plus exact, narrow adoption:
 | Proposed commit exists, no `merge_prepared` or `merge_rejected` terminal event | Settle any dangling merge-verification process as interrupted/unknown-spend, treat the proposal as unverified residue, and rerun verification; a pass or code rejection is never stranded in a separate finished event. |
 | After `merge_prepared`, run ref still equals `expected_head` | Retry the same compare-and-swap to the recorded proposed SHA, then append `task_merged`. For `already_present` the two SHAs are equal, so this is a validation-only no-op followed by the same settlement. |
 | After the ref moved, before `task_merged` | If the ref equals the recorded proposed SHA, append `task_merged`; any third SHA is foreign history and resume refuses. |
+| `task_merged` exists but the ref disagrees | Refuse; the log and integration branch no longer describe the same run. |
 
 Every read the engine makes of the repository to decide these rows (whether a recorded object
 exists, what a worktree's index holds against its `HEAD`, what `fsck` reports unreachable, which
 worktrees are registered) is an inspection, and an inspection that fails is an error, never an
-answer: a Git or filesystem failure while inspecting propagates as a Git or I/O error naming what
-failed, and is not read as the object being absent, the index differing, the store holding
-nothing unreachable, or the worktree being unregistered. Only Git's own answer for absence, given
-from an object store this process can read, is absence. Where Git reports what it cannot read as
-what it does not have (an unreadable pack file, on git 2.43), the engine establishes that the
-store is readable before it takes that answer.
-| `task_merged` exists but the ref disagrees | Refuse; the log and integration branch no longer describe the same run. |
+answer: a Git or filesystem failure while inspecting propagates as a Git or I/O error naming the
+command or the path that failed, and is not read as the object being absent, the index
+differing, the store holding nothing unreachable, or the worktree being unregistered. Absence is
+only what Git itself answers for absence. Where Git reports what it cannot read as what it does
+not have — an unreadable pack makes `rev-parse --verify --quiet` exit 1 in silence, exactly as a
+missing object does (git 2.43) — the two are indistinguishable to the engine's inspections, and
+establishing that a store is readable is the object store's own concern, not an inspection's.
 
 Worktree cleanup happens only after the event proving the corresponding state
 is terminal. Internal candidate/prepared refs remain until `run_finished`, then

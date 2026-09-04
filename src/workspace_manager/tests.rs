@@ -4198,8 +4198,18 @@ fn a_relative_registration_still_binds_its_checkout() {
 
 /// Git failing to enumerate is an error, never "not registered": a zero-length
 /// `commondir`, the interrupted-add residue `revalidate_removal` documents,
-/// makes `git worktree list` fail, and the classifier propagates that rather
+/// makes `git worktree list` fail, and `record_for` propagates that rather
 /// than reading the registered-but-unpopulated worktree as absent.
+///
+/// **The classifier's half of this test changed with `SWEEP-WORKTREE-012`**
+/// (measured by the `worktree.rs` sweep on PR #131, deferred to this file):
+/// that exact state is an add killed between creating the administrative
+/// directory and writing `commondir`, which is residue the add sites
+/// register, so the classifier reads the registration itself and answers
+/// `Internal` rather than reporting an inspection it could not make. It is
+/// still never "absent", which is what this test was written to pin;
+/// `an_add_killed_before_commondir_is_written_is_interrupted_add_residue`
+/// carries the fuller case.
 #[test]
 fn a_failed_worktree_list_is_an_error_not_an_absent_registration() {
     let fixture = Fixture::created("failed-list");
@@ -4216,11 +4226,17 @@ fn a_failed_worktree_list_is_an_error_not_an_absent_registration() {
         error.to_string().contains("worktree list"),
         "the error names the command: {error}"
     );
-    classify_object_residue(
-        EffectSiteId::Worktree(WorktreeSite::Add),
-        &ResidueTarget::new(&fixture.base).at(&path),
-    )
-    .expect_err("the classifier propagates the failure and does not answer for Git");
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    assert_eq!(
+        classify_object_residue(site, &target).expect("the classifier reads the registration"),
+        ObjectResidue::Internal,
+        "the interrupted add is residue this site registers, and never absence"
+    );
+    assert_eq!(
+        observed_residue_elements(site, &target).expect("observe"),
+        vec![ResidueElement::RegisteredUnpopulatedWorktree]
+    );
 }
 
 #[test]
@@ -6480,87 +6496,6 @@ fn the_classifiers_inspections_report_a_git_failure_instead_of_answering() {
     }
 }
 
-/// Git reports an object in a pack this process cannot read as an object it
-/// does not have: `rev-parse --verify --quiet` exits 1 in silence and `diff
-/// --cached --quiet` exits 1 as for a difference (git 2.43, the pack at mode
-/// 000 with its `.idx` readable). So before the sweep's first repair those
-/// were "no such object", "no HEAD" and "differs", and `RepairMaterialize`
-/// classified a clean but unreadable repository `After`. The absent and
-/// differing answers are now trusted only after the object store is found
-/// readable, and an unreadable pack is an `Io` error naming it. Evaluated on
-/// the Unix legs, where a mode bit binds a non-root user.
-///
-/// Witnessed failing with `refuse_unreadable_object_store` removed from
-/// `read_only_verify` (the object reads answer) and, separately, from
-/// `index_differs_from_head` (the difference answers).
-#[cfg(unix)]
-#[test]
-fn an_unreadable_pack_is_an_error_and_not_a_missing_object_or_a_difference() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let fixture = Fixture::created("residue-unreadable-pack");
-    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
-    let path = fixture.manager.slot_path(&slot);
-    git(&fixture.base, &["repack", "-a", "-d", "-q"]);
-    let pack_dir = object_directory(&fixture.base)
-        .expect("objects")
-        .join("pack");
-    let packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
-        .expect("pack directory")
-        .map(|entry| entry.expect("entry").path())
-        .filter(|file| {
-            file.extension()
-                .is_some_and(|extension| extension == "pack")
-        })
-        .collect();
-    assert!(!packs.is_empty(), "the repack must have produced a pack");
-    let _restore: Vec<RestoreMode> = packs
-        .iter()
-        .map(|pack| RestoreMode { path: pack.clone() })
-        .collect();
-    for pack in &packs {
-        fs::set_permissions(pack, fs::Permissions::from_mode(0o000)).expect("make it unreadable");
-        // The injection must bite: root, or a process holding
-        // CAP_DAC_OVERRIDE, reads through a mode of 000.
-        assert!(
-            fs::File::open(pack).is_err(),
-            "prerequisite not met: the mode bit did not bind (running as root or with \
-             CAP_DAC_OVERRIDE); this test needs an unprivileged user"
-        );
-    }
-    let names_a_pack = |error: &UpstrokeError| matches!(error, UpstrokeError::Io { path, .. } if packs.contains(path));
-
-    let error = object_exists(&fixture.base, &fixture.head)
-        .expect_err("an object in an unreadable pack is not a missing object");
-    assert!(names_a_pack(&error), "the error names the pack: {error}");
-    let error = fixture
-        .manager
-        .object_exists(&fixture.head)
-        .expect_err("the manager's contract: a Git error other than no such object");
-    assert!(names_a_pack(&error), "the error names the pack: {error}");
-    // `HEAD` is a ref read, not an object read: `rev-parse --verify --quiet
-    // HEAD` answers the id a detached HEAD holds without opening the object
-    // (measured: it also answers for an id whose object is absent), so the
-    // unreadable pack does not reach it and it still answers.
-    assert_eq!(
-        head_commit(&path).expect("a ref read").as_deref(),
-        Some(fixture.head.as_str())
-    );
-    let error = index_differs_from_head(&path)
-        .expect_err("a clean index against an unreadable HEAD tree does not differ");
-    assert!(names_a_pack(&error), "the error names the pack: {error}");
-    let target = ResidueTarget::new(&fixture.base).at(&path);
-    let error =
-        classify_object_residue(EffectSiteId::Object(ObjectSite::RepairMaterialize), &target)
-            .expect_err("the classifier does not answer After for a store it could not read");
-    assert!(names_a_pack(&error), "the error names the pack: {error}");
-    let error = classify_object_residue(
-        EffectSiteId::Object(ObjectSite::CandidateCommitTree),
-        &ResidueTarget::new(&fixture.base).published(&fixture.head),
-    )
-    .expect_err("the classifier does not answer for a store it could not read");
-    assert!(names_a_pack(&error), "the error names the pack: {error}");
-}
-
 /// The pointer is a claim; the directory behind it is the fact. `gitdir:`
 /// with an empty path is what a kill between the pointer's creation and its
 /// write can leave, and git 2.43 refuses it as "invalid gitfile format": it
@@ -6734,6 +6669,246 @@ fn a_failed_git_inspection_names_the_command_the_directory_the_status_and_what_g
             "the error carries {needle:?}: {message}"
         );
     }
+}
+
+/// The registration's `gitdir` is read, not stat'ed: at mode 000 it stats
+/// fine, and `git worktree list` exits 0 and omits the worktree (measured on
+/// git 2.43), so a scan that only stats left the omission reading as "not
+/// registered". An empty `gitdir` names no checkout and is the refusal
+/// `registration_checkout` already makes. Evaluated on the Unix legs, where a
+/// mode bit binds a non-root user.
+///
+/// Witnessed failing with `registration_of`'s `fs::read` replaced by
+/// `fs::symlink_metadata` (the mode-000 case answers `Unregistered`, so the
+/// classifier answers `None`), and with the empty-`gitdir` refusal removed
+/// from the same read path.
+#[cfg(unix)]
+#[test]
+fn a_registration_whose_gitdir_cannot_be_read_is_an_error_and_not_an_absent_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("residue-gitdir-unreadable");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("admin dir")
+        .expect("the worktree is registered");
+    let gitdir = admin.join("gitdir");
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert_eq!(classify(site, &target), ObjectResidue::After, "the control");
+
+    let _restore = RestoreMode {
+        path: gitdir.clone(),
+    };
+    fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o000)).expect("make it unreadable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // reads through a mode of 000, and this test would then measure nothing.
+    assert!(
+        fs::read(&gitdir).is_err(),
+        "prerequisite not met: the mode bit did not bind (running as root or with \
+         CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+    );
+    // The measurement: git omits the worktree it cannot read, exit 0.
+    let listing = git(&fixture.base, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listing.contains(&path.display().to_string()),
+        "git omits the registration whose gitdir it cannot read: {listing}"
+    );
+    let error = record_for(&fixture.base, &path).expect_err("not an absent registration");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &gitdir),
+        "the error names the gitdir: {error}"
+    );
+    let error = classify_object_residue(site, &target).expect_err("not a classified state");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &gitdir),
+        "the error names the gitdir: {error}"
+    );
+
+    // An empty `gitdir` binds no checkout, and is refused by name.
+    fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o644)).expect("readable again");
+    fs::write(&gitdir, b"").expect("empty the gitdir");
+    let error = classify_object_residue(site, &target).expect_err("an empty gitdir names nothing");
+    assert!(
+        matches!(&error, UpstrokeError::Git { message } if message.contains("empty gitdir")),
+        "the refusal says what it read: {error}"
+    );
+}
+
+/// `git worktree add` creates the administrative directory and writes
+/// `commondir` into it, so a kill in between leaves a registration with a
+/// zero-length `commondir` — and git 2.43 then refuses to enumerate *any*
+/// worktree ("failed to read ... commondir", exit 128), which since #127's
+/// `record_for` repair is an error rather than a listing. That state is an
+/// interrupted add, which is residue this site registers, so the classifier
+/// answers `Internal` with the element observed rather than reporting an
+/// inspection failure. `SWEEP-WORKTREE-012` on PR #131, where the sampling
+/// harness saw it as an unclassified sample (2 failures in 26 box runs, always
+/// `Worktree.Add: n=8 none=1 internal=6 after=0 unclassified=1`).
+///
+/// Witnessed failing with `add_state`'s `registration_of` call removed: the
+/// listing's failure propagates and the classifier answers no class at all.
+#[test]
+fn an_add_killed_before_commondir_is_written_is_interrupted_add_residue() {
+    let fixture = Fixture::created("residue-commondir");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("admin dir")
+        .expect("the worktree is registered");
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert_eq!(classify(site, &target), ObjectResidue::After, "the control");
+
+    let commondir = admin.join("commondir");
+    fs::write(&commondir, b"").expect("truncate commondir as a kill would leave it");
+    // The measurement: git refuses to enumerate at all in this state.
+    let listing = git_out(&fixture.base, &["worktree", "list", "--porcelain", "-z"]);
+    assert!(!listing.status.success(), "git refuses the enumeration");
+    assert!(
+        String::from_utf8_lossy(&listing.stderr).contains("commondir"),
+        "git names the file it could not read: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+
+    assert_eq!(
+        classify(site, &target),
+        ObjectResidue::Internal,
+        "an add killed before commondir was written is the interrupted prefix"
+    );
+    assert_eq!(
+        observed_residue_elements(site, &target).expect("observe"),
+        vec![ResidueElement::RegisteredUnpopulatedWorktree]
+    );
+    // And with the file gone entirely, which is the same prefix one step
+    // earlier.
+    fs::remove_file(&commondir).expect("remove commondir");
+    assert_eq!(classify(site, &target), ObjectResidue::Internal);
+}
+
+/// §8: a repository whose path is not UTF-8 is a repository, and git writes
+/// those bytes into a linked worktree's `.git` pointer and prints them from
+/// `rev-parse --git-path`. Reading either as a `String` made such a worktree
+/// an error, and the add classifier answered `Io` where it had answered
+/// `After`. A path byte outside UTF-8 needs a Unix path.
+///
+/// Witnessed failing with `git_dir_of`'s `fs::read` restored to
+/// `fs::read_to_string` (the pointer read errors) and, separately, with
+/// `object_directory` restored to `String::from_utf8` (`temporary_object_files`
+/// errors, so `observed_residue_elements` does).
+#[cfg(unix)]
+#[test]
+fn a_repository_whose_path_is_not_utf8_is_still_classified() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    let root = scratch("residue-non-utf8");
+    let base = root.join(OsString::from_vec(b"repo-\xff".to_vec()));
+    fs::create_dir(&base).expect("a repository directory whose name is not UTF-8");
+    assert!(
+        base.to_str().is_none(),
+        "the prerequisite: this path is not representable as UTF-8"
+    );
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.name", "t"]);
+    git(&base, &["config", "user.email", "t@t"]);
+    git(&base, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    let head = git(&base, &["rev-parse", "HEAD"]);
+    let worktree = root.join(OsString::from_vec(b"linked-\xff".to_vec()));
+    // Not the `git` helper: its arguments are `&str`, and a lossy spelling of
+    // this path is a different path. The bytes go to git as bytes.
+    let added = Command::new("git")
+        .arg("-C")
+        .arg(&base)
+        .args(["worktree", "add", "-q", "--detach"])
+        .arg(&worktree)
+        .arg(&head)
+        .output()
+        .expect("run git worktree add");
+    assert!(
+        added.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let pointer = fs::read(worktree.join(".git")).expect("the pointer");
+    assert!(
+        std::str::from_utf8(&pointer).is_err(),
+        "the pointer git wrote is not UTF-8: {pointer:?}"
+    );
+
+    let git_dir = git_dir_of(&worktree)
+        .expect("a pointer whose bytes are not UTF-8 is still a pointer")
+        .expect("a git directory is behind it");
+    assert!(git_dir.is_dir());
+    assert!(
+        object_directory(&base).expect("objects").is_dir(),
+        "the objects directory git prints is read as bytes too"
+    );
+    let target = ResidueTarget::new(&base).at(&worktree);
+    assert_eq!(
+        classify(EffectSiteId::Worktree(WorktreeSite::Add), &target),
+        ObjectResidue::After
+    );
+    assert!(
+        observed_residue_elements(EffectSiteId::Object(ObjectSite::CandidateStage), &target)
+            .expect("observe")
+            .is_empty()
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A git directory moved and symlinked at its old name is one Git reads:
+/// `git status`, `rev-parse --git-dir` and `worktree list` all work. So the
+/// question `git_dir_of` asks of the pointer's target is what it *is*, which
+/// means following the link (`metadata`); `symlink_metadata` answered "not a
+/// directory" and reclassified a populated worktree as the interrupted
+/// prefix. `symlink_metadata` is kept where refusing a link is the point,
+/// which `a_dangling_index_lock_symlink_is_the_lock_git_sees` pins. A
+/// symlink needs a Unix filesystem here.
+///
+/// Witnessed failing with `metadata` restored to `symlink_metadata` in
+/// `git_dir_of` (the classifier answers `Internal` for a worktree Git reads).
+#[cfg(unix)]
+#[test]
+fn a_git_directory_reached_through_a_symlink_is_a_populated_worktree() {
+    let fixture = Fixture::created("residue-symlinked-git-dir");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert_eq!(classify(site, &target), ObjectResidue::After, "the control");
+
+    let admin = git_dir_of(&path)
+        .expect("git dir")
+        .expect("linked worktree");
+    let moved = admin
+        .parent()
+        .expect("the worktrees directory")
+        .join("relocated-admin");
+    fs::rename(&admin, &moved).expect("move the administrative directory");
+    std::os::unix::fs::symlink(&moved, &admin).expect("symlink its old name");
+    // The measurement: git reads the worktree through the link.
+    assert_eq!(
+        git(&path, &["rev-parse", "HEAD"]),
+        fixture.head,
+        "git reads the relocated-and-symlinked git directory"
+    );
+
+    assert_eq!(
+        git_dir_of(&path)
+            .expect("read")
+            .expect("a directory is behind the link"),
+        admin,
+        "the pointer's target is what it is, followed through the link"
+    );
+    assert_eq!(
+        classify(site, &target),
+        ObjectResidue::After,
+        "a worktree git reads is populated"
+    );
 }
 
 /// `command_internal_sub_effects`: "the classifier is **total** over

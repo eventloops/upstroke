@@ -234,7 +234,7 @@ fn resolve_relative(admin: &Path, relative: &Path) -> Option<PathBuf> {
 /// stop being UTF-8. Git for Windows writes UTF-8, so the failing arm is for
 /// hostile or corrupt bytes, and it refuses.
 #[cfg(unix)]
-fn decode_path(bytes: &[u8]) -> Result<PathBuf, Utf8Error> {
+pub(super) fn decode_path(bytes: &[u8]) -> Result<PathBuf, Utf8Error> {
     use std::os::unix::ffi::OsStringExt as _;
     // The one copy in this module: the borrowed bytes becoming the owned path.
     Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
@@ -247,7 +247,7 @@ fn decode_path(bytes: &[u8]) -> Result<PathBuf, Utf8Error> {
 /// compares a spelling with its own normalisation, and the normalisation is
 /// spelled with the platform's separator; so is the recorded path, then.
 #[cfg(not(unix))]
-fn decode_path(bytes: &[u8]) -> Result<PathBuf, Utf8Error> {
+pub(super) fn decode_path(bytes: &[u8]) -> Result<PathBuf, Utf8Error> {
     std::str::from_utf8(bytes)
         .map(|text| PathBuf::from(text.replace('/', std::path::MAIN_SEPARATOR_STR)))
 }
