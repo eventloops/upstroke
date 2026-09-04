@@ -1,12 +1,7 @@
-//! Config loading (DESIGN.md §17 subset for `validate`).
-//!
-//! Two optional files: repo-level `upstroke.toml` (routing overrides, pins,
-//! strategy) and user-level `~/.upstroke/pools.toml` (capacity pools, normally
-//! written by `upstroke connect`). Both missing is the normal fresh-repo case
-//! and falls back to derived defaults silently.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/config.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
@@ -31,9 +26,6 @@ use crate::util;
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
-    // Parsed as raw values so shape mistakes get actionable messages instead
-    // of bare serde errors (configs written before these sections were
-    // consumed must not brick on upgrade with cryptic output).
     gates: Option<toml::Value>,
     engine: Option<toml::Value>,
     interaction: Option<toml::Value>,
@@ -41,23 +33,12 @@ struct RawRepoConfig {
     runner: Option<toml::Value>,
 }
 
-/// `[runner]` (DESIGN.md:612): "a runner is orthogonal to an adapter: `[runner]`
-/// config selects `host` or `container` (image, mounts)".
-///
-/// Read as a raw value like the sections above it, so a shape mistake reports as
-/// a named problem rather than a serde error about a struct nobody wrote.
 #[derive(Debug, Deserialize)]
 struct RawRunner {
     kind: Option<String>,
-    /// The image **reference** an operator wrote. Never what a container is
-    /// created from — INV-23 pins the runtime's immutable id for that.
     image: Option<String>,
-    /// Per-agent credential volume names (R20, operator-owned).
     credential_volumes: Option<BTreeMap<String, String>>,
-    /// Extra mounts the boundary receives beyond the ones the runner composes.
     mounts: Option<Vec<RawRunnerMount>>,
-    /// Everything else. Unlike `[engine]`, an unknown key here is an **error**;
-    /// see [`read_runner`].
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -81,14 +62,10 @@ struct RawGate {
 struct RawEngine {
     shell: Option<String>,
     on_task_failure: Option<String>,
-    /// §17's concurrency ceiling.
     max_parallel: Option<u32>,
-    /// Autonomous repair generations per original task before a human is asked.
     max_merge_repairs: Option<u32>,
-    /// Per-agent and per-pool concurrency slots; both default to `max_parallel`.
     max_per_agent: Option<u32>,
     max_per_pool: Option<u32>,
-    /// Everything else, so a typo warns by name instead of vanishing.
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -97,38 +74,17 @@ struct RawEngine {
 struct RawInteraction {
     mode: Option<String>,
     notify: Option<Vec<String>>,
-    /// Seconds a detached interactive run waits at a hard block for an answer
-    /// to arrive as an event; `0` disables waiting.
     wait_on_block_secs: Option<u64>,
-    /// `ask_before = { frontier_escalation_over_usd = 5.0 }` (§12).
     ask_before: Option<toml::Value>,
 }
 
-/// `[interaction] ask_before` (§12) — the thresholds that turn a routing move
-/// into a question for a person.
-///
-/// One key today, and an unknown one is a **hard error** naming the accepted
-/// set: a typo here silently deletes a spend approval, which is the same harm
-/// that made `second_opinion` error rather than warn.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AskBefore {
-    /// Ask before escalating onto a **frontier** rung once the run's reported
-    /// spend has reached this many api-equivalent dollars.
-    ///
-    /// Deliberately spend-to-*date*, not a forward projection. A literal
-    /// reading of "this escalation will cost more than $N" needs per-model
-    /// $/token rates the catalog does not ship, and §10's whole position is
-    /// that guessing costs is worse than measuring them — inventing a price
-    /// table would pile unverifiable static data on top of model names that
-    /// have already proved perishable. v0.2 can project forward from *observed*
-    /// per-rung costs once decision logs hold them.
     pub frontier_escalation_over_usd: Option<f64>,
 }
 
 impl AskBefore {
-    /// Accepted keys, named once so the parser and its error message cannot
-    /// disagree about what is legal.
     const ACCEPTED: [&'static str; 1] = ["frontier_escalation_over_usd"];
 }
 
@@ -136,12 +92,7 @@ impl AskBefore {
 struct RawRouting {
     strategy: Option<RawStrategy>,
     overrides: Option<Vec<RawOverride>>,
-    /// `[routing.effort]` is parsed as a raw value so shape and spelling
-    /// mistakes can name the two accepted roles rather than failing in serde's
-    /// outer config message.
     effort: Option<toml::Value>,
-    /// Per-kind chain entries (`fix = { chain = [...] }`) plus anything the
-    /// config author got wrong — unknown keys warn rather than error.
     #[serde(flatten)]
     kinds: BTreeMap<String, toml::Value>,
 }
@@ -163,9 +114,6 @@ struct RawStrategy {
 #[serde(deny_unknown_fields)]
 struct RawOverride {
     paths: Vec<String>,
-    /// Optional since step 9: an override may raise the tier floor, ask for a
-    /// cross-family second opinion, or both. Requiring it would force a no-op
-    /// `start_at = "small"` on anyone who wants only the second reviewer.
     start_at: Option<Tier>,
     second_opinion: Option<String>,
 }
@@ -176,9 +124,6 @@ struct RawPin {
     tier: Tier,
     agent: String,
     model: String,
-    /// Optional override of the tier's default reasoning effort (§10), used
-    /// when no explicit role policy applies. A pin is the narrower way to buy
-    /// a deliberate effort for one tier.
     effort: Option<String>,
 }
 
@@ -188,34 +133,15 @@ struct RawKindRouting {
     chain: Option<Vec<Tier>>,
     tier: Option<Tier>,
     attempts_per: Option<u32>,
-    /// `[routing] review = { timeout_secs = 5400 }`. Kept on this raw shape
-    /// because `review` shares the routing table with task kinds; rejected on
-    /// task-kind entries below so a misplaced timeout is never ignored.
     timeout_secs: Option<u64>,
-    /// `[routing] review = { enabled = false }` — the explicit opt-out of
-    /// §11.2 review, for plans where a frontier judgement per task costs more
-    /// than the work it is judging.
     enabled: Option<bool>,
 }
 
-/// `[pools.*]`, with each entry's byte offset kept.
-///
-/// `toml::Spanned` rather than a plain value because a `BTreeMap` iterates in
-/// **sorted key order**, and both `Config.pools` and
-/// [`crate::capacity::pool_for`] promise *file* order — "moving a pool up the
-/// file promotes it" is the whole mechanism an operator has for choosing
-/// between two accounts on one vendor (§13's profiles). Sorting silently
-/// substituted an alphabet for that choice. The span is the offset of the
-/// entry's value in the source, so re-sorting by it restores exactly what was
-/// written, with no new dependency.
 #[derive(Debug, Default, Deserialize)]
 struct RawPools {
     pools: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
 }
 
-/// One `[pools.<name>]` entry, before validation. Every field is optional here
-/// so a shape mistake reports as a named problem rather than a serde error
-/// about a struct the config author never wrote.
 #[derive(Debug, Default, Deserialize)]
 struct RawPool {
     kind: Option<String>,
@@ -227,20 +153,11 @@ struct RawPool {
     reserve: Option<f64>,
     monthly_allowance: Option<toml::Value>,
     endpoint: Option<String>,
-    /// §13's credential-profile seam (D2): which account this pool draws from.
     profile: Option<String>,
-    /// Everything else, so a typo warns by name instead of vanishing.
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
 
-/// `[budgets]` (§17). API-equivalent dollars; omitting either means unlimited.
-///
-/// `deny_unknown_fields` because §13 lists a third budget kind this build does
-/// not have — per-pool fractions — so `pool_fraction` is the key an operator
-/// reading the design reaches for first. Accepting it silently would let them
-/// believe they had capped a pool while the run spent against no ceiling at
-/// all, which is the one failure mode a budget must not have.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budgets {
@@ -254,13 +171,6 @@ impl Budgets {
     }
 }
 
-/// One ceiling, checked the same way wherever it came from.
-///
-/// Shared with the `--budget` flag rather than living only in the `[budgets]`
-/// parser: a flag that overrides a validated key must not be a way around the
-/// validation. Zero and negative both stop the run before it spends anything,
-/// and NaN silently never fires — three different broken behaviours behind one
-/// mistyped number.
 pub fn check_budget(name: &str, limit: f64) -> Result<(), String> {
     if !limit.is_finite() || limit <= 0.0 {
         return Err(format!(
@@ -278,23 +188,12 @@ pub struct KindChain {
     pub from_config: bool,
 }
 
-/// `second_opinion` on a `[[routing.overrides]]` (§11.3).
-///
-/// One variant today. It stays an enum rather than a bool because §11.5
-/// generalizes the reviewer into a list of passes with a lens each, and the
-/// security lens arrives here as a second variant with a different ladder
-/// dispatch — not as a second boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondOpinion {
-    /// A second reviewer from a different model *family* must also pass. The
-    /// spelling is §17's; the semantics are §11.3's ("a different model
-    /// family"), which is the stricter of the two — see [`crate::catalog::Family`].
     DifferentVendor,
 }
 
 impl SecondOpinion {
-    /// Accepted spellings, named once so the parser and its error message
-    /// cannot disagree about what is legal.
     const ACCEPTED: [&'static str; 1] = ["different-vendor"];
 
     fn parse(s: &str) -> Option<Self> {
@@ -308,7 +207,6 @@ impl SecondOpinion {
 #[derive(Debug)]
 pub struct CompiledOverride {
     pub raw_paths: Vec<String>,
-    /// `None` when this override exists only to request a second opinion.
     pub start_at: Option<Tier>,
     pub second_opinion: Option<SecondOpinion>,
     pub globs: GlobSet,
@@ -329,8 +227,6 @@ pub struct Pin {
     pub effort: Option<Effort>,
 }
 
-/// One `[[gates]]` entry (§17). `None` for the whole list means the section
-/// was absent and the engine derives defaults from the repo's shape.
 #[derive(Debug, Clone)]
 pub struct GateConfig {
     pub name: String,
@@ -340,12 +236,6 @@ pub struct GateConfig {
 
 pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `[engine] on_task_failure` (§17).
-///
-/// This governs only a *genuinely failed* task — one a human declined to
-/// unblock, or one whose chain resolved to nothing. A task parked on a
-/// question never halts the run whatever this says: invariant 6 ("questions
-/// never stop the runnable frontier") is not configurable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnTaskFailure {
     Halt,
@@ -362,60 +252,19 @@ impl OnTaskFailure {
     }
 }
 
-/// `[engine] max_parallel` (§17), and the only value this engine accepts.
-///
-/// One attempt at a time is not a tuning choice here, it is the whole shape of
-/// the v0.1 scheduler: one worktree, one candidate, one commit. Parallelism
-/// arrives with the topology engine, and until it does a higher ceiling can only
-/// be a promise the run does not keep.
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 
-/// `[engine] max_merge_repairs` (§17): autonomous repair generations per
-/// original task before the ladder asks a human instead.
 pub const DEFAULT_MAX_MERGE_REPAIRS: u32 = 2;
 
-/// The last event schema a sequential engine writes.
-///
-/// Runs recorded at or below it are sequential for the rest of their lives —
-/// they never upgrade into a parallel topology — so their ceilings are read as
-/// a statement about some *other*, future run rather than as an instruction to
-/// this one. See [`EngineLimits`].
 pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 
-/// Which reading of the `[engine]` ceilings a load is performing.
-///
-/// The same four keys mean two different things depending on what is about to
-/// happen, and the difference is not cosmetic — it is the difference between a
-/// refusal and a warning.
-///
-/// A run **being created now** is a promise about to be made: `max_parallel = 4`
-/// would have the operator budget wall-clock and spend for four workers and get
-/// one, so it is refused before anything exists.
-///
-/// A run being **resumed** already exists. Its semantics were fixed when it
-/// started, and today's config cannot change them; the only question is whether
-/// it may continue. Refusing there does not prevent a broken promise — the run
-/// is already sequential and will stay sequential — it merely strands a run the
-/// operator can no longer reach, because a key they added for a future run is
-/// sitting in a file the resume happens to re-read. That is a worse outcome
-/// than the one the refusal exists to prevent, so the resume warns, keeps its
-/// recorded sequential ceiling, and continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineLimits {
-    /// A run about to be created, or a preview of one (`upstroke validate`).
     Fresh,
-    /// A resume of a run a sequential engine recorded.
     SequentialResume,
 }
 
 impl EngineLimits {
-    /// The reading that applies to a resume of a run at `effective_schema`.
-    ///
-    /// Anything past [`LAST_SEQUENTIAL_SCHEMA`] is not a sequential run's
-    /// resume, so it gets the ordinary reading rather than the legacy one.
-    /// Today that path is unreachable — no schema above it exists — and what it
-    /// should do once one does is the activation question, which is not this
-    /// slice's to answer.
     #[must_use]
     pub fn for_resume(effective_schema: u32) -> Self {
         if effective_schema <= LAST_SEQUENTIAL_SCHEMA {
@@ -426,62 +275,23 @@ impl EngineLimits {
     }
 }
 
-/// One extra mount an operator asked the boundary to receive.
-///
-/// DESIGN.md:612 names `image, mounts` as `[runner]`'s two configurable halves.
-/// The runner composes the role's own worktree mount, the read-only reviewer
-/// mount and the per-agent credential volume itself; this is the operator's
-/// addition to that set — a toolchain cache, a shared model directory.
-///
-/// **`read_only` defaults to `true`.** A mount the operator did not describe is
-/// the one whose blast radius they did not think about, and DESIGN.md:398 is
-/// explicit that "the v0.2 execution root is deliberately non-authoritative":
-/// a writable host path handed to gate-executed repository code is the class
-/// the container runner exists to bound. Writable is a thing you say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerMount {
     pub source: PathBuf,
-    /// Where the boundary sees it. A container-side absolute path, so it is a
-    /// `String` and not a `PathBuf`: it is never resolved on this machine.
     pub target: String,
     pub read_only: bool,
 }
 
-/// What `[runner]` selects, before anything has inspected a runtime.
-///
-/// **Not** a [`RunnerPolicy`]: that record carries the runtime's immutable image
-/// id and its manifest digest, which only inspection can establish. This is the
-/// operator's *request* — the input `crate::runner::container::resolve` turns
-/// into a record, and the value INV-23's rebuild path compares against a
-/// recorded one ("today's `[runner]` config that differs warns naming the
-/// difference and is ignored").
-///
-/// [`RunnerPolicy`]: crate::topology::events::RunnerPolicy
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerSelection {
-    /// PR3's wire kind, and deliberately not a second enum: the config and the
-    /// record have to be comparable, and two spellings of one choice are two
-    /// things that drift.
     pub kind: RunnerKind,
-    /// The image reference, for a container selection.
     pub image: Option<String>,
-    /// Per-agent credential volume names (R20).
     pub credential_volumes: BTreeMap<String, String>,
-    /// Extra mounts, parsed and carried. Nothing in this slice acts on them —
-    /// `production_effect` is "none" — and, more durably, they are **not part of
-    /// the recorded execution identity**: INV-23's `RunnerPolicy` has four
-    /// fields and none of them is a mount list.
     pub mounts: Vec<RunnerMount>,
-    /// Whether a `[runner]` section was present at all.
-    ///
-    /// Load-bearing for the rebuild path: an **absent** section is not "a config
-    /// that differs", so a resume with no `[runner]` in the file must not warn
-    /// that its runner kind moved.
     pub from_config: bool,
 }
 
 impl RunnerSelection {
-    /// What an absent `[runner]` section means: the host runner, nothing else.
     #[must_use]
     pub fn host_default() -> Self {
         Self {
@@ -500,70 +310,27 @@ pub struct Config {
     pub overrides: Vec<CompiledOverride>,
     pub pins: Vec<Pin>,
     pub strategy: Strategy,
-    /// `~/.upstroke/pools.toml`, in file order — which is preference order for
-    /// [`crate::capacity::pool_for`].
     pub pools: Vec<Pool>,
-    /// `[budgets]` (§17); both keys optional, both meaning unlimited when absent.
     pub budgets: Budgets,
-    /// `[interaction] ask_before` (§12).
     pub ask_before: AskBefore,
-    /// `Some` (possibly empty — explicitly no gates) when `[[gates]]` was
-    /// configured; `None` means derive from the repo.
     pub gates: Option<Vec<GateConfig>>,
     pub shell: ShellKind,
-    /// `[routing] review = { tier = … }` (§11.2). `None` means the frontier
-    /// default.
     pub review_tier: Option<Tier>,
-    /// `[routing] review = { enabled = false }` opts out of review entirely.
     pub review_enabled: bool,
-    /// Independent wall-clock allowance for each review pass. Unlike a worker
-    /// attempt timeout this is frozen into [`crate::review::ReviewPlan`], so a
-    /// resume cannot silently adopt a different verification budget.
     pub review_pass_timeout: Duration,
-    /// Explicit role policy. A role setting outranks pin and tier defaults so
-    /// `implementation = "xhigh"` really does mean every worker attempt.
     implementation_effort_override: Option<Effort>,
     review_effort_override: Option<Effort>,
-    /// `[engine] on_task_failure` (§17); default `Halt`.
     pub on_task_failure: OnTaskFailure,
-    /// `[engine] max_parallel` (§17): the ceiling this load's run may actually
-    /// execute at, [`DEFAULT_MAX_PARALLEL`] by default.
-    ///
-    /// The *effective* ceiling, not a transcription of the file. Above the
-    /// default it is refused outright for a fresh run, and for a sequential
-    /// run's resume it is warned about and left at the default the run has been
-    /// executing at all along — a run's execution shape is a fact about the
-    /// run. See [`EngineLimits`], which is what chooses between the two; the
-    /// `parse_engine` reader below is where the choice is made.
     pub max_parallel: u32,
-    /// `[engine] max_merge_repairs` (§17); [`DEFAULT_MAX_MERGE_REPAIRS`].
-    /// Validated and kept, acted on by the topology engine.
     pub max_merge_repairs: u32,
-    /// `[engine] max_per_agent` (§17); defaults to the configured
-    /// `max_parallel`. Validated and kept, acted on by the topology engine.
     pub max_per_agent: u32,
-    /// `[engine] max_per_pool` (§17); defaults to the configured
-    /// `max_parallel`. Validated and kept, acted on by the topology engine.
     pub max_per_pool: u32,
-    /// `[interaction] mode` (§12); default `on_block`.
     pub interaction_mode: InteractionMode,
-    /// `[interaction] notify` (§12); default `["cli"]`.
     pub notify: Vec<String>,
-    /// `[interaction] wait_on_block_secs` (§12/§19). How long a detached but
-    /// interactive run waits at a hard block for an answer to arrive as an
-    /// event before ending parked. `ZERO` disables the wait, which is what a
-    /// terminal-attached run and CI both want.
     pub wait_on_block: Duration,
-    /// `[runner]` (DESIGN.md:612). Always the host selection in this build:
-    /// `kind = "container"` is refused for every schema-1..3 fresh run and
-    /// resume before any effect — see [`refuse_legacy_container_selection`].
     pub runner: RunnerSelection,
 }
 
-/// Everything `[engine]` contributes, kept together so adding a knob does not
-/// widen a tuple every caller has to re-destructure — the reason
-/// [`InteractionSettings`] below exists, applied to the section that just grew
-/// four keys.
 struct EngineSettings {
     shell: ShellKind,
     on_task_failure: OnTaskFailure,
@@ -573,8 +340,6 @@ struct EngineSettings {
     max_per_pool: u32,
 }
 
-/// Everything `[interaction]` contributes, kept together so adding a knob does
-/// not widen a tuple every caller has to re-destructure.
 struct InteractionSettings {
     mode: InteractionMode,
     notify: Vec<String>,
@@ -582,10 +347,6 @@ struct InteractionSettings {
     ask_before: AskBefore,
 }
 
-/// §12's default hard-block wait for a detached interactive run: long enough
-/// that an operator answering from a phone finds the run still going, short
-/// enough that a forgotten run gives its workspace and branch back the same
-/// day.
 pub const DEFAULT_WAIT_ON_BLOCK: Duration = Duration::from_secs(30 * 60);
 
 impl Config {
@@ -600,8 +361,6 @@ impl Config {
             })
     }
 
-    /// The tier-bound effort before a role policy is applied: a pin's override,
-    /// else the tier's default (§10).
     pub fn effort_for(&self, tier: Tier) -> Effort {
         self.pins
             .iter()
@@ -610,21 +369,16 @@ impl Config {
             .unwrap_or_else(|| Effort::for_tier(tier))
     }
 
-    /// Effort every implementation attempt uses. An explicit role policy is
-    /// global across task kinds and tiers; otherwise the tier/pin rule applies.
     pub fn implementation_effort(&self, tier: Tier) -> Effort {
         self.implementation_effort_override
             .unwrap_or_else(|| self.effort_for(tier))
     }
 
-    /// Effort every reviewer judges at. The role policy wins when present;
-    /// otherwise use the review tier, with §11.2's frontier default.
     pub fn review_effort(&self) -> Effort {
         self.review_effort_override
             .unwrap_or_else(|| self.effort_for(self.review_tier.unwrap_or(Tier::Frontier)))
     }
 
-    /// Resolve the full role policy once so a run can record and retain it.
     pub fn resolved_effort_policy(&self) -> ResolvedEffortPolicy {
         ResolvedEffortPolicy {
             small: self.implementation_effort(Tier::Small),
@@ -637,12 +391,8 @@ impl Config {
 
 pub const DEFAULT_ATTEMPTS_PER: u32 = 2;
 
-/// Frontier reviews can legitimately spend tens of minutes reading a broad
-/// diff. This is per pass, including its one verdict-format re-ask.
 pub const DEFAULT_REVIEW_PASS_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 
-/// Derived default escalation chain per kind (DESIGN.md §10.1), used when the
-/// repo config is absent or silent for that kind.
 pub fn default_chain(kind: TaskKind) -> Vec<Tier> {
     match kind {
         TaskKind::Design => vec![Tier::Frontier],
@@ -652,14 +402,6 @@ pub fn default_chain(kind: TaskKind) -> Vec<Tier> {
     }
 }
 
-/// Load effective config.
-///
-/// `repo_config`: explicit `--config` path (missing file = error) or `None`
-/// to look for `upstroke.toml` in `discover_in` (missing = silent defaults).
-/// `discover_in` is the repo root the run targets — never the process CWD,
-/// which can differ and would load another repo's config.
-/// `pools_file`: explicit pools path (tests) or `None` to discover
-/// `~/.upstroke/pools.toml` (missing = silent).
 pub fn load(
     repo_config: Option<&Path>,
     discover_in: &Path,
@@ -675,11 +417,6 @@ pub fn load(
     )
 }
 
-/// [`load`] for a caller that is not creating a run.
-///
-/// Only `[engine]`'s ceilings read `limits`, and only to decide whether a value
-/// this engine cannot honour refuses or warns — see [`EngineLimits`]. Every
-/// other key means the same thing either way.
 pub fn load_limits(
     repo_config: Option<&Path>,
     discover_in: &Path,
@@ -697,15 +434,6 @@ pub fn load_limits(
     )
 }
 
-/// [`load`] with the adapter registry injected.
-///
-/// Only `[pools]` consults it, to decide whether a pool names an agent this
-/// build can drive. Injected for the same reason
-/// [`crate::validate::builtin_adapter`] is: the engine resolves adapters
-/// through a `Harness`, not through the global registry, so a guard that asks
-/// the registry directly is answering a question about a different set than the
-/// one that will actually run — and the unusable-pool path could only ever be
-/// tested with an agent the binary genuinely lacks.
 pub fn load_with(
     repo_config: Option<&Path>,
     discover_in: &Path,
@@ -722,12 +450,6 @@ pub fn load_with(
     )
 }
 
-/// [`load_limits`] from bytes that were captured earlier.
-///
-/// The only entry point that can be reasoned about across a lock: everything it
-/// parses comes out of `captured`, so "what was validated" and "what was
-/// captured" are the same bytes rather than two reads that happened to agree.
-/// See [`CapturedConfig`].
 pub fn load_captured(
     captured: &CapturedConfig,
     limits: EngineLimits,
@@ -741,7 +463,6 @@ pub fn load_captured(
     )
 }
 
-/// [`load_captured`] with the adapter registry injected — see [`load_with`].
 pub fn load_captured_with(
     captured: &CapturedConfig,
     has_adapter: &dyn Fn(&str) -> bool,
@@ -794,10 +515,6 @@ pub fn load_captured_with(
         }
         for (key, value) in routing.kinds {
             let Some(kind) = TaskKind::parse(&key) else {
-                // `review` is a routing ROLE, not a task kind (DESIGN §17's
-                // own example configures it). Parse and echo it rather than
-                // warning users off their own documented config; the reviewer
-                // consumes it in step 6.
                 if key == "review" {
                     let rr: RawKindRouting =
                         value.try_into().map_err(|e| UpstrokeError::Config {
@@ -887,10 +604,6 @@ pub fn load_captured_with(
             .enumerate()
         {
             let n = index + 1;
-            // A misspelled value here silently deletes a verification layer:
-            // the operator asked for two model families on their blast-radius
-            // paths and would get one, with nothing said. That is the same
-            // reason `[interaction] mode` errors rather than warns.
             let second_opinion = match ov.second_opinion.as_deref() {
                 None => None,
                 Some(raw) => Some(SecondOpinion::parse(raw).ok_or_else(|| {
@@ -904,9 +617,6 @@ pub fn load_captured_with(
                     }
                 })?),
             };
-            // Both keys are optional individually, but an override that raises
-            // nothing and asks for nothing does nothing — and reads exactly
-            // like one whose key was misspelled into oblivion.
             if ov.start_at.is_none() && second_opinion.is_none() {
                 return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
@@ -976,10 +686,6 @@ pub fn load_captured_with(
             ));
             continue;
         }
-        // Validated here rather than discovered at spend time: the provider
-        // rejects an unknown effort with a 400 *after* the turn has started
-        // (measured 2026-08-11), so a typo costs a whole attempt instead of a
-        // config error. Same posture as the pinned-model check above.
         let effort = match pin.effort.as_deref().map(Effort::parse) {
             Some(None) => {
                 return Err(UpstrokeError::Config {
@@ -1038,21 +744,8 @@ pub fn load_captured_with(
     })
 }
 
-/// Every accepted `[runner]` key, written out.
-///
-/// The error messages name this rather than a serde-derived list, so a key that
-/// stops being read is a key that stops being offered.
 const RUNNER_KEYS: &str = "`kind`, `image`, `credential_volumes`, `mounts`";
 
-/// Parse `[runner]`, then refuse a container selection this engine may not make.
-///
-/// Two steps and not one, deliberately. [`read_runner`] is the whole of the
-/// parse and accepts `kind = "container"`; [`refuse_legacy_container_selection`]
-/// is the refusal `slice_contract.expected_failures_refusals[0]` names. Keeping
-/// them apart means the refusal is an independently droppable predicate — a
-/// mutation that deletes it does not also delete the ability to describe a
-/// container runner — and it means the resolution path can be given a parsed
-/// container selection without going through a door this engine keeps locked.
 fn parse_runner(
     raw: Option<toml::Value>,
     repo_path: &Path,
@@ -1063,23 +756,12 @@ fn parse_runner(
     Ok(selection)
 }
 
-// ---------------------------------------------------------------------------
-// The section readers
-// ---------------------------------------------------------------------------
-
 mod parse;
 use self::parse::{
     parse_budgets, parse_engine, parse_gates, parse_interaction, parse_role_effort, read_runner,
     refuse_legacy_container_selection,
 };
 
-/// Where a load looks for the repo config, and whether an absent file there is
-/// an error.
-///
-/// Split out because [`CapturedConfig::capture`] has to capture *the same* file
-/// the load reads: two copies of "explicit path, else `upstroke.toml` beside the
-/// repo" would be two chances for a pre-lock check to validate a file the run
-/// then does not load.
 fn repo_config_location(repo_config: Option<&Path>, discover_in: &Path) -> (PathBuf, bool) {
     match repo_config {
         Some(p) => (p.to_path_buf(), true),
@@ -1087,7 +769,6 @@ fn repo_config_location(repo_config: Option<&Path>, discover_in: &Path) -> (Path
     }
 }
 
-/// Where a load looks for pools, if anywhere. See [`repo_config_location`].
 fn pools_location(pools_file: Option<&Path>) -> Option<(PathBuf, bool)> {
     match pools_file {
         Some(p) => Some((p.to_path_buf(), true)),
@@ -1095,44 +776,19 @@ fn pools_location(pools_file: Option<&Path>) -> Option<(PathBuf, bool)> {
     }
 }
 
-/// One file exactly as it was at one instant: the bytes it had, the fact that
-/// it had none, or the error reading it produced.
-///
-/// This is not a fingerprint taken beside a read — it *is* the read. Everything
-/// downstream of a capture parses these bytes and no others, which is what makes
-/// "the config that was validated" and "the config that was captured" the same
-/// object rather than two reads that happened to agree. A digest, or a
-/// modification time, or a second `fs::read` performed next to the real one,
-/// would each leave the same hole: bytes can change and change back between two
-/// observations, and every such scheme reports "unchanged" while the run
-/// executes something nothing ever checked.
-///
-/// The three cases are kept apart rather than collapsed into "some bytes or
-/// not", because the caller owes a different answer to each: an absent
-/// `--config` someone typed is a typo, an absent discovered one is the ordinary
-/// fresh repo, and one that is there but cannot be read is neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
     path: PathBuf,
-    /// Whether an absent file here is an error — see [`repo_config_location`].
     required: bool,
-    /// `Ok(None)`: not there. `Ok(Some(_))`: exactly these bytes. `Err`: the
-    /// kind and text of the failure, kept so the error a consumer raises reads
-    /// the way the direct read's would have.
     content: Result<Option<Vec<u8>>, (io::ErrorKind, String)>,
 }
 
 impl FileSnapshot {
-    /// The file this describes.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The captured bytes as text, or `None` if the file was not there.
-    ///
-    /// Fails the way the read it replaces would have: an unreadable file, or one
-    /// whose bytes are not UTF-8, is a [`UpstrokeError::Io`] against this path.
     pub fn text(&self) -> Result<Option<String>, UpstrokeError> {
         let io_error = |source| UpstrokeError::Io {
             path: self.path.clone(),
@@ -1151,7 +807,6 @@ impl FileSnapshot {
     }
 }
 
-/// One file as it is right now.
 #[must_use]
 pub fn snapshot_file(path: &Path, required: bool) -> FileSnapshot {
     let content = match fs::read(path) {
@@ -1166,24 +821,13 @@ pub fn snapshot_file(path: &Path, required: bool) -> FileSnapshot {
     }
 }
 
-/// Every file a load reads, captured at one instant.
-///
-/// A validation performed before a lock is only worth the ordering it buys if
-/// what it validated is what the run then uses, and the only way to know that is
-/// for the validation to have no other source. So a caller captures once and
-/// hands the capture to [`load_captured`]; taking the lease and capturing again
-/// then compares two things that are directly comparable, because one of them is
-/// what was parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedConfig {
     repo: FileSnapshot,
-    /// Absent when this load has no pools file to read at all — no `--pools`
-    /// and no `~/.upstroke/pools.toml` — which is silence rather than emptiness.
     pools: Option<FileSnapshot>,
 }
 
 impl CapturedConfig {
-    /// Capture what a [`load_with`] with these arguments would read.
     #[must_use]
     pub fn capture(
         repo_config: Option<&Path>,
@@ -1198,15 +842,10 @@ impl CapturedConfig {
         }
     }
 
-    /// The captured files, for a caller that has to name them.
     pub fn files(&self) -> impl Iterator<Item = &FileSnapshot> {
         std::iter::once(&self.repo).chain(self.pools.as_ref())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Reading the captured bytes
-// ---------------------------------------------------------------------------
 
 mod read;
 use self::read::{read_pools, read_repo_config};
@@ -1229,16 +868,7 @@ mod tests {
         path
     }
 
-    /// An explicit pools path with no pools in it.
-    ///
-    /// A real, empty file rather than an absent one: an explicit `--pools` that
-    /// does not exist is now a hard error (a path someone typed and that is not
-    /// there is a typo), and passing `None` here would reach for the operator's
-    /// real `~/.upstroke/pools.toml` — which no test may touch.
     fn missing() -> PathBuf {
-        // Created once: the file is identical for every caller, and rewriting
-        // one shared path from parallel tests means truncating it under a
-        // reader.
         static PATH: OnceLock<PathBuf> = OnceLock::new();
         PATH.get_or_init(|| {
             let dir =
@@ -1256,7 +886,6 @@ mod tests {
         .clone()
     }
 
-    /// Empty discovery root so tests never pick up a real upstroke.toml.
     fn hermetic() -> PathBuf {
         let dir = env::temp_dir().join(format!("upstroke-config-hermetic-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("hermetic dir");
@@ -1340,8 +969,6 @@ model = "claude-opus-4-8"
         assert_eq!(cfg.pins.len(), 1);
         assert_eq!(cfg.strategy.mode, "value-max");
         assert_eq!(cfg.strategy.spend_down_after, Some(0.7));
-        // `review` is a routing role, not a task kind: parsed, echoed, and
-        // never warned about (DESIGN §17 configures it in its own example).
         assert_eq!(cfg.review_tier, Some(Tier::Frontier));
         assert_eq!(cfg.review_pass_timeout, Duration::from_secs(7200));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
@@ -1349,9 +976,6 @@ model = "claude-opus-4-8"
 
     #[test]
     fn an_override_may_ask_for_a_second_opinion_without_raising_the_floor() {
-        // Requiring `start_at` would force a no-op `start_at = "small"` on
-        // anyone who wants a cross-family reviewer on paths whose difficulty
-        // is already routed correctly.
         let path = scratch(
             "soonly.toml",
             "[[routing.overrides]]\npaths = [\"docs/**\"]\nsecond_opinion = \
@@ -1364,7 +988,6 @@ model = "claude-opus-4-8"
             cfg.overrides[0].second_opinion,
             Some(SecondOpinion::DifferentVendor)
         );
-        // With no floor to apply, routing is untouched.
         assert_eq!(
             cfg.chain_for(TaskKind::Fix).chain,
             vec![Tier::Small, Tier::Mid, Tier::Frontier]
@@ -1374,8 +997,6 @@ model = "claude-opus-4-8"
 
     #[test]
     fn a_misspelled_second_opinion_is_a_hard_error() {
-        // Warning and carrying on would run the task with ONE reviewer while
-        // the config says two — a verification layer deleted in silence.
         let path = scratch(
             "badso.toml",
             "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nstart_at = \"frontier\"\n\
@@ -1415,8 +1036,6 @@ model = "claude-opus-4-8"
 
     #[test]
     fn an_override_that_does_nothing_is_a_hard_error() {
-        // Indistinguishable from one whose only key was misspelled into a
-        // section serde ignores, so it cannot be waved through.
         let path = scratch(
             "emptyov.toml",
             "[[routing.overrides]]\npaths = [\"src/**\"]\n",
@@ -1552,9 +1171,6 @@ model = "claude-opus-4-8"
 
     #[test]
     fn effort_defaults_by_tier_and_a_pin_overrides_it() {
-        // What makes a tier mean something to an agent with an effort axis: a
-        // chain that escalates has to move this too, or every rung thinks
-        // exactly as hard as the last one.
         let path = scratch(
             "effortpin.toml",
             "[[pins]]\ntier = \"frontier\"\nagent = \"claude-code\"\nmodel = \"claude-opus-5\"\n\
@@ -1564,11 +1180,8 @@ model = "claude-opus-4-8"
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.effort_for(Tier::Small), Effort::Low);
         assert_eq!(cfg.effort_for(Tier::Mid), Effort::Medium);
-        // The pin wins over the tier's `high` default when no role policy is
-        // present — the original behavior remains intact.
         assert_eq!(cfg.effort_for(Tier::Frontier), Effort::Max);
         assert_eq!(cfg.implementation_effort(Tier::Frontier), Effort::Max);
-        // Reviewers judge at the review tier, which defaults to frontier.
         assert_eq!(cfg.review_effort(), Effort::Max);
     }
 
@@ -1694,9 +1307,6 @@ effort = "low"
 
     #[test]
     fn a_misspelled_effort_is_a_config_error_not_a_burned_attempt() {
-        // The provider rejects an unknown effort with a 400 after the turn has
-        // started (measured), so a typo would otherwise cost an attempt and
-        // report as an agent failure. Same posture as the pinned-model check.
         let path = scratch(
             "badeffort.toml",
             "[[pins]]\ntier = \"mid\"\nagent = \"claude-code\"\nmodel = \"claude-sonnet-5\"\n\
@@ -1802,9 +1412,6 @@ monthly_allowance = 300
         assert_eq!(max.monthly_allowance, Allowance::Auto);
         assert!(max.usable);
 
-        // D2's seam: two Claude Max pools differing only in `profile` parse and
-        // stay distinct. Nothing acts on the field in v0.1 — this is the shape
-        // being right ahead of the behaviour, deliberately.
         assert_eq!(max.profile.as_deref(), Some("personal"));
         assert_eq!(cfg.pools[1].profile.as_deref(), Some("work"));
         assert_eq!(
@@ -1825,7 +1432,6 @@ monthly_allowance = 300
             load(None, &hermetic(), Some(&path), warnings)
         };
 
-        // `kind` decides which estimator rule runs.
         let err = load_pools(
             "badkind.toml",
             "[pools.p]\nkind = \"subscription\"\nagent = \"claude-code\"\n",
@@ -1837,8 +1443,6 @@ monthly_allowance = 300
             "lists what is accepted: {err}"
         );
 
-        // Dropping `signals` by typo would discard §13's ground truth while the
-        // file still claims to have it.
         let err = load_pools(
             "badsource.toml",
             "[pools.p]\nkind = \"credits\"\nagent = \"copilot\"\nsources = [\"signal\"]\n",
@@ -1847,7 +1451,6 @@ monthly_allowance = 300
         .expect_err("unknown source must error");
         assert!(err.to_string().contains("signals"), "got: {err}");
 
-        // A "150% margin" has no degraded reading, only a wrong one.
         for bad in ["safety_margin = 1.5", "reserve = -0.2"] {
             let err = load_pools(
                 "badfraction.toml",
@@ -1867,8 +1470,6 @@ monthly_allowance = 300
         .expect_err("an unparseable window must error");
         assert!(err.to_string().contains("duration"), "got: {err}");
 
-        // §17's own example ships `agent = "aider"`, which has no adapter in
-        // v0.1. Erroring would brick anyone who copied the documented file.
         warnings.clear();
         let cfg = load_pools(
             "aider.toml",
@@ -1895,7 +1496,6 @@ monthly_allowance = 300
 
     #[test]
     fn wrong_section_shapes_get_actionable_errors() {
-        // `[gates]` as a table — the classic array-of-tables mistake.
         let path = scratch("gatestable.toml", "[gates]\ncheck = \"cargo check\"\n");
         let mut warnings = Vec::new();
         let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
@@ -1903,7 +1503,6 @@ monthly_allowance = 300
         let msg = err.to_string();
         assert!(msg.contains("[[gates]]"), "names the expected shape: {msg}");
 
-        // Wrong field type inside an entry.
         let path = scratch(
             "gatestype.toml",
             "[[gates]]\nname = \"t\"\ncmd = \"cargo test\"\ntimeout_secs = \"600\"\n",
@@ -1912,7 +1511,6 @@ monthly_allowance = 300
             .expect_err("string timeout must error");
         assert!(err.to_string().contains("timeout_secs"), "got: {err}");
 
-        // [engine] with a wrong type.
         let path = scratch("enginetype.toml", "[engine]\nshell = 5\n");
         let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
             .expect_err("numeric shell must error");
@@ -2010,8 +1608,6 @@ timeout_secs = 1200
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.wait_on_block, Duration::from_secs(90));
 
-        // Zero is a real setting, not "unset" — it is how an operator says a
-        // detached run should end parked rather than hold the workspace.
         let path = scratch("nowait.toml", "[interaction]\nwait_on_block_secs = 0\n");
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.wait_on_block, Duration::ZERO);
@@ -2038,17 +1634,12 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
         assert_eq!(cfg.notify, ["cli", "desktop"]);
         assert_eq!(cfg.wait_on_block, Duration::from_secs(120));
         assert_eq!(cfg.on_task_failure, OnTaskFailure::Continue);
-        // Parsed and acted on since step 10 — the "needs the ledger" warning it
-        // used to carry expired when the ledger landed.
         assert_eq!(cfg.ask_before.frontier_escalation_over_usd, Some(5.0));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
 
     #[test]
     fn a_misspelled_ask_before_key_is_a_hard_error() {
-        // Warning and carrying on would run past the spend the operator asked
-        // to approve, with nothing said — the `second_opinion` lesson, applied
-        // to money.
         let path = scratch(
             "badask.toml",
             "[interaction]\nask_before = { frontier_escalation_over_usdd = 5.0 }\n",
@@ -2076,8 +1667,6 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
         assert_eq!(cfg.budgets.task_usd, Some(4.0));
         assert!(cfg.budgets.any());
 
-        // Zero and negative both have two readings — "stop before starting" and
-        // "no limit" — and which one happened must never be a surprise.
         for bad in ["run_usd = 0.0", "task_usd = -1.0"] {
             let path = scratch("badbudget.toml", &format!("[budgets]\n{bad}\n"));
             let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
@@ -2085,15 +1674,12 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
             assert!(err.to_string().contains("ceiling"), "got: {err}");
         }
 
-        // Absent means unlimited, silently.
         let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
         assert!(!cfg.budgets.any());
     }
 
     #[test]
     fn misspelled_mode_or_failure_policy_is_a_hard_error() {
-        // Both decide whether the run stops or waits for a human. A typo that
-        // silently reverts to the default is not a recoverable surprise.
         let path = scratch("badmode.toml", "[interaction]\nmode = \"always\"\n");
         let mut warnings = Vec::new();
         let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
@@ -2130,11 +1716,6 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
 
     #[test]
     fn pools_keep_the_order_they_were_written_in() {
-        // `pool_for` takes the first match and its doc promises "table order as
-        // preference", which is the only mechanism an operator has for choosing
-        // between two accounts on one vendor. A `BTreeMap` silently substituted
-        // an alphabet for that choice — and every fixture happened to be
-        // alphabetical already, so nothing noticed.
         let path = scratch(
             "orderpools.toml",
             "[pools.work]
@@ -2165,9 +1746,6 @@ agent = \"claude-code\"
 
     #[test]
     fn an_unbuilt_budget_key_is_refused_rather_than_ignored() {
-        // §13 lists per-pool budgets, so `pool_fraction` is the key someone
-        // reading the design reaches for first. Accepting it silently would let
-        // them believe a pool was capped while nothing capped it.
         let path = scratch(
             "poolbudget.toml",
             "[budgets]
@@ -2183,9 +1761,6 @@ pool_fraction = 0.5
 
     #[test]
     fn an_explicit_pools_path_that_does_not_exist_is_a_typo_not_an_empty_machine() {
-        // Same rule `--config` has had: a path someone typed and that is not
-        // there is a mistake, and answering it with "no pools connected — run
-        // `upstroke connect`" sends them to regenerate a file that was fine.
         let absent = env::temp_dir()
             .join("upstroke-definitely-missing")
             .join("pools.toml");
@@ -2200,9 +1775,6 @@ pool_fraction = 0.5
 
     #[test]
     fn engine_limits_default_when_nothing_configures_them() {
-        // The four ceilings have to exist as values before anything can be
-        // said about a config that sets them — and a fresh repo must reach
-        // them without writing an `[engine]` section at all.
         let mut warnings = Vec::new();
         let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
         assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);
@@ -2211,8 +1783,6 @@ pool_fraction = 0.5
         assert_eq!(cfg.max_per_pool, DEFAULT_MAX_PARALLEL);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
 
-        // Same values through a section that configures something else, so the
-        // defaults are the parser's and not an artifact of the absent-table path.
         let path = scratch("engineshellonly.toml", "[engine]\nshell = \"bash\"\n");
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);
@@ -2224,11 +1794,6 @@ pool_fraction = 0.5
 
     #[test]
     fn max_parallel_above_one_is_refused_rather_than_read_past() {
-        // The refusal this section exists for. Accepting `max_parallel = 4`
-        // and then running one attempt at a time would have the operator
-        // budget a wall-clock and a spend for four workers and get one, with
-        // nothing said — so it errors at load, which is before a lock, a
-        // workspace, or a run directory exists.
         let mut warnings = Vec::new();
         for parallel in [2u32, 4, 64] {
             let path = scratch(
@@ -2248,8 +1813,6 @@ pool_fraction = 0.5
             );
         }
 
-        // One is not merely tolerated — it is the engine's actual behaviour, so
-        // writing it down deliberately must not warn.
         warnings.clear();
         let path = scratch("oneparallel.toml", "[engine]\nmax_parallel = 1\n");
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
@@ -2259,12 +1822,6 @@ pool_fraction = 0.5
 
     #[test]
     fn a_sequential_resume_warns_about_an_impossible_ceiling_rather_than_refusing_it() {
-        // The refusal above protects a promise about to be made. A run that
-        // already exists has made its promise, and it was a sequential one —
-        // refusing there would not prevent anything, it would only strand a run
-        // whose one fault is that someone edited a file it re-reads on the way
-        // back in. So the same value that stops a fresh run lets a resume
-        // through, says so by name, and leaves the recorded ceiling in place.
         let path = scratch("resumeparallel.toml", "[engine]\nmax_parallel = 3\n");
         let mut warnings = Vec::new();
         let cfg = load_limits(
@@ -2286,7 +1843,6 @@ pool_fraction = 0.5
             "the value is named and disowned: {warnings:?}"
         );
 
-        // The same file, one line earlier in its life, still refuses.
         let mut fresh_warnings = Vec::new();
         load_limits(
             Some(&path),
@@ -2297,9 +1853,6 @@ pool_fraction = 0.5
         )
         .expect_err("a run being created now must still refuse it");
 
-        // What the resume softens is that one ceiling, not validation. A limit
-        // with no meaning at all is refused for a resume exactly as for a fresh
-        // run — otherwise "legacy" would become a way around every check.
         for key in [
             "max_parallel",
             "max_merge_repairs",
@@ -2321,12 +1874,6 @@ pool_fraction = 0.5
 
     #[test]
     fn the_engine_limit_reading_follows_the_schema_the_run_recorded() {
-        // Sequential forever, by the topology design: a run recorded at schema
-        // 1, 2 or 3 never becomes a parallel one, so its resume reads the
-        // ceilings as a statement about some future run. Anything past that
-        // ceiling is not a sequential run's resume and gets the ordinary
-        // reading — which is today's refusal, because whether a topology run
-        // may raise its own ceiling is the activation question, not this one.
         for schema in 1..=LAST_SEQUENTIAL_SCHEMA {
             assert_eq!(
                 EngineLimits::for_resume(schema),
@@ -2342,10 +1889,6 @@ pool_fraction = 0.5
 
     #[test]
     fn zero_and_non_integer_engine_limits_are_config_errors() {
-        // Zero reads as both "no ceiling" and "nothing may run", and a limit
-        // whose meaning depends on which the reader assumed is not a limit.
-        // Every one of the four is checked: a rule that holds for `max_parallel`
-        // alone is a rule the next key added here quietly escapes.
         let mut warnings = Vec::new();
         for key in [
             "max_parallel",
@@ -2364,8 +1907,6 @@ pool_fraction = 0.5
             );
         }
 
-        // A value of the wrong shape is a mistake about the same setting, and
-        // must not fall through to the default the way an omitted key does.
         for body in [
             "max_parallel = \"1\"",
             "max_merge_repairs = 1.5",
@@ -2384,9 +1925,6 @@ pool_fraction = 0.5
 
     #[test]
     fn an_unknown_engine_key_warns_by_name_instead_of_vanishing() {
-        // `[engine]` used to drop every key it did not know, so a misspelled
-        // ceiling was indistinguishable from no ceiling at all. The typo below
-        // is the realistic one, and the operator has to be able to see it.
         let path = scratch(
             "unknownengine.toml",
             "[engine]\nmax_paralel = 4\nbogus = \"x\"\n",
@@ -2405,17 +1943,11 @@ pool_fraction = 0.5
             warnings.iter().all(|w| w.contains("[engine]")),
             "and located: {warnings:?}"
         );
-        // The typo bought nothing, which is exactly what the warning says.
         assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);
     }
 
     #[test]
     fn topology_only_limits_are_kept_and_announced_as_inert() {
-        // These three bound a topology this engine does not have: they are not
-        // wrong, they are early. So they parse, they are kept for the run that
-        // will read them, and each one says out loud that today's run does not
-        // — which is the whole difference between an unacted-on key and an
-        // ignored one.
         let path = scratch(
             "topologylimits.toml",
             "[engine]\nmax_merge_repairs = 5\nmax_per_agent = 3\nmax_per_pool = 2\n",
@@ -2434,8 +1966,6 @@ pool_fraction = 0.5
             );
         }
 
-        // Written at their defaults they change nothing, so there is nothing to
-        // announce — the warning tracks the *value*, not the presence of a key.
         warnings.clear();
         let path = scratch(
             "defaultlimits.toml",
@@ -2449,9 +1979,6 @@ pool_fraction = 0.5
 
     #[test]
     fn the_new_engine_limits_sit_beside_the_keys_that_already_worked() {
-        // The section grew four keys; the two it already had must still be
-        // consumed from the same table, and the shell warning must still be the
-        // soft one while `on_task_failure` stays hard.
         let path = scratch(
             "engineall.toml",
             "[engine]\nshell = \"powershell\"\non_task_failure = \"continue\"\n\
@@ -2472,21 +1999,6 @@ pool_fraction = 0.5
 
     #[test]
     fn a_load_validates_the_captured_bytes_and_not_a_second_read_of_the_file() {
-        // The capture/read/restore race, driven by hand at the only speed a
-        // test can drive it. `refusing` is a config this engine must not run;
-        // `accepted` is one it may.
-        //
-        // The interleaving is the dangerous one, A to B and back to A: capture
-        // while the file says A, let it say B for exactly as long as the
-        // validation takes, restore A before the confirmation looks. An
-        // implementation that fingerprints the file and then reads it again for
-        // the parse validates B, later compares two equal A captures, concludes
-        // nothing moved, and runs A — a config whose required refusal never
-        // fired. Nothing downstream can detect that, because by then both
-        // observations agree.
-        //
-        // What closes it is not a better comparison, it is having one read. The
-        // capture *is* the parser's input, so the answer below is A's.
         let refusing = "[engine]\nmax_parallel = 3\n";
         let accepted = "[engine]\nmax_merge_repairs = 4\n";
         let path = scratch("abarefusing.toml", refusing);
@@ -2501,9 +2013,6 @@ pool_fraction = 0.5
             "the transient file was validated in place of the captured one: {error}"
         );
 
-        // And back to A. The confirmation an engine performs here agrees with
-        // the capture — which is the trap, not the proof: agreement is only
-        // worth something because the thing it agrees with is what was parsed.
         fs::write(&path, refusing).expect("A restored");
         assert_eq!(
             CapturedConfig::capture(Some(&path), &hermetic(), Some(&missing())),
@@ -2512,10 +2021,6 @@ pool_fraction = 0.5
              validation is what had to see it"
         );
 
-        // The same claim the other way round, so this cannot pass by refusing
-        // everything: a captured config that is fine stays fine while the file
-        // is briefly one that would be refused. A run must inherit neither a
-        // refusal nor an acceptance from bytes it never held.
         let path = scratch("abaaccepted.toml", accepted);
         let captured = CapturedConfig::capture(Some(&path), &hermetic(), Some(&missing()));
         fs::write(&path, refusing).expect("B, for the length of the validation");
@@ -2531,8 +2036,6 @@ pool_fraction = 0.5
 
     #[test]
     fn a_capture_covers_the_pools_file_as_well_as_the_repo_config() {
-        // Two files feed a load, and a capture that covered one of them would
-        // leave the other free to move unobserved between a check and its use.
         let repo = scratch("capturedpools-config.toml", "[engine]\nshell = \"bash\"\n");
         let pools = scratch(
             "capturedpools-pools.toml",
@@ -2544,7 +2047,6 @@ pool_fraction = 0.5
             vec![repo.as_path(), pools.as_path()]
         );
 
-        // A pool named only by the transient file must not reach the config.
         fs::write(
             &pools,
             "[pools.two]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n",
@@ -2564,8 +2066,6 @@ pool_fraction = 0.5
 
     #[test]
     fn a_blank_pool_name_is_refused() {
-        // The name is what an attempt is attributed to; blank is
-        // indistinguishable from "no pool" by the time it reaches the ledger.
         let path = scratch(
             "blankname.toml",
             "[pools.\"\"]
@@ -2579,18 +2079,6 @@ agent = \"copilot\"
         assert!(err.to_string().contains("non-empty name"), "got: {err}");
     }
 
-    // -----------------------------------------------------------------------
-    // `[runner]` (DESIGN.md:612)
-    // -----------------------------------------------------------------------
-
-    /// An absent `[runner]` section is the host runner, and says it was not
-    /// configured.
-    ///
-    /// `from_config` is not decoration: INV-23's rebuild path warns when
-    /// "today's `[runner]` config differs", and a repository that never wrote
-    /// one has no config to differ. The two halves are asserted separately
-    /// because a default that set `from_config: true` would be invisible in the
-    /// `kind` alone.
     #[test]
     fn an_absent_runner_section_is_the_unconfigured_host_runner() {
         let mut warnings = Vec::new();
@@ -2606,15 +2094,6 @@ agent = \"copilot\"
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// The section parses every key DESIGN.md:612 names, and a mount is
-    /// read-only unless the operator said otherwise.
-    ///
-    /// `read_runner` rather than `load`, because `parse_runner` refuses a
-    /// container selection outright in this build and the parse is what is under
-    /// test here. The two are separate functions for exactly this reason.
-    ///
-    /// Second field held constant: the `kind`, which is `container` in every
-    /// assertion, so what varies is only which key is being read.
     #[test]
     fn the_runner_section_parses_kind_image_volumes_and_mounts() {
         let raw: toml::Value = toml::from_str(
@@ -2648,7 +2127,6 @@ mounts = [
                 RunnerMount {
                     source: PathBuf::from("/opt/toolchain"),
                     target: "/opt/toolchain".to_owned(),
-                    // Writable is a thing you say.
                     read_only: true,
                 },
                 RunnerMount {
@@ -2659,8 +2137,6 @@ mounts = [
             ]
         );
         assert!(selection.from_config);
-        // The two mounts differ in `read_only` and only one of them said so, so
-        // the default is doing the work rather than the fixture.
         assert_eq!(
             selection
                 .mounts
@@ -2671,15 +2147,6 @@ mounts = [
         );
     }
 
-    /// Every shape `[runner]` refuses, each with the reason, and each named.
-    ///
-    /// An unknown key is an **error** here where `[engine]` warns, and the grid
-    /// says so out loud: a mistyped key in `[engine]` leaves a ceiling at its
-    /// default, while `knid = "container"` leaves the run executing on the host
-    /// while its config reads as though gate code were confined.
-    ///
-    /// Second field held constant: every cell is a `[runner]` section and
-    /// nothing else, so no cell can fail for another section's reason.
     #[test]
     fn the_runner_section_refuses_every_shape_it_cannot_act_on() {
         let cases: &[(&str, &str, &str)] = &[
@@ -2733,13 +2200,7 @@ mounts = [
                 "kind = \"container\"\nimage = \"i\"\nmounts = [{ source = \"/a\", target = \"/b\", ro = true }]\n",
                 "[runner]:",
             ),
-            (
-                "not a table",
-                "",
-                // A `[runner]` that is a scalar cannot be written as a section
-                // header, so this cell is driven directly below.
-                "[runner]:",
-            ),
+            ("not a table", "", "[runner]:"),
         ];
 
         let mut refused = 0;
@@ -2762,24 +2223,11 @@ mounts = [
         }
         assert_eq!(refused, cases.len(), "every shape was driven");
 
-        // The control: the shape these are all variations on is accepted, so
-        // the refusals above are about what each cell changed.
         let ok: toml::Value =
             toml::from_str("kind = \"container\"\nimage = \"upstroke/ci:3.2\"\n").expect("toml");
         read_runner(Some(ok), Path::new("upstroke.toml")).expect("the base shape is accepted");
     }
 
-    /// The `[runner]` a `upstroke.toml` writes is the value resolution consumes,
-    /// end to end.
-    ///
-    /// PR12's activation is one call — `refuse_legacy_container_selection` in
-    /// [`parse_runner`] — and everything on either side of it already works.
-    /// This drives the whole chain that will be live then, from TOML bytes to a
-    /// `RunnerPolicy` that PR3's `completeness()` accepts, so the two halves are
-    /// known to fit rather than assumed to.
-    ///
-    /// Second field held constant: the runtime, which holds exactly what the
-    /// TOML names, so every assertion is about the value that crossed the seam.
     #[test]
     fn a_container_section_parses_into_the_selection_resolution_consumes() {
         use crate::runner::container::FakeRuntime;
@@ -2813,21 +2261,11 @@ credential_volumes = { claude-code = "creds-cc" }
         );
         policy.completeness().expect("a complete record");
 
-        // The control: the same TOML against a runtime that holds nothing is
-        // refused, so the success above is about what the runtime had.
         let empty = FakeRuntime::new(ContainerTrace::off());
         resolve_container(&empty, &selection)
             .expect_err("a runtime holding nothing cannot resolve it");
     }
 
-    /// A container selection is refused under both readings; a host one is not.
-    ///
-    /// The unit-level twin of
-    /// `runner::container::resolve::tests::legacy_container_selection_refused_before_effects`,
-    /// which drives the same refusal through both write commands. This one
-    /// pins that the refusal is a property of `refuse_legacy_container_selection`
-    /// alone, so deleting it from `parse_runner` is a distinct, separately
-    /// witnessed kill.
     #[test]
     fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {
         for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
@@ -2842,7 +2280,6 @@ credential_volumes = { claude-code = "creds-cc" }
                 kind: RunnerKind::Host,
                 ..container.clone()
             };
-            // The two selections differ in the kind and in nothing else.
             assert_eq!(
                 RunnerSelection {
                     kind: container.kind,
@@ -2861,8 +2298,6 @@ credential_volumes = { claude-code = "creds-cc" }
                 message.contains("[runner] `kind = \"container\"` is refused"),
                 "{limits:?}: {message}"
             );
-            // The message says which reading it is, so an operator can tell a
-            // refused fresh run from a refused resume.
             let expected = match limits {
                 EngineLimits::Fresh => "is being created by the schema-1..3 engine",
                 EngineLimits::SequentialResume => "keeps the boundary it started with",

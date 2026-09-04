@@ -15,7 +15,7 @@ source, documentation, workflows, release machinery and this file.
 3. **Run the eight-command baseline** (`CODING_STANDARDS.md` §2) before every push, then wait for
    the two required contexts: `upstroke-ci` (formatting, Clippy on three platforms, the Linux and macOS
    test matrix, the Windows suite on its self-hosted ephemeral runner `test (winguest)`, the
-   MSRV matrix, the four Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
+   MSRV matrix, the five Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
    branch behind `master` is updated first and waits again.
 4. **One frontier review pass on the green head.** Give the exact diff and head SHA to an
    independent frontier-class reviewer at `max` effort — today `gpt-5.6-sol` through `codex exec`,
