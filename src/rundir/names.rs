@@ -1,10 +1,45 @@
-//! The names this module writes on disk, as constants.
+//! The names the `rundir` funnels write on disk, as constants.
 //!
 //! The marker, the two private records and their staging siblings, the event
-//! log and the frozen plan. They are consts rather than literals at each call
-//! site because a census, a funnel and a test all have to agree on the same
-//! byte string: `run_creation` names each of these files and the ownership
-//! proof reads three of them back.
+//! log and the frozen plan. They are consts rather than a literal at each call
+//! site because the sites that have to agree on the byte string sit in
+//! different files: the funnels in `src/rundir.rs` publish them, the classifier
+//! in `classify.rs` and the ownership proof in `ownership.rs` read them back,
+//! and two tests in `tests.rs` pin them:
+//! `the_names_on_disk_are_the_names_the_packet_writes` binds every const to its
+//! literal, and `the_event_log_and_the_plan_are_reached_through_their_constants`
+//! binds the two `RunPaths` accessors to theirs.
+//!
+//! **One source of truth for `rundir`, not yet for the crate.** [`EVENT_LOG`]
+//! and [`PLAN`] name the two files a command outside this module opens by path
+//! rather than through `RunPaths`, and five such sites still spell the byte
+//! string for themselves: `export.rs`, `status.rs`, `capacity.rs`, `validate.rs`
+//! and `engine/resume.rs`. A rename of either const is therefore still a
+//! multi-file edit. The six names above them are not: no production code
+//! outside `rundir` spells any of the six as a path, and the one test that does
+//! (`engine/topology/emit/tests.rs`, joining `committed.json`) is recorded as
+//! `SWEEP-NAMES-003`.
+//!
+//! **What the proof consults, exactly.** `prove_private_half_ownership` reads
+//! two of these back and parses each ([`MARKER`], then [`OWNER_RECORD`] at the
+//! locator the marker names); *stats* a third, because conjunct 12 is
+//! [`COMMIT_RECORD`]'s **existence** and never its content; and compares a lone
+//! directory entry against [`MARKER_STAGED`] to tell a bare husk from a staged
+//! one. Four names, three kinds of use — a reader replacing the stat with a
+//! read would be weakening the deletion boundary, not tidying it.
+//!
+//! **How much authority stands behind each byte string.** `DESIGN.md` §15's
+//! run-directory drawing carries [`EVENT_LOG`] and [`PLAN`]; the other six
+//! appear in no `design/` section. Their packet,
+//! `decisions.workspace_candidates.run_creation`, left this repository on
+//! 2026-09-03 (`DESIGN.md`, "Retired records"), so its wording is checkable
+//! here only where the tree quotes it: `src/engine/topology/create.rs`'s
+//! verbatim P0-P8 order names `.creating`, `plan.normalized.json` and
+//! `events.jsonl`, and `rundir::tests`'s durability test quotes the staging
+//! rule the three `.tmp` siblings below follow, "write `<name>.tmp`, **fsync**,
+//! rename, **fsync the directory**". `owner.json` and `committed.json` are
+//! named in those quotations by role rather than by filename; their spelling is
+//! pinned by that one test and by nothing else.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree and not by the file, so an out-of-line

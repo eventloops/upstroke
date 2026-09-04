@@ -2241,6 +2241,38 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
     );
 }
 
+/// Every spelling of the event log and the frozen plan **inside this module**
+/// goes through the constant (`SWEEP-NAMES-001`).
+///
+/// A separate claim from the test above, and a separate mutation. That one
+/// pins each const to its byte string; this one pins the two accessors to the
+/// const, and the two are independent: `RunPaths::events` spelt
+/// `"events.jsonl"` for itself until this sweep, so the const was load-bearing
+/// for `classify::first_committed_line` — which decides husk from committed —
+/// and decorative for the accessor naming the file it looks for.
+///
+/// Two mutations, both run. `RunPaths::events` changed to `"events.json"`
+/// fails this test and leaves the test above passing. `EVENT_LOG` changed to
+/// `"events.jsonlx"` fails this test on master's accessor and passes on the
+/// routed one — which is what says the routing changed something, since with
+/// both spellings equal an accessor using the const and one using an identical
+/// literal are otherwise indistinguishable.
+///
+/// **Not the only guard, and not claimed as one.** Much of the crate writes
+/// through the accessor and reads through the const, so either mutation also
+/// reddens tests across `engine`, `export` and `answer`. Those report a broken
+/// resume; this one reports the disagreement itself, in the module that owns
+/// both names.
+#[test]
+fn the_event_log_and_the_plan_are_reached_through_their_constants() {
+    // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
+    // needs no scratch tree and leaves none.
+    let paths = paths_in(Path::new("names-through-consts"), BOUND_RUN);
+
+    assert_eq!(paths.events(), paths.public.join(EVENT_LOG));
+    assert_eq!(paths.plan_json(), paths.public.join(PLAN));
+}
+
 #[test]
 fn a_committed_private_half_is_never_provable_however_bound_it_is() {
     // The commit-record condition is the last conjunct and the one whose
