@@ -1,9 +1,10 @@
 //! Object-id vocabulary, and the refusals every ref transition is gated on.
 //!
-//! **INV-17's well-formedness half.** `update-ref` is given ids, not
-//! references: a malformed one is refused before any funnel runs, and the null
-//! id is refused on both sides of an update, because measured on git 2.43 it
-//! does not mean "this id" on either. As the expected-old,
+//! **The well-formedness half of the ref rule** (`design/26` step 5: a full
+//! hexadecimal object id on both sides, the null id refused on either).
+//! `update-ref` is given ids, not references: a malformed one is refused before
+//! any funnel runs, and the null id is refused on both sides of an update,
+//! because measured on git 2.43 it does not mean "this id" on either. As the expected-old,
 //! `update-ref -d <ref> 0{40}` deletes *unconditionally* rather than failing the
 //! compare-and-swap the caller believed it had written. As the new value,
 //! `update-ref <ref> 0{40} <old>` succeeds and **deletes** the ref when `<old>`

@@ -224,8 +224,8 @@ pub enum Refusal {
         refname: String,
     },
 
-    /// `INV-17`'s other side: the new value of a create or compare-and-swap
-    /// was the null object id.
+    /// The other side of the null-id rule (`design/26` step 5): the new value
+    /// of a create or compare-and-swap was the null object id.
     ///
     /// Measured, git 2.43: `git update-ref --no-deref <ref> 0{40} <old>`
     /// **succeeds and deletes the ref** when `<old>` matches, and with `""`
@@ -235,7 +235,7 @@ pub enum Refusal {
     /// and preserves the ref, as for any new value). A compare-and-swap that
     /// deletes the integration ref, or a create that reports success with no
     /// ref behind it, is not what either primitive's name promises, so it is
-    /// refused here. `design/26` step 5 states the rule.
+    /// refused here.
     #[error(
         "refusing to create or swap `{refname}` to the null object id: `git update-ref` reads it \
          as \"must not exist afterwards\", so it would delete the ref when the expected old \
