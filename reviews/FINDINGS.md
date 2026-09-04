@@ -6380,10 +6380,11 @@ and pushed before that merged, and sweep_coordinator's ruling is that this round
 rather than converting mid-flight. Nothing is migrated, so §56 keeps resolving and keeps being
 cited as a section.
 
-**The conversion is mechanical, and this paragraph is the recipe.** It follows PR #140, which
-restores the two rules `#138` lost by merging with only its first commit — so a successor should
-read `reviews/findings/README.md` at the head it works from rather than trusting this paragraph if
-the two disagree. A file is
+**The conversion is mechanical, and this paragraph is the recipe**, checked against
+`reviews/findings/README.md` as this branch carries it — PR #140 (`44dc06f`) restored the two
+rules `#138` lost by merging with only its first commit, and the README is authoritative, so read
+it at the head you work from rather than trusting this paragraph if the two ever disagree. A file
+is
 `reviews/findings/<severity>_<category>_<UTC timestamp>_<brief-description>.md`: **severity leads
 the name**, which is the whole point, because the directory then sorts worst-first. Every category
 in the table below is already a word from the closed vocabulary
