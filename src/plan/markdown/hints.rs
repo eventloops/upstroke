@@ -1,13 +1,4 @@
-//! Path-hint heuristics: the file paths a task's prose mentions.
-//!
-//! A bare word is a hint when it looks like a path rather than a sentence —
-//! it contains a separator, is not a URL, and either carries a known source
-//! extension, globs, or is at least two segments deep. Inline code is judged
-//! more loosely, since a backticked token is already a deliberate reference.
-//!
-//! A source of the DAG with two consumers: [`super::drafts`] harvests hints
-//! while walking a task's events, and [`super::assemble`] reuses
-//! [`push_unique`] to merge them behind the annotation's own `paths=`.
+//! Extended notes: `docs/internals/plan/markdown/hints.md`
 
 const HINT_EXTENSIONS: &[&str] = &[
     ".rs", ".md", ".toml", ".json", ".yml", ".yaml", ".txt", ".py", ".ts", ".js", ".lock",
