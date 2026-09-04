@@ -1,12 +1,8 @@
 # reviews/
 
-Dated **implementation reviews** — the last stage of the design lifecycle
-(`proposals/` → council → `decisions/` → implementation → here). Scope is a
-commit or build step; result is findings and their fixes, named
-`YYYY-MM-DD-<slug>.md`.
-
-Design critiques of proposals do not live here; they sit beside their proposal
-in [`proposals/`](../proposals/README.md).
+Dated **implementation reviews**: the verdict a frontier reviewer returned on a
+pull request head, recorded verbatim. Scope is a commit or build step; result is
+findings and their fixes, named `YYYY-MM-DD-<slug>.md`.
 
 [`FINDINGS.md`](FINDINGS.md) is the standing finding ledger — every finding across every slice,
 its disposition, and whether it has recurred. It is an **input to every review**: a reviewer reads

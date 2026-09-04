@@ -33,7 +33,6 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 
 use crate::agent::proc::{self, NoHooks, SpawnHooks};
 use crate::agent::{ProcessOutput, claude, codex, copilot};
@@ -45,67 +44,15 @@ use crate::runner::{AgentId, CommandSpec, ExecutionRole, ProbeTarget, Runner, Ru
 use crate::topology::effects::ProcessSite;
 use crate::topology::events::RunnerPolicy;
 
-/// The command the `RunnerPreflight` shell probe runs.
-///
-/// `decisions.sequential_substrate.runner`: "the RunnerPreflight shell probe
-/// (the recorded shell executing `exit 0` through the Runner …)". Not `true`,
-/// not `--version`: `exit 0` is a builtin of every shell
-/// [`ShellKind`] names, so the probe tests the shell and not a program that
-/// happens to be beside it.
-pub const SHELL_PROBE_COMMAND: &str = "exit 0";
-
-/// How long the shell probe may take.
-///
-/// A shell that has not run `exit 0` in ten seconds is unavailable for
-/// pre-flight's purposes whatever it is doing.
-pub const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+mod probe;
+pub use self::probe::{SHELL_PROBE_COMMAND, SHELL_PROBE_TIMEOUT, run_shell_probe};
 
 // ---------------------------------------------------------------------------
 // Environment composition
 // ---------------------------------------------------------------------------
 
-/// How the platform compares environment variable names.
-///
-/// A type rather than a `cfg!` at each comparison. `cfg!(windows)` is false on
-/// a Linux developer box and on the Linux CI cell, so a rule written as a
-/// `cfg!` is a rule whose Windows arm no test on those machines can reach —
-/// both sides of the pin move together. [`Self::ALL`] is what the grids run
-/// over; [`Self::current`] is what production selects. The same shape
-/// [`crate::topology::effects::Host`] uses, for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum KeyCase {
-    /// Unix: `Path` and `PATH` are two variables.
-    Sensitive,
-    /// Windows: `Path` and `PATH` are one variable, and a child that received
-    /// both would receive whichever the block happened to list last.
-    Insensitive,
-}
-
-impl KeyCase {
-    /// Both rules. Every grid runs over this, not over [`Self::current`].
-    pub const ALL: &'static [Self] = &[Self::Sensitive, Self::Insensitive];
-
-    /// The rule this machine's process environment obeys.
-    #[must_use]
-    pub const fn current() -> Self {
-        if cfg!(windows) {
-            Self::Insensitive
-        } else {
-            Self::Sensitive
-        }
-    }
-
-    /// Whether these two names are the same variable under this rule.
-    #[must_use]
-    pub fn same_key(self, left: &OsStr, right: &OsStr) -> bool {
-        match self {
-            Self::Sensitive => left == right,
-            Self::Insensitive => left
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&right.to_string_lossy()),
-        }
-    }
-}
+mod environment;
+pub use self::environment::{HostEnvironment, KeyCase};
 
 /// The environment keys `host-v1` owns.
 ///
@@ -173,219 +120,6 @@ const fn supplies_credentials(role: &ExecutionRole) -> bool {
         | ExecutionRole::Probe(ProbeTarget::Agent(_)) => true,
         ExecutionRole::Gate | ExecutionRole::Probe(ProbeTarget::Shell) => false,
     }
-}
-
-/// `host-v1`'s environment contract.
-///
-/// Holds its base explicitly so a test can compose against a base it wrote
-/// rather than against whatever variables happen to be set on the machine
-/// running the suite.
-#[derive(Debug, Clone)]
-pub struct HostEnvironment {
-    base: Vec<(OsString, OsString)>,
-    case: KeyCase,
-}
-
-impl HostEnvironment {
-    /// The Upstroke process environment, under this platform's name rule.
-    #[must_use]
-    pub fn from_process() -> Self {
-        Self {
-            base: std::env::vars_os().collect(),
-            case: KeyCase::current(),
-        }
-    }
-
-    /// An explicit base, for grids that must cover both name rules.
-    #[must_use]
-    pub fn with_base(base: Vec<(OsString, OsString)>, case: KeyCase) -> Self {
-        Self { base, case }
-    }
-
-    /// The base this runner composes from.
-    #[must_use]
-    pub fn base(&self) -> &[(OsString, OsString)] {
-        &self.base
-    }
-
-    /// The name rule in force.
-    #[must_use]
-    pub const fn case(&self) -> KeyCase {
-        self.case
-    }
-
-    /// The reserved values the runner supplies for this request.
-    ///
-    /// A reserved key the base does not carry is **not** supplied: setting an
-    /// absent variable to the empty string is a different environment from not
-    /// setting it, and several CLIs read "set but empty" as an instruction.
-    ///
-    /// DESIGN.md:259-262 — "the host runner starts from the Upstroke environment
-    /// and the container runner from the image environment; **each** supplies
-    /// role-scoped `HOME`, `PATH`, and credential locations" — resolved for
-    /// `host-v1` as follows, and the split is deliberate:
-    ///
-    /// * **credential locations are role-scoped**, by
-    ///   [`supplies_credentials`]. A gate is repository-controlled code and the
-    ///   shell probe is a shell; neither runs an agent CLI, so neither is told
-    ///   where an agent's credentials live, whatever agent the request happens
-    ///   to name. This is the sentence's own word "role-scoped" doing work.
-    /// * **`HOME`, `PATH` and `USERPROFILE` are supplied to every role at the
-    ///   host boundary's own value.** That is a boundary, and "one machine,
-    ///   one user" is a rationale rather than a basis for it, so it is drawn
-    ///   from live passages — three of them, each forbidding a different part
-    ///   of a per-role value:
-    ///
-    ///   1. DESIGN.md:263 — "Probe and execution compose the **same** base,
-    ///      mounts, reserved values, and overlay, so pre-flight certifies the
-    ///      environment that will actually spend." `probe(<agent>)`,
-    ///      `implement` and `review` are the probe and the execution that
-    ///      sentence pairs; a `HOME` differing across them would make
-    ///      pre-flight certify an environment the attempt never runs in.
-    ///   2. `decisions/2026-08-12-merge-queue-execution-topology.md:331-333` —
-    ///      "gate-shell/program availability is checked inside the same
-    ///      boundary." The shell probe certifies the shell a gate will run; a
-    ///      `PATH` differing between `probe(shell)` and `gate` would certify a
-    ///      different program from the one that runs.
-    ///   3. The same decision, :341-342 — "Host runner behavior remains
-    ///      available and honestly provides **no OS boundary** around gate
-    ///      code." Handing gate code a different `HOME` on this host would
-    ///      assert an isolation the host does not have: repository-controlled
-    ///      code reads the real home directory by absolute path either way.
-    ///      What the host *can* honestly do is not disclose a location it
-    ///      would otherwise hand over, and that is [`supplies_credentials`].
-    ///
-    ///   The value comes from the base rather than from anything this runner
-    ///   invents, because the same decision says where the base is (:321-322):
-    ///   "**The host base starts from the Upstroke process environment**, while
-    ///   the container base starts from the image environment." A process
-    ///   environment carries one value per key under [`KeyCase`] — so one
-    ///   value is what a correct `host-v1` *produces*, not a narrowing this
-    ///   slice chose. The container runner differs not because its `HOME`
-    ///   string differs per role but because each role's container is its own
-    ///   filesystem; PR4's `production_effect` is "same behavior plus stronger
-    ///   Windows crash containment", and no passage describes a per-role home
-    ///   directory on the host for it to grow into.
-    ///
-    ///   Asserted from those passages, not commented, by
-    ///   `the_reserved_values_every_role_gets_are_the_host_boundarys_own` — so
-    ///   a `host-v1` that ever does scope `HOME` has to change a passage
-    ///   first, rather than a count.
-    ///
-    /// A reserved key the base does not carry is **not** supplied: setting an
-    /// absent variable to the empty string is a different environment from not
-    /// setting it, and several CLIs read "set but empty" as an instruction.
-    #[must_use]
-    pub fn reserved_values(
-        &self,
-        role: &ExecutionRole,
-        agent: Option<&AgentId>,
-    ) -> Vec<(&'static str, OsString)> {
-        let mut supplied = Vec::new();
-        for key in RESERVED_ALWAYS {
-            if let Some(value) = self.lookup(key) {
-                supplied.push((*key, value));
-            }
-        }
-        if supplies_credentials(role) {
-            if let Some(key) = agent.and_then(credential_location) {
-                if let Some(value) = self.lookup(key) {
-                    supplied.push((key, value));
-                }
-            }
-        }
-        supplied
-    }
-
-    /// Base, then reserved values, then overlay — DESIGN.md:263's own order
-    /// ("the same base, mounts, reserved values, and overlay").
-    ///
-    /// The base's own copies of the **reserved** keys are dropped before the
-    /// runner supplies them, and that is what makes "role-scoped" a property
-    /// of the child's environment rather than of a vector nothing reads.
-    /// Cloning the base and then upserting would leave every credential
-    /// location the Upstroke process happens to carry in a gate's environment —
-    /// a gate is repository-controlled code, and `CODEX_HOME` reaching it is
-    /// exactly the thing [`supplies_credentials`] exists to prevent. It would
-    /// also make this step *output-equivalent to deleting it*, because
-    /// [`Self::reserved_values`] reads the values back out of the same base.
-    /// So the reserved keys arrive from one place — this function's supply
-    /// step, which is role-scoped — or not at all.
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] naming the key when the overlay names a
-    /// reserved one. That is the contract's `expected_failures_refusals[0]`,
-    /// "reserved env conflict -> pre-flight error", and it is refused by
-    /// **key**: `invariants_introduced[0]` says "reserved keys refused
-    /// pre-flight", and an overlay permitted to restate `PATH` today because
-    /// the value happens to match is an overlay that breaks silently the day
-    /// the runner's value changes.
-    pub fn compose(
-        &self,
-        role: &ExecutionRole,
-        agent: Option<&AgentId>,
-        overlay: &[(String, String)],
-    ) -> Result<Vec<(OsString, OsString)>, UpstrokeError> {
-        self.preflight(overlay)?;
-        let mut composed = self.base.clone();
-        for reserved in reserved_keys() {
-            composed.retain(|(name, _)| !self.case.same_key(name, OsStr::new(reserved)));
-        }
-        for (key, value) in self.reserved_values(role, agent) {
-            upsert(&mut composed, self.case, OsString::from(key), value);
-        }
-        for (key, value) in overlay {
-            upsert(
-                &mut composed,
-                self.case,
-                OsString::from(key),
-                OsString::from(value),
-            );
-        }
-        Ok(composed)
-    }
-
-    /// The reserved-key refusal on its own, so a caller can certify an overlay
-    /// without building an environment.
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] naming the offending key and the reserved key
-    /// it collides with.
-    pub fn preflight(&self, overlay: &[(String, String)]) -> Result<(), UpstrokeError> {
-        for (key, _) in overlay {
-            if let Some(reserved) = reserved_keys()
-                .into_iter()
-                .find(|reserved| self.case.same_key(OsStr::new(key), OsStr::new(reserved)))
-            {
-                return Err(UpstrokeError::Refused {
-                    message: format!(
-                        "the command overlay sets `{key}`, which is reserved by the host runner \
-                         (`{reserved}`). An adapter may select a profile or change CLI behaviour, \
-                         but the runner owns the environment the process executes in \
-                         (DESIGN.md:258-264)"
-                    ),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn lookup(&self, key: &str) -> Option<OsString> {
-        self.base
-            .iter()
-            .find(|(name, _)| self.case.same_key(name, OsStr::new(key)))
-            .map(|(_, value)| value.clone())
-    }
-}
-
-fn upsert(into: &mut Vec<(OsString, OsString)>, case: KeyCase, key: OsString, value: OsString) {
-    if let Some(slot) = into.iter_mut().find(|(name, _)| case.same_key(name, &key)) {
-        slot.1 = value;
-        return;
-    }
-    into.push((key, value));
 }
 
 // ---------------------------------------------------------------------------
@@ -775,156 +509,8 @@ fn cmd_switch_index(program: &Path, spec: &CommandSpec) -> Option<usize> {
 // Program resolution
 // ---------------------------------------------------------------------------
 
-/// How a platform turns a program **name** into the file names it may be.
-///
-/// A type rather than a `cfg!` at each comparison, for [`KeyCase`]'s reason and
-/// with more at stake: `PR6D-001` is a rule whose Windows arm no Linux machine
-/// could reach, and it shipped because every fixture that could have caught it
-/// was `#[cfg(windows)]` and every Windows fixture used an absolute path. Both
-/// variants are constructible on both platforms, so the Windows naming rule is
-/// executed by the Linux suite on every run and not only by the guest.
-///
-/// The *file* predicate is platform-native and cannot be gridded — Windows has
-/// no mode bits — so [`Self::is_program`] degrades to "is a file" wherever the
-/// bits do not exist. Everything above it is pure string work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum ProgramNaming {
-    /// Unix. `/` separates; there are no executable extensions, so `execvp`
-    /// tries the name itself in each `PATH` directory and skips a file whose
-    /// execute bit is clear rather than failing on it.
-    Posix,
-    /// Windows. `\`, `/` and `:` all separate, and an extensionless name is not
-    /// a program: a shell appends `PATHEXT`'s entries in order. `CreateProcessW`
-    /// appends `.exe` **only**, which is the whole of `PR6D-001` — `PATHEXT`
-    /// lists `.CMD`, a shell finds `claude.cmd`, and `std::process::Command`
-    /// does not.
-    Windows,
-}
-
-impl ProgramNaming {
-    /// What this platform does.
-    const fn current() -> Self {
-        if cfg!(windows) {
-            Self::Windows
-        } else {
-            Self::Posix
-        }
-    }
-
-    /// `PATHEXT`'s entries when nothing sets it.
-    ///
-    /// `cmd.exe`'s own built-in default, **in its order**: `.COM` before `.EXE`
-    /// before `.BAT` before `.CMD`. Written here from the platform rather than
-    /// borrowed from [`crate::util::executable_extensions`], whose default is a
-    /// different order and which also probes the extensionless name — a rule
-    /// for a diagnostic, not for a spawn.
-    const DEFAULT_PATHEXT: &'static [&'static str] = &[".com", ".exe", ".bat", ".cmd"];
-
-    /// Whether `program` is a name for this boundary to resolve, rather than a
-    /// location to use as given.
-    ///
-    /// The same partition the platform itself draws: `execvp` searches `PATH`
-    /// for a name and never for something containing `/`, and std's Windows
-    /// search is reached only by `is_file_name`. A location is therefore handed
-    /// to `Command` byte for byte, which is what makes "an absolute program
-    /// spawns exactly as it did before this repair" true by construction rather
-    /// than by a fixture.
-    fn is_bare_name(self, program: &str) -> bool {
-        if program.is_empty() {
-            return false;
-        }
-        !program.chars().any(|c| match self {
-            Self::Posix => c == '/',
-            // `:` because `C:file` is drive-relative and `f:s` names an
-            // alternate data stream; neither is a name to search `PATH` for.
-            Self::Windows => matches!(c, '/' | '\\' | ':'),
-        })
-    }
-
-    /// The file names `program` may be, in the order a shell tries them.
-    ///
-    /// Windows: a name that already carries an extension is tried verbatim
-    /// first and then with each `PATHEXT` entry appended; a name without one is
-    /// **not** tried verbatim, because an extensionless file is not a program
-    /// there — `CreateProcessW` appends `.exe` to it and `cmd.exe` appends
-    /// `PATHEXT`. Trying it anyway would let a data file called `claude` sitting
-    /// in a `PATH` directory shadow the real `claude.exe`.
-    ///
-    /// Unix: the name, and nothing else.
-    fn candidates(self, program: &str, pathext: Option<&OsStr>) -> Vec<OsString> {
-        let mut names = Vec::new();
-        if self == Self::Posix {
-            names.push(OsString::from(program));
-            return names;
-        }
-        if Path::new(program).extension().is_some() {
-            names.push(OsString::from(program));
-        }
-        for extension in Self::extensions(pathext) {
-            let candidate = OsString::from(format!("{program}{extension}"));
-            if !names.contains(&candidate) {
-                names.push(candidate);
-            }
-        }
-        names
-    }
-
-    /// `PATHEXT` as a list, or the platform default when it is unset, empty, or
-    /// carries nothing usable.
-    ///
-    /// An entry that does not start with `.` is dropped rather than joined —
-    /// `PATHEXT=exe` would otherwise produce `claudeexe` — and an entry list
-    /// that ends up empty falls back to the default rather than to "no
-    /// candidates at all", because a `PATHEXT` of `;;;` is a malformed variable
-    /// and not an instruction that this machine has no programs.
-    fn extensions(pathext: Option<&OsStr>) -> Vec<String> {
-        let listed: Vec<String> = pathext
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .split(';')
-            .map(|entry| entry.trim().to_ascii_lowercase())
-            .filter(|entry| entry.len() > 1 && entry.starts_with('.'))
-            .collect();
-        if listed.is_empty() {
-            return Self::DEFAULT_PATHEXT
-                .iter()
-                .map(|extension| (*extension).to_owned())
-                .collect();
-        }
-        listed
-    }
-
-    /// Whether this file is one a spawn of that name would reach.
-    ///
-    /// Unix checks the execute bit because `execvp` does: a non-executable
-    /// `claude` in an early `PATH` directory is skipped there, and a resolution
-    /// that stopped at it would refuse — or spawn `EACCES` — where the old code
-    /// found the real one further along. Windows has no such bit, so existence
-    /// is the whole question there.
-    fn is_program(self, path: &Path) -> bool {
-        if !path.is_file() {
-            return false;
-        }
-        match self {
-            Self::Windows => true,
-            Self::Posix => executable_bit(path),
-        }
-    }
-}
-
-/// The execute bit, where the platform has one.
-#[cfg(unix)]
-fn executable_bit(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
-}
-
-/// Windows files carry no execute bit, so `ProgramNaming::Posix` degrades to
-/// existence when a grid drives it there. Nothing in production reaches this.
-#[cfg(not(unix))]
-fn executable_bit(_path: &Path) -> bool {
-    true
-}
+mod naming;
+use self::naming::{ProgramNaming, composed_value, resolve_program};
 
 thread_local! {
     /// See [`program_resolutions`].
@@ -976,166 +562,127 @@ pub fn program_searches() -> u64 {
     SEARCHES.with(std::cell::Cell::get)
 }
 
-/// The value of `key` in a composed environment, under this platform's name
-/// rule.
-fn composed_value<'a>(
-    composed: &'a [(OsString, OsString)],
-    case: KeyCase,
-    key: &str,
-) -> Option<&'a OsStr> {
-    composed
-        .iter()
-        .find(|(name, _)| case.same_key(name, OsStr::new(key)))
-        .map(|(_, value)| value.as_os_str())
-}
+/// The containment proof and its sole mint, in a module with no descendants.
+///
+/// `Contained`'s field is private to **this** module rather than to
+/// `runner::host`, which is the whole point: Rust privacy reaches a module
+/// and everything below it, so a field private to `runner::host` is
+/// constructible from `runner::host::naming`, `::environment` and `::probe`.
+/// `proof` has no children, so its siblings cannot reach the field and the
+/// only route to a value is [`contain_write_command`], which performs the
+/// join. The mint stays with the type as a local implementation invariant of this
+/// module: a proof and the only code that may create it are read together or not
+/// at all.
+mod proof {
+    use super::ESTABLISHMENTS;
+    use crate::agent::proc::{self, SpawnHooks};
+    use crate::error::UpstrokeError;
 
-/// Which file `program` names, at this boundary.
-///
-/// The second clause of `PR4-ADAPTER-RESOLVES-ON-THE-HOST`: the adapter names
-/// the CLI and consults no filesystem, and the runner resolves that name
-/// against **the environment it composes**. `composed` is that environment —
-/// the one the child is about to be given — so pre-flight and the attempt
-/// resolve identically because they compose identically (DESIGN.md:263).
-///
-/// One rule for every program this boundary runs. `gates::ShellKind::spec` has
-/// always shipped a bare `sh`, `bash`, `cmd` or `pwsh` and the three agent CLIs
-/// now do too; a second rule for one of them is how `PR6D-001` happened.
-///
-/// **What it deliberately does not search.** std's Windows fallbacks — the
-/// application directory, the system directory, the Windows directory, and the
-/// *parent* process's `PATH` — are not consulted. A runner that owns the
-/// environment (DESIGN.md:118) and then reaches outside it for a program is
-/// composing one environment and resolving against another, which is the class
-/// of bug this function exists to close. In production the composed `PATH` is
-/// the coordinator process's own (`PATH` is reserved, so no overlay can move
-/// it), and `%SystemRoot%\System32` is on it on every Windows installation, so
-/// the narrowing is reachable only by a caller that supplies a `HostEnvironment`
-/// with a `PATH` of its own — which is exactly the caller that meant it.
-///
-/// It also does not search a `PATH` entry that is not absolute — the empty
-/// entry of `PR6-LANED-003` and every other spelling of "the current
-/// directory". The reason is in the loop below; the short form is that this
-/// runner's current directory is the workspace.
-///
-/// # Errors
-///
-/// [`UpstrokeError::Refused`] naming the program, the boundary and the `PATH` it
-/// searched, when a bare name matches nothing. Fail-closed on purpose: the
-/// alternative is handing the name to `Command` anyway and letting the spawn
-/// fail with a bare `NotFound` that names no boundary, which on Windows is
-/// precisely the failure an operator could not diagnose.
-fn resolve_program(
-    program: &str,
-    composed: &[(OsString, OsString)],
-    case: KeyCase,
-    naming: ProgramNaming,
-) -> Result<PathBuf, UpstrokeError> {
-    SEARCHES.with(|count| count.set(count.get() + 1));
-    if !naming.is_bare_name(program) {
-        // A location, used as given — no probing, no extension, nothing this
-        // machine contributed. This is every absolute program the suite and the
-        // v0.1 product already spawn, and it must not change.
-        return Ok(PathBuf::from(program));
-    }
-    let path = composed_value(composed, case, "PATH");
-    let candidates = naming.candidates(program, composed_value(composed, case, "PATHEXT"));
-    let mut searched = 0_usize;
-    let mut skipped = 0_usize;
-    for dir in std::env::split_paths(path.unwrap_or_else(|| OsStr::new(""))) {
-        // **`PR6-LANED-003`.** A `PATH` entry that does not name a location on
-        // its own names one *relative to a current directory*, and this
-        // runner's current directory is the workspace — repository content,
-        // under automation. DESIGN.md:398-402 is explicit that repository
-        // content executing with this process's authority is the threat the
-        // container runner exists to bound; the host runner cannot bound it for
-        // gate code, but the *agent* is not gate code and must not become a way
-        // in. An **empty** entry is the finding's own case and the degenerate
-        // one — POSIX gives a null prefix the meaning "the current directory",
-        // so `PATH=:/usr/bin` with a `claude` in the workspace is a
-        // workspace-controlled agent.
-        //
-        // Fail-closed, and it costs a real capability: a program reachable only
-        // through a relative `PATH` entry is refused rather than run. That is
-        // the right side to fail on. The alternative is worse than it looks —
-        // this predicate runs against the *coordinator's* current directory
-        // while the child runs against the *workspace* — so a relative entry
-        // does not merely widen the search, it lets the runner certify one file
-        // and execute another, which is DESIGN.md:612 in the same breath.
-        //
-        // `Path::is_absolute` rather than a [`ProgramNaming`] rule: like
-        // [`ProgramNaming::is_program`], this is a question about *this*
-        // filesystem's paths rather than about how a name is spelled, and
-        // `std::env::split_paths` is already the platform's own splitter. The
-        // rule the grid does execute on both platforms is the one above it.
-        if !dir.is_absolute() {
-            skipped += 1;
-            continue;
-        }
-        searched += 1;
-        // Directory outermost, candidate innermost: `PATH` order decides
-        // between installations and `PATHEXT` order decides only within one
-        // directory. The other nesting promotes a later directory over an
-        // earlier installation, which is the shape the deleted
-        // `find_program_candidates` test pinned.
-        for candidate in &candidates {
-            let file = dir.join(candidate);
-            if naming.is_program(&file) {
-                return Ok(file);
-            }
+    /// Proof that this process has performed its write-command containment
+    /// startup (INV-18, host portion).
+    ///
+    /// The type exists so that "the ambient job is established before anything
+    /// this run could spawn" is a thing the compiler checks rather than a thing
+    /// each new entry point is trusted to remember. **The field is private to
+    /// this module, and this module has no descendants** — so no sibling of
+    /// `runner::host`'s children, and not `runner::host` itself, can name it.
+    /// The only values of it in the crate are the ones
+    /// [`contain_write_command`] returns after [`proc::join_ambient_job`] has
+    /// succeeded, and that is enforced by the compiler rather than by a census.
+    ///
+    /// **The module boundary is the mechanism, and it is load-bearing.** Rust
+    /// privacy is scoped to a module *and everything below it*, so a private
+    /// field in `runner::host` is reachable from every child of
+    /// `runner::host` — which the per-concern split made four modules rather
+    /// than one. **Three spellings construct one**, and only the third contains
+    /// the `Contained(` needle a lexical census looks for:
+    /// `Contained { 0: () }`, `let c = Contained; c(())`, and the plain
+    /// `Contained(())` — none of them calling `Contained::new`, so none of them
+    /// incrementing [`super::containment_establishments`]. Confining the type to
+    /// a module with nothing beneath it is what makes "a caller cannot forge
+    /// one" true again. **A runtime test cannot observe that**, because the
+    /// property is that the offending code does not compile: those three forms
+    /// and `proof::Contained::new()` — four in all — were each planted in
+    /// `runner::host::naming` and each rejected, as `E0451`, `E0423`, `E0423`
+    /// and `E0624`. The fourth is the control that decides the shape: it is what
+    /// a `pub(super) fn new` would have let through, minting a token with no
+    /// join performed while the counter agreed with it. The evidence is the
+    /// repair round's, not a `#[test]`'s.
+    ///
+    /// `src/main.rs` has the same shape for the CLI's own dispatch (its
+    /// `containment::Contained` proves *classification*: a write command joined,
+    /// a read-only one was not asked to). This is the library half of that idea,
+    /// for the callers that never go through `main.rs` at all — the frozen public
+    /// `engine::run/run_with/run_harness` and `resume/resume_with/resume_harness`
+    /// facades, which a downstream crate may call directly.
+    #[derive(Debug)]
+    pub struct Contained(());
+
+    impl Contained {
+        /// The only constructor, and it is private: a token exists exactly when
+        /// the containment step ran and returned `Ok`.
+        fn new() -> Self {
+            ESTABLISHMENTS.with(|count| count.set(count.get() + 1));
+            Self(())
         }
     }
-    Err(UpstrokeError::Refused {
-        message: format!(
-            "the host runner cannot execute `{program}`: nothing of that name is on the PATH \
-             this runner composes ({searched} director{} searched{}, as {}). The runner resolves \
-             a program name against the environment it composes (DESIGN.md:118), so the program \
-             must be installed inside the boundary that executes it — on PATH for the host \
-             runner, in the image for a container runner. PATH: {}",
-            if searched == 1 { "y" } else { "ies" },
-            match skipped {
-                0 => String::new(),
-                1 => ", 1 PATH entry skipped as not absolute".to_owned(),
-                n => format!(", {n} PATH entries skipped as not absolute"),
-            },
-            candidates
-                .iter()
-                .map(|candidate| format!("`{}`", candidate.to_string_lossy()))
-                .collect::<Vec<_>>()
-                .join(", "),
-            path.unwrap_or_else(|| OsStr::new("<unset>"))
-                .to_string_lossy()
-        ),
-    })
-}
 
-/// Proof that this process has performed its write-command containment
-/// startup (INV-18, host portion).
-///
-/// The type exists so that "the ambient job is established before anything
-/// this run could spawn" is a thing the compiler checks rather than a thing
-/// each new entry point is trusted to remember. Its field is private to this
-/// module, so the only values of it in the crate are the ones
-/// [`contain_write_command`] returns after [`proc::join_ambient_job`] has
-/// succeeded — a caller cannot forge one, and
-/// [`crate::engine`]'s write coordinator will not start without one.
-///
-/// `src/main.rs` has the same shape for the CLI's own dispatch (its
-/// `containment::Contained` proves *classification*: a write command joined,
-/// a read-only one was not asked to). This is the library half of that idea,
-/// for the callers that never go through `main.rs` at all — the frozen public
-/// `engine::run/run_with/run_harness` and `resume/resume_with/resume_harness`
-/// facades, which a downstream crate may call directly.
-#[derive(Debug)]
-pub struct Contained(());
-
-impl Contained {
-    /// The only constructor, and it is private: a token exists exactly when
-    /// the containment step ran and returned `Ok`.
-    fn new() -> Self {
-        ESTABLISHMENTS.with(|count| count.set(count.get() + 1));
-        Self(())
+    /// The write-command containment startup step (INV-18, host portion), and the
+    /// proof that it ran.
+    ///
+    /// What `src/main.rs` calls at the top of every write command, before any
+    /// dispatch arm runs, and what the engine's write coordinator calls before it
+    /// touches anything. `crash_reconstruction`: "at process start every write
+    /// command creates one non-inheritable ambient Job Object with
+    /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns the coordinator process
+    /// itself to it … if the ambient job cannot be created or joined the write
+    /// command refuses at startup with a diagnostic before any workspace effect".
+    ///
+    /// A free function because the ambient job is a property of the *process*, not
+    /// of a runner value: it is established once at startup and held to process
+    /// exit, and it must be established before anything that could spawn exists.
+    /// Idempotent for the same reason — `windows_job::join_ambient` memoises the
+    /// process's one answer — so a coordinator entered through the CLI, which has
+    /// already joined, re-establishes at no cost and gets its proof.
+    /// [`crate::runner::host::HostRunner::start_write_command`] is the same step
+    /// with a runner's own
+    /// observer attached, for the ST-07 evidence, and it calls **this** function —
+    /// so there is one join site and one mint in the crate, not two.
+    ///
+    /// ## Why the observer is a parameter
+    ///
+    /// It is threaded one level further out than the funnel's, and for the reason
+    /// that put a `join` closure inside `proc::join_ambient_job_with` and a
+    /// `contain` parameter on `engine::run_contained`: **no machine here can make
+    /// the real join fail on demand** — `windows_job::join_ambient` memoises the
+    /// process's one answer, so a binary that has ever joined can never observe a
+    /// failure — and a step that took no observer therefore had no failure path
+    /// any test could drive.
+    ///
+    /// That matters here more than anywhere else it is threaded. This is the
+    /// function the frozen public facades (`engine::run_harness`,
+    /// `engine::resume_harness`) and `src/main.rs`'s dispatch all reach, and it is
+    /// the **only** place in the crate that mints a [`Contained`]; the `map` below
+    /// losing its short-circuit is the whole of INV-18's host portion silently
+    /// ceasing to hold, on the platform where the failure is real. Production
+    /// passes [`crate::agent::proc::NoHooks`] at every call site, exactly as it
+    /// does to the process
+    /// funnel; the suite arms an observer that refuses at
+    /// `Spawn.AmbientJobJoined` and watches the refusal come back out with no
+    /// proof minted (see
+    /// `tests::the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing`).
+    ///
+    /// # Errors
+    ///
+    /// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
+    /// created or joined. On Unix this cannot fail: containment there is the
+    /// per-invocation reaper and the isolated process group.
+    pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
+        proc::join_ambient_job(hooks).map(|()| Contained::new())
     }
 }
+
+pub use self::proof::{Contained, contain_write_command};
 
 thread_local! {
     /// See [`containment_establishments`].
@@ -1162,58 +709,6 @@ thread_local! {
 #[must_use]
 pub fn containment_establishments() -> u64 {
     ESTABLISHMENTS.with(std::cell::Cell::get)
-}
-
-/// The write-command containment startup step (INV-18, host portion), and the
-/// proof that it ran.
-///
-/// What `src/main.rs` calls at the top of every write command, before any
-/// dispatch arm runs, and what the engine's write coordinator calls before it
-/// touches anything. `crash_reconstruction`: "at process start every write
-/// command creates one non-inheritable ambient Job Object with
-/// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns the coordinator process
-/// itself to it … if the ambient job cannot be created or joined the write
-/// command refuses at startup with a diagnostic before any workspace effect".
-///
-/// A free function because the ambient job is a property of the *process*, not
-/// of a runner value: it is established once at startup and held to process
-/// exit, and it must be established before anything that could spawn exists.
-/// Idempotent for the same reason — `windows_job::join_ambient` memoises the
-/// process's one answer — so a coordinator entered through the CLI, which has
-/// already joined, re-establishes at no cost and gets its proof.
-/// [`HostRunner::start_write_command`] is the same step with a runner's own
-/// observer attached, for the ST-07 evidence, and it calls **this** function —
-/// so there is one join site and one mint in the crate, not two.
-///
-/// ## Why the observer is a parameter
-///
-/// It is threaded one level further out than the funnel's, and for the reason
-/// that put a `join` closure inside `proc::join_ambient_job_with` and a
-/// `contain` parameter on `engine::run_contained`: **no machine here can make
-/// the real join fail on demand** — `windows_job::join_ambient` memoises the
-/// process's one answer, so a binary that has ever joined can never observe a
-/// failure — and a step that took no observer therefore had no failure path
-/// any test could drive.
-///
-/// That matters here more than anywhere else it is threaded. This is the
-/// function the frozen public facades (`engine::run_harness`,
-/// `engine::resume_harness`) and `src/main.rs`'s dispatch all reach, and it is
-/// the **only** place in the crate that mints a [`Contained`]; the `map` below
-/// losing its short-circuit is the whole of INV-18's host portion silently
-/// ceasing to hold, on the platform where the failure is real. Production
-/// passes [`NoHooks`] at every call site, exactly as it does to the process
-/// funnel; the suite arms an observer that refuses at
-/// `Spawn.AmbientJobJoined` and watches the refusal come back out with no
-/// proof minted (see
-/// `tests::the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing`).
-///
-/// # Errors
-///
-/// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
-/// created or joined. On Unix this cannot fail: containment there is the
-/// per-invocation reaper and the isolated process group.
-pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
-    proc::join_ambient_job(hooks).map(|()| Contained::new())
 }
 
 /// [`contain_write_command`] for a caller with nothing to prove it to.
@@ -1265,81 +760,6 @@ pub fn shell_probe_request(
         agent: None,
         invocation,
     }
-}
-
-/// Execute the shell probe through `runner`.
-///
-/// The packet's own finding `F-43` / `V14-VERIFY-004` is why this exists:
-/// availability cannot be established by inspection, only by a spawn.
-/// `gates::shell_available` is a PATH check and stays one — it answers
-/// "is there a file with that name", which is a different question from "does
-/// this shell run a command".
-///
-/// # Errors
-///
-/// [`UpstrokeError::Refused`]. The contract's `expected_failures_refusals[3]`:
-/// "a failing shell probe -> returned pre-flight error to the caller
-/// (TopologyRun classifies it: creator error before P5b on a fresh run;
-/// refusal before any recovery event on resume)". Classification is the
-/// caller's; this returns the error.
-pub fn run_shell_probe(
-    runner: &dyn Runner,
-    shell: ShellKind,
-    workspace: PathBuf,
-    invocation: InvocationId,
-) -> Result<(), UpstrokeError> {
-    let request = shell_probe_request(shell, workspace, invocation);
-    let output = runner
-        .run(&request)
-        .map_err(|error| UpstrokeError::Refused {
-            message: format!(
-                "pre-flight: the recorded shell `{}` could not be run through the runner: {error}",
-                shell.program()
-            ),
-        })?;
-    if output.timed_out {
-        return Err(UpstrokeError::Refused {
-            message: format!(
-                "pre-flight: the recorded shell `{}` did not finish `{SHELL_PROBE_COMMAND}` \
-                 within {:?}",
-                shell.program(),
-                SHELL_PROBE_TIMEOUT
-            ),
-        });
-    }
-    // A probe whose tree was terminated for exceeding the bounded capture
-    // allowance did not run `exit 0` to completion, whatever code came back.
-    // `output_limited` means the supervisor killed the owned process tree
-    // (`proc.rs`: "the child exceeded the bounded stdout or stderr capture
-    // allowance and its owned process tree was terminated"), and the limit can
-    // be observed during the final drain of a child that has *already exited
-    // 0* — so this is checked on its own rather than through the exit code. A
-    // shell that printed 16 MiB in answer to `exit 0` is not the shell this
-    // pre-flight is certifying either way.
-    if output.output_limited {
-        return Err(UpstrokeError::Refused {
-            message: format!(
-                "pre-flight: the recorded shell `{}` exceeded the bounded output allowance \
-                 running `{SHELL_PROBE_COMMAND}` and its process tree was terminated",
-                shell.program()
-            ),
-        });
-    }
-    if output.code != Some(0) {
-        return Err(UpstrokeError::Refused {
-            message: format!(
-                "pre-flight: the recorded shell `{}` ran `{SHELL_PROBE_COMMAND}` and exited {}; \
-                 stderr: {}",
-                shell.program(),
-                match output.code {
-                    Some(code) => code.to_string(),
-                    None => "by a signal or a kill".to_owned(),
-                },
-                output.stderr.trim()
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -53,7 +53,6 @@ funnel = [
     "remove_intent_site",
     "remove_site",
     "repair_materialize",
-    "residue_classified_sites",
     "snapshot_commit_tree",
     "verify_worktree",
     "write_intent_site",
@@ -62,64 +61,315 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "add_snapshot",
-    "as_str",
     "assert_publishable",
-    "at",
     "base",
     "candidate_diff",
     "changed_paths",
-    "classify_object_residue",
     "commit_parent",
     "commit_tree_sha",
     "common_git_dir",
-    "decode_changed_paths",
     "derive",
     "direct_ref_target",
-    "durability_ledger",
-    "element_breaks_quiescence",
     "execution_root",
     "execution_root_of",
-    "fmt",
     "from",
-    "from_base",
-    "gates",
-    "harness",
-    "integration",
-    "intent_name",
     "intent_path",
     "intents",
-    "is_null_object_id",
-    "is_object_id",
-    "kind",
-    "ledger",
-    "new",
     "object_directory",
     "object_exists",
-    "observed_residue_elements",
-    "phase",
     "private_root",
-    "published",
     "quiescence",
     "reclaim_intents",
-    "recording_durability",
     "refs_under",
     "refuse_unexpected_refs",
-    "relative",
     "remove_intent",
     "remove_snapshot",
     "remove_worktree",
     "repo_key",
     "repo_key_v1",
-    "repository",
     "revalidate",
-    "review",
     "row",
     "slot_path",
     "temporary_object_files",
     "unreachable_objects",
-    "worktree",
     "worktree_records",
     "write_intent",
+]
+
+# The five production children the `m3-rundir` split gave `src/rundir.rs`, added
+# in the same commit as the split. Seventeen externally reachable `fn`s left the
+# parent's file, and a name that leaves the domain is a name nobody has to
+# classify any more -- so the children join `CLASSIFIED_MODULES` by name, which
+# is the only form that list has: its census reads every entry as a source file,
+# so there is no prefix to widen `src/rundir.rs` into. `C-002` is the standing
+# finding that the roll-call is hand-maintained, and it is not this split's.
+#
+# THE REPOINT IS A NET WIDENING OF FOUR, and it is written down rather than
+# implied: 17 names leave the parent's block and 21 arrive in the children's,
+# because four names are classified here that the parent's block did not carry
+# separately.
+#
+#   * `first_line` and `first_line_within` were PRIVATE `fn`s of
+#     `src/rundir.rs`, below the classification threshold entirely. The
+#     extraction made them `pub(super)` in `classify.rs` so `rundir::tests` can
+#     still drive them by name, and a `pub(super) fn` is externally reachable, so
+#     they must be classified now. `pub(super)` here is `rundir` and its
+#     descendants and nothing wider.
+#   * `public_dir` and `fmt` each named TWO items inside the parent's file -- the
+#     free `public_dir` and `PrivateHalfProof::public_dir`, `RepoKey`'s `Display`
+#     and `RetainReason`'s -- and this record classifies by bare name, so one
+#     entry covered both. The split separates each pair into different files, so
+#     each half is now classified on its own. That is why they are not among the
+#     seventeen: the parent still derives its half.
+#
+# Both are widenings. No name that was classified before is unclassified now.
+#
+# Every one of the five is `effect_free`, and that is what the split was arranged
+# to make true: no funnel and no effect site moved. Each child DENIES all three
+# governed lints at file scope and takes no `effects/allowlist.toml` row -- the
+# whole run-directory, answer and lock funnel surface, its atomic publication
+# primitives and its platform locking stayed in the parent, which keeps the
+# allowlist identity.
+[[module]]
+path = "src/rundir/classify.rs"
+crate_path = "upstroke::rundir::classify"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "classify_run_dir",
+    "first_line",
+    "first_line_within",
+    "run_started_sha256",
+]
+
+[[module]]
+path = "src/rundir/discovery.rs"
+crate_path = "upstroke::rundir::discovery"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "describe",
+    "find_question",
+    "husk_report",
+    "latest_run",
+    "list_husks",
+    "list_runs",
+    "resolve_run_id",
+    "run_dir_names",
+]
+
+[[module]]
+path = "src/rundir/names.rs"
+crate_path = "upstroke::rundir::names"
+funnel = []
+# The eight production children the `m4-workspace` split gave
+# `src/workspace_manager.rs`, added in the same commit as the split. Twenty-six
+# names left the parent's file, and a name that leaves the domain is a name
+# nobody has to classify any more -- so the children join `CLASSIFIED_MODULES`
+# by name, which is the only form that list has: `reachable_fns_are_classified`
+# joins every entry onto the manifest root and reads it as a source file, so
+# there is no directory prefix to widen `src/workspace_manager.rs` into. `C-002`
+# is the standing finding that the roll-call is hand-maintained rather than
+# derived, and it is not this split's to repair.
+#
+# THE REPOINT IS A NET WIDENING OF NINETEEN, and it is written down rather than
+# implied: 26 names leave the parent's block and 45 arrive in the children's.
+# The difference is two effects, both of them widenings:
+#
+#   * SEVENTEEN names were PRIVATE `fn`s of `src/workspace_manager.rs`, below
+#     the classification threshold entirely. The extraction made them
+#     `pub(super)` in a child so the parent (and, for `is_reparse_point`, the
+#     suite) can still call them by name, and a `pub(super) fn` is externally
+#     reachable, so they must be classified now. `pub(super)` here is
+#     `workspace_manager` and its descendants and nothing wider. They are
+#     `canonical_prefix`, `is_at_or_inside`, `is_reparse_point`,
+#     `refuse_reparse_points`, `refuse_unreal_directory` and `strip_verbatim`
+#     (containment); `apply`, `funnel` and `point` (hooks); `from_intent_name`,
+#     `safe_component` and `validate` (naming); `refuse_expected_old` and
+#     `refuse_malformed_object_id` (object); `parse_worktree_records` and
+#     `registration_checkout` (parsers); and `administrative_residue_at`
+#     (residue).
+#   * `fmt` and `new` each named TWO items inside the parent's file -- the
+#     `Display` impls of `SnapshotName` and `VerifyFailure`, and the
+#     constructors of `HarnessEffects` and `ResidueTarget` -- and this record
+#     classifies by bare name, so one entry covered both. The split separates
+#     each pair into different files, so each half is now classified on its own.
+#     That is why they are not among the seventeen: the pair was already
+#     classified, once.
+#
+# Both are widenings. No name that was classified before is unclassified now.
+#
+# Every one of the eight is `effect_free` apart from the one `funnel` row the
+# parent already carried, and that is what the split was arranged to make true:
+# no funnel and no effect site moved. Each child DENIES all three governed lints
+# at file scope and takes no `effects/allowlist.toml` row -- an allowance is what
+# that file records, and these modules take none. Every `Command`, every `fs`
+# write, every durability barrier and every platform removal retry stayed in the
+# parent, which keeps the allowlist identity.
+
+# The four containment predicates plus the two platform helpers they are built on. Every one observes -- `fs::symlink_metadata` and `fs::canonicalize` -- and none of the six is a governed primitive; nothing here creates, renames or removes a path.
+[[module]]
+path = "src/workspace_manager/containment.rs"
+crate_path = "upstroke::workspace_manager::containment"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "canonical_prefix",
+    "is_at_or_inside",
+    "is_reparse_point",
+    "refuse_reparse_points",
+    "refuse_unreal_directory",
+    "strip_verbatim",
+]
+
+# The observer seam and the funnel protocol. `funnel`, `point` and `apply` perform no effect of their own: `funnel` takes the primitive as a closure and the parent supplies it, so the effect and its allowlist row stay in `src/workspace_manager.rs`. `apply` can end the process on `Injection::Kill`, and `std::process::abort` is not a governed primitive.
+[[module]]
+path = "src/workspace_manager/hooks.rs"
+crate_path = "upstroke::workspace_manager::hooks"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "apply",
+    "durability_ledger",
+    "funnel",
+    "harness",
+    "ledger",
+    "new",
+    "phase",
+    "point",
+    "recording_durability",
+]
+
+# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
+[[module]]
+path = "src/workspace_manager/naming.rs"
+crate_path = "upstroke::workspace_manager::naming"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "as_str",
+    "fmt",
+    "from_intent_name",
+    "gates",
+    "integration",
+    "intent_name",
+    "kind",
+    "relative",
+    "review",
+    "safe_component",
+    "validate",
+]
+
+# Object-id well-formedness and the two refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
+[[module]]
+path = "src/workspace_manager/object.rs"
+crate_path = "upstroke::workspace_manager::object"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "is_null_object_id",
+    "is_object_id",
+    "refuse_expected_old",
+    "refuse_malformed_object_id",
+]
+
+# Decoders for the bytes Git's plumbing hands back. Functions over `&[u8]`; the commands whose output they read are run by the parent, inside its funnels.
+[[module]]
+path = "src/workspace_manager/parsers.rs"
+crate_path = "upstroke::workspace_manager::parsers"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "decode_changed_paths",
+    "parse_worktree_records",
+    "registration_checkout",
+]
+
+# The read-only residue classifier. `residue_classified_sites` keeps the `funnel` class the parent's row gave it -- it derives its answer from the frozen site enums and is reached as part of that surface -- and every other name here observes: no object is written, no ref moved, no index touched. The Git inspections it reads through are the parent's helpers, and so is every process start.
+[[module]]
+path = "src/workspace_manager/residue.rs"
+crate_path = "upstroke::workspace_manager::residue"
+funnel = [
+    "residue_classified_sites",
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "administrative_residue_at",
+    "at",
+    "classify_object_residue",
+    "element_breaks_quiescence",
+    "from_base",
+    "new",
+    "observed_residue_elements",
+    "published",
+    "repository",
+    "worktree",
+]
+
+# Two data types and no functions at all: `SnapshotInput` and `Snapshot` carry public fields and declare no externally reachable `fn`. The row is present and empty because the domain is derived from the module, so an empty module must be recorded as empty rather than omitted.
+[[module]]
+path = "src/workspace_manager/snapshot_ref.rs"
+crate_path = "upstroke::workspace_manager::snapshot_ref"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+]
+
+[[module]]
+path = "src/rundir/ownership.rs"
+crate_path = "upstroke::rundir::ownership"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # Conjunct 12's classification, read-only and total: it takes the stat that
+    # was already performed and answers whether it *proves* the private commit
+    # record absent. Only `NotFound` does.
+    "commit_record_proves_absence",
+    "prove_private_half_ownership",
+    "public_dir",
+    "run_id",
+    "target",
+]
+
+[[module]]
+path = "src/rundir/retention.rs"
+crate_path = "upstroke::rundir::retention"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "fmt",
+    "kind",
+    "name",
+    "owner_field",
+]
+
+# The worktree record, the quiescence a reuse demands and the reasons the answer can be no. One `fn`: `VerifyFailure`'s `Display`. The verification that produces these values runs a Git child and is the parent's.
+[[module]]
+path = "src/workspace_manager/worktree.rs"
+crate_path = "upstroke::workspace_manager::worktree"
+funnel = [
+]
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "fmt",
 ]
 
 [[module]]
@@ -162,22 +412,15 @@ effect_free = [
     "answers",
     "artifacts",
     "as_str",
-    "classify_run_dir",
     "commit_record_after_error",
-    # Conjunct 12's classification, read-only and total: it takes the stat that
-    # was already performed and answers whether it *proves* the private commit
-    # record absent. Only `NotFound` does.
-    "commit_record_proves_absence",
     "create",
     "create_hooked",
     "default_private_root",
-    "describe",
     "drop",
     "durability_ledger",
     "enter",
     "enter_cleanup_scope",
     "events",
-    "find_question",
     "fmt",
     "for_repo",
     "for_worktree_git_dir",
@@ -188,32 +431,19 @@ effect_free = [
     "harness",
     "holder",
     "hook",
-    "husk_report",
     "is_running",
-    "kind",
-    "latest_run",
     "ledger",
-    "list_husks",
-    "list_runs",
     "lock_file",
-    "name",
     "new",
-    "owner_field",
     "permits_deletion",
     "plan_json",
-    "prove_private_half_ownership",
     "public_dir",
     "questions",
     "recording_durability",
     "report_json",
-    "resolve_run_id",
     "reviews",
-    "run_dir_names",
-    "run_id",
-    "run_started_sha256",
     "runs_root",
     "settings",
-    "target",
     "transcripts",
     "v1",
     "with_private_root",
@@ -364,34 +594,123 @@ effectful = [
 ]
 effectful_unnameable = []
 effect_free = [
-    "base",
-    "case",
-    "compose",
     "contain_write_command",
     "containment_establishments",
     "credential_location",
-    "current",
     "default",
     "environment",
     "fmt",
-    "from_process",
     "new",
     "policy",
     "policy_digest",
-    "preflight",
     "program_resolutions",
     "program_searches",
     "reserved_keys",
-    "reserved_values",
     "run",
-    "run_shell_probe",
-    "same_key",
     "shell_probe",
     "shell_probe_request",
     "start_write_command",
-    "with_base",
     "with_environment",
     "with_hooks",
+]
+
+# The three production children the `m5-host` split gave `src/runner/host.rs`,
+# added in the same commit as the split. Ten externally reachable `fn`s left
+# the parent's file, and a name that leaves the domain is a name nobody has to
+# classify any more -- so the children join `CLASSIFIED_MODULES` by name, one
+# path each, which is the only form that list has: its census joins every entry
+# onto the manifest root and reads it as a source file, so there is no prefix to
+# widen `src/runner/host.rs` into. `C-002` is the standing finding that the
+# roll-call is hand-maintained, and it is not this split's.
+#
+# THE REPOINT IS A NET WIDENING OF SIX, written down rather than implied: 10
+# names leave the parent's block and 16 arrive in the children's.
+#
+#   * `lookup` (`HostEnvironment::lookup`), `is_bare_name` and `is_program`
+#     (`ProgramNaming`'s), `composed_value` and `resolve_program` were PRIVATE
+#     `fn`s of `src/runner/host.rs`, below the classification threshold
+#     entirely. The extraction makes them `pub(super)` in their children so the
+#     parent and `runner::host::tests` can still reach them by name, and a
+#     `pub(super) fn` is externally reachable, so they must be classified now.
+#     `pub(super)` here is `runner::host` and its descendants and nothing wider.
+#   * `current` named TWO items inside the parent's file -- `KeyCase::current`
+#     (`pub`) and `ProgramNaming::current` (private) -- and this record
+#     classifies by bare name, so one entry covered the reachable one. The split
+#     separates the pair into different files, and the private half becomes
+#     `pub(super)`, so each is now classified on its own.
+#
+# Every one is a widening. No name that was classified before is unclassified
+# now.
+#
+# All three children are `effect_free`, and that is what the split was arranged
+# to make true: no funnel, no effect site and no `cfg` moved. `HostRunner::run`
+# with its two `ProcessSite` values, `build_command_at` with the crate's one
+# host-side `std::process::Command`, the `Contained` mint and the reserved-key
+# vocabulary all stayed in the parent, which keeps the allowlist identity. Each
+# child DENIES all three governed lints at file scope and takes no
+# `effects/allowlist.toml` row.
+#
+# `crate_path` is EMPTY for all three, because each is a private `mod`. The
+# schema says so at `src/effects/tests.rs:327` -- "the path a denied entry would
+# name this module by, or empty when the module is not reachable from outside
+# its parent (a private `mod`, or the binary crate root)" -- and
+# `src/engine/{coordinator,resume,attempt,preflight}.rs` are the tree's
+# convention. An earlier revision of this note recorded
+# `upstroke::runner::host::probe` and argued the value was harmless because the
+# field is read only for a `funnel` or `effectful` row. That argument was true
+# and beside the point: `E0603` makes the path unnameable, so it was false
+# metadata that validation happens not to look at, and if one of these `fn`s is
+# ever reclassified effectful the stored path could not name it for the
+# denylist. Review finding 2 on PR #111.
+[[module]]
+path = "src/runner/host/environment.rs"
+crate_path = ""
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "base",
+    "case",
+    "compose",
+    "current",
+    "from_process",
+    "lookup",
+    "preflight",
+    "reserved_values",
+    "same_key",
+    "with_base",
+]
+
+# `is_program` and `resolve_program` read the filesystem -- `Path::is_file` and,
+# on Unix, the execute bit -- and are classified EFFECT-FREE for the tree's own
+# reason: a read-only inspection is not an effect (`classify_object_residue` is
+# the precedent, and `ContainerRuntime`'s inspections are classified the same
+# way beside it). Nothing here creates, writes, renames or removes a path, and
+# the spawn that follows a resolution is the parent's `HostRunner::run`, which
+# `runner::tests::every_production_process_start_is_classified` accounts for
+# under `src/runner/host.rs`.
+[[module]]
+path = "src/runner/host/naming.rs"
+crate_path = ""
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "composed_value",
+    "current",
+    "is_bare_name",
+    "is_program",
+    "resolve_program",
+]
+
+[[module]]
+path = "src/runner/host/probe.rs"
+crate_path = ""
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    "run_shell_probe",
 ]
 
 # PR6's Container funnel. The read-only inspections of `ContainerRuntime`
@@ -681,22 +1000,64 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "active_processes_with",
+    "child_leads_its_own_group",
+    "deref",
+    "deref_mut",
+    # A pure decision over a memoised `Result`: it clones a message or returns
+    # `Ok`, and touches nothing.
+    "memoised_outcome",
+    "terminate_and_wait",
+    "terminate_and_wait_with",
+]
+
+# The observation and injection surface, out of line since the `m6-proc` split.
+# A private `mod` of the funnel, so nothing here is reachable from outside
+# `agent::proc` except through the root's own re-exports of `SpawnHooks` and
+# `NoHooks` -- the two names that were `pub` before the move and are `pub` after
+# it. `crate_path` is the module's real path all the same, because the two
+# appliers are `pub(super)` and `externally_reachable_fns` counts that.
+[[module]]
+path = "src/agent/proc/hooks.rs"
+crate_path = "upstroke::agent::proc::hooks"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # `apply`/`apply_io`: turn a hook's answer back into control flow. Both
+    # return `Ok` or an error carrying the point's name; neither starts,
+    # signals or waits on anything. The one non-returning path is
+    # `std::process::abort()` under an injected `Kill`, which is the harness
+    # deliberately ending THIS process without running a destructor -- the
+    # whole claim under test -- and not an effect on anything outside it.
+    "apply",
+    "apply_io",
     # `SpawnHooks` default bodies. `child_created` does nothing; `point_mode`
     # delegates to `point`, which is an observer question and not an effect.
     # In the domain since `PR6-LANEF-007`.
     "child_created",
+    "point",
     "point_mode",
-    "active_processes_with",
+]
+
+# The ambient Job Object and the cleanup reapers' reclaim scope, out of line
+# since the `m6-proc` split. Every Win32 call underneath these is made by
+# `windows_job`, which stayed in the parent; every Unix one by `termination`,
+# which stayed there too. The classifications are the ones these names carried
+# in the parent's block, unchanged by the move.
+[[module]]
+path = "src/agent/proc/ambient.rs"
+crate_path = "upstroke::agent::proc::ambient"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
     "ambient_job_established",
     "child_in_ambient_job",
-    "child_leads_its_own_group",
-    "deref",
-    "deref_mut",
     "join_ambient_job",
-    # A pure decision over a memoised `Result`: it clones a message or returns
-    # `Ok`, and touches nothing.
-    "memoised_outcome",
-    "point",
+    # `join_ambient_job` over an explicit join step, so the error arm can be
+    # executed at all. Same classification as the entry point it implements.
+    "join_ambient_job_with",
     # `#[cfg(all(windows, test))]`: writes a value into a process-local
     # `OnceLock` so a subprocess helper can carry a real ambient failure. No
     # effect outside this process, and no production caller at all.
@@ -710,8 +1071,33 @@ effect_free = [
     # coordinator has died. The same classification `poison_ambient_for_tests`
     # carries, for the same reason.
     "set_container_reclaim_scope",
-    "terminate_and_wait",
-    "terminate_and_wait_with",
+]
+
+# The pipe reader, out of line since the `m6-proc` split. It reads the stdout
+# and stderr handles `run_with_timeout_and_limit` already holds, inside that
+# funnel call's own `Process.Spawn` site; it starts no process, opens nothing,
+# and names no path. So it reaches no effect of its own and takes no site --
+# which is why all four are `effect_free` and none is denied. The four were
+# private items of `src/agent/proc.rs` before the move and are `pub(super)`
+# after it, the same visibility, and that is what puts them in this domain.
+[[module]]
+path = "src/agent/proc/drain.rs"
+crate_path = "upstroke::agent::proc::drain"
+funnel = []
+effectful = []
+effectful_unnameable = []
+effect_free = [
+    # Snapshot the buffer after a bounded grace instead of joining, so an
+    # orphan holding the write end cannot stall the supervisor.
+    "collect",
+    # Whether either stream hit the capture allowance; the supervisor asks
+    # before it decides to terminate the tree.
+    "drain_limit_exceeded",
+    "limit_exceeded",
+    # Hands the reader to a thread. `thread::spawn` is not
+    # `std::process::Command::spawn`, and this module's own `start` is not a
+    # denied path: a segment-matching scan flags both and neither is one.
+    "start",
 ]
 
 [[module]]

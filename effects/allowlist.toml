@@ -61,9 +61,15 @@ MODULE TREE and not by the file, so this file would otherwise have inherited \
 `src/workspace_manager.rs`'s inner allow of all three lints silently: that is \
 `PR6-LANEF-004`, and this is the first out-of-line child this funnel has had. \
 `runner::container::tests::every_child_module_of_the_container_funnel_states_\
-its_own_lint_level` is the census that refuses such a child, and its `FUNNELS` \
-domain does NOT reach this parent -- so nothing was red and the level is \
-written here because the hole is the same one, not because a gate caught it. \
+its_own_lint_level` is the census that refuses such a child. Its `FUNNELS` \
+domain did NOT reach this parent when this row was written, so nothing was red \
+and the level was written here because the hole was the same one, not because a \
+gate caught it. THAT IS NO LONGER TRUE, and the sentence is corrected rather \
+than left standing: the `m4-workspace` split added \
+`src/workspace_manager.rs` to that census's `FUNNELS` domain in the same \
+commit, so this file is now graded against all three governed lints and named \
+in the domain individually. The level below is unchanged; what changed is that \
+a gate now checks it. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
 all three lints; this row allows TWO of that three, so it is a strict subset \
@@ -139,10 +145,22 @@ path = "src/topology/effects.rs"
 allows = []
 packet = "effect_site_inventory.mechanism (2): named in the funnel-module list"
 review = """
-The site enums, their const accessors and `effect_sites()`. Performs no effect \
-at all, in production or in tests, so it carries no attribute — listed because \
-the packet lists it, and because a future effect here would have to be reviewed \
-into `allows` rather than appearing silently."""
+The `EffectSiteId` union over the eleven site enums, its `row()` mapping and the \
+inventory constants. The site enums themselves are in the `sites` child and \
+`effect_sites()` in the `export` child: this module was split into per-concern \
+children, and this row is the root of that module rather than the whole of it. \
+Performs no effect at all, in production or in tests, so it carries no \
+attribute — listed because the packet lists it, and because a future effect \
+here would have to be reviewed into `allows` rather than appearing silently. \
+WHAT HOLDS THE SAME PROPERTY FOR THE SEVEN CHILDREN, which this row does not \
+reach: none of them carries a module-level `allow` either, so `clippy.toml`'s \
+denials bind them exactly as written and the lint gate is what enforces this — \
+not this entry. An `allow` added to any of them would have to be recorded here, \
+which is what \
+`every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist` fails on. \
+Said out loud because the split narrowed what this row covers without narrowing \
+the property: a reader who mistook the entry for the guarantee could remove the \
+thing actually providing it."""
 
 [[funnel]]
 path = "src/runner/host.rs"
@@ -198,6 +216,93 @@ The Process supervision primitives. Spawn enters through an API taking \
 combined funnel."""
 
 [[funnel]]
+path = "src/agent/proc/tests.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/agent/proc.rs"
+review = """
+The Process funnel's supervision half's own test module, extracted from \
+`src/agent/proc.rs` into a sibling file and given attributes of its own IN THE \
+SAME COMMIT -- never inheriting one. A Rust lint level is scoped by the MODULE \
+TREE and not by the file, so this file would otherwise have inherited \
+`src/agent/proc.rs`'s inner allow of these same three lints silently: that is \
+`PR6-LANEF-004`, and `runner::container::tests::every_child_module_of_the_\
+container_funnel_states_its_own_lint_level` refuses a child that does not state \
+its own level. \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. Every one of these calls was already \
+made by these same test bodies inside `src/agent/proc.rs`, under that file's own \
+inner allow of the same three lints; the move changes where the level is stated, \
+not what it permits. \
+WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and counting \
+the errors -- 143 sites on Linux, and a Linux figure: the Windows-gated bodies \
+are not compiled here, so the count is a floor rather than the whole file. \
+`clippy::disallowed_methods`, 120 sites -- the supervision suite asks the kernel \
+directly about process groups, signals and reaping (`libc::kill` 41, \
+`libc::signal` 5, `libc::sigprocmask` 2, `libc::flock` 2, and one each of \
+`libc::fork`, `libc::_exit`, `libc::waitpid`, `libc::waitid`, `libc::setpgid`, \
+`libc::setrlimit`, `libc::raise`, `libc::open`, `libc::close`, `libc::fcntl`), \
+builds and tears down scratch trees for its helpers (`std::fs::write` 15, \
+`std::fs::remove_dir_all` 12, `std::fs::create_dir_all` 9, `std::fs::remove_file` \
+4, `std::fs::File::create` 2, and one each of `std::fs::create_dir` and \
+`std::fs::set_permissions`), re-execs this test binary as its agent \
+(`std::process::Command::spawn` 8, `std::process::Command::output` 1) and speaks \
+the readiness protocol over pipes (`std::io::Write::flush` 4, \
+`std::io::Write::write_all` 3); `clippy::disallowed_types`, 19 sites, every one \
+`std::process::Command`, because a supervision suite that never spawns \
+establishes nothing -- containment cannot be established by inspection; \
+`clippy::disallowed_macros`, 4 sites, `std::print` 2 and one each of \
+`std::println` and `std::eprint`, all of them a subprocess helper reporting to \
+its parent over the stream the test reads. \
+CONTAINMENT, STATED AS IT IS, BECAUSE IT IS NOT UNIFORM. Most of these bodies \
+build a scratch directory of their own making under `std::env::temp_dir()`, \
+keyed by process id plus a ulid or a nanosecond timestamp, and touch nothing \
+outside it; the process effects are re-execs of this test binary and the trees \
+it starts and kills. FOUR SITES ARE NOT THAT, in two shapes, and every one of \
+them moved out of `src/agent/proc.rs` rather than being anything this \
+extraction wrote. \
+(1) `timeout_kills_a_background_grandchild_before_it_can_escape` and \
+`successful_direct_exit_still_kills_detached_group_members` put a marker FILE \
+directly in `std::env::temp_dir()` and call `std::fs::remove_file` on it before \
+creating any directory or child, so the removal is of a path they have not \
+proven they own. The first keys on process id and thread name ALONE: after a \
+crashed run leaves its marker behind and the operating system reuses that pid, \
+that `remove_file` deletes a file this suite did not create. The second adds a \
+nanosecond timestamp, which makes the same collision remote rather than \
+impossible. \
+(2) `spawn_signal_helper` and the reaper suite's `scratch` helper call \
+`std::fs::remove_dir_all` on their scratch path BEFORE `create_dir_all`, which \
+is the same unproven-ownership removal one level up; both key on process id plus \
+a ulid or nanoseconds. \
+That is the older, pre-token shape `rundir::scratch_tree::acquire` was written \
+to replace, and it is the same hazard the `src/rundir/tests.rs` row above \
+records for the same reason. THIS ROW RECORDS IT RATHER THAN IMPLYING A \
+CONTAINMENT THE FILE DOES NOT HAVE: all four ran inside the parent under the \
+parent's own allow, and repairing them is a change to test behaviour that this \
+move deliberately does not make. \
+HOW EQUAL "MOVED" IS, STATED EXACTLY, BECAUSE "BYTE-IDENTICAL" WOULD BE FALSE \
+OF THIS FILE. Lifting the block out of `mod tests { … }` dedents every line by \
+four columns, which changes what fits inside the width and makes `rustfmt` \
+reflow. Every difference it produces is formatting and nothing else -- \
+expressions that now fit on one line, a dropped trailing comma, an elided \
+closure brace, one `panic!` match arm braced -- and the property is stated \
+without a line count on purpose: a count here mixes the reflowed lines together \
+with the imports the split forced this file to name for itself, which are not \
+formatting, and it goes stale at the next edit while the next reader trusts it. \
+THE EQUALITY THAT DOES HOLD IS REPRODUCIBLE, and it is the one worth stating: dedent the body of \
+`mod tests` in `src/agent/proc.rs` at this branch's base by four columns, run \
+`rustfmt --edition 2024` over it, and the result is this file byte-for-byte once \
+the three imports the split forced it to name for itself are removed \
+(`std::io::Read`, `crate::topology::effects::Injection`, and a `#[cfg(windows)]` \
+`super::ambient::join_ambient_job_with`; every one of them reached this suite \
+through `use super::*` before the move -- the first two as names the parent \
+imported, the third as a sibling item of the parent that the split relocated). \
+The four bodies named above are byte-identical after the dedent alone; \
+`rustfmt` touched none of them. So \
+the suite is semantically equivalent and formatting-normalised rather than \
+byte-equal, and this row says which rather than claiming the stronger thing. \
+Recorded here rather than left inherited, so the scope is a reviewed artifact \
+rather than an accident of the module tree."""
+
+[[funnel]]
 path = "src/agent/proc/test_support/readiness.rs"
 allows = ["clippy::disallowed_methods"]
 expect_sites = 6
@@ -212,10 +317,10 @@ that is `PR6-LANEF-004`, measured twice in the Container subtree, and this is \
 the first out-of-line child the Process funnel has ever had. \
 ALL THREE GOVERNED LINTS ARE DENIED AT FILE SCOPE, AND THE ALLOWANCE IS SIX \
 PER-SITE `#[expect]` ATTRIBUTES rather than a file-scope allow. That is \
-`PR72-PLACEMENT-001` and `decisions/2026-08-30-readiness-lint-placement.md` is \
-the amendment admitting it: `mechanism` (2) permits an allowance "only as \
-module-level attributes", and a per-site expectation is NARROWER than the \
-module-level allow it replaces, not a widening of it. \
+`PR72-PLACEMENT-001`, and `standards/02_standards_automated_baseline.md` \
+(the lints paragraph) admits it: this file's own mechanism otherwise permits an \
+allowance "only as module-level attributes", and a per-site expectation is \
+NARROWER than the module-level allow it replaces, not a widening of it. \
 MEASURED, and it is why the old shape was wrong rather than merely untidy: \
 deleting the previous `#![allow(clippy::disallowed_methods)]` changed nothing \
 at `cargo clippy --all-targets --all-features -- -D warnings`, because \
@@ -473,7 +578,7 @@ AND SINCE W1 IT CARRIES AN ATTRIBUTE AND A ROW OF ITS OWN. It was INLINE, so \
 the file-scope allow this row records WAS its lint level by the module tree; it \
 is now the sibling file `src/rundir/scratch_tree.rs`, which is exactly the \
 OUT-OF-LINE shape `PR72-PLACEMENT-001` and \
-`decisions/2026-08-30-readiness-lint-placement.md` are about -- a child \
+`standards/02_standards_automated_baseline.md` are about -- a child \
 inheriting a level nobody had written down -- so it states its own and its row \
 below records the two lints it needs of the three this file allows."""
 
@@ -490,9 +595,10 @@ the module tree; it is out of line since W1, so that paragraph now points here \
 and this file states its own level. `PR6-LANEF-004` is the shape it would \
 otherwise have taken. `runner::container::tests::every_child_module_of_the_\
 container_funnel_states_its_own_lint_level` is the census that refuses such a \
-child and its `FUNNELS` domain does NOT reach this parent -- so nothing was red, \
-and the level is written here because the hole is the same one, not because a \
-gate caught it. \
+child. Its `FUNNELS` domain did NOT reach this parent when this row was \
+written, so nothing was red and the level was written here because the hole was \
+the same one, not because a gate caught it; `src/rundir.rs` joined that domain \
+in W2 and the census now grades this file like any other child. \
 THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
 calls inside `src/rundir.rs`, under that file's own inner allow of all three \
 lints; this row allows TWO of that three, a strict subset, and the move changes \

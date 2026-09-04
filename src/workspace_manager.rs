@@ -19,15 +19,16 @@
 //! `hook(Before, site) -> primitive -> hook(After, site)`, so hooks exist for
 //! every site by construction". [`funnel`] is that sentence, once, and every
 //! primitive in this module goes through it. Production passes [`NoHooks`],
-//! which answers [`Injection::Proceed`] and records nothing; the ST-07 subset
-//! passes [`HarnessEffects`], which records into PR3's [`HookHarness`].
+//! which answers [`Injection::Proceed`](crate::topology::effects::Injection::Proceed)
+//! and records nothing; the ST-07 subset passes [`HarnessEffects`], which records
+//! into PR3's [`HookHarness`](crate::topology::effects::HookHarness).
 //!
 //! The after hook is **not** called when the primitive returned `Err`. The
 //! after phase's claim is `AfterEffect::Referenced` / `Unreferenced` /
 //! `Released` — "the artifact is present and referenced by the row `row()`
 //! names" — and a funnel that ran it after a failed primitive would record an
 //! execution of a phase whose claim is false, which is the same false report
-//! [`HookHarness`] exists to prevent.
+//! [`HookHarness`](crate::topology::effects::HookHarness) exists to prevent.
 //!
 //! # Nothing here is a production caller
 //!
@@ -61,187 +62,30 @@
     clippy::disallowed_macros
 )]
 
-use std::ffi::{OsStr, OsString};
-use std::fmt;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::error::UpstrokeError;
 use crate::topology::effects::{
-    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, ObjectResidue, ObjectSite,
-    RefSite, ResidueElement, ResourceRow, SnapshotSite, SubEffectPoint, WorktreeSite,
+    EffectSiteId, HookPhase, ObjectSite, RefSite, ResourceRow, SnapshotSite, SubEffectPoint,
+    WorktreeSite,
 };
-use crate::topology::paths::{GitPath, PathSet};
+use crate::topology::paths::PathSet;
 use crate::util::{DurabilityLedger, DurableStep};
 
 // ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
 
-/// What a funnel tells whoever is watching, at both hook phases and at the
-/// parent-side sub-effect points.
-///
-/// The shape mirrors [`crate::agent::proc::SpawnHooks`], which PR4 wired onto
-/// the same [`HookHarness`], except that these funnels serve many sites each,
-/// so the site travels with the call.
-pub trait EffectHooks {
-    /// The funnel reached `phase` of `site`. The answer says what it must do.
-    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection;
-
-    /// Where this observer wants the funnel's durability primitives recorded.
-    ///
-    /// A *handle*, taken before the funnel body runs, rather than a method the
-    /// body calls back into: `funnel` already holds `&mut dyn EffectHooks` for
-    /// the whole call, so a body that also needed the observer would be a
-    /// second mutable borrow of it. The handle is cloneable and shares its log,
-    /// so what the body records is what the caller reads.
-    ///
-    /// The default records nothing, which is what production passes and what
-    /// every observer that does not care about durability inherits.
-    fn durability_ledger(&self) -> DurabilityLedger {
-        DurabilityLedger::off()
-    }
-}
-
-/// What production passes: nothing is armed and nothing is recorded.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoHooks;
-
-impl EffectHooks for NoHooks {
-    fn phase(&mut self, _site: EffectSiteId, _phase: HookPhase) -> Injection {
-        Injection::Proceed
-    }
-}
-
-/// Wires these funnels onto PR3's [`HookHarness`], the way
-/// [`crate::runner::HarnessHooks`] wires the process funnel onto it.
-#[derive(Debug, Clone, Default)]
-pub struct HarnessEffects {
-    harness: Arc<Mutex<HookHarness>>,
-    ledger: DurabilityLedger,
-}
-
-impl HarnessEffects {
-    /// Observe through `harness`.
-    #[must_use]
-    pub fn new(harness: Arc<Mutex<HookHarness>>) -> Self {
-        Self {
-            harness,
-            ledger: DurabilityLedger::off(),
-        }
-    }
-
-    /// The harness this observer records into.
-    #[must_use]
-    pub fn harness(&self) -> &Arc<Mutex<HookHarness>> {
-        &self.harness
-    }
-
-    /// Also record every durability primitive the funnels perform.
-    #[must_use]
-    pub fn recording_durability(mut self) -> Self {
-        self.ledger = DurabilityLedger::recording();
-        self
-    }
-
-    /// The durability ledger this observer records into.
-    #[must_use]
-    pub fn ledger(&self) -> DurabilityLedger {
-        self.ledger.clone()
-    }
-}
-
-impl EffectHooks for HarnessEffects {
-    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-        let mut harness = self
-            .harness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        harness.hook(site, phase)
-    }
-
-    fn durability_ledger(&self) -> DurabilityLedger {
-        self.ledger.clone()
-    }
-}
-
-/// Do what a hook answered.
-///
-/// [`Injection::Kill`] aborts, for the reason
-/// [`crate::agent::proc`] already gives: the claim under test is what a
-/// coordinator that dies **without running any cleanup** leaves durable, and
-/// both `panic!` and `std::process::exit` run destructors.
-fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), UpstrokeError> {
-    match injection {
-        Injection::Proceed => Ok(()),
-        Injection::Kill => std::process::abort(),
-        Injection::Error => Err(UpstrokeError::Refused {
-            message: format!("the `{site}` funnel was made to fail at its `{phase}` phase"),
-        }),
-    }
-}
-
-/// `hook(Before, site) -> primitive -> hook(After, site)`, once.
-fn funnel<T, F>(
-    hooks: &mut dyn EffectHooks,
-    site: EffectSiteId,
-    primitive: F,
-) -> Result<T, UpstrokeError>
-where
-    F: FnOnce() -> Result<T, UpstrokeError>,
-{
-    apply(
-        hooks.phase(site, HookPhase::Before),
-        site,
-        HookPhase::Before,
-    )?;
-    let value = primitive()?;
-    apply(hooks.phase(site, HookPhase::After), site, HookPhase::After)?;
-    Ok(value)
-}
-
-/// Consult a parent-side sub-effect point, in every mode the point declares.
-///
-/// The harness is keyed by `(site, point, mode)` because "a mode is executed
-/// when its fault fired", so one funnel position consults it once per declared
-/// mode and the first non-`Proceed` answer wins. [`SubEffectPoint::IdUnread`]
-/// declares `Kill` alone, so in practice this is one call — but the loop is
-/// over [`SubEffectPoint::modes`] rather than over a literal, so a point that
-/// gains a mode is consulted for it.
-fn point(
-    hooks: &mut dyn EffectHooks,
-    site: EffectSiteId,
-    at: SubEffectPoint,
-) -> Result<(), UpstrokeError> {
-    let mut decision = Injection::Proceed;
-    for mode in at.modes() {
-        let answer = hooks.phase(
-            site,
-            HookPhase::Point {
-                point: at,
-                mode: *mode,
-            },
-        );
-        if decision == Injection::Proceed {
-            decision = answer;
-        }
-    }
-    apply(
-        decision,
-        site,
-        HookPhase::Point {
-            point: at,
-            mode: InjectionMode::Kill,
-        },
-    )
-}
+mod hooks;
+pub use self::hooks::{EffectHooks, HarnessEffects, NoHooks};
+use self::hooks::{apply, funnel, point};
 
 // ---------------------------------------------------------------------------
 // Refusals
@@ -483,314 +327,38 @@ pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> P
     private_root.join("workspaces").join(repo_key).join(run_id)
 }
 
-/// Whether `metadata` describes a symlink, junction, or any other reparse
-/// point.
-///
-/// **Windows and Unix answer different questions on purpose.** On Unix the only
-/// such object is a symbolic link. On Windows the set is larger — a directory
-/// junction (`mklink /J`) and a mount point are reparse points that are *not*
-/// symbolic links, and `FileType::is_symlink` answers true only for the
-/// name-surrogate tags. `expected_failures_refusals[0]` is "symlink/**junction**
-/// on the chain", so the Windows half reads the raw attribute
-/// (`FILE_ATTRIBUTE_REPARSE_POINT`) instead, which is true for every reparse
-/// point whatever its tag. A refusal that fired only on POSIX symlinks would
-/// pass every Linux test and refuse nothing a Windows operator can build.
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
+// ---------------------------------------------------------------------------
+// Path hygiene
+// ---------------------------------------------------------------------------
 
-/// See the Windows half for why the two differ.
-#[cfg(not(windows))]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-/// The first component of `path`'s chain **at or below `anchor`** that is a
-/// reparse point, if any.
-///
-/// # Why the walk is anchored
-///
-/// `decisions.workspace_candidates.execution_root` says "with no
-/// symlink/reparse point on the chain", and a chain has to start somewhere.
-/// It starts at the operator's own authorized root, canonicalized — which is
-/// how the packet anchors the same check on the other half of the same
-/// structure: `expected_failures_refusals[9]` requires "a locator chain without
-/// reparse points **canonicalizing to** `<authorized private root>/runs/
-/// <basename>`". The root is resolved and trusted; what must be reparse-free is
-/// everything the run itself builds beneath it.
-///
-/// The unanchored reading was tried and is wrong on a real platform, not just
-/// inconvenient: macOS ships `/var` as a symlink to `private/var` and its
-/// `$TMPDIR` lives under it, so an operator whose private root is anywhere
-/// under `/var` — including every default temporary directory on that OS —
-/// would have every run refused for a link they did not create and cannot
-/// remove. No live passage asks for that, and the containment the refusal
-/// exists to protect is unaffected: every deletion in this module goes through
-/// [`WorkspaceManager::contained`], which compares **canonical** paths, so a
-/// resolved link cannot carry a removal outside the root.
-///
-/// Only components that exist are inspected: a root that has not been created
-/// yet has an absent leaf, and refusing on absence would refuse every first
-/// run.
-fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-    let Ok(relative) = path.strip_prefix(anchor) else {
-        return Ok(None);
-    };
-    let mut walked = anchor.to_path_buf();
-    for component in relative.components() {
-        walked.push(component.as_os_str());
-        if matches!(component, Component::Prefix(_) | Component::RootDir) {
-            continue;
-        }
-        match fs::symlink_metadata(&walked) {
-            Ok(metadata) => {
-                if is_reparse_point(&metadata) {
-                    return Ok(Some(walked));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(UpstrokeError::Io {
-                    path: walked,
-                    source,
-                });
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Refuse `path` when a component of its chain below `anchor` is a reparse
-/// point.
-fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
-    if let Some(at) = reparse_point_below(anchor, path)? {
-        return Err(Refusal::ReparsePointOnChain {
-            chain: path.to_path_buf(),
-            at,
-        }
-        .into());
-    }
-    Ok(())
-}
-
-/// The leaf clause of `execution_root`: "the managed base is a **real
-/// directory**".
-fn refuse_unreal_directory(path: &Path) -> Result<(), UpstrokeError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| UpstrokeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.is_dir() || is_reparse_point(&metadata) {
-        return Err(Refusal::BaseIsNotADirectory {
-            path: path.to_path_buf(),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-/// Undo Windows' extended-length (`\\?\`) canonical form.
-///
-/// **Measured on the Windows Server 2025 guest**, and a production defect
-/// rather than a test artefact: `fs::canonicalize` on Windows returns
-/// `\\?\C:\...`, and Git — an MSYS program — rewrites that to `//?/C:/...`
-/// and fails with `could not create leading directories … Invalid argument`.
-/// Every `git worktree add` under an execution root derived from a
-/// canonicalized private root failed with it. Whatever this module hands to Git
-/// has to be a path Git can open, so the verbatim prefix comes back off.
-///
-/// A path that genuinely *requires* the verbatim form — one longer than
-/// `MAX_PATH`, or carrying a component Win32 would reject — is left as it is:
-/// stripping it would produce a path that names something else, and Git could
-/// not have used either spelling.
-#[cfg(windows)]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    use std::path::Prefix;
-
-    let mut components = path.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return path;
-    };
-    let mut rebuilt = match prefix.kind() {
-        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:\\", letter as char)),
-        Prefix::VerbatimUNC(server, share) => {
-            let mut unc = PathBuf::from("\\\\");
-            unc.push(server);
-            unc.push(share);
-            unc
-        }
-        _ => return path,
-    };
-    for component in components {
-        if matches!(component, Component::RootDir) {
-            continue;
-        }
-        rebuilt.push(component.as_os_str());
-    }
-    rebuilt
-}
-
-/// See the Windows half: nothing to undo anywhere else.
-#[cfg(not(windows))]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    path
-}
-
-/// Canonicalize the longest existing prefix of `path` and rejoin the rest.
-///
-/// `fs::canonicalize` needs the whole path to exist; an execution root is
-/// compared for containment before it does.
-fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(strip_verbatim(canonical));
-    }
-    let mut tail = Vec::new();
-    let mut head = path.to_path_buf();
-    loop {
-        let Some(parent) = head.parent().map(Path::to_path_buf) else {
-            return Ok(path.to_path_buf());
-        };
-        let Some(name) = head.file_name().map(OsStr::to_os_string) else {
-            return Ok(path.to_path_buf());
-        };
-        tail.push(name);
-        head = parent;
-        if let Ok(canonical) = fs::canonicalize(&head) {
-            let mut canonical = strip_verbatim(canonical);
-            for name in tail.iter().rev() {
-                canonical.push(name);
-            }
-            return Ok(canonical);
-        }
-        if head.parent().is_none() {
-            return Ok(path.to_path_buf());
-        }
-    }
-}
-
-/// Whether `inner` is `outer` or lies beneath it. Both must already be
-/// canonical-prefixed.
-fn is_at_or_inside(outer: &Path, inner: &Path) -> bool {
-    inner == outer || inner.starts_with(outer)
-}
+mod containment;
+use self::containment::{
+    canonical_prefix, is_at_or_inside, refuse_reparse_points, refuse_unreal_directory,
+    strip_verbatim,
+};
 
 // ---------------------------------------------------------------------------
 // Slots: the worktree, staging, and snapshot names the packet gives
 // ---------------------------------------------------------------------------
 
-/// The three worktree namespaces of an execution root.
+mod naming;
+use self::naming::safe_component;
+pub use self::naming::{IntentRecord, Slot, SnapshotName};
+
+/// The slot's effect-site vocabulary: which [`EffectSiteId`] each of its four
+/// funnel positions runs under, and the [`ResourceRow`] that accounts for it.
 ///
-/// `decisions.workspace_candidates.manager` names two of them literally —
-/// "detached linked worktrees with durable synced intents (`tasks/k<key>-g<gen>`,
-/// `merge/s<seq>`)" — and `snapshots` names the third, whose members
-/// `decisions.workspace_candidates.snapshots` requires to be "never reused
-/// across roles or attempts".
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Slot {
-    /// `tasks/k<key>-g<gen>` — a task worktree, R9.
-    Task {
-        /// The task key.
-        key: String,
-        /// The generation number.
-        generation: u32,
-    },
-    /// `merge/s<seq>` — a staging worktree, R10. Never created for an
-    /// exact-base fast sequence.
-    Staging {
-        /// The merge sequence number.
-        sequence: u64,
-    },
-    /// `snapshots/<name>` — an exact gate or review snapshot, R24.
-    Snapshot {
-        /// The snapshot's name, which encodes its role, generation, and
-        /// attempt so that no two roles or attempts can collide.
-        name: SnapshotName,
-    },
-}
-
-/// A snapshot's name, built so that "never reused across roles or attempts" is
-/// a property of the name rather than of the caller's discipline.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SnapshotName(String);
-
-impl SnapshotName {
-    /// The one snapshot the whole gate set runs on.
-    #[must_use]
-    pub fn gates(generation: u32, attempt: u32) -> Self {
-        Self(format!("g{generation}-a{attempt}-gates"))
-    }
-
-    /// One fresh snapshot per reviewer.
-    #[must_use]
-    pub fn review(generation: u32, attempt: u32, reviewer: u32) -> Self {
-        Self(format!("g{generation}-a{attempt}-review{reviewer}"))
-    }
-
-    /// The snapshot an integration transaction judges its proposal on.
-    #[must_use]
-    pub fn integration(sequence: u64) -> Self {
-        Self(format!("s{sequence}-integration"))
-    }
-
-    /// The name as a directory component.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SnapshotName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Whether `name` is safe as a single path component.
-fn safe_component(name: &str) -> Option<&'static str> {
-    if name.is_empty() {
-        return Some("it is empty");
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Some("only ASCII alphanumerics, `-`, and `_` are legal in a slot component");
-    }
-    if name.starts_with('-') {
-        return Some(
-            "a leading `-` would be read as an option by the Git commands the funnels run",
-        );
-    }
-    None
-}
-
+/// Kept in this file rather than in `naming` with the rest of [`Slot`]
+/// because these five methods are the only place eleven of the inventory's
+/// sites are named as literals, and
+/// `effects::tests::every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent`
+/// reads `src/workspace_manager.rs` **by path** to check that a funnel module
+/// names every site it owns. A split that moved them into a child would leave
+/// that census reading a file the names had left, so it would report eleven
+/// sites as having no funnel at all — while the funnels themselves had not
+/// moved an inch. The child keeps the pure name arithmetic; the site mapping
+/// belongs to the funnels, and the funnels are here.
 impl Slot {
-    /// The slot's path relative to the execution root.
-    #[must_use]
-    pub fn relative(&self) -> PathBuf {
-        match self {
-            Self::Task { key, generation } => {
-                PathBuf::from("tasks").join(format!("k{key}-g{generation}"))
-            }
-            Self::Staging { sequence } => PathBuf::from("merge").join(format!("s{sequence}")),
-            Self::Snapshot { name } => PathBuf::from("snapshots").join(name.as_str()),
-        }
-    }
-
-    /// The intent file's name, injective over slots: the two components are
-    /// joined by `.`, which [`safe_component`] forbids inside either.
-    #[must_use]
-    pub fn intent_name(&self) -> String {
-        match self {
-            Self::Task { key, generation } => format!("tasks.k{key}-g{generation}.intent"),
-            Self::Staging { sequence } => format!("merge.s{sequence}.intent"),
-            Self::Snapshot { name } => format!("snapshots.{name}.intent"),
-        }
-    }
-
     /// The row that accounts for this slot.
     ///
     /// Taken from the frozen site enums rather than restated: `R9`, `R10` and
@@ -840,191 +408,14 @@ impl Slot {
             Self::Snapshot { .. } => EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
         }
     }
-
-    /// What the intent record calls this kind.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Task { .. } => "task",
-            Self::Staging { .. } => "staging",
-            Self::Snapshot { .. } => "snapshot",
-        }
-    }
-
-    /// Refuse a slot whose components could escape the execution root.
-    fn validate(&self) -> Result<(), Refusal> {
-        let (kind, name) = match self {
-            Self::Task { key, .. } => ("task", key.as_str()),
-            Self::Staging { .. } => return Ok(()),
-            Self::Snapshot { name } => ("snapshot", name.as_str()),
-        };
-        match safe_component(name) {
-            None => Ok(()),
-            Some(why) => Err(Refusal::SlotName {
-                kind,
-                name: name.to_owned(),
-                why,
-            }),
-        }
-    }
-
-    /// Rebuild a slot from an intent file name, so reclaim never has to trust
-    /// a path stored inside a record.
-    fn from_intent_name(name: &str) -> Option<Self> {
-        let stem = name.strip_suffix(".intent")?;
-        if let Some(rest) = stem.strip_prefix("tasks.k") {
-            let (key, generation) = rest.rsplit_once("-g")?;
-            return Some(Self::Task {
-                key: key.to_owned(),
-                generation: generation.parse().ok()?,
-            });
-        }
-        if let Some(rest) = stem.strip_prefix("merge.s") {
-            return Some(Self::Staging {
-                sequence: rest.parse().ok()?,
-            });
-        }
-        if let Some(rest) = stem.strip_prefix("snapshots.") {
-            return Some(Self::Snapshot {
-                name: SnapshotName(rest.to_owned()),
-            });
-        }
-        None
-    }
-}
-
-/// The durable per-owner recovery record `resource_accounting` requires of
-/// every worktree, staging, and snapshot slot.
-///
-/// `enforcement_domains.external_physical`: "every worktree, staging, snapshot,
-/// and container intent is a durable per-owner recovery record in its row,
-/// reclaimed at process start (never 'empty')".
-///
-/// The worktree path is **not** a field. Reclaim derives it from the intent's
-/// own name and the execution root, so a record cannot name a path outside the
-/// root it lives in — the containment `cleanup` requires ("expected-path,
-/// contained, idempotent, and never establishes authority") is then structural
-/// rather than checked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IntentRecord {
-    /// `task`, `staging`, or `snapshot`.
-    pub kind: String,
-    /// The slot's path relative to the execution root, as Git names paths.
-    pub slot: String,
-    /// The run that owns it.
-    pub run_id: String,
-    /// The coordinator incarnation that wrote it, so a later incarnation of the
-    /// same run can tell its own residue from a live sibling's.
-    pub incarnation: String,
 }
 
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
 
-/// A registered worktree of the managed repository, as
-/// `git worktree list --porcelain -z` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeRecord {
-    /// The checkout path, decoded byte-safely.
-    pub path: PathBuf,
-    /// The commit its HEAD names, when it has one.
-    pub head: Option<String>,
-    /// The branch it has checked out, when it is not detached.
-    pub branch: Option<String>,
-    /// Git's own lock reason. `git worktree add` holds `initializing` for the
-    /// whole of its run and releases it only once the checkout is populated, so
-    /// this field is how a registered-but-unpopulated worktree announces
-    /// itself.
-    pub locked: Option<String>,
-    /// Git's own prunable reason.
-    pub prunable: Option<String>,
-}
-
-/// Why [`WorkspaceManager::verify_worktree`] refused to reuse a worktree.
-///
-/// `decisions.workspace_candidates.generation`: "a worktree is reused across a
-/// process boundary or after an interrupted Git command … only after
-/// Worktree.Verify: the recorded path is a linked worktree of this repository,
-/// HEAD equals the recorded base (or, for RetainedIdle, the worktree holds the
-/// retained cumulative tree), the index is unlocked, and no
-/// cherry-pick/merge/revert/sequencer/rebase state exists".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyFailure {
-    /// Nothing is registered at the recorded path.
-    NotRegistered,
-    /// Registered, and `git worktree add` never finished populating it — the
-    /// `registered-but-unpopulated` residue element.
-    Unpopulated,
-    /// Registered at the path but belonging to a different repository.
-    ForeignRepository,
-    /// The checkout directory is gone.
-    Missing,
-    /// HEAD is not the recorded base.
-    HeadMismatch {
-        /// The recorded base.
-        expected: String,
-        /// What HEAD actually is.
-        actual: String,
-    },
-    /// The retained cumulative tree is not the one the worktree holds.
-    TreeMismatch {
-        /// The recorded tree.
-        expected: String,
-        /// Why the index does not hold it: the paths that differ, or the reason
-        /// the comparison could not be made against that tree at all.
-        ///
-        /// This was the tree the index writes out as, and obtaining it meant
-        /// running `git write-tree`, which **writes** (`PR5-CONF-002`). A
-        /// read-only observation cannot name a tree object that does not exist
-        /// yet, so it names the difference instead — which is the more useful
-        /// half of that diagnostic anyway.
-        difference: String,
-    },
-    /// Administrative residue of an interrupted command.
-    Residue(ResidueElement),
-}
-
-impl fmt::Display for VerifyFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotRegistered => f.write_str("no worktree is registered at the recorded path"),
-            Self::Unpopulated => f.write_str(
-                "the worktree is registered and was never populated: `git worktree add` still \
-                 holds its `initializing` lock",
-            ),
-            Self::ForeignRepository => {
-                f.write_str("the worktree at the recorded path belongs to another repository")
-            }
-            Self::Missing => f.write_str("the worktree's checkout directory is gone"),
-            Self::HeadMismatch { expected, actual } => {
-                write!(f, "HEAD is {actual}, not the recorded base {expected}")
-            }
-            Self::TreeMismatch {
-                expected,
-                difference,
-            } => write!(
-                f,
-                "the worktree does not hold the retained cumulative tree {expected}: {difference}"
-            ),
-            Self::Residue(element) => write!(
-                f,
-                "administrative residue of an interrupted command is present: {element:?}"
-            ),
-        }
-    }
-}
-
-/// What a worktree has to hold for [`WorkspaceManager::verify_worktree`] to
-/// pass it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Quiescence {
-    /// The ordinary case: HEAD equals the recorded base.
-    AtBase(String),
-    /// `RetainedIdle`: "the worktree holds the retained cumulative tree".
-    HoldsTree(String),
-}
+mod worktree;
+pub use self::worktree::{Quiescence, VerifyFailure, WorktreeRecord};
 
 /// The owner of an execution root and everything inside it.
 #[derive(Debug, Clone)]
@@ -1035,7 +426,13 @@ pub struct WorkspaceManager {
     run_id: String,
     incarnation: String,
     /// The operator's authorized private root, canonicalized. It is the anchor
-    /// the reparse-point walk starts at — see [`reparse_point_below`].
+    /// the reparse-point walk starts at — see `containment::reparse_point_below`.
+    ///
+    /// Named rather than linked: the split left that function private to the
+    /// child, which is narrower than the module-wide visibility it had here, so
+    /// no path from this module resolves to it and a link would be broken.
+    /// Widening it to `pub(super)` to make the link work would be a visibility
+    /// change made for a doc comment.
     private_root: PathBuf,
     execution_root: PathBuf,
 }
@@ -2782,485 +2179,27 @@ impl WorkspaceManager {
     }
 }
 
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[1..];
-    }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
-}
+// ---------------------------------------------------------------------------
+// Git output decoders
+// ---------------------------------------------------------------------------
 
-/// Decode the authoritative checkout side of a linked-worktree registration.
-///
-/// Registration-state table used by recovery:
-///
-/// | `gitdir` state | Can bind an exact checkout? | Recovery action |
-/// |---|---:|---|
-/// | valid UTF-8 or Unix path bytes | yes | revalidate containment, then act |
-/// | absent or unreadable | no | refuse before mutation |
-/// | zero-length | no | refuse before mutation |
-/// | partial / not ending in `.git` | no | refuse before mutation |
-///
-/// `commondir` is deliberately not an input to this binding. A valid `gitdir`
-/// plus an empty `commondir` is the one safe repairable state: it identifies
-/// the checkout while explaining why Git's own enumeration cannot proceed.
-fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBuf, UpstrokeError> {
-    let bytes = trim_ascii(bytes);
-    if bytes.is_empty() {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree registration {} has an empty gitdir",
-                admin.display()
-            ),
-        });
-    }
-    let Some(recorded) = decode_registration_path(bytes) else {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree registration {} has a gitdir this platform cannot represent exactly",
-                admin.display()
-            ),
-        });
-    };
-    let normalized: PathBuf = recorded.components().collect();
-    if !recorded.is_absolute()
-        || recorded
-            .components()
-            .any(|component| component == Component::ParentDir)
-        || normalized.as_os_str() != recorded.as_os_str()
-    {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree registration {} has a gitdir that is not an absolute normalized path",
-                admin.display()
-            ),
-        });
-    }
-    if recorded.file_name() != Some(OsStr::new(".git")) {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree registration {} has a gitdir that does not name a checkout .git",
-                admin.display()
-            ),
-        });
-    }
-    let Some(checkout) = recorded.parent() else {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree registration {} has a parentless gitdir",
-                admin.display()
-            ),
-        });
-    };
-    Ok(checkout.to_path_buf())
-}
+mod parsers;
+pub use self::parsers::decode_changed_paths;
+use self::parsers::{parse_worktree_records, registration_checkout};
 
-#[cfg(unix)]
-fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
-    Some(decode_git_path(bytes))
-}
-
-#[cfg(windows)]
-fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
-    std::str::from_utf8(bytes)
-        .ok()
-        .map(|path| PathBuf::from(path.replace('/', "\\")))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
-    std::str::from_utf8(bytes).ok().map(PathBuf::from)
-}
-
-/// What a snapshot is checked out at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SnapshotInput {
-    /// The integration case: an existing commit, and no object is created.
-    Commit(String),
-    /// The candidate case: a tree, for which the funnel first writes an
-    /// ephemeral commit on `parent`.
-    Tree {
-        /// The immutable tree under judgment.
-        tree: String,
-        /// The recorded parent the ephemeral commit sits on.
-        parent: String,
-    },
-}
-
-/// One live exact snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snapshot {
-    /// Its slot.
-    pub slot: Slot,
-    /// Its checkout.
-    pub path: PathBuf,
-    /// The commit its detached HEAD names.
-    pub head: String,
-    /// The ephemeral commit this snapshot created, when its input was a tree.
-    /// It returns to R27 when the snapshot is removed.
-    pub ephemeral: Option<String>,
-}
+mod snapshot_ref;
+pub use self::snapshot_ref::{Snapshot, SnapshotInput};
 
 // ---------------------------------------------------------------------------
 // Residue classification
 // ---------------------------------------------------------------------------
 
-/// What the parent recorded of a site's after-phase publication.
-///
-/// **The packet writes the predicate as `classify_object_residue(site,
-/// worktree)`** (`decisions.effect_site_inventory.command_internal_sub_effects`),
-/// and for five of the nine sites that is all it needs. For the other four it
-/// is not implementable, and the reason is a property of Git rather than of
-/// this module: `write-tree`, the two commit-tree sites, and the proposal
-/// cherry-pick publish a **content-addressed** object, so "the command
-/// completed" and "the command never ran" leave object stores that differ only
-/// in an object whose name the classifier would have to compute — and computing
-/// it is the effect. So the second argument carries the worktree *and* what the
-/// parent recorded, which is exactly the datum `IdUnread` is defined by the
-/// absence of.
-///
-/// [`Self::new`] is the five-site form; [`Self::published`] adds the record.
-#[derive(Debug, Clone)]
-pub struct ResidueTarget<'a> {
-    repository: &'a Path,
-    worktree: &'a Path,
-    published: Option<&'a str>,
-    base: Option<&'a str>,
-}
-
-impl<'a> ResidueTarget<'a> {
-    /// The worktree the site's Git command ran in — for the two commit-tree
-    /// sites, the repository the object was written into.
-    #[must_use]
-    pub fn new(repository: &'a Path) -> Self {
-        Self {
-            repository,
-            worktree: repository,
-            published: None,
-            base: None,
-        }
-    }
-
-    /// The site's owning worktree, when it is not the repository itself.
-    ///
-    /// Given separately because the worktree of a killed `worktree add` may not
-    /// exist at all, and a classifier that asked *it* which worktrees are
-    /// registered would answer "none registered" for the very residue it is
-    /// there to recognise.
-    #[must_use]
-    pub fn at(mut self, worktree: &'a Path) -> Self {
-        self.worktree = worktree;
-        self
-    }
-
-    /// The object id the parent read and recorded, for the sites whose
-    /// after-phase reference is a **content-addressed object** it must name to
-    /// tell "written" from "never written".
-    #[must_use]
-    pub fn published(mut self, object: &'a str) -> Self {
-        self.published = Some(object);
-        self
-    }
-
-    /// The commit the site's worktree was checked out at, for the site whose
-    /// after-phase reference is *movement* of that worktree's HEAD.
-    ///
-    /// `Object.ProposalCherryPick` is the one: `resource_accounting[R10]` says
-    /// "its detached HEAD and index reference the proposal commit … while it
-    /// exists", so the after phase is a fact about the staging HEAD rather than
-    /// about anything the parent recorded — and the base it moved off is known
-    /// before the command runs, because `Worktree.AddStaging` checked it out.
-    /// A kill therefore cannot lose it, which is why this site does not need
-    /// the parent's record the way the object-printing sites do.
-    #[must_use]
-    pub fn from_base(mut self, base: &'a str) -> Self {
-        self.base = Some(base);
-        self
-    }
-
-    /// The repository the objects live in.
-    #[must_use]
-    pub fn repository(&self) -> &Path {
-        self.repository
-    }
-
-    /// The worktree.
-    #[must_use]
-    pub fn worktree(&self) -> &Path {
-        self.worktree
-    }
-}
-
-/// Every site the classifier is total over, derived from the frozen enums.
-///
-/// `command_internal_sub_effects`: "the classifier is total over `{None,
-/// Internal, After}` for **every Object site** and for `Worktree.Add` /
-/// `Snapshot.Add`". The list is not written out here: it is every site whose
-/// `residue_classes()` is non-empty, which is what PR3 froze and what
-/// `ObjectSite::residue_classes` and `WorktreeSite::residue_classes` answer.
-/// Enumerating it by hand is the `bounded_grid` failure this project has
-/// recorded three times — a grid over the sites its author remembered.
-#[must_use]
-pub fn residue_classified_sites() -> Vec<EffectSiteId> {
-    EffectSiteId::all()
-        .into_iter()
-        .filter(|site| !site.residue_classes().is_empty())
-        .collect()
-}
-
-/// The read-only inspection predicate of
-/// `decisions.effect_site_inventory.command_internal_sub_effects`.
-///
-/// > "the prefix objects-written-reference-unpublished is registered as the
-/// > residue class `ObjectResidue::Internal`, defined by the read-only
-/// > inspection predicate `classify_object_residue(site, worktree)`: unreachable
-/// > objects per `git fsck --unreachable` and/or Git temporary object files
-/// > (R27; Git prunes both) plus administrative residue in the owning
-/// > worktree's git dir … or a registered-but-unpopulated worktree, **with the
-/// > after-phase reference absent**".
-///
-/// The order is that sentence's: the after-phase reference decides `After`
-/// first, and only its absence lets residue decide `Internal`.
-///
-/// Read-only. Nothing here writes an object, moves a ref, or touches an index.
-///
-/// # Errors
-///
-/// A Git or I/O error, or [`UpstrokeError::Refused`] for a site the frozen enums
-/// register no residue class for — the classifier is total over its domain and
-/// silent outside it, rather than answering `None` for a question nobody asked.
-pub fn classify_object_residue(
-    site: EffectSiteId,
-    target: &ResidueTarget<'_>,
-) -> Result<ObjectResidue, UpstrokeError> {
-    if site.residue_classes().is_empty() {
-        return Err(UpstrokeError::Refused {
-            message: format!(
-                "`{site}` registers no residue class, so classify_object_residue has nothing to \
-                 be total over there"
-            ),
-        });
-    }
-    if after_reference_present(site, target)? {
-        return Ok(ObjectResidue::After);
-    }
-    if internal_residue_present(site, target)? {
-        return Ok(ObjectResidue::Internal);
-    }
-    Ok(ObjectResidue::None)
-}
-
-/// Whether the site's after-phase reference is present.
-fn after_reference_present(
-    site: EffectSiteId,
-    target: &ResidueTarget<'_>,
-) -> Result<bool, UpstrokeError> {
-    let worktree = target.worktree;
-    let repository = target.repository;
-    match site {
-        // The three adds: registered *and* populated. `git worktree add` holds
-        // an `initializing` lock for the whole of its run, so a surviving lock
-        // is Git's own statement that the population did not finish.
-        EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
-        | EffectSiteId::Snapshot(SnapshotSite::Add) => {
-            let Some(record) = record_for(repository, worktree)? else {
-                return Ok(false);
-            };
-            Ok(record.locked.as_deref() != Some("initializing") && worktree.join(".git").exists())
-        }
-        // `git add -A` publishes its blobs by renaming index.lock over index.
-        // A surviving lock is proof the publication did not happen; otherwise
-        // the after state is an index that reflects the working tree.
-        EffectSiteId::Object(ObjectSite::CandidateStage) => {
-            if index_lock_present(worktree)? {
-                return Ok(false);
-            }
-            Ok(!worktree_has_unstaged_changes(worktree)?)
-        }
-        // `write-tree` publishes its trees through the index's cache-tree
-        // extension, which is a fsck root — so the recorded tree being present
-        // *and reachable* is the after phase, and an unreachable one is the
-        // interrupted prefix.
-        EffectSiteId::Object(ObjectSite::CandidateWriteTree) => {
-            if index_lock_present(worktree)? {
-                return Ok(false);
-            }
-            let Some(published) = target.published else {
-                return Ok(false);
-            };
-            Ok(object_exists(repository, published)?
-                && !unreachable_objects(repository)?
-                    .iter()
-                    .any(|id| id == published))
-        }
-        // The commit-tree sites: `AfterEffect::Unreferenced`. The object is
-        // present and nothing references it — the after phase and the R27
-        // residue differ only in whether the parent recorded the id, which is
-        // what `IdUnread` is.
-        EffectSiteId::Object(ObjectSite::SnapshotCommitTree | ObjectSite::CandidateCommitTree) => {
-            let Some(published) = target.published else {
-                return Ok(false);
-            };
-            object_exists(repository, published)
-        }
-        // The proposal cherry-pick publishes its objects through the staging
-        // HEAD.
-        EffectSiteId::Object(ObjectSite::ProposalCherryPick) => {
-            if index_lock_present(worktree)? {
-                return Ok(false);
-            }
-            let Some(head) = head_commit(worktree)? else {
-                return Ok(false);
-            };
-            if let Some(published) = target.published {
-                return Ok(head == published);
-            }
-            Ok(target.base.is_some_and(|base| head != base))
-        }
-        // `cherry-pick --no-commit` publishes its merge objects through the
-        // repair worktree's index. CHERRY_PICK_HEAD survives a *successful*
-        // `--no-commit`, so it is never the discriminator here.
-        EffectSiteId::Object(ObjectSite::RepairMaterialize) => {
-            if index_lock_present(worktree)? {
-                return Ok(false);
-            }
-            index_differs_from_head(worktree)
-        }
-        other => Err(UpstrokeError::Refused {
-            message: format!("`{other}` has no after-phase reference the classifier knows"),
-        }),
-    }
-}
-
-/// Whether the command-internal residue of `site` is present.
-fn internal_residue_present(
-    site: EffectSiteId,
-    target: &ResidueTarget<'_>,
-) -> Result<bool, UpstrokeError> {
-    Ok(!observed_residue_elements(site, target)?.is_empty())
-}
-
-/// Which of the site's own registered residue elements are present.
-///
-/// The element list is [`EffectSiteId::residue_elements`] — PR3's, frozen —
-/// rather than a list written here. A classifier that recognised elements its
-/// site does not register would answer `Internal` for states the fault matrix
-/// never tables, and one that recognised fewer would answer `None` for durable
-/// state no action recovers.
-///
-/// # Errors
-///
-/// A Git or I/O error.
-pub fn observed_residue_elements(
-    site: EffectSiteId,
-    target: &ResidueTarget<'_>,
-) -> Result<Vec<ResidueElement>, UpstrokeError> {
-    let worktree = target.worktree;
-    let repository = target.repository;
-    let mut present = Vec::new();
-    let git_dir = git_dir_of(worktree)?;
-    for element in site.residue_elements() {
-        let seen = match element {
-            ResidueElement::UnreferencedObject => {
-                let unreachable = unreachable_objects(repository)?;
-                match target.published {
-                    Some(published) => unreachable.iter().any(|id| id != published),
-                    None => !unreachable.is_empty(),
-                }
-            }
-            ResidueElement::TemporaryObjectFile => temporary_object_files(repository)?,
-            ResidueElement::IndexLock => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("index.lock").exists()),
-            ResidueElement::CherryPickHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("CHERRY_PICK_HEAD").exists()),
-            ResidueElement::MergeHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("MERGE_HEAD").exists()),
-            ResidueElement::MergeMsg => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("MERGE_MSG").exists()),
-            ResidueElement::OrigHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("ORIG_HEAD").exists()),
-            ResidueElement::SequencerState => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("sequencer").exists()),
-            ResidueElement::RegisteredUnpopulatedWorktree => record_for(repository, worktree)?
-                .is_some_and(|record| {
-                    record.locked.as_deref() == Some("initializing")
-                        || !worktree.join(".git").exists()
-                }),
-        };
-        if seen {
-            present.push(*element);
-        }
-    }
-    Ok(present)
-}
-
-/// Whether an element makes the worktree it sits in non-quiescent.
-///
-/// **A counted, stated boundary.** `command_internal_sub_effects` says of the
-/// synthetic evidence that for each element "`classify_object_residue` returns
-/// `Internal`, **`Worktree.Verify` fails**, and the tabled recovery converges".
-/// That is true of every element that lives in the owning worktree's git dir
-/// and of a registered-but-unpopulated worktree. It is *not* true of
-/// [`ResidueElement::UnreferencedObject`] or
-/// [`ResidueElement::TemporaryObjectFile`]: those live in the shared object
-/// store, are R27 — "Git's" — and are left by ordinary Git use (every amended
-/// commit leaves one). A `Worktree.Verify` that consulted the object store
-/// would refuse to reuse an `OpenNoAttempt` worktree in essentially every real
-/// repository, which `decisions.workspace_candidates.generation` requires it to
-/// reuse.
-///
-/// So the suite asserts the `Verify`-fails half for the elements it holds of,
-/// asserts its *negation* for the other two, and asserts the partition as a
-/// count — see `every_registered_residue_element_is_constructed_and_recovers`.
-#[must_use]
-pub const fn element_breaks_quiescence(element: ResidueElement) -> bool {
-    match element {
-        ResidueElement::UnreferencedObject | ResidueElement::TemporaryObjectFile => false,
-        ResidueElement::IndexLock
-        | ResidueElement::CherryPickHead
-        | ResidueElement::MergeHead
-        | ResidueElement::MergeMsg
-        | ResidueElement::OrigHead
-        | ResidueElement::SequencerState
-        | ResidueElement::RegisteredUnpopulatedWorktree => true,
-    }
-}
-
-/// The administrative residue in one worktree's git dir, in the order
-/// `command_internal_sub_effects` lists it.
-///
-/// `ORIG_HEAD` is deliberately absent from what makes a worktree non-quiescent
-/// here even though the sentence lists it: no site's frozen
-/// `residue_elements()` registers it, and `git reset`, `git merge` and
-/// `git rebase` all write one in the ordinary course of events, so reading it
-/// as evidence of an interrupted command would close generations that are
-/// perfectly reusable. Recorded rather than silently dropped.
-fn administrative_residue_at(git_dir: &Path) -> Result<Vec<ResidueElement>, UpstrokeError> {
-    let mut present = Vec::new();
-    for (name, element) in [
-        ("index.lock", ResidueElement::IndexLock),
-        ("CHERRY_PICK_HEAD", ResidueElement::CherryPickHead),
-        ("MERGE_HEAD", ResidueElement::MergeHead),
-        ("MERGE_MSG", ResidueElement::MergeMsg),
-        ("sequencer", ResidueElement::SequencerState),
-        ("rebase-merge", ResidueElement::SequencerState),
-        ("rebase-apply", ResidueElement::SequencerState),
-        ("REVERT_HEAD", ResidueElement::SequencerState),
-    ] {
-        if git_dir.join(name).exists() {
-            present.push(element);
-        }
-    }
-    Ok(present)
-}
+mod residue;
+use self::residue::administrative_residue_at;
+pub use self::residue::{
+    ResidueTarget, classify_object_residue, element_breaks_quiescence, observed_residue_elements,
+    residue_classified_sites,
+};
 
 fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
     let pointer = worktree.join(".git");
@@ -3471,187 +2410,13 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
     Ok(None)
 }
 
-/// Whether `value` is a full hexadecimal object id of either hash length.
-#[must_use]
-pub fn is_object_id(value: &str) -> bool {
-    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
+// ---------------------------------------------------------------------------
+// Object ids and the ref-transition refusals
+// ---------------------------------------------------------------------------
 
-/// Whether `value` is the null object id of either hash length.
-#[must_use]
-pub fn is_null_object_id(value: &str) -> bool {
-    is_object_id(value) && value.bytes().all(|byte| byte == b'0')
-}
-
-fn refuse_malformed_object_id(
-    refname: &str,
-    role: &'static str,
-    value: &str,
-) -> Result<(), UpstrokeError> {
-    if is_object_id(value) {
-        return Ok(());
-    }
-    Err(Refusal::MalformedObjectId {
-        refname: refname.to_owned(),
-        role,
-        value: value.to_owned(),
-    }
-    .into())
-}
-
-/// The expected-old side of every move and delete: a well-formed, non-null id.
-fn refuse_expected_old(refname: &str, old: &str) -> Result<(), UpstrokeError> {
-    refuse_malformed_object_id(refname, "expected-old", old)?;
-    if is_null_object_id(old) {
-        return Err(Refusal::NullExpectedOld {
-            refname: refname.to_owned(),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-/// Turn `git diff --name-status -M -z` bytes into a [`PathSet`].
-///
-/// A separate function from [`WorkspaceManager::changed_paths`] so the hostile
-/// byte cases — an undecodable path, an embedded newline, a path that is
-/// nothing but a delimiter — can be exercised on every platform rather than
-/// only on the one whose filesystem can hold them.
-///
-/// # The record grammar
-///
-/// `-z --name-status` emits NUL-*terminated* fields, one status field followed
-/// by the paths that status has: `A\0path\0`, `D\0path\0`, `M\0path\0`, and for
-/// a detected rename or copy **two** — `R100\0old\0new\0`. Both are kept, which
-/// is `path_policy.actual`'s "both rename endpoints": the old endpoint is the
-/// one another owner may already hold a lease on, and an answer that omits it
-/// is silently smaller than the diff.
-///
-/// # Why unparsable is repo-wide, not shorter
-///
-/// One undecodable path makes the **whole** answer [`PathSet::RepoWide`], and
-/// so does a status field this grammar does not recognise. The alternative,
-/// dropping it and returning the rest, would hand the merge queue a region that
-/// is silently *smaller* than the diff and let two overlapping tasks run in
-/// parallel; `GitPath`'s own contract is that "paths that did not decode are
-/// never stored", and `prediction` classifies "unsafe or unparsable forms" as
-/// repo-wide. Repo-wide overlaps everything, so it is the direction that
-/// refuses rather than the one that admits.
-#[must_use]
-pub fn decode_changed_paths(bytes: &[u8]) -> PathSet {
-    let mut paths = Vec::new();
-    let mut fields = bytes
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty());
-    while let Some(status) = fields.next() {
-        let Some(endpoints) = status_endpoints(status) else {
-            return PathSet::RepoWide;
-        };
-        for _ in 0..endpoints {
-            // A record that stops mid-way is a truncated answer, and a
-            // truncated answer is a shorter region.
-            let Some(field) = fields.next() else {
-                return PathSet::RepoWide;
-            };
-            match std::str::from_utf8(field) {
-                Ok(decoded) => paths.push(GitPath::from(decoded)),
-                Err(_) => return PathSet::RepoWide,
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    PathSet::Prefixes { paths }
-}
-
-/// How many path fields a `--name-status` status field is followed by, or
-/// `None` when this is not a status field at all.
-///
-/// The letters are `git diff`'s own documented set. `R` and `C` carry a
-/// similarity score and two endpoints; everything else carries one and no
-/// score. Anything else — including a path that arrived where a status was
-/// expected, which is what a decoder reading `--name-only` output would see —
-/// is unparsable and makes the answer repo-wide.
-fn status_endpoints(status: &[u8]) -> Option<usize> {
-    let (letter, score) = status.split_first()?;
-    match letter {
-        b'R' | b'C' => score
-            .iter()
-            .all(u8::is_ascii_digit)
-            .then_some(2)
-            .filter(|_| !score.is_empty()),
-        b'A' | b'D' | b'M' | b'T' | b'U' | b'X' => score.is_empty().then_some(1),
-        _ => None,
-    }
-}
-
-/// Parse `git worktree list --porcelain -z`.
-///
-/// Attributes are NUL-terminated and an empty attribute ends a record. Paths
-/// are taken as bytes, because a repository path need not be UTF-8 on Unix.
-fn parse_worktree_records(bytes: &[u8]) -> Vec<WorktreeRecord> {
-    let mut records = Vec::new();
-    let mut current: Option<WorktreeRecord> = None;
-    for field in bytes.split(|byte| *byte == 0) {
-        if field.is_empty() {
-            if let Some(record) = current.take() {
-                records.push(record);
-            }
-            continue;
-        }
-        if let Some(path) = field.strip_prefix(b"worktree ") {
-            if let Some(record) = current.take() {
-                records.push(record);
-            }
-            current = Some(WorktreeRecord {
-                path: decode_git_path(path),
-                head: None,
-                branch: None,
-                locked: None,
-                prunable: None,
-            });
-            continue;
-        }
-        let Some(record) = current.as_mut() else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(field);
-        let text = text.trim_end();
-        if let Some(head) = text.strip_prefix("HEAD ") {
-            record.head = Some(head.to_owned());
-        } else if let Some(branch) = text.strip_prefix("branch ") {
-            record.branch = Some(branch.to_owned());
-        } else if text == "locked" {
-            record.locked = Some(String::new());
-        } else if let Some(reason) = text.strip_prefix("locked ") {
-            record.locked = Some(reason.to_owned());
-        } else if text == "prunable" {
-            record.prunable = Some(String::new());
-        } else if let Some(reason) = text.strip_prefix("prunable ") {
-            record.prunable = Some(reason.to_owned());
-        }
-    }
-    if let Some(record) = current.take() {
-        records.push(record);
-    }
-    records
-}
-
-#[cfg(unix)]
-fn decode_git_path(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt as _;
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
-}
-
-#[cfg(windows)]
-fn decode_git_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).replace('/', "\\"))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn decode_git_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-}
+mod object;
+pub use self::object::{is_null_object_id, is_object_id};
+use self::object::{refuse_expected_old, refuse_malformed_object_id};
 
 // ---------------------------------------------------------------------------
 // Small filesystem helpers

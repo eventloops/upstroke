@@ -51,6 +51,46 @@ pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
         })
 }
 
+/// The plan corpus, embedded at compile time from `fixtures/`.
+///
+/// The four plan files under `fixtures/` at the repository root are the single
+/// source of this corpus. Each constant below is [`include_str!`] of one of
+/// them: the compiler reads the file, the text is part of the test binary, and
+/// nothing reads the file at run time — `plan::markdown`'s and
+/// `crate::topology::registry`'s tests take the text from here. The one region
+/// that still reads the files from disk at run time is `crate::validate`'s
+/// tests, which never stopped: `validate::run` takes a path, and those tests
+/// hand it `fixtures/<name>.md` as they always have. Only the plans a
+/// compile-time consumer uses are embedded; `cyclic-plan.md` has none — its
+/// one reader is `validate`'s refusal test, at run time — so it is a file and
+/// nothing else.
+///
+/// One copy, not two. A literal here would put the plan text in the file and in
+/// the source, and a corpus kept in two places drifts — the class this
+/// repository has recorded three times. Edit the file; the constant follows.
+///
+/// The parser is what the bytes matter to: the annotation grammar is column-
+/// and delimiter-sensitive, and `steps-plan.md` carries a U+2014 em dash it
+/// sees. `Plan.source.hash` is not a byte oracle for them —
+/// [`crate::ir::content_hash`] skips every CR deliberately, so a CRLF checkout
+/// hashes the same as the LF original, which
+/// `markdown::tests::crlf_plans_parse_identically` asserts.
+#[cfg(test)]
+pub(crate) mod corpus {
+    /// No annotations at all, so every field comes from the heuristics: five
+    /// tasks inferred from `##` headings, with one acceptance list.
+    pub(crate) const BARE_PLAN: &str = include_str!("../../fixtures/bare-plan.md");
+
+    /// The annotated plan: every annotation attribute the grammar carries, a
+    /// `min=` clip, path hints, and an artifact wired along the dependency
+    /// chain. Four tasks, no cycles.
+    pub(crate) const SAMPLE_PLAN: &str = include_str!("../../fixtures/sample-plan.md");
+
+    /// The Claude Code plan-mode shape: an ordered list, no per-task headings,
+    /// no annotations. Its third line carries a U+2014 em dash.
+    pub(crate) const STEPS_PLAN: &str = include_str!("../../fixtures/steps-plan.md");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

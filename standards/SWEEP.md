@@ -1,0 +1,131 @@
+# Standards sweep
+
+§6 (shared ownership, locks, clones) and §7 (the `?` operator) were tightened on 2026-09-03. They
+bind new and materially changed code immediately. The existing tree predates them and is being
+brought up to them one file at a time: each file gets a deep review by a frontier model, then a
+pull request that lands the cleanup and adds the file to the table below.
+
+**Activation rule.** In a file not yet listed here, §6 and §7 apply to the code a change adds or
+rewrites: every line inside a hunk the change introduces or modifies, and the whole body of any
+function the change modifies. A pure formatting, renaming or comment change activates nothing.
+An existing `Rc`, `Arc`, `Mutex`, `RwLock`, `clone()` or `?` outside that scope is not a review
+finding. Once a file is listed, §6 and §7 apply to it in full, and a reviewer may cite them
+against any line.
+
+**The activation rule is temporary.** It exists only because the tree predates the rules. When
+every Rust file the standards govern (§1: all Rust in the repository, which today is `src/` and
+`examples/probe.rs`) is listed in the swept table, the transitional wording goes in one pull
+request, every sentence of it: this file's opening paragraph ("bind new and materially changed
+code immediately ... one file at a time"), this paragraph and the activation rule above; §6's
+paragraph "These three rules bind the code a change adds or rewrites, now" and its "Enforced by"
+line's reference to this file; §7's sentence "This rule is transitional in the same way as
+§6's"; §1's sentence "Some standards are newer than the tree; `standards/SWEEP.md` says which";
+§16's sentence "A §6 or §7 finding in an unswept file is in scope only under the activation
+rule"; `MAINTAINING.md`'s triage clause "or against an unswept file under a transitional
+standard"; the `CODING_STANDARDS.md` index paragraph that points here; and the hard-conventions
+bullet in `CLAUDE.md` and `AGENTS.md` that says these rules "bind the code a change adds or
+rewrites" and points at the activation rule. After that §6 and §7 bind the whole tree with no
+scoping, and this file is the record of how the tree got there. Errors are handled where they
+arise; a `?` that survives a sweep is one the reviewer agreed was deliberate.
+
+## Review queue
+
+The queue is the W2 decomposition wave: the seven large modules split into per-concern child
+modules by the pull requests that merged on 2026-09-03 (#110, #107, #106, #108, #111, #117,
+#123), one pull request per parent. For each family, every Rust file under its
+directory is queued (the children the split produced, and the test, fixture and support files
+that were extracted there earlier), followed by the parent, which keeps whatever the split did
+not move. Families are listed in the order their splits merged, and a family of this wave that
+merged after the last edit of this table joins it in the next pull request that touches the
+table, whichever that is; a stale queue is a queue with work owed, not a broken one. Each file is
+swept in queue order: one session, one file, one review by Claude Fable 5.1 whose only subject
+is that file, then the pull request that lands the cleanup and moves the row to the swept table.
+Files outside `src/` that the standards govern (today `examples/probe.rs`) close the wave.
+
+The tree has older per-concern families that no pull request of this wave produced, among them
+`src/plan/markdown/` (`cd612c3`, 2026-08-30), `src/engine/topology/`, `src/runner/container/`,
+`src/effects/`, `src/events/log/`, `src/validate/`, `src/status/` and `src/connect/`, and flat
+modules no split has touched. They are not on this queue. They join it, family by family, after
+the wave above or earlier when the owner names one, and the merge-order rule applies within a
+wave, not across the history of the tree.
+
+| # | File | Lines | Family | Merged |
+|---|---|---|---|---|
+| 1 | `src/workspace_manager/containment.rs` | 235 | #110 | 2026-09-03 |
+| 2 | `src/workspace_manager/hooks.rs` | 200 | #110 | 2026-09-03 |
+| 3 | `src/workspace_manager/naming.rs` | 254 | #110 | 2026-09-03 |
+| 4 | `src/workspace_manager/object.rs` | 68 | #110 | 2026-09-03 |
+| 5 | `src/workspace_manager/parsers.rs` | 274 | #110 | 2026-09-03 |
+| 6 | `src/workspace_manager/residue.rs` | 400 | #110 | 2026-09-03 |
+| 7 | `src/workspace_manager/snapshot_ref.rs` | 56 | #110 | 2026-09-03 |
+| 8 | `src/workspace_manager/worktree.rs` | 135 | #110 | 2026-09-03 |
+| 9 | `src/workspace_manager/fixture.rs` | 386 | #110 | 2026-09-03 |
+| 10 | `src/workspace_manager/tests.rs` | 5,973 | #110 | 2026-09-03 |
+| 11 | `src/workspace_manager.rs` | 2,535 | #110 | 2026-09-03 |
+| 12 | `src/rundir/classify.rs` | 280 | #107 | 2026-09-03 |
+| 13 | `src/rundir/discovery.rs` | 331 | #107 | 2026-09-03 |
+| 14 | `src/rundir/names.rs` | 45 | #107 | 2026-09-03 |
+| 15 | `src/rundir/ownership.rs` | 344 | #107 | 2026-09-03 |
+| 16 | `src/rundir/retention.rs` | 232 | #107 | 2026-09-03 |
+| 17 | `src/rundir/scratch_tree.rs` | 1,281 | #107 | 2026-09-03 |
+| 18 | `src/rundir/tests.rs` | 4,079 | #107 | 2026-09-03 |
+| 19 | `src/rundir.rs` | 1,792 | #107 | 2026-09-03 |
+| 20 | `src/topology/effects/bijection.rs` | 475 | #106 | 2026-09-03 |
+| 21 | `src/topology/effects/export.rs` | 123 | #106 | 2026-09-03 |
+| 22 | `src/topology/effects/harness.rs` | 360 | #106 | 2026-09-03 |
+| 23 | `src/topology/effects/registry.rs` | 727 | #106 | 2026-09-03 |
+| 24 | `src/topology/effects/residue_authority.rs` | 1,086 | #106 | 2026-09-03 |
+| 25 | `src/topology/effects/sites.rs` | 1,617 | #106 | 2026-09-03 |
+| 26 | `src/topology/effects/vocab.rs` | 796 | #106 | 2026-09-03 |
+| 27 | `src/topology/effects/tests.rs` | 6,073 | #106 | 2026-09-03 |
+| 28 | `src/topology/effects.rs` | 723 | #106 | 2026-09-03 |
+| 29 | `src/topology/fold/apply.rs` | 603 | #108 | 2026-09-03 |
+| 30 | `src/topology/fold/check_attempt.rs` | 792 | #108 | 2026-09-03 |
+| 31 | `src/topology/fold/check_candidate.rs` | 252 | #108 | 2026-09-03 |
+| 32 | `src/topology/fold/check_end.rs` | 187 | #108 | 2026-09-03 |
+| 33 | `src/topology/fold/check_integration.rs` | 659 | #108 | 2026-09-03 |
+| 34 | `src/topology/fold/outcome.rs` | 219 | #108 | 2026-09-03 |
+| 35 | `src/topology/fold/parse.rs` | 57 | #108 | 2026-09-03 |
+| 36 | `src/topology/fold/predicates.rs` | 320 | #108 | 2026-09-03 |
+| 37 | `src/topology/fold/region.rs` | 107 | #108 | 2026-09-03 |
+| 38 | `src/topology/fold/start.rs` | 293 | #108 | 2026-09-03 |
+| 39 | `src/topology/fold/tests.rs` | 9,805 | #108 | 2026-09-03 |
+| 40 | `src/topology/fold.rs` | 862 | #108 | 2026-09-03 |
+| 41 | `src/runner/host/environment.rs` | 288 | #111 | 2026-09-03 |
+| 42 | `src/runner/host/naming.rs` | 320 | #111 | 2026-09-03 |
+| 43 | `src/runner/host/probe.rs` | 133 | #111 | 2026-09-03 |
+| 44 | `src/runner/host/tests.rs` | 7,391 | #111 | 2026-09-03 |
+| 45 | `src/runner/host.rs` | 777 | #111 | 2026-09-03 |
+| 46 | `src/agent/proc/ambient.rs` | 228 | #117 | 2026-09-03 |
+| 47 | `src/agent/proc/drain.rs` | 95 | #117 | 2026-09-03 |
+| 48 | `src/agent/proc/hooks.rs` | 113 | #117 | 2026-09-03 |
+| 49 | `src/agent/proc/test_support/readiness.rs` | 583 | #117 | 2026-09-03 |
+| 50 | `src/agent/proc/tests.rs` | 3,893 | #117 | 2026-09-03 |
+| 51 | `src/agent/proc.rs` | 5,239 | #117 | 2026-09-03 |
+| 52 | `src/config/parse.rs` | 571 | #123 | 2026-09-03 |
+| 53 | `src/config/read.rs` | 274 | #123 | 2026-09-03 |
+| 54 | `src/config.rs` | 2,875 | #123 | 2026-09-03 |
+| 55 | `examples/probe.rs` | 70 | — | — |
+
+Line counts are as of the family's split merge and are a guide to session sizing, not a
+contract. "Family" is the pull request whose split defines the family the file belongs to, and
+"Merged" is when that split landed; neither says which pull request first created the file at
+its path (several of the test and support files were extracted earlier: by #98, #100 and #102,
+and `readiness.rs` by `1cd4b1e` on 2026-08-30), and `git log --follow` is the record for that.
+`examples/probe.rs` belongs to no family.
+
+Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
+
+| Construct | Sites | Files |
+|---|---|---|
+| `Arc<` | 81 | 20 |
+| `Mutex<` | 145 | 32 |
+| `Rc<` | 4 | 2 |
+| `.clone()` | 1,941 | 84 |
+| `?` (propagation) | ≈1,200 | 71 |
+
+## Swept files
+
+| File | Swept at (commit) | Date | Notes |
+|---|---|---|---|
+| _none yet_ | | | |

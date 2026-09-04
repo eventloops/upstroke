@@ -74,12 +74,12 @@
 //
 // `effects/allowlist.toml` records the lint and the exact number of sites, and
 // `effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so`
-// asserts the file, the row and the prose agree. The amendment that admits a
-// per-site `#[expect]` below module level at all is
-// `decisions/2026-08-30-readiness-lint-placement.md`:
-// `decisions.effect_site_inventory.mechanism` (2) permits
-// an allowance "only as module-level attributes", and this is narrower than the
-// module-level allowance it replaces rather than a widening of it.
+// asserts the file, the row and the prose agree. The rule that admits a
+// per-site `#[expect]` below module level at all is the lints paragraph of
+// `standards/02_standards_automated_baseline.md`: the allowlist's own
+// mechanism otherwise permits an allowance only as module-level attributes,
+// and this is narrower than the module-level allowance it replaces rather
+// than a widening of it.
 //
 // What the six are written against is the staged publication in
 // `publish_between`: **five distinct denied paths across six sites** --
@@ -422,9 +422,9 @@ enum Framed {
 /// per-stream output allowance, reused rather than a second cap
 /// introduced beside it. It matters because `read_line` against a
 /// producer that never frames anything grows a `String` without limit:
-/// the same shape `rundir::first_line` already refuses, and a fixture
-/// that ran the machine out of memory while waiting would be a worse
-/// failure than the one the wait is bounding.
+/// the same shape `rundir::classify::first_line` already refuses, and a
+/// fixture that ran the machine out of memory while waiting would be a
+/// worse failure than the one the wait is bounding.
 fn read_frames(stdout: ChildStdout, framed: &Sender<Framed>) {
     let mut reader = BufReader::new(stdout);
     let mut drained = 0_usize;
