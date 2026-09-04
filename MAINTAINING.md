@@ -83,6 +83,54 @@ least one of:
 The reviewer's label does not decide this; the owner classifies, and a P1 whose failure needs
 speculative preconditions is reclassified down with a ledger row saying why.
 
+### When a pull request may be looping
+
+Repair rounds are not free. A push waits on both required contexts, and a repaired serious P1 costs
+another frontier pass under step 5. They also do not always converge. Two signals say a pull
+request may be looping rather than converging, and each obliges the author to say so.
+
+**This subsection never overrides step 5.** Neither signal withdraws a fix, closes a pull request
+or decides anything by itself. When one appears, the author writes in the body that it has
+appeared, what the evidence is, and why the pull request should continue — or proposes narrowing it
+or closing it. Raising a signal is the author's, the moment it appears, and not the reviewer's to
+keep finding: step 5 makes the author responsible for the pull request until it lands, and that
+responsibility includes saying when it may not. Narrowing is the author's too, and the findings on
+a narrowed pull request are triaged under step 5 exactly as before. Closing a pull request that has
+already had a review pass is the owner's; the owner may delegate that closure in writing, for that
+pull request, to the agent doing the work on it, and the delegation is disclosed with the closure.
+This is said here because nothing else in this file assigns it.
+
+**The premise looks disproved.** Every change is made for a stated reason, and a review or a CI run
+can put that reason in doubt: the failure it was meant to fix happens again on its own head, the
+measurement it rested on does not reproduce, the cause it named looks not to be the cause. Say so,
+and say what the evidence does not establish as well as what it does. A message is not a defect and
+two faults print one sentence, so a recurrence is worth exactly its fingerprint — the same test
+failing the same assertion for the same reason, or the change's own mechanism measured and shown
+not to have fired, is evidence; a shared label is not, and neither is one red run of a test already
+known to fail under load. Then say which the pull request is: still converging on the defect it
+names, narrowed to the part that stands on its own, or finished, with what it learned kept as
+findings and the question it was answering re-opened. A narrowed pull request is retitled; step 6
+re-validates the live title, and a title still naming a withdrawn fix is the next finding.
+
+**A pass finds a P1 in machinery an earlier round of this pull request added.** Any earlier round,
+not only the last one: a defect that takes two passes to surface is the same loop moving more
+slowly. Say that too, and say why the next repair converges where the earlier ones did not — what
+the defect in the repair was, what the fix is, and what test holds it. An inverted condition with a
+regression test is not the same animal as a third round of machinery invented to keep the second
+round's machinery safe, and which one it is shows only when someone writes it down. When it is the
+second, the smaller change is the one to propose: keep what has survived a pass, drop the machinery
+those rounds invented, and record what it was for as a finding carrying its proposal.
+
+Neither signal is a licence to abandon a real defect. A relevant serious P1 is fixed and
+re-reviewed under step 5 whatever the signals say, and what a narrowing drops is preserved where
+step 5 puts any open finding: one file each under `reviews/findings/`, saying what the change that
+takes it up should do. A pull request that does not merge carries nothing into the tree by itself,
+so those files land through a change of their own. What a signal costs is a paragraph. A loop
+neither signal catches is still a loop, so these are a floor and not a detector.
+
+PR #125 is the pull request this subsection was written from; `reviews/FINDINGS.md` §49 is its
+record.
+
 ### Tech debt sweeps
 
 Logged rows are swept, not forgotten, at three points: before any release tag or crates.io publish,
