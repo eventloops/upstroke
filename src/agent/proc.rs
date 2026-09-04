@@ -1468,8 +1468,10 @@ mod termination {
     /// child is not established, and this budget is a mitigation, not a
     /// repair; the failure message reports what the parent can see of the
     /// child when the wait ends (`helper_snapshot`), so a recurrence says
-    /// whether it was still running, stopped or already gone, and how many
-    /// descriptors it still held. A helper that never comes up still fails
+    /// whether it was still running, stopped or already gone, and, when the
+    /// host answers, how many descriptors it held open, which is not how
+    /// far a close loop over every descriptor number had got. A helper that
+    /// never comes up still fails
     /// the launch, only later; nothing waits on this budget in the ordinary
     /// case, since READY arrives as soon as the child has closed its
     /// descriptors. Runtime acknowledgements from a helper that is already
@@ -1499,6 +1501,11 @@ mod termination {
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
     /// How long a READY wait goes between looks at the termination flag.
     const LAUNCH_INTERRUPT_SLICE: Duration = Duration::from_millis(50);
+    /// How many reaper READY waits this process has begun. A test that must
+    /// turn the termination flag while a wait is in progress, rather than
+    /// before it, watches this instead of sleeping.
+    #[cfg(test)]
+    static READY_WAITS_BEGUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const GUARD_PROBE: u8 = 0xe1;
 
     /// Whether a launch in progress should be given up: a termination is
@@ -2537,6 +2544,8 @@ mod termination {
             pid,
         };
         let ready_wait = std::time::Instant::now();
+        #[cfg(test)]
+        READY_WAITS_BEGUN.fetch_add(1, Ordering::SeqCst);
         let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
         // A termination that arrived during the wait, or with READY, wins:
         // the caller holds the launch barrier, and releasing it is what lets
@@ -2549,12 +2558,13 @@ mod termination {
             let waited = ready_wait.elapsed();
             // What the parent can see of the child, read before killing it.
             // The wait answers `None` for a timeout, EOF and a read error
-            // alike, so the elapsed time and the ceiling are hints; the
-            // child's state and descriptor count say where it was when the
-            // wait ended. A full-budget wait with the child alive and its
-            // descriptors mostly closed is not the close loop; a stopped
-            // child was stopped by something; an exited one died before
-            // READY with its pipe end held open elsewhere.
+            // alike, so the elapsed time and the ceiling are hints. The
+            // snapshot says which state the child was in and, when the host
+            // answers, how many descriptors it held open; a stopped child
+            // was stopped by something, and an exited one died before READY
+            // with its pipe end held open elsewhere. The count does not say
+            // how far a close loop over every descriptor number had got,
+            // since that loop closes numbers whether or not they are open.
             let snapshot = helper_snapshot(pid);
             reaper.abandon();
             return Err(format!(
@@ -3006,14 +3016,21 @@ mod termination {
     /// byte first. A reaper that came up after its READY deadline has that
     /// stale byte queued ahead of its CANCEL acknowledgement; judging the first
     /// byte alone failed a cancel the reaper had accepted (`C-004`).
+    ///
+    /// One deadline. While it stands, an unexpected byte is skipped and the
+    /// wait goes on with what is left; once it has passed, the reader's
+    /// zero-timeout final look is the last read, and an unexpected byte there
+    /// ends the wait as a timeout would. So the wait is bounded by `timeout`
+    /// plus one look however many bytes a failed or reused pipe supplies,
+    /// which matters because `Reaper::cancel` runs under the launch barrier.
     fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match read_guard_ack(fd, remaining) {
                 Some(byte) if byte == expected => return true,
-                Some(_) => continue,
-                None => return false,
+                Some(_) if !remaining.is_zero() => continue,
+                Some(_) | None => return false,
             }
         }
     }
@@ -3567,6 +3584,10 @@ mod termination {
             tv_nsec: ((ms % 1_000) * 1_000_000).try_into().unwrap_or(0),
         };
         loop {
+            // SAFETY: both pointers name the one live `timespec` on this
+            // stack; `nanosleep` reads it and, when a signal interrupts the
+            // sleep, writes what is left back into it, which the next turn
+            // of the loop passes in again.
             let result = unsafe { libc::nanosleep(&remaining, &mut remaining) };
             if result == 0 || !last_errno_is_interrupted() {
                 return;
@@ -3889,10 +3910,14 @@ mod termination {
     }
 
     /// What the parent can see of a forked helper that has not said READY,
-    /// for a failure message: whether it is still running, stopped, exited
-    /// but unreaped, or gone, and how many descriptors it holds open. Read
-    /// before the helper is killed. The queries are the ones the reaper uses
-    /// to watch its parent; a host without them reports what it cannot see.
+    /// for a failure message: whether it is alive, stopped, exited but
+    /// unreaped, or gone, and, when the host answers, how many descriptors it
+    /// holds open. Read before the helper is killed. A query that fails or
+    /// answers short is reported as unknown, not as a state; the count is a
+    /// count of open descriptors and says nothing about how far a close loop
+    /// over every descriptor number had got. The queries are the ones the
+    /// reaper uses to watch its parent; a host without them reports what it
+    /// cannot see.
     fn helper_snapshot(pid: libc::pid_t) -> String {
         let state = helper_state(pid);
         match helper_open_descriptors(pid) {
@@ -3917,13 +3942,17 @@ mod termination {
 
     #[cfg(target_os = "linux")]
     fn helper_open_descriptors(pid: libc::pid_t) -> Option<usize> {
-        std::fs::read_dir(format!("/proc/{pid}/fd"))
+        let descriptors = PathBuf::from("/proc").join(pid.to_string()).join("fd");
+        std::fs::read_dir(descriptors)
             .ok()
             .map(|entries| entries.count())
     }
 
     #[cfg(target_os = "macos")]
     fn helper_state(pid: libc::pid_t) -> String {
+        // SAFETY: `proc_bsdshortinfo` is a plain C struct of integers and
+        // fixed byte arrays, for which all-zero bytes is a valid value; the
+        // kernel overwrites it below.
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
         // SAFETY: `info` is valid storage of exactly the size passed. The
@@ -3939,8 +3968,14 @@ mod termination {
                 size,
             )
         };
+        // The wrapper answers zero for a failed query and leaves errno; only
+        // a process the kernel cannot find is gone, anything else is unknown.
         if read != size {
-            return "gone".to_owned();
+            return if read == 0 && last_errno() == libc::ESRCH {
+                "gone".to_owned()
+            } else {
+                "in a state this host did not report".to_owned()
+            };
         }
         match info.pbsi_status {
             libc::SSTOP => "stopped".to_owned(),
@@ -3958,15 +3993,23 @@ mod termination {
         // count; the count is the second call's answer.
         const PROC_PIDLISTFDS: libc::c_int = 1;
         const PROC_FDINFO_SIZE: usize = 8;
+        // The wrapper answers zero for a failed query, so zero is "not
+        // readable" from either call, not a count.
         // SAFETY: a null buffer of length zero asks only for the size.
         let needed =
             unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return None;
+        }
         let mut buffer = vec![0_u8; usize::try_from(needed).ok()?];
         let length = libc::c_int::try_from(buffer.len()).ok()?;
         // SAFETY: `buffer` is writable for exactly the length passed.
         let filled = unsafe {
             libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer.as_mut_ptr().cast(), length)
         };
+        if filled <= 0 {
+            return None;
+        }
         usize::try_from(filled)
             .ok()
             .map(|bytes| bytes / PROC_FDINFO_SIZE)
@@ -4998,6 +5041,9 @@ mod termination {
                 message.contains("interrupted by a termination signal"),
                 "the launch at READY failed for the wrong reason: {message}"
             );
+            // SAFETY: as above, `waitpid(-1, WNOHANG)` inspects only this
+            // process's children, and the reaper abandoned at READY is the
+            // only one it has had since the last such look.
             let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
             assert!(
                 waited < 0 && !last_errno_is_interrupted(),
@@ -5028,13 +5074,6 @@ mod termination {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-
-        /// How many `LAUNCH_INTERRUPT_SLICE`s a launch may take to notice a
-        /// termination that became pending during its READY wait: the slice
-        /// in which it is noticed, the kill and reap of the abandoned reaper,
-        /// and room for a loaded runner, all well inside the READY the tests
-        /// hold back.
-        const INTERRUPT_LATENCY_SLICES: u32 = 20;
 
         /// The termination flag as a handled signal would leave it.
         fn set_pending_termination() {
@@ -5073,7 +5112,7 @@ mod termination {
         /// One launch through the production funnel, of a child that exits
         /// at once, with `hooks` watching.
         fn launch(hooks: &mut dyn super::super::SpawnHooks) -> Result<(), UpstrokeError> {
-            let mut command = Command::new("/bin/sh");
+            let mut command = Command::new(std::path::Path::new("/bin/sh"));
             command.args(["-c", "exit 0"]);
             super::super::run_with_timeout_at(
                 ProcessSite::Spawn,
@@ -5206,39 +5245,59 @@ mod termination {
             }
             seed_state_without_a_monitor();
             // The parent test holds READY back through
-            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`; the flag turns from
-            // another thread part-way through that wait, as a handled signal
-            // would turn it.
+            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`. The flag turns from
+            // another thread once that thread has seen the READY wait begin
+            // (`READY_WAITS_BEGUN`), never before, so `claim_launch` cannot be
+            // what refuses; no sleep decides the order.
             let ready_delay = Duration::from_millis(
                 std::env::var("UPSTROKE_TEST_REAPER_READY_DELAY_MS")
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
                     .expect("the parent test sets the READY delay"),
             );
-            let flag_delay = LAUNCH_INTERRUPT_SLICE * 6;
-            let bound = flag_delay + LAUNCH_INTERRUPT_SLICE * INTERRUPT_LATENCY_SLICES;
+            // The wait ends within a slice of the flag: the poll in flight
+            // when the flag turns runs out, and one more slice covers the
+            // kill and reap of the abandoned reaper and the scheduling of
+            // this thread on a loaded runner.
+            let bound = LAUNCH_INTERRUPT_SLICE * 2;
             assert!(
                 bound < ready_delay,
                 "the bound {bound:?} must fall before READY at {ready_delay:?}, or a launch that \
                  waited for READY and only then looked would pass"
             );
             let setter = thread::spawn(move || {
-                thread::sleep(flag_delay);
+                let patience = Instant::now() + Duration::from_secs(5);
+                while READY_WAITS_BEGUN.load(Ordering::SeqCst) == 0 {
+                    if Instant::now() > patience {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let turned = Instant::now();
                 set_pending_termination();
+                Some(turned)
             });
-            let started = Instant::now();
             let outcome = launch(&mut super::super::NoHooks);
-            let elapsed = started.elapsed();
-            setter.join().expect("the flag-setting thread");
+            let failed = Instant::now();
+            let turned = setter
+                .join()
+                .expect("the flag-setting thread")
+                .expect("the READY wait never began, so the flag was never turned");
             interruption_message(outcome, "during the READY wait");
             assert!(
-                elapsed >= flag_delay,
-                "the launch failed after {elapsed:?}, before the flag turned at {flag_delay:?}"
+                failed >= turned,
+                "the launch failed before the flag turned, so the wait was not what refused it"
             );
+            let after_flag = failed.duration_since(turned);
             assert!(
-                elapsed < bound,
-                "a termination pending since {flag_delay:?} held the launch for {elapsed:?}, \
-                 past {bound:?}"
+                after_flag < bound,
+                "a termination pending during the READY wait held the launch for {after_flag:?} \
+                 after the flag turned, past {bound:?}"
+            );
+            assert_eq!(
+                READY_WAITS_BEGUN.load(Ordering::SeqCst),
+                1,
+                "one launch, one READY wait"
             );
             assert_eq!(
                 PENDING_TERMINATION.load(Ordering::SeqCst),
@@ -5249,12 +5308,13 @@ mod termination {
         }
 
         /// A termination that becomes pending while the reaper's READY wait
-        /// is in progress fails the launch within a few slices of the flag
-        /// turning, through the full launch path, long before READY would
-        /// have arrived. An implementation that looked at the flag once on
-        /// entry and then waited for READY fails the bound.
+        /// is in progress ends that wait within a slice of the flag turning,
+        /// through the full launch path, long before READY would have
+        /// arrived. The flag turns only after the wait has observably begun.
+        /// A wait that ignores the flag and looks only after READY fails the
+        /// bound by the rest of the injected delay.
         #[test]
-        fn a_termination_arriving_during_the_ready_wait_fails_the_launch_within_a_slice() {
+        fn a_termination_arriving_during_the_ready_wait_ends_the_wait_within_a_slice_of_the_flag() {
             run_helper(
                 "launch_interrupted_during_ready_wait_helper",
                 "UPSTROKE_LAUNCH_INTERRUPTED_DURING_READY_HELPER",
@@ -5488,6 +5548,46 @@ mod termination {
             );
         }
 
+        /// A pipe that keeps supplying bytes that are not the acknowledgement
+        /// does not hold a CANCEL past its deadline: one deadline, one final
+        /// look, then `false`, however many bytes arrive. The read runs on
+        /// its own thread and is collected with a bound, so a reader that
+        /// never returns fails the test rather than hanging it.
+        #[test]
+        fn a_flood_of_unexpected_bytes_does_not_hold_a_cancel_past_its_deadline() {
+            let pipe = create_cloexec_pipe().expect("an acknowledgement pipe");
+            let flood = thread::spawn(move || {
+                // Until the read end closes and the write fails.
+                while write_raw(pipe[1], &[REAPER_FAIL]) {}
+            });
+            let timeout = Duration::from_secs(2);
+            let bound = timeout + LAUNCH_INTERRUPT_SLICE * 2;
+            let (sent, received) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            thread::spawn(move || {
+                let answer = acknowledged(pipe[0], REAPER_OK, timeout);
+                let _ = sent.send((answer, started.elapsed()));
+            });
+            let (answer, elapsed) = received
+                .recv_timeout(bound + Duration::from_secs(2))
+                .expect("a CANCEL flooded with unexpected bytes never returned");
+            assert!(
+                !answer,
+                "a flood of unexpected bytes was taken for the acknowledgement"
+            );
+            assert!(
+                elapsed >= timeout,
+                "the wait gave up after {elapsed:?}, before its {timeout:?} deadline"
+            );
+            assert!(
+                elapsed < bound,
+                "a flood of unexpected bytes held the wait for {elapsed:?}, past {bound:?}"
+            );
+            close_fd(pipe[0]);
+            close_fd(pipe[1]);
+            flood.join().expect("the flooding thread");
+        }
+
         /// The sliced reader does not report a timeout on a readable
         /// descriptor. The predicate stands in for the thread being off the
         /// CPU: after the first empty slice it lets the acknowledgement
@@ -5579,8 +5679,19 @@ mod termination {
                 thread::sleep(Duration::from_millis(10));
             }
             child.reap();
-            let gone = helper_snapshot(pid);
-            assert!(gone.starts_with("gone"), "a reaped child: {gone}");
+            // The failure arms this host can provoke: a reaped pid is gone,
+            // and its descriptors cannot be read, so the snapshot says so
+            // rather than counting.
+            assert_eq!(
+                helper_open_descriptors(pid),
+                None,
+                "a reaped child's descriptors were counted"
+            );
+            assert_eq!(
+                helper_snapshot(pid),
+                "gone, its descriptors not readable",
+                "a reaped child"
+            );
         }
 
         #[cfg(target_os = "linux")]
