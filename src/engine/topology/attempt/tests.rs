@@ -2600,3 +2600,35 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
     );
     assert!(process.balances());
 }
+
+/// A capture id that is not an object id is a Git error, not a refusal
+/// (PR #130, pass 3).
+///
+/// `git write-tree`'s output and the recorded base are the engine's own
+/// values, so a malformed one is the tool or the engine misbehaving. Reaching
+/// `ObjectId::new` with a `?` made it `UpstrokeError::Refused`, which says a
+/// caller offered something it should not have. Witnessed by restoring that
+/// `?`: the error becomes `Refused` and the first assertion fails.
+#[test]
+fn a_malformed_captured_id_is_a_git_error_naming_where_the_value_came_from() {
+    let malformed = "not-an-object-id".to_owned();
+    let error = captured_object_id("`git write-tree`", malformed.clone())
+        .expect_err("a value that is not an object id");
+    let UpstrokeError::Git { message } = &error else {
+        panic!("the engine's own malformed value is a Git error, not a refusal: {error}");
+    };
+    assert!(
+        message.contains("`git write-tree` did not yield an object id")
+            && message.contains(&malformed),
+        "the message names the source and the value: {message}"
+    );
+
+    let good = "0123456789abcdef0123456789abcdef01234567".to_owned();
+    assert_eq!(
+        captured_object_id("the recorded base commit", good.clone())
+            .expect("a full hexadecimal id")
+            .as_str(),
+        good,
+        "and a well-formed id passes through unchanged"
+    );
+}

@@ -338,7 +338,7 @@ effect_free = [
     "worktree",
 ]
 
-# Two data types and no functions at all: `SnapshotInput` and `Snapshot` carry public fields and declare no externally reachable `fn`. The row is present and empty because the domain is derived from the module, so an empty module must be recorded as empty rather than omitted.
+# Four value types and their constructors and accessors: `ObjectId` (validated once, at `new`), `SnapshotObject` (the role of an input id and its `rev-parse` peel), `SnapshotInput` and `Snapshot` (private fields, built by the parent's funnel through `new`, read through accessors). Every function is a check or a field read over owned values; the funnel that resolves an input against the repository and checks a snapshot out is the parent's.
 [[module]]
 path = "src/workspace_manager/snapshot_ref.rs"
 crate_path = "upstroke::workspace_manager::snapshot_ref"
@@ -347,6 +347,16 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "as_str",
+    "ephemeral",
+    "fmt",
+    "head",
+    "id",
+    "new",
+    "object_type",
+    "path",
+    "peel",
+    "slot",
 ]
 
 [[module]]
