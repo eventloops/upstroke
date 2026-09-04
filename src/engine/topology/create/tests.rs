@@ -558,6 +558,9 @@ impl IntegrationRefs for FakeRefs {
         refname: &str,
         new: &str,
     ) -> Result<(), UpstrokeError> {
+        // The contract's refusal, before the kill: the real primitive refuses
+        // a malformed or null value before its funnel runs.
+        crate::workspace_manager::refuse_new(refname, new)?;
         if self.kill_on_create {
             std::process::abort();
         }
@@ -574,6 +577,58 @@ impl IntegrationRefs for FakeRefs {
             .push((refname.to_owned(), new.to_owned()));
         Ok(())
     }
+}
+
+/// The contract [`IntegrationRefs::create_zero_old`] states binds this double
+/// as it binds `WorkspaceManager` (`PR126-REVIEW2-DOUBLES-ACCEPT-NULL-NEW`):
+/// a null value is refused and nothing is stored.
+#[test]
+fn the_fake_refs_refuse_a_null_new_value_as_the_real_primitive_does() {
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    let null = "0".repeat(40);
+    let error = refs
+        .create_zero_old(hooks.effects(), "refs/heads/upstroke/run-1", &null)
+        .expect_err("the double refuses a null new value");
+    assert!(
+        error.to_string().contains("null object id"),
+        "the refusal must name its reason: {error}"
+    );
+    assert_eq!(refs.created(), Vec::<(String, String)>::new());
+    assert_eq!(
+        refs.direct_target("refs/heads/upstroke/run-1")
+            .expect("read"),
+        None
+    );
+}
+
+/// The reviewer's two sequences: an absent ref and a null recorded base is
+/// refused and stores nothing, and a ref already at the null id is not adopted
+/// as "already at the base" (`PR126-REVIEW2-DOUBLES-ACCEPT-NULL-NEW`).
+#[test]
+fn ensure_integration_ref_refuses_a_null_base_whether_the_ref_is_absent_or_at_it() {
+    let null = "0".repeat(40);
+    let refname = "refs/heads/upstroke/run-1";
+    let mut hooks = TestHooks::new();
+
+    let refs = FakeRefs::empty();
+    let error = ensure_integration_ref(&refs, hooks.effects(), refname, &null)
+        .expect_err("a null base is refused on an absent ref");
+    assert!(
+        error.to_string().contains("null object id"),
+        "the refusal must name its reason: {error}"
+    );
+    assert_eq!(refs.created(), Vec::<(String, String)>::new());
+    assert_eq!(refs.direct_target(refname).expect("read"), None);
+
+    let refs = FakeRefs::at(&null);
+    let error = ensure_integration_ref(&refs, hooks.effects(), refname, &null)
+        .expect_err("a ref at the null id is not adopted as the base");
+    assert!(
+        error.to_string().contains("null object id"),
+        "the refusal must name its reason: {error}"
+    );
+    assert_eq!(refs.created(), Vec::<(String, String)>::new());
 }
 
 // -----------------------------------------------------------------------
