@@ -77,23 +77,27 @@ sweep of this file changed them and the counts below are re-measured -- but the 
 LEVEL is what this clause is about, and it is unchanged: TWO of that three, a \
 strict subset of the parent's allow, so the move still changes where the level \
 is stated and not what it permits. \
-WHAT IT NEEDS EACH FOR, re-measured in the sweep by denying all three and \
-counting the errors: `clippy::disallowed_methods`, 23 sites -- it builds and \
-tears down the scratch repositories the suites measure against \
-(`fs::remove_dir_all` 5, `fs::create_dir_all` 4, `fs::write` 4, \
-`fs::set_permissions` 4, `fs::create_dir` 1, `fs::remove_file` 1), runs real \
-children (`Command::output` 2, `Command::spawn` 1), and asks the operating \
-system whether one of them is still there (`libc::kill` 1, signal 0, in the \
-`#[cfg(unix)]` test that witnesses `KillableGitChild`'s drop), because no funnel \
-owns `git init` and a fixture that never runs `git` builds no repository to \
-measure; `clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
-AT EXTRACTION THE COUNT WAS 15 AND THE COMPOSITION WAS DIFFERENT, so the change \
-is recorded rather than overwritten: `Command::status` 1 became `Command::output` \
-2 when the child runner started reading the child's streams; `fs::create_dir_all` \
-5 became 4 plus one exclusive `fs::create_dir` when `scratch` stopped adopting a \
-directory it had not made; and the tests the file now carries account for the \
-four `fs::set_permissions`, three of the five `fs::remove_dir_all` and the one \
-`libc::kill`. \
+WHAT IT NEEDS EACH FOR, re-measured at the head this row describes by \
+flipping this file's `allow` to `deny` and counting the errors -- the command \
+is in the pull request body, so the numbers can be regenerated rather than \
+trusted: `clippy::disallowed_methods`, 16 sites -- it builds and tears down \
+the scratch repositories the suites measure against (`fs::write` 4, \
+`fs::create_dir_all` 4, `fs::set_permissions` 2, `fs::remove_dir_all` 1, \
+`fs::remove_file` 1), runs real children (`Command::spawn` 2, \
+`Command::output` 1), and asks the operating system whether one of them is \
+still there (`libc::kill` 1, signal 0, in the `#[cfg(unix)]` test that \
+witnesses `KillableGitChild`'s drop), because no funnel owns `git init` and a \
+fixture that never runs `git` builds no repository to measure; \
+`clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
+AT EXTRACTION THE COUNT WAS 15, AND AN EARLIER ROUND OF THIS SWEEP RECORDED \
+23 THAT WAS NEVER RE-MEASURED AFTER THE CODE CHANGED UNDER IT -- the pass-2 \
+reviewer caught that, and the numbers above are the measurement rather than an \
+estimate. What moved since extraction: `Command::status` became \
+`Command::spawn` when the child runner started reading the child's streams \
+under a bound; the scratch tree's own creation and removal left this file \
+entirely, because `rundir::scratch_tree` owns them now, which is why \
+`fs::create_dir` and one of the removals are gone; and the tests this file now \
+carries account for the two `fs::set_permissions` and the one `libc::kill`. \
 `clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
 at zero sites, and the two `#[cfg(windows)]` bodies a Unix host cannot measure \
 are `ExitStatus` arithmetic naming no macro -- so a `println!` here is still a \
