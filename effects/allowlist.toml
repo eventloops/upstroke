@@ -80,9 +80,9 @@ is stated and not what it permits. \
 WHAT IT NEEDS EACH FOR, re-measured at the head this row describes by \
 flipping this file's `allow` to `deny` and counting the errors -- the command \
 is in the pull request body, so the numbers can be regenerated rather than \
-trusted: `clippy::disallowed_methods`, 16 sites -- it builds and tears down \
-the scratch repositories the suites measure against (`fs::write` 4, \
-`fs::create_dir_all` 4, `fs::set_permissions` 2, `fs::remove_dir_all` 1, \
+trusted: `clippy::disallowed_methods`, 18 sites -- it builds and tears down \
+the scratch repositories the suites measure against (`fs::create_dir_all` 5, \
+`fs::write` 4, `fs::remove_dir_all` 2, `fs::set_permissions` 2, \
 `fs::remove_file` 1), runs real children (`Command::output` 1, \
 `Command::spawn` 1, `Command::status` 1), and asks the operating system \
 whether one of them is still there (`libc::kill` 1, signal 0, in the \
@@ -93,38 +93,40 @@ repository to measure; \
 AT EXTRACTION THE COUNT WAS 15, AND AN EARLIER ROUND OF THIS SWEEP RECORDED \
 23 THAT WAS NEVER RE-MEASURED AFTER THE CODE CHANGED UNDER IT -- the pass-2 \
 reviewer caught that, and the numbers above are the measurement rather than an \
-estimate. What moved since extraction: the scratch tree's own \
-creation and one removal left this file entirely, because \
-`rundir::scratch_tree` owns them now; `Command::status` is the kill child's \
-again, after a bounded-capture rewrite that used `Command::spawn` was \
-withdrawn under the third pass; and the tests this file now carries account \
-for the two `fs::set_permissions`, the one `libc::kill` and one of the \
-`Command::spawn` sites. \
+estimate. What moved since extraction: `Command::status` is the kill \
+child's again, after a bounded-capture rewrite that used `Command::spawn` was \
+withdrawn under the third pass; the scratch tree's creation and removal are \
+back in this file too, after the §8 token that had taken them into \
+`rundir::scratch_tree` was withdrawn under the fourth; and the tests this file \
+now carries account for the two `fs::set_permissions`, the one `libc::kill` and \
+one of the `Command::spawn` sites. \
 `clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
 at zero sites, and the two `#[cfg(windows)]` bodies a Unix host cannot measure \
 are `ExitStatus` arithmetic naming no macro -- so a `println!` here is still a \
 build error. \
-CONTAINMENT, STATED AS IT IS AND AS FAR AS IT IS ENFORCED, and re-read against \
-the tree rather than carried forward. Every write and every directory creation \
-this module performs is under a root from `scratch_tree`, which acquires through \
-`rundir::scratch_tree` -- §8's `cfg(test)` deletion-authority token -- so the \
-name carries a fresh ULID rather than a tag and a process id, the create is \
-exclusive, nothing is pre-cleaned, and the removal is spent against a token \
-bound to that exact root. THAT IS A PROPERTY OF THE CALLERS AND NOT OF THE \
-TYPES: `write_file` and `create_dir` write wherever the caller points them, and \
-no token is issued or checked for those; `reviews/FINDINGS.md` records it as a \
-deferred row for the sweep of `src/workspace_manager.rs`. TWO REMOVALS ARE NOT \
-TOKEN-CARRIED and are named rather than elided. `Fixture::adopt` reclaims a tree \
-another process built, from a path it was handed rather than one it can prove it \
-owns, because a token cannot be minted from a path; that is master's behaviour \
-kept deliberately, since reclaiming nothing would leak a tree per kill test, and \
-the §8 deviation is its own deferred row. `scratch` hands back a root with the \
-guard spent, for the single caller that wants a directory and not a fixture, so \
-nothing removes that one at all. Beyond the root, `run_kill_child` re-execs THIS \
-test binary `--exact --ignored`, and `git_out` and `KillableGitChild::spawn` run \
-the system `git` in a caller-supplied directory -- with the environment cleared \
-and rebuilt from an allowlist, so an ambient `GIT_DIR` cannot move the effect \
-into a repository nobody named (measured, git 2.43.0). \
+CONTAINMENT, STATED AS IT IS, WHICH IS NARROWER THAN IT READS. Most of this \
+module's writes and directory creations are under a root from `scratch`, which \
+is `std::env::temp_dir()` joined with a name carrying the tag, the process id \
+and a per-call ordinal, and `Fixture::drop` removes that root. NOT ALL OF THEM, \
+and the exceptions are named rather than covered by the sentence: `write_file` \
+and `create_dir` write wherever their caller points them, and callers do point \
+them elsewhere -- `effects/attempt-residue-histogram.json` through the first, \
+and `src/engine/topology/scaffold.rs`'s own tag-and-pid `kill_dir` through the \
+second. So this is a property of the callers and not of the types, and no token \
+is issued or checked; `reviews/FINDINGS.md` carries it as a deferred row for the \
+sweep of `src/workspace_manager.rs`. THE REMOVALS ARE NOT TOKEN-CARRIED EITHER. \
+`scratch` pre-cleans a predictable path before acquiring anything, and \
+`Fixture::drop` removes a root it cannot prove it owns -- §8 requires both to \
+carry the `cfg(test)` scratch-tree token, and the pull request that swept this \
+file tried three shapes for that and withdrew all three, because a fixture \
+adopted from another process's tree can hold no token and every substitute \
+either deleted a tree it did not own or leaked one per kill test. That finding \
+is in the ledger with the analysis. Beyond the root, `run_kill_child` re-execs \
+THIS test binary `--exact --ignored`, and `git_out` and \
+`KillableGitChild::spawn` run the system `git` in a caller-supplied directory -- \
+with the environment cleared and rebuilt from an allowlist, so an ambient \
+`GIT_DIR` cannot move the effect into a repository nobody named (measured, git \
+2.43.0). \
 HANDLES, PRECISELY, because a blanket claim here would be false: no item returns \
 a `File`, an `OpenOptions` or a `Command`, but one DOES hand back a live process \
 handle and it is named rather than covered. `KillableGitChild::spawn` returns a \
@@ -161,10 +163,9 @@ site-taking APIs and plants the residue and the husks they are meant to find \
 sites, every one `std::process::Command`; `clippy::disallowed_macros`, 3 \
 sites, every one `std::println` in a diagnostic. \
 CONTAINMENT, STATED AS IT IS. The filesystem effects are under roots \
-`fixture::scratch_tree` minted through `rundir::scratch_tree`, §8's \
-`cfg(test)` deletion-authority token -- a fresh ULID, an exclusive create and \
-no pre-clean, where this clause used to describe the predictable tag-and-pid \
-name that row no longer has; the process effects are the system `git` and re-execs of this test \
+`fixture::scratch` minted, whose predictable tag-and-pid name and pre-clean \
+that row describes and whose §8 finding is in the ledger, the token that would \
+have closed it having been withdrawn after four passes; the process effects are the system `git` and re-execs of this test \
 binary. HANDLES: nothing in this file is `pub` or `pub(crate)` at all, so \
 nothing crosses the module boundary; the one type owning a live \
 `std::process::Child` -- `SampledChild`, the kill sampler's handle -- is \
