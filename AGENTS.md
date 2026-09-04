@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Context for Claude Code sessions working on this repository.
+Context for Codex sessions working on this repository.
 
 ## What upstroke is
 
