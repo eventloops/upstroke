@@ -310,6 +310,7 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "changed_path_records",
     "decode_changed_paths",
     "parse_worktree_records",
     "registration_checkout",
