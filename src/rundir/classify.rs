@@ -124,45 +124,16 @@ pub(super) const FIRST_LINE_WINDOW: u64 = 1 << 20;
 /// that function.
 pub(super) const SCAN_CHUNK: usize = 64 * 1024;
 
-/// How many `Interrupted` reads one pass over a source retries before it gives
-/// up and answers `None`.
-///
-/// `Interrupted` is `std::io`'s own convention for "this read did not happen",
-/// so answering an end of file on it would classify a committed run as a husk —
-/// the direction that must never be taken. It is also the only way a read can
-/// return having spent none of its budget, and the census holds the physical
-/// worktree lock across this call, so retrying it without a bound is a probe
-/// that never returns and a lock that is never released.
-///
-/// **The bound has to be applied at the read itself, and the first version of
-/// this constant was not.** `Read::read_to_end` retries `Interrupted` inside
-/// `std::io`, without limit, and an interrupted read consumes none of a
-/// `Take`'s byte budget — measured on this box at rustc 1.85: a reader
-/// answering `Interrupted` unconditionally was still being called after five
-/// million reads with the `Take` limit untouched. A constant consulted only by
-/// [`newline_offset_from`] was therefore never reached, because both of
-/// [`first_line_within`]'s reads spun in `std::io` before the scan ran. That is
-/// why nothing in this module reads through `read_to_end` any more:
-/// [`read_chunk`] is the one place a read happens and the one place this
-/// constant is spent.
-///
-/// **No claim is made that a regular file never returns `Interrupted`.** An
-/// earlier version of this doc said so; `std::io`'s contract does not, POSIX
-/// permits `EINTR` from a slow device that a path can name, and a probe whose
-/// termination rests on an assumption about the source is the shape this
-/// constant exists to retire. Sixty-four is far past any read a real log needs
-/// and small enough to bound a hostile one.
-pub(super) const INTERRUPTED_RETRIES: u32 = 64;
-
 /// Classify one run directory. Read-only, and bounded rather than total.
 ///
 /// The read is bounded; acquiring the handle is not. [`first_committed_line`]
 /// refuses anything whose name is not a regular file, and a path swapped for a
 /// writer-less fifo inside the window between that check and the `open` blocks
 /// in the kernel — under the physical worktree lock the census holds across
-/// this call. The module doc says what was measured, why the non-blocking open
-/// that would close it cannot be written in this module, and where the close
-/// belongs; this sentence asserts no totality it does not have.
+/// this call. The module doc says what was measured, that the non-blocking open
+/// which would close it *is* available here at the cost of an allowlist row,
+/// and why the close is deferred to the funnel parent as a preference all the
+/// same; this sentence asserts no totality it does not have.
 ///
 /// **Every other way this answers `Husk` is bounded**, including the ones that
 /// are failures rather than verdicts: an `events.jsonl` that cannot be stat'd,
@@ -304,14 +275,24 @@ pub(super) fn first_line(file: &mut File) -> Option<Vec<u8>> {
 /// this signature the same source is a twenty-line reader, so the termination
 /// claim is measured on every host rather than on Linux only.
 ///
-/// **Both reads go through [`read_within`], and neither through `read_to_end`.**
-/// A source that answers `Interrupted` — from its first read, or for ever after
-/// the rewind — terminates here at [`INTERRUPTED_RETRIES`] and answers `None`.
-/// Through `read_to_end` it did not: `std::io` retries `Interrupted` without
-/// limit and an interrupted read spends none of a `Take`'s budget, so the probe
-/// hung with the physical worktree lock held. Measured, and witnessed in
-/// `an_unconditionally_interrupted_source_has_no_first_line` and
-/// `a_source_that_is_interrupted_for_ever_after_the_rewind_has_no_first_line`.
+/// **Neither read terminates on a source that answers `Interrupted`, and that
+/// is `SWEEP-CLASSIFY-001` — an open P1, not an oversight.** `read_to_end`
+/// retries `Interrupted` inside `std::io` without limit and an interrupted read
+/// spends none of a `Take`'s budget, so the probe does not return and the
+/// census holds the physical worktree lock while it does not. Measured on this
+/// box at rustc 1.85: five million interrupted reads with the `Take` limit
+/// untouched, and master's own copy of this function did not return in 25
+/// seconds against the same reader.
+///
+/// **A retry cap is the wrong repair and this pull request withdrew one.** An
+/// exhausted cap has to answer something, and the only answers this signature
+/// has are `Committed` and `Husk`; `Husk` is the *reclaiming* one, so a burst of
+/// interruptions above the cap turns a run the source would have delivered into
+/// one `list_runs` hides, resume refuses, and the reclaim path may delete. "I
+/// could not tell" needs a classification that is neither, which needs
+/// `classify_run_dir`'s signature to change, which reaches `RunDirEntry`,
+/// `list_runs` and `list_husks`. The row carries the measurement and the
+/// reasoning for whoever takes it.
 ///
 /// **The scan is constant memory and the answer is not.** A source with no
 /// newline in it costs one [`SCAN_CHUNK`] buffer however long it is, which is
@@ -331,7 +312,11 @@ pub(super) fn first_line(file: &mut File) -> Option<Vec<u8>> {
 /// therefore re-established on the re-read itself, at the site.
 pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> Option<Vec<u8>> {
     let mut window = Vec::new();
-    read_within(source, FIRST_LINE_WINDOW.min(bound), &mut window)?;
+    source
+        .by_ref()
+        .take(FIRST_LINE_WINDOW.min(bound))
+        .read_to_end(&mut window)
+        .ok()?;
     if let Some(newline) = window.iter().position(|byte| *byte == b'\n') {
         window.truncate(newline);
         return Some(window);
@@ -354,7 +339,7 @@ pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> O
     let want = length.saturating_add(1);
     source.seek(SeekFrom::Start(0)).ok()?;
     let mut line = Vec::new();
-    read_within(source, want, &mut line)?;
+    source.by_ref().take(want).read_to_end(&mut line).ok()?;
     if line.len() as u64 != want || line.pop() != Some(b'\n') {
         return None;
     }
@@ -368,25 +353,36 @@ pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> O
 /// also the length of the line that precedes it, which is what the caller
 /// wants.
 ///
-/// **Termination**: every iteration returns or spends at least one byte of
-/// `budget`, and [`read_chunk`] returns or spends one of
-/// [`INTERRUPTED_RETRIES`]. Both are finite, so the loop is.
+/// **This loop does not terminate on a source that answers `Interrupted`, and
+/// no claim is made that it does.** Every iteration returns or spends a byte of
+/// `budget` *except* the `Interrupted` retry, which spends nothing — so an
+/// endless stream of them is scanned for ever. That is `SWEEP-CLASSIFY-001`,
+/// which is the same defect [`first_line_within`]'s two `read_to_end` calls
+/// have, in this module's own code rather than in `std::io`'s.
 ///
-/// The sentence this replaces claimed that termination while the retry lived in
-/// this loop — which made the claim true of this loop and false of the probe,
-/// because [`first_line_within`]'s two reads went through `read_to_end` and
-/// spun in `std::io` before this function was ever called. The retry is at the
-/// read now, so the claim covers every read the probe makes rather than the one
-/// third of them that happened to be written here.
+/// An earlier version of this doc asserted the termination and then named the
+/// branch that made the assertion false, two clauses later. The behaviour here
+/// is master's; only the claim is withdrawn. Treating `Interrupted` as an end
+/// of file instead would classify a committed run as a husk, and so would
+/// giving up after a fixed number of them: `Husk` is the reclaiming answer, and
+/// the row says why that makes a cap the wrong repair.
 fn newline_offset_from<R: Read>(source: &mut R, mut offset: u64, mut budget: u64) -> Option<u64> {
     let mut chunk = [0_u8; SCAN_CHUNK];
-    let mut interrupted = 0_u32;
     while budget > 0 {
+        let want = chunk_len(budget);
         // A short read is normal, not an end: only zero means end of file.
-        let read = read_chunk(source, &mut chunk[..chunk_len(budget)], &mut interrupted)?;
-        if read == 0 {
-            return None;
-        }
+        let read = match source.read(&mut chunk[..want]) {
+            Ok(0) => return None,
+            // Clamped, so a `Read` implementation answering more than it was
+            // given cannot index past the buffer or underflow the budget. No
+            // claim is made about which implementations do that; the clamp
+            // costs one comparison and the claim would have to be defended.
+            Ok(read) => read.min(want),
+            // Unbounded, and that is `SWEEP-CLASSIFY-001` rather than an
+            // oversight: see this function's doc.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
         if let Some(at) = chunk[..read].iter().position(|byte| *byte == b'\n') {
             return Some(offset + at as u64);
         }
@@ -394,36 +390,6 @@ fn newline_offset_from<R: Read>(source: &mut R, mut offset: u64, mut budget: u64
         budget -= read as u64;
     }
     None
-}
-
-/// Read up to `limit` bytes into `into`, stopping at the limit or at a real end
-/// of file, in [`SCAN_CHUNK`]-sized reads.
-///
-/// **This exists because `Read::read_to_end` cannot be used here**, and that is
-/// the whole of it. `read_to_end` retries `Interrupted` inside `std::io` without
-/// limit, and an interrupted read consumes none of a `Take`'s byte budget, so
-/// the two reads [`first_line_within`] makes used to spin in `std::io` on a
-/// source that answered `Interrupted` — with the census holding the physical
-/// worktree lock across them, and with [`INTERRUPTED_RETRIES`] never consulted
-/// because the scan between them was never reached. Both reads come through
-/// here now.
-///
-/// The memory is the caller's business and is stated at the two call sites: this
-/// grows `into` by what it reads, so `limit` is the allocation as well as the
-/// byte budget.
-fn read_within<R: Read>(source: &mut R, limit: u64, into: &mut Vec<u8>) -> Option<()> {
-    let mut chunk = [0_u8; SCAN_CHUNK];
-    let mut interrupted = 0_u32;
-    let mut remaining = limit;
-    while remaining > 0 {
-        let read = read_chunk(source, &mut chunk[..chunk_len(remaining)], &mut interrupted)?;
-        if read == 0 {
-            return Some(());
-        }
-        into.extend_from_slice(&chunk[..read]);
-        remaining -= read as u64;
-    }
-    Some(())
 }
 
 /// How much of the scan buffer a budget of `remaining` bytes may use.
@@ -436,32 +402,6 @@ fn chunk_len(remaining: u64) -> usize {
     match usize::try_from(remaining) {
         Ok(fits) if fits < SCAN_CHUNK => fits,
         _ => SCAN_CHUNK,
-    }
-}
-
-/// One read, with the interruption allowance spent here and nowhere else.
-///
-/// `Ok(0)` is the caller's end of file and is passed through; `None` is a read
-/// that failed, or an allowance exhausted. `interrupted` is the caller's counter
-/// so that one pass over a source shares one allowance however many reads it
-/// takes.
-///
-/// The count is clamped to the buffer, so a `Read` implementation answering more
-/// than it was given cannot make a caller index past the buffer or underflow a
-/// budget. No claim is made about which implementations do that: this function
-/// is generic, and the clamp costs one comparison.
-fn read_chunk<R: Read>(source: &mut R, into: &mut [u8], interrupted: &mut u32) -> Option<usize> {
-    loop {
-        match source.read(into) {
-            Ok(read) => return Some(read.min(into.len())),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                if *interrupted == INTERRUPTED_RETRIES {
-                    return None;
-                }
-                *interrupted += 1;
-            }
-            Err(_) => return None,
-        }
     }
 }
 
