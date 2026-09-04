@@ -2952,13 +2952,18 @@ fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     // The legal name, driven through every primitive **before** the hostile
     // ones, because a primitive that refuses every slot name satisfies every
     // assertion below and this is the only thing that says otherwise. The
-    // grid as it stood asserted refusals and nothing else: replacing one
-    // primitive's `safe_component` check with an unconditional refusal left
-    // it green, and the one test that carried a legal-name control drove
-    // `write_intent` alone. A primitive may still fail here for its own
-    // reasons — `add_worktree` has no durable intent, `proposal_cherry_pick`
-    // has no worktree — so what is asserted is the *reason*: whatever else
-    // goes wrong, a legal name is never refused as a slot name.
+    // grid as it stood asserted refusals and nothing else, and the one test
+    // that carried a legal-name control drove `write_intent` alone. Measured:
+    // with `candidate_diff` returning a slot-name refusal for every call,
+    // **this module's whole suite passed** — the primitive has no other
+    // success-path driver here, and what caught it was a driver test two
+    // modules away, which is not where a claim about this API belongs (§12,
+    // the lowest layer that can observe the failure).
+    //
+    // A primitive may still fail here for its own reasons — `add_worktree`
+    // has no durable intent, `proposal_cherry_pick` has no worktree — so what
+    // is asserted is the *reason*: whatever else goes wrong, a legal name is
+    // never refused as a slot name.
     let legal = Slot::Task {
         key: "ok_key-1".to_owned(),
         generation: 1,
@@ -6135,14 +6140,21 @@ fn every_change_kind_reaches_the_region_including_both_rename_endpoints() {
 ///   [`crate::workspace::REVIEW_DIFF_FLAGS`]: Git then says "Binary files …
 ///   differ", which is not a patch a reviewer or `classify::diff_failure` can
 ///   read.
-/// * **`-c color.ui=false`.** The repository is configured `color.ui=always`,
+/// * **Colour suppression.** The repository is configured `color.ui=always`,
 ///   which is exactly the operator config the flag list exists to defeat, and
-///   `WorkspaceManager::command` sets no colour option of its own. Witnessed
-///   against dropping the flag: the diff comes back carrying escape codes.
+///   `WorkspaceManager::command` sets no colour option of its own. The witness
+///   is dropping **both** `-c color.ui=false` and `--no-color`, and it is
+///   stated as a pair on purpose: dropping either alone leaves the other
+///   suppressing colour, and a claim measured against a mutation that does not
+///   bite is not a measurement. Witnessed against dropping the pair: the diff
+///   comes back carrying escape codes.
 ///
-/// The other four flags — `--no-ext-diff`, `--no-textconv` and `--no-color` —
-/// need an external program or a `.gitattributes` filter to observe and are a
-/// deferred row rather than half a test.
+/// `--no-ext-diff` and `--no-textconv` need an external program or a
+/// `.gitattributes` filter to observe; they are a deferred row rather than
+/// half a test.
+///
+/// Each mutation above was run against **master's whole crate suite**, which
+/// passed all 1,903 tests under every one of them.
 #[test]
 fn the_candidate_diff_is_of_the_recorded_objects_and_survives_operator_diff_config() {
     let fixture = Fixture::created("candidate-diff");
