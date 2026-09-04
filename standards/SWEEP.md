@@ -121,20 +121,22 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 | `.clone()` | 1,941 | 84 |
 | `?` (propagation) | ≈1,200 | 71 |
 
-Baseline at the panic-surface tightening (master `44dc06f`, 166 Rust files under `src/` and
-`examples/`):
+Baseline at the panic-surface tightening, re-measured after the merge-in (master `74537be`, 166
+Rust files under `src/` and `examples/`; it was 77 sites at `44dc06f`, and PR #136's sweep of
+`src/workspace_manager/tests.rs` added two):
 
 | Construct | Sites | Files |
 |---|---|---|
-| `unreachable!` | 77 | 23 |
+| `unreachable!` | 79 | 23 |
 | indexing and slicing | not yet measured | not yet measured |
 
 `unreachable!` is greppable and the count above is exact at that head. Indexing and slicing are
 not: `v[i]` cannot be told from a macro's brackets or an attribute by text, so the honest count is
 whatever `clippy::indexing_slicing` reports, and no run has been made. Measuring it is the first
 task of the pull request that lands the `[lints]` entries, and until then the queue's sessions are
-the measurement, one file at a time. None of the eight files already in the swept table contains
-an `unreachable!`, so the second-pass debt below is the indexing half only.
+the measurement, one file at a time. Eight of the nine files already in the swept table contain no
+`unreachable!`, so for those the second-pass debt below is the indexing half only; the ninth,
+`src/workspace_manager/tests.rs`, holds three and owes both halves.
 
 ## Swept files
 
@@ -165,11 +167,14 @@ code is already correct.
 
 §7's panic surface post-dates every row in the swept table, not just the first five: the rule was
 tightened on 2026-09-04 and the last of these landed the same day under the brief as it then read.
-None of the eight contains an `unreachable!`, so what is owed on all of them is the indexing half —
-each `v[i]` and `&v[a..b]` dispositioned, or replaced by `get`, `first`, `last`,
-`split_at_checked` or a pattern. That is a cheap re-read rather than a session, and the pull
-request that measures the tree with `clippy::indexing_slicing` can settle these eight from its
-own output.
+Eight of the nine contain no `unreachable!`, so what is owed on those is the indexing half — each
+`v[i]` and `&v[a..b]` dispositioned, or replaced by `get`, `first`, `last`, `split_at_checked` or
+a pattern. That is a cheap re-read rather than a session, and the pull request that measures the
+tree with `clippy::indexing_slicing` can settle those eight from its own output.
+`src/workspace_manager/tests.rs` is the exception and owes both halves: it holds three
+`unreachable!` sites, one of them the kill helper's, which PR #136 measured as satisfying the
+`IdUnread` oracle's `!status.success()` and replaced with `died_by_abort`. Each of the three needs
+the `#[expect]` with a `reason` §7 now requires, or the proof that makes it unnecessary.
 
 They are listed here so the gap is recorded rather than forgotten. The queue comes first: a file
 with no pass at all earns attention before a file that has had several. Decide whether to spend
