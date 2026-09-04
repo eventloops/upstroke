@@ -224,6 +224,25 @@ pub enum Refusal {
         refname: String,
     },
 
+    /// `INV-17`'s other side: the new value of a create or compare-and-swap
+    /// was the null object id.
+    ///
+    /// Measured, git 2.43: `git update-ref --no-deref <ref> 0{40} <old>`
+    /// **succeeds and deletes the ref**, and with `""` as the old value
+    /// succeeds and creates nothing, because a null new value means "must not
+    /// exist afterwards". A compare-and-swap that deletes the integration ref,
+    /// or a create that reports success with no ref behind it, is not what
+    /// either primitive's name promises, so it is refused here.
+    #[error(
+        "refusing to create or swap `{refname}` to the null object id: `git update-ref` reads it \
+         as \"must not exist afterwards\" and would delete the ref, or create nothing while \
+         reporting success"
+    )]
+    NullNew {
+        /// The ref that was to be created or swapped.
+        refname: String,
+    },
+
     /// An object id that is not a full hexadecimal id.
     #[error(
         "refusing `{value}` as the {role} object id of `{refname}`: an engine ref primitive takes \
@@ -1348,7 +1367,7 @@ impl WorkspaceManager {
         new: &str,
     ) -> Result<(), UpstrokeError> {
         self.refuse_symbolic(refname)?;
-        refuse_malformed_object_id(refname, "new", new)?;
+        refuse_new(refname, new)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
             self.update_ref(&["--no-deref", refname, new, ""])
         })
@@ -1369,7 +1388,7 @@ impl WorkspaceManager {
         new: &str,
     ) -> Result<(), UpstrokeError> {
         self.assert_publishable(refname)?;
-        refuse_malformed_object_id(refname, "new", new)?;
+        refuse_new(refname, new)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
             self.update_ref(&["--no-deref", refname, new, old])
@@ -2400,7 +2419,7 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
 
 mod object;
 pub use self::object::{is_null_object_id, is_object_id};
-use self::object::{refuse_expected_old, refuse_malformed_object_id};
+use self::object::{refuse_expected_old, refuse_new};
 
 // ---------------------------------------------------------------------------
 // Small filesystem helpers
