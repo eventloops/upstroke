@@ -10,11 +10,15 @@
 //! that names something outside the root -- can be exercised on every platform
 //! rather than only on the one whose filesystem can hold them.
 //!
-//! Every grammar here refuses rather than admits. A field that is not the
-//! grammar, a record cut short, a path this platform cannot spell exactly: each
-//! is named at the point it is seen, never dropped, skipped over or read as
-//! something shorter. What a refusal becomes is decided once per grammar, at
-//! the one site that knows the caller's action, and that site says so.
+//! Every grammar here refuses rather than admits, to the extent its tests
+//! prove: a field that is not the grammar, a record cut short, a path this
+//! platform cannot spell exactly, an attribute whose value its own grammar
+//! forbids, and a changed path that is not one normalised repository path are
+//! each named at the point they are seen, never dropped, skipped over or read
+//! as something shorter. What a refusal becomes is decided once per grammar,
+//! at the one site that knows the caller's action, and that site says so. The
+//! one thing skipped on purpose is an attribute label this module does not
+//! know, because Git may add one.
 //!
 //! The commands whose output these read are run by the parent, inside its
 //! funnels; nothing here starts a process or touches a path.
@@ -65,7 +69,8 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 ///
 /// | `gitdir` state | Can bind an exact checkout? | Recovery action |
 /// |---|---:|---|
-/// | valid UTF-8 or Unix path bytes | yes | revalidate containment, then act |
+/// | absolute UTF-8 or Unix path bytes | yes | revalidate containment, then act |
+/// | relative path bytes | yes, joined to `admin` | canonicalise, revalidate containment, then act |
 /// | absent or unreadable | no | refuse before mutation |
 /// | zero-length | no | refuse before mutation |
 /// | partial / not ending in `.git` | no | refuse before mutation |
@@ -76,6 +81,15 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 /// form feed) is refused by the rows below rather than quietly repaired into a
 /// checkout Git never named.
 ///
+/// **A relative `gitdir` is Git's own form**, not corruption: since Git 2.48,
+/// `worktree.useRelativePaths=true` (and `worktree add --relative-paths`)
+/// writes the linking files relative, and Git's reader joins the recorded path
+/// to the directory holding the `gitdir` file and resolves it with realpath
+/// (`worktree.c`, `get_linked_worktree`). This does the join, against `admin`,
+/// which is that directory; the caller's canonicalisation is the realpath. The
+/// `..` components such a path is made of are the join's, so they are allowed
+/// there and only there; an absolute registration still refuses them.
+///
 /// `commondir` is deliberately not an input to this binding. A valid `gitdir`
 /// plus an empty `commondir` is the one safe repairable state: it identifies
 /// the checkout while explaining why Git's own enumeration cannot proceed.
@@ -83,8 +97,8 @@ fn trim_gitdir(mut bytes: &[u8]) -> &[u8] {
 /// # Errors
 ///
 /// [`UpstrokeError::Git`] naming the registration and the row of the table it
-/// fell into. Every row has the same action, refuse before mutation, so the
-/// message is the distinction and one variant carries it.
+/// fell into. Every refusing row has the same action, refuse before mutation,
+/// so the message is the distinction and one variant carries it.
 pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBuf, UpstrokeError> {
     let bytes = trim_gitdir(bytes);
     if bytes.is_empty() {
@@ -108,11 +122,34 @@ pub(super) fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBu
             });
         }
     };
+    let relative = !recorded.is_absolute();
+    let recorded = if relative {
+        if recorded.has_root() {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "worktree registration {} has a gitdir that is rooted but not absolute",
+                    admin.display()
+                ),
+            });
+        }
+        if !admin.is_absolute() {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "worktree registration {} is not an absolute path, so its relative gitdir \
+                     cannot be resolved",
+                    admin.display()
+                ),
+            });
+        }
+        admin.join(recorded)
+    } else {
+        recorded
+    };
     let normalized: PathBuf = recorded.components().collect();
-    if !recorded.is_absolute()
-        || recorded
+    if (!relative
+        && recorded
             .components()
-            .any(|component| component == Component::ParentDir)
+            .any(|component| component == Component::ParentDir))
         || normalized.as_os_str() != recorded.as_os_str()
     {
         return Err(UpstrokeError::Git {
@@ -197,6 +234,29 @@ pub(super) enum NameStatusError {
     /// that is not.
     #[error("field {field} is not UTF-8 from byte {valid_up_to}")]
     UndecodablePath { field: usize, valid_up_to: usize },
+    /// A path field is not one normalised repository path: it is absolute, ends
+    /// in a separator, has an empty, `.` or `..` component, or carries a
+    /// backslash. Git writes none of these; each is a second spelling of a path
+    /// the lease comparator would not match to its first.
+    #[error("field {field} is not a normalised repository path")]
+    UnsafePath { field: usize },
+}
+
+/// Whether a decoded `--name-status` path is one normalised repository path.
+///
+/// The lease comparator (`topology::leases`) compares paths component by
+/// component, so `src/./shared.rs` and `src/shared.rs` would be two regions
+/// that do not overlap, and two owners of one file would run at once. Git
+/// itself emits only normalised, relative, forward-slash paths; anything else
+/// is not Git's answer, and the region for it is repo-wide.
+fn is_normalised_repository_path(path: &str) -> bool {
+    // An empty path, a leading or trailing `/` and a doubled `/` all split
+    // into an empty component, so the component rule is the whole rule but
+    // for the backslash, which `/`-splitting never sees.
+    !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
 }
 
 /// Read `git diff --name-status -M -z` bytes as the paths they name, sorted
@@ -209,14 +269,15 @@ pub(super) enum NameStatusError {
 /// a detected rename or copy **two** — `R100\0old\0new\0`. Both are kept, which
 /// is `path_policy.actual`'s "both rename endpoints": the old endpoint is the
 /// one another owner may already hold a lease on, and an answer that omits it
-/// is silently smaller than the diff. An empty answer is an empty diff.
+/// is silently smaller than the diff. An empty answer is an empty diff, which
+/// is the one answer `git diff` gives with no bytes at all.
 ///
-/// The grammar is read exactly. The final NUL is taken off first, so that an
-/// empty field means an empty field and not the end of the bytes; a tail
-/// without that NUL, an empty field, a doubled terminator, a field that is not
-/// a status where a status is due, and a record whose endpoints stop early are
-/// each refused with their position, never re-aligned into a plausible
-/// shorter list.
+/// The final NUL is taken off first, so that an empty field means an empty
+/// field and not the end of the bytes; a tail without that NUL, an empty
+/// field, a doubled terminator, a field that is not a status where a status is
+/// due, a record whose endpoints stop early, and a path that is not one
+/// normalised repository path are each refused with their position, never
+/// re-aligned into a plausible shorter list.
 ///
 /// # Errors
 ///
@@ -245,7 +306,10 @@ pub(super) fn changed_path_records(bytes: &[u8]) -> Result<Vec<GitPath>, NameSta
                 return Err(NameStatusError::EmptyField { field });
             }
             match std::str::from_utf8(path) {
-                Ok(decoded) => paths.push(GitPath::from(decoded)),
+                Ok(decoded) if is_normalised_repository_path(decoded) => {
+                    paths.push(GitPath::from(decoded));
+                }
+                Ok(_) => return Err(NameStatusError::UnsafePath { field }),
                 Err(error) => {
                     return Err(NameStatusError::UndecodablePath {
                         field,
@@ -292,7 +356,8 @@ pub fn decode_changed_paths(bytes: &[u8]) -> PathSet {
             | NameStatusError::EmptyField { .. }
             | NameStatusError::UnknownStatus { .. }
             | NameStatusError::Truncated { .. }
-            | NameStatusError::UndecodablePath { .. },
+            | NameStatusError::UndecodablePath { .. }
+            | NameStatusError::UnsafePath { .. },
         ) => PathSet::RepoWide,
     }
 }
@@ -318,58 +383,101 @@ fn status_endpoints(status: &[u8]) -> Option<usize> {
     }
 }
 
+/// Whether `value` is an object id as `git worktree list` prints one: every
+/// byte a hexadecimal digit, forty of them (SHA-1) or sixty-four (SHA-256).
+fn is_object_id(value: &[u8]) -> bool {
+    matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Whether `value` can be a refname at all: `git check-ref-format` forbids
+/// ASCII control characters, space, DEL and the seven bytes `~ ^ : ? * [ \`
+/// anywhere in one. Not the whole rule (the `..`, `@{` and `.lock` clauses are
+/// not applied), but everything a stray or hostile byte could add to a name.
+fn can_be_refname(value: &[u8]) -> bool {
+    !value.is_empty()
+        && !value
+            .iter()
+            .any(|byte| *byte <= b' ' || *byte == 0x7f || b"~^:?*[\\".contains(byte))
+}
+
 /// Parse `git worktree list --porcelain -z`.
 ///
-/// Attributes are NUL-terminated and an empty attribute ends a record, so a
-/// complete answer ends in two NULs. Paths are taken as bytes through
-/// [`decode_path`], because a repository path need not be UTF-8 on Unix and a
-/// lossy spelling is not the path. The other attributes are read lossily into
-/// the [`String`]s [`WorktreeRecord`] gives them: `HEAD` is hexadecimal,
-/// `locked` and `prunable` are Git's own reasons and are read only for the
-/// word `initializing`, and `branch` is compared with a UTF-8 refname, which a
-/// non-UTF-8 branch name cannot equal in any spelling. An attribute this
-/// parser does not know is skipped, since Git may add one.
+/// # The record grammar
 ///
-/// The framing is read exactly: bytes that do not end in NUL, a final record
-/// that no empty attribute closed, and an attribute before any `worktree` line
-/// are refused rather than read as a complete list. A list cut short at a
-/// record boundary would otherwise drop the `locked initializing` line that
-/// tells a registered-but-unpopulated worktree from a populated one.
+/// Git's own words: "the porcelain format has a line per attribute. If `-z` is
+/// given then the lines are terminated with NUL rather than a newline.
+/// Attributes are listed with a label and value separated by a single space.
+/// Boolean attributes (like `bare` and `detached`) are listed as a label only
+/// … The first attribute of a worktree is always `worktree`, an empty line
+/// indicates the end of the record." So a complete answer ends in two NULs,
+/// and it is never empty: Git lists the repository's own worktree first.
+///
+/// Read exactly, to the extent the tests prove: bytes that do not end in NUL,
+/// an empty answer, a `worktree` header while a record is still open, a final
+/// record no empty attribute closed, an empty attribute with no record open,
+/// and an attribute before any `worktree` line are refused rather than read as
+/// a complete list. A list cut short at a record boundary would otherwise drop
+/// the `locked initializing` line that tells a registered-but-unpopulated
+/// worktree from a populated one.
+///
+/// # The attributes
+///
+/// The path is taken as bytes through [`decode_path`], because a repository
+/// path need not be UTF-8 on Unix and a lossy spelling is not the path; under
+/// `-z` it is verbatim, and a space is a legal byte of one. The structural
+/// attributes are held to their own grammars: `HEAD` is an object id
+/// ([`is_object_id`]), `branch` is a refname's byte set ([`can_be_refname`],
+/// which forbids whitespace), `detached` and `bare` are labels with no value,
+/// and none of the four appears twice in a record. `locked` and `prunable` are
+/// Git's own reasons, verbatim (a lock reason may carry a newline, which is why
+/// `-z` exists), read lossily into the [`String`]s [`WorktreeRecord`] gives
+/// them and consulted only for the word `initializing`. A label this parser
+/// does not know is skipped, since Git may add one.
 ///
 /// # Errors
 ///
 /// [`UpstrokeError::Git`] naming the record and what was wrong with it. The
 /// callers have one action, refuse, so one variant carries the distinction.
 pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>, UpstrokeError> {
-    let mut records = Vec::new();
+    let refuse = |record: usize, what: &str| UpstrokeError::Git {
+        message: format!("worktree list record {record} {what}"),
+    };
     if bytes.is_empty() {
-        return Ok(records);
+        return Err(UpstrokeError::Git {
+            message: "worktree list is empty; Git lists at least the repository's own worktree"
+                .to_owned(),
+        });
     }
     let Some(body) = bytes.strip_suffix(b"\0") else {
         return Err(UpstrokeError::Git {
             message: "worktree list ends without a terminator".to_owned(),
         });
     };
+    let mut records: Vec<WorktreeRecord> = Vec::new();
     let mut current: Option<WorktreeRecord> = None;
     for field in body.split(|byte| *byte == 0) {
+        let index = records.len();
         if field.is_empty() {
-            if let Some(record) = current.take() {
-                records.push(record);
-            }
+            let Some(record) = current.take() else {
+                return Err(refuse(index, "is closed before it is opened"));
+            };
+            records.push(record);
             continue;
         }
         if let Some(path) = field.strip_prefix(b"worktree ") {
-            if let Some(record) = current.take() {
-                records.push(record);
+            if current.is_some() {
+                return Err(refuse(index, "is not closed before the next record begins"));
+            }
+            if path.is_empty() {
+                return Err(refuse(index, "has an empty path"));
             }
             let path = match decode_path(path) {
                 Ok(path) => path,
                 Err(error) => {
                     return Err(UpstrokeError::Git {
                         message: format!(
-                            "worktree list record {} names a path that is not UTF-8 from byte {}, \
-                             which this platform cannot represent exactly",
-                            records.len(),
+                            "worktree list record {index} names a path that is not UTF-8 from \
+                             byte {}, which this platform cannot represent exactly",
                             error.valid_up_to()
                         ),
                     });
@@ -385,34 +493,52 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
             continue;
         }
         let Some(record) = current.as_mut() else {
-            return Err(UpstrokeError::Git {
-                message: "worktree list has an attribute before its first record".to_owned(),
-            });
+            return Err(refuse(index, "has an attribute before its worktree line"));
         };
-        let text = String::from_utf8_lossy(field);
-        if let Some(head) = text.strip_prefix("HEAD ") {
-            record.head = Some(head.to_owned());
-        } else if let Some(branch) = text.strip_prefix("branch ") {
-            record.branch = Some(branch.to_owned());
-        } else if text == "locked" {
-            record.locked = Some(String::new());
-        } else if let Some(reason) = text.strip_prefix("locked ") {
-            record.locked = Some(reason.to_owned());
-        } else if text == "prunable" {
-            record.prunable = Some(String::new());
-        } else if let Some(reason) = text.strip_prefix("prunable ") {
-            record.prunable = Some(reason.to_owned());
+        let (label, value) = match field.iter().position(|byte| *byte == b' ') {
+            Some(space) => (&field[..space], Some(&field[space + 1..])),
+            None => (field, None),
+        };
+        match (label, value) {
+            (b"HEAD", Some(value)) if is_object_id(value) && record.head.is_none() => {
+                record.head = Some(String::from_utf8_lossy(value).into_owned());
+            }
+            (b"HEAD", _) => return Err(refuse(index, "has a HEAD that is not one object id")),
+            (b"branch", Some(value)) if can_be_refname(value) && record.branch.is_none() => {
+                record.branch = Some(String::from_utf8_lossy(value).into_owned());
+            }
+            (b"branch", _) => return Err(refuse(index, "has a branch that is not one refname")),
+            (b"detached" | b"bare", None) => {}
+            (b"detached" | b"bare", Some(_)) => {
+                return Err(refuse(index, "has a boolean attribute carrying a value"));
+            }
+            (b"locked", value) if record.locked.is_none() => {
+                record.locked = Some(reason(value));
+            }
+            (b"prunable", value) if record.prunable.is_none() => {
+                record.prunable = Some(reason(value));
+            }
+            (b"locked" | b"prunable", _) => {
+                return Err(refuse(index, "has a reason attribute twice"));
+            }
+            _ => {}
         }
     }
     if current.is_some() {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "worktree list record {} is not closed; the list was cut short",
-                records.len()
-            ),
-        });
+        return Err(refuse(
+            records.len(),
+            "is not closed; the list was cut short",
+        ));
     }
     Ok(records)
+}
+
+/// A `locked` or `prunable` reason as Git printed it: empty for the bare
+/// label, otherwise the bytes after the label's one space, verbatim.
+fn reason(value: Option<&[u8]>) -> String {
+    value.map_or_else(String::new, |value| {
+        String::from_utf8_lossy(value).into_owned()
+    })
 }
 
 #[cfg(test)]
@@ -430,12 +556,40 @@ mod tests {
         bytes
     }
 
+    /// NUL-terminated porcelain fields, in order.
+    fn porcelain(fields: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for field in fields {
+            bytes.extend_from_slice(field);
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    const HEAD: &[u8] = b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f1510";
+    const OID: &str = "88663d58b63b0acaf3c31e98aa723336b24f1510";
+
     fn admin() -> &'static Path {
         Path::new("/repository/.git/worktrees/example")
     }
 
     fn message(error: UpstrokeError) -> String {
         error.to_string()
+    }
+
+    /// `path`, spelled with this platform's separator.
+    fn platform(path: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            path.replace('/', "\\")
+        } else {
+            path.to_owned()
+        })
+    }
+
+    /// An absolute path: `C:` makes a Windows path absolute; on Unix the
+    /// leading `/` does.
+    fn absolute(path: &str) -> PathBuf {
+        platform(&format!("{}{path}", if cfg!(windows) { "C:" } else { "" }))
     }
 
     /// Git's own reading of a `gitdir` file, measured: trailing space, tab,
@@ -451,12 +605,20 @@ mod tests {
                 .expect("a trailing line terminator is not part of the path");
             assert_eq!(decoded, checkout, "with tail {tail:?}");
         }
+        // A leading space is part of the path, which is then relative, and a
+        // relative registration is joined to `admin` as Git joins it: the
+        // decoded checkout is under the registration directory, never the
+        // absolute checkout the bytes resemble.
         let leading = format!(" {root}/wt/.git\n");
-        let refused = registration_checkout(admin(), leading.as_bytes())
-            .expect_err("a leading space is part of the path, which is then relative");
+        let decoded = registration_checkout(admin(), leading.as_bytes())
+            .expect("a leading space makes the path relative, which Git resolves");
+        assert_ne!(
+            decoded, checkout,
+            "the space is not trimmed into the absolute checkout"
+        );
         assert!(
-            message(refused).contains("not an absolute normalized path"),
-            "the refusal names the row: a relative path"
+            decoded.starts_with(admin()),
+            "a relative path is joined to the registration directory: {decoded:?}"
         );
         let form_feed = format!("{root}/wt/.git\x0c\n");
         let refused = registration_checkout(admin(), form_feed.as_bytes())
@@ -469,15 +631,10 @@ mod tests {
 
     #[test]
     fn registration_checkout_names_the_row_a_gitdir_falls_into() {
-        // `C:` makes a Windows path absolute; on Unix the leading `/` does.
         let root = if cfg!(windows) { "C:" } else { "" };
         let cases: &[(String, &str)] = &[
             (String::new(), "has an empty gitdir"),
             ("  \n".to_owned(), "has an empty gitdir"),
-            (
-                "relative/.git".to_owned(),
-                "not an absolute normalized path",
-            ),
             (
                 format!("{root}/absolute/../traversal/.git"),
                 "not an absolute normalized path",
@@ -507,6 +664,41 @@ mod tests {
                 "the refusal names the registration"
             );
         }
+    }
+
+    /// Git 2.48's `worktree.useRelativePaths`: the path is relative to the
+    /// directory holding the `gitdir` file, and the `..` it is made of are
+    /// the join's, resolved by the caller's canonicalisation.
+    #[test]
+    fn a_relative_registration_is_joined_to_its_registration_directory() {
+        let admin = absolute("/repo/.git/worktrees/example");
+        let decoded = registration_checkout(&admin, b"../../../wt/.git\n")
+            .expect("a relative gitdir is Git's own form");
+        assert_eq!(decoded, admin.join(platform("../../../wt")));
+        assert!(
+            decoded.is_absolute(),
+            "the join is absolute because admin is"
+        );
+
+        let refused = registration_checkout(&admin, b"../../../wt\n")
+            .expect_err("a relative gitdir still names a checkout .git");
+        assert!(message(refused).contains("does not name a checkout .git"));
+
+        let refused = registration_checkout(&admin, b"../../.././wt/.git\n")
+            .expect_err("a relative gitdir is still normalised");
+        assert!(message(refused).contains("not an absolute normalized path"));
+
+        let refused = registration_checkout(&platform("relative/admin"), b"../wt/.git\n")
+            .expect_err("nothing to resolve a relative gitdir against");
+        assert!(message(refused).contains("cannot be resolved"));
+
+        let elsewhere = absolute("/elsewhere/wt/.git");
+        let mut bytes = elsewhere.as_os_str().as_encoded_bytes().to_vec();
+        bytes.push(b'\n');
+        let decoded =
+            registration_checkout(&admin, &bytes).expect("an absolute registration is unchanged");
+        assert_eq!(decoded, absolute("/elsewhere/wt"));
+        assert!(!decoded.starts_with(&admin), "and is not joined to admin");
     }
 
     #[cfg(not(unix))]
@@ -678,6 +870,51 @@ mod tests {
         assert_eq!(cases.len(), 16, "sixteen independent refused shapes");
     }
 
+    /// A second spelling of a path is not a narrow region: the lease
+    /// comparator matches components literally, so `src/./shared.rs` would
+    /// not overlap `src/shared.rs` and two owners of one file would run at
+    /// once. Each alias is refused by name and the region is repo-wide.
+    #[test]
+    fn a_changed_path_that_is_not_one_normalised_path_is_repo_wide() {
+        let aliases: &[(&str, &[u8])] = &[
+            ("a `.` component", b"src/./shared.rs"),
+            ("a `..` component", b"src/../x"),
+            ("an absolute path", b"/abs"),
+            ("an empty component", b"a//b"),
+            ("a backslash", b"a\\b"),
+            ("a trailing separator", b"src/"),
+            ("a lone `.`", b"."),
+        ];
+        for (name, path) in aliases {
+            let bytes = status_record(b"M", &[path]);
+            assert_eq!(
+                changed_path_records(&bytes).expect_err(name),
+                NameStatusError::UnsafePath { field: 1 },
+                "{name}"
+            );
+            assert!(decode_changed_paths(&bytes).is_repo_wide(), "{name}");
+            let as_destination = status_record(b"R100", &[b"src/shared.rs", path]);
+            assert_eq!(
+                changed_path_records(&as_destination).expect_err(name),
+                NameStatusError::UnsafePath { field: 2 },
+                "{name}, as a rename destination"
+            );
+        }
+        let plain = status_record(b"M", &[b"src/shared.rs"]);
+        let decoded = decode_changed_paths(&plain);
+        assert!(!decoded.is_repo_wide(), "a plain path stays narrow");
+        assert_eq!(
+            decoded
+                .prefixes()
+                .expect("narrow")
+                .iter()
+                .map(GitPath::as_str)
+                .collect::<Vec<_>>(),
+            vec!["src/shared.rs"]
+        );
+        assert_eq!(aliases.len(), 7, "seven independent aliases");
+    }
+
     #[test]
     fn decode_changed_paths_is_the_records_or_repo_wide() {
         let bytes = status_record(b"R100", &[b"src/auth.rs", b"archive/auth.rs"]);
@@ -700,56 +937,46 @@ mod tests {
 
     /// The porcelain `-z` grammar, as Git 2.43.0 emits it: a `worktree` line, its
     /// attributes, and an empty attribute closing each record. Under `-z` a
-    /// lock reason is verbatim, newline and trailing space included.
+    /// lock reason is verbatim, newline and trailing space included, and a
+    /// label this parser does not know is skipped.
     #[test]
     fn worktree_records_are_read_from_the_porcelain_grammar() {
-        let mut bytes = Vec::new();
-        for field in [
-            &b"worktree /repo"[..],
-            b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f1510",
+        let bytes = porcelain(&[
+            b"worktree /repo",
+            HEAD,
             b"branch refs/heads/master",
             b"",
             b"worktree /repo/wt",
-            b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f1510",
+            HEAD,
             b"detached",
             b"locked why\nnot ",
             b"prunable gitdir file points to non-existent location",
+            b"extension a label this parser does not know",
             b"",
             b"worktree /repo/bare",
             b"bare",
             b"locked",
             b"prunable",
             b"",
-        ] {
-            bytes.extend_from_slice(field);
-            bytes.push(0);
-        }
+        ]);
         let records = parse_worktree_records(&bytes).expect("Git's own grammar");
         let expected = vec![
             WorktreeRecord {
-                path: PathBuf::from(if cfg!(windows) { "\\repo" } else { "/repo" }),
-                head: Some("88663d58b63b0acaf3c31e98aa723336b24f1510".to_owned()),
+                path: platform("/repo"),
+                head: Some(OID.to_owned()),
                 branch: Some("refs/heads/master".to_owned()),
                 locked: None,
                 prunable: None,
             },
             WorktreeRecord {
-                path: PathBuf::from(if cfg!(windows) {
-                    "\\repo\\wt"
-                } else {
-                    "/repo/wt"
-                }),
-                head: Some("88663d58b63b0acaf3c31e98aa723336b24f1510".to_owned()),
+                path: platform("/repo/wt"),
+                head: Some(OID.to_owned()),
                 branch: None,
                 locked: Some("why\nnot ".to_owned()),
                 prunable: Some("gitdir file points to non-existent location".to_owned()),
             },
             WorktreeRecord {
-                path: PathBuf::from(if cfg!(windows) {
-                    "\\repo\\bare"
-                } else {
-                    "/repo/bare"
-                }),
+                path: platform("/repo/bare"),
                 head: None,
                 branch: None,
                 locked: Some(String::new()),
@@ -757,34 +984,167 @@ mod tests {
             },
         ];
         assert_eq!(records, expected);
-        assert!(parse_worktree_records(b"").expect("no bytes").is_empty());
+        let refused = parse_worktree_records(b"").expect_err("Git never lists nothing");
+        assert!(message(refused).contains("worktree list is empty"));
     }
 
+    /// Framing: a record ends only at the empty attribute. A header while a
+    /// record is open, a list without its final terminator, a final record no
+    /// empty attribute closed, a separator with nothing open, and an attribute
+    /// before any header are each refused, not read as a complete list.
     #[test]
     fn a_worktree_list_cut_short_is_refused_not_read_as_complete() {
-        let cases: &[(&[u8], &str)] = &[
+        let cases: &[(&str, Vec<u8>, &str)] = &[
             (
-                b"worktree /repo\0HEAD abc\0\0worktree /repo/wt\0HEAD abc",
+                "two records without the separator between them",
+                [
+                    porcelain(&[b"worktree /slot", HEAD]),
+                    porcelain(&[b"worktree /next", HEAD, b""]),
+                ]
+                .concat(),
+                "record 0 is not closed before the next record begins",
+            ),
+            (
+                "the lock line cut off before the next header",
+                [
+                    porcelain(&[b"worktree /slot", HEAD, b"detached"]),
+                    porcelain(&[b"worktree /next", HEAD, b""]),
+                ]
+                .concat(),
+                "record 0 is not closed before the next record begins",
+            ),
+            (
+                "a list without its final terminator",
+                {
+                    let mut bytes = porcelain(&[b"worktree /repo", HEAD, b"", b"worktree /wt"]);
+                    bytes.extend_from_slice(HEAD);
+                    bytes
+                },
                 "ends without a terminator",
             ),
             (
-                b"worktree /repo\0HEAD abc\0\0worktree /repo/wt\0HEAD abc\0",
-                "record 1 is not closed",
+                "a final record no empty attribute closed",
+                porcelain(&[b"worktree /repo", HEAD, b"", b"worktree /wt", HEAD]),
+                "record 1 is not closed; the list was cut short",
             ),
-            (b"worktree /repo\0", "record 0 is not closed"),
             (
-                b"HEAD abc\0worktree /repo\0\0",
-                "an attribute before its first record",
+                "a header alone",
+                porcelain(&[b"worktree /repo"]),
+                "record 0 is not closed; the list was cut short",
+            ),
+            (
+                "a separator with no record open",
+                porcelain(&[b"worktree /repo", HEAD, b"", b""]),
+                "record 1 is closed before it is opened",
+            ),
+            (
+                "an attribute before any header",
+                porcelain(&[HEAD, b"worktree /repo", b""]),
+                "record 0 has an attribute before its worktree line",
+            ),
+            (
+                "a header with no path",
+                porcelain(&[b"worktree ", HEAD, b""]),
+                "record 0 has an empty path",
             ),
         ];
-        for (bytes, expected) in cases {
-            let refused = parse_worktree_records(bytes).expect_err("cut short");
+        for (name, bytes, expected) in cases {
+            let refused = parse_worktree_records(bytes).expect_err(name);
             let text = message(refused);
             assert!(
                 text.contains(expected),
-                "{bytes:?}: expected {expected:?} in {text:?}"
+                "{name}: expected {expected:?} in {text:?}"
             );
         }
+        assert_eq!(cases.len(), 8, "eight independent framing refusals");
+    }
+
+    /// The structural attributes are held to their own grammars, so a stray
+    /// byte cannot make `refs/heads/main ` a branch nobody has checked out;
+    /// the reasons stay verbatim.
+    #[test]
+    fn structural_attributes_refuse_what_their_grammars_forbid() {
+        let cases: &[(&str, &[u8], &str)] = &[
+            (
+                "a branch with a trailing space",
+                b"branch refs/heads/main ",
+                "record 0 has a branch that is not one refname",
+            ),
+            (
+                "a branch with an embedded tab",
+                b"branch refs/heads/ma\tin",
+                "record 0 has a branch that is not one refname",
+            ),
+            (
+                "a branch with a control byte",
+                b"branch refs/heads/main\x01",
+                "record 0 has a branch that is not one refname",
+            ),
+            (
+                "a branch with a forbidden byte",
+                b"branch refs/heads/ma[in",
+                "record 0 has a branch that is not one refname",
+            ),
+            (
+                "an empty branch",
+                b"branch ",
+                "record 0 has a branch that is not one refname",
+            ),
+            (
+                "a HEAD with a trailing space",
+                b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f1510 ",
+                "record 0 has a HEAD that is not one object id",
+            ),
+            (
+                "a HEAD that is not hexadecimal",
+                b"HEAD abc",
+                "record 0 has a HEAD that is not one object id",
+            ),
+            (
+                "a HEAD with no value",
+                b"HEAD",
+                "record 0 has a HEAD that is not one object id",
+            ),
+            (
+                "a boolean attribute carrying a value",
+                b"detached yes",
+                "record 0 has a boolean attribute carrying a value",
+            ),
+        ];
+        for (name, attribute, expected) in cases {
+            let bytes = porcelain(&[b"worktree /repo", attribute, b""]);
+            let refused = parse_worktree_records(&bytes).expect_err(name);
+            let text = message(refused);
+            assert!(
+                text.contains(expected),
+                "{name}: expected {expected:?} in {text:?}"
+            );
+        }
+        assert_eq!(cases.len(), 9, "nine independent attribute refusals");
+
+        let twice = porcelain(&[b"worktree /repo", HEAD, HEAD, b""]);
+        assert!(
+            message(parse_worktree_records(&twice).expect_err("HEAD twice"))
+                .contains("record 0 has a HEAD that is not one object id")
+        );
+        let locked_twice = porcelain(&[b"worktree /repo", HEAD, b"locked", b"locked again", b""]);
+        assert!(
+            message(parse_worktree_records(&locked_twice).expect_err("locked twice"))
+                .contains("record 0 has a reason attribute twice")
+        );
+
+        let verbatim = porcelain(&[b"worktree /repo", HEAD, b"locked initializing ", b""]);
+        let records = parse_worktree_records(&verbatim).expect("a reason is verbatim");
+        assert_eq!(records[0].locked.as_deref(), Some("initializing "));
+        let sha256 = porcelain(&[
+            b"worktree /repo",
+            b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f151088663d58b63b0acaf3c31e98",
+            b"",
+        ]);
+        assert!(
+            parse_worktree_records(&sha256).is_ok(),
+            "a SHA-256 object id is sixty-four hexadecimal digits"
+        );
     }
 
     #[cfg(unix)]
@@ -792,7 +1152,7 @@ mod tests {
     fn a_worktree_path_keeps_every_byte_on_unix() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let records = parse_worktree_records(b"worktree /repo/caf\xe9\0HEAD abc\0\0")
+        let records = parse_worktree_records(&porcelain(&[b"worktree /repo/caf\xe9", HEAD, b""]))
             .expect("every byte string is a Unix path");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path.as_os_str().as_bytes(), b"/repo/caf\xe9");
@@ -801,10 +1161,16 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn a_worktree_path_that_is_not_utf8_is_refused_with_its_offset() {
-        let refused = parse_worktree_records(
-            b"worktree C:/repo\0HEAD abc\0\0worktree C:/repo/caf\xe9\0HEAD abc\0\0",
-        )
-        .expect_err("a lossy spelling is not a worktree's identity");
+        let bytes = porcelain(&[
+            b"worktree C:/repo",
+            HEAD,
+            b"",
+            b"worktree C:/repo/caf\xe9",
+            HEAD,
+            b"",
+        ]);
+        let refused = parse_worktree_records(&bytes)
+            .expect_err("a lossy spelling is not a worktree's identity");
         assert!(
             message(refused).contains("record 1 names a path that is not UTF-8 from byte 11"),
             "the refusal says which record and where"
