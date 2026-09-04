@@ -58,8 +58,18 @@ reason.
 
 Everything. A module that gets a notes file gets *all* of its prose moved: the module essay, every
 item's rustdoc including its `# Errors` and `# Panics` sections, every inline comment, the section
-banners. The notes file opens with an *Item contracts* section so the API documentation is still
-one place, and carries the rationale below it.
+banners. Module docs (`//!`) come first under *Module*; every other comment becomes a section
+headed by the line of code it sat above, with its enclosing item —
+`` ## `impl HostRunner` › `pub fn new() -> Self {` `` — so the heading is the grep string that finds
+the code, and a file reads top to bottom in source order. The files were generated from the source
+by the migration and are a faithful dump; a curated file (today `runner/host.md`) may organise the
+same material further, and a section may be reworded like any other documentation.
+
+Three censuses read prose and were pointed at the notes or re-expressed rather than kept in the
+source: `runner::container::tests` reads the orphan-window documentation from
+`docs/internals/runner/container.md`, and the two comment-strip floors in `agent::tests` and
+`runner::host::tests` now plant a control line and assert it is removed instead of counting the
+live comments.
 
 Three things do not move, because they are not this standard's to place:
 

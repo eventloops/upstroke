@@ -21,6 +21,7 @@ set -euo pipefail
 export PATH="/usr/bin:/bin:$PATH"
 
 cd "${BASH_SOURCE[0]%/*}/../.."
+root="$(pwd)"
 
 failed=0
 error() {
@@ -129,7 +130,7 @@ while IFS= read -r notes; do
     error "$notes does not link back to its module"
     continue
   fi
-  resolved="$(cd "${notes%/*}" && realpath -m --relative-to="$(cd ../../.. && pwd)" "$link" 2>/dev/null || true)"
+  resolved="$(cd "${notes%/*}" && realpath -m --relative-to="$root" "$link" 2>/dev/null || true)"
   [[ "$resolved" == "$module" ]] \
     || error "$notes links to $link, which resolves to '${resolved:-nothing}' rather than $module"
 done < <(find "$notes_root" -name '*.md' | sort)
