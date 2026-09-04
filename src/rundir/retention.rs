@@ -48,6 +48,17 @@ pub enum RetainReason {
     /// The marker's repository key is not this repository's: a directory
     /// copied from another repository.
     MarkerRepoKeyMismatch { recorded: String, expected: String },
+    /// The marker's recorded private target could not be asked about: the stat
+    /// failed for a reason that is not `NotFound`, so its absence was never
+    /// established.
+    ///
+    /// The census reclaims the public husk alone "if the marker's private
+    /// target does not exist", and only `NotFound` says it does not. An
+    /// `EACCES` on a parent component, an `ELOOP`, a Windows sharing violation
+    /// or a locator the platform will not even accept as a path are answers the
+    /// filesystem declined to give, and the husk's removal takes `.creating`
+    /// with it — the private half's only locator.
+    TargetUndecidable { detail: String },
     /// The recorded locator does not canonicalize to
     /// `<authorized private root>/runs/<basename>`.
     LocatorOutsideAuthorizedRoot { locator: PathBuf, expected: PathBuf },
@@ -92,6 +103,7 @@ impl RetainReason {
         "marker-unparseable",
         "marker-run-id-mismatch",
         "marker-repo-key-mismatch",
+        "target-undecidable",
         "locator-outside-authorized-root",
         "locator-through-reparse-point",
         "owner-record-missing",
@@ -109,6 +121,7 @@ impl RetainReason {
             Self::MarkerUnparseable => "marker-unparseable",
             Self::MarkerRunIdMismatch { .. } => "marker-run-id-mismatch",
             Self::MarkerRepoKeyMismatch { .. } => "marker-repo-key-mismatch",
+            Self::TargetUndecidable { .. } => "target-undecidable",
             Self::LocatorOutsideAuthorizedRoot { .. } => "locator-outside-authorized-root",
             Self::LocatorThroughReparsePoint { .. } => "locator-through-reparse-point",
             Self::OwnerRecordMissing => "owner-record-missing",
@@ -178,6 +191,11 @@ impl std::fmt::Display for RetainReason {
             Self::MarkerRepoKeyMismatch { recorded, expected } => write!(
                 f,
                 "its marker carries repository key `{recorded}`, not this repository's `{expected}`"
+            ),
+            Self::TargetUndecidable { detail } => write!(
+                f,
+                "its marker's private target could not be asked about, so nothing about it is \
+                 established: {detail}"
             ),
             Self::LocatorOutsideAuthorizedRoot { locator, expected } => write!(
                 f,

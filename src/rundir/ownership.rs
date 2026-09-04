@@ -161,8 +161,37 @@ pub fn prove_private_half_ownership(
     // alone is reclaimed". Existence is asked of the link itself, so a
     // dangling symlink counts as present and is refused below rather than
     // reclaimed past.
-    if fs::symlink_metadata(&locator).is_err() {
-        return PrivateHalfOwnership::NothingBound(UnboundShape::TargetAbsent);
+    //
+    // **Fail-closed, and only `NotFound` is proof.** This was
+    // `symlink_metadata(&locator).is_err()`, which read every error as absence
+    // — and `TargetAbsent` is a *reclaiming* answer, whose reclaim deletes the
+    // public directory with `.creating` in it. That marker is the private
+    // half's only locator, and `create.rs` says what losing it costs: "a
+    // private half no marker names is one no census, no `status` and no
+    // deferred prune can ever reach again". So an `EACCES` on a parent
+    // component, an `ELOOP`, an `ENOTDIR`, a Windows sharing violation or a
+    // locator the platform will not accept as a path orphaned a private half
+    // that was still there, on evidence that it was gone.
+    //
+    // It is `SWEEP-CLASSIFY-009`'s class through a different syscall, and not
+    // its instance: `lstat(2)` consumes no file descriptor, so the descriptor
+    // exhaustion that drives that finding never reaches this conjunct and the
+    // listing's repair does not close this one.
+    //
+    // The rule is the one `commit_record_proves_absence` states for conjunct
+    // 12 — only `io::ErrorKind::NotFound` proves a path is not there — spelled
+    // again here rather than shared, so that each conjunct keeps refusing on
+    // its own and a mutation to one is not a mutation to both.
+    match fs::symlink_metadata(&locator) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return PrivateHalfOwnership::NothingBound(UnboundShape::TargetAbsent);
+        }
+        Err(error) => {
+            return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable {
+                detail: format!("{}: {error}", locator.display()),
+            });
+        }
     }
 
     // Conjunct 4: no symlink or reparse point below the runs directory.

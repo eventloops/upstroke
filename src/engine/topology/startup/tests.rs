@@ -1080,6 +1080,9 @@ fn every_retain_reason() -> Vec<RetainReason> {
             recorded: "a".to_owned(),
             expected: "b".to_owned(),
         },
+        RetainReason::TargetUndecidable {
+            detail: "a: b".to_owned(),
+        },
         RetainReason::LocatorOutsideAuthorizedRoot {
             locator: PathBuf::from("a"),
             expected: PathBuf::from("b"),

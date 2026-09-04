@@ -1779,6 +1779,29 @@ fn proof_cases() -> Vec<ProofCase> {
             expect: Expect::Retained("marker-repo-key-mismatch", None),
         },
         ProofCase {
+            // The existence step, refusing on a stat that is not an answer.
+            // The input is a path holding a NUL, which `std` rejects before
+            // any syscall: measured on Linux as `InvalidInput` ("file name
+            // contained an unexpected NUL byte"), and expected to be
+            // `InvalidInput` on Windows too, where the wide-string conversion
+            // refuses interior NULs. **That second half is expected, not
+            // measured here** — CI's Windows leg is what settles it, and this
+            // case is what asks the question. Either way it is not `NotFound`,
+            // which is the only kind this conjunct now takes as proof, and it
+            // needs no privilege and no mode bits.
+            //
+            // A reachable input rather than a contrivance: `private_dir` is a
+            // JSON string read off disk, and `\u0000` is valid JSON. The
+            // `EACCES` shape an operator actually meets is the Unix witness
+            // below.
+            name: "a marker whose recorded target cannot be asked about",
+            before: |husk| {
+                husk.marker.private_dir = format!("{}\0nul", husk.private.display());
+            },
+            after: nothing_after,
+            expect: Expect::Retained("target-undecidable", None),
+        },
+        ProofCase {
             name: "locator outside the authorized private root",
             before: |husk| {
                 let foreign = husk.root.join("foreign-root").join("runs");
@@ -2586,6 +2609,109 @@ fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
         classify_run_dir(&public),
         RunDirClass::Committed,
         "and the run is still a committed run"
+    );
+}
+
+/// A private target the census cannot ask about is not a target that is
+/// gone, and the marker that locates it survives.
+///
+/// `TargetAbsent` is a reclaiming answer, and its reclaim deletes the public
+/// directory with `.creating` inside it. That marker is the private half's
+/// only locator, so reading a stat that failed as "the target is gone"
+/// orphans a private half that is still there — permanently, because
+/// `create.rs` says "a private half no marker names is one no census, no
+/// `status` and no deferred prune can ever reach again".
+///
+/// The door is a permission on a **parent component** of the recorded
+/// locator, which is what an operator meets: the private root's own
+/// directory bits, an `EACCES` from a mount, a directory another process is
+/// re-creating. `lstat(2)` takes no file descriptor, so this is a different
+/// door from `SWEEP-CLASSIFY-009`'s descriptor exhaustion and the listing's
+/// repair does not close it; the grid case above pins the classification on
+/// every platform, and this pins the shape that actually happens.
+///
+/// Unix only, and the precondition is asserted rather than assumed: a
+/// process privileged enough to ignore the mode bits fails here rather than
+/// passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_private_target_that_cannot_be_stat_ed_is_not_a_target_that_is_gone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("target-unstattable");
+    husk.publish();
+    let public = husk.public();
+    let parent = husk
+        .private
+        .parent()
+        .expect("the runs directory")
+        .to_path_buf();
+
+    // The control: readable, this husk proves and is reclaimable in full.
+    match husk.prove() {
+        PrivateHalfOwnership::Proven(token) => {
+            assert_eq!(
+                token.run_id(),
+                BOUND_RUN,
+                "the control must be the happy path"
+            )
+        }
+        other => panic!("the control must prove, not {other:?}"),
+    }
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("close the parent");
+    let stat = fs::symlink_metadata(&husk.private);
+    let readable_again = || {
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("open the parent")
+    };
+    if stat.is_ok() {
+        readable_again();
+        panic!(
+            "this fixture needs a stat that fails, and here one does not — a process with \
+             the privilege to ignore the permission bits cannot measure this"
+        );
+    }
+
+    let answer = husk.prove();
+    readable_again();
+
+    match answer {
+        // What the census does with a `NothingBound`: the public half goes,
+        // and `.creating` goes with it. Before the fix this arm ran.
+        PrivateHalfOwnership::NothingBound(shape) => {
+            let reclaimed = remove_public_husk(&public, &mut NoHooks);
+            panic!(
+                "a stat that could not answer answered {shape:?}, a reclaiming answer; the \
+                 reclaim it licenses returned {reclaimed:?} and the marker that locates the \
+                 private half is {}",
+                if public.join(MARKER).is_file() {
+                    "still there"
+                } else {
+                    "GONE"
+                }
+            );
+        }
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "target-undecidable", "{reason}");
+            assert!(
+                reason
+                    .to_string()
+                    .contains(&husk.private.display().to_string()),
+                "the operator is told which target could not be asked about: {reason}"
+            );
+        }
+        PrivateHalfOwnership::Proven(_) => {
+            panic!("a target that could not be stat-ed proved nothing")
+        }
+    }
+
+    assert!(
+        public.join(MARKER).is_file(),
+        "the marker that locates the private half is still here"
+    );
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and so is the private half it names"
     );
 }
 
