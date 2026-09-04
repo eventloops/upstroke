@@ -5652,3 +5652,80 @@ member of the class row above rather than a property of any packet.
 **And one row already in §2 is not this append's, though four of these rows are instances of its
 shape.** `CLASS-GATE-STATED-DOMAIN-EXCEEDS-COUNTED-DOMAIN` landed with #106. The domain rows here
 cross-reference it; none of them restates it.
+
+## 47. PR #109 exact-head review — the closing-handle control's residual scheduling dependence
+
+`gpt-5.6-sol` at `max` effort on `48cefb3356d7c7c8893c1fb077a51e6022d58fd4`, the second pass this
+pull request bought. Verdict `CHANGES_REQUIRED`, two findings. The parts of both that are about what
+the test *claims* were repaired on the head that follows the pass; what remains here is one
+mechanism that cannot be repaired from a test, and two interleavings whose preconditions the repair
+made narrow rather than impossible. They are carried, with the measurement that would settle each,
+rather than argued away.
+
+The subject is `workspace_manager::tests::a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused`,
+`#[cfg(windows)]`, whose first case holds a file open across the start of `remove_worktree` and
+expects the retry in `remove_tree_once_handles_close` to cross the closing window.
+
+### FIND-109-CLOSING-CASE-HOLDER-STARVATION
+
+**Fingerprint.** Windows only. `panicked at src/workspace_manager/tests.rs`, assertion
+`removal retries across the closing handle`, with an `Io` error carrying os error 32
+(`ERROR_SHARING_VIOLATION`) or 5 (`ERROR_ACCESS_DENIED`) naming the slot directory. A red matching
+that fingerprint is this row until shown otherwise; a red that does not match it is a regression.
+
+**Mechanism, and why it is not a rate question.** The holder thread closes the handle 300ms after
+the remove funnel's `Before` phase signals it. If that thread is not scheduled at all for the length
+of the retry window — 40 attempts with 39 sleeps of 25ms between them — the handle is still open on
+the last attempt, a correct bounded implementation returns `Err`, and the case fails on correct
+production behaviour. Uniform slowness does not do this: the loop needs 39 wakeups to the holder's
+two, so a delay applied evenly to every wakeup widens the margin. Targeted starvation of one thread
+on a loaded runner does, and `--test-threads=16` on 4 vCPUs is where it would come from.
+
+**Why it is not repaired here.** Closing "once an attempt has provably run" is what would remove the
+dependence, and nothing outside the loop can observe an attempt. The funnel's `Before` phase is the
+last seam a test may use, and it fires before the first attempt, not between attempts. The obvious
+substitute — watching a sentinel file disappear, since a failed `remove_dir_all` deletes what it
+reached — was measured on the Windows guest and does not work in this shape: with the held name
+sorting first in the directory index the failing attempt deletes **nothing**, sentinels and nested
+files alike surviving (probed with the real name `held-by-the-dying-child`, and with names sorting
+first, middle and last, the last being the only arrangement that clears the directory). Making it
+work would mean ordering the fixture's filenames against an NTFS enumeration detail, which trades
+this dependence for a less legible one. Anything better needs a seam in
+`remove_tree_once_handles_close` itself — production code, and a scope decision the owner has
+reserved.
+
+**Rate.** Unmeasured, and deliberately so rather than by omission. It has never been observed: the
+control has failed only in its pre-repair form, on a five-second timer, and the repaired form has
+passed every run made of it — CI's `test (winguest)` leg on three heads, plus targeted guest runs.
+The measurement that would settle it is a soak of this test alone under `--test-threads=16` pinned
+to 4 CPUs with the rest of the suite running, counting failures over runs; nothing here claims a
+rate without it.
+
+**Consequence.** A red matching the fingerprint is this row, not a regression in
+`remove_tree_once_handles_close`. Owner: whoever holds the workspace-manager area. The follow-up is
+the scope decision named above, not a re-tuning of the 300ms.
+
+### FIND-109-FAIL-SAFE-DIAGNOSES-ONLY-ITS-BOUND
+
+**Fingerprint.** Windows only, assertion text beginning `the fail-safe released the handle after`.
+
+**Mechanism.** `FAIL_SAFE` is a 600s watchdog that converts a wedged removal into a verdict. Two
+interleavings remain. A remover descheduled for longer than the watchdog, between the funnel's
+`Before` phase and the loop, lets the watchdog fire against a bounded retry that then succeeds
+immediately — a false failure. And a holder that is never scheduled again after the signal cannot
+observe the release, though the wait for the signal is now itself bounded so the holder is armed
+from the moment the handle is open rather than only after the signal.
+
+**What was repaired instead.** The assertion no longer diagnoses. It used to read `the retry is
+unbounded rather than budgeted`; it now states the bound that was crossed and says explicitly that an
+unbounded retry and a thread that stopped being scheduled read identically from where the test
+stands. The `FAIL_SAFE` doc comment says the same, and no longer claims a multiple of a measured
+worst case.
+
+**Rate.** Unobserved; both interleavings need a 600-second stall of a specific thread. The witness
+that exercises the mechanism deliberately — the attempt bound raised to `u32::MAX` — reports
+`took` = 600.0301503s against the 600s bound, which is the lower bound the assertion now claims and
+no more.
+
+**Consequence.** A red matching the fingerprint means a removal slower than ten minutes, which is
+worth investigating on its own terms whatever caused it. Owner: as above.

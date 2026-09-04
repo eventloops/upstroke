@@ -712,9 +712,21 @@ fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
 /// code. What it removes is everything the five-second version raced: the
 /// fixture, the `ready` handshake, this thread's scheduling, and the funnel's
 /// own preamble. The hold is sized against what remains rather than against the
-/// budget — 300ms against a loop that sleeps 39 x 25ms — and a starved machine
-/// stretches those 39 wakes further than the holder's one, so the margin widens
-/// at both ends rather than narrowing.
+/// budget — 300ms against a loop that sleeps 39 x 25ms.
+///
+/// **That margin is against delay, not against starvation, and the difference
+/// is this control's limit.** Spread a per-wakeup delay evenly and the margin
+/// widens, since the loop needs 39 wakeups to this thread's two and no uniform
+/// delay lets it finish first. What it does not survive is *this thread
+/// specifically* not being scheduled while the remover runs: descheduled for
+/// the length of the loop's window, the holder has not closed by the fortieth
+/// attempt, a correct bounded implementation returns `Err`, and the case fails
+/// on correct behaviour. Closing "after the first attempt" is what would settle
+/// it, and nothing outside the loop can observe an attempt — the funnel is the
+/// last seam, and a partial `remove_dir_all` deletes nothing at all when the
+/// held name sorts first, which was measured rather than assumed. So the
+/// residual is recorded in `reviews/FINDINGS.md` instead of being papered over
+/// here.
 ///
 /// A handshake alone would deadlock on the one regression this control is for,
 /// which is why `FAIL_SAFE` exists below: if the retry ever became unbounded,
@@ -735,15 +747,30 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
 
     /// How long the held case waits for the handshake before releasing anyway.
     ///
-    /// This is not the oracle and must never decide the test. It exists so an
-    /// unbounded retry is *reported here* rather than hanging until CI kills the
-    /// job with no verdict at all.
+    /// It exists so an unbounded retry is *reported here* rather than hanging
+    /// until CI kills the job with no verdict at all. It bounds **both** of the
+    /// holder's waits — for the funnel's signal, and then for the release — so
+    /// there is no window in which this thread is parked with nothing bounding
+    /// it. `CODING_STANDARDS.md` §12: every wait is bounded, and the bound
+    /// bounds a wedged producer.
+    ///
+    /// **What a fire establishes is the bound it crossed, and not the reason.**
+    /// Firing on the first wait says removal did not reach the funnel in time;
+    /// firing on the second says it entered and did not return. Neither says
+    /// *why*, because an unbounded retry and a thread that stopped being
+    /// scheduled read identically from here. The assertions below say only the
+    /// former, and quote the elapsed time so the reader can tell them apart.
+    /// The claim this doc used to make — that a fire proves an unbounded retry —
+    /// was more than the mechanism can deliver.
     ///
     /// **It bounds exactly the interval the test measures.** The window opens
     /// when the holder observes `removal_started`, which `SignalOnRemoval` sends
     /// from inside `remove_worktree` — necessarily after `started` was taken, so
-    /// the window opens after `took` began and a fire implies
-    /// `took >= FAIL_SAFE` rather than merely suggesting it. The first version
+    /// the window opens after `took` began and a fire on that second wait
+    /// implies `took >= FAIL_SAFE` rather than merely suggesting it. (The first
+    /// wait opens earlier, at the handle's opening, which is the price of
+    /// bounding it at all; its fire is reported as the different thing it is.)
+    /// The first version
     /// opened the window at the handle's opening instead, so it covered the
     /// handshake and this thread's scheduling too — the same mistake the
     /// five-second timer made, at a different scale, and the reason the
@@ -851,6 +878,8 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         let (release, released) = mpsc::channel::<()>();
         let fail_safe_fired = Arc::new(AtomicBool::new(false));
         let fired = Arc::clone(&fail_safe_fired);
+        let signal_never_arrived = Arc::new(AtomicBool::new(false));
+        let unsignalled = Arc::clone(&signal_never_arrived);
         let handle = std::thread::spawn(move || {
             // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
             // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
@@ -865,11 +894,19 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
                 .expect("hold the file open the way a git child does");
             opened.send(()).expect("announce the handle is held");
             // Nothing about the hold begins until the removal funnel says it
-            // has. Both outcomes continue: `Ok(())` is the signal, and
-            // `Disconnected` is the run unwinding before removal was reached --
-            // a handle held past *that* would only obstruct the fixture's own
-            // cleanup.
-            let _ = removal_started.recv();
+            // has. `Ok(())` is the signal and `Disconnected` is the run
+            // unwinding before removal was reached -- a handle held past *that*
+            // would only obstruct the fixture's own cleanup -- and both
+            // continue.
+            //
+            // Bounded, because §12 asks that every wait bound a wedged producer
+            // and this one has one. A retry that never returns never reaches
+            // the funnel's `After` and never fails either, so an unbounded wait
+            // here could leave this thread parked with the fail-safe below --
+            // the thing that turns a hang into a verdict -- never armed at all.
+            if let Err(mpsc::RecvTimeoutError::Timeout) = removal_started.recv_timeout(FAIL_SAFE) {
+                unsignalled.store(true, Ordering::SeqCst);
+            }
             match hold {
                 Some(hold) => std::thread::sleep(hold),
                 // Held until `Holder` drops the sender, which happens only once
@@ -923,16 +960,23 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
              is about the retry at all"
         );
         // Read before the outcome is interpreted, so the diagnostic names the
-        // real fault. A fired fail-safe means removal did not return within
-        // `FAIL_SAFE` -- an unbounded retry, which is the hang this control
-        // exists to catch -- and without this the `Ok` that the freed handle then
-        // permitted would be reported in its place. The elapsed time is quoted
-        // because it is the number that says whether the budget or the fail-safe
-        // is the thing that needs changing.
+        // real fault rather than whatever the freed handle then permitted. The
+        // first says removal never reached the funnel; the second says it
+        // reached it and did not come back. Both quote the elapsed time, since
+        // that is the number saying which bound needs changing.
+        assert!(
+            !signal_never_arrived.load(Ordering::SeqCst),
+            "removal did not reach the remove funnel within {FAIL_SAFE:?} of the handle being \
+             opened, and then returned in {took:?}: whatever this run measured it was not the \
+             retry, because the hold had not begun while the loop ran"
+        );
         assert!(
             !fail_safe_fired.load(Ordering::SeqCst),
-            "the fail-safe released the handle after {FAIL_SAFE:?} and removal then returned \
-             in {took:?} as {}: the retry is unbounded rather than budgeted",
+            "the fail-safe released the handle after {FAIL_SAFE:?} with removal still inside the \
+             funnel, and removal then returned in {took:?} as {}. That establishes the bound it \
+             crossed -- a removal slower than the fail-safe -- and not the reason for it: an \
+             unbounded retry is why this bound exists, but a thread that stopped being scheduled \
+             reads the same",
             if outcome.is_ok() { "Ok" } else { "Err" }
         );
         if expected_removal {
