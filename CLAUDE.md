@@ -72,14 +72,17 @@ itself, and its wrapper is the way to run them there.
 Read the `standards/` sections a change touches. In particular:
 
 - **Edition 2024, MSRV 1.85.**
-- **The §7 panic policy is lint-enforced.** `.unwrap()` is denied everywhere, tests included;
-  `.expect()` and `panic!` are denied outside tests via `Cargo.toml`'s `[lints]`.
+- **The §7 panic policy is lint-enforced at its centre, a review duty at its edges.** `.unwrap()`
+  is denied everywhere, tests included; `.expect()` and `panic!` are denied outside tests via
+  `Cargo.toml`'s `[lints]`. Indexing, slicing and `unreachable!` are denied by §7 on the same
+  terms but have no lint yet, so they bind by review under the activation rule.
 - **`anyhow` only at the binary edge.** Libraries return `thiserror` types.
 - **All paths through `std::path`.** Windows is a first-class target; CI runs the full matrix on
   ubuntu, macos and windows.
-- **No shared ownership, locks, or non-trivial clones without a stated reason, and every `?`
-  deliberate** (§6, §7). These bind the code a change adds or rewrites; `standards/SWEEP.md`
-  states the activation rule and tracks the file-by-file cleanup of the existing tree.
+- **No shared ownership, locks, or non-trivial clones without a stated reason, every `?`
+  deliberate, and no panicking index, slice or `unreachable!` outside an `#[expect]`** (§6, §7).
+  These bind the code a change adds or rewrites; `standards/SWEEP.md` states the activation rule
+  and tracks the file-by-file cleanup of the existing tree.
 - **Conventional commit titles**, enforced on PR titles by `.github/scripts/validate-pr-body.sh`:
   `type(optional-scope): summary`, type one of feat, fix, docs, refactor, test, chore, ci, build,
   perf, security, release, revert.

@@ -1,16 +1,17 @@
 # Standards sweep
 
-§6 (shared ownership, locks, clones) and §7 (the `?` operator) were tightened on 2026-09-03. They
-bind new and materially changed code immediately. The existing tree predates them and is being
-brought up to them one file at a time: each file gets a deep review by a frontier model, then a
-pull request that lands the cleanup and adds the file to the table below.
+§6 (shared ownership, locks, clones) and §7 (the `?` operator) were tightened on 2026-09-03, and
+§7's panic surface (indexing, slicing, `unreachable!`) on 2026-09-04. They bind new and materially
+changed code immediately. The existing tree predates them and is being brought up to them one file
+at a time: each file gets a deep review by a frontier model, then a pull request that lands the
+cleanup and adds the file to the table below.
 
 **Activation rule.** In a file not yet listed here, §6 and §7 apply to the code a change adds or
 rewrites: every line inside a hunk the change introduces or modifies, and the whole body of any
 function the change modifies. A pure formatting, renaming or comment change activates nothing.
-An existing `Rc`, `Arc`, `Mutex`, `RwLock`, `clone()` or `?` outside that scope is not a review
-finding. Once a file is listed, §6 and §7 apply to it in full, and a reviewer may cite them
-against any line.
+An existing `Rc`, `Arc`, `Mutex`, `RwLock`, `clone()`, `?`, `v[i]`, `&v[a..b]` or `unreachable!`
+outside that scope is not a review finding. Once a file is listed, §6 and §7 apply to it in full,
+and a reviewer may cite them against any line.
 
 **The activation rule is temporary.** It exists only because the tree predates the rules. When
 every Rust file the standards govern (§1: all Rust in the repository, which today is `src/` and
@@ -19,14 +20,19 @@ request, every sentence of it: this file's opening paragraph ("bind new and mate
 code immediately ... one file at a time"), this paragraph and the activation rule above; §6's
 paragraph "These three rules bind the code a change adds or rewrites, now" and its "Enforced by"
 line's reference to this file; §7's sentence "This rule is transitional in the same way as
-§6's"; §1's sentence "Some standards are newer than the tree; `standards/SWEEP.md` says which";
-§16's sentence "A §6 or §7 finding in an unswept file is in scope only under the activation
-rule"; `MAINTAINING.md`'s triage clause "or against an unswept file under a transitional
-standard"; the `CODING_STANDARDS.md` index paragraph that points here; and the hard-conventions
-bullet in `CLAUDE.md` and `AGENTS.md` that says these rules "bind the code a change adds or
-rewrites" and points at the activation rule. After that §6 and §7 bind the whole tree with no
+§6's" and, in its panic-surface paragraph, the sentence beginning "This rule is transitional in
+the same way as §6's and the `?` rule above"; §1's sentence "Some standards are newer than the
+tree; `standards/SWEEP.md` says which"; §16's sentence "A §6 or §7 finding in an unswept file is
+in scope only under the activation rule"; `MAINTAINING.md`'s triage clause "or against an unswept
+file under a transitional standard"; the `CODING_STANDARDS.md` index paragraph that points here;
+and the hard-conventions bullet in `CLAUDE.md` and `AGENTS.md` that says these rules "bind the
+code a change adds or rewrites" and points at the activation rule. That same pull request adds
+`clippy::indexing_slicing` and `clippy::unreachable` to `[lints]` with their `clippy.toml` test
+allowances, which is what makes the prose removable: §7's panic surface stops being a review duty
+at the commit the build starts catching it. After that §6 and §7 bind the whole tree with no
 scoping, and this file is the record of how the tree got there. Errors are handled where they
-arise; a `?` that survives a sweep is one the reviewer agreed was deliberate.
+arise; a `?` that survives a sweep is one the reviewer agreed was deliberate; an index or an
+`unreachable!` that survives one is under an `#[expect]` that says why.
 
 ## Review queue
 
@@ -116,6 +122,21 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 | `.clone()` | 1,941 | 84 |
 | `?` (propagation) | ≈1,200 | 71 |
 
+Baseline at the panic-surface tightening (master `44dc06f`, 166 Rust files under `src/` and
+`examples/`):
+
+| Construct | Sites | Files |
+|---|---|---|
+| `unreachable!` | 77 | 23 |
+| indexing and slicing | not yet measured | not yet measured |
+
+`unreachable!` is greppable and the count above is exact at that head. Indexing and slicing are
+not: `v[i]` cannot be told from a macro's brackets or an attribute by text, so the honest count is
+whatever `clippy::indexing_slicing` reports, and no run has been made. Measuring it is the first
+task of the pull request that lands the `[lints]` entries, and until then the queue's sessions are
+the measurement, one file at a time. None of the eight files already in the swept table contains
+an `unreachable!`, so the second-pass debt below is the indexing half only.
+
 ## Swept files
 
 | File | Swept at (commit) | Date | Notes |
@@ -141,6 +162,14 @@ race in `containment.rs`, the null id accepted on the new side of a compare-and-
 `object.rs`, a registration bound to a checkout Git does not read from it in `parsers.rs`. What
 those passes did not ask for is the second limb: the shape improvement nobody raises because the
 code is already correct.
+
+§7's panic surface post-dates every row in the swept table, not just the first five: the rule was
+tightened on 2026-09-04 and the last of these landed the same day under the brief as it then read.
+None of the eight contains an `unreachable!`, so what is owed on all of them is the indexing half —
+each `v[i]` and `&v[a..b]` dispositioned, or replaced by `get`, `first`, `last`,
+`split_at_checked` or a pattern. That is a cheap re-read rather than a session, and the pull
+request that measures the tree with `clippy::indexing_slicing` can settle these eight from its
+own output.
 
 They are listed here so the gap is recorded rather than forgotten. The queue comes first: a file
 with no pass at all earns attention before a file that has had several. Decide whether to spend
