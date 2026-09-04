@@ -1212,10 +1212,20 @@ mod tests {
             expected,
             "the fixture's commits are not a function of its inputs alone"
         );
+        // `b.txt` and not `a.txt`: the fixture's last step checks `main` out
+        // over `side`, which creates `b.txt` and leaves `a.txt` alone because
+        // its blob did not change. Only a file a checkout actually writes goes
+        // through the attribute filter, so asserting on `a.txt` alone passes
+        // whether the pin holds or not (measured, with the pin deleted).
+        assert_eq!(
+            fs::read(fixture.base.join("b.txt")).expect("read the checked-out file back"),
+            b"two\n",
+            "an ambient attributes file rewrote what the checkout wrote"
+        );
         assert_eq!(
             fs::read(fixture.base.join("a.txt")).expect("read the seed file back"),
             b"one\n",
-            "an ambient attributes file rewrote the checked-out content"
+            "an ambient attributes file rewrote the seed file"
         );
         assert!(
             !fixture.base.join("hook-ran.marker").exists(),
