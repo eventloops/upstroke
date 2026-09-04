@@ -113,7 +113,7 @@ pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError>
 /// * [`AMBIENT_REFUSAL_PREFIX`] followed by `join`'s own diagnostic and
 ///   "No process was spawned" when the join fails;
 /// * the funnel's own wording ("the process funnel was made to fail at its
-///   `Spawn.AmbientJobJoined` containment step") when the observer answers
+///   `AmbientJobJoined` containment step") when the observer answers
 ///   `Error` at the kill coordinate, which is *after* a join that succeeded.
 ///   Only a hand-written observer can answer so — the harness keys each
 ///   answer by mode — and it is surfaced rather than ignored, as
