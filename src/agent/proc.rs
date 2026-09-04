@@ -5550,10 +5550,35 @@ mod termination {
         /// assertion fails with `alive in state Z`.
         #[test]
         fn the_helper_snapshot_tells_a_running_child_from_a_stopped_and_an_exited_one() {
-            // SAFETY: the forked child calls only `pause` until it is
-            // signalled, and is killed and reaped by `ForkedChild`.
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            assert!(open_max > 0, "invalid open-file descriptor ceiling");
+            let open_max = libc::c_int::try_from(open_max).expect("descriptor ceiling fits c_int");
+            let ready = create_cloexec_pipe().expect("a readiness pipe");
+            // SAFETY: the forked child closes its inherited descriptors,
+            // writes one byte and then calls only `pause` until it is
+            // signalled; all three are async-signal-safe, and `ForkedChild`
+            // kills and reaps it.
+            //
+            // Closing them is what a real helper does as its first work, so
+            // the count below is this fixture's own four and not whatever the
+            // harness happened to have open. It also keeps this child from
+            // holding a sibling test's descriptors: a fork in a multithreaded
+            // harness inherits every open descriptor, including a writable
+            // one on an executable another thread is in the middle of
+            // writing, and a process holding that makes the sibling's `execv`
+            // of it fail with `ETXTBSY`.
             let pid = unsafe { libc::fork() };
             if pid == 0 {
+                close_inherited_fds(
+                    &[
+                        libc::STDIN_FILENO,
+                        libc::STDOUT_FILENO,
+                        libc::STDERR_FILENO,
+                        ready[1],
+                    ],
+                    open_max,
+                );
+                let _ = write_raw(ready[1], &[1_u8]);
                 loop {
                     unsafe { libc::pause() };
                 }
@@ -5564,6 +5589,18 @@ mod termination {
                 std::io::Error::last_os_error()
             );
             let mut child = ForkedChild(pid);
+            // The byte is the child saying its descriptor scrub is done. The
+            // parent's copy of the write end goes first, so a child that died
+            // instead is an end-of-file here and not a wait without an end;
+            // without this handshake the count below would race the child's
+            // own close loop and read whatever it had reached.
+            close_fd(ready[1]);
+            let mut scrubbed = [0_u8; 1];
+            assert!(
+                read_raw_exact(ready[0], &mut scrubbed),
+                "the child did not finish closing its inherited descriptors"
+            );
+            close_fd(ready[0]);
 
             let alive = helper_snapshot(pid);
             assert!(
@@ -5572,7 +5609,16 @@ mod termination {
             );
             assert!(
                 !alive.contains(" 0 descriptors open"),
-                "a child that inherited this process's descriptors holds none: {alive}"
+                "a live child was reported as holding no descriptors: {alive}"
+            );
+            // The child kept exactly four descriptors — the three standard
+            // ones and the write end it answered on — and the handshake above
+            // means it had finished closing before this was read, so the
+            // count is a count and not a stand-in for "not readable".
+            #[cfg(target_os = "linux")]
+            assert!(
+                alive.contains(" with 4 descriptors open"),
+                "the child kept the three standard descriptors and its own pipe: {alive}"
             );
 
             // SAFETY: `pid` is this process's own unreaped child. `WUNTRACED`
