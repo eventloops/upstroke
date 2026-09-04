@@ -83,6 +83,50 @@ least one of:
 The reviewer's label does not decide this; the owner classifies, and a P1 whose failure needs
 speculative preconditions is reclassified down with a ledger row saying why.
 
+### When to stop repairing
+
+Repair rounds are not free. A push waits on both required contexts, and a repaired serious P1 costs
+another frontier pass under step 5. They also do not always converge. Two signals say a pull request
+should be re-scoped rather than repaired again. Both are the author's to raise the moment they
+appear, not the reviewer's to keep finding: step 5 makes the author responsible for the pull request
+until it lands, and that responsibility includes saying when it should not. Narrowing it is the
+author's too. Closing one that has already had a review pass is the owner's, as the merge is, and is
+delegated the same way.
+
+**The premise was disproved.** Every change is made for a stated reason, and a review or a CI run
+can show that reason to be false. The failure it was meant to fix still happens on its own head;
+the measurement it rested on does not reproduce; the cause it named is not the cause. Stop there.
+Findings keep arriving around a change whose purpose has gone, and repairing them buys nothing. Say
+plainly in the body that the premise failed, and say what the pull request should become: narrowed
+to the part that stands on its own, closed with what it learned kept as findings, or replaced by a
+change that re-opens the question it was answering. Retitle a narrowed pull request. Step 6
+re-validates the live title, and a title still naming a withdrawn fix is the next finding.
+
+**Pass N+1 finds a P1 in what pass N's repair added.** A repair that introduces a defect of the same
+severity as the one it fixed is evidence about the shape of the change, not a step towards landing
+it. Once that has happened, the next round starts from a smaller change: keep what has survived a
+pass, drop the machinery the last round invented, and record what that machinery was for as a
+finding carrying its proposal. Do not carry the machinery forward on the theory that one more check
+will settle it; that theory is what the signal denies.
+
+Neither signal is a licence to abandon a real defect, and neither relaxes step 5 for a pull request
+that is still converging. What is dropped is preserved where step 5 puts any open finding, one file
+each under `reviews/findings/`, saying what the change that takes it up should do, so the next
+person starts where this one stopped. A pull request that does not merge carries nothing into the
+tree by itself, so those files land through a change of their own.
+
+**Worked example: PR #125.** It raised the forked helpers' READY budget from two seconds to ten to
+fix a macOS test-leg failure on master. At pass 4 the pull request's own CI showed that failure
+recurring on the exact reviewed head with the ten seconds elapsed, which disproved the premise. It
+ran to pass 8 anyway, each round adding machinery to make the larger budget safe, and from pass 3
+on every pass found a P1 in what an earlier round had added. After pass 7 the budget was withdrawn
+and the pull request narrowed; after pass 8 the coordinator closed it under the owner's written
+delegation. No code merged, and eleven deferred `PR125-CLOSE-*` rows in `reviews/FINDINGS.md` §49
+are what the eight passes left. The four passes after the disproof were not empty, and reached
+defects that had been on master all along. But five of those eleven rows are about machinery those
+rounds invented and the narrowing then discarded, and the rounds that produced them are what the
+two signals above exist to prevent.
+
 ### Tech debt sweeps
 
 Logged rows are swept, not forgotten, at three points: before any release tag or crates.io publish,
