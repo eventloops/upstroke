@@ -70,7 +70,12 @@ struct RawRunnerMount {
     read_only: Option<bool>,
 }
 
+/// One `[[gates]]` entry as written. An unknown key is an **error**, as in
+/// `[runner]`: the entry has three keys, the one that is optional decides when
+/// a running gate is killed and reported failed, and a typo there is a timeout
+/// the operator asked for and did not get — see `parse::parse_gates`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawGate {
     name: String,
     cmd: String,
@@ -93,7 +98,12 @@ struct RawEngine {
     unknown: BTreeMap<String, toml::Value>,
 }
 
+/// `[interaction]` as written. An unknown key is an **error**, as in
+/// `[runner]`: `mode` and `ask_before` each decide whether a person is asked,
+/// and `ask_befor = { … }` is a spend approval that no longer exists — see
+/// `parse::parse_interaction`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawInteraction {
     mode: Option<String>,
     notify: Option<Vec<String>>,
