@@ -89,7 +89,9 @@ use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, AttemptStarted4, Materialization, RungBinding, SessionId,
     TopologyEventBody,
 };
-use crate::workspace_manager::{Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager};
+use crate::workspace_manager::{
+    ObjectId, Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager,
+};
 
 use super::dispatch::{self, Dispatched, EventEmitter};
 use super::identity::{AttemptIdentities, InvocationLedger, SlotAssertion, SlotPair, is_slotted};
@@ -399,6 +401,22 @@ pub struct Capture {
     /// The commit the tree is judged against, and the parent of every snapshot's
     /// ephemeral commit.
     pub parent: String,
+}
+
+/// One of the capture's recorded ids as an [`ObjectId`], or a Git error.
+///
+/// **§7: whose mistake is it.** These two values are not a caller's: the tree
+/// is `git write-tree`'s own output and the parent is the base commit this run
+/// recorded, both already object ids by the time they are held as strings. A
+/// value here that is not one is the tool or the engine misbehaving, so it is
+/// [`UpstrokeError::Git`] naming where the value came from, as
+/// `add_snapshot` does for a `git commit-tree` line -- not
+/// `UpstrokeError::Refused`, which says the caller offered something it should
+/// not have and which `ObjectId::new`'s refusal would otherwise become here.
+fn captured_object_id(source: &str, value: String) -> Result<ObjectId, UpstrokeError> {
+    ObjectId::new(value).map_err(|refusal| UpstrokeError::Git {
+        message: format!("{source} did not yield an object id: {refusal}"),
+    })
 }
 
 /// What the ladder's **cheap rungs** said, before a gate or a reviewer ran.
@@ -896,7 +914,7 @@ impl AttemptContext<'_> {
                     .gate(u32::try_from(index).unwrap_or(u32::MAX), 0);
                 let request = gate_request(
                     gate.command.clone(),
-                    snapshot.path.clone(),
+                    snapshot.path().to_path_buf(),
                     gate.timeout,
                     invocation,
                 );
@@ -981,7 +999,7 @@ impl AttemptContext<'_> {
                     diff: &inputs.diff,
                     artifacts: &inputs.artifacts,
                     decisions: &inputs.decisions,
-                    workspace: &snapshot.path,
+                    workspace: snapshot.path(),
                     settings_dir: &self.paths.settings(),
                     reviews_dir: &self.paths.reviews(),
                     stem: format!("{}-{}", inputs.stem, attempt),
@@ -1065,8 +1083,8 @@ impl AttemptContext<'_> {
             self.hooks.effects(),
             &name,
             &SnapshotInput::Tree {
-                tree: capture.tree.clone(),
-                parent: capture.parent.clone(),
+                tree: captured_object_id("`git write-tree`", capture.tree.clone())?,
+                parent: captured_object_id("the recorded base commit", capture.parent.clone())?,
             },
         )
     }

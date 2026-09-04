@@ -199,6 +199,15 @@ impl Fixture {
         git(&base, &["init", "-q", "-b", "main", &object_format]);
         git(&base, &["config", "user.email", "tests@upstroke.local"]);
         git(&base, &["config", "user.name", "upstroke tests"]);
+        // Line endings are pinned for the same reason the object format is
+        // (§12, and `PR126-REVIEW2-NULL-TESTS-INHERIT-THE-HASH-FORMAT`): an
+        // ambient Git setting that silently changes what a test observes.
+        // With `core.autocrlf` on, as it is on the Windows guest, a blob
+        // written as `A\n` is checked out as `A\r\n`, so a test comparing
+        // checked-out content against what it wrote fails on that platform
+        // alone while the blob is the one it asked for.
+        git(&base, &["config", "core.autocrlf", "false"]);
+        git(&base, &["config", "core.eol", "lf"]);
         // `git worktree add` writes a reflog entry; keep the repository
         // self-contained so nothing depends on a global config.
         git(&base, &["config", "core.logAllRefUpdates", "true"]);
