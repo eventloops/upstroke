@@ -5729,3 +5729,48 @@ no more.
 
 **Consequence.** A red matching the fingerprint means a removal slower than ten minutes, which is
 worth investigating on its own terms whatever caused it. Owner: as above.
+
+### The second pass on this branch, and a correction to the fingerprint above
+
+`gpt-5.6-sol` at `max` on `7f1b998570197e29d76208448ca637555b33e78a` — the head that carried the
+repairs for the pass on `48cefb3` — returned `CHANGES_REQUIRED` with four findings. The branch's two
+repair rounds were spent by then, so these are recorded here and carried rather than repaired. They
+are `SOL-7F1-01` through `SOL-7F1-04` in PR #109's ledger, all `deferred`.
+
+**The fingerprint given for `FIND-109-CLOSING-CASE-HOLDER-STARVATION` above does not discriminate,
+and must not be relied on as written.** It names
+`removal retries across the closing handle` with os error 32 or 5 — which is exactly what a genuine
+retry regression produces: set `ATTEMPTS = 1` and the held handle makes removal return that error
+naming that slot, as this branch's own mutation witness shows. A maintainer meeting a real
+regression and matching it against that fingerprint would discount it as the known scheduling
+residual, which is the opposite of what a flake record is for. What actually separates the two is
+whether the holder was **still holding when the assertion ran**: the residual reaches the assertion
+with the handle open because the holder never got to close it, while a retry regression reaches it
+with the retry gone. The test does not currently record which happened, so the discriminator is not
+yet observable — a corrected fingerprint needs that, and the repair is left open rather than guessed
+at here.
+
+Also carried, all Windows-only and all in
+`workspace_manager::tests::a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused`:
+
+- **`SOL-7F1-01`, the missed hang survives.** Bounding the holder's first wait does not bound its
+  transition into the second. The holder must still be scheduled to observe the already-queued
+  `Before` signal before it arms the timeout that releases the permanently held handle; descheduled
+  past `FAIL_SAFE` before observing it, the Windows job's own timeout expires first and the test
+  hangs with no diagnostic. This is the same mechanism `FIND-109-FAIL-SAFE-DIAGNOSES-ONLY-ITS-BOUND`
+  names, at the transition rather than at either wait, and that row did not previously say so.
+- **`SOL-7F1-03`, two surviving overclaims.** If the first wait times out and removal then starts
+  during the holder's 300ms sleep, the retry really does run, so the assertion's
+  `whatever this run measured it was not the retry` is not always true; and the test's own doc
+  comment still says the fail-safe "reports it as the unbounded retry it is", which is the claim the
+  repair withdrew.
+- **`SOL-7F1-04`, three unbounded waits.** `ready.recv()` is unbounded, `Holder::drop` joins without
+  a bound, and the join result is discarded — so a holder that panics is not a defined outcome of
+  this test, and a wedged one hangs the job rather than failing it. `standards/10` and §12 both
+  reach this; the pull request deferred only the sleep dependence and did not name these.
+
+**Consequence for all four.** Rates unmeasured; none has been observed. Owner: whoever holds the
+workspace-manager area. The order worth doing them in is the fingerprint first — it is the only one
+that can mislead someone reading a red — then the overclaims, then the unbounded waits, then the
+scope decision on a production seam that
+`FIND-109-CLOSING-CASE-HOLDER-STARVATION` describes.
