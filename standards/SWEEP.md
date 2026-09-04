@@ -27,9 +27,13 @@ in scope only under the activation rule"; `MAINTAINING.md`'s triage clause "or a
 file under a transitional standard"; the `CODING_STANDARDS.md` index paragraph that points here;
 and the hard-conventions bullet in `CLAUDE.md` and `AGENTS.md` that says these rules "bind the
 code a change adds or rewrites" and points at the activation rule. That same pull request adds
-`clippy::indexing_slicing` and `clippy::unreachable` to `[lints]` with their `clippy.toml` test
-allowances, which is what makes the prose removable: §7's panic surface stops being a review duty
-at the commit the build starts catching it. After that §6 and §7 bind the whole tree with no
+`clippy::indexing_slicing` and `clippy::unreachable` to `[lints]`, taking
+`allow-indexing-slicing-in-tests` and no allowance for `unreachable!`, which has none to take (see
+§7). That is what makes the prose removable: the panic surface §7 governs stops being a review duty
+**for these two constructs** at the commit the build starts catching them. It does not end the
+review duty for the panic surface as a whole — `assert!`, `split_at`, `expect`-shaped helpers and
+arithmetic overflow all still terminate, and a local macro that expands to `unreachable!` resolves
+elsewhere and is not caught — so §7's paragraph on what may panic survives these lints. After that §6 and §7 bind the whole tree with no
 scoping, and this file is the record of how the tree got there. Errors are handled where they
 arise; a `?` that survives a sweep is one the reviewer agreed was deliberate; an index or an
 `unreachable!` that survives one is under an `#[expect]` that says why.
@@ -121,22 +125,35 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 | `.clone()` | 1,941 | 84 |
 | `?` (propagation) | ≈1,200 | 71 |
 
-Baseline at the panic-surface tightening, re-measured after the merge-in (master `74537be`, 166
-Rust files under `src/` and `examples/`; it was 77 sites at `44dc06f`, and PR #136's sweep of
-`src/workspace_manager/tests.rs` added two):
+Baseline at the panic-surface tightening, measured at master `74537be` over 166 Rust files under
+`src/` and `examples/` by running the two lints themselves —
+`cargo clippy --all-targets --all-features -- -W clippy::unreachable -W clippy::indexing_slicing`,
+counting each warning's primary span once:
 
-| Construct | Sites | Files |
-|---|---|---|
-| `unreachable!` | 79 | 23 |
-| indexing and slicing | not yet measured | not yet measured |
+| Construct | Sites | Files | In a `tests.rs` | Elsewhere |
+|---|---|---|---|---|
+| `unreachable!` | 65 | 20 | 43 | 22 |
+| indexing and slicing | 1,030 | 72 | 438 | 592 |
 
-`unreachable!` is greppable and the count above is exact at that head. Indexing and slicing are
-not: `v[i]` cannot be told from a macro's brackets or an attribute by text, so the honest count is
-whatever `clippy::indexing_slicing` reports, and no run has been made. Measuring it is the first
-task of the pull request that lands the `[lints]` entries, and until then the queue's sessions are
-the measurement, one file at a time. Eight of the nine files already in the swept table contain no
-`unreachable!`, so for those the second-pass debt below is the indexing half only; the ninth,
-`src/workspace_manager/tests.rs`, holds three and owes both halves.
+**Neither construct can be counted by text, and the earlier figures in this section were a text
+census that was wrong.** `grep` finds 79 mentions of `unreachable!` across 23 files at this head;
+14 of them are comments, doc comments and string literals discussing the construct, several of them
+in the very tests whose helper ends in one. The count above is what the compiler resolves, and it
+supersedes both the 77 recorded at `44dc06f` and the 79 that replaced it. The suite
+`src/workspace_manager/tests.rs` holds **one** invocation, at line 7390, and it was there at
+`44dc06f`: PR #136 added two mentions and no invocations.
+
+Two limits of these numbers, both stated rather than hidden. They are a **Linux** run, so code
+behind a platform gate is invisible to them: `src/runner/host/tests.rs:5161` is a real
+`unreachable!` inside `#[cfg(windows)] fn windows_ambient_coordinator_helper`, which makes the
+across-platform count 66 across 21 files, and the msvc leg is what would report the Windows half of
+the indexing count. And the `tests.rs` split is by file name, so an inline `#[cfg(test)] mod tests`
+inside a production file counts under "elsewhere": 592 and 22 are upper bounds on the production
+figure, not the figure.
+
+Of the nine files in the swept table, eight contain no `unreachable!` at all and the ninth,
+`src/workspace_manager/tests.rs`, contains the single site above — which it inherited rather than
+introduced, and which its sweep already reasoned about.
 
 ## Swept files
 
@@ -167,14 +184,16 @@ code is already correct.
 
 §7's panic surface post-dates every row in the swept table, not just the first five: the rule was
 tightened on 2026-09-04 and the last of these landed the same day under the brief as it then read.
-Eight of the nine contain no `unreachable!`, so what is owed on those is the indexing half — each
-`v[i]` and `&v[a..b]` dispositioned, or replaced by `get`, `first`, `last`, `split_at_checked` or
-a pattern. That is a cheap re-read rather than a session, and the pull request that measures the
-tree with `clippy::indexing_slicing` can settle those eight from its own output.
-`src/workspace_manager/tests.rs` is the exception and owes both halves: it holds three
-`unreachable!` sites, one of them the kill helper's, which PR #136 measured as satisfying the
-`IdUnread` oracle's `!status.success()` and replaced with `died_by_abort`. Each of the three needs
-the `#[expect]` with a `reason` §7 now requires, or the proof that makes it unnecessary.
+What is owed on the eight production files is the indexing half — each `v[i]` and `&v[a..b]`
+dispositioned, or replaced by `get`, `first`, `last`, `split_at_checked` or a pattern. That is a
+cheap re-read rather than a session, and the pull request that lands the lints can settle those
+eight from its own output, since the run above already names every site.
+
+The ninth row, `src/workspace_manager/tests.rs`, owes something different and smaller than an
+earlier draft of this section claimed. Its indexing sites fall under the test allowance the section
+above takes, so nothing is owed there. Its one `unreachable!`, at line 7390, is denied in tests like
+any other and needs an `#[expect(clippy::unreachable, reason = "…")]` or the proof that removes it —
+one site, inherited from before the sweep rather than introduced by it.
 
 They are listed here so the gap is recorded rather than forgotten. The queue comes first: a file
 with no pass at all earns attention before a file that has had several. Decide whether to spend

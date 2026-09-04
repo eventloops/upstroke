@@ -43,10 +43,18 @@ and a message naming the failed premise.
 two whenever the index comes from input, configuration, persisted state, I/O, subprocess behaviour
 or a scheduling outcome. `clippy::indexing_slicing` and `clippy::unreachable` are not in `[lints]`
 today, so those are the constructs this standard governs that the build does not catch: prose where
-the rest of the panic policy is mechanized. Both are owed a `[lints]` entry denying them, with a
-`clippy.toml` test allowance beside the three already there. Prefer `get`, `get_mut`,
-`first`, `last`, `split_at_checked` and pattern matching, each of which returns the absence rather
-than terminating on it. This rule is transitional in the same way as §6's and the `?` rule above: it
+the rest of the panic policy is mechanized. Both are owed a `[lints]` entry denying them, and they
+take **different** treatment in tests, because Clippy offers different treatment. Indexing takes
+`allow-indexing-slicing-in-tests` beside the three allowances already in `clippy.toml`: a test that
+indexes a collection it has just built panics as its own failure, which is the carve-out `panic!`
+and `.expect(` already have. `unreachable!` takes no allowance, because Clippy has none to take —
+there is no `allow-unreachable-in-tests`, and `allow-panic-in-tests` does not suppress
+`clippy::unreachable` (measured on clippy 0.1.97: the site in `src/workspace_manager/tests.rs` is
+reported under this repository's current `clippy.toml`). So `unreachable!` is denied in tests as
+well, like `.unwrap()`, and a test that needs one carries the per-site `#[expect]` with a `reason`
+that this section already requires of every use. Prefer `get`, `get_mut`, `first`, `last`,
+`split_at_checked` and pattern matching, each of which returns the absence rather than terminating
+on it. This rule is transitional in the same way as §6's and the `?` rule above: it
 binds the code a change adds or rewrites, under the activation rule `standards/SWEEP.md` states,
 and the `[lints]` entries land in the pull request that retires that rule, when the tree can compile
 under them.
@@ -56,4 +64,6 @@ unwinding, so `panic = "abort"` is a change to this standard, not a build settin
 
 Enforced by: `[lints]` on all three Clippy legs for `unwrap_used`, `expect_used`, `panic`, `todo`
 and `unimplemented`; review for indexing, slicing, `unreachable!` and the rest, until those two
-lints land.
+lints land. Even once they do, the lints are narrower than this section: `assert!`, `split_at`,
+arithmetic overflow and a local macro that expands to `unreachable!` all still terminate and none
+is caught, so what may panic stays a review question and only these two constructs stop being one.
