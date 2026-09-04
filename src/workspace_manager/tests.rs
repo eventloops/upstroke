@@ -8497,9 +8497,18 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             // descendants `git worktree add` spawns: they survive a bare
             // child kill and go on writing into the worktree
             // `recover_sample` then forces the removal of, and a forced
-            // removal cannot converge against a live writer. Measured, fifty
-            // runs per arm on one machine under one load: 5/50 failures with
-            // the bare child, 0/50 with the group.
+            // removal cannot converge against a live writer. Measured at
+            // this head, fifty runs per arm alternating under load: that
+            // error code 2/50 with the bare child, 0/50 with the group,
+            // agreeing with the 5/50 against 0/50 the finding measured on the
+            // pre-repair tree.
+            //
+            // **It is one of two error codes under the assertion this
+            // protects, and the other is untouched by anything here.** A
+            // zero-length `gitdir` left by the same interrupted command races
+            // nothing, so no kill reaches it; it is a funnel and contract
+            // question filed as its own finding. Nothing below should be read
+            // as saying this test now converges.
             //
             // Neither arm is a claim that the kill *emptied* the group. That
             // is a statement about processes this harness never owned, and
@@ -9018,9 +9027,11 @@ impl WorkspaceManager {
 /// cannot be is a *hard red for an environmental rate*: on the self-hosted
 /// Windows runner an inspection genuinely does fail, `failed to read <a temp
 /// object file>` while a delete-pending removal is still holding the name, at
-/// a rate around 2%, and this test's subject is classification rather than
-/// read reliability. Every branch and every pull request that merges master
-/// paid for that, and #137 paid a rerun.
+/// a rate reported as around 2% and not measured from here, and this test's
+/// subject is classification rather than
+/// read reliability. The assertion is on master, so every branch that merges
+/// master is exposed to it -- exposed, not billed: what is known to have been
+/// spent is #137's one rerun.
 ///
 /// So a refusal is retried rather than tolerated. The two shapes are not
 /// equivalent and this is the one that keeps the assertions: a tolerated
@@ -9717,8 +9728,22 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// completion. A bare child kill leaves `git worktree add`'s descendants
 /// alive and writing into the very worktree [`recover_sample`] then forces
 /// the removal of, and no contract promises a removal converges against a
-/// live writer. Measured, fifty runs per arm, same commit and same load:
-/// bare child 5/50 failed, process group 0/50.
+/// live writer. Measured twice and independently, fifty runs per arm each,
+/// by different hands on different trees:
+/// `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` on the pre-repair tree,
+/// bare child 5/50 against process group 0/50; and again at this repair's own
+/// head, alternating the two binaries run by run under load, bare child 2/50
+/// against process group 0/50. The trees are near-identical -- what is
+/// independent is the measurement, not the code.
+///
+/// **That is one of the two error codes this assertion carries, and the other
+/// one survives.** An interrupted `git worktree add` also leaves a zero-length
+/// `gitdir` -- a registration naming nothing, which `revalidate_removal`
+/// deliberately refuses rather than removes -- and that residue races nothing,
+/// so no kill shape reaches it. Measured 0/50 against 1/50, which is one
+/// event and is what it should be: both arms sample the same rate. It is
+/// `SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR`, and it is why
+/// this repair does not make this test green.
 ///
 /// So the sampled child is spawned with `process_group(0)` and the kill goes
 /// to `-pgid`, which is what production does. **Unix only**: `std` offers no
