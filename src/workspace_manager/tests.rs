@@ -2394,13 +2394,37 @@ fn a_staging_orphan_of_each_kind_is_reported_and_no_removal_site_fires() {
 
 /// `commit_parent` and `commit_tree_sha` used to fold every failure of the
 /// command into `None` through `git_ok(..).ok()`, a containment refusal
-/// included: the outer `revalidate()` does not read `hooks-none`'s entries,
-/// so a hook planted there after the gate reached the runner's check and
-/// its refusal came back as "not a commit". Only Git's own quiet "no such
-/// object" is `None`; the refusal propagates.
+/// included: an entry appearing in `hooks-none` between the gate's own
+/// `worktree list` and the lookup's `rev-parse` made the per-command check
+/// refuse, and `.ok()` turned that refusal into "not a commit". The gate
+/// reads the hooks path through the same runner, so from the public methods
+/// it refuses first; the lookup itself is driven here directly, as the
+/// second command in that sequence. Only Git's own quiet "no such object"
+/// (exit status 1, nothing on stderr) is `None`; a refusal and a Git failure
+/// that speaks both propagate.
 #[test]
 fn a_hook_planted_in_hooks_none_makes_the_object_lookups_refuse_rather_than_answer_none() {
     let fixture = Fixture::created("lookup-refuses");
+    let lookup = |spec: String| {
+        [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(spec),
+        ]
+    };
+
+    // A Git failure that speaks is an error, not absence: peeling a tree to
+    // a commit exits 1 with a message.
+    let spoken = fixture
+        .manager
+        .quiet_object_lookup(&lookup(format!("{}^{{tree}}^{{commit}}", fixture.head)))
+        .expect_err("a Git failure that speaks propagates");
+    assert!(
+        matches!(&spoken, UpstrokeError::Git { message } if message.contains("rev-parse")),
+        "the error names the command: {spoken}"
+    );
+
     fs::write(
         fixture
             .manager
@@ -2410,6 +2434,15 @@ fn a_hook_planted_in_hooks_none_makes_the_object_lookups_refuse_rather_than_answ
         b"#!/bin/sh\nexit 0\n",
     )
     .expect("plant a hook");
+    let refused = fixture
+        .manager
+        .quiet_object_lookup(&lookup(format!("{}^{{commit}}^", fixture.head)))
+        .expect_err("the lookup propagates the runner's refusal rather than answering None");
+    let message = refusal_of(&refused);
+    assert!(
+        message.contains("hook-free") && message.contains("post-checkout"),
+        "the refusal must name its reason: {message}"
+    );
     for (name, result) in [
         (
             "commit_parent",
