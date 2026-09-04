@@ -70,40 +70,62 @@ than left standing: the `m4-workspace` split added \
 commit, so this file is now graded against all three governed lints and named \
 in the domain individually. The level below is unchanged; what changed is that \
 a gate now checks it. \
-THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
-calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
-all three lints; this row allows TWO of that three, so it is a strict subset \
-and the move changes where the level is stated, not what it permits. \
-WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
-counting the errors: `clippy::disallowed_methods`, 15 sites -- it builds and \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. At extraction these same bodies \
+made these same calls inside `src/workspace_manager.rs`, under that file's own \
+inner allow of all three lints. The bodies are no longer byte-identical -- the \
+sweep of this file changed them and the counts below are re-measured -- but the \
+LEVEL is what this clause is about, and it is unchanged: TWO of that three, a \
+strict subset of the parent's allow, so the move still changes where the level \
+is stated and not what it permits. \
+WHAT IT NEEDS EACH FOR, re-measured in the sweep by denying all three and \
+counting the errors: `clippy::disallowed_methods`, 23 sites -- it builds and \
 tears down the scratch repositories the suites measure against \
-(`fs::create_dir_all` 5, `fs::write` 4, `fs::remove_dir_all` 2, \
-`fs::remove_file` 1) and runs real children (`Command::output` 1, \
-`Command::status` 1, `Command::spawn` 1), because no funnel owns `git init` and \
-a fixture that never runs `git` builds no repository to measure; \
-`clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
+(`fs::remove_dir_all` 5, `fs::create_dir_all` 4, `fs::write` 4, \
+`fs::set_permissions` 4, `fs::create_dir` 1, `fs::remove_file` 1), runs real \
+children (`Command::output` 2, `Command::spawn` 1), and asks the operating \
+system whether one of them is still there (`libc::kill` 1, signal 0, in the \
+`#[cfg(unix)]` test that witnesses `KillableGitChild`'s drop), because no funnel \
+owns `git init` and a fixture that never runs `git` builds no repository to \
+measure; `clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
+AT EXTRACTION THE COUNT WAS 15 AND THE COMPOSITION WAS DIFFERENT, so the change \
+is recorded rather than overwritten: `Command::status` 1 became `Command::output` \
+2 when the child runner started reading the child's streams; `fs::create_dir_all` \
+5 became 4 plus one exclusive `fs::create_dir` when `scratch` stopped adopting a \
+directory it had not made; and the tests the file now carries account for the \
+four `fs::set_permissions`, three of the five `fs::remove_dir_all` and the one \
+`libc::kill`. \
 `clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
 at zero sites, and the two `#[cfg(windows)]` bodies a Unix host cannot measure \
 are `ExitStatus` arithmetic naming no macro -- so a `println!` here is still a \
 build error. \
-CONTAINMENT, STATED AS IT IS. Every write and every directory creation is under \
-a root from `scratch`, which is `std::env::temp_dir()` joined with a name \
-carrying the tag, the process id and a per-call ordinal, and `Fixture::drop` \
-removes its own root. Two effects are NOT confined to that root, and they are \
-named rather than elided: `scratch` opens with `let _ = \
-fs::remove_dir_all(&dir)` on that predictable path, so a process-id collision \
-after a crashed run can delete a stale tree this call did not create; and \
-`run_kill_child` re-execs THIS test binary `--exact --ignored` while `git_out` \
-and `KillableGitChild::spawn` run the system `git` in a caller-supplied \
-directory. Both bodies are byte-identical to what already ran inside the parent. \
+CONTAINMENT, STATED AS IT IS AND AS FAR AS IT IS ENFORCED. Every write and every \
+directory creation this module performs is under a root from `scratch`, which is \
+`std::env::temp_dir()` joined with a name carrying the tag, the process id and a \
+per-call ordinal, and `Fixture::drop` removes its own root. THAT IS A PROPERTY OF \
+THE CALLERS AND NOT OF THE TYPES: `write_file` and `create_dir` write wherever \
+the caller points them, and no token of the kind `rundir`'s scratch tree carries \
+is issued or checked. `reviews/FINDINGS.md` records that as a deferred row for \
+the sweep of `src/workspace_manager.rs`, with the token as the proposal. Three \
+effects are NOT confined to that root, and they are named rather than elided: \
+`scratch` removes a stale tree at its predictable path, which after a process-id \
+collision is a tree this call did not create -- it now REPORTS a removal that \
+failed instead of adopting whatever survived it, so what is unaccounted for here \
+is the deletion and no longer the adoption; `run_child_test` re-execs THIS test \
+binary `--exact --ignored`; and `git_out` and `KillableGitChild::spawn` run the \
+system `git` in a caller-supplied directory, with Git's own repository-locating \
+environment removed from every command the module builds, so that an ambient \
+`GIT_DIR` cannot move the effect into a repository nobody named (measured, git \
+2.43.0: with it set, `git -C <fresh> init` re-initialises the repository the \
+variable names and exits 0). \
 HANDLES, PRECISELY, because a blanket claim here would be false: no item returns \
 a `File`, an `OpenOptions` or a `Command`, but one DOES hand back a live process \
 handle and it is named rather than covered. `KillableGitChild::spawn` returns a \
 `pub(crate)` type owning a `std::process::Child`, because the residue kill \
 sampler has to kill a real `git` at a chosen instant and a handle it cannot \
 reach is a kill it cannot time. Its `child` field is private, it exposes only \
-`kill`, `exited`, `wait` and `fired`, and the whole module is `#[cfg(test)]` so \
-the type is not in the rlib at all. \
+`kill`, `exited`, `wait`, `fired` and `id`, it kills and reaps the child in its \
+own `Drop` because `std::process::Child` does neither, and the whole module is \
+`#[cfg(test)]` so the type is not in the rlib at all. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
