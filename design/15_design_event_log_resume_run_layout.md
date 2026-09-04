@@ -27,7 +27,20 @@ The split keeps transcripts and reviewer records out of ordinary workspace reads
 
 The v0.2 execution root is deliberately non-authoritative. A container receives only its role's one worktree mount; it never receives the public log, sibling worktrees, or private artifacts. On the host runner the agent permission surface remains the boundary and gate code is not OS-confined — the reason the container runner exists. Worktree disappearance is recoverable from events and internal refs, and cleanup follows a terminal event rather than creating one.
 
+The execution root is created only when the managed base is a real directory, the chain from the authorized private root down to the root carries no symlink or reparse point and no regular file, the canonical root is inside no repository worktree, and no foreign worktree is inside it. A run id is one plain path component, so the path recorded above is the only one it can name. Every create, reclaim and delete revalidates all of that before entering its effect funnel, and re-checks the chain inside the funnel, after its before-hook and immediately before the effect.
+
 Current host-process crash containment is deliberately platform-specific. On Unix, ordinary descendants remain in an isolated process group and a separate cleanup reaper retains the run's cleanup lease if the conductor is killed; code that deliberately daemonises out of that group remains outside the host-runner contract. When a forked helper (the cleanup reaper or the job-control guard) does not report READY within its startup budget, the launch fails and the error carries what the parent can see of the child at that moment (alive, stopped, exited but unreaped, or gone) and, where the host reports it, how many descriptors it holds open. A helper given up on is signalled only after a non-blocking `waitpid` has proved its pid still names this process's unreaped child, and is reaped within a bound; one that has not exited by then is left, with the signal pending, for the process's exit to collect, so that the launch barrier is not held for as long as the kernel takes. On Windows, each command is created suspended, assigned to a private kill-on-close Job Object, and only then resumed. Direct-child success and timeout both terminate and boundedly observe that job empty; abrupt conductor death closes its non-inheritable handle and lets the kernel terminate ordinary descendants. PID scanning and `taskkill` are not part of the ownership protocol. Exact gate/review worktrees likewise record and sync a private intent before `git worktree add`; resume reclaims every such registration before it switches branches or dispatches another worker.
+
+**Synced intents.** Each intent file is one JSON object with exactly four string fields, in this
+order: `kind`, `slot`, `run_id`, `incarnation`. `kind` is one of `task`, `staging` or `snapshot`.
+`slot` is the slot's identifier, `<namespace>/<component>`, the canonical spelling of a slot the
+engine validated; it names the slot for whoever reads the record, and the filesystem path is
+derived from the intent's file name and the execution root, never from this field. A reader
+accepts no other key, no alias for a key or a kind word, no default for a missing field, and no
+record whose `kind` disagrees with the namespace of its `slot`; any of those is refused. No code
+in the engine acts on a record's contents: reclaim trusts the intent's file name alone, and the
+record is provenance for an operator and for any future reader, which this contract binds. The
+implementation is `IntentRecord` in `src/workspace_manager/naming.rs`.
 
 Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file.
 

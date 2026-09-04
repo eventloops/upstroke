@@ -60,6 +60,8 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "acted_through",
+    "acted_through_paths",
     "add_snapshot",
     "assert_publishable",
     "base",
@@ -236,6 +238,7 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "apply",
+    "consult",
     "durability_ledger",
     "funnel",
     "harness",
@@ -243,10 +246,12 @@ effect_free = [
     "new",
     "phase",
     "point",
+    "poisoned",
     "recording_durability",
+    "refusal_cause",
 ]
 
-# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
+# Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.
 [[module]]
 path = "src/workspace_manager/naming.rs"
 crate_path = "upstroke::workspace_manager::naming"
@@ -257,18 +262,31 @@ effectful_unnameable = []
 effect_free = [
     "as_str",
     "fmt",
+    "from",
     "from_intent_name",
     "gates",
+    "deserialize",
+    "expecting",
+    "id",
+    "incarnation",
     "integration",
+    "intent_kind",
     "intent_name",
     "kind",
+    "new",
     "relative",
     "review",
+    "run_id",
     "safe_component",
+    "serialize",
+    "slot",
+    "try_from",
     "validate",
+    "visit_map",
+    "visit_str",
 ]
 
-# Object-id well-formedness and the two refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
+# Object-id well-formedness and the refusals every ref transition is gated on. Predicates over a `&str`; the transitions they guard are the parent's funnels.
 [[module]]
 path = "src/workspace_manager/object.rs"
 crate_path = "upstroke::workspace_manager::object"
@@ -280,7 +298,7 @@ effect_free = [
     "is_null_object_id",
     "is_object_id",
     "refuse_expected_old",
-    "refuse_malformed_object_id",
+    "refuse_new",
 ]
 
 # Decoders for the bytes Git's plumbing hands back. Functions over `&[u8]`; the commands whose output they read are run by the parent, inside its funnels.
@@ -292,6 +310,7 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "changed_path_records",
     "decode_changed_paths",
     "parse_worktree_records",
     "registration_checkout",

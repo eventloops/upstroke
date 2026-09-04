@@ -461,6 +461,12 @@ impl EffectHooks for ArmedEffects {
     fn durability_ledger(&self) -> DurabilityLedger {
         self.inner.durability_ledger()
     }
+
+    // Forwarded, so a poison the inner observer found is reported as poison
+    // and not as a fault this double armed.
+    fn refusal_cause(&self) -> Option<String> {
+        self.inner.refusal_cause()
+    }
 }
 
 /// The order the funnels ran in, which is what an ordering clause is about.
@@ -1729,7 +1735,7 @@ fn snapshot_residue_reclaimed() {
         .reclaim_intents(hooks.effects())
         .expect("reclaim");
     assert!(
-        reclaimed.contains(&review.slot),
+        reclaimed.slots.contains(&review.slot),
         "the reviewer's snapshot is reclaimed as residue: {reclaimed:?}"
     );
     assert!(!review.path.exists(), "its worktree is gone");
