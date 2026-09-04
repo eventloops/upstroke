@@ -2010,7 +2010,7 @@ impl WorkspaceManager {
                 OsString::from("-z"),
             ],
         )?;
-        Ok(parse_worktree_records(&output))
+        parse_worktree_records(&output)
     }
 
     fn worktree_record(&self, path: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
@@ -2385,7 +2385,7 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
         return Ok(None);
     }
     let wanted = canonical_prefix(worktree)?;
-    for record in parse_worktree_records(&output.stdout) {
+    for record in parse_worktree_records(&output.stdout)? {
         if canonical_prefix(&record.path)? == wanted {
             return Ok(Some(record));
         }

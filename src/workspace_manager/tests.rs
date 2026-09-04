@@ -2442,7 +2442,7 @@ fn registration_gitdir_decodes_non_utf8_path_bytes() {
 
     let decoded = registration_checkout(
         Path::new("/repository/.git/worktrees/example"),
-        b" /tmp/non-utf8-\xff/.git\n",
+        b"/tmp/non-utf8-\xff/.git\n",
     )
     .expect("byte-valid registration");
     assert_eq!(
