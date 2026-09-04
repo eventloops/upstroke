@@ -3280,10 +3280,6 @@ fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
     ))
 }
 
-fn index_lock_present(worktree: &Path) -> Result<bool, UpstrokeError> {
-    Ok(git_dir_of(worktree)?.is_some_and(|dir| dir.join("index.lock").exists()))
-}
-
 /// Whether anything in the working tree is not yet in the index.
 fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, UpstrokeError> {
     // `--no-renames` is load-bearing, not tidiness: `status --porcelain -z`
