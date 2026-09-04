@@ -289,8 +289,36 @@ pub(super) fn commit_record_proves_absence(stat: &io::Result<fs::Metadata>) -> b
 /// content". Read literally: anything other than the staging file is other
 /// content, the empty run skeleton included, because retention costs a
 /// report and reclamation cannot be undone.
+///
+/// **Both reclaiming answers require a listing that happened**
+/// (`SWEEP-CLASSIFY-009`). This is a *second* observation of a directory the
+/// caller has already failed to read once — it is reached only from conjunct
+/// 1's error arm — and [`super::read_dir_names`] used to answer `[]` for a
+/// `read_dir` that failed, which is this function's `Bare` arm and the
+/// reclaiming one. A transient whole-process descriptor exhaustion (`EMFILE`,
+/// `ENFILE`) fails the classification probe's `open`, the marker read and this
+/// listing in the same moment; the plan became `ReclaimPublicOnly`, which
+/// carries no commit-record check anywhere on its path, and
+/// [`super::remove_public_husk`] then listed the directory again after the
+/// transient had cleared and removed a committed run's public half,
+/// `events.jsonl` included.
+///
+/// So a listing that did not answer is [`RetainReason::ListingUnreadable`]: no
+/// token, nothing deleted, the husk reported with the error that stopped the
+/// listing. It is the same fail-closed choice [`commit_record_proves_absence`]
+/// makes one conjunct further down, and the cost of being wrong is the same
+/// shape — a husk retained until an operator prunes it, against a committed run
+/// that is gone.
 fn unbound_shape(public: &Path) -> PrivateHalfOwnership {
-    match read_dir_names(public).as_slice() {
+    let names = match read_dir_names(public) {
+        Ok(names) => names,
+        Err(error) => {
+            return PrivateHalfOwnership::Retained(RetainReason::ListingUnreadable {
+                detail: format!("{}: {error}", public.display()),
+            });
+        }
+    };
+    match names.as_slice() {
         [] => PrivateHalfOwnership::NothingBound(UnboundShape::Bare),
         [only] if only == MARKER_STAGED => {
             PrivateHalfOwnership::NothingBound(UnboundShape::StagedMarkerOnly)

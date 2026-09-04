@@ -66,6 +66,16 @@ pub enum RetainReason {
     },
     /// A husk with no marker at all, carrying run-scoped content.
     MarkerlessWithContent,
+    /// The public half's own listing did not answer, so its shape was never
+    /// established and neither reclaiming shape can be ruled in.
+    ///
+    /// `startup_census` (i) reclaims a husk that *is* "a bare directory or one
+    /// holding only a staged `.creating.tmp`", and a directory that could not be
+    /// listed has not been shown to be either. The detail carries the path and
+    /// the error, because "could not be listed" leaves an operator no way to
+    /// tell a descriptor exhaustion that has since cleared from a permission
+    /// that has not.
+    ListingUnreadable { detail: String },
     /// `committed.json` is present: the private half may have crossed P5b, so
     /// no census and no creating process ever deletes it.
     PossiblyCommitted,
@@ -88,6 +98,7 @@ impl RetainReason {
         "owner-record-unparseable",
         "owner-record-disagrees",
         "markerless-with-content",
+        "listing-unreadable",
         "possibly-committed",
     ];
 
@@ -104,6 +115,7 @@ impl RetainReason {
             Self::OwnerRecordUnparseable => "owner-record-unparseable",
             Self::OwnerRecordDisagrees { .. } => "owner-record-disagrees",
             Self::MarkerlessWithContent => "markerless-with-content",
+            Self::ListingUnreadable { .. } => "listing-unreadable",
             Self::PossiblyCommitted => "possibly-committed",
         }
     }
@@ -194,6 +206,10 @@ impl std::fmt::Display for RetainReason {
             Self::MarkerlessWithContent => {
                 f.write_str("it carries run-scoped content but no marker to bind it")
             }
+            Self::ListingUnreadable { detail } => write!(
+                f,
+                "its contents could not be listed, so nothing about its shape is                  established: {detail}"
+            ),
             Self::PossiblyCommitted => {
                 f.write_str("its private half carries a commit record, so the run may have started")
             }

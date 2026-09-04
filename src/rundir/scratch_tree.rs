@@ -706,7 +706,9 @@ mod witnesses {
                  exists for"
         );
         assert_eq!(
-            read_dir_names(parent.path()).len(),
+            read_dir_names(parent.path())
+                .expect("the parent lists")
+                .len(),
             2,
             "both roots must be present at once, or the second acquisition took the \
                  first's name"
@@ -798,7 +800,7 @@ mod witnesses {
         // non-portable (`PR77-WIN-UNDECIDABLE-STAT-ORACLE` — the Windows
         // guest maps that stat to `NotFound`).
         assert_eq!(
-            read_dir_names(parent.path()),
+            read_dir_names(parent.path()).expect("the parent lists"),
             ["a-file"],
             "a refused acquisition left something behind in the parent"
         );

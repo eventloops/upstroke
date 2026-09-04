@@ -830,7 +830,19 @@ pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<
         hooks,
         EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
         || {
-            for entry in read_dir_names(public) {
+            // The listing first, and the whole listing, before anything is
+            // removed. This loop used to run over `read_dir_names`' silent
+            // `Vec::new()`, so a directory this call could not read was one it
+            // removed nothing from — and then unlinked the marker anyway and
+            // failed on the non-empty directory, leaving a husk carrying content
+            // whose private half no marker names any more. A listing that did
+            // not answer now refuses the whole removal, with nothing touched
+            // (`SWEEP-CLASSIFY-009`).
+            let entries = read_dir_names(public).map_err(|source| UpstrokeError::Io {
+                path: public.to_path_buf(),
+                source,
+            })?;
+            for entry in entries {
                 if entry == MARKER {
                     continue;
                 }
@@ -886,16 +898,46 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
     }
 }
 
-fn read_dir_names(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+/// Every name in `dir`, sorted — or the failure that stopped the listing.
+///
+/// **A listing that did not happen is not an empty one** (`SWEEP-CLASSIFY-009`).
+/// This returned `Vec::new()` for a `read_dir` that failed and dropped every
+/// per-entry error with `flatten()`, so "I could not read this directory" and
+/// "this directory is empty" were the same value — and empty is the *reclaiming*
+/// answer at `unbound_shape` and the *nothing to remove* answer in
+/// [`remove_public_husk`]. Under a whole-process descriptor exhaustion
+/// (`EMFILE`, `ENFILE`, which are ordinary on a busy machine and transient) the
+/// classification probe's `open`, the marker read and this listing fail
+/// together, and a committed run's public half was removed on the evidence that
+/// it was empty.
+///
+/// So the answer is a `Result` and every caller decides for itself. The two on
+/// the reclaim path both decide the same way — refuse — and this function makes
+/// no decision at all, which is why it is a `Result` rather than an enum of
+/// shapes: the shapes are `unbound_shape`'s vocabulary and it already has them.
+///
+/// **No error kind is privileged, `NotFound` included.** The question this
+/// answers is "what is in this directory", and only a listing that completed
+/// answers it; a directory that is not there has not answered it either. That is
+/// also the portable rule: this crate has already measured the Windows guest
+/// mapping a stat beneath a file ancestor to `NotFound`
+/// (`PR77-WIN-UNDECIDABLE-STAT-ORACLE`), so a rule reading one `ErrorKind` as
+/// established absence would mean one thing on Linux and another there.
+///
+/// Per-entry errors are propagated for the same reason: `read_dir` succeeding
+/// and an entry failing is a directory that listed *partially*, which is not a
+/// directory that is empty and not one whose contents are known.
+///
+/// The file already answers two other unanswerable probes this way and this was
+/// the one that did not: [`is_running`] calls a lock it cannot inspect held, and
+/// [`commit_record_after_error`] calls a stat it cannot take `Unknown`.
+fn read_dir_names(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------

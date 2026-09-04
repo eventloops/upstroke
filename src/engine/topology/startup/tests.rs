@@ -1095,6 +1095,9 @@ fn every_retain_reason() -> Vec<RetainReason> {
             expected: "b".to_owned(),
         },
         RetainReason::MarkerlessWithContent,
+        RetainReason::ListingUnreadable {
+            detail: "a: b".to_owned(),
+        },
         RetainReason::PossiblyCommitted,
     ]
 }

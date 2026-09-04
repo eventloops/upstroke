@@ -1870,6 +1870,23 @@ fn proof_cases() -> Vec<ProofCase> {
             expect: Expect::Retained("markerless-with-content", None),
         },
         ProofCase {
+            // The other answer `unbound_shape` gives, and the one this grid
+            // could not reach before `SWEEP-CLASSIFY-009`: a listing that did
+            // not happen used to be an empty one, which is the *reclaiming*
+            // answer. Removing the public directory is how a `read_dir` is made
+            // to fail on every platform this crate builds for; the `EACCES`
+            // shape the finding is actually about — a transient the whole
+            // process hits, where the marker read and the listing fail together
+            // and clear before the removal runs — needs mode bits and is the
+            // Unix witness below.
+            name: "a public half whose listing does not answer",
+            before: nothing,
+            after: |husk| {
+                fs::remove_dir_all(husk.public()).expect("remove the public half");
+            },
+            expect: Expect::Retained("listing-unreadable", None),
+        },
+        ProofCase {
             name: "private half carrying a commit record",
             before: nothing,
             after: |husk| write(&husk.private.join(COMMIT_RECORD), b"{}"),
@@ -2456,6 +2473,169 @@ fn a_public_husk_removal_that_fails_partway_leaves_the_marker_that_locates_it() 
     assert!(!public.exists(), "including the marker and the directory");
 }
 
+/// `SWEEP-CLASSIFY-009`: a committed run whose directory could not be read
+/// is **not** an empty one, and its public half is still there afterwards.
+///
+/// The mechanism, in the order it happens. A transient whole-process
+/// descriptor exhaustion — `EMFILE`, `ENFILE`, ordinary on a busy machine —
+/// fails the classification probe's `open`, the marker read at conjunct 1
+/// and the listing under it in the same moment. `read_dir_names` answered
+/// `[]` for that failed listing and `[]` is `unbound_shape`'s `Bare` arm, so
+/// the census classified `Husk`, the proof answered `NothingBound(Bare)` and
+/// the plan became `ReclaimPublicOnly` — which carries no commit-record check
+/// anywhere on its path. Both call sites do the same thing with that answer
+/// (`engine::topology::startup::apply`'s `ReclaimPublicOnly` arm and
+/// `create.rs`'s `stat_after_error`): they call `remove_public_husk`, which
+/// lists the directory a **second** time, after the transient has cleared,
+/// and removes what it finds.
+///
+/// So the fixture is that sequence and nothing else: the answer is taken
+/// while the directory cannot be read, the permissions go back before the
+/// reclaim, and the reclaim runs exactly when the answer licenses it. The
+/// control above it is the same directory, readable: it is retained as a
+/// marker-less husk carrying content, so readability is the only difference
+/// between the two runs.
+///
+/// Unix only, and the mode bits are asserted rather than assumed: a process
+/// with the privilege to ignore them measures nothing, and this fails there
+/// rather than passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("unreadable-committed");
+    husk.publish();
+    let public = husk.public();
+    // A committed run in its ordinary end state: the log has its first line
+    // and the creator's marker is gone.
+    fs::remove_file(public.join(MARKER)).expect("the run committed, so the marker went");
+    write(
+        &public.join(EVENT_LOG),
+        format!("{}\n", committed_line(BOUND_RUN, 4)).as_bytes(),
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Committed,
+        "the fixture must be a committed run, or this measures nothing"
+    );
+
+    // The control. Readable, this directory is retained: the listing holds
+    // `events.jsonl`, which is content no marker binds.
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "markerless-with-content",
+            "readable, it is content with no marker: {reason}"
+        ),
+        other => panic!("readable, this husk is retained, not {other:?}"),
+    }
+
+    // The transient. Everything that reads this directory fails at once.
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o000)).expect("close it");
+    assert!(
+        fs::read_dir(&public).is_err(),
+        "this fixture needs a listing that fails, and here one does not — a process with          the privilege to ignore the permission bits cannot measure this"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Husk,
+        "the classifier's own open fails in the same moment, which is what makes the          census reach the proof at all"
+    );
+    let answer = husk.prove();
+    // And it clears, before anything is deleted — which is the whole point:
+    // the second listing succeeds.
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o700)).expect("open it again");
+
+    match answer {
+        // What both call sites do with a `NothingBound`, done here rather
+        // than described: the public half is reclaimed, no commit record
+        // consulted. Before the fix this arm ran and took `events.jsonl`
+        // with it.
+        PrivateHalfOwnership::NothingBound(shape) => {
+            let reclaimed = remove_public_husk(&public, &mut NoHooks);
+            panic!(
+                "an unreadable listing answered {shape:?}, the reclaiming answer; the \
+                 reclaim it licenses returned {reclaimed:?} and the committed log is {}",
+                if public.join(EVENT_LOG).is_file() {
+                    "still there"
+                } else {
+                    "GONE"
+                }
+            );
+        }
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "listing-unreadable", "{reason}");
+            assert!(
+                reason.to_string().contains(&public.display().to_string()),
+                "the operator is told which directory did not answer: {reason}"
+            );
+        }
+        PrivateHalfOwnership::Proven(_) => {
+            panic!("a directory that could not be read proved nothing")
+        }
+    }
+
+    assert!(
+        public.join(EVENT_LOG).is_file(),
+        "the committed run's log is still here"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Committed,
+        "and the run is still a committed run"
+    );
+}
+
+/// The removal's **own** listing, which is the second observation and the
+/// one that deletes.
+///
+/// `remove_public_husk` ran its loop over `read_dir_names`' silent
+/// `Vec::new()`, so a directory it could not list was one it removed nothing
+/// from — and then unlinked the marker anyway and failed on the non-empty
+/// directory. That leaves a husk carrying content whose private half no
+/// marker names any more, and `create.rs` says what that costs: "a private
+/// half no marker names is one no census, no `status` and no deferred prune
+/// can ever reach again".
+///
+/// Mode `0o300` is the shape descriptor exhaustion has, built without
+/// privilege: search and write, no read. `read_dir` fails, and the unlink of
+/// the marker inside it would succeed — a listing needs a descriptor and an
+/// unlink does not.
+#[cfg(unix)]
+#[test]
+fn a_public_removal_whose_listing_does_not_answer_removes_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("publichusk-unlistable");
+    husk.publish();
+    let public = husk.public();
+    write(&public.join(PLAN), b"{}");
+
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o300)).expect("no read bit");
+    assert!(
+        fs::read_dir(&public).is_err(),
+        "this fixture needs a listing that fails, and here one does not — a process with          the privilege to ignore the permission bits cannot measure this"
+    );
+
+    let error = remove_public_husk(&public, &mut NoHooks)
+        .expect_err("a removal that cannot list what it is removing refuses");
+
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o700)).expect("open it again");
+    assert!(
+        public.join(MARKER).is_file(),
+        "the marker that locates the private half survived: {error}"
+    );
+    assert!(
+        public.join(PLAN).is_file(),
+        "and so did the content the listing never named: {error}"
+    );
+    assert!(
+        error.to_string().contains(&public.display().to_string()),
+        "the failure names the directory it could not list: {error}"
+    );
+}
+
 /// A public half whose only content is `.creating.tmp` is **removed**, not
 /// retained.
 ///
@@ -2526,7 +2706,7 @@ fn p0_creates_the_public_directory_and_nothing_private() {
 
     assert!(public.is_dir(), "P0 created the public run directory");
     assert_eq!(
-        read_dir_names(&public),
+        read_dir_names(&public).expect("the public directory lists"),
         Vec::<String>::new(),
         "and it is bare: no skeleton, no marker, no private half beneath it"
     );
@@ -2558,21 +2738,21 @@ fn the_owner_record_is_the_first_content_of_a_private_half() {
 
     create_private_dir(&private, &mut NoHooks).expect("P3");
     assert_eq!(
-        read_dir_names(&private),
+        read_dir_names(&private).expect("the private half lists"),
         Vec::<String>::new(),
         "immediately after P3 the private half is empty"
     );
 
     stage_owner_record(&private, &owner, &mut NoHooks).expect("P3a");
     assert_eq!(
-        read_dir_names(&private),
+        read_dir_names(&private).expect("the private half lists"),
         vec![OWNER_RECORD_STAGED.to_owned()],
         "the staged owner record is the only thing in it"
     );
 
     publish_owner_record(&private, &mut NoHooks).expect("P3b");
     assert_eq!(
-        read_dir_names(&private),
+        read_dir_names(&private).expect("the private half lists"),
         vec![OWNER_RECORD.to_owned()],
         "and after publication the owner record is the only content there has ever been"
     );
