@@ -878,7 +878,21 @@ impl Run {
         // leaves behind is still owned; under the temporary directory
         // otherwise, which is every ordinary test.
         let fixture = match std::env::var_os(KILL_SCRATCH) {
-            Some(parent) => Fixture::created_under(Path::new(&parent)),
+            Some(parent) => {
+                let parent = PathBuf::from(parent);
+                // Validated rather than trusted, even though the blast radius
+                // of a wrong value is pollution and not deletion: nothing
+                // removes this path, because the guard belongs to the parent's
+                // own tree and the child holds none. A stray value would
+                // otherwise build a repository somewhere surprising and fail
+                // later, somewhere else.
+                assert!(
+                    parent.is_absolute() && parent.is_dir(),
+                    "`{KILL_SCRATCH}` must name an existing absolute directory, and named {}",
+                    parent.display()
+                );
+                Fixture::created_under(&parent)
+            }
             None => Fixture::created(tag),
         };
         let harness = Arc::new(Mutex::new(HookHarness::new()));

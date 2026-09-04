@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 // The repository fixture and the three Git helpers are `fixture`'s, not
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
-use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_kill_child, scratch};
+use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_child_test, scratch};
 
 /// `value`, which the fixture read from Git, as the [`ObjectId`] every
 /// snapshot input is built from.
@@ -7181,20 +7181,23 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
     );
     // **And it must be an abort by this platform's own measure, not merely
     // an exit that is neither success nor a panic** (PR #136 pass 2,
-    // finding 2). `died_by_abort` names `SIGABRT` on Unix, but on Windows it
-    // is a negation — unsuccessful and not the panic's 101 — because
-    // `abort()` reaches `__fastfail`, whose code has moved between CRT
-    // versions and so cannot be written down. A negation accepts far too
-    // much: change only the Windows arm of `Injection::Kill` from `abort()`
-    // to `process::exit(1)` and the helper still dies at `IdUnread`, still
-    // leaves the object, and still satisfies every assertion here.
+    // finding 2). `died_by_abort` names `SIGABRT` on Unix; on Windows it was
+    // a negation — unsuccessful and not the panic's 101 — because `abort()`
+    // reaches `__fastfail`, whose code has moved between CRT versions and so
+    // cannot be written down. A negation accepts far too much: change only
+    // the Windows arm of `Injection::Kill` from `abort()` to
+    // `process::exit(1)` and the helper still dies at `IdUnread`, still
+    // leaves the object, and still satisfies every assertion here. PR #135
+    // took that finding into `fixture.rs` and replaced the negation with the
+    // same measurement this test uses; the comparison below stays, because it
+    // is what pins the property here rather than in the predicate.
     //
     // What cannot be written down can still be **measured**. This runs one
     // child whose whole body is `std::process::abort()`, on this machine and
     // this CRT, moments before the comparison — so the oracle is the exit
     // status an abort actually produces here, and `exit(1)` is not equal to
     // it on either platform.
-    let aborted = run_kill_child(
+    let aborted = run_child_test(
         "workspace_manager::tests::abort_probe_helper",
         &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
     );
@@ -7287,11 +7290,11 @@ fn exit_one_probe_helper() {
 /// comparing against a *measured* abort does not.
 #[test]
 fn the_abort_oracle_separates_an_abort_from_an_exit_of_one() {
-    let aborted = run_kill_child(
+    let aborted = run_child_test(
         "workspace_manager::tests::abort_probe_helper",
         &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
     );
-    let exited = run_kill_child(
+    let exited = run_child_test(
         "workspace_manager::tests::exit_one_probe_helper",
         &[(EXIT_ONE_PROBE, std::ffi::OsStr::new("1"))],
     );
