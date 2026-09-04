@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 // The repository fixture and the three Git helpers are `fixture`'s, not
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
-use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, scratch};
+use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_kill_child, scratch};
 
 /// `value`, which the fixture read from Git, as the [`ObjectId`] every
 /// snapshot input is built from.
@@ -7165,6 +7165,35 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
          `unreachable!` and panic: {:?}",
         helper.status
     );
+    // **And it must be an abort by this platform's own measure, not merely
+    // an exit that is neither success nor a panic** (PR #136 pass 2,
+    // finding 2). `died_by_abort` names `SIGABRT` on Unix, but on Windows it
+    // is a negation — unsuccessful and not the panic's 101 — because
+    // `abort()` reaches `__fastfail`, whose code has moved between CRT
+    // versions and so cannot be written down. A negation accepts far too
+    // much: change only the Windows arm of `Injection::Kill` from `abort()`
+    // to `process::exit(1)` and the helper still dies at `IdUnread`, still
+    // leaves the object, and still satisfies every assertion here.
+    //
+    // What cannot be written down can still be **measured**. This runs one
+    // child whose whole body is `std::process::abort()`, on this machine and
+    // this CRT, moments before the comparison — so the oracle is the exit
+    // status an abort actually produces here, and `exit(1)` is not equal to
+    // it on either platform.
+    let aborted = run_kill_child(
+        "workspace_manager::tests::abort_probe_helper",
+        &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
+    );
+    assert!(
+        died_by_abort(&aborted),
+        "the probe must itself look like an abort, or it is measuring nothing: {aborted:?}"
+    );
+    assert!(
+        same_end(&helper.status, &aborted),
+        "the helper ended {:?}, and an abort on this platform ends {aborted:?}; those are \
+         different ends, so what killed it was not `std::process::abort`",
+        helper.status
+    );
     let written = fs::read_to_string(&record).expect("the helper recorded its repository");
     let mut lines = written.lines();
     let repository = PathBuf::from(lines.next().expect("repository path"));
@@ -7192,6 +7221,119 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
 
 /// Where the helper tells its parent which repository to inspect.
 const ID_UNREAD_RECORD: &str = "UPSTROKE_PR5A_ID_UNREAD_RECORD";
+
+/// Set to make [`abort_probe_helper`] abort.
+///
+/// Guarded by a variable for the same reason [`id_unread_kill_helper`] is: the
+/// item is `#[ignore]`, but a run with `--include-ignored` would otherwise
+/// abort the whole test process.
+const ABORT_PROBE: &str = "UPSTROKE_PR136_ABORT_PROBE";
+
+/// Abort, so a parent can measure what this platform's
+/// [`std::process::abort`] looks like from outside instead of describing it.
+#[test]
+#[ignore = "subprocess helper"]
+fn abort_probe_helper() {
+    if std::env::var_os(ABORT_PROBE).is_none() {
+        return;
+    }
+    std::process::abort();
+}
+
+/// Set to make [`exit_one_probe_helper`] exit 1.
+const EXIT_ONE_PROBE: &str = "UPSTROKE_PR136_EXIT_ONE_PROBE";
+
+/// Exit 1, which is what the mutation pass 2 named turns an abort into.
+#[test]
+#[ignore = "subprocess helper"]
+fn exit_one_probe_helper() {
+    if std::env::var_os(EXIT_ONE_PROBE).is_none() {
+        return;
+    }
+    std::process::exit(1);
+}
+
+/// The abort oracle is tested, on every platform, against the thing it must
+/// not accept (PR #136 pass 2, finding 2).
+///
+/// The finding is Windows-shaped: there `died_by_abort` is a *negation* —
+/// unsuccessful, and not the panic's 101 — because `abort()` reaches
+/// `__fastfail`, whose code has moved between CRT versions. A negation admits
+/// `process::exit(1)`, so changing only the Windows arm of `Injection::Kill`
+/// from `abort()` to `exit(1)` left `a_kill_at_id_unread_aborts_before_the_id_is_recorded`
+/// green there. **The Unix legs cannot see that mutation** — measured: with
+/// `Injection::Kill` changed to `exit(1)`, that test fails on Linux at the
+/// reviewed head as well, because the Unix arm names `SIGABRT` — so Linux was
+/// never going to witness the repair through that test.
+///
+/// This one witnesses it everywhere, by testing the oracle rather than the
+/// funnel: two real children, one aborting and one exiting 1, and the two
+/// predicates applied to both. It says in one place what the repair claims —
+/// that the shared predicate accepts an exit this suite must reject, and that
+/// comparing against a *measured* abort does not.
+#[test]
+fn the_abort_oracle_separates_an_abort_from_an_exit_of_one() {
+    let aborted = run_kill_child(
+        "workspace_manager::tests::abort_probe_helper",
+        &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
+    );
+    let exited = run_kill_child(
+        "workspace_manager::tests::exit_one_probe_helper",
+        &[(EXIT_ONE_PROBE, std::ffi::OsStr::new("1"))],
+    );
+
+    // The premises: each child really ended the way its name says.
+    assert!(
+        died_by_abort(&aborted),
+        "the abort probe must abort: {aborted:?}"
+    );
+    assert_eq!(
+        exited.code(),
+        Some(1),
+        "the exit probe must exit 1: {exited:?}"
+    );
+
+    // What `died_by_abort` is on Windows, written out and applied here so the
+    // weakness is demonstrated rather than described: unsuccessful, and not
+    // the panic's 101. It accepts BOTH children.
+    let windows_form = |status: &std::process::ExitStatus| {
+        const PANIC: i32 = 101;
+        !status.success() && status.code() != Some(PANIC)
+    };
+    assert!(
+        windows_form(&aborted) && windows_form(&exited),
+        "the negation accepts both ends, which is the finding: {aborted:?} vs {exited:?}"
+    );
+
+    // And what the repair uses does not.
+    assert!(
+        !same_end(&aborted, &exited),
+        "an abort and an exit of 1 must not be the same end on any platform: {aborted:?} \
+         vs {exited:?}"
+    );
+    assert!(
+        same_end(&aborted, &aborted),
+        "…while an abort is the same end as itself, or the comparison rejects everything"
+    );
+}
+
+/// Whether two exit statuses are the **same end**, by value.
+///
+/// Not "both unsuccessful": that is the negation `died_by_abort` has to fall
+/// back on for Windows, and it accepts every failing exit there is. On Unix an
+/// end is a signal or a code; on Windows it is a code. Two ends are the same
+/// when those agree.
+fn same_end(left: &std::process::ExitStatus, right: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        left.signal() == right.signal() && left.code() == right.code()
+    }
+    #[cfg(not(unix))]
+    {
+        left.code() == right.code()
+    }
+}
 
 /// Spawned by `a_kill_at_id_unread_aborts_before_the_id_is_recorded`.
 #[test]
@@ -8544,6 +8686,17 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
                  added here may be a Git argument the kill sampler does not run",
             counts.literals
         );
+        // The domain's boundary, asserted rather than assumed (§12, and
+        // PR #136 pass 2, finding 1). Every count above is over a body whose
+        // end came from the blanked text; this says the body a naive scan
+        // would have taken is the same one, so no literal in this funnel is
+        // carrying a false closing brace today.
+        assert!(
+            !counts.false_boundary,
+            "`{signature}` holds a string literal carrying what looks like the function's \
+                 closing brace, so a scan over unblanked text reads a truncated body; the \
+                 counts above are over the real one, and this is the boundary saying so"
+        );
     }
 }
 
@@ -8563,16 +8716,36 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
 /// [`the_sampled_argv_census_counts_code_and_never_comments`] can drive it
 /// against an injected violation.
 fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
-    let blanked = crate::effects::blank_comments(source);
-    let body = blanked
-        .split_once(signature)
-        .unwrap_or_else(|| panic!("`{signature}` is no longer in this file"))
-        .1;
-    let body = &body[..body.find("\n    }\n").expect("the function ends")];
-    // Every string literal in the body, however it is spelt, counted by
-    // walking the text rather than by matching one construct. A literal is
-    // `"` … `"` with `\"` escaped; the body is already comment-blanked, so
-    // what is left is code.
+    // **The extent is found structurally, the counting is not** (PR #136
+    // pass 2, finding 1). The needles live inside string literals, so the
+    // counting text must keep them — and a text that keeps its literals can
+    // carry a *false function boundary*: a raw string holding a line of four
+    // spaces and a brace ends the body early, and the census then reads a
+    // truncated function while its declared numbers are satisfied by whatever
+    // was injected before the cut. The reviewer's reproduction added a Git
+    // argument and a boundary together and stayed green.
+    //
+    // So the boundary comes from `blank_comments_and_strings`, where no
+    // literal survives to forge one, and the counting from `blank_comments`
+    // over the same byte range. The first blanker replaces each blanked byte
+    // with a space rather than deleting it, so one range indexes both texts —
+    // that is the property this depends on, and it is that function's, tested
+    // there.
+    let structural = crate::effects::blank_comments_and_strings(source);
+    let at = structural
+        .find(signature)
+        .unwrap_or_else(|| panic!("`{signature}` is no longer in this file"));
+    let start = at + signature.len();
+    let end = start
+        + structural[start..]
+            .find("\n    }\n")
+            .expect("the function ends");
+    // What the naive scan — over text that still carries its literals — would
+    // have taken as the end. Keeping both is the domain-boundary assertion
+    // §12 asks for: a literal that carries a boundary makes the two disagree,
+    // and the census reports that rather than silently reading less.
+    let naive_end = source[start..].find("\n    }\n").map(|at| start + at);
+    let body = crate::effects::blank_comments(&source[start..end]);
     let bytes = body.as_bytes();
     let mut literals = 0_usize;
     let mut i = 0;
@@ -8590,6 +8763,7 @@ fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
         from_literal: body.matches("OsString::from(\"").count(),
         dynamic: body.matches("OsString::from(").count(),
         literals,
+        false_boundary: naive_end.is_some_and(|naive| naive < end),
     }
 }
 
@@ -8611,6 +8785,11 @@ struct SampledArgvCounts {
     /// which is why the claim this census carries is narrowed to what it can
     /// actually support and the structural version is a deferred row.
     literals: usize,
+    /// Whether a string literal in this body carries what looks like the
+    /// function's closing brace, so the naive scan would stop before the real
+    /// end. The census asserts this is false for every sampled funnel: it is
+    /// the boundary of the domain, and §12 asks a census to assert it.
+    false_boundary: bool,
 }
 
 /// The census's own positive controls (§12), one per thing it can miss.
@@ -8644,6 +8823,7 @@ impl WorkspaceManager {
             from_literal: 0,
             dynamic: 1,
             literals: 0,
+            false_boundary: false,
         },
         "a comment naming either construct is prose and is not an argument"
     );
@@ -8655,8 +8835,34 @@ impl WorkspaceManager {
             from_literal: 1,
             dynamic: 2,
             literals: 1,
+            false_boundary: false,
         },
         "an argument spelt `OsString::from(\"…\")` must move every count that can see it"
+    );
+
+    // **The reviewer's false-boundary reproduction** (PR #136 pass 2,
+    // finding 1): a raw string carrying a line of four spaces and a brace,
+    // added together with a Git argument. Over unblanked text the scan stops
+    // inside that raw string and reads a body short of the real one, and the
+    // injected argument makes the truncated counts match what was declared.
+    // The structural extent is not fooled, so the counts are the true ones
+    // and `false_boundary` reports the attempt.
+    let truncating = clean.replace(
+        comment,
+        "argv.push(OsString::from(flag));\n        let _boundary = r\"\n    }\n\";",
+    );
+    let counts = sampled_argv_counts(&truncating, "pub fn sampled(");
+    assert_eq!(
+        (counts.from_literal, counts.dynamic, counts.literals),
+        (0, 2, 1),
+        "the extent comes from the blanked text, so the whole body is read: two \
+         `OsString::from(` and one literal, the raw string itself — a scan that stopped \
+         inside that raw string would see the second `argv.push` and neither of the \
+         literals after it: {counts:?}"
+    );
+    assert!(
+        counts.false_boundary,
+        "…and the false boundary is reported, which is what the census asserts against"
     );
 
     let sibling = clean.replace(comment, "argv.push(\"--ignore-errors\".into());");
