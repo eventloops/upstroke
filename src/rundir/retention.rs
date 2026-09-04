@@ -48,16 +48,26 @@ pub enum RetainReason {
     /// The marker's repository key is not this repository's: a directory
     /// copied from another repository.
     MarkerRepoKeyMismatch { recorded: String, expected: String },
-    /// The marker's recorded private target could not be asked about: the stat
-    /// failed for a reason that is not `NotFound`, so its absence was never
-    /// established.
+    /// A question about the marker's recorded private target that the
+    /// filesystem declined to answer, so its absence was never established.
+    /// Two questions can go unanswered, and the detail names which path did:
+    ///
+    /// - **whether it exists** — the stat of the recorded locator failed for a
+    ///   reason that is not `NotFound`: an `EACCES` on a parent component, an
+    ///   `ELOOP`, a Windows sharing violation, or a locator the platform will not
+    ///   even accept as a path;
+    /// - **where it should be** — the authorized private root, or its `runs`
+    ///   directory, could not be canonicalized, so the recorded locator could not
+    ///   be placed against the path this run's private half would have. The
+    ///   target's own stat may have succeeded or answered `NotFound`; that answer
+    ///   is not acted on, because it is an answer about a path nothing has shown
+    ///   to be this run's.
     ///
     /// The census reclaims the public husk alone "if the marker's private
-    /// target does not exist", and only `NotFound` says it does not. An
-    /// `EACCES` on a parent component, an `ELOOP`, a Windows sharing violation
-    /// or a locator the platform will not even accept as a path are answers the
-    /// filesystem declined to give, and the husk's removal takes `.creating`
-    /// with it — the private half's only locator.
+    /// target does not exist", and that needs both questions answered: only
+    /// `NotFound` says it does not exist, and only an established locator says
+    /// *which* path's `NotFound` counts. The husk's removal takes `.creating`
+    /// with it — the private half's only locator — so neither is guessed.
     TargetUndecidable { detail: String },
     /// The recorded locator does not canonicalize to
     /// `<authorized private root>/runs/<basename>`.
@@ -213,8 +223,8 @@ impl std::fmt::Display for RetainReason {
             ),
             Self::TargetUndecidable { detail } => write!(
                 f,
-                "its marker's private target could not be asked about, so nothing about it is \
-                 established: {detail}"
+                "its marker's private target could not be placed or asked about, so nothing about \
+                 it is established: {detail}"
             ),
             Self::LocatorOutsideAuthorizedRoot { locator, expected } => write!(
                 f,

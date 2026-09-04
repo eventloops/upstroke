@@ -219,6 +219,13 @@ pub fn prove_private_half_ownership(
                 expected,
             });
         }
+        // The same reason as a stat that did not answer, and deliberately so:
+        // both are "a question about the recorded target the filesystem
+        // declined to answer", the variant's contract names both, and the
+        // detail carries the path that did not answer — here the root or its
+        // `runs` directory, not the target. The target's own stat may have
+        // answered `NotFound` above; that answer is not acted on, because it is
+        // about a path nothing has shown to be this run's.
         LocatorIdentity::Undetermined { detail } => {
             return PrivateHalfOwnership::Retained(RetainReason::TargetUndecidable { detail });
         }
