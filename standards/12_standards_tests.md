@@ -50,7 +50,8 @@ than adjective:
 - an identified mechanism on a supported platform is a defect at any rate, fixed by repairing it;
 - keep per-run output so each occurrence's outcome and diagnostic survive together.
 
-Carried flakes live in `reviews/FINDINGS.md` with their rate, owner and consequence.
+Carried flakes live in the finding ledger (`reviews/findings/`, one file per finding; older
+ones in `reviews/FINDINGS.md`) with their rate, owner and consequence.
 
 **Instruments and censuses.** Source-based enforcement is code and is tested like code. A census of
 Rust structure blanks comments and string, character, byte-string and raw-string literals before
