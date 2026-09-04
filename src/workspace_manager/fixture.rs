@@ -1860,7 +1860,21 @@ mod tests {
             "the abandoned tree is the premise of this test"
         );
 
-        drop(Fixture::adopt(root.clone(), owner));
+        let adopted = Fixture::adopt(root.clone(), owner);
+        // Held, not dropped on the way in: an `adopt` that took the guard and
+        // let it fall would reclaim the tree it is about to read from, which
+        // is the other way to get this wrong and the one a `None` field takes.
+        assert!(
+            root.exists(),
+            "the tree was reclaimed while the fixture adopting it was still alive: {}",
+            root.display()
+        );
+        assert_eq!(
+            adopted.seed,
+            git(&adopted.base, &["rev-list", "--max-parents=0", "main"]),
+            "the adopted fixture can still read the repository it adopted"
+        );
+        drop(adopted);
 
         assert!(
             !root.exists(),
