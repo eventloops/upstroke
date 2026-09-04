@@ -1183,8 +1183,10 @@ fn torn_first_line_is_husk_or_possibly_committed_per_commit_record() {
     // literal-pinning test as a renamer would, and this is the **only** test of
     // 1,924 that fails. Until `DESIGN.md` §15 says what compatibility these
     // wire names carry (`SWEEP-NAMES-008`), that makes this literal the one
-    // thing standing between a rename and a proof that reads an old husk's
-    // absent `committed.json` as licence to delete committed private data.
+    // thing standing between a rename and a proof that stats the NEW spelling
+    // in an old P5b directory — where the OLD `committed.json` is present and
+    // the new name is absent — and reads that absence as licence to delete
+    // committed private data.
     assert!(
         after_p5b.paths.private.join("committed.json").is_file(),
         "the private half was removed"

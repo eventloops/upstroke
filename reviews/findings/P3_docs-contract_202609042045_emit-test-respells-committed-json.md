@@ -38,6 +38,16 @@ panicked at src/engine/topology/emit/tests.rs:1180:5: the private half was remov
 **One test out of 1,924.** Not "one of the guards" — the only one. Every other spelling of the name
 follows the constant and moves with it.
 
+**What that run is, and is not.** It is a mutation run that fails, and `MAINTAINING.md` fixes a
+finding carrying a mutation witness whatever its severity. The coordinator's ruling, posted on the
+pull request so it is recorded rather than assumed: that clause is about a witness of a **live
+defect**, and this run demonstrates the opposite — **a safeguard holding**. Nobody has renamed
+`COMMIT_RECORD`; the tree today is safe precisely *because* that literal fails the rename, and the
+finding is a latent compatibility risk conditional on a future change **plus** the removal of this
+guard. So the row stays deferred, and the mitigation it carries — do not remove the guard before
+§15 — is the fix that is available now. A later reader who sees "deferred" beside "a mutation run
+fails" should read this paragraph before concluding the ledger contradicts itself.
+
 This row is the **canonical home** of that count. `src/rundir/names.rs`, `standards/SWEEP.md`,
 `SWEEP-NAMES-008` and the pull request body point here rather than restating it, because a number
 restated in five places is a number that drifts in four of them — which is exactly how

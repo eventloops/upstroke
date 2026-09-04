@@ -37,10 +37,16 @@ being one blanket claim:
 * Rename **`EVENT_LOG`** and five sites go stale — `export.rs`, `validate.rs`,
   `engine/resume.rs`, `status.rs`, `capacity.rs` — each of which then looks for
   a log the run no longer writes.
-* Rename **`PLAN`** and only two do, `export.rs` and `engine/resume.rs`.
-  `status`, `validate` and `capacity` never open the frozen plan, so they are
-  unaffected; an earlier version of this row said "either constant" and named
-  all five for both, which is wrong.
+* Rename **`PLAN`** and the picture splits by *which runs* a reader opens,
+  which an earlier version of this row got wrong twice — first by naming all
+  five files for both constants, then by saying `status` never opens the plan.
+  It does: `src/status.rs` reads it through `RunPaths::plan_json`, as does
+  `src/engine/coordinator.rs`; only `validate` and `capacity` never open it.
+  So for a **new run written under the new name**, the two literal readers —
+  `export.rs` and `engine/resume.rs` — are the ones stranded, and the accessor
+  readers follow the rename. For a **persisted run written under the old
+  name**, every reader seeks the new name and fails, accessor readers
+  included; that half is `SWEEP-NAMES-008`'s subject, not this row's.
 
 Either way the omission surfaces at run time rather than as a compile error,
 which is the property that makes this a finding at all.
