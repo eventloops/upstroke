@@ -30,6 +30,15 @@
 //! because that step measures it as a condition rather than an id, and no
 //! object can be snapshotted at it.
 //!
+//! **Resolving to itself is not the whole of exactness.** `git replace A B`
+//! makes Git read `B` wherever `A` is named while `rev-parse` still prints
+//! `A`, so the check above passes and the checkout materialises `B`
+//! (measured, git 2.43). The engine takes the mechanism out of the picture
+//! rather than detecting it: every command the manager runs carries
+//! `GIT_NO_REPLACE_OBJECTS=1`, set where those commands are built, so a
+//! snapshot is of the objects the repository holds. That, and not the
+//! resolution alone, is what makes the checkout the judged tree.
+//!
 //! **What a [`Snapshot`] holds together** (§5, §6): its fields are private
 //! and it has one constructor, [`Snapshot::new`], visible to the parent only.
 //! The slot is built from the [`SnapshotName`] the constructor is given, so it
@@ -139,6 +148,16 @@ impl SnapshotObject {
         match self {
             Self::Commit | Self::Parent => "^{commit}",
             Self::Tree => "^{tree}",
+        }
+    }
+
+    /// The object type this role must name, which is not its own name: the
+    /// parent of an ephemeral commit is a commit.
+    #[must_use]
+    pub fn object_type(self) -> &'static str {
+        match self {
+            Self::Commit | Self::Parent => "commit",
+            Self::Tree => "tree",
         }
     }
 }

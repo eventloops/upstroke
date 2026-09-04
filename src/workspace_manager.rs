@@ -324,10 +324,12 @@ pub enum Refusal {
     /// only an answer equal to the input; anything else is not an exact
     /// snapshot input.
     #[error(
-        "refusing `{value}` as the snapshot {role}: the repository resolves it to {}, not to \
-         itself, so it is not a full object id of this repository (a ref spelt in hexadecimal, \
-         an id of the other object format's length, or no object at all)",
-        .resolved.as_deref().unwrap_or("nothing")
+        "refusing `{value}` as the snapshot {role}: the repository peels it to {}, not to \
+         itself, so it does not name a {} of this repository as it stands -- a ref spelt in \
+         hexadecimal, an object of another type (a commit offered as the tree peels to that \
+         commit's tree), an id of the other object format's length, or no object at all",
+        .resolved.as_deref().unwrap_or("nothing"),
+        .role.object_type()
     )]
     SnapshotInputResolvesElsewhere {
         /// Which id of the input.
@@ -1973,19 +1975,29 @@ impl WorkspaceManager {
     /// the answer is `id` itself.
     ///
     /// The peel is the role's ([`SnapshotObject::peel`]), so a commit offered
-    /// as the tree resolves to its tree and is refused, and a tree offered as
-    /// the parent resolves to nothing and is refused. A full id of the
-    /// repository's own format that names an object of the required type
+    /// as the tree peels to that commit's tree and is refused. A full id of
+    /// the repository's own format that names an object of the required type
     /// resolves to itself, even when a ref of the same spelling exists (Git
     /// prefers the object and warns on stderr, which `--verify` tolerates).
+    ///
+    /// **The two kinds of wrong type answer differently**, and both refuse.
+    /// A peel Git can perform to another object is this refusal. A peel it
+    /// cannot perform at all -- a tree offered where a commit is required --
+    /// is a Git error that speaks: measured on git 2.43, `rev-parse --verify
+    /// --quiet <tree>^{commit}` exits non-zero with "expected commit type, but
+    /// the object dereferences to tree type" on stderr, which is not the
+    /// silent exit 1 that [`Self::quiet_object_lookup`] reads as absence, so
+    /// it arrives as [`UpstrokeError::Git`] naming the mismatch in Git's own
+    /// words. Nothing has run either way.
     ///
     /// # Errors
     ///
     /// [`Refusal::SnapshotInputResolvesElsewhere`], carrying what the
     /// repository answered; or a Git failure other than "no such object",
-    /// which [`Self::quiet_object_lookup`] reports as the error it is. The
-    /// `?` on the lookup is that propagation (§7): the error already names
-    /// the command, the directory and Git's own words.
+    /// which [`Self::quiet_object_lookup`] reports as the error it is,
+    /// including the unpeelable type above. The `?` on the lookup is that
+    /// propagation (§7): the error already names the command, the directory
+    /// and Git's own words.
     fn refuse_unless_resolves_to_itself(
         &self,
         role: SnapshotObject,
@@ -2697,7 +2709,8 @@ impl WorkspaceManager {
         self.refuse_hooks_entries()
     }
 
-    /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
+    /// Run Git in `cwd` with every repository hook, the fsmonitor and the
+    /// replacement mechanism disabled.
     ///
     /// The hooks path is walked first ([`Self::revalidate_hooks_path`]).
     fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
@@ -2709,6 +2722,30 @@ impl WorkspaceManager {
             })
     }
 
+    /// The one place every command this manager runs is built, and so the one
+    /// place its environment is set.
+    ///
+    /// **`GIT_NO_REPLACE_OBJECTS=1` on all of them.** `git replace A B` makes
+    /// Git read `B` wherever `A` is named, while `rev-parse` still prints `A`:
+    /// measured on git 2.43, with a replacement in place `rev-parse --verify
+    /// --quiet A^{tree}` prints `A`, `commit-tree A -p P` records the raw tree
+    /// `A`, and `worktree add --detach` on that commit materialises the
+    /// *contents of `B`*. So [`Self::add_snapshot`]'s resolve-once check, which
+    /// compares `rev-parse`'s answer with the input, cannot see it, and a
+    /// snapshot of the judged tree would run gates and reviewers over another
+    /// tree entirely -- against `DESIGN.md` §15's exact snapshot. The
+    /// mechanism is refused rather than detected: with the variable set Git
+    /// ignores every replacement, and the same command materialises `A`
+    /// (measured, both ways). It is set here rather than in the snapshot
+    /// funnel because this is where the commands are built, and the reason
+    /// holds for all of them: every funnel primitive (`worktree add`, `worktree
+    /// prune`, `add`, `write-tree`, `cherry-pick`, `commit-tree`,
+    /// `update-ref`) and every read the manager makes through
+    /// [`Self::git`] and [`Self::git_with_identity`] (`rev-parse`, `worktree
+    /// list`, `for-each-ref`, `show-ref`, `diff`) is about the objects the
+    /// repository actually holds. The two free functions `read_only_git` and
+    /// `read_only_git_ok` are outside this builder, as they are outside the
+    /// hooks-path walk; nothing on the snapshot path runs through them.
     fn command(&self, cwd: &Path, args: &[OsString]) -> Command {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(self.hooks_dir());
@@ -2720,6 +2757,7 @@ impl WorkspaceManager {
             .arg(hooks_config)
             .args(["-c", "core.fsmonitor=false"])
             .args(["-c", "protocol.file.allow=never"])
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(args)
             .stdin(Stdio::null());
         command

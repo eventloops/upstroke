@@ -353,6 +353,7 @@ effect_free = [
     "head",
     "id",
     "new",
+    "object_type",
     "path",
     "peel",
     "slot",

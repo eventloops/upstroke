@@ -4834,6 +4834,178 @@ fn a_full_id_of_the_repositorys_own_format_is_accepted_and_the_head_is_what_git_
     }
 }
 
+/// A snapshot of a tree with a replacement object in place materialises the
+/// tree that was judged, not its replacement (PR #130, pass 2's P1).
+///
+/// `git replace A B` makes Git read `B` wherever `A` is named while
+/// `rev-parse` still prints `A`, so `add_snapshot`'s resolve-once check
+/// cannot see it: measured on git 2.43, `commit-tree A -p P` records the raw
+/// tree `A` and `worktree add --detach` on that commit writes the *contents
+/// of `B`*, so gates and reviewers would run over another tree entirely,
+/// against `DESIGN.md` §15's exact snapshot. The manager sets
+/// `GIT_NO_REPLACE_OBJECTS=1` on every command it runs, so the mechanism is
+/// gone rather than detected.
+///
+/// The assertion is on the materialised bytes and on the recorded commit's
+/// raw tree, since the head is unchanged under a tree replacement and a test
+/// that read only the head could not see this. Witnessed failing with the
+/// environment variable removed from `command`: the checkout holds `B`.
+#[test]
+fn a_snapshot_ignores_a_replacement_object_and_materialises_the_judged_tree() {
+    let fixture = Fixture::created("replace-objects");
+    let file = fixture.base.join("replaced.txt");
+
+    fs::write(&file, "A\n").expect("the judged content");
+    git(&fixture.base, &["add", "replaced.txt"]);
+    git(&fixture.base, &["commit", "-q", "-m", "the judged tree"]);
+    let judged_commit = git(&fixture.base, &["rev-parse", "HEAD"]);
+    let judged_tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+
+    fs::write(&file, "B\n").expect("the other content");
+    git(&fixture.base, &["add", "replaced.txt"]);
+    git(&fixture.base, &["commit", "-q", "-m", "the other tree"]);
+    let other_commit = git(&fixture.base, &["rev-parse", "HEAD"]);
+    let other_tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+    assert_ne!(judged_tree, other_tree, "two distinct trees");
+
+    // Back to the judged commit, and the replacement in place.
+    git(
+        &fixture.base,
+        &["checkout", "--detach", "--quiet", &judged_commit],
+    );
+    git(&fixture.base, &["replace", &judged_tree, &other_tree]);
+    assert_eq!(
+        git(&fixture.base, &["replace", "-l"]),
+        judged_tree,
+        "the replacement is in place"
+    );
+    assert_eq!(
+        git(
+            &fixture.base,
+            &["rev-parse", "--verify", &format!("{judged_tree}^{{tree}}")]
+        ),
+        judged_tree,
+        "and `rev-parse` still prints the judged tree, which is why the funnel's \
+         resolve-once check cannot see the replacement"
+    );
+
+    let snapshot = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(1, 1),
+            &SnapshotInput::Tree {
+                tree: oid(&judged_tree),
+                parent: oid(&other_commit),
+            },
+        )
+        .expect("the judged tree is a tree of this repository");
+
+    assert_eq!(
+        fs::read_to_string(snapshot.path().join("replaced.txt")).expect("the checkout"),
+        "A\n",
+        "the snapshot materialises the judged tree, not the object replacing it"
+    );
+    let recorded = git(
+        &fixture.base,
+        &["cat-file", "commit", snapshot.head().as_str()],
+    );
+    assert!(
+        recorded.contains(&format!("tree {judged_tree}")),
+        "the ephemeral commit records the judged tree: {recorded}"
+    );
+
+    fixture
+        .manager
+        .remove_snapshot(&mut NoHooks, &snapshot)
+        .expect("Snapshot.Remove + Snapshot.RemoveIntent");
+}
+
+/// A full object id of the wrong type for its role is refused as what it is:
+/// the message names the role's object type and what the repository peeled the
+/// value to, and never says a full object id is not one (PR #130, pass 2).
+///
+/// A commit id offered as the `tree` peels to that commit's tree, so the
+/// resolve-once check refuses it; the diagnostic at the reviewed head said it
+/// "is not a full object id of this repository", which is false of a commit
+/// id. Witnessed failing with the message's `{role.object_type()}` replaced by
+/// the role's own name, which spells the parent's required type `parent`.
+#[test]
+fn a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requires() {
+    let fixture = Fixture::created("wrong-object-type");
+    let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+    let commit = fixture.head.clone();
+
+    // A commit where a tree is required: it peels to that commit's tree.
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 1),
+            &SnapshotInput::Tree {
+                tree: oid(&commit),
+                parent: oid(&commit),
+            },
+        )
+        .expect_err("a commit is not a tree");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Tree,
+        value: commit.clone(),
+        resolved: Some(tree.clone()),
+    };
+    assert!(
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "expected `{expected}`, got `{error}`"
+    );
+    let message = expected.to_string();
+    assert!(
+        message.contains("does not name a tree of this repository"),
+        "the message names the object type the role requires: {message}"
+    );
+    assert!(
+        !message.contains("is not a full object id"),
+        "and never calls a full object id something other than one: {message}"
+    );
+
+    // A tree where a commit is required cannot be peeled at all, and Git says
+    // so rather than exiting silently: that is not the silent exit 1 the
+    // lookup reads as absence, so it arrives as the Git error it is, naming
+    // the mismatch in Git's own words (measured, git 2.43). Both kinds of
+    // wrong type refuse; only the peelable kind is this module's refusal.
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 2),
+            &SnapshotInput::Tree {
+                tree: oid(&tree),
+                parent: oid(&tree),
+            },
+        )
+        .expect_err("a tree is not a commit");
+    let UpstrokeError::Git { message } = &error else {
+        panic!("an unpeelable type is a Git error, not a refusal: {error}");
+    };
+    assert!(
+        message.contains(&tree) && message.contains("expected commit type"),
+        "the Git error names the value and the mismatch: {message}"
+    );
+
+    // And the parent role's refusal, when Git can peel, names the object type
+    // the role requires rather than the role's own word.
+    let parent_role = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Parent,
+        value: commit,
+        resolved: Some(tree),
+    };
+    assert!(
+        parent_role
+            .to_string()
+            .contains("does not name a commit of this repository"),
+        "the parent role requires a commit: {parent_role}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Worktree.Verify and forced removal
 // -----------------------------------------------------------------------
