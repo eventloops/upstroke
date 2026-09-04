@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     CensusInputs, FailedStep, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome,
-    WorktreeLocked, apply, census_run_dirs, startup_census,
+    WorktreeLocked, apply, census_run_dirs, scan, startup_census,
 };
 use crate::error::UpstrokeError;
 use crate::events::log::EventLog;
@@ -1020,6 +1020,114 @@ fn locator_through_reparse_point_retained() {
         "the private target must be byte-identical afterwards"
     );
     assert!(exists(&husk.public()));
+}
+
+/// The census itself, driven to the reclaim on a listing it could not read —
+/// and refusing.
+///
+/// **This is the witness pass 1 said the change did not have, and the reason
+/// it did not.** `scan` calls `is_running` before the ownership proof and
+/// skips a husk whose lock it cannot inspect, and `is_running` maps every
+/// non-`NotFound` error to "held". Under a *whole-process* descriptor
+/// exhaustion — the `EMFILE`/`ENFILE` story this pull request first told —
+/// the `run.lock` open fails too, so the census plans `Skip` and never
+/// reaches the proof or the removal. That sequence does not occur, and the
+/// rundir-level witnesses, which call classify, prove and remove directly,
+/// could not have shown that it did.
+///
+/// The failure that **does** reach the reclaim is a selective one: the log
+/// cannot be opened and the directory cannot be listed, while `run.lock` can
+/// still be opened by name. A public directory carrying `--wx` bits is exactly
+/// that, and it is what this fixture builds:
+///
+/// 1. `classify_run_dir` opens `events.jsonl`, is refused, and answers `Husk`
+///    for a run whose log is committed;
+/// 2. `is_running` opens `run.lock` — search is granted, so the open succeeds
+///    — finds no holder and answers **false**, so the husk is not skipped;
+/// 3. the proof finds no marker and asks `unbound_shape`, whose `read_dir` is
+///    refused because the directory has no read bit;
+/// 4. before the fix that answered `Bare`, the plan was `ReclaimPublicOnly`,
+///    and `apply` removed the committed run's public half once the failure
+///    cleared.
+///
+/// The permissions are restored between `scan` and `apply`, which is what
+/// makes the second listing succeed and the removal find everything — the
+/// same shape as a transient that clears, driven through the real census
+/// rather than described.
+///
+/// Unix only: the fixture needs a directory that can be searched and not
+/// listed, which is a mode bit.
+#[cfg(unix)]
+#[test]
+fn the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new("census-unreadable-listing");
+    let run_id = "01CENSUSUNREADABLE00000000";
+    let _husk = Husk::at_p0(&fixture, run_id).commit_log();
+    let public = fixture.public(run_id);
+    let log = public.join(rundir::EVENT_LOG);
+    // A committed run has a `run.lock` from P2. Taken and released through the
+    // real API, so the file on disk is the one a live run leaves behind.
+    drop(RunLock::acquire(&public).expect("the run lock"));
+    assert!(exists(&rundir::lock_file(&public)), "the lock file is there");
+    assert_eq!(
+        rundir::classify_run_dir(&public),
+        RunDirClass::Committed,
+        "the fixture must be a committed run, or this measures nothing"
+    );
+
+    // The selective failure.
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o000)).expect("close the log");
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o300)).expect("search, not read");
+    let readable_again = || {
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o700)).expect("open the husk");
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).expect("open the log");
+    };
+    if fs::read_dir(&public).is_ok() || rundir::classify_run_dir(&public) == RunDirClass::Committed
+    {
+        readable_again();
+        panic!(
+            "this fixture needs a listing that fails and a classifier that is refused, and \
+             here one of them is not — a process with the privilege to ignore the permission \
+             bits cannot measure this"
+        );
+    }
+
+    let scanned = scan(run_id, &fixture.inputs(), None);
+    readable_again();
+
+    assert_eq!(
+        scanned.class,
+        RunDirClass::Husk,
+        "the classifier's open was refused, which is what sends the census to the proof"
+    );
+    assert!(
+        !matches!(scanned.plan, Planned::Skip),
+        "`is_running` must not have gated this: `run.lock` stayed inspectable, which is the \
+         whole difference between this failure and a descriptor exhaustion"
+    );
+    let plan_before_apply = format!("{:?}", scanned.plan);
+    let outcome = apply(&mut rundir::NoHooks, &scanned.public, scanned.plan);
+
+    match outcome {
+        RunDirOutcome::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "listing-unreadable",
+            "the census retains and reports it: {reason}"
+        ),
+        other => panic!(
+            "the census planned {plan_before_apply} on a listing it could not read and the \
+             outcome was {other:?}; the committed log is {}",
+            if exists(&log) { "still there" } else { "GONE" }
+        ),
+    }
+    assert!(exists(&log), "the committed run's log is still here");
+    assert_eq!(
+        rundir::classify_run_dir(&public),
+        RunDirClass::Committed,
+        "and the run is still a committed run"
+    );
 }
 
 /// Every retention reason, driven through the census's retain arm.
