@@ -4106,6 +4106,123 @@ fn reclaim_removes_the_registration_whose_commondir_is_empty() {
         .expect("Git enumeration works again");
 }
 
+/// `target` relative to `from`, both canonicalised: `..` up to the common
+/// ancestor, then down. What Git 2.48's `worktree.useRelativePaths` writes.
+fn relative_from(from: &Path, target: &Path) -> PathBuf {
+    let from = fs::canonicalize(from).expect("from exists");
+    let target = fs::canonicalize(target).expect("target exists");
+    let mut from = from.components().peekable();
+    let mut target = target.components().peekable();
+    while from.peek().is_some() && from.peek() == target.peek() {
+        from.next();
+        target.next();
+    }
+    let mut relative = PathBuf::new();
+    for _ in from {
+        relative.push("..");
+    }
+    for component in target {
+        relative.push(component);
+    }
+    relative
+}
+
+/// A relative registration, Git 2.48's `worktree.useRelativePaths` form, is
+/// joined to its registration directory and canonicalised, so the slot's own
+/// registration rewritten relative still binds the slot; one that resolves to a
+/// foreign directory inside the root refuses by containment, as an absolute
+/// one would.
+#[test]
+fn a_relative_registration_still_binds_its_checkout() {
+    let fixture = Fixture::created("relative-registration");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("admin dir")
+        .expect("registered");
+    let relative = relative_from(&admin, &path.join(".git"));
+    assert!(
+        relative.starts_with(".."),
+        "the fixture wrote a relative path"
+    );
+    fs::write(admin.join("gitdir"), format!("{}\n", relative.display())).expect("relative gitdir");
+    let bound = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("a relative registration resolves")
+        .expect("and still binds the slot");
+    assert_eq!(bound, admin);
+
+    let foreign = fixture.manager.execution_root().join("foreign");
+    fs::create_dir_all(&foreign).expect("a foreign directory inside the root");
+    let relative = relative_from(&admin, &foreign);
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}/.git\n", relative.display()),
+    )
+    .expect("relative gitdir naming the foreign directory");
+    fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect_err("a registration resolving to a foreign directory inside the root refuses");
+
+    // A relative registration whose checkout does not exist and which climbs
+    // above the filesystem root refuses by name at the decoder, where before
+    // the join was handed to canonicalisation with its `..` intact and the
+    // absent checkout was read as "not this registration".
+    let depth = fs::canonicalize(&admin)
+        .expect("admin exists")
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count();
+    let mut climb = PathBuf::new();
+    for _ in 0..=depth {
+        climb.push("..");
+    }
+    climb.push("absent");
+    climb.push(".git");
+    fs::write(admin.join("gitdir"), format!("{}\n", climb.display())).expect("climbing gitdir");
+    let refused = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect_err("a relative registration that climbs above the root refuses by name");
+    assert!(
+        refused
+            .to_string()
+            .contains("climbs above the filesystem root"),
+        "{refused}"
+    );
+}
+
+/// Git failing to enumerate is an error, never "not registered": a zero-length
+/// `commondir`, the interrupted-add residue `revalidate_removal` documents,
+/// makes `git worktree list` fail, and the classifier propagates that rather
+/// than reading the registered-but-unpopulated worktree as absent.
+#[test]
+fn a_failed_worktree_list_is_an_error_not_an_absent_registration() {
+    let fixture = Fixture::created("failed-list");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("admin dir")
+        .expect("registered");
+    fs::write(admin.join("commondir"), []).expect("truncate commondir");
+    let error = record_for(&fixture.base, &path).expect_err("Git could not enumerate");
+    assert!(
+        error.to_string().contains("worktree list"),
+        "the error names the command: {error}"
+    );
+    classify_object_residue(
+        EffectSiteId::Worktree(WorktreeSite::Add),
+        &ResidueTarget::new(&fixture.base).at(&path),
+    )
+    .expect_err("the classifier propagates the failure and does not answer for Git");
+}
+
 #[test]
 fn malformed_gitdir_refuses_before_removal() {
     for (case, bytes) in [("empty", &b""[..]), ("partial", &b"not-a-dot-git-path"[..])] {
@@ -4219,9 +4336,11 @@ fn a_registration_rebound_after_validation_keeps_its_admin_state() {
 
 #[test]
 fn registration_gitdir_requires_an_absolute_normalized_path() {
+    // A relative `gitdir` is Git 2.48's own form and is joined to the
+    // registration directory (`a_relative_registration_still_binds_its_checkout`);
+    // what an absolute one may not do is traverse or alias.
     let admin = Path::new("/repository/.git/worktrees/example");
     for bytes in [
-        &b"relative/.git"[..],
         &b"/absolute/../traversal/.git"[..],
         &b"/absolute/./alias/.git"[..],
     ] {
@@ -4246,7 +4365,7 @@ fn registration_gitdir_decodes_non_utf8_path_bytes() {
 
     let decoded = registration_checkout(
         Path::new("/repository/.git/worktrees/example"),
-        b" /tmp/non-utf8-\xff/.git\n",
+        b"/tmp/non-utf8-\xff/.git\n",
     )
     .expect("byte-valid registration");
     assert_eq!(
