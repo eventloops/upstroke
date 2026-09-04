@@ -854,6 +854,12 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
             }
             Injection::Proceed
         }
+
+        // Never `Injection::Error`, and nothing is wrapped, so there is no
+        // refusal of its own to explain.
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
     }
 
     // `Some(d)`: a process whose last handle closes `d` after removal is
