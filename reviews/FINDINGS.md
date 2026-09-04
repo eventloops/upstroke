@@ -6364,8 +6364,12 @@ to in that order. One public method of the module, `candidate_diff`, had no test
 all. Three unit tests of a sibling child's `pub(super)` helper are weaker copies of that child's
 own tests and one of them was vacuous on Windows; they are deleted, each row naming the test that
 carries the claim. Two source censuses counted unblanked text and had no positive control, which
-§12 requires of every census. Four mutations were run against **master's whole crate suite** to
-establish that the gaps were real rather than argued.
+§12 requires of every census. Four mutations of `candidate_diff` were run against **master's whole
+crate suite at the base**, all 1,903 of whose tests passed under each: three of them are the
+witnesses the new test now carries, and the fourth — dropping `-c color.ui=false` alone — is
+disclosed in the pull-request body as a claim this sweep wrote and then withdrew, because
+`--no-color` still suppresses colour and the mutation therefore does not bite. The colour claim is
+stated as the pair.
 
 | ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
 |---|---|---|---|---|---|---|---|---|
