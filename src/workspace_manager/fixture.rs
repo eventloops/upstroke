@@ -93,11 +93,7 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::marker::PhantomData;
-
-// §8 names this token for exactly what `scratch_tree` does: recursive deletion
-// of a run-scoped tree is token-carried, and the `cfg(test)` scratch-tree token
-// is the one a test build carries.
-use crate::rundir::scratch_tree::{ScratchTree, acquire};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // -----------------------------------------------------------------------
 // Fixtures
@@ -199,91 +195,83 @@ pub(crate) fn note_removal_attempt(attempt: u32) {
     });
 }
 
-/// A scratch tree of this call's own, guarded, and reclaimed when the guard
-/// drops.
+static SCRATCH: AtomicU32 = AtomicU32::new(0);
+
+/// A scratch directory unique to this process *and* to this call, because
+/// the suite runs tests in parallel and two fixtures sharing a directory
+/// would each measure the other's Git repository.
 ///
-/// **Through `rundir::scratch_tree`, which is the token §8 names**: recursive
-/// deletion of a run-scoped tree is token-carried, and that module's whole
-/// subject is this hazard. It replaces what stood here — a name built from a
-/// tag, the process id and an ordinal, pre-cleaned with `remove_dir_all`
-/// before anything was acquired — which after a process-id collision, or with
-/// two process-id namespaces sharing one temporary directory, destroyed a tree
-/// this process had no claim on. Creating exclusively afterwards did not
-/// authorise the deletion that preceded it. Now the name carries a fresh ULID
-/// so no two calls can collide, the root is created with an exclusive
-/// `create_dir` so "previously nonexistent" is the kernel's answer, nothing is
-/// pre-cleaned, and the removal is spent against a token bound to that exact
-/// root.
+/// **This is master's, restored.** Four frontier passes read this file, and
+/// three of them faulted the machinery that replaced it. The `rundir::
+/// scratch_tree` token §8 names removes the pre-clean below — a `remove_dir_all`
+/// on a predictable tag-and-pid name, before anything is acquired — but a token
+/// cannot be minted from a path, so a *fixture adopted from another process's
+/// tree* can hold no token, and every shape tried for that gap either deleted a
+/// tree the fixture could not prove it owned or leaked one per kill test. The
+/// §8 finding is back in `reviews/FINDINGS.md` with the three attempts written
+/// out; closing it needs an ownership handoff somebody can authenticate, which
+/// is a design question rather than a repair to this file.
+///
+/// `tag` is still validated as one path component by the manager's own
+/// [`safe_component`], which no finding has touched: a tag carrying a separator
+/// would put the tree somewhere [`Fixture::drop`] does not remove it from.
 ///
 /// # Panics
 ///
-/// If `tag` is not a [`safe_component`], or if the acquisition refuses,
-/// naming the root and what the filesystem said.
-pub(crate) fn scratch_tree(tag: &str) -> ScratchTree {
+/// If `tag` is not a safe component, or if the directory cannot be made.
+pub(crate) fn scratch(tag: &str) -> PathBuf {
     if let Err(why) = safe_component(tag) {
         panic!("the fixture's scratch tag `{tag}` is not one path component: {why}");
     }
-    match acquire(&std::env::temp_dir(), tag) {
-        Ok(tree) => tree,
-        Err(refusal) => panic!(
-            "the fixture could not acquire a scratch tree at {}: {:?}",
-            refusal.root().display(),
-            refusal.source()
-        ),
+    let ordinal = SCRATCH.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "upstroke-wm-{tag}-{}-{ordinal}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create the scratch directory");
+    dir
+}
+
+/// A destination that cannot hold configuration, whatever anybody writes to it.
+///
+/// `core.hooksPath`, `core.attributesFile` and `core.excludesFile` point at it,
+/// and so do `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME` and
+/// `XDG_CONFIG_HOME`.
+///
+/// **A sink, not a secret, and that distinction is the fourth pass's.** Two
+/// earlier shapes were names nobody was expected to guess — first a bare
+/// filename joined to the command's own directory, which is an ordinary path a
+/// test can `git add` and Git then loads as global config; then an absolute
+/// path with a fresh ULID whose parent did not exist, which `git config
+/// --global` cannot create. Both rested on nobody constructing the path, and
+/// every Git child is *handed* it in `GIT_CONFIG_GLOBAL`: measured on git
+/// 2.43.0, an alias running `mkdir -p "${GIT_CONFIG_GLOBAL%/*}"` and writing
+/// the file makes the next command load it. So the destination is now one that
+/// cannot hold config at all. Measured, same version, all three arms:
+///
+/// - `git config --global i18n.commitEncoding ISO-8859-1` answers `could not
+///   lock config file /dev/null: Permission denied` and exits 255;
+/// - an alias writing **directly** to the path exits 0 and nothing is loaded,
+///   because the bytes go to the null device — this is the bypass the reviewer
+///   used, and the one a secret name does not close;
+/// - `mkdir -p /dev/null` fails `File exists`, so no child can turn
+///   `core.hooksPath` into a hook directory, and an ordinary `add` and `commit`
+///   still work.
+///
+/// **The Windows arm is inferred, not measured.** `NUL` is that platform's null
+/// device and the reasoning is the same, but nothing on this box can run it. If
+/// a Windows leg reds on this, that is the measurement and the claim narrows to
+/// Unix.
+const fn absent() -> &'static str {
+    #[cfg(unix)]
+    {
+        "/dev/null"
     }
-}
-
-/// [`scratch_tree`]'s root, for the one caller that wants a directory and not
-/// a fixture.
-///
-/// **The guard is spent here and the tree is not reclaimed.** A token cannot
-/// be minted outside `rundir::scratch_tree`, so a caller holding only a path
-/// has no authority to delete anything, and this hands back exactly that: an
-/// exclusively created, unpredictably named directory that nothing will
-/// remove. One directory per suite run, from the single test that calls this.
-/// The guard-returning [`scratch_tree`] is what a fixture uses, and moving the
-/// last caller onto it is a deferred row rather than an edit here, because the
-/// caller is in `src/workspace_manager/tests.rs`, which another pull request
-/// is repairing.
-pub(crate) fn scratch(tag: &str) -> PathBuf {
-    scratch_tree(tag).disarm().path().to_path_buf()
-}
-
-/// A path that does not exist, cannot be predicted, and is outside every
-/// repository this module builds.
-///
-/// `core.hooksPath`, `core.attributesFile` and `core.excludesFile` point at
-/// it, and so do `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME` and
-/// `XDG_CONFIG_HOME`. Git runs no hook from a path that does not exist, reads
-/// an absent config, attributes or excludes file as empty, and finds no `~`
-/// configuration under a home that is not there.
-///
-/// **It used to be a bare name joined to the command's own directory**, which
-/// put it *inside the repository*: `<repo>/upstroke-fixture-absent` is an
-/// ordinary filename a test can write or a branch can carry, and a file there
-/// is a **loaded global configuration file**. Measured on git 2.43.0 under
-/// exactly these pins: planting `[i18n] commitEncoding = ISO-8859-1` at that
-/// name made `git config --show-origin --list` report it as loaded, which is
-/// the door's own claim falsified by an ordinary `git add`. The path is now
-/// absolute, under the temporary directory, and carries a fresh ULID, so no
-/// test can name it and nothing creates it. One per process, because a
-/// constant path shared by every process is predictable again.
-fn absent() -> &'static Path {
-    static ABSENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    ABSENT.get_or_init(|| {
-        // **Two components, and the second is why this holds.** A path whose
-        // parent exists is one Git will create: measured on git 2.43.0, `git
-        // config --global i18n.commitEncoding ISO-8859-1` through the exported
-        // helper creates the file `GIT_CONFIG_GLOBAL` names and exits 0, and
-        // every later fixture command then loads it. With the parent absent
-        // the same command refuses -- `could not lock config file …: No such
-        // file or directory`, exit 255, nothing created -- while reads stay
-        // silent and successful. Nothing creates the directory below, so the
-        // guarantee is Git's rather than this module's discipline.
-        std::env::temp_dir()
-            .join(format!("upstroke-fixture-absent-{}", crate::ulid::ulid()))
-            .join("absent")
-    })
+    #[cfg(not(unix))]
+    {
+        "NUL"
+    }
 }
 
 /// The whole of what a Git child inherits from this process.
@@ -484,38 +472,6 @@ impl ObjectFormat {
     }
 }
 
-/// How a [`Fixture`] reclaims its tree.
-///
-/// Two arms because the two cases have different authority. A fixture this
-/// process built acquired its tree through §8's token and spends that token on
-/// the way out. A fixture *adopted* from a tree another process built has no
-/// token and cannot mint one, so it keeps master's behaviour: a best-effort
-/// recursive removal of the root it was handed. That second arm is a §8
-/// deviation this pull request does not close — see [`Fixture::adopt`].
-enum Reclaim {
-    /// Token-carried, for a tree this process acquired. Underscored because
-    /// nothing reads the guard: it is held so that its own `Drop` spends the
-    /// token.
-    Owned(#[allow(dead_code)] ScratchTree),
-    /// Master's, for a tree another process built and this one was handed.
-    Adopted(PathBuf),
-}
-
-impl Drop for Reclaim {
-    fn drop(&mut self) {
-        match self {
-            // The guard spends the token itself.
-            Self::Owned(_) => {}
-            // Best effort, exactly as master's `Fixture::drop` was: there is
-            // no error path from a `Drop`, and a tree left behind is the
-            // inode class this pull request rows rather than a silent success.
-            Self::Adopted(root) => {
-                let _ = fs::remove_dir_all(root);
-            }
-        }
-    }
-}
-
 pub(crate) struct Fixture {
     /// The root of the scratch tree, as a field because six files read it that
     /// way and an accessor would edit `src/workspace_manager/tests.rs`, which
@@ -531,12 +487,6 @@ pub(crate) struct Fixture {
     pub(crate) head: String,
     /// A commit on a side branch, based on `seed`, for the cherry-picks.
     pub(crate) side: String,
-    /// How the tree is reclaimed, and with what authority.
-    ///
-    /// **Last field, so it drops last** and the tree outlives everything that
-    /// reads from it. Underscored because nothing reads it: it is held for its
-    /// `Drop`.
-    _reclaim: Reclaim,
 }
 
 impl Fixture {
@@ -551,13 +501,11 @@ impl Fixture {
 
     /// A repository of the given object format, under [`scratch_parent`].
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
-        let scratch = scratch_tree(tag);
-        let root = scratch.path().to_path_buf();
-        Self::at(root, Reclaim::Owned(scratch), object_format)
+        Self::at(scratch(tag), object_format)
     }
 
     /// The body every constructor shares, over a root and whatever owns it.
-    fn at(root: PathBuf, reclaim: Reclaim, object_format: ObjectFormat) -> Self {
+    fn at(root: PathBuf, object_format: ObjectFormat) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
         fs::create_dir_all(&base).expect("the fixture's repository directory");
@@ -617,7 +565,6 @@ impl Fixture {
             seed,
             head,
             side,
-            _reclaim: reclaim,
         }
     }
 
@@ -679,18 +626,6 @@ impl Fixture {
             seed,
             head,
             side,
-            // **Built last, in the struct literal, and that is the whole
-            // point.** Every line above can fail — a stale or malformed
-            // handoff, a repository without `main` or `side`, a `derive` that
-            // refuses — and while this value existed before them, unwinding
-            // dropped it and recursively deleted the root it was handed. That
-            // deletes another tree when the handoff is wrong, and it destroys
-            // the failed child's evidence exactly when somebody needs to look
-            // at it. Master built the droppable `Fixture` only after these
-            // steps succeeded; so does this.
-            // `an_adoption_that_fails_validation_leaves_the_tree_alone` is the
-            // witness, because construction order is invisible in review.
-            _reclaim: Reclaim::Adopted(root.clone()),
             root,
         }
     }
@@ -743,6 +678,20 @@ impl Fixture {
             .add_worktree(hooks, &slot, &self.head)
             .unwrap_or_else(|error| panic!("add the fixture's worktree for `{key}`: {error}"));
         slot
+    }
+}
+
+impl Drop for Fixture {
+    /// Master's, restored with the rest of the reclaim path.
+    ///
+    /// Best effort, and untokened: the path removed is the one the fixture was
+    /// built or adopted at, not one this process can prove it owns. That is
+    /// §8's finding, and it is back in `reviews/FINDINGS.md` rather than fixed
+    /// here — four passes, three attempts at an ownership handoff, and each one
+    /// either deleted a tree it could not prove it owned or leaked one per kill
+    /// test. Closing it needs a handoff somebody can authenticate.
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -1089,6 +1038,24 @@ mod tests {
     /// produced, which the child's must equal.
     const AMBIENT_EXPECT: &str = "UPSTROKE_TEST_AMBIENT_EXPECT";
 
+    /// Where a child touches the proof that it ran.
+    ///
+    /// **A child that never ran is not a child that succeeded.** `--exact`
+    /// against a name no test has runs nothing and exits 0, so a parent
+    /// asserting only on the status accepts a renamed child as a pass and every
+    /// claim under it becomes vacuous — the fourth pass's finding 6. The check
+    /// that used to catch this read the harness prologue out of the child's
+    /// stdout, and it went with the capture the third pass withdrew. This needs
+    /// no streams: the child writes the marker as its last act, and the parent
+    /// requires it.
+    const RAN_MARKER: &str = "UPSTROKE_TEST_CHILD_RAN";
+
+    /// The child's last act: prove it ran.
+    fn mark_that_this_child_ran() {
+        let marker = std::env::var_os(RAN_MARKER).expect("the parent's marker path, in the child");
+        write_file(Path::new(&marker), b"ran\n");
+    }
+
     #[test]
     fn a_scratch_tag_that_is_not_one_path_component_is_refused() {
         let refused = std::panic::catch_unwind(|| scratch("has/separator"));
@@ -1099,56 +1066,6 @@ mod tests {
         assert!(
             message.contains("is not one path component"),
             "the refusal must name the tag and the objection: {message}"
-        );
-    }
-
-    /// The pre-clean is gone, and what replaces it never touches a tree it did
-    /// not create: two acquisitions are two roots, and the first one's bytes
-    /// are still there after the second.
-    #[test]
-    fn a_second_scratch_tree_is_a_second_root_and_pre_cleans_nothing() {
-        let first = scratch_tree("token-first");
-        let planted = first.path().join("planted.txt");
-        write_file(&planted, b"the first tree's own bytes\n");
-
-        let second = scratch_tree("token-second");
-        assert_ne!(
-            first.path(),
-            second.path(),
-            "a fresh ULID means two acquisitions cannot collide on a name"
-        );
-        assert!(
-            planted.exists(),
-            "the second acquisition removed the first tree's bytes at {}",
-            planted.display()
-        );
-    }
-
-    /// The guard reclaims **its own** root and nothing above or beside it, and
-    /// it reclaims on drop rather than at the end of a passing body, so a
-    /// failing test leaves no tree behind.
-    #[test]
-    fn a_dropped_scratch_guard_reclaims_its_own_tree_and_nothing_else() {
-        let neighbour = scratch_tree("token-neighbour");
-        let beside = neighbour.path().join("beside.txt");
-        write_file(&beside, b"a neighbouring tree\n");
-
-        let root = {
-            let tree = scratch_tree("token-dropped");
-            let root = tree.path().to_path_buf();
-            write_file(&root.join("inside.txt"), b"inside the guarded tree\n");
-            root
-        };
-
-        assert!(
-            !root.exists(),
-            "the guard's own tree survived its drop: {}",
-            root.display()
-        );
-        assert!(
-            beside.exists(),
-            "the drop reached outside the token's root, to {}",
-            beside.display()
         );
     }
 
@@ -1207,10 +1124,12 @@ mod tests {
         let victim_git_dir = victim.base.join(".git");
         let victim_index = victim_git_dir.join("index");
 
+        let ran = clean.root.join("child-ran.marker");
         let status = run_kill_child(
             AMBIENT_CHILD,
             &[
                 (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
+                (RAN_MARKER, ran.as_os_str()),
                 ("GIT_DIR", victim_git_dir.as_os_str()),
                 ("GIT_WORK_TREE", victim.base.as_os_str()),
                 ("GIT_INDEX_FILE", victim_index.as_os_str()),
@@ -1225,6 +1144,11 @@ mod tests {
         assert!(
             status.success(),
             "the child built its fixture under a hostile Git environment and ended {status:?}"
+        );
+        assert!(
+            ran.exists(),
+            "no test ran in the child: `{AMBIENT_CHILD}` matched nothing, and an exit of 0 from a \
+             harness that ran nothing is not this test passing"
         );
         assert_eq!(
             git(&victim.base, &["rev-parse", "main"]),
@@ -1251,6 +1175,7 @@ mod tests {
             expected,
             "the fixture's commits are not a function of its inputs alone"
         );
+        mark_that_this_child_ran();
     }
 
     /// `seed` is documented as the first commit. A child that committed on
@@ -1492,10 +1417,12 @@ mod tests {
         let config_path = hostile.join("config");
         write_file(&config_path, &config);
 
+        let ran = clean.root.join("child-ran.marker");
         let status = run_kill_child(
             CONFIG_CHILD,
             &[
                 (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
+                (RAN_MARKER, ran.as_os_str()),
                 ("GIT_CONFIG_GLOBAL", config_path.as_os_str()),
                 ("GIT_CONFIG_SYSTEM", config_path.as_os_str()),
                 ("GIT_TEMPLATE_DIR", template.as_os_str()),
@@ -1506,17 +1433,27 @@ mod tests {
             "the child built its fixture under a hostile Git configuration and template and \
              ended {status:?}"
         );
+        assert!(
+            ran.exists(),
+            "no test ran in the child: `{CONFIG_CHILD}` matched nothing, and an exit of 0 from a \
+             harness that ran nothing is not this test passing"
+        );
     }
 
-    /// `path` as the bytes a Git config value spells it with.
+    /// `path` as a **quoted** Git config value, in bytes.
     ///
-    /// A display conversion is for diagnostics (§8), and this value is written
-    /// into a file Git then reads as a path, so the conversion is exact where
-    /// it can be and a refusal where it cannot: on Unix the path's own bytes,
-    /// and elsewhere a path that is not Unicode is refused rather than having
-    /// its bytes replaced, because a Git config file there is UTF-8 and a
-    /// replacement character is a different path. Git's parser reads `\\` as an
-    /// escape, so each one is doubled — on the bytes, not on a `String`.
+    /// Escaping backslashes is not enough, and the fourth pass measured why:
+    /// written bare, `hooksPath = /tmp/a#b/hooks ` reads back as `/tmp/a`,
+    /// because Git treats an unquoted `#` as a comment and trims trailing
+    /// whitespace — so a witness could point at a file other than the one it
+    /// claimed to test. Written inside `"…"` the same value reads back byte for
+    /// byte, trailing space included (measured, git 2.43.0).
+    ///
+    /// A display conversion is for diagnostics (§8), so the bytes are the
+    /// path's own on Unix, and elsewhere a path that is not Unicode is refused
+    /// rather than replaced: a Git config file there is UTF-8, and a
+    /// replacement character is a different path. A newline is refused too,
+    /// because Git config has no representation for one inside a value.
     fn config_path_bytes(path: &Path) -> Vec<u8> {
         #[cfg(unix)]
         let bytes = {
@@ -1531,14 +1468,21 @@ mod tests {
                 path.display()
             ),
         };
-        let mut escaped = Vec::with_capacity(bytes.len());
+        assert!(
+            !bytes.contains(&b'\n'),
+            "the fixture cannot write {} into a Git config file: a value cannot carry a newline",
+            path.display()
+        );
+        let mut quoted = Vec::with_capacity(bytes.len() + 2);
+        quoted.push(b'"');
         for byte in bytes {
-            if byte == b'\\' {
-                escaped.push(b'\\');
+            if byte == b'\\' || byte == b'"' {
+                quoted.push(b'\\');
             }
-            escaped.push(byte);
+            quoted.push(byte);
         }
-        escaped
+        quoted.push(b'"');
+        quoted
     }
 
     /// `trim()` ate a trailing space from a path Git answered with, which is a
@@ -1547,8 +1491,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_strips_the_line_terminator_and_not_a_trailing_space() {
-        let tree = scratch_tree("trailing-space");
-        let awkward = tree.path().join("repo with a trailing space ");
+        let root = scratch("trailing-space");
+        let awkward = root.join("repo with a trailing space ");
         create_dir(&awkward);
         git(&awkward, &["init", "-q", "-b", "main"]);
         assert_eq!(
@@ -1668,81 +1612,6 @@ mod tests {
         std::process::exit(1);
     }
 
-    /// An adopted fixture reclaims the tree it adopted, which is master's
-    /// behaviour and is kept deliberately.
-    ///
-    /// `std::mem::forget` is the aborting child, exactly: its `Drop` never
-    /// runs, so its tree survives it. The pull request that tried to give this
-    /// process a *token* for that tree built an unauthenticated protocol and
-    /// withdrew it; what is left is master's best-effort removal, and the
-    /// alternative — reclaiming nothing — would add a leak master does not
-    /// have. The tree must still be there while the adopting fixture is alive,
-    /// or the removal has eaten the repository it is about to read.
-    #[test]
-    fn an_adopted_fixture_reclaims_the_tree_it_adopted() {
-        let fixture = Fixture::new("adopted");
-        let root = fixture.root.clone();
-        // The child died by `abort()`: nothing of its own is reclaimed.
-        std::mem::forget(fixture);
-        assert!(
-            root.exists(),
-            "the abandoned tree is the premise of this test"
-        );
-
-        let adopted = Fixture::adopt(root.clone());
-        assert!(
-            root.exists(),
-            "the tree was reclaimed while the fixture adopting it was still alive: {}",
-            root.display()
-        );
-        assert_eq!(
-            adopted.seed,
-            git(&adopted.base, &["rev-list", "--max-parents=0", "main"]),
-            "the adopted fixture can still read the repository it adopted"
-        );
-        drop(adopted);
-
-        assert!(
-            !root.exists(),
-            "the tree the child left behind outlived the fixture that adopted it: {}",
-            root.display()
-        );
-    }
-
-    /// An adoption that fails validation must leave the tree alone.
-    ///
-    /// Construction order is invisible in review and no existing test
-    /// exercised it, which is how `Reclaim::Adopted` came to be built before
-    /// any of the four validation steps: an unwind then deleted the root the
-    /// caller supplied, so a stale or malformed handoff destroyed another tree
-    /// and a failed child's evidence went with it. This fails at `1bcc12e` and
-    /// passes here.
-    #[test]
-    fn an_adoption_that_fails_validation_leaves_the_tree_alone() {
-        let tree = scratch_tree("adopt-refused");
-        let root = tree.path().to_path_buf();
-        // A tree that is not a fixture: `adopt` reaches `rev-parse main` and
-        // fails there, which is what a stale handoff looks like.
-        write_file(
-            &root.join("repo").join("evidence.txt"),
-            b"a failed child's tree\n",
-        );
-
-        let refused = std::panic::catch_unwind({
-            let root = root.clone();
-            move || Fixture::adopt(root)
-        });
-        assert!(
-            refused.is_err(),
-            "adopting a tree that is not a repository must fail"
-        );
-        assert!(
-            root.join("repo").join("evidence.txt").exists(),
-            "the failed adoption deleted the tree it was handed, and the evidence with it: {}",
-            root.display()
-        );
-    }
-
     /// The absent path the pins name is one Git will not create.
     ///
     /// The pass-3 reviewer's own sequence: a test can reach the exported `git`
@@ -1783,6 +1652,41 @@ mod tests {
                 "a fixture command read configuration from {origin}"
             );
         }
+    }
+
+    /// A config value carrying `#`, `;` and a trailing space reads back whole.
+    ///
+    /// Bare, Git reads `/tmp/a#b/hooks ` as `/tmp/a`: the `#` opens a comment
+    /// and the trailing whitespace is trimmed, so a witness that wrote paths
+    /// bare could be pointing at a different file than the one it names.
+    #[test]
+    fn a_config_path_survives_gits_comment_and_trimming_rules() {
+        let fixture = Fixture::new("config-quoting");
+        let awkward = fixture.root.join("a#b;c ");
+        create_dir(&awkward);
+
+        let mut written = b"[core]\n\thooksPath = ".to_vec();
+        written.extend_from_slice(&config_path_bytes(&awkward));
+        written.push(b'\n');
+        let config = fixture.root.join("quoting.config");
+        write_file(&config, &written);
+
+        let read_back = git(
+            &fixture.base,
+            &[
+                "config",
+                "--file",
+                config
+                    .to_str()
+                    .expect("the fixture's own scratch path is UTF-8"),
+                "core.hooksPath",
+            ],
+        );
+        assert_eq!(
+            PathBuf::from(read_back),
+            awkward,
+            "Git read a different path out of the config than the one written in"
+        );
     }
 
     /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
@@ -1839,5 +1743,6 @@ mod tests {
                 .expect("canonicalize the fixture's own repository"),
             "a template `core.worktree` moved the repository's worktree elsewhere"
         );
+        mark_that_this_child_ran();
     }
 }
