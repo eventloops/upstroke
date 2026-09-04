@@ -6233,17 +6233,24 @@ mod termination {
                     "{label} was signalled or reaped behind the gate \
                      (waitpid(-1, WNOHANG) returned {waited}): {launch}"
                 );
-                // Clean up what the gate deliberately left behind.
+                // What happens to a helper the gate leaves alone: it ends
+                // itself. The parent closed both ends of the command pipe on
+                // its way out, so the helper's first look at that descriptor
+                // once it reaches its loop is an end-of-file, and both loops
+                // exit zero on that. This is waited for, not timed —
+                // `waitid(WEXITED | WNOWAIT)` returns on the transition
+                // itself — so the test observes the property rather than
+                // giving it a deadline. A helper that did not end itself
+                // would block here, which is the honest failure for a
+                // property whose whole content is "it ends".
+                //
+                // The residual, stated in the body: a helper wedged before it
+                // reaches its loop is not ended by this path, where master's
+                // unconditional SIGKILL would have ended it once the kernel
+                // could deliver. That is the price of not signalling a pid we
+                // cannot claim.
                 let mut child = ForkedChild(pid_in(&launch));
-                // SAFETY: the pid names this process's own unreaped child,
-                // which the assertion above has just confirmed exists.
-                unsafe {
-                    assert_eq!(
-                        libc::kill(child.0, libc::SIGKILL),
-                        0,
-                        "{label} was not there to kill"
-                    );
-                }
+                wait_for_exit_without_reaping(child.0);
                 child.reap();
             }
         }
