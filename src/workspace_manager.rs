@@ -2678,7 +2678,7 @@ impl WorkspaceManager {
                 OsString::from("-z"),
             ],
         )?;
-        Ok(parse_worktree_records(&output))
+        parse_worktree_records(&output)
     }
 
     fn worktree_record(&self, path: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
@@ -3061,12 +3061,15 @@ fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
 /// is inside the execution root and is not a repository at all — would answer
 /// "nothing is registered" for exactly the residue this is here to see.
 fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
-    let output = read_only_git(repository, &["worktree", "list", "--porcelain", "-z"])?;
-    if !output.status.success() {
-        return Ok(None);
-    }
+    // A non-zero exit is Git failing to enumerate (a zero-length `commondir`
+    // left by an interrupted add makes it fail before any record), and that is
+    // an error carrying Git's stderr, never "not registered": absence is only
+    // the parsed list not naming `worktree`. Each `?` here propagates this
+    // module family's own contextualised error, on which every caller has one
+    // action, refuse.
+    let output = read_only_git_ok(repository, &["worktree", "list", "--porcelain", "-z"])?;
     let wanted = canonical_prefix(worktree)?;
-    for record in parse_worktree_records(&output.stdout) {
+    for record in parse_worktree_records(&output)? {
         if canonical_prefix(&record.path)? == wanted {
             return Ok(Some(record));
         }
