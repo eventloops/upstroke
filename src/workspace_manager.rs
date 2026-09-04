@@ -735,7 +735,9 @@ impl WorkspaceManager {
     /// follows a link in its parent as readily as a link at the root, and an
     /// `intents/` exchanged for a link to a victim directory between the
     /// gate and the effect would otherwise delete or write there with every
-    /// check passed.
+    /// check passed. The one path every Git-running primitive acts through
+    /// besides its target, `hooks-none`, is walked by the Git runner itself
+    /// immediately before each command ([`Self::revalidate_hooks_path`]).
     ///
     /// `DESIGN.md` §15: every create, reclaim and delete revalidates before
     /// its funnel and re-checks the chain inside it. Between the gate and the
@@ -1156,29 +1158,32 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         self.revalidate()?;
         let intent = self.intent_path(slot);
-        // Absent is the refusal; anything that is not a regular file is the
-        // same refusal, since only a file is a durable record; a metadata
-        // failure — a loop planted at the intent's name, permission — is an
-        // error, not "no intent".
-        let durable = match fs::symlink_metadata(&intent) {
-            Ok(metadata) => metadata.is_file(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(UpstrokeError::Io {
-                    path: intent,
-                    source,
-                });
-            }
-        };
-        if !durable {
-            return Err(Refusal::AddWithoutIntent {
-                slot: slot.relative().display().to_string(),
-                intent,
-            }
-            .into());
-        }
         funnel(hooks, slot.add_site(), move || {
             self.revalidate_chain(&path)?;
+            // Inside the funnel, after the `Before` hook: an intent removed
+            // between a check outside and the add would leave a worktree that
+            // `reclaim_intents` can never find. Absent is the refusal;
+            // anything that is not a regular file is the same refusal, since
+            // only a file is a durable record; a metadata failure — a loop
+            // planted at the intent's name, permission — is an error, not
+            // "no intent".
+            let durable = match fs::symlink_metadata(&intent) {
+                Ok(metadata) => metadata.is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(source) => {
+                    return Err(UpstrokeError::Io {
+                        path: intent,
+                        source,
+                    });
+                }
+            };
+            if !durable {
+                return Err(Refusal::AddWithoutIntent {
+                    slot: slot.relative().display().to_string(),
+                    intent,
+                }
+                .into());
+            }
             // Inside the funnel, not before it (`PR5-CONF-003`). `identity` says
             // "the funnel itself calls hook(Before, site) -> primitive ->
             // hook(After, site)" and `scope` requires "every effect through
@@ -2159,8 +2164,33 @@ impl WorkspaceManager {
     // Git plumbing
     // -----------------------------------------------------------------------
 
+    /// The hooks path, walked immediately before every Git command.
+    ///
+    /// Every command runs with `core.hooksPath` at [`Self::hooks_dir`], and a
+    /// hook that ran from there would be an effect no site accounts for. The
+    /// in-funnel chain check walks the effect's own target and not this path,
+    /// so a `hooks-none` exchanged for a link to a directory holding an
+    /// executable `post-checkout` after that check would have Git execute it.
+    /// So the chain from the private root down to `hooks-none` is walked
+    /// here, adjacent to the spawn, for every command: each component a real
+    /// directory and no reparse point. Absence is allowed — a root not yet
+    /// created has no hooks directory, and Git runs no hook from a path that
+    /// does not exist — and the same window between check and spawn remains
+    /// that [`Self::revalidate_chain`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::ReparsePointOnChain`], or
+    /// an I/O error naming the component that could not be read.
+    fn revalidate_hooks_path(&self) -> Result<(), UpstrokeError> {
+        refuse_reparse_points(&self.private_root, &self.hooks_dir())
+    }
+
     /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
+    ///
+    /// The hooks path is walked first ([`Self::revalidate_hooks_path`]).
     fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
+        self.revalidate_hooks_path()?;
         self.command(cwd, args)
             .output()
             .map_err(|error| UpstrokeError::Git {
@@ -2185,6 +2215,7 @@ impl WorkspaceManager {
     }
 
     fn git_with_identity(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
+        self.revalidate_hooks_path()?;
         self.command(cwd, args)
             // Environment identity overrides repository and global config and
             // any inherited GIT_AUTHOR_*/GIT_COMMITTER_*, so a commit-tree is a
@@ -2667,27 +2698,61 @@ fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<
         path: parent.to_path_buf(),
         source,
     })?;
-    let staged = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&staged).map_err(|source| UpstrokeError::Io {
-            path: staged.clone(),
-            source,
-        })?;
-        file.write_all(bytes).map_err(|source| UpstrokeError::Io {
-            path: staged.clone(),
-            source,
-        })?;
-        sync_file_recorded(&file, &staged, ledger)?;
-    }
-    fs::rename(&staged, path).map_err(|source| UpstrokeError::Io {
-        path: path.to_path_buf(),
-        source,
+    let name = path.file_name().ok_or_else(|| UpstrokeError::Git {
+        message: format!("{} has no file name", path.display()),
     })?;
-    ledger.record(
-        DurableStep::Renamed,
-        path,
-        fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-    );
+    // A per-call unique staging name, and `create_new`: a fixed name is a
+    // name anyone can plant, and `File::create` follows a link planted there
+    // to whatever it names. `create_new` refuses an existing name of any
+    // kind, link included, so the staged file is this call's alone.
+    let mut staged_name = OsString::from(".");
+    staged_name.push(name);
+    staged_name.push(format!(".{}.tmp", crate::ulid::ulid()));
+    let staged = parent.join(staged_name);
+    let written = {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|source| UpstrokeError::Io {
+                path: staged.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| UpstrokeError::Io {
+                path: staged.clone(),
+                source,
+            })
+            .and_then(|()| sync_file_recorded(&file, &staged, ledger))
+    };
+    let landed = written.and_then(|()| {
+        fs::rename(&staged, path).map_err(|source| UpstrokeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    });
+    if let Err(error) = landed {
+        // The staged file is ours alone, so a refused attempt leaves nothing
+        // behind — or names what it left.
+        return Err(match fs::remove_file(&staged) {
+            Ok(()) => error,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
+            Err(cleanup) => UpstrokeError::Io {
+                path: staged,
+                source: std::io::Error::new(
+                    cleanup.kind(),
+                    format!("{error}; and the staged file could not be removed: {cleanup}"),
+                ),
+            },
+        });
+    }
+    let length = fs::metadata(path)
+        .map(|meta| meta.len())
+        .map_err(|source| UpstrokeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    ledger.record(DurableStep::Renamed, path, length);
     sync_directory(parent, ledger)
 }
 

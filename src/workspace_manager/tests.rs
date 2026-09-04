@@ -1477,6 +1477,182 @@ impl EffectHooks for ExchangeAtBefore {
     }
 }
 
+/// Every Git command runs with `core.hooksPath` at `<root>/hooks-none`, and
+/// the in-funnel chain check walks the effect's target, not that path. A
+/// `hooks-none` exchanged at the `Before` hook for a link to an outside
+/// directory holding an executable `post-checkout` had `git worktree add`
+/// run it. The Git runner now walks the hooks path immediately before every
+/// command.
+#[test]
+fn a_hooks_path_exchanged_at_the_before_hook_refuses_the_worktree_add_and_runs_no_hook() {
+    let fixture = Fixture::created("hooks-exchanged");
+    let slot = fixture.task("delta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let outside = fixture.root.join("outside-hooks");
+    fs::create_dir_all(&outside).expect("outside hooks directory");
+    let marker = fixture.root.join("hook-ran.marker");
+    let script = outside.join("post-checkout");
+    fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display())).expect("hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    }
+    let hooks_dir = fixture.manager.execution_root().join("hooks-none");
+    let mut hooks = ExchangeAtBefore {
+        site: slot.add_site(),
+        original: hooks_dir.clone(),
+        moved: fixture.root.join("hooks-moved"),
+        victim: outside,
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the Git runner sees the exchanged hooks path");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&hooks_dir.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert!(!marker.exists(), "the outside hook never ran");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// `write_intent` staged through a fixed name, `<intent>.tmp`, opened with
+/// `File::create`, which follows a link planted there: the record went into
+/// the victim file the link named, and the link was renamed into place as
+/// the intent. The staging name is now unique per call and opened
+/// `create_new`, so a planted name is never followed. A file link needs a
+/// symlink, which the Windows guest's test user cannot create.
+#[cfg(unix)]
+#[test]
+fn a_link_planted_at_the_old_staging_name_is_never_followed_by_the_intent_write() {
+    let fixture = Fixture::created("staging-planted");
+    let slot = fixture.task("epsilon", 1);
+    let victim = fixture.root.join("victim.txt");
+    fs::write(&victim, "victim bytes\n").expect("victim");
+    let intent = fixture.manager.intent_path(&slot);
+    let old_staging = intent.with_extension("tmp");
+    std::os::unix::fs::symlink(&victim, &old_staging).expect("plant the link at the old name");
+
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("the write stages through its own unique name and lands");
+    assert_eq!(
+        fs::read(&victim).expect("victim"),
+        b"victim bytes\n",
+        "the victim is untouched"
+    );
+    let landed = fs::symlink_metadata(&intent).expect("the intent");
+    assert!(
+        landed.is_file() && landed.len() > 0,
+        "the intent landed as a regular file with the record"
+    );
+    assert!(
+        fs::symlink_metadata(&old_staging)
+            .expect("the planted link")
+            .file_type()
+            .is_symlink(),
+        "the planted link is still a link, and not what landed"
+    );
+}
+
+/// A link planted at the intent's own name is replaced by the rename, which
+/// does not follow it: the victim it named is untouched and the intent lands
+/// as a regular file. The valid call lands atomically over a hostile leaf.
+#[cfg(unix)]
+#[test]
+fn a_link_planted_at_the_intent_name_is_replaced_not_followed_by_the_intent_write() {
+    let fixture = Fixture::created("intent-name-planted");
+    let slot = fixture.task("eta", 1);
+    let victim = fixture.root.join("victim.txt");
+    fs::write(&victim, "victim bytes\n").expect("victim");
+    let intent = fixture.manager.intent_path(&slot);
+    std::os::unix::fs::symlink(&victim, &intent).expect("plant the link at the intent's name");
+
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("the write lands over the planted link");
+    assert_eq!(
+        fs::read(&victim).expect("victim"),
+        b"victim bytes\n",
+        "the victim is untouched"
+    );
+    let landed = fs::symlink_metadata(&intent).expect("the intent");
+    assert!(
+        landed.is_file() && landed.len() > 0,
+        "the intent is a regular file with the record, not the link"
+    );
+}
+
+/// The durable-intent precondition sat before the funnel, so an intent
+/// removed at the `Before` hook still yielded a worktree, one that
+/// `reclaim_intents` could never find. The check now runs inside the funnel
+/// after the hook, and afterwards `intents()` and `reclaim_intents` agree
+/// that there is nothing.
+#[test]
+fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
+    struct RemoveIntentAtBefore {
+        site: EffectSiteId,
+        intent: PathBuf,
+    }
+
+    impl EffectHooks for RemoveIntentAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == self.site && phase == HookPhase::Before {
+                fs::remove_file(&self.intent).expect("remove the intent");
+            }
+            Injection::Proceed
+        }
+    }
+
+    let fixture = Fixture::created("intent-removed-in-hook");
+    let slot = fixture.task("zeta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let mut hooks = RemoveIntentAtBefore {
+        site: slot.add_site(),
+        intent: fixture.manager.intent_path(&slot),
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the check inside the funnel sees the removed intent");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("durable intent"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+    let recorded = fixture.manager.intents().expect("intents").len();
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect("reclaim")
+        .len();
+    assert_eq!(
+        (recorded, reclaimed),
+        (0, 0),
+        "nothing is recorded and nothing is reclaimed, so the two agree"
+    );
+}
+
 /// A prefix that resolves to a regular file cannot carry components below
 /// it, and the filesystem said so; rejoining them lexically would hand back
 /// exactly the unverified path `canonical_prefix` exists not to. Reported as
@@ -1512,8 +1688,13 @@ struct RestoreMode {
 impl Drop for RestoreMode {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755))
-            .expect("restore the directory's mode");
+        match fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755)) {
+            Ok(()) => {}
+            // Already gone: nothing to restore, and a second panic while
+            // unwinding would abort the whole test process.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("restore the mode of {}: {error}", self.path.display()),
+        }
     }
 }
 
@@ -1537,12 +1718,19 @@ fn an_intent_that_cannot_be_read_is_an_error_and_not_an_absent_intent() {
         path: intents.clone(),
     };
     fs::set_permissions(&intents, fs::Permissions::from_mode(0o000)).expect("make it unsearchable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // reads through a mode of 000, and this test would then measure nothing.
+    let intent = fixture.manager.intent_path(&slot);
+    assert!(
+        fs::symlink_metadata(&intent).is_err(),
+        "prerequisite not met: the mode bit did not bind (running as root or with \
+         CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+    );
 
     let error = fixture
         .manager
         .add_worktree(&mut NoHooks, &slot, &fixture.head)
         .expect_err("an intent that cannot be read is not an intent that is absent");
-    let intent = fixture.manager.intent_path(&slot);
     assert!(
         matches!(&error, UpstrokeError::Io { path, .. } if path == &intent),
         "the error names the intent it could not read: {error}"
@@ -1563,6 +1751,17 @@ fn a_scaffolding_directory_that_cannot_be_removed_is_reported_not_swallowed() {
     let _restore = RestoreMode { path: root.clone() };
     fs::set_permissions(&root, fs::Permissions::from_mode(0o555))
         .expect("make the root unwritable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // writes through a mode of 555, the removal would then succeed and the
+    // fixture's root would be gone before the assertion.
+    let probe = root.join("probe-write");
+    if fs::create_dir(&probe).is_ok() {
+        fs::remove_dir(&probe).expect("remove the probe");
+        panic!(
+            "prerequisite not met: the mode bit did not bind (running as root or with \
+             CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+        );
+    }
 
     let error = fixture
         .manager
@@ -2804,10 +3003,19 @@ fn the_intent_and_its_directory_are_synced_before_the_add_begins() {
         steps, expected,
         "the durability sequence complete at the moment the add begins: {at_add:?}"
     );
-    assert_eq!(
-        at_add[0].path,
-        intent.with_extension("tmp"),
-        "the sync is of the staged intent, before it has its published name"
+    // The staged name is unique per call and never the published one; what
+    // is pinned is where it lived and that it is gone once published.
+    let staged = &at_add[0].path;
+    assert!(
+        staged.parent() == Some(intents_dir.as_path())
+            && staged != &intent
+            && staged
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+            && !staged.exists(),
+        "the sync is of the staged intent, in the intents directory, under a name that is \
+         not the published one and is gone once published: {}",
+        staged.display()
     );
     assert_eq!(
         at_add[0].len,
