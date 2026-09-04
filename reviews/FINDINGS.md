@@ -6202,3 +6202,43 @@ defect and are repaired at the root described above; the fifth was text.
 **What is still not measured, stated so it is not read as closed.** The rate of a 600-second stall
 above, and nothing else about this control: the attempt count removed the scheduling dependence
 that the earlier rows carried, rather than narrowing it.
+
+### FIND-109-SECOND-SIGHTING-OF-THE-LINUX-EMPTY-GITDIR-SAMPLER
+
+**Not this pull request's defect, and not this pull request's row to change.** It is recorded here
+because the row it concerns is merged, a merged row is not edited by a later pull request, and a
+sighting that lives only in a pull-request body is a sighting nobody finds when the fingerprint
+fires again.
+
+**The prior row.** `PR107-LINUX-WORKSPACE-RESIDUE-EMPTY-GITDIR-FINGERPRINT` records
+`workspace_manager::tests::sampled_git_child_kills_every_residue_classified_and_recovered`
+panicking at `forced removal converges: Git { message: "worktree registration
+…/.git/worktrees/kalpha-g1 has an empty gitdir" }`, on PR #107's `test (ubuntu-latest)` leg at
+`9963fb0`. It is explicitly **open as one unexplained observation, not classified as a flake or a
+regression**, it is a member of `CLASS-INTERMITTENT-SUBPROCESS-KILL-SETTLE-RESIDUE-FAILURES`, and
+its own terms make **a second sighting** one of the three things that would move its disposition —
+alongside an owner ruling and new evidence. It also calls itself the cheapest of that class to
+chase, because it is the only member on the Linux leg, which this project's build box reproduces
+directly.
+
+**The second sighting.** The eight-command baseline at `4b933311978ceab058ed355a52d1ec6b021169db`
+on the Linux build box, full suite: `test result: FAILED. 1904 passed; 1 failed; 35 ignored`, the
+same test, the same assertion, the same message shape — `worktree registration
+/tmp/upstroke-wm-sample-add-3511797-218/repo/.git/worktrees/kalpha-g1 has an empty gitdir` — at
+`src/workspace_manager/tests.rs:8815`. Run under the box-wide gate lock, with another session's
+suite active on the machine at the same time. The same test then passed **five times out of five**
+run alone at that head, which is the isolation half of the prior row's own nondeterminism.
+
+**What this pull request can and cannot say about it.** It does not touch that test:
+`git diff 95c5bd3 HEAD -- src/workspace_manager/tests.rs` contains no line naming it. The prior
+sighting is on PR #107 and predates this branch. But the honest limit is this: this pull request's
+only production change on the Linux leg is a thread-local increment inside the removal primitive,
+and a kill sampler is a timing experiment, so it **cannot be absolutely excluded** as an influence.
+The judgement here — offered as a judgement, not a measurement — is that a thread-local get-and-set
+is nanoseconds against a sampler whose ladder is in microseconds (the failing run's own ladder
+begins at 11304us), and that the fingerprint predating the change is the stronger evidence. If a
+third sighting lands on a head without that increment, this paragraph is what to delete.
+
+**Consequence.** This row exists to be found when that fingerprint fires a third time. The
+disposition of the prior row is its owner's to rule on, not this pull request's; nothing in it has
+been edited.
