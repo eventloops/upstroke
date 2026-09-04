@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 // The repository fixture and the three Git helpers are `fixture`'s, not
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
-use super::fixture::{Fixture, git, git_out, scratch};
+use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_kill_child, scratch};
 
 /// `value`, which the fixture read from Git, as the [`ObjectId`] every
 /// snapshot input is built from.
@@ -3346,35 +3346,13 @@ fn nothing_outside_the_execution_root_is_ever_deleted() {
         .expect("a slot path is contained");
 }
 
-#[test]
-fn a_slot_name_that_could_escape_the_root_refuses() {
-    let fixture = Fixture::created("slot-names");
-    for hostile in ["..", "../escape", "a/b", "-force", "", "naïve"] {
-        let slot = Slot::Task {
-            key: hostile.to_owned(),
-            generation: 1,
-        };
-        let error = fixture
-            .manager
-            .write_intent(&mut NoHooks, &slot)
-            .expect_err("a hostile slot name refuses");
-        let message = refusal_of(&error);
-        assert!(
-            message.contains("slot name"),
-            "the refusal must name its reason for `{hostile}`: {message}"
-        );
-    }
-    fixture
-        .manager
-        .write_intent(
-            &mut NoHooks,
-            &Slot::Task {
-                key: "ok_key-1".to_owned(),
-                generation: 1,
-            },
-        )
-        .expect("a legal name is accepted");
-}
+// `a_slot_name_that_could_escape_the_root_refuses` stood here and is gone: its
+// six hostile names are a strict subset of `HOSTILE_SLOT_NAMES` below and it
+// drove one primitive of the eleven, which is the `bounded_grid` shape the
+// grid test was written to replace. What it carried that the grid did not is
+// the *legal* name — and that half is not redundant at all, so it has moved
+// into the grid and now runs for every primitive rather than for
+// `write_intent` alone.
 
 /// The hostile slot names, one per **mechanism** by which a name escapes
 /// containment or changes a command's meaning.
@@ -3399,9 +3377,8 @@ const HOSTILE_SLOT_NAMES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every public primitive that turns a `&Slot` into a path refuses a
-/// hostile name — over a list **derived from this module's own
-/// signatures**, not from the ones the author remembered.
+/// Every public primitive **this scan can see** that turns a `&Slot` into a
+/// path refuses a hostile name.
 ///
 /// `a_slot_name_that_could_escape_the_root_refuses` exercises exactly one
 /// primitive, `write_intent`. That is the `bounded_grid` failure this
@@ -3414,9 +3391,22 @@ const HOSTILE_SLOT_NAMES: &[(&str, &str)] = &[
 /// are `pub`, so the name is caller data at every one of those entry
 /// points.
 ///
-/// The derivation is the scan below: a primitive that can refuse is a
-/// `pub fn` taking `slot: &Slot` and returning a `Result`. Adding one
-/// without an arm here fails this test by name.
+/// **What the scan is, and what it cannot see** (PR #136 pass 3, finding 2;
+/// noticed by this sweep at its start and not acted on, which is the honest
+/// provenance). The set comes from matching two exact spellings in this
+/// module's source — `slot: &Slot` and `-> Result<` — so it is a tripwire and
+/// not a derivation. A primitive spelt `target: &Slot`, or one returning
+/// `std::result::Result<…>`, is **invisible to it**: the derived set, this
+/// grid and the scan's own positive control all stay green while that
+/// primitive turns caller data into a path with nothing refusing for it. The
+/// `seen_fns > 30` check below is a floor that says the scan read something,
+/// not a boundary that says it read everything, and §12 asks for the second.
+///
+/// So the claim is: *adding a primitive spelt the way the existing eleven are
+/// spelt, without an arm here, fails this test by name.* Adding one spelt
+/// otherwise does not, and no third census is being written to chase it — two
+/// text censuses in this file have now been walked around three times between
+/// them. The row records both invisible spellings.
 #[test]
 fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     let fixture = Fixture::created("slot-grid");
@@ -3513,6 +3503,36 @@ fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     fs::create_dir_all(&outside).expect("outside directory");
     fs::write(outside.join("keep.txt"), "keep\n").expect("outside file");
 
+    // The legal name, driven through every primitive **before** the hostile
+    // ones, because a primitive that refuses every slot name satisfies every
+    // assertion below and this is the only thing that says otherwise. The
+    // grid as it stood asserted refusals and nothing else, and the one test
+    // that carried a legal-name control drove `write_intent` alone. Measured:
+    // with `candidate_diff` returning a slot-name refusal for every call,
+    // **this module's whole suite passed** — the primitive has no other
+    // success-path driver here, and what caught it was a driver test two
+    // modules away, which is not where a claim about this API belongs (§12,
+    // the lowest layer that can observe the failure).
+    //
+    // A primitive may still fail here for its own reasons — `add_worktree`
+    // has no durable intent, `proposal_cherry_pick` has no worktree — so what
+    // is asserted is the *reason*: whatever else goes wrong, a legal name is
+    // never refused as a slot name.
+    let legal = Slot::Task {
+        key: "ok_key-1".to_owned(),
+        generation: 1,
+    };
+    for (name, call) in &primitives {
+        if let Err(error) = call(&legal) {
+            let message = refusal_of(&error);
+            assert!(
+                !message.contains("slot name"),
+                "`{name}` refused the legal slot name `ok_key-1` as a slot name, so its \
+                 refusals below say nothing about hostility: {message}"
+            );
+        }
+    }
+
     for (name, call) in &primitives {
         for (hostile, why) in HOSTILE_SLOT_NAMES {
             let slot = Slot::Task {
@@ -3537,8 +3557,10 @@ fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     );
 }
 
-/// The names of this module's `pub fn`s that take `slot: &Slot` and return
-/// a `Result` — read out of the source rather than listed.
+/// The names of this module's `pub fn`s **spelt** `slot: &Slot` and
+/// `-> Result<` — matched in the source rather than listed, and matched by
+/// spelling rather than derived, which is the limit
+/// `every_slot_taking_primitive_refuses_a_hostile_slot_name` states in full.
 ///
 /// `slot_path` and `intent_path` are deliberately not in this set: they
 /// return a `PathBuf` infallibly and are path arithmetic, which is why the
@@ -3548,9 +3570,33 @@ fn slot_taking_fallible_primitives() -> BTreeSet<String> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/workspace_manager.rs"),
     )
     .expect("read this module's source");
+    let (names, seen_fns) = slot_taking_fallible_primitives_in(&source);
+    // The domain, asserted rather than assumed: the scan read this module's
+    // signatures and not nothing.
+    assert!(
+        seen_fns > 30,
+        "the scan read this module's signatures rather than nothing: {seen_fns}"
+    );
+    names
+}
+
+/// The scan itself, over text rather than over a path, so
+/// [`the_slot_primitive_scan_reads_code_and_never_prose`] can inject a
+/// violation into it. Returns the names and how many `pub fn`s were examined.
+fn slot_taking_fallible_primitives_in(source: &str) -> (BTreeSet<String>, usize) {
+    // **Comments and string literals blanked first** (§12: "a census of Rust
+    // structure blanks comments and string … literals before counting"; and
+    // `PR4-CENSUS-COMMENT-ORACLE`, the standing row for a census that counted
+    // a doc comment). Every needle here is code — `pub fn`, `slot: &Slot`,
+    // `-> Result<` — so a signature written inside a block comment or a raw
+    // string is prose and not a method of this module. The blanker is
+    // `crate::effects`', the one in the tree, which carries its own proof;
+    // this census does not write a second (`PR5D-VISIBILITY-CHECK-DUPLICATED`
+    // is the standing row for a parser written twice).
+    let blanked = crate::effects::blank_comments_and_strings(source);
     let mut names = BTreeSet::new();
     let mut seen_fns = 0_usize;
-    for chunk in source.split("\n    pub fn ").skip(1) {
+    for chunk in blanked.split("\n    pub fn ").skip(1) {
         seen_fns += 1;
         let Some((signature, _)) = chunk.split_once('{') else {
             continue;
@@ -3562,11 +3608,42 @@ fn slot_taking_fallible_primitives() -> BTreeSet<String> {
             names.insert(name.to_owned());
         }
     }
+    (names, seen_fns)
+}
+
+/// The census's own positive control (§12: "every census … carries a positive
+/// control that injects one violation and sees the expected failure").
+///
+/// The violation is the thing the grid above exists to catch: a slot-taking
+/// fallible `pub fn` that no arm names. The two negative cases are the two
+/// shapes that reach the split needle without being code — a block comment
+/// and a raw string literal, both of which can carry a real newline followed
+/// by four spaces — and they are why the scan blanks before counting.
+#[test]
+fn the_slot_primitive_scan_reads_code_and_never_prose() {
+    let code = "\n    pub fn newly_added(&self, slot: &Slot) -> Result<(), UpstrokeError> {\n        Ok(())\n    }\n";
+
+    let (found, seen) = slot_taking_fallible_primitives_in(code);
+    assert_eq!(seen, 1, "the scan examined the injected signature");
     assert!(
-        seen_fns > 30,
-        "the scan read this module's signatures rather than nothing: {seen_fns}"
+        found.contains("newly_added"),
+        "the injected violation must be reported, or this census cannot fail: {found:?}"
     );
-    names
+
+    for (what, prose) in [
+        ("a block comment", format!("/*{code}*/\n")),
+        (
+            "a raw string literal",
+            format!("const S: &str = r\"{code}\";\n"),
+        ),
+    ] {
+        let (found, seen) = slot_taking_fallible_primitives_in(&prose);
+        assert_eq!(
+            (found.len(), seen),
+            (0, 0),
+            "{what} is prose, not a method of this module: {found:?}"
+        );
+    }
 }
 
 /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
@@ -4266,15 +4343,31 @@ fn an_integration_ref_checked_out_in_a_second_worktree_is_refused() {
 // Intents: synced before the add, and reclaimed
 // -----------------------------------------------------------------------
 
+/// **The hook-order assertion this test used to end with is gone,
+/// deliberately.** It read `HookHarness::coverage()` — a *first-observation*
+/// log — for the index of `Worktree.WriteIntent/After` and of
+/// `Worktree.Add/Before`, and asserted the first came earlier. `write_intent` and `add_worktree` are two
+/// separate calls this test makes in that order, so the log records them in
+/// that order whatever either funnel does, and no edit to either could have
+/// moved it: the assertion restated the test's own script. It is the
+/// `PR5-WORKSPACE-022` shape, recorded on the snapshot test one screen below,
+/// where a *fresh* harness fixed it because there both events happen inside
+/// one `add_snapshot` call. Here nothing does, so the claim lives where it is
+/// enforced rather than merely performed:
+/// `an_add_without_a_durable_intent_refuses_and_leaves_nothing_registered` for
+/// the ordering, and `the_intent_and_its_directory_are_synced_before_the_add_begins`
+/// for what "durable" means at the moment the add begins. What stays here is
+/// what this fixture can still witness: the intent is a durable file while no
+/// worktree exists — the interrupted-add prefix the name is about — and
+/// reclaim removes it.
 #[test]
 fn the_intent_is_durable_before_the_add_and_reclaim_removes_it() {
     let fixture = Fixture::created("intent-order");
-    let (mut hooks, shared) = harness();
     let slot = fixture.task("alpha", 1);
 
     fixture
         .manager
-        .write_intent(&mut hooks, &slot)
+        .write_intent(&mut NoHooks, &slot)
         .expect("intent");
     assert!(
         fixture.manager.intent_path(&slot).is_file(),
@@ -4289,36 +4382,11 @@ fn the_intent_is_durable_before_the_add_and_reclaim_removes_it() {
     // snapshot add leaves a durable intent that reclaim removes."
     let reclaimed = fixture
         .manager
-        .reclaim_intents(&mut hooks)
+        .reclaim_intents(&mut NoHooks)
         .expect("reclaim");
     assert_eq!(reclaimed.slots, vec![slot.clone()]);
     assert!(!fixture.manager.intent_path(&slot).exists());
     assert!(fixture.manager.intents().expect("intents").is_empty());
-
-    // And the hook order the sentence is about, from the harness's own
-    // first-observation order.
-    fixture
-        .manager
-        .write_intent(&mut hooks, &slot)
-        .expect("intent again");
-    fixture
-        .manager
-        .add_worktree(&mut hooks, &slot, &fixture.head)
-        .expect("add");
-    let observed = shared.lock().expect("harness").coverage().to_vec();
-    let index = |site: EffectSiteId, phase: HookPhase| {
-        observed
-            .iter()
-            .position(|seen| seen.site == site && seen.phase == phase)
-            .unwrap_or_else(|| panic!("{site} {phase} was never observed"))
-    };
-    assert!(
-        index(
-            EffectSiteId::Worktree(WorktreeSite::WriteIntent),
-            HookPhase::After
-        ) < index(EffectSiteId::Worktree(WorktreeSite::Add), HookPhase::Before),
-        "the intent's after phase precedes the add's before phase"
-    );
 }
 
 /// A refusal at `Before(Worktree.Add)` refuses **before any effect**
@@ -4513,12 +4581,18 @@ fn the_intent_and_its_directory_are_synced_before_the_add_begins() {
         at_add[1].path, intent,
         "the rename lands on the intent name"
     );
-    #[cfg(unix)]
+    // **On every platform, like the step list above.** `write_synced` ends in
+    // `sync_directory(parent, ledger)` and `sync_directory` records the path
+    // it was handed, so there is nothing platform-shaped left in what is
+    // recorded — the `cfg` here was the last residue of the fork the step
+    // list already lost (`PR5-CONF-013`), and it left the Windows leg unable
+    // to see a barrier taken against the wrong path. It also needed a
+    // `let _ = &intents_dir;` to keep the binding used, which is a §7 discard
+    // standing in for a missing assertion.
     assert_eq!(
         at_add[2].path, intents_dir,
         "the directory sync is of the directory the rename changed"
     );
-    let _ = &intents_dir;
 }
 
 /// `snapshots`: "an interrupted add leaves a registered-but-unpopulated
@@ -4882,46 +4956,31 @@ fn a_registration_rebound_after_validation_keeps_its_admin_state() {
     assert!(admin.exists(), "identity is rechecked before admin removal");
 }
 
-#[test]
-fn registration_gitdir_requires_an_absolute_normalized_path() {
-    // A relative `gitdir` is Git 2.48's own form and is joined to the
-    // registration directory (`a_relative_registration_still_binds_its_checkout`);
-    // what an absolute one may not do is traverse or alias.
-    let admin = Path::new("/repository/.git/worktrees/example");
-    for bytes in [
-        &b"/absolute/../traversal/.git"[..],
-        &b"/absolute/./alias/.git"[..],
-    ] {
-        registration_checkout(admin, bytes).expect_err("non-normalized gitdir refuses");
-    }
-}
-
-#[cfg(windows)]
-#[test]
-fn registration_gitdir_refuses_invalid_utf8_on_windows() {
-    registration_checkout(
-        Path::new(r"C:\repository\.git\worktrees\example"),
-        b"C:\\worktree-\xff\\.git",
-    )
-    .expect_err("lossy path aliases are not registration identity");
-}
-
-#[cfg(unix)]
-#[test]
-fn registration_gitdir_decodes_non_utf8_path_bytes() {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let decoded = registration_checkout(
-        Path::new("/repository/.git/worktrees/example"),
-        b"/tmp/non-utf8-\xff/.git\n",
-    )
-    .expect("byte-valid registration");
-    assert_eq!(
-        decoded.as_os_str().as_bytes(),
-        b"/tmp/non-utf8-\xff",
-        "registration discovery is byte-preserving on Unix"
-    );
-}
+// The three `registration_gitdir_*` unit tests that stood here are gone. They
+// drove `parsers::registration_checkout` — a `pub(super)` helper of a *sibling*
+// child, reached from this file through `use super::*` — and every claim they
+// made is made again, and more strongly, by that child's own module tests:
+//
+// * absolute-and-normalized, by `registration_checkout_names_the_row_a_gitdir_
+//   falls_into`, which asserts *which* row each shape falls into rather than
+//   only that it refused, over six shapes rather than two;
+// * the Windows non-UTF-8 refusal, by `a_registration_that_is_not_utf8_is_
+//   refused_with_its_offset`, which also asserts the byte offset;
+// * the Unix byte-preserving decode, by `a_registration_keeps_every_path_byte_
+//   on_unix`, which is the same assertion.
+//
+// The normalized-path one was worse than redundant: it spelt its fixture
+// `Path::new("/repository/.git/worktrees/example")` and `b"/absolute/../…"`,
+// and on Windows neither is absolute — `Path::is_absolute` wants a prefix — so
+// the guest reached the "rooted but not absolute" arm and never the
+// normalization check the test is named for. The sibling's fixtures route
+// through its `absolute()` helper, which prepends `C:` on Windows, and are
+// therefore about what they say on both platforms.
+//
+// What this file keeps is the composition: `a_relative_registration_still_binds_
+// its_checkout` and the removal tests below drive the same decoder through the
+// public primitives against a real repository, which is what a suite at this
+// level is for.
 
 /// Build the state a killed `git worktree add` leaves: the registration
 /// exists and Git still holds its `initializing` lock.
@@ -6109,12 +6168,6 @@ fn an_unparsable_status_record_is_repo_wide_and_never_shorter() {
 /// hand-rolled `commit_tree` sequence that also carries `IdUnread`.
 #[test]
 fn a_git_child_that_fails_inside_a_funnel_records_before_and_never_claims_after() {
-    let fixture = Fixture::created("funnel-failure");
-    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
-    // Well-formed and absent: it passes every argument check and then makes
-    // the child itself fail, which is the only way into the funnel body.
-    let absent = "0".repeat(39) + "1";
-
     /// One failing drive: it runs a Git child that exits non-zero inside a
     /// funnel body and answers whether the call really failed.
     type FailingDrive = Box<dyn Fn(&mut dyn EffectHooks) -> bool>;
@@ -6127,7 +6180,7 @@ fn a_git_child_that_fails_inside_a_funnel_records_before_and_never_claims_after(
                 let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
                 fixture
                     .manager
-                    .proposal_cherry_pick(hooks, &slot, &("0".repeat(39) + "1"))
+                    .proposal_cherry_pick(hooks, &slot, ABSENT_COMMIT)
                     .is_err()
             }),
         ),
@@ -6140,7 +6193,7 @@ fn a_git_child_that_fails_inside_a_funnel_records_before_and_never_claims_after(
                     .manager
                     .candidate_commit_tree(
                         hooks,
-                        &("0".repeat(39) + "1"),
+                        ABSENT_COMMIT,
                         &fixture.head,
                         "upstroke: candidate",
                     )
@@ -6167,10 +6220,12 @@ fn a_git_child_that_fails_inside_a_funnel_records_before_and_never_claims_after(
             "{what}: the primitive failed, so there is no object present and referenced                  for After to be claiming"
         );
     }
-
-    let _ = &slot;
-    let _ = &absent;
 }
+
+/// A well-formed SHA-1 object id of an object no fixture has: it passes every
+/// argument check and then makes the Git child itself fail, which is the only
+/// way into a funnel body's failure path.
+const ABSENT_COMMIT: &str = "0000000000000000000000000000000000000001";
 
 /// Two generations of one task key are two different worktrees
 /// (`PR5-WORKSPACE-010`).
@@ -6194,9 +6249,7 @@ fn two_generations_of_one_task_key_are_two_worktrees() {
         "one key at two generations must not name one directory"
     );
     assert!(
-        first
-            .relative()
-            .ends_with("tasks/k alpha-g0".replace(' ', "").as_str()),
+        first.relative().ends_with("tasks/kalpha-g0"),
         "the packet spells it tasks/k<key>-g<gen>: {}",
         first.relative().display()
     );
@@ -6627,6 +6680,136 @@ fn every_change_kind_reaches_the_region_including_both_rename_endpoints() {
     );
 }
 
+/// `candidate_diff` produces the text a reviewer judges, and until this sweep
+/// **nothing in this suite asserted anything about it**: its one appearance in
+/// this file is the hostile-slot-name grid above, where every call is expected
+/// to fail, so a body returning `Err` for every slot passed this module's
+/// whole suite. What caught that mutation crate-wide was
+/// `engine::topology::recover`'s driver tests, fourteen of which went red —
+/// two modules away, and for reasons that say nothing about the diff. §12 asks
+/// for the lowest layer that can observe the failure, and the three claims
+/// below are not observable there at all.
+///
+/// Three claims, one fixture, each with the mutation it is witnessed against:
+///
+/// * **The recorded objects, not the world.** The worktree's HEAD is moved off
+///   the recorded parent first, exactly as
+///   `changed_paths_honour_the_recorded_base_after_head_has_moved_off_it` moves
+///   it, and the two readings are proved to differ before the answer is read.
+///   Witnessed against a body that diffs from current HEAD: `b.txt` arrived
+///   between the seed and the base, so that diff carries it and this one
+///   must not.
+/// * **`--binary`.** Witnessed against dropping it from
+///   [`crate::workspace::REVIEW_DIFF_FLAGS`]: Git then says "Binary files …
+///   differ", which is not a patch a reviewer or `classify::diff_failure` can
+///   read.
+/// * **Colour suppression.** The repository is configured `color.ui=always`,
+///   which is exactly the operator config the flag list exists to defeat, and
+///   `WorkspaceManager::command` sets no colour option of its own. The witness
+///   is dropping **both** `-c color.ui=false` and `--no-color`, and it is
+///   stated as a pair on purpose: dropping either alone leaves the other
+///   suppressing colour, and a claim measured against a mutation that does not
+///   bite is not a measurement. Witnessed against dropping the pair: the diff
+///   comes back carrying escape codes.
+///
+/// `--no-ext-diff` and `--no-textconv` need an external program or a
+/// `.gitattributes` filter to observe; they are a deferred row rather than
+/// half a test.
+///
+/// Each mutation above was run against **master's whole crate suite**, which
+/// passed all 1,903 tests under every one of them.
+#[test]
+fn the_candidate_diff_is_of_the_recorded_objects_and_survives_operator_diff_config() {
+    let fixture = Fixture::created("candidate-diff");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+
+    // The operator config the shared flag list is there to defeat.
+    git(&fixture.base, &["config", "color.ui", "always"]);
+
+    fs::write(path.join("a.txt"), "changed\n").expect("a text edit");
+    // A NUL in the first bytes is what makes Git call a file binary.
+    fs::write(path.join("bin.dat"), [0_u8, 1, 2, 0xff]).expect("a binary file");
+    fixture
+        .manager
+        .candidate_stage(&mut NoHooks, &slot)
+        .expect("stage");
+    let tree = fixture
+        .manager
+        .candidate_write_tree(&mut NoHooks, &slot)
+        .expect("write-tree");
+
+    // **Both** recorded arguments are moved off the world, because each has
+    // its own way of being ignored.
+    //
+    // HEAD moves off the recorded parent: that separates a body honouring
+    // `parent` from one re-reading HEAD.
+    git(&path, &["reset", "-q", "--soft", &fixture.seed]);
+    assert_eq!(
+        git(&path, &["rev-parse", "HEAD"]),
+        fixture.seed,
+        "the worktree's HEAD really moved off the recorded base"
+    );
+    // And the **index** moves off the recorded tree (PR #136 pass 1,
+    // finding 1). `reset --soft` deliberately leaves the index equal to the
+    // tree just captured, so with only the step above a body that ignored
+    // `tree` and ran `git diff --cached <parent> --` produced byte-identical
+    // output and passed every assertion here. Staging one more file after the
+    // capture is what makes the argument the only route to the expected
+    // answer. The harm it stands for is `DESIGN.md` §14's exact-tree
+    // guarantee: the index moves on after a capture, and a reviewer shown the
+    // index is shown a tree the candidate does not commit.
+    fs::write(path.join("after-capture.txt"), "staged after the capture\n")
+        .expect("a file staged after the tree was captured");
+    git(&path, &["add", "after-capture.txt"]);
+
+    // The premises, asserted before the answer is read, so neither
+    // discriminator can quietly stop discriminating.
+    assert_ne!(
+        git(&path, &["write-tree"]),
+        tree,
+        "the index must no longer hold the recorded tree, or `tree` is not the only \
+         way to the expected diff"
+    );
+    let from_index = git(&path, &["diff", "--cached", "--name-only", &fixture.head]);
+    assert!(
+        from_index.contains("after-capture.txt"),
+        "a body reading the index rather than the recorded tree would carry \
+         after-capture.txt: {from_index}"
+    );
+    assert!(
+        git(&path, &["diff", "--name-only", &fixture.seed, &tree]).contains("b.txt"),
+        "and a body reading current HEAD rather than the recorded parent would carry b.txt"
+    );
+
+    let diff = fixture
+        .manager
+        .candidate_diff(&slot, &fixture.head, &tree)
+        .expect("the diff of the recorded objects");
+
+    assert!(
+        !diff.contains("after-capture.txt"),
+        "the diff is of the recorded tree, not of whatever the index holds now: {diff}"
+    );
+    assert!(
+        !diff.contains("b.txt"),
+        "the diff is against the recorded parent, not against wherever HEAD is now: {diff}"
+    );
+    assert!(
+        diff.contains("a/a.txt") && diff.contains("+changed"),
+        "and it carries the edit it was asked for: {diff}"
+    );
+    assert!(
+        diff.contains("GIT binary patch"),
+        "a binary file reaches the reviewer as a patch, not as \"Binary files … differ\": \
+         {diff}"
+    );
+    assert!(
+        !diff.contains('\u{1b}'),
+        "a configured `color.ui=always` must not reach the text a gate reads: {diff:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_repository_path_a_string_cannot_carry_makes_the_region_repo_wide() {
@@ -6981,9 +7164,49 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
         .stderr(Stdio::null())
         .output()
         .expect("run the helper");
+    // **The oracle is the abort's own signature, not `!success()`**, which is
+    // what `fixture::died_by_abort` exists to say and what this call site said
+    // for itself until this sweep. The helper ends in `unreachable!`, so a
+    // `Kill` that stopped killing leaves it panicking: the harness reports a
+    // failed test and exits 101, `!success()` is true, and every assertion
+    // below still holds — the commit-tree the helper then completes writes an
+    // unreferenced object, which is `Internal` for a target with no recorded
+    // id. Witnessed: with `Injection::Kill` replaced by `Injection::Proceed`
+    // in `id_unread_kill_helper`, this test passed.
     assert!(
-        !helper.status.success(),
-        "the helper must die at the point rather than finish"
+        died_by_abort(&helper.status),
+        "the helper must die at the point by `std::process::abort`, not reach its own \
+         `unreachable!` and panic: {:?}",
+        helper.status
+    );
+    // **And it must be an abort by this platform's own measure, not merely
+    // an exit that is neither success nor a panic** (PR #136 pass 2,
+    // finding 2). `died_by_abort` names `SIGABRT` on Unix, but on Windows it
+    // is a negation — unsuccessful and not the panic's 101 — because
+    // `abort()` reaches `__fastfail`, whose code has moved between CRT
+    // versions and so cannot be written down. A negation accepts far too
+    // much: change only the Windows arm of `Injection::Kill` from `abort()`
+    // to `process::exit(1)` and the helper still dies at `IdUnread`, still
+    // leaves the object, and still satisfies every assertion here.
+    //
+    // What cannot be written down can still be **measured**. This runs one
+    // child whose whole body is `std::process::abort()`, on this machine and
+    // this CRT, moments before the comparison — so the oracle is the exit
+    // status an abort actually produces here, and `exit(1)` is not equal to
+    // it on either platform.
+    let aborted = run_kill_child(
+        "workspace_manager::tests::abort_probe_helper",
+        &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
+    );
+    assert!(
+        died_by_abort(&aborted),
+        "the probe must itself look like an abort, or it is measuring nothing: {aborted:?}"
+    );
+    assert!(
+        same_end(&helper.status, &aborted),
+        "the helper ended {:?}, and an abort on this platform ends {aborted:?}; those are \
+         different ends, so what killed it was not `std::process::abort`",
+        helper.status
     );
     let written = fs::read_to_string(&record).expect("the helper recorded its repository");
     let mut lines = written.lines();
@@ -7012,6 +7235,119 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
 
 /// Where the helper tells its parent which repository to inspect.
 const ID_UNREAD_RECORD: &str = "UPSTROKE_PR5A_ID_UNREAD_RECORD";
+
+/// Set to make [`abort_probe_helper`] abort.
+///
+/// Guarded by a variable for the same reason [`id_unread_kill_helper`] is: the
+/// item is `#[ignore]`, but a run with `--include-ignored` would otherwise
+/// abort the whole test process.
+const ABORT_PROBE: &str = "UPSTROKE_PR136_ABORT_PROBE";
+
+/// Abort, so a parent can measure what this platform's
+/// [`std::process::abort`] looks like from outside instead of describing it.
+#[test]
+#[ignore = "subprocess helper"]
+fn abort_probe_helper() {
+    if std::env::var_os(ABORT_PROBE).is_none() {
+        return;
+    }
+    std::process::abort();
+}
+
+/// Set to make [`exit_one_probe_helper`] exit 1.
+const EXIT_ONE_PROBE: &str = "UPSTROKE_PR136_EXIT_ONE_PROBE";
+
+/// Exit 1, which is what the mutation pass 2 named turns an abort into.
+#[test]
+#[ignore = "subprocess helper"]
+fn exit_one_probe_helper() {
+    if std::env::var_os(EXIT_ONE_PROBE).is_none() {
+        return;
+    }
+    std::process::exit(1);
+}
+
+/// The abort oracle is tested, on every platform, against the thing it must
+/// not accept (PR #136 pass 2, finding 2).
+///
+/// The finding is Windows-shaped: there `died_by_abort` is a *negation* —
+/// unsuccessful, and not the panic's 101 — because `abort()` reaches
+/// `__fastfail`, whose code has moved between CRT versions. A negation admits
+/// `process::exit(1)`, so changing only the Windows arm of `Injection::Kill`
+/// from `abort()` to `exit(1)` left `a_kill_at_id_unread_aborts_before_the_id_is_recorded`
+/// green there. **The Unix legs cannot see that mutation** — measured: with
+/// `Injection::Kill` changed to `exit(1)`, that test fails on Linux at the
+/// reviewed head as well, because the Unix arm names `SIGABRT` — so Linux was
+/// never going to witness the repair through that test.
+///
+/// This one witnesses it everywhere, by testing the oracle rather than the
+/// funnel: two real children, one aborting and one exiting 1, and the two
+/// predicates applied to both. It says in one place what the repair claims —
+/// that the shared predicate accepts an exit this suite must reject, and that
+/// comparing against a *measured* abort does not.
+#[test]
+fn the_abort_oracle_separates_an_abort_from_an_exit_of_one() {
+    let aborted = run_kill_child(
+        "workspace_manager::tests::abort_probe_helper",
+        &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
+    );
+    let exited = run_kill_child(
+        "workspace_manager::tests::exit_one_probe_helper",
+        &[(EXIT_ONE_PROBE, std::ffi::OsStr::new("1"))],
+    );
+
+    // The premises: each child really ended the way its name says.
+    assert!(
+        died_by_abort(&aborted),
+        "the abort probe must abort: {aborted:?}"
+    );
+    assert_eq!(
+        exited.code(),
+        Some(1),
+        "the exit probe must exit 1: {exited:?}"
+    );
+
+    // What `died_by_abort` is on Windows, written out and applied here so the
+    // weakness is demonstrated rather than described: unsuccessful, and not
+    // the panic's 101. It accepts BOTH children.
+    let windows_form = |status: &std::process::ExitStatus| {
+        const PANIC: i32 = 101;
+        !status.success() && status.code() != Some(PANIC)
+    };
+    assert!(
+        windows_form(&aborted) && windows_form(&exited),
+        "the negation accepts both ends, which is the finding: {aborted:?} vs {exited:?}"
+    );
+
+    // And what the repair uses does not.
+    assert!(
+        !same_end(&aborted, &exited),
+        "an abort and an exit of 1 must not be the same end on any platform: {aborted:?} \
+         vs {exited:?}"
+    );
+    assert!(
+        same_end(&aborted, &aborted),
+        "…while an abort is the same end as itself, or the comparison rejects everything"
+    );
+}
+
+/// Whether two exit statuses are the **same end**, by value.
+///
+/// Not "both unsuccessful": that is the negation `died_by_abort` has to fall
+/// back on for Windows, and it accepts every failing exit there is. On Unix an
+/// end is a signal or a code; on Windows it is a code. Two ends are the same
+/// when those agree.
+fn same_end(left: &std::process::ExitStatus, right: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        left.signal() == right.signal() && left.code() == right.code()
+    }
+    #[cfg(not(unix))]
+    {
+        left.code() == right.code()
+    }
+}
 
 /// Spawned by `a_kill_at_id_unread_aborts_before_the_id_is_recorded`.
 #[test]
@@ -7856,6 +8192,25 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             "one observation per sample, or the tally below is over the wrong list"
         );
 
+        // **The refusals first** (PR #136 pass 1, finding 2). A classifier
+        // refusal becomes `None` in `observed`, so `tally` leaves it out of
+        // every bucket and the histogram total falls short of `SAMPLING_N` —
+        // which means the generic total assertion below fired first and the
+        // words explaining *why* the classifier refused were never printed.
+        // The diagnostic this sweep added was therefore unreachable on the
+        // one failure it exists to diagnose. It is asserted here, before
+        // anything derived from the tally, because a refusal is a different
+        // failure from an unclassifiable residue and deserves to be reported
+        // as itself.
+        assert!(
+            run.refusals.is_empty(),
+            "{site}: the classifier refused {} of {SAMPLING_N} samples, which is not the \
+                 same thing as a residue in no class — it is an inspection that failed, and \
+                 the assertions below would have called it unclassified: {:?}",
+            run.refusals.len(),
+            run.refusals
+        );
+
         // The independent tally. Not `tally()` again — a second call to the
         // code under test agrees with itself by construction — but a count
         // per class written out separately, so a bucket incremented under
@@ -7891,7 +8246,9 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         );
         assert_eq!(
             record.unclassified, 0,
-            "an unclassifiable residue is durable state no tabled action recovers"
+            "an unclassifiable residue is durable state no tabled action recovers; a \
+             classifier refusal reads the same here and is reported by its own assertion \
+             above, which found none"
         );
         assert!(
             record.recovered,
@@ -8019,6 +8376,30 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                      Git child this harness kills, and a kill skipped for one of the four is \
                      invisible to every count taken over all four"
             );
+
+            // **What the kill answered is recorded and printed, and not
+            // asserted on** (PR #136 pass 3, finding 3). The assertion that
+            // stood here paired a kill error with a `try_wait` taken
+            // immediately before the kill, and the reviewer reproduced the
+            // false green: on Unix an exited-but-unreaped child is a zombie,
+            // `kill(SIGKILL)` on it returns **success**, and the wait reports
+            // the child's own exit — so in the race window the error is empty,
+            // this check passed, and another shape's kills satisfied the
+            // global floor while this shape killed nothing. The claim in the
+            // deleted comment that the race was "one-sided, a false red and
+            // never a false green" was wrong.
+            //
+            // No third attempt is being made. Two observations taken at two
+            // instants cannot decide this from inside the process, and the row
+            // says what a sound version needs instead: the child watched from
+            // outside it.
+            let errors: Vec<&String> = shape
+                .iter()
+                .filter_map(|launch| launch.kill_error.as_ref())
+                .collect();
+            if !errors.is_empty() {
+                println!("kill errors {label}: {errors:?}");
+            }
 
             // **When each kill fired**, read off the clock by the kill
             // rather than off the delay the caller asked for
@@ -8199,6 +8580,13 @@ struct SamplingRun {
     /// What `classify_object_residue` answered for each sample, in order.
     /// `None` is a sample it could not classify at all.
     observed: Vec<Option<ObjectResidue>>,
+    /// What the classifier said when it *refused* a sample, one line each.
+    ///
+    /// A refusal and an unclassifiable residue both arrive in `observed` as
+    /// `None`, and the assertion they fail is worded for the second of them.
+    /// The words that tell the two apart are here, so a red run says which it
+    /// met instead of naming only the one it probably did not.
+    refusals: Vec<String>,
 }
 
 /// Tally per-sample observations into the packet's histogram.
@@ -8222,31 +8610,70 @@ fn tally(observed: &[Option<ObjectResidue>]) -> (ClassHistogram, u32) {
 /// No sampled funnel builds a Git argument from a literal (Fable's
 /// `PR5-CONF-004`).
 ///
-/// Sharing the lists makes the *transcription* impossible; this is what
-/// stops a funnel growing an argument beside its list and putting the
-/// divergence back. `command_internal_sub_effects` (ii) says the sampled
-/// child is "the Git child of the site", and a child spawned with a
-/// different argv is a different child however faithful the list is.
+/// Sharing the lists makes the *transcription* impossible.
+/// `command_internal_sub_effects` (ii) says the sampled child is "the Git
+/// child of the site", and a child spawned with a different argv is a
+/// different child however faithful the list is. The two axes are the *shared
+/// list* and the *call site that uses it*: sharing covers the first, and only
+/// reading the call sites can see the second.
 ///
-/// The two axes are the *shared list* and the *call site that uses it*.
-/// Sharing covers the first; a funnel that appends `"--force"` inline is
-/// still an un-shared argument, and only reading the call sites can see it.
-/// The dynamic arguments each funnel legitimately adds — a path, a commit —
-/// are counted rather than forbidden, so growing one is a change to this
-/// number rather than a silent widening.
+/// # This is a tripwire, not a guarantee, and it says so
+///
+/// **Every claim this census used to make has been withdrawn**, over three
+/// frontier passes that each walked around it a different way (PR #136,
+/// findings `PR136-P3-SAMPLED-ARGV-CENSUS-IS-FAIL-OPEN`,
+/// `PR136-PASS2-P1-CENSUS-EXTENT-FORGED-BY-A-LITERAL` and
+/// `PR136-PASS3-P1-CENSUS-EXTENT-FORGED-BY-A-DECOY`). A census over source
+/// text cannot hold a behaviour claim, and this one has now been shown not to
+/// three times:
+///
+/// * a sibling spelling: `argv.push("--ignore-errors".into())` adds a fixed
+///   Git argument and moves neither `OsString::from` count;
+/// * a false boundary: a raw string holding a line of four spaces and a brace
+///   ended the body early, so the declared counts were satisfied by what was
+///   injected before the cut;
+/// * a decoy: the scan takes the **first global** `.find` of the signature and
+///   never proves the match is in `impl WorkspaceManager`, so an earlier
+///   method of that name with an empty body on another type absorbs it while
+///   the real one grows an argument.
+///
+/// The first two are closed — literals are counted, the extent comes from the
+/// blanked text. **The third is not, and no third repair is being attempted**:
+/// two passes produced two forgeries, and a third piece of machinery in the
+/// same place is what this pull request stopped doing.
+///
+/// So what it asserts is exactly this and nothing more: **these four funnel
+/// bodies contain no inline literal Git argument, and hold the declared number
+/// of literals and `OsString::from` arguments, today.** It is a tripwire that
+/// catches a careless edit. It does not establish that the sampled child runs
+/// the funnel's argv, and **§12's domain-boundary requirement is unmet here**,
+/// which the row records rather than this doc pretending otherwise. The
+/// structural version — comparing what the funnel passes against what
+/// `sampled_command` passes, as values at run time — needs a seam in the
+/// parent's argv construction and is a deferred row.
 #[test]
 fn no_sampled_funnel_builds_its_argv_from_a_literal() {
     // (function, how many `OsString::from(<expression>)` arguments it adds
-    // beyond its shared list, and what they are).
-    const SAMPLED: &[(&str, usize, &str)] = &[
+    // beyond its shared list, how many string literals its body holds at all,
+    // and what those literals are).
+    const SAMPLED: &[(&str, usize, usize, &str)] = &[
         (
             "pub fn add_worktree(",
             1,
-            "the commit; the path is a PathBuf",
+            1,
+            "the commit is the dynamic argument, the path is a PathBuf; the one literal is \
+             the `operation: \"create\"` field of a Filesystem error, not a Git argument",
         ),
-        ("pub fn candidate_stage(", 0, "none"),
-        ("pub fn candidate_write_tree(", 0, "none"),
-        ("pub fn proposal_cherry_pick(", 1, "the commit to pick"),
+        ("pub fn candidate_stage(", 0, 0, "none of either"),
+        ("pub fn candidate_write_tree(", 0, 0, "none of either"),
+        (
+            "pub fn proposal_cherry_pick(",
+            1,
+            2,
+            "the commit to pick is the dynamic argument; the two literals are the argv of a \
+             SECOND, unsampled Git child, `git rev-parse HEAD`, which this funnel runs after \
+             the pick to read the proposal commit",
+        ),
     ];
     // CRLF normalized first: the Windows guest checks this tree out with it,
     // and `find("\n    }\n")` does not match `\r\n    }\r\n`. Measured — this
@@ -8255,26 +8682,199 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace_manager.rs"))
             .expect("the funnel module's source")
             .replace("\r\n", "\n");
-    for (signature, dynamic, what) in SAMPLED {
-        let body = source
-            .split_once(signature)
-            .unwrap_or_else(|| panic!("`{signature}` is no longer in this file"))
-            .1;
-        let body = &body[..body.find("\n    }\n").expect("the function ends")];
-        let literals = body.matches("OsString::from(\"").count();
+    for (signature, dynamic, literal, what) in SAMPLED {
+        let counts = sampled_argv_counts(&source, signature);
         assert_eq!(
-            literals, 0,
-            "`{signature}` builds {literals} Git argument(s) from a string literal; \
-                 every fixed argument belongs in the shared list the kill sampler reads, \
-                 or the sampler stops running the command the funnel runs"
+            counts.from_literal, 0,
+            "`{signature}` builds {} Git argument(s) from a string literal; every fixed \
+                 argument belongs in the shared list the kill sampler reads, or the sampler \
+                 stops running the command the funnel runs",
+            counts.from_literal
         );
-        let dynamics = body.matches("OsString::from(").count();
         assert_eq!(
-            dynamics, *dynamic,
-            "`{signature}` adds {dynamics} dynamic Git argument(s), not {dynamic} \
-                 ({what}); if that is deliberate, `sampled_command` needs the same one"
+            counts.dynamic, *dynamic,
+            "`{signature}` adds {} dynamic Git argument(s), not {dynamic} ({what}); if that \
+                 is deliberate, `sampled_command` needs the same one",
+            counts.dynamic
+        );
+        // The literal count, which is what the two above do not see (PR #136
+        // pass 1, finding 3): `"--ignore-errors".into()` is a fixed Git
+        // argument beside the shared list and moves neither of them. Every
+        // literal a body holds is declared, so growing one — for an argument
+        // or for anything else — is a number that stops matching rather than
+        // a change nobody reads.
+        assert_eq!(
+            counts.literals, *literal,
+            "`{signature}` holds {} string literal(s), not {literal} ({what}); a literal \
+                 added here may be a Git argument the kill sampler does not run",
+            counts.literals
         );
     }
+}
+
+/// How many `OsString::from("…")` and how many `OsString::from(…)` the body of
+/// `signature` holds, in that order.
+///
+/// **Comments blanked, string literals kept.** The needle lives *inside* a
+/// literal — `OsString::from("` ends in the literal's own opening quote — so
+/// the sibling blanker, which blanks a literal including its quotes, would
+/// search for bytes the haystack can no longer contain; `blank_comments`' own
+/// documentation says exactly that, which is why there are two of them.
+/// Blanking at all is §12 and `PR4-CENSUS-COMMENT-ORACLE`: a census that
+/// counts a comment counts prose, and a funnel body is where a comment about
+/// `OsString::from(` is most likely to be written.
+///
+/// Takes the source as text so
+/// [`the_sampled_argv_census_counts_code_and_never_comments`] can drive it
+/// against an injected violation.
+fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
+    // **The extent is found structurally, the counting is not** (PR #136
+    // pass 2, finding 1). The needles live inside string literals, so the
+    // counting text must keep them — and a text that keeps its literals can
+    // carry a *false function boundary*: a raw string holding a line of four
+    // spaces and a brace ends the body early, and the census then reads a
+    // truncated function while its declared numbers are satisfied by whatever
+    // was injected before the cut. The reviewer's reproduction added a Git
+    // argument and a boundary together and stayed green.
+    //
+    // So the boundary comes from `blank_comments_and_strings`, where no
+    // literal survives to forge one, and the counting from `blank_comments`
+    // over the same byte range. The first blanker replaces each blanked byte
+    // with a space rather than deleting it, so one range indexes both texts —
+    // that is the property this depends on, and it is that function's, tested
+    // there.
+    let structural = crate::effects::blank_comments_and_strings(source);
+    let at = structural
+        .find(signature)
+        .unwrap_or_else(|| panic!("`{signature}` is no longer in this file"));
+    let start = at + signature.len();
+    let end = start
+        + structural[start..]
+            .find("\n    }\n")
+            .expect("the function ends");
+    let body = crate::effects::blank_comments(&source[start..end]);
+    let bytes = body.as_bytes();
+    let mut literals = 0_usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            literals += 1;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+        }
+        i += 1;
+    }
+    SampledArgvCounts {
+        from_literal: body.matches("OsString::from(\"").count(),
+        dynamic: body.matches("OsString::from(").count(),
+        literals,
+    }
+}
+
+/// What [`sampled_argv_counts`] found in one funnel body.
+#[derive(Debug, PartialEq, Eq)]
+struct SampledArgvCounts {
+    /// `OsString::from("…")` — a fixed Git argument spelt inline.
+    from_literal: usize,
+    /// `OsString::from(…)` of any kind, fixed or dynamic.
+    dynamic: usize,
+    /// **Every** string literal in the body, whatever it is for.
+    ///
+    /// The two counts above match two exact spellings, and a census over
+    /// source text is satisfied by any sibling spelling — PR #136 pass 1,
+    /// finding 3, with the reproduction `"--ignore-errors".into()`, which adds
+    /// a fixed Git argument beside the shared list while leaving both of them
+    /// unchanged. This count is not fooled by that one, because the argument
+    /// is still a literal. It is fooled by a `const`, a variable or a call,
+    /// which is why the claim this census carries is narrowed to what it can
+    /// actually support and the structural version is a deferred row.
+    literals: usize,
+}
+
+/// The tripwire's own controls: what it does catch, and one thing it does not.
+///
+/// The first violation is the one the census was written for — a fixed Git
+/// argument spelt `OsString::from("…")` beside the shared list. The second is
+/// pass 1's: `"--ignore-errors".into()` is the same defect in another
+/// spelling, and it left both `OsString::from` counts where they were, which
+/// is why literals are counted at all. The negative case is the same text in a
+/// comment, which is what blanking is for; the third case shows the extent is
+/// taken from the blanked text, so a literal cannot end the body early.
+///
+/// **None of this makes the census a guarantee.** A `const`, a variable, a
+/// call, or the decoy function of pass 3's finding 1 all pass every assertion
+/// here. The controls prove it catches what it claims to catch, and the claim
+/// is small.
+#[test]
+fn the_sampled_argv_census_counts_code_and_never_comments() {
+    let clean = "\
+impl WorkspaceManager {
+    pub fn sampled(&self) {
+        let mut argv = fixed(&Self::SAMPLED_ARGV);
+        // Never OsString::from(\"--force\") here: it belongs in the list.
+        argv.push(OsString::from(commit));
+    }
+}
+";
+    let comment = "// Never OsString::from(\"--force\") here: it belongs in the list.";
+    assert_eq!(
+        sampled_argv_counts(clean, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 0,
+            dynamic: 1,
+            literals: 0,
+        },
+        "a comment naming either construct is prose and is not an argument"
+    );
+
+    let inline = clean.replace(comment, "argv.push(OsString::from(\"--force\"));");
+    assert_eq!(
+        sampled_argv_counts(&inline, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 1,
+            dynamic: 2,
+            literals: 1,
+        },
+        "an argument spelt `OsString::from(\"…\")` must move every count that can see it"
+    );
+
+    // **The reviewer's false-boundary reproduction** (PR #136 pass 2,
+    // finding 1): a raw string carrying a line of four spaces and a brace,
+    // added together with a Git argument. Over unblanked text the scan stops
+    // inside that raw string and reads a body short of the real one, and the
+    // injected argument makes the truncated counts match what was declared.
+    // The structural extent is not fooled, so the counts are the true ones.
+    let truncating = clean.replace(
+        comment,
+        "argv.push(OsString::from(flag));\n        let _boundary = r\"\n    }\n\";",
+    );
+    assert_eq!(
+        sampled_argv_counts(&truncating, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 0,
+            dynamic: 2,
+            literals: 1,
+        },
+        "the extent comes from the blanked text, so the whole body is read: two \
+         `OsString::from(` and one literal, the raw string itself — a scan that stopped \
+         inside that raw string would see the second `argv.push` and neither of the \
+         literals after it"
+    );
+
+    let sibling = clean.replace(comment, "argv.push(\"--ignore-errors\".into());");
+    let counts = sampled_argv_counts(&sibling, "pub fn sampled(");
+    assert_eq!(
+        (counts.from_literal, counts.dynamic),
+        (0, 1),
+        "the reviewer's reproduction: `.into()` moves neither `OsString::from` count, which \
+         is exactly why this census was fail-open"
+    );
+    assert_eq!(
+        counts.literals, 1,
+        "…and it is the literal count that sees it, which is the repair"
+    );
 }
 
 /// Kill the Git child of one site `SAMPLING_N` times and classify what is
@@ -8301,6 +8901,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
             .collect::<Vec<_>>()
     );
     let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
     let mut recovered = true;
 
     for run in 0..SAMPLING_N {
@@ -8323,7 +8924,17 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         kill_git_child(&cwd, &args, delay);
 
         let target = ResidueTarget::new(&base).at(&path).from_base(&fixture.head);
-        observed.push(classify_object_residue(site, &target).ok());
+        // `.ok()` is what the tally needs, and it is not what a reader of a
+        // red run needs: it folds "the classifier refused, and here is why"
+        // into the same `None` as "this residue is in no class", and the
+        // assertion those `None`s fail is worded for the second. §7 asks that
+        // a discard be best-effort with defined observability, so the error's
+        // own words are kept and go into that assertion's message.
+        let classified = classify_object_residue(site, &target);
+        if let Err(error) = &classified {
+            refusals.push(format!("run {run}: {error}"));
+        }
+        observed.push(classified.ok());
         if !recover_sample(&fixture, &slot) {
             recovered = false;
         }
@@ -8340,6 +8951,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
             recovered,
         },
         observed,
+        refusals,
     }
 }
 
@@ -8643,18 +9255,13 @@ enum LaunchEnd {
 /// kill is gone. The third arm exists so that such a command reddens the
 /// suite instead of being miscounted.
 fn launch_end(status: &std::process::ExitStatus) -> LaunchEnd {
-    // `Child::kill` sends `SIGKILL`. No exit a child reaches on its own can
-    // carry a signal at all, and nothing else here signals this child, so
-    // the signal is a fingerprint the kill alone can leave.
-    #[cfg(unix)]
-    let killed = std::os::unix::process::ExitStatusExt::signal(status) == Some(libc::SIGKILL);
-    // `Child::kill` is `TerminateProcess(handle, 1)`, so the fingerprint
-    // here is exit code 1. `measure_budget` asserts that this same command
-    // in this same fixture exits 0 when nothing kills it, so 1 is not an
-    // end any of these four commands reaches by itself.
-    #[cfg(windows)]
-    let killed = status.code() == Some(1);
-    if killed {
+    // The fingerprint is `fixture::died_by_kill`, not a second copy of it.
+    // This file carried its own per-platform arms, byte-for-byte the ones in
+    // `fixture.rs`, and `src/engine/topology/attempt/tests.rs` reads the
+    // shared one: two spellings of one platform fact drift apart at whichever
+    // of them a new platform is taught first, and the half that is not taught
+    // goes on counting kills after the kill is gone.
+    if died_by_kill(status) {
         LaunchEnd::Killed
     } else if status.success() {
         LaunchEnd::Completed
@@ -8678,6 +9285,20 @@ struct SampledLaunch {
     argv: Vec<String>,
     after: std::time::Duration,
     fired: Option<std::time::Duration>,
+    /// What [`SampledChild::kill`] answered, when it answered an error.
+    ///
+    /// **`fired` says a kill ran at this child; it does not say the kill
+    /// worked** (PR #136 pass 1, finding 4). The result was discarded at the
+    /// call site with `let _ =`, so a shape whose kills all *failed* while its
+    /// children exited normally passed its per-shape checks — every child was
+    /// fired at, none was `Failed` — and another shape's successful kills
+    /// satisfied the one global floor. The suite could then certify killing all
+    /// four command shapes with one of them never killed. §7 asks a discard to
+    /// be best-effort with a defined failure path, and **the path is
+    /// observability, not an assertion**: the value is recorded here and
+    /// printed beside the per-shape counts. Pass 3 showed why it cannot be
+    /// asserted on — see the note at that printing.
+    kill_error: Option<String>,
     end: LaunchEnd,
 }
 
@@ -8770,7 +9391,8 @@ impl SampledChild {
     /// actual timing rather than the timing it was asked for; stored after
     /// the call, the record cannot outlive the call's removal, because
     /// deleting `self.child.kill()` leaves `outcome` unbound and the module
-    /// stops compiling.
+    /// stops compiling. The kill's own answer is returned and recorded by the
+    /// caller; nothing here decides what it means.
     ///
     /// What that still leaves reachable is a fake that keeps the call and
     /// throws its effect away. The kill floor at the end of the sampling
@@ -8791,7 +9413,12 @@ impl SampledChild {
 fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
     let mut child = SampledChild::spawn(cwd, args);
     std::thread::sleep(after);
-    let _ = child.kill();
+    // Kept, not discarded. A kill of a child that has already reached its own
+    // exit legitimately fails on Windows -- `TerminateProcess` answers
+    // `ERROR_ACCESS_DENIED` for an exited process -- so this is not an
+    // `expect`; what it is is evidence, and the per-shape assertion pairs it
+    // with how the child ended.
+    let kill_error = child.kill().err().map(|error| error.to_string());
     // Reaped rather than discarded: this status is the whole observation.
     let status = child.wait().expect("reap the sampled git child");
     SAMPLED_LAUNCHES
@@ -8801,6 +9428,7 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
             argv: args.to_vec(),
             after,
             fired: child.fired,
+            kill_error,
             end: launch_end(&status),
         });
 }
