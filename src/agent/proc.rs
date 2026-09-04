@@ -1499,8 +1499,8 @@ mod termination {
     /// monitor's to kill. A
     /// suspension request is not an interruption: the guard is what performs
     /// a suspension, and a launch that failed on Ctrl-Z would be a surprise,
-    /// so a suspension waits for READY and is then honoured, within this
-    /// budget rather than the old two seconds. The guard's own READY wait
+    /// so a suspension waits for READY, up to this budget rather than the
+    /// old two seconds, and is then honoured. The guard's own READY wait
     /// runs during supervisor initialisation, before any handler is installed
     /// or group registered, so nothing can be pending behind it and it is a
     /// plain budgeted wait.
