@@ -107,7 +107,7 @@ body when it has been.
 | `MAINTAINING.md` | Change lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `.github/scripts/` | The 4 `test-*.sh` gates and the `validate-*` helpers they exercise |
-| `reviews/` | `reviews/FINDINGS.md`, the standing finding ledger; historical review records moved to the private lab repository on 2026-09-04 |
+| `reviews/` | `reviews/findings/`, the standing finding ledger, one file per finding; `reviews/FINDINGS.md`, the same ledger up to 2026-09-04, closed to new sections; historical review records moved to the private lab repository on 2026-09-04 |
 | `effects/` | The effect-governance allowlists the `src/effects/tests.rs` census enforces |
 
 `src/` is one crate: `plan/` (ingestion), `agent/` (the Claude Code, Copilot and Codex adapters,
