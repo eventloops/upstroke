@@ -805,7 +805,10 @@ mod tests {
     /// fails loudly rather than passing vacuously.
     const AMBIENT_CHILD: &str = "workspace_manager::fixture::tests::ambient_environment_child";
 
-    /// What the parent hands the child: the three commit ids its own fixture
+    /// The harness name of [`ambient_config_child`], run the same way.
+    const CONFIG_CHILD: &str = "workspace_manager::fixture::tests::ambient_config_child";
+
+    /// What the parent hands each child: the three commit ids its own fixture
     /// produced, which the child's must equal.
     const AMBIENT_EXPECT: &str = "UPSTROKE_TEST_AMBIENT_EXPECT";
 
@@ -1107,5 +1110,96 @@ mod tests {
             "the installed Git calls these local and this module does not strip them: {missing:?}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the ambient claim: a **configuration file** this
+    /// process cannot replace for itself.
+    ///
+    /// The child is given a global and a system config file pinning everything
+    /// the fixture pins — signing on, an ignore file that excludes the seed
+    /// files, an attributes file that rewrites their line endings on checkout,
+    /// a hooks directory holding a `post-checkout`, an fsmonitor, `autocrlf`
+    /// and another default branch — and must still produce this process's three
+    /// commit ids, this process's file content, and no hook.
+    #[test]
+    fn the_fixture_is_immune_to_an_ambient_global_git_config() {
+        let clean = Fixture::new("config-clean");
+        let expected = format!("{} {} {}", clean.seed, clean.head, clean.side);
+
+        let hostile = clean.root.join("hostile");
+        let excludes = hostile.join("ignore");
+        let attributes = hostile.join("attributes");
+        let hooks = hostile.join("hooks");
+        let hook = hooks.join("post-checkout");
+        write_file(&excludes, b"*.txt\n");
+        write_file(&attributes, b"* text eol=crlf\n");
+        write_file(&hook, b"#!/bin/sh\n: > hook-ran.marker\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+                .expect("make the hostile hook executable");
+        }
+        let config = hostile.join("config");
+        write_file(
+            &config,
+            format!(
+                "[commit]\n\tgpgsign = true\n\
+                 [init]\n\tdefaultBranch = trunk\n\
+                 [core]\n\tautocrlf = true\n\
+                 \tfsmonitor = {hook}\n\
+                 \texcludesFile = {excludes}\n\
+                 \tattributesFile = {attributes}\n\
+                 \thooksPath = {hooks}\n",
+                hook = escaped(&hook),
+                excludes = escaped(&excludes),
+                attributes = escaped(&attributes),
+                hooks = escaped(&hooks),
+            )
+            .as_bytes(),
+        );
+
+        let status = run_child_test(
+            CONFIG_CHILD,
+            &[
+                (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
+                ("GIT_CONFIG_GLOBAL", config.as_os_str()),
+                ("GIT_CONFIG_SYSTEM", config.as_os_str()),
+            ],
+        );
+        assert!(
+            status.success(),
+            "the child built its fixture under a hostile Git configuration and ended {status:?}"
+        );
+    }
+
+    /// A path as a Git config value: the parser reads `\\` as an escape, so a
+    /// Windows path written verbatim is a bad config value.
+    fn escaped(path: &Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
+    /// The child half of [`the_fixture_is_immune_to_an_ambient_global_git_config`].
+    #[test]
+    #[ignore = "spawned by `the_fixture_is_immune_to_an_ambient_global_git_config` with a \
+                hostile Git configuration"]
+    fn ambient_config_child() {
+        let expected =
+            std::env::var(AMBIENT_EXPECT).expect("the parent's expected commit ids, in the child");
+        let fixture = Fixture::new("config-child");
+        assert_eq!(
+            format!("{} {} {}", fixture.seed, fixture.head, fixture.side),
+            expected,
+            "the fixture's commits are not a function of its inputs alone"
+        );
+        assert_eq!(
+            fs::read(fixture.base.join("a.txt")).expect("read the seed file back"),
+            b"one\n",
+            "an ambient attributes file rewrote the checked-out content"
+        );
+        assert!(
+            !fixture.base.join("hook-ran.marker").exists(),
+            "an ambient hooks path ran a hook during the fixture's own checkouts"
+        );
     }
 }
