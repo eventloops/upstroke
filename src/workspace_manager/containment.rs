@@ -151,15 +151,20 @@ pub(crate) enum Leaf {
 /// own empty scaffolding, `remove_file` on an intent, and on the `locked`
 /// marker inside that admin entry — but a non-recursive removal still
 /// follows a link in its *parent*, and so does every read and every write.
-/// So each funnel primitive names, as data, every path it acts through after
-/// its `Before` hook — the parent's
+/// So each funnel primitive names, as data, the paths of nine roles it acts
+/// through after its `Before` hook — the parent's
 /// [`Primitive::acted_through`](super::Primitive::acted_through): the
 /// effect's target, its parent chain, Git's hooks path, the intent it
-/// authorises on, the registration it removes — and one helper walks the
-/// whole set with this predicate immediately before the syscalls. An
-/// exchanged `intents/`, `tasks/`, `hooks-none` or admin directory refuses
-/// exactly as an exchanged root does, and a test generated from that table
-/// plants a link at each path in turn.
+/// authorises on, the registration it removes — and one helper walks that
+/// set with this predicate immediately before the syscalls. An exchanged
+/// `intents/`, `tasks/`, `hooks-none` or admin directory refuses exactly as
+/// an exchanged root does. The table is those nine roles and no more: Git's
+/// own repository-discovery paths — the `.git` file or link of the checkout
+/// and of the base, and `commondir`, `objects`, `refs`, `packed-refs`,
+/// `index` and `config` behind them — are not walked, and the two
+/// commit-tree funnels have no entry. That is the parent's funnel design
+/// and its sweep's; the durable fix is directory-handle-relative operations
+/// or a stated trust boundary for what may write inside the execution root.
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
@@ -380,7 +385,10 @@ pub(super) fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// past: a prefix the filesystem refuses to resolve for any other reason —
 /// permission, a link loop, a name it cannot represent, transient I/O — is
 /// an error, because a comparison over a path the filesystem never verified
-/// proves nothing about containment. And a prefix that resolves to something
+/// proves nothing about containment. Absence is read from the component
+/// itself, without following: a link that exists with an absent target
+/// answers `NotFound` to `canonicalize` too, and is a reparse point on the
+/// chain, not a component to peel past. And a prefix that resolves to something
 /// other than a directory while components remain below it is
 /// `NotADirectory` at that prefix, on every platform: the filesystem has
 /// said the rest of the path cannot exist, and rejoining it lexically would
@@ -435,6 +443,30 @@ pub(super) fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
             Err(error) if is_absent(&error) => error,
             Err(source) => return Err(UpstrokeError::Io { path: head, source }),
         };
+        // `NotFound` from `canonicalize` does not say the head is absent: a
+        // link that exists and whose target is absent answers the same, and
+        // peeling past it would reconstruct a path through a link that is
+        // there. Read the head itself, without following, before peeling
+        // it: an existing link is a reparse point on the chain and refuses;
+        // a component that exists and is not a link yet did not resolve is
+        // a race between the two reads, reported as the resolution failure.
+        match fs::symlink_metadata(&head) {
+            Ok(metadata) if is_reparse_point(&metadata) => {
+                return Err(Refusal::ReparsePointOnChain {
+                    chain: path.to_path_buf(),
+                    at: head,
+                }
+                .into());
+            }
+            Ok(_) => {
+                return Err(UpstrokeError::Io {
+                    path: head,
+                    source: absent,
+                });
+            }
+            Err(error) if is_absent(&error) => {}
+            Err(source) => return Err(UpstrokeError::Io { path: head, source }),
+        }
         // `file_name` is `None` when what is left ends in `..` or is a root:
         // there is no plain component to peel.
         let Some(name) = head.file_name().map(OsStr::to_os_string) else {

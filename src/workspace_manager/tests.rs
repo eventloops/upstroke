@@ -1663,15 +1663,17 @@ fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
     );
 }
 
-/// One substitution per path a primitive acts through: a `Before` hook
-/// exchanges the path for a link to an outside victim, the primitive must
-/// refuse naming the substituted component, and the victim must be
-/// untouched. Generated from `Primitive::ALL` and `acted_through_paths`, so
-/// every path the table names is driven; the case count is pinned so that a
-/// path dropped from the table is a case that stops being generated and a
-/// number that stops matching. A file link needs a symlink, which the
-/// Windows guest's test user cannot create, so the file-leaf cases run on
-/// the Unix legs and are counted as skipped on Windows.
+/// One substitution per path the table names for a primitive: a `Before`
+/// hook exchanges the path for a link to an outside victim, the primitive
+/// must refuse naming the substituted component, and the victim must be
+/// untouched. Generated from `every_primitive` and `acted_through_paths`, so
+/// every path the table names is driven; the case count is pinned as a
+/// regression pin on the table's own size — a path dropped from the table
+/// is a case that stops being generated and a number that stops matching —
+/// and it is not a proof that the table is complete, which it is not (see
+/// `ActedThrough`). A file link needs a symlink, which the Windows guest's
+/// test user cannot create, so the file-leaf cases run on the Unix legs and
+/// are counted as skipped on Windows.
 #[test]
 fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook() {
     let mut driven = 0_usize;
@@ -1835,7 +1837,7 @@ impl SubstitutionCase {
                     .manager
                     .execution_root()
                     .join("intents")
-                    .join(".stage-01ORPHAN0000000000000000.tmp");
+                    .join(format!(".stage-task-{}.tmp", crate::ulid::ulid()));
                 fs::write(&orphan, b"{}").expect("plant the orphan");
             }
             P::VerifyWorktree
@@ -2148,7 +2150,8 @@ fn a_slot_name_at_the_old_maximum_still_lands_its_intent() {
 /// The §8 staging protocol's recovery rule: a staging file is never an
 /// intent. An orphan a crash left behind used to fail `intents()` forever,
 /// which blocked every reclaim; now `intents()` ignores it, `reclaim_intents`
-/// removes it, and a retry of the write lands.
+/// removes it, and a retry of the write lands. The orphan has the exact
+/// shape `write_intent` produces, a real ULID included.
 #[test]
 fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
     let fixture = Fixture::created("staging-orphan");
@@ -2158,7 +2161,7 @@ fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
         .write_intent(&mut NoHooks, &slot)
         .expect("a real intent");
     let intents = fixture.manager.execution_root().join("intents");
-    let orphan = intents.join(".stage-01ORPHAN0000000000000000.tmp");
+    let orphan = intents.join(format!(".stage-task-{}.tmp", crate::ulid::ulid()));
     fs::write(&orphan, b"{\"half\":").expect("plant the orphan");
 
     assert_eq!(
@@ -2180,6 +2183,171 @@ fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
         .write_intent(&mut NoHooks, &slot)
         .expect("a retry of the write lands");
     assert!(fixture.manager.intent_path(&slot).is_file());
+}
+
+/// `hooks-none` must be empty, not only a real link-free directory: a hook
+/// written into it runs under every Git command. A `Before` hook writes an
+/// executable `post-checkout` into the existing directory; the add refuses
+/// naming the entry, and the hook never runs.
+#[test]
+fn a_hook_written_into_hooks_none_at_the_before_hook_refuses_the_worktree_add_and_never_runs() {
+    struct WriteHookAtBefore {
+        site: EffectSiteId,
+        script: PathBuf,
+        marker: PathBuf,
+    }
+
+    impl EffectHooks for WriteHookAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == self.site && phase == HookPhase::Before {
+                fs::write(
+                    &self.script,
+                    format!("#!/bin/sh\n: > '{}'\n", self.marker.display()),
+                )
+                .expect("write the hook");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&self.script, fs::Permissions::from_mode(0o755))
+                        .expect("executable hook");
+                }
+            }
+            Injection::Proceed
+        }
+    }
+
+    let fixture = Fixture::created("hooks-none-written");
+    let slot = fixture.task("theta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let hooks_dir = fixture.manager.execution_root().join("hooks-none");
+    let marker = fixture.root.join("hook-ran.marker");
+    let mut hooks = WriteHookAtBefore {
+        site: slot.add_site(),
+        script: hooks_dir.join("post-checkout"),
+        marker: marker.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("a hooks path that holds a hook refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("hook-free") && message.contains("post-checkout"),
+        "the refusal must name its reason and the entry: {message}"
+    );
+    assert!(!marker.exists(), "the hook never ran");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// `NotFound` from `canonicalize` does not say a component is absent: a link
+/// that exists with an absent target answers the same, and the peel used to
+/// walk past it and reconstruct the path through a link that is there. The
+/// link is read without following, and refuses as a reparse point on the
+/// chain. A dangling link needs a symlink, which the Windows guest's test
+/// user cannot create.
+#[cfg(unix)]
+#[test]
+fn canonical_prefix_refuses_a_dangling_link_rather_than_peeling_past_it() {
+    let tree =
+        acquire(&std::env::temp_dir(), "canonical-dangling").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
+    let link = real.join("link");
+    std::os::unix::fs::symlink(real.join("missing"), &link).expect("plant the dangling link");
+    let error = canonical_prefix(&link.join("child"))
+        .expect_err("a dangling link on the chain is a reparse point, not absence");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&link.display().to_string()),
+        "the refusal must name its reason and the link: {message}"
+    );
+}
+
+/// Only the exact shape `write_intent` produces is a staging file. A name
+/// that merely resembles one is nobody's to hide or delete: `intents()`
+/// reports it as the malformed file it is, and `reclaim_intents` leaves it
+/// where it is.
+#[test]
+fn a_name_that_merely_resembles_a_staging_file_is_neither_hidden_nor_removed() {
+    let fixture = Fixture::created("staging-lookalike");
+    let intents = fixture.manager.execution_root().join("intents");
+    let lookalike = intents.join(".stage-report.tmp");
+    fs::write(&lookalike, b"someone's report\n").expect("plant the lookalike");
+
+    let listed = fixture
+        .manager
+        .intents()
+        .expect_err("a malformed name in the intent directory is reported");
+    assert!(
+        refusal_of(&listed).contains("unexpected file"),
+        "reported as the malformed file it is: {listed}"
+    );
+    fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect_err("reclaim stops at the malformed name too");
+    assert_eq!(
+        fs::read(&lookalike).expect("the lookalike"),
+        b"someone's report\n",
+        "and it is untouched"
+    );
+}
+
+/// An orphan of each kind is removed under the site of its kind — the row
+/// the record would have joined — so the hooks, fault row and accounting are
+/// the right ones. The harness records which sites executed.
+#[test]
+fn a_staging_orphan_of_each_kind_is_removed_under_its_own_site() {
+    let fixture = Fixture::created("staging-orphan-kinds");
+    let intents = fixture.manager.execution_root().join("intents");
+    let kinds = [
+        ("task", EffectSiteId::Worktree(WorktreeSite::RemoveIntent)),
+        (
+            "staging",
+            EffectSiteId::Worktree(WorktreeSite::RemoveStagingIntent),
+        ),
+        (
+            "snapshot",
+            EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
+        ),
+    ];
+    let mut orphans = Vec::new();
+    for (kind, _) in &kinds {
+        let orphan = intents.join(format!(".stage-{kind}-{}.tmp", crate::ulid::ulid()));
+        fs::write(&orphan, b"{").expect("plant the orphan");
+        orphans.push(orphan);
+    }
+    let (mut hooks, shared) = harness();
+
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut hooks)
+        .expect("reclaim removes every orphan");
+    assert!(
+        reclaimed.is_empty(),
+        "no intent was recorded, so none is reclaimed"
+    );
+    for orphan in &orphans {
+        assert!(!orphan.exists(), "{} is gone", orphan.display());
+    }
+    let observed = shared.lock().expect("harness").coverage().to_vec();
+    for (kind, site) in &kinds {
+        for phase in [HookPhase::Before, HookPhase::After] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|seen| seen.site == *site && seen.phase == phase),
+                "the {kind} orphan's removal ran {site} {phase}: {observed:?}"
+            );
+        }
+    }
 }
 
 /// A prefix that resolves to a regular file cannot carry components below
@@ -2297,8 +2465,12 @@ fn a_scaffolding_directory_that_cannot_be_removed_is_reported_not_swallowed() {
         .remove_execution_root(&mut NoHooks)
         .expect_err("a scaffolding directory that cannot be removed is reported");
     assert!(
-        matches!(&error, UpstrokeError::Io { path, .. } if path.starts_with(&root) && path != &root),
-        "the error names the scaffolding directory it could not remove: {error}"
+        matches!(
+            &error,
+            UpstrokeError::Filesystem { operation: "remove", path, .. }
+                if path.starts_with(&root) && path != &root
+        ),
+        "the error names the removal and the scaffolding directory it could not remove: {error}"
     );
 }
 
