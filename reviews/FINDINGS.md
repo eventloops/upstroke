@@ -5990,127 +5990,103 @@ ruling (amendment 11), and `src/runner/host.rs` is untouched. The P2 and the cou
 | PR130-REVIEW3-WRONG-TYPE-CLASSIFIED-BY-GIT-STDERR | P2 | 8c5dbc37b0cf3ed2ef28c6a6447368f10c1b0adf / src/workspace_manager.rs:1983 | a `Tree` whose `parent` is that same tree cannot be peeled to a commit, so Git failed with "expected commit type" on stderr rather than the silent exit 1 the lookup reads as absence, and a bare `?` returned `UpstrokeError::Git` -> the peelable direction (a commit offered as the tree) returned `Refusal::SnapshotInputResolvesElsewhere` for the same class of caller mistake, and the body promised the typed refusal for an input that does not resolve to itself -> one caller mistake was classified by Git's stderr behaviour and the other by the decision the caller can make; the inverse also held, malformed `git write-tree` output reaching `ObjectId::new(..)?` became `UpstrokeError::Refused` when it is the tool misbehaving | introduced_by_feature | correctness | a1c8d2f | fixed at 3e00568752: the failing peel is classified by asking the object's type once (`cat-file -t`), and a type that is not the role's is the same refusal, which gains `found_type` so the message names the type the value does name; only a repository that will not say keeps the Git error (a bare `rev-parse --verify` cannot make the distinction: measured, it echoes an absent full id and exits 0). `captured_object_id` in `attempt.rs` turns a malformed `write-tree` or recorded-base value into `UpstrokeError::Git` naming its source. `a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requires` covers both directions and an absent id; `a_malformed_captured_id_is_a_git_error_naming_where_the_value_came_from` covers the inverse; witnessed under four mutations listed in the body | fixed |
 | PR130-REVIEW3-SCOPE-NUMSTAT-WRONG | P3 | 8c5dbc37b0cf3ed2ef28c6a6447368f10c1b0adf / reviews/FINDINGS.md:1 | the body's Scope said `src/workspace_manager/tests.rs` was `+388 -25` while the diff was `+391 -25` -> the figure was carried from an earlier head instead of being re-derived after the last commit -> a reviewer checking scope against the diff finds the accounting false, which is the one thing that list exists to be | introduced_by_feature | docs-contract | 8c5dbc3 | fixed at 3e00568752: every numstat in the body is generated from `git diff --numstat origin/master..HEAD` at the published head by the script that assembles the body, never typed; the count is re-derived after the final commit and before the single publish | fixed |
 
-## 51. PR #109 exact-head review — the closing-handle control's residual scheduling dependence
+## 51. PR #109 — the closing-handle control, and the oracle that observed timing
 
-`gpt-5.6-sol` at `max` effort on `48cefb3356d7c7c8893c1fb077a51e6022d58fd4`, the second pass this
-pull request bought. Verdict `CHANGES_REQUIRED`, two findings. The parts of both that are about what
-the test *claims* were repaired on the head that follows the pass; what remains here is one
-mechanism that cannot be repaired from a test, and two interleavings whose preconditions the repair
-made narrow rather than impossible. They are carried, with the measurement that would settle each,
-rather than argued away.
+Three `gpt-5.6-sol` passes at `max` effort on this pull request's own subject,
+`workspace_manager::tests::a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused`
+(`#[cfg(windows)]`): on `48cefb3` (two findings), on `7f1b998` (four), and on `86fa1d8` (one P1,
+three P2, one P3). The rows the first two passes left carried are **closed** by the repair the
+third forced, and this section is written from that end rather than as three appended layers,
+because a reader meeting a red needs one instruction and not a history.
 
-The subject is `workspace_manager::tests::a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused`,
-`#[cfg(windows)]`, whose first case holds a file open across the start of `remove_worktree` and
-expects the retry in `remove_tree_once_handles_close` to cross the closing window.
+**The one defect underneath all of them.** The control released its held handle at the remove
+funnel's `Before` phase, which fires *before* the primitive is entered. Nothing outside the loop
+could see an *attempt*, so the oracle asserted the retry indirectly — the closing case expected a
+removal to succeed against a handle it believed was open when the first attempt ran. That belief is
+a scheduling assumption, and it is unsound in both directions. Deschedule the remover between the
+hook and the loop, let the timed release expire first, and the single attempt of a
+retry-deleted engine (`ATTEMPTS = 1`) succeeds unaided: **the mutant passes.** The same
+interleaving unmutated is a removal that never needed the retry, which the oracle equally could not
+tell from one that did.
 
-### FIND-109-CLOSING-CASE-HOLDER-STARVATION
+**The repair, and why the carried rows go with it.** `remove_tree_once_handles_close` now records
+each attempt through a seam that is a `#[cfg(not(test))]` no-op in production, and the control
+reads the count: both cases assert the removal made more than one attempt, so a deleted retry fails
+by the count rather than by whether a handle happened still to be open. The release is ordered
+against an attempt instead of a clock — the holder closes when told attempt 1 has *already
+completed*, and the observer waits for the close before the loop continues — so attempt 1 provably
+ran with the handle open and attempt 2 provably ran after it closed. The 300ms hold, the
+five-second timer before it and the funnel-phase signal are all gone with the assumption they
+served.
 
-**Fingerprint.** Windows only. `panicked at src/workspace_manager/tests.rs`, assertion
-`removal retries across the closing handle`, with a `Filesystem` error carrying os error 32
-(`ERROR_SHARING_VIOLATION`) or 5 (`ERROR_ACCESS_DENIED`) naming the slot directory. It read `Io`
-until the base merge `b7ee896` brought in master's split of that variant by §7's operation-context
-rule; a red recorded before that merge spells the same refusal `Io`, and so do the mutation
-witnesses quoted in PR #109's body, which were measured on a head that predates it. A red matching
-this fingerprint is this row until shown otherwise; a red that does not match it is a regression.
+`FIND-109-CLOSING-CASE-HOLDER-STARVATION` is therefore **closed, not carried**. It existed because
+a release could not be ordered against an attempt, and now it can. So is the record's own defect,
+which the pass on `7f1b998` found and this section used to carry: it gave the residual the same
+fingerprint a real retry regression produces, told a maintainer to classify a red as the known
+scheduling failure, and then told them the fingerprint could not be relied on. Those two
+instructions contradicted each other and the discriminator offered to settle them — whether the
+holder was still holding when the assertion ran — did not discriminate, because with `ATTEMPTS = 1`
+removal returns error 32 while the holder is normally still inside its hold, exactly like the
+starvation case.
 
-**Mechanism, and why it is not a rate question.** The holder thread closes the handle 300ms after
-the remove funnel's `Before` phase signals it. If that thread is not scheduled at all for the length
-of the retry window — 40 attempts with 39 sleeps of 25ms between them — the handle is still open on
-the last attempt, a correct bounded implementation returns `Err`, and the case fails on correct
-production behaviour. Uniform slowness does not do this: the loop needs 39 wakeups to the holder's
-two, so a delay applied evenly to every wakeup widens the margin. Targeted starvation of one thread
-on a loaded runner does, and `--test-threads=16` on 4 vCPUs is where it would come from.
-
-**Why it is not repaired here.** Closing "once an attempt has provably run" is what would remove the
-dependence, and nothing outside the loop can observe an attempt. The funnel's `Before` phase is the
-last seam a test may use, and it fires before the first attempt, not between attempts. The obvious
-substitute — watching a sentinel file disappear, since a failed `remove_dir_all` deletes what it
-reached — was measured on the Windows guest and does not work in this shape: with the held name
-sorting first in the directory index the failing attempt deletes **nothing**, sentinels and nested
-files alike surviving (probed with the real name `held-by-the-dying-child`, and with names sorting
-first, middle and last, the last being the only arrangement that clears the directory). Making it
-work would mean ordering the fixture's filenames against an NTFS enumeration detail, which trades
-this dependence for a less legible one. Anything better needs a seam in
-`remove_tree_once_handles_close` itself — production code, and a scope decision the owner has
-reserved.
-
-**Rate.** Unmeasured, and deliberately so rather than by omission. It has never been observed: the
-control has failed only in its pre-repair form, on a five-second timer, and the repaired form has
-passed every run made of it — CI's `test (winguest)` leg on three heads, plus targeted guest runs.
-The measurement that would settle it is a soak of this test alone under `--test-threads=16` pinned
-to 4 CPUs with the rest of the suite running, counting failures over runs; nothing here claims a
-rate without it.
-
-**Consequence.** A red matching the fingerprint is this row, not a regression in
-`remove_tree_once_handles_close`. Owner: whoever holds the workspace-manager area. The follow-up is
-the scope decision named above, not a re-tuning of the 300ms.
+**So there is now one instruction, and it is short.** A red on this test is a regression. The
+assertions quote the attempt count, and that is the discriminator the earlier record could not
+supply: `the removal must have retried: the loop reported 1 attempt(s)` is a retry that is gone;
+a refusal in the closing case after more than one attempt is a removal that could not cross a
+window it used to cross. Neither reading needs a rate, a soak, or a judgement about how loaded the
+runner was.
 
 ### FIND-109-FAIL-SAFE-DIAGNOSES-ONLY-ITS-BOUND
 
-**Fingerprint.** Windows only, assertion text beginning `the fail-safe released the handle after`.
+**Fingerprint.** Windows only, assertion text beginning `the fail-safe released the handle`.
 
-**Mechanism.** `FAIL_SAFE` is a 600s watchdog that converts a wedged removal into a verdict. Two
-interleavings remain. A remover descheduled for longer than the watchdog, between the funnel's
-`Before` phase and the loop, lets the watchdog fire against a bounded retry that then succeeds
-immediately — a false failure. And a holder that is never scheduled again after the signal cannot
-observe the release, though the wait for the signal is now itself bounded so the holder is armed
-from the moment the handle is open rather than only after the signal.
+**What it still says.** `FAIL_SAFE` is a ten-minute watchdog that converts a wedged removal into a
+verdict rather than a hung CI job. Firing establishes the bound that was crossed — a removal slower
+than the fail-safe — and **not** the reason: an unbounded retry and a thread that stopped being
+scheduled read identically from where the test stands. The assertion says only the former and
+quotes both the elapsed time and the attempt count so a reader can tell them apart. This row exists
+so nobody re-reads a fire as a proof of the former.
 
-**What was repaired instead.** The assertion no longer diagnoses. It used to read `the retry is
-unbounded rather than budgeted`; it now states the bound that was crossed and says explicitly that an
-unbounded retry and a thread that stopped being scheduled read identically from where the test
-stands. The `FAIL_SAFE` doc comment says the same, and no longer claims a multiple of a measured
-worst case.
+**What is closed.** The pass on `86fa1d8` found the watchdog was not end-to-end: the holder had two
+600-second receives in series, so a wedged removal could hold the Windows job for nearly twenty
+minutes and be killed by its 20-minute timeout with no assertion having run at all — the fail-safe
+defeating its own purpose. There is now **one deadline**, taken once before the holder starts, and
+every receive in the test and in the holder waits only for what is left of it, so the sum is
+bounded by it. The holder also has a single wait now rather than two, which closes the transition
+between them that `SOL-7F1-01` recorded: there is no longer a window in which the holder is parked
+with nothing armed.
 
-**Rate.** Unobserved; both interleavings need a 600-second stall of a specific thread. The witness
-that exercises the mechanism deliberately — the attempt bound raised to `u32::MAX` — reports
-`took` = 600.0301503s against the 600s bound, which is the lower bound the assertion now claims and
-no more.
+**Rate.** Unobserved. What remains needs a 600-second stall of one specific thread, and the
+measurement that would settle it is a soak; nothing here claims a rate without one.
 
 **Consequence.** A red matching the fingerprint means a removal slower than ten minutes, which is
-worth investigating on its own terms whatever caused it. Owner: as above.
+worth investigating on its own terms whatever caused it. Owner: whoever holds the workspace-manager
+area.
 
-### The second pass on this branch, and a correction to the fingerprint above
+### The `86fa1d8` pass, and what each finding became
 
-`gpt-5.6-sol` at `max` on `7f1b998570197e29d76208448ca637555b33e78a` — the head that carried the
-repairs for the pass on `48cefb3` — returned `CHANGES_REQUIRED` with four findings. The branch's two
-repair rounds were spent by then, so these are recorded here and carried rather than repaired. They
-are `SOL-7F1-01` through `SOL-7F1-04` in PR #109's ledger, all `deferred`.
+`gpt-5.6-sol` at `max` on `86fa1d82308898e666f5ef2d20fea787f4dfad33`, `CHANGES_REQUIRED`: one P1,
+three P2, one P3, all in the test this pull request exists to fix and so all in scope. They are
+`SOL-86F-01` through `SOL-86F-05` in PR #109's ledger, all `fixed`. Four of the five were one
+defect and are repaired at the root described above; the fifth was text.
 
-**The fingerprint given for `FIND-109-CLOSING-CASE-HOLDER-STARVATION` above does not discriminate,
-and must not be relied on as written.** It names
-`removal retries across the closing handle` with os error 32 or 5 — which is exactly what a genuine
-retry regression produces: set `ATTEMPTS = 1` and the held handle makes removal return that error
-naming that slot, as this branch's own mutation witness shows. A maintainer meeting a real
-regression and matching it against that fingerprint would discount it as the known scheduling
-residual, which is the opposite of what a flake record is for. What actually separates the two is
-whether the holder was **still holding when the assertion ran**: the residual reaches the assertion
-with the handle open because the holder never got to close it, while a retry regression reaches it
-with the retry gone. The test does not currently record which happened, so the discriminator is not
-yet observable — a corrected fingerprint needs that, and the repair is left open rather than guessed
-at here.
+- **P1, the retry-deleted mutant can still pass.** The oracle observed timing rather than attempts.
+  Repaired by the seam and the count assertion; the mutant now dies by the count on the guest.
+- **P2, `FAIL_SAFE` is not end-to-end.** Two 600-second receives in series. Repaired by the single
+  deadline.
+- **P2, the touched test is not §10/§12-compliant.** `ready.recv()` unbounded, `Holder::drop`
+  joining without a bound and discarding the join result — so a holder panic dropped the file, let
+  the closing case succeed without a retry, and vanished. All three repaired: the deadline bounds
+  the receive and the wait for the thread, and the payload is re-raised with `resume_unwind` (or
+  reported, during an unwind, where panicking would abort).
+- **P2, the flake record can still hide a real regression.** The contradiction and the
+  non-discriminating discriminator described above. Repaired by closing the row rather than by
+  wording it better.
+- **P3, the variant documentation repair is incomplete.** `workspace_manager.rs:679` still said the
+  engine reports a hard `Io` failure while every failure from that helper is
+  `Filesystem { operation: "remove" }`. Corrected, and the rest of the file re-checked rather than
+  the cited line alone — it was the only stale spelling left in it.
 
-Also carried, all Windows-only and all in
-`workspace_manager::tests::a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused`:
-
-- **`SOL-7F1-01`, the missed hang survives.** Bounding the holder's first wait does not bound its
-  transition into the second. The holder must still be scheduled to observe the already-queued
-  `Before` signal before it arms the timeout that releases the permanently held handle; descheduled
-  past `FAIL_SAFE` before observing it, the Windows job's own timeout expires first and the test
-  hangs with no diagnostic. This is the same mechanism `FIND-109-FAIL-SAFE-DIAGNOSES-ONLY-ITS-BOUND`
-  names, at the transition rather than at either wait, and that row did not previously say so.
-- **`SOL-7F1-03`, two surviving overclaims.** If the first wait times out and removal then starts
-  during the holder's 300ms sleep, the retry really does run, so the assertion's
-  `whatever this run measured it was not the retry` is not always true; and the test's own doc
-  comment still says the fail-safe "reports it as the unbounded retry it is", which is the claim the
-  repair withdrew.
-- **`SOL-7F1-04`, three unbounded waits.** `ready.recv()` is unbounded, `Holder::drop` joins without
-  a bound, and the join result is discarded — so a holder that panics is not a defined outcome of
-  this test, and a wedged one hangs the job rather than failing it. `standards/10` and §12 both
-  reach this; the pull request deferred only the sleep dependence and did not name these.
-
-**Consequence for all four.** Rates unmeasured; none has been observed. Owner: whoever holds the
-workspace-manager area. The order worth doing them in is the fingerprint first — it is the only one
-that can mislead someone reading a red — then the overclaims, then the unbounded waits, then the
-scope decision on a production seam that
-`FIND-109-CLOSING-CASE-HOLDER-STARVATION` describes.
+**What is still not measured, stated so it is not read as closed.** The rate of a 600-second stall
+above, and nothing else about this control: the attempt count removed the scheduling dependence
+that the earlier rows carried, rather than narrowing it.
