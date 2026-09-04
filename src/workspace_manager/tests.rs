@@ -688,8 +688,12 @@ fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
 /// **Which stretch consumed the margin was not measured.** Raising `STEP`
 /// reproduces the first one deterministically, but no per-attempt timing was
 /// captured from the original occurrence, so nothing here claims the loop itself
-/// outlived the timer. The handshake settles both, because it takes the wall
-/// clock out of the oracle entirely rather than budgeting it.
+/// outlived the timer. The handshake settles both without deciding between
+/// them, because it stops the oracle depending on a timer that has to *beat*
+/// the loop. Two wall-clock quantities remain and neither is that race:
+/// `FAIL_SAFE`, a watchdog whose firing is provably a removal that really did
+/// take longer than it; and the closing case's hold, which the paragraph below
+/// measures from the start of removal rather than from the handle's opening.
 ///
 /// The **first** half is anchored to a handshake too, for a different reason:
 /// it is what makes the retry falsifiable. `SignalOnRemoval` releases the holder
