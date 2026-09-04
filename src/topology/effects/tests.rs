@@ -5741,6 +5741,121 @@ fn the_bijection_fails_on_every_missing_link() {
 }
 
 #[test]
+fn every_failing_residue_element_is_reported_with_its_own_element_and_predicate() {
+    // Pass 2 on `2421651`, finding 2: the three element Directions above each
+    // break `synthetic[0]` alone and match the variant alone, so a checker
+    // that reported the first bad element and stopped — the `break`
+    // `SWEEP-BIJECTION-003` removed — or one that reported a constant element,
+    // would pass all three. This is the witness those Directions are not:
+    // several distinct elements failing at once, in different predicates,
+    // one of them in two at once, and the exact set of `(variant, element)`
+    // pairs asserted — every one present, nothing else of the family.
+    let host = Host::current();
+    let cherry = EffectSiteId::Object(ObjectSite::ProposalCherryPick);
+    let elements = cherry.residue_elements();
+    assert_eq!(elements.len(), 7, "the fixture site lists seven elements");
+    let residue = EntryPhase::Residue {
+        class: ResidueClass::ObjectInternal,
+    };
+
+    let mut entries = self_test_registry(host);
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.site == cherry && entry.phase == residue)
+        .expect("the self-test registry carries the cherry-pick residue entry");
+    let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence else {
+        panic!("a residue entry carries recovery-proven evidence");
+    };
+    // Four elements broken, in the middle and at the end of the list rather
+    // than at index 0, so a checker that only ever reads the first record
+    // has nothing to report.
+    let mut broken = 0;
+    for record in synthetic.iter_mut() {
+        match record.element {
+            ResidueElement::IndexLock => {
+                record.constructed = false;
+                broken += 1;
+            }
+            ResidueElement::MergeHead => {
+                record.recovered = false;
+                broken += 1;
+            }
+            ResidueElement::SequencerState => {
+                record.classified = ObjectResidue::After;
+                broken += 1;
+            }
+            // Two predicates on one element: both are reported, separately.
+            ResidueElement::CherryPickHead => {
+                record.constructed = false;
+                record.recovered = false;
+                broken += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        broken, 4,
+        "the fixture carries the four elements this test breaks"
+    );
+
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &entries,
+        host,
+    );
+    let mut reported: Vec<(&str, ResidueElement)> = failures
+        .iter()
+        .filter_map(|failure| match failure {
+            BijectionFailure::ResidueElementNotConstructed { site, element, .. }
+                if *site == cherry =>
+            {
+                Some(("not-constructed", *element))
+            }
+            BijectionFailure::ResidueElementNotRecovered { site, element, .. }
+                if *site == cherry =>
+            {
+                Some(("not-recovered", *element))
+            }
+            BijectionFailure::ResidueElementMisclassified {
+                site,
+                element,
+                classified,
+                expected,
+                ..
+            } if *site == cherry => {
+                assert_eq!(*classified, ObjectResidue::After, "{failures:#?}");
+                assert_eq!(*expected, ObjectResidue::Internal, "{failures:#?}");
+                Some(("misclassified", *element))
+            }
+            _ => None,
+        })
+        .collect();
+    reported.sort();
+    let mut expected = vec![
+        ("not-constructed", ResidueElement::IndexLock),
+        ("not-recovered", ResidueElement::MergeHead),
+        ("misclassified", ResidueElement::SequencerState),
+        ("not-constructed", ResidueElement::CherryPickHead),
+        ("not-recovered", ResidueElement::CherryPickHead),
+    ];
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "the report did not name every failing element with its own predicate: {failures:#?}"
+    );
+    // And nothing else of the family: the three healthy elements and the
+    // sampling record produce no residue-element failure.
+    assert!(
+        !failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::MissingEvidence { site, .. } if *site == cherry
+        )),
+        "{failures:#?}"
+    );
+}
+
+#[test]
 fn a_never_hit_internal_class_passes_and_an_unclassifiable_one_does_not() {
     // Both directions of `completeness_rule`'s one explicit exemption:
     // "an unclassifiable residue fails; a never-hit Internal class does
