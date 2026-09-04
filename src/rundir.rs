@@ -116,12 +116,12 @@ impl RunPaths {
 
     /// The append-only source of truth (§15).
     pub fn events(&self) -> PathBuf {
-        self.public.join("events.jsonl")
+        self.public.join(EVENT_LOG)
     }
 
     /// The frozen plan this run is executing (§5).
     pub fn plan_json(&self) -> PathBuf {
-        self.public.join("plan.normalized.json")
+        self.public.join(PLAN)
     }
 
     /// A projection of the log for humans and tooling — derived, never read
