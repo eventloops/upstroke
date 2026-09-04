@@ -78,11 +78,12 @@ pub struct WorktreeRecord {
     /// Git's own lock reason, when the worktree is locked; empty for a lock
     /// taken without one.
     ///
-    /// `pub(super)` for one reader and for now: `residue.rs` (queue row 6,
-    /// PR #128 in flight) compares it with `initializing` at two sites, and
-    /// that file is not this sweep's to edit. Its two lines move to
-    /// [`WorktreeRecord::is_initializing`] and this field goes private with
-    /// the base merge-in that follows #128; every other reader asks the
+    /// `pub(super)` for one reader and for now: `residue.rs` compares it with
+    /// `initializing` directly, at one site since its own sweep merged
+    /// (PR #128, `95c5bd3`). That line becomes
+    /// [`WorktreeRecord::is_initializing`] and this field goes private when a
+    /// change touches it -- the parent's sweep, queue row 11, reads every one
+    /// of these call sites (`SWEEP-WORKTREE-004`). Every other reader asks the
     /// accessor.
     pub(super) locked: Option<String>,
     /// Git's own prunable reason, when the worktree is prunable; empty when
