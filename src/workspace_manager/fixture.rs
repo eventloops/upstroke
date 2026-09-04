@@ -233,6 +233,30 @@ pub(crate) fn scratch_tree(tag: &str) -> ScratchTree {
     }
 }
 
+/// [`scratch_tree`] under a parent the caller names.
+///
+/// **A path argument and not an environment variable.** The kill protocol
+/// needs a parent to own the tree its child builds, and a value this module
+/// read from the environment would be an ambient input in the one file whose
+/// subject is that ambient inputs are not trusted — the door opened from the
+/// inside. So the parent is passed in. Which directory a kill child builds
+/// under is the kill protocol's business and is decided in
+/// `src/engine/topology/scaffold.rs`, which owns that protocol and its
+/// variables; nothing here reads one.
+pub(crate) fn scratch_tree_under(parent: &Path, tag: &str) -> ScratchTree {
+    if let Err(why) = safe_component(tag) {
+        panic!("the fixture's scratch tag `{tag}` is not one path component: {why}");
+    }
+    match acquire(parent, tag) {
+        Ok(tree) => tree,
+        Err(refusal) => panic!(
+            "the fixture could not acquire a scratch tree at {}: {:?}",
+            refusal.root().display(),
+            refusal.source()
+        ),
+    }
+}
+
 /// [`scratch_tree`]'s root, for the one caller that wants a directory and not
 /// a fixture.
 ///
@@ -476,8 +500,10 @@ pub(crate) struct Fixture {
     /// The tree's ownership, and with it the authority to remove it.
     ///
     /// **Last field, so it drops last** and the tree outlives everything that
-    /// reads from it. `None` for [`Fixture::adopt`], which re-opens a tree
-    /// another process created and therefore holds no claim on it.
+    /// reads from it. Always `Some` today: [`Fixture::new`] acquires its own
+    /// and [`Fixture::adopt`] is handed the one its caller minted. The `Option`
+    /// is what lets the field be moved out of in a future shape rather than a
+    /// state that happens.
     /// Underscored because nothing reads it: it is held for its `Drop`, which
     /// is where the tree is reclaimed.
     _scratch: Option<ScratchTree>,
@@ -493,9 +519,29 @@ impl Fixture {
         Self::with_object_format(tag, ObjectFormat::Sha1)
     }
 
-    /// A repository of the given object format.
+    /// A repository of the given object format, under [`scratch_parent`].
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
-        let scratch = scratch_tree(tag);
+        Self::in_tree(scratch_tree(tag), object_format)
+    }
+
+    /// [`Self::new`] in a subtree of `parent`.
+    ///
+    /// The kill protocol's shape: a parent acquires a tree, tells its child to
+    /// build under it, and keeps the guard, so a child that dies by
+    /// `std::process::abort()` leaves a subtree the parent still owns. The
+    /// child acquires its own subtree here, so a child that exits normally
+    /// still reclaims what it made.
+    pub(crate) fn under(parent: &Path, tag: &str) -> Self {
+        Self::in_tree(scratch_tree_under(parent, tag), ObjectFormat::Sha1)
+    }
+
+    /// [`Self::created`] in a subtree of `parent`.
+    pub(crate) fn created_under(parent: &Path, tag: &str) -> Self {
+        Self::under(parent, tag).with_execution_root()
+    }
+
+    /// The body both constructors share, over a tree already acquired.
+    fn in_tree(scratch: ScratchTree, object_format: ObjectFormat) -> Self {
         let root = scratch.path().to_path_buf();
         let base = root.join("repo");
         let private = root.join("private");
@@ -580,15 +626,13 @@ impl Fixture {
     /// do — moves that parent off it while leaving the root commit where it
     /// was.
     ///
-    /// **An adopted fixture removes nothing.** The tree was created by another
-    /// process, which held the only token for it and died without spending it;
-    /// a token cannot be minted from a path, and §8 does not let this process
-    /// recursively delete what it cannot prove it owns. So the tree a kill
-    /// child leaves behind stays until whoever owns the directory it sits in
-    /// reclaims it, and that owner is the kill-child plumbing in
-    /// `src/engine/topology/scaffold.rs` rather than this module — a deferred
-    /// row, and the same leak its own `kill_dir` already has.
-    pub(crate) fn adopt(root: PathBuf) -> Self {
+    /// **`owner` is the guard the caller minted before it spawned the child**,
+    /// and it is why nothing leaks. A token cannot be minted from a path, so
+    /// this process cannot take ownership of a tree its child created; instead
+    /// the caller acquires the tree first, hands the child [`SCRATCH_ROOT`],
+    /// and passes the guard here. `root` is then a subtree of what `owner`
+    /// names, and dropping this fixture reclaims both.
+    pub(crate) fn adopt(root: PathBuf, owner: ScratchTree) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
         let head = git(&base, &["rev-parse", "main"]);
@@ -609,7 +653,7 @@ impl Fixture {
             seed,
             head,
             side,
-            _scratch: None,
+            _scratch: Some(owner),
         }
     }
 
@@ -1009,11 +1053,30 @@ impl Drop for KillableGitChild {
 /// directory the panicking child's `Drop` had already deleted. Measured:
 /// exactly that, on a kill armed at a site the child never reached.
 ///
-/// Unix has a value for it — `SIGABRT`, which no Rust panic raises. Windows
-/// does not expose one portably (`abort()` reaches `__fastfail`, whose code
-/// has moved between CRT versions), so there the oracle is the *negation*
-/// of the panic's own exit code, which `std::process::abort` cannot produce
-/// and `panic!` always does.
+/// **A value per platform, and on Windows that used to be a negation.** It was
+/// `!status.success() && status.code() != Some(PANIC_EXIT)`, which accepts
+/// every unsuccessful exit that is not a panic — `std::process::exit(1)`
+/// included — so a child that failed for any reason at all read as a child the
+/// injection had killed, and the oracle had stopped discriminating. No Unix
+/// run could see it: the Unix arm names `SIGABRT`, so the mutation is
+/// invisible on every leg this box runs. Found by `sweep-tests-25` and routed
+/// here because this file is `PR #135`'s subject.
+///
+/// Unix has one value, `SIGABRT`, which no Rust panic raises and which is a
+/// name rather than a number. Windows has no portable one — `abort()` reaches
+/// `__fastfail`, whose code has moved between CRT versions — and the answer is
+/// **not** to write down the code this session believes it is today. Nobody
+/// here has measured a Windows abort, and a constant nobody measured is the
+/// defect this pull request has been finding all afternoon. So the Windows arm
+/// *measures* instead: [`measured_abort_end`] runs a real
+/// `std::process::abort()` once and remembers how it ended, and this compares
+/// against that. A CRT that changes the code cannot make the oracle stale,
+/// because the oracle asks the CRT. The design is `sweep-tests-25`'s, which
+/// found this and built the comparison shape for its own suite.
+///
+/// `the_abort_oracle_separates_an_abort_from_an_ordinary_failure` runs both
+/// children on **every** platform, so the arm each leg compiles is the arm
+/// that leg measures.
 pub(crate) fn died_by_abort(status: &std::process::ExitStatus) -> bool {
     #[cfg(unix)]
     {
@@ -1021,9 +1084,42 @@ pub(crate) fn died_by_abort(status: &std::process::ExitStatus) -> bool {
     }
     #[cfg(windows)]
     {
-        !status.success() && status.code() != Some(PANIC_EXIT)
+        status.code().is_some() && status.code() == measured_abort_end()
     }
 }
+
+/// How a real `std::process::abort()` ends on this machine, measured once.
+///
+/// Windows only, because Unix names `SIGABRT` and needs no measurement. One
+/// child per test process, cached: [`died_by_abort`] is called once per kill
+/// test and this is the first of them.
+///
+/// # Panics
+///
+/// Through [`run_child_test`], if the probe cannot be run or does not run its
+/// one test — a probe that silently stopped aborting would otherwise make the
+/// oracle accept whatever the probe returned instead.
+#[cfg(windows)]
+fn measured_abort_end() -> Option<i32> {
+    static END: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *END.get_or_init(|| {
+        let probe = run_child_test(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
+        assert!(
+            !probe.success(),
+            "the abort probe exited successfully, so it did not abort: {probe:?}"
+        );
+        probe.code()
+    })
+}
+
+/// The harness name of the child that aborts.
+pub(crate) const ABORT_PROBE: &str = "workspace_manager::fixture::tests::aborting_child";
+
+/// What arms [`ABORT_PROBE`].
+///
+/// The child returns without aborting unless this is set, so a run with
+/// `--include-ignored` cannot kill the suite with it.
+pub(crate) const ABORT_PROBE_ARM: &str = "UPSTROKE_TEST_ABORT_PROBE";
 
 /// Whether `status` carries this platform's signature of a
 /// [`std::process::Child::kill`].
@@ -1086,6 +1182,9 @@ mod tests {
     /// child. `run_child_test` refuses a name no test has, so a rename here
     /// fails loudly rather than passing vacuously.
     const AMBIENT_CHILD: &str = "workspace_manager::fixture::tests::ambient_environment_child";
+
+    /// The harness name of [`exiting_child`].
+    const EXITING_CHILD: &str = "workspace_manager::fixture::tests::exiting_child";
 
     /// The harness name of [`panicking_child`].
     const PANICKING_CHILD: &str = "workspace_manager::fixture::tests::panicking_child";
@@ -1267,12 +1366,16 @@ mod tests {
     /// have spoken about a different commit than the one that built it.
     #[test]
     fn adopt_re_derives_the_first_commit_after_main_has_moved_on() {
-        let fixture = Fixture::new("adopt-root");
+        // The kill protocol's shape without a second process: an owner tree,
+        // a fixture in a subtree of it, and the owner handed to `adopt`.
+        let owner = scratch_tree("adopt-owner");
+        let owner_root = owner.path().to_path_buf();
+        let fixture = Fixture::under(&owner_root, "adopt-root");
         write_file(&fixture.base.join("d.txt"), b"third\n");
         git(&fixture.base, &["add", "-A"]);
         git(&fixture.base, &["commit", "-q", "-m", "third"]);
 
-        let adopted = Fixture::adopt(fixture.root.clone());
+        let adopted = Fixture::adopt(fixture.root.clone(), owner);
         assert_eq!(adopted.seed, fixture.seed, "the first commit is re-derived");
         assert_eq!(adopted.side, fixture.side, "and so is the side commit");
         assert_ne!(
@@ -1626,6 +1729,114 @@ mod tests {
             "an unfinished reader must be reported rather than waited on: {text}"
         );
         drop(sender);
+    }
+
+    /// The oracle itself, run on **every** platform, because the arm a leg
+    /// compiles is the only arm that leg can measure: the Unix arm names
+    /// `SIGABRT` and cannot see the Windows arm's defect, which is why this
+    /// one was found by another session's Windows work rather than by any run
+    /// on this box.
+    ///
+    /// Two children: one dies by `std::process::abort()`, one exits non-zero
+    /// the ordinary way. The oracle must say yes to the first and no to the
+    /// second. The negation it replaces said yes to both.
+    #[test]
+    fn the_abort_oracle_separates_an_abort_from_an_ordinary_failure() {
+        let aborted = run_child_test(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
+        let exited = run_child_test(EXITING_CHILD, &[]);
+
+        // Premises first, so a probe that stopped working is loud rather than
+        // vacuous.
+        assert!(
+            died_by_abort(&aborted),
+            "the oracle did not recognise a real `std::process::abort()`: {aborted:?}"
+        );
+        assert_eq!(
+            exited.code(),
+            Some(1),
+            "the ordinary-failure child did not exit 1: {exited:?}"
+        );
+
+        // The defect, written out rather than described: the negation this
+        // replaced accepts both children, so it is not an abort oracle at all.
+        // This assertion is what fails first if the negation ever comes back.
+        let negation = |status: &std::process::ExitStatus| {
+            !status.success() && status.code() != Some(PANIC_EXIT)
+        };
+        assert!(
+            negation(&aborted) && negation(&exited),
+            "the negation is supposed to accept both, which is why it was replaced"
+        );
+
+        assert!(
+            !died_by_abort(&exited),
+            "the oracle read an ordinary non-zero exit as an abort: {exited:?}"
+        );
+        assert!(
+            !died_by_abort(&exited_with(PANIC_EXIT)),
+            "the oracle read a panic as an abort"
+        );
+        assert!(
+            !same_end(&aborted, &exited),
+            "an abort and an exit of one are not the same end"
+        );
+        assert!(
+            same_end(&aborted, &aborted),
+            "a comparison that rejects everything would satisfy the line above"
+        );
+    }
+
+    /// Whether two children ended the same way, compared as values.
+    ///
+    /// `sweep-tests-25`'s shape: not "both unsuccessful", which is the
+    /// negation being replaced.
+    fn same_end(left: &std::process::ExitStatus, right: &std::process::ExitStatus) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            left.signal() == right.signal() && left.code() == right.code()
+        }
+        #[cfg(not(unix))]
+        {
+            left.code() == right.code()
+        }
+    }
+
+    /// A status for a process that exited with `code` and no signal.
+    fn exited_with(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            // A `wait` status packs the exit code into the high byte.
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    /// The abort half of [`the_abort_oracle_separates_an_abort_from_an_ordinary_failure`],
+    /// and the probe [`died_by_abort`] measures against on Windows.
+    ///
+    /// Armed by [`ABORT_PROBE_ARM`] and inert without it, so a run that
+    /// includes ignored tests does not abort the suite.
+    #[test]
+    #[ignore = "spawned by `the_abort_oracle_separates_an_abort_from_an_ordinary_failure`"]
+    fn aborting_child() {
+        if std::env::var_os(ABORT_PROBE_ARM).is_none() {
+            return;
+        }
+        std::process::abort();
+    }
+
+    /// The ordinary-failure half: a non-zero exit that is not a panic and not
+    /// an abort, which is what the Windows arm used to accept.
+    #[test]
+    #[ignore = "spawned by `the_abort_oracle_separates_an_abort_from_an_ordinary_failure`"]
+    fn exiting_child() {
+        std::process::exit(1);
     }
 
     /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
