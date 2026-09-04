@@ -460,10 +460,13 @@ fn status_endpoints(status: &[u8]) -> Option<usize> {
 /// a record with two attributes outside the grammar is refused for the first
 /// one read: `HEAD` is an object id, `branch` is a refname's byte set (which
 /// forbids whitespace) and is kept as the bytes Git printed, no attribute
-/// appears twice in a record, and `locked` and `prunable` are Git's own
-/// reasons, verbatim (a lock reason may carry a newline, which is why `-z`
-/// exists), consulted only for the word `initializing`. A label this parser
-/// does not know is skipped, since Git may add one.
+/// appears twice in a record, and `locked` and `prunable` carry the bytes of
+/// Git's own reason (which may include a newline, one reason `-z` exists),
+/// consulted only for the word `initializing`. `OpenRecord::close` then
+/// refuses a set of attributes that is not a worktree -- neither bare nor a
+/// HEAD with exactly one of `branch` and `detached` -- and this function
+/// names the record it refused. A label this parser does not know is skipped,
+/// since Git may add one.
 ///
 /// # Errors
 ///
@@ -492,7 +495,10 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
             let Some(open) = current.take() else {
                 return Err(refuse(index, "is closed before it is opened"));
             };
-            records.push(open.close());
+            match open.close() {
+                Ok(record) => records.push(record),
+                Err(malformed) => return Err(refuse(index, &malformed.to_string())),
+            }
             continue;
         }
         if let Some(path) = field.strip_prefix(b"worktree ") {
@@ -602,9 +608,12 @@ mod tests {
         let mut open = OpenRecord::at(platform(path));
         if let Some(head) = head {
             open.head(head.as_bytes()).expect("one HEAD");
-        }
-        if let Some(branch) = branch {
-            open.branch(branch).expect("one branch");
+            match branch {
+                Some(branch) => open.branch(branch).expect("one branch"),
+                None => open.detached().expect("detached once"),
+            }
+        } else {
+            open.bare().expect("bare once");
         }
         if let Some(locked) = locked {
             open.locked(locked).expect("one lock");
@@ -612,7 +621,7 @@ mod tests {
         if let Some(prunable) = prunable {
             open.prunable(prunable).expect("one prunable");
         }
-        open.close()
+        open.close().expect("a record Git could print")
     }
 
     /// `path`, spelled with this platform's separator.
@@ -1056,7 +1065,8 @@ mod tests {
             (
                 "a list without its final terminator",
                 {
-                    let mut bytes = porcelain(&[b"worktree /repo", HEAD, b"", b"worktree /wt"]);
+                    let mut bytes =
+                        porcelain(&[b"worktree /repo", HEAD, b"detached", b"", b"worktree /wt"]);
                     bytes.extend_from_slice(HEAD);
                     bytes
                 },
@@ -1064,7 +1074,14 @@ mod tests {
             ),
             (
                 "a final record no empty attribute closed",
-                porcelain(&[b"worktree /repo", HEAD, b"", b"worktree /wt", HEAD]),
+                porcelain(&[
+                    b"worktree /repo",
+                    HEAD,
+                    b"detached",
+                    b"",
+                    b"worktree /wt",
+                    HEAD,
+                ]),
                 "record 1 is not closed; the list was cut short",
             ),
             (
@@ -1074,7 +1091,7 @@ mod tests {
             ),
             (
                 "a separator with no record open",
-                porcelain(&[b"worktree /repo", HEAD, b"", b""]),
+                porcelain(&[b"worktree /repo", HEAD, b"detached", b"", b""]),
                 "record 1 is closed before it is opened",
             ),
             (
@@ -1183,18 +1200,121 @@ mod tests {
                 .contains("record 0 has a boolean attribute twice")
         );
 
-        let verbatim = porcelain(&[b"worktree /repo", HEAD, b"locked initializing ", b""]);
-        let records = parse_worktree_records(&verbatim).expect("a reason is verbatim");
+        let kept = porcelain(&[
+            b"worktree /repo",
+            HEAD,
+            b"detached",
+            b"locked initializing ",
+            b"",
+        ]);
+        let records = parse_worktree_records(&kept).expect("a reason keeps its bytes");
         assert_eq!(records[0].lock_reason(), Some("initializing "));
         let sha256 = porcelain(&[
             b"worktree /repo",
             b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f151088663d58b63b0acaf3c31e98",
+            b"detached",
             b"",
         ]);
         assert!(
             parse_worktree_records(&sha256).is_ok(),
             "a SHA-256 object id is sixty-four hexadecimal digits"
         );
+    }
+
+    /// A set of attributes that is not a worktree is refused by record
+    /// number: the shape rule `OpenRecord::close` applies, which the parser
+    /// reports like any other refusal.
+    #[test]
+    fn a_record_whose_attributes_are_not_a_worktree_is_refused() {
+        let cases: &[(&str, &[&[u8]], &str)] = &[
+            (
+                "a HEAD with neither branch nor detached",
+                &[b"worktree /repo", HEAD],
+                "record 0 names a HEAD but neither a branch nor a detached checkout",
+            ),
+            (
+                "a branch and detached at once",
+                &[
+                    b"worktree /repo",
+                    HEAD,
+                    b"branch refs/heads/live",
+                    b"detached",
+                ],
+                "record 0 is on a branch and detached at once",
+            ),
+            (
+                "bare with a HEAD",
+                &[b"worktree /repo", b"bare", HEAD],
+                "record 0 is bare and also names a HEAD, a branch or a detached checkout",
+            ),
+            (
+                "bare with a branch",
+                &[b"worktree /repo", b"bare", b"branch refs/heads/live"],
+                "record 0 is bare and also names a HEAD, a branch or a detached checkout",
+            ),
+            (
+                "bare and detached",
+                &[b"worktree /repo", b"bare", b"detached"],
+                "record 0 is bare and also names a HEAD, a branch or a detached checkout",
+            ),
+            (
+                "neither bare nor a HEAD",
+                &[b"worktree /repo", b"locked"],
+                "record 0 names no HEAD and is not bare",
+            ),
+        ];
+        for (name, attributes, expected) in cases {
+            let mut fields = attributes.to_vec();
+            fields.push(b"");
+            let refused = parse_worktree_records(&porcelain(&fields)).expect_err(name);
+            let text = message(refused);
+            assert!(
+                text.contains(expected),
+                "{name}: expected {expected:?} in {text:?}"
+            );
+        }
+        assert_eq!(cases.len(), 6, "six independent shape refusals");
+
+        // Every shape Git 2.43.0 was measured printing, and each is accepted:
+        // bare alone, HEAD with a branch, HEAD detached, and either of those
+        // carrying a lock or a prune reason.
+        let accepted: &[(&str, &[&[u8]])] = &[
+            ("a bare repository", &[b"worktree /repo", b"bare"]),
+            (
+                "a worktree on a branch",
+                &[b"worktree /repo", HEAD, b"branch refs/heads/master"],
+            ),
+            (
+                "a detached worktree",
+                &[b"worktree /repo", HEAD, b"detached"],
+            ),
+            (
+                "a locked worktree with no reason",
+                &[b"worktree /repo", HEAD, b"detached", b"locked"],
+            ),
+            (
+                "a prunable worktree with a reason",
+                &[
+                    b"worktree /repo",
+                    HEAD,
+                    b"detached",
+                    b"prunable gitdir file points to non-existent location",
+                ],
+            ),
+            (
+                "a bare repository that is locked",
+                &[b"worktree /repo", b"bare", b"locked"],
+            ),
+        ];
+        for (name, attributes) in accepted {
+            let mut fields = attributes.to_vec();
+            fields.push(b"");
+            match parse_worktree_records(&porcelain(&fields)) {
+                Ok(records) => assert_eq!(records.len(), 1, "{name}"),
+                Err(error) => panic!("{name} is a shape Git prints: {}", message(error)),
+            }
+        }
+        assert_eq!(accepted.len(), 6, "six measured shapes");
     }
 
     /// The grammar is applied as each attribute is read, so a record with two
@@ -1220,8 +1340,13 @@ mod tests {
     fn a_worktree_path_keeps_every_byte_on_unix() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let records = parse_worktree_records(&porcelain(&[b"worktree /repo/caf\xe9", HEAD, b""]))
-            .expect("every byte string is a Unix path");
+        let records = parse_worktree_records(&porcelain(&[
+            b"worktree /repo/caf\xe9",
+            HEAD,
+            b"detached",
+            b"",
+        ]))
+        .expect("every byte string is a Unix path");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path().as_os_str().as_bytes(), b"/repo/caf\xe9");
     }
@@ -1232,9 +1357,11 @@ mod tests {
         let bytes = porcelain(&[
             b"worktree C:/repo",
             HEAD,
+            b"detached",
             b"",
             b"worktree C:/repo/caf\xe9",
             HEAD,
+            b"detached",
             b"",
         ]);
         let refused = parse_worktree_records(&bytes)

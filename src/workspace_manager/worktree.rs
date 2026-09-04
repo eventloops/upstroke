@@ -2,15 +2,22 @@
 //! [`WorkspaceManager::verify_worktree`](super::WorkspaceManager::verify_worktree)
 //! demands of one before it is reused.
 //!
-//! `decisions.workspace_candidates.generation` (its substance is `DESIGN.md`
-//! §26 since the record was retired): "a worktree is reused across a process
-//! boundary or after an interrupted Git command … only after Worktree.Verify".
 //! These are the three values that conversation is held in -- the record Git
 //! hands back, the quiescence the caller asks for, and the reasons the answer
 //! can be no. The verification itself runs a Git child and is the parent's; the
 //! record is produced by `parsers.rs`, which reads the `--porcelain -z` framing
 //! and feeds each attribute to an [`OpenRecord`], and this module holds the
-//! grammar of the record's own attributes.
+//! grammar of the record itself.
+//!
+//! The words quoted here and on [`VerifyFailure`] -- "a worktree is reused
+//! across a process boundary or after an interrupted Git command … only after
+//! Worktree.Verify" and the four conditions that follow -- are
+//! `decisions.workspace_candidates.generation`'s own, from a decision record
+//! the repository retired on 2026-09-03. `DESIGN.md`'s retired-records table
+//! does not map that record to a section, so this module says where the words
+//! come from and claims nothing about which design sentence carries them now
+//! (`SWEEP-WORKTREE-014`); what the code does is stated by the code's own
+//! documentation below.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -36,15 +43,26 @@ use crate::topology::effects::ResidueElement;
 /// A registered worktree of the managed repository, as
 /// `git worktree list --porcelain -z` reports it.
 ///
-/// The value holds the grammar of its attributes: a `HEAD` is a full
+/// The value holds the grammar of its attributes -- a `HEAD` is a full
 /// hexadecimal object id, a `branch` is inside the refname byte set, and no
-/// attribute is read twice. Each rule is applied once, by [`OpenRecord`] as
-/// the attribute arrives, and [`OpenRecord::close`] is the one way to build a
-/// record; the fields are private so that nothing constructs one around it
-/// (`locked` is readable by the parent module for now, and says why). The
-/// path and the two reasons are verbatim. `detached` and `bare` are not
-/// stored: the shape says it, a bare worktree having no HEAD and a detached
-/// one no branch.
+/// attribute is read twice -- and the shape of the record as a whole: a
+/// worktree is either bare, with no HEAD and no branch, or it names a HEAD
+/// and exactly one of `branch` and `detached`. Each attribute rule is applied
+/// by [`OpenRecord`] as the attribute arrives and the shape by
+/// [`OpenRecord::close`], which is the one way to build a record; the fields
+/// are private so that nothing constructs one around them (`locked` is
+/// readable by the parent module for now, and says why).
+///
+/// So `branch()` answering `None` means this worktree has checked out no
+/// branch, never that Git's answer did not say. `detached` and `bare` are not
+/// stored, because the shape rule makes them derivable: a record with a HEAD
+/// and no branch is the detached one, and a record with no HEAD is the bare
+/// one.
+///
+/// The path is the parser's decoding. The two reasons are **not** verbatim:
+/// they are decoded with replacement characters, which
+/// [`WorktreeRecord::lock_reason`] states, because they are shown and
+/// compared with one ASCII word, never used as identity (§8).
 ///
 /// No `Clone`: nothing copies a record. The parent iterates the list Git
 /// returned by value and moves the path into the refusal that names it
@@ -77,12 +95,12 @@ pub struct WorktreeRecord {
 /// One record of `git worktree list --porcelain -z` while its attributes are
 /// being read: from its `worktree` line to the empty attribute that closes it.
 ///
-/// The parser feeds each attribute as it arrives and every rule of the
-/// record is applied here, in attribute order, so a refusal names the first
+/// The parser feeds each attribute as it arrives and each attribute's own
+/// rule is applied here, in attribute order, so a refusal names the first
 /// attribute outside the grammar, exactly as the parser did when it held the
-/// rules itself; [`OpenRecord::close`] is the one way to make a
-/// [`WorktreeRecord`], and it cannot fail, because nothing outside the grammar
-/// was ever stored.
+/// rules itself. [`OpenRecord::close`] applies the rule no single attribute
+/// can carry -- which combinations of `HEAD`, `branch`, `bare` and `detached`
+/// are a worktree -- and is the one way to make a [`WorktreeRecord`].
 ///
 /// The path is already decoded, because which bytes can be a path is the
 /// platform's question and the parser answers it per platform. Every other
@@ -109,13 +127,13 @@ pub(super) struct OpenRecord<'a> {
     prunable: Option<&'a [u8]>,
 }
 
-/// Why an [`OpenRecord`] refused an attribute: it is outside the grammar, or
-/// it was read before.
+/// Why an [`OpenRecord`] refused a record: an attribute outside its grammar or
+/// read twice, or a set of attributes that is not a worktree.
 ///
 /// The text is a predicate of the record, for the parser to join after the
 /// record's number: "record 0 has a HEAD that is not one object id".
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(super) enum MalformedAttribute {
+pub(super) enum MalformedRecord {
     /// `HEAD` is not forty or sixty-four hexadecimal digits, or is a second
     /// `HEAD`: either way the record does not have one object id.
     #[error("has a HEAD that is not one object id")]
@@ -130,6 +148,19 @@ pub(super) enum MalformedAttribute {
     /// `locked` or `prunable` a second time.
     #[error("has a reason attribute twice")]
     ReasonTwice,
+    /// `bare` alongside a `HEAD`, a `branch` or `detached`.
+    #[error("is bare and also names a HEAD, a branch or a detached checkout")]
+    BareWithCheckout,
+    /// Neither `bare` nor a `HEAD`.
+    #[error("names no HEAD and is not bare")]
+    NoHead,
+    /// Both `branch` and `detached`: a checkout is one or the other.
+    #[error("is on a branch and detached at once")]
+    BranchAndDetached,
+    /// Neither `branch` nor `detached` on a worktree that has a HEAD, so
+    /// nothing in the record says whether a branch is checked out there.
+    #[error("names a HEAD but neither a branch nor a detached checkout")]
+    NeitherBranchNorDetached,
 }
 
 impl<'a> OpenRecord<'a> {
@@ -154,18 +185,18 @@ impl<'a> OpenRecord<'a> {
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::Head`] for a value outside the grammar or a
+    /// [`MalformedRecord::Head`] for a value outside the grammar or a
     /// second `HEAD`.
-    pub(super) fn head(&mut self, value: &'a [u8]) -> Result<(), MalformedAttribute> {
+    pub(super) fn head(&mut self, value: &'a [u8]) -> Result<(), MalformedRecord> {
         if self.head.is_some() {
-            return Err(MalformedAttribute::Head);
+            return Err(MalformedRecord::Head);
         }
         match std::str::from_utf8(value) {
             Ok(text) if is_object_id(text) => {
                 self.head = Some(text);
                 Ok(())
             }
-            Ok(_) | Err(_) => Err(MalformedAttribute::Head),
+            Ok(_) | Err(_) => Err(MalformedRecord::Head),
         }
     }
 
@@ -177,11 +208,11 @@ impl<'a> OpenRecord<'a> {
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::Branch`] for a value outside the byte set or a
+    /// [`MalformedRecord::Branch`] for a value outside the byte set or a
     /// second `branch`.
-    pub(super) fn branch(&mut self, value: &'a [u8]) -> Result<(), MalformedAttribute> {
+    pub(super) fn branch(&mut self, value: &'a [u8]) -> Result<(), MalformedRecord> {
         if self.branch.is_some() || !can_be_refname(value) {
-            return Err(MalformedAttribute::Branch);
+            return Err(MalformedRecord::Branch);
         }
         self.branch = Some(value);
         Ok(())
@@ -191,10 +222,10 @@ impl<'a> OpenRecord<'a> {
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::BooleanTwice`] for a second `detached`.
-    pub(super) fn detached(&mut self) -> Result<(), MalformedAttribute> {
+    /// [`MalformedRecord::BooleanTwice`] for a second `detached`.
+    pub(super) fn detached(&mut self) -> Result<(), MalformedRecord> {
         if self.detached {
-            return Err(MalformedAttribute::BooleanTwice);
+            return Err(MalformedRecord::BooleanTwice);
         }
         self.detached = true;
         Ok(())
@@ -204,57 +235,92 @@ impl<'a> OpenRecord<'a> {
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::BooleanTwice`] for a second `bare`.
-    pub(super) fn bare(&mut self) -> Result<(), MalformedAttribute> {
+    /// [`MalformedRecord::BooleanTwice`] for a second `bare`.
+    pub(super) fn bare(&mut self) -> Result<(), MalformedRecord> {
         if self.bare {
-            return Err(MalformedAttribute::BooleanTwice);
+            return Err(MalformedRecord::BooleanTwice);
         }
         self.bare = true;
         Ok(())
     }
 
-    /// `locked` or `locked <reason>`, the reason verbatim and empty for the
-    /// bare label.
+    /// `locked` or `locked <reason>`, the reason's bytes and the empty slice
+    /// for the bare label.
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::ReasonTwice`] for a second `locked`.
-    pub(super) fn locked(&mut self, reason: &'a [u8]) -> Result<(), MalformedAttribute> {
+    /// [`MalformedRecord::ReasonTwice`] for a second `locked`.
+    pub(super) fn locked(&mut self, reason: &'a [u8]) -> Result<(), MalformedRecord> {
         if self.locked.is_some() {
-            return Err(MalformedAttribute::ReasonTwice);
+            return Err(MalformedRecord::ReasonTwice);
         }
         self.locked = Some(reason);
         Ok(())
     }
 
-    /// `prunable` or `prunable <reason>`, the reason verbatim and empty for
-    /// the bare label.
+    /// `prunable` or `prunable <reason>`, the reason's bytes and the empty
+    /// slice for the bare label.
     ///
     /// # Errors
     ///
-    /// [`MalformedAttribute::ReasonTwice`] for a second `prunable`.
-    pub(super) fn prunable(&mut self, reason: &'a [u8]) -> Result<(), MalformedAttribute> {
+    /// [`MalformedRecord::ReasonTwice`] for a second `prunable`.
+    pub(super) fn prunable(&mut self, reason: &'a [u8]) -> Result<(), MalformedRecord> {
         if self.prunable.is_some() {
-            return Err(MalformedAttribute::ReasonTwice);
+            return Err(MalformedRecord::ReasonTwice);
         }
         self.prunable = Some(reason);
         Ok(())
     }
 
-    /// The empty attribute: the record is complete.
+    /// The empty attribute: the record is complete, if its attributes are a
+    /// worktree.
+    ///
+    /// **The shape rule, measured on the box (Git 2.43.0) over every shape a
+    /// repository could be put into**: a bare repository's own worktree lists
+    /// as `bare` and nothing else; every other worktree lists a `HEAD` and
+    /// then exactly one of `branch <refname>` and `detached`. That holds for
+    /// the main worktree and a linked one, for `--detach`, `--no-checkout` and
+    /// `-b`, for a repository with no commits at all (`HEAD` is the null id
+    /// and the unborn branch is still named), and for a registration whose
+    /// checkout is gone (`HEAD` null, `detached`, `prunable …`); `locked` and
+    /// `prunable` are orthogonal to it.
+    ///
+    /// Anything else is refused rather than read, because the alternative is
+    /// to answer a question about a worktree from evidence that does not say:
+    /// a record with a `HEAD` and no `branch` would otherwise reach
+    /// `assert_publishable` as "this worktree has no branch checked out", and
+    /// a `bare` record carrying a `branch` as a checkout that is not one.
+    /// §14: malformed or contradictory external evidence fails closed.
     ///
     /// The borrowed attributes become the owned record here, the one copy
-    /// this module makes. The two reasons are decoded lossily: they are
-    /// consulted for the one word `initializing` and shown, never used as
-    /// identity (§8).
-    pub(super) fn close(self) -> WorktreeRecord {
-        WorktreeRecord {
+    /// this module makes. The two reasons are decoded with replacement
+    /// characters: they are compared with one ASCII word and shown, never used
+    /// as identity (§8).
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedRecord::BareWithCheckout`], [`MalformedRecord::NoHead`],
+    /// [`MalformedRecord::BranchAndDetached`] or
+    /// [`MalformedRecord::NeitherBranchNorDetached`].
+    pub(super) fn close(self) -> Result<WorktreeRecord, MalformedRecord> {
+        if self.bare {
+            if self.head.is_some() || self.branch.is_some() || self.detached {
+                return Err(MalformedRecord::BareWithCheckout);
+            }
+        } else if self.head.is_none() {
+            return Err(MalformedRecord::NoHead);
+        } else if self.branch.is_some() && self.detached {
+            return Err(MalformedRecord::BranchAndDetached);
+        } else if self.branch.is_none() && !self.detached {
+            return Err(MalformedRecord::NeitherBranchNorDetached);
+        }
+        Ok(WorktreeRecord {
             path: self.path,
             head: self.head.map(str::to_owned),
             branch: self.branch.map(<[u8]>::to_vec),
             locked: self.locked.map(reason),
             prunable: self.prunable.map(reason),
-        }
+        })
     }
 }
 
@@ -279,7 +345,9 @@ impl WorktreeRecord {
     }
 
     /// The branch it has checked out, when it is not detached: the bytes of a
-    /// full refname (`refs/heads/…`), as Git printed them. Ask
+    /// full refname (`refs/heads/…`), as Git printed them. `None` is a
+    /// detached or bare worktree, which the shape rule makes a fact about the
+    /// worktree rather than about Git's answer. Ask
     /// [`Self::has_checked_out`] rather than spelling the comparison.
     #[must_use]
     pub fn branch(&self) -> Option<&[u8]> {
@@ -298,10 +366,12 @@ impl WorktreeRecord {
     }
 
     /// Git's own lock reason: `None` when the worktree is not locked, `Some("")`
-    /// for a lock taken without a reason, otherwise the reason as Git printed
-    /// it (Git trims its own `locked` file, so the reason has no trailing
-    /// whitespace; an embedded newline survives, which is why the parent asks
-    /// for `-z`).
+    /// for a lock taken without a reason, otherwise the reason Git printed,
+    /// decoded with replacement characters where it is not UTF-8 (Git trims
+    /// its own `locked` file, so the reason has no trailing whitespace; an
+    /// embedded newline survives, which is why the parent asks for `-z`). It
+    /// is a diagnostic and the one ASCII word [`Self::is_initializing`] looks
+    /// for, never identity, so the lossy decode is the right one (§8).
     #[must_use]
     pub fn lock_reason(&self) -> Option<&str> {
         self.locked.as_deref()
@@ -316,33 +386,35 @@ impl WorktreeRecord {
     /// reason, or with any other, is somebody's lock on a worktree Git
     /// finished, and the parent reads it as populated.
     ///
-    /// This is not provenance. The record cannot tell Git's `initializing`
-    /// from the same word a repository writer puts there with
-    /// `git worktree lock --reason initializing` on a populated worktree: both
-    /// read `true`, and the parent's verification answers `Unpopulated` for
-    /// both, after which an open generation is removed and re-added and a
-    /// retained one is closed. The engine writes no marker of its own at the
-    /// add funnel (`worktree add --detach --quiet`), so a marker only it
-    /// produces is the parent's to add (`SWEEP-WORKTREE-013`); until then a
-    /// writer to the execution root who forges Git's word is inside the trust
-    /// boundary the root already assumes (§14): the same writer can delete the
-    /// checkout outright.
+    /// This is not provenance, and nothing downstream may say it is. The
+    /// record cannot tell Git's `initializing` from the same word a repository
+    /// writer puts there with `git worktree lock --reason initializing` on a
+    /// populated worktree, which Git permits: both read `true`, and the
+    /// parent's verification answers [`VerifyFailure::Unpopulated`] for both,
+    /// whose text therefore reports the lock and not a history. The engine
+    /// writes no marker of its own at the add funnel
+    /// (`worktree add --detach --quiet`), so a marker only it produces is the
+    /// parent's to add, and whether one is owed -- which turns on whether a
+    /// writer to the execution root is inside this engine's trust boundary, a
+    /// question no `DESIGN.md` section settles -- is
+    /// `SWEEP-WORKTREE-013`, for the owner rather than for this file.
     #[must_use]
     pub fn is_initializing(&self) -> bool {
         self.locked.as_deref() == Some("initializing")
     }
 
     /// Git's own prunable reason: `None` when Git would not prune the entry,
-    /// `Some("")` when it would and printed no reason, otherwise the reason as
-    /// Git printed it.
+    /// `Some("")` when it would and printed no reason, otherwise the reason
+    /// Git printed, decoded like [`Self::lock_reason`].
     #[must_use]
     pub fn prunable_reason(&self) -> Option<&str> {
         self.prunable.as_deref()
     }
 }
 
-/// A reason as Git printed it, for showing and for the one word the parent
-/// looks for; never identity, so the lossy decode is the right one (§8).
+/// A reason for showing and for the one word the parent looks for, decoded
+/// with `U+FFFD` where Git's bytes are not UTF-8; never identity, so the lossy
+/// decode is the right one (§8).
 fn reason(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
 }
@@ -385,10 +457,14 @@ fn can_be_refname(value: &[u8]) -> bool {
 pub enum VerifyFailure {
     /// Nothing is registered at the recorded path.
     NotRegistered,
-    /// Registered, and `git worktree add` never finished populating it — the
-    /// `registered-but-unpopulated` residue element. Or somebody locked a
-    /// populated worktree with Git's own word; the record cannot tell
-    /// ([`WorktreeRecord::is_initializing`]).
+    /// Registered, and locked with Git's word `initializing`.
+    ///
+    /// That is the lock `git worktree add` holds while it populates a
+    /// checkout, so the reuse path treats it as the
+    /// `registered-but-unpopulated` residue element. It is not proof of one:
+    /// a repository writer may lock a populated worktree with the same word,
+    /// and the record cannot tell ([`WorktreeRecord::is_initializing`]), which
+    /// is why this variant's text reports the lock rather than a history.
     Unpopulated,
     /// Registered at the path but belonging to a different repository.
     ForeignRepository,
@@ -424,8 +500,8 @@ impl fmt::Display for VerifyFailure {
         match self {
             Self::NotRegistered => f.write_str("no worktree is registered at the recorded path"),
             Self::Unpopulated => f.write_str(
-                "the worktree is registered and was never populated: `git worktree add` still \
-                 holds its `initializing` lock",
+                "the worktree is registered and holds an `initializing` lock, the lock \
+                 `git worktree add` writes while it populates a checkout",
             ),
             Self::ForeignRepository => {
                 f.write_str("the worktree at the recorded path belongs to another repository")
@@ -473,36 +549,54 @@ mod tests {
     const SHA1: &str = "88663d58b63b0acaf3c31e98aa723336b24f1510";
     const SHA256: &str = "88663d58b63b0acaf3c31e98aa723336b24f151088663d58b63b0acaf3c31e98";
 
+    /// An open record with nothing read yet.
     fn open() -> OpenRecord<'static> {
         OpenRecord::at(PathBuf::from("slot"))
     }
 
-    /// A record with one lock reason and, optionally, one prunable reason.
-    fn locked_with(lock: Option<&[u8]>, prunable: Option<&[u8]>) -> WorktreeRecord {
+    /// An open record of the shape Git prints for a detached worktree, which
+    /// [`OpenRecord::close`] accepts: a HEAD and `detached`.
+    fn detached() -> OpenRecord<'static> {
         let mut open = open();
+        open.head(SHA1.as_bytes()).expect("one HEAD");
+        open.detached().expect("detached once");
+        open
+    }
+
+    /// The record `open` spells, which must be a shape Git prints.
+    fn close(open: OpenRecord<'_>) -> WorktreeRecord {
+        open.close().expect("a shape Git prints")
+    }
+
+    /// A detached record with one lock reason and, optionally, one prunable
+    /// reason.
+    fn locked_with(lock: Option<&[u8]>, prunable: Option<&[u8]>) -> WorktreeRecord {
+        let mut open = detached();
         if let Some(reason) = lock {
             open.locked(reason).expect("one lock");
         }
         if let Some(reason) = prunable {
             open.prunable(reason).expect("one prunable");
         }
-        open.close()
+        close(open)
     }
 
     /// A record checking out `branch`.
     fn on_branch(branch: &[u8]) -> WorktreeRecord {
         let mut open = open();
+        open.head(SHA1.as_bytes()).expect("one HEAD");
         open.branch(branch).expect("a branch inside the byte set");
-        open.close()
+        close(open)
     }
 
     /// The path is the parser's decoding, taken as given and handed back
-    /// owned for the refusal that names it; a record with no attribute has
-    /// nothing else.
+    /// owned for the refusal that names it; a bare worktree has nothing else.
     #[test]
     fn the_path_is_taken_as_decoded_and_handed_back_owned() {
         let path = PathBuf::from("root").join("tasks").join("kalpha-g1");
-        let bare = OpenRecord::at(path.clone()).close();
+        let mut open = OpenRecord::at(path.clone());
+        open.bare().expect("bare once");
+        let bare = close(open);
         assert_eq!(bare.path(), path.as_path());
         assert_eq!(bare.head(), None);
         assert_eq!(bare.branch(), None);
@@ -510,6 +604,62 @@ mod tests {
         assert_eq!(bare.prunable_reason(), None);
         assert!(!bare.is_initializing());
         assert_eq!(bare.into_path(), path);
+    }
+
+    /// The shape rule: a worktree is bare, or names a HEAD and exactly one of
+    /// `branch` and `detached`. Every combination Git 2.43.0 was measured
+    /// printing is accepted and every other refused, so `branch()` answering
+    /// `None` is a fact about the worktree and not about Git's answer.
+    #[test]
+    fn a_record_is_bare_or_a_head_with_exactly_one_of_branch_and_detached() {
+        let head = || {
+            let mut open = open();
+            open.head(SHA1.as_bytes()).expect("one HEAD");
+            open
+        };
+        let bare = || {
+            let mut open = open();
+            open.bare().expect("bare once");
+            open
+        };
+
+        let mut on_branch = head();
+        on_branch.branch(b"refs/heads/main").expect("one branch");
+        assert!(on_branch.close().is_ok(), "a worktree on a branch");
+        let mut apart = head();
+        apart.detached().expect("detached once");
+        assert!(apart.close().is_ok(), "a detached worktree");
+        let mut locked = bare();
+        locked.locked(b"").expect("one lock");
+        assert!(locked.close().is_ok(), "a lock is orthogonal to the shape");
+        assert!(bare().close().is_ok(), "a bare repository");
+
+        assert_eq!(
+            head().close(),
+            Err(MalformedRecord::NeitherBranchNorDetached),
+            "a HEAD says nothing about a branch on its own"
+        );
+        let mut both = head();
+        both.branch(b"refs/heads/main").expect("one branch");
+        both.detached().expect("detached once");
+        assert_eq!(both.close(), Err(MalformedRecord::BranchAndDetached));
+        let mut bare_head = bare();
+        bare_head.head(SHA1.as_bytes()).expect("one HEAD");
+        assert_eq!(bare_head.close(), Err(MalformedRecord::BareWithCheckout));
+        let mut bare_branch = bare();
+        bare_branch.branch(b"refs/heads/main").expect("one branch");
+        assert_eq!(bare_branch.close(), Err(MalformedRecord::BareWithCheckout));
+        let mut bare_apart = bare();
+        bare_apart.detached().expect("detached once");
+        assert_eq!(bare_apart.close(), Err(MalformedRecord::BareWithCheckout));
+        assert_eq!(
+            open().close(),
+            Err(MalformedRecord::NoHead),
+            "a record naming nothing is not a worktree"
+        );
+        let mut only_branch = open();
+        only_branch.branch(b"refs/heads/main").expect("one branch");
+        assert_eq!(only_branch.close(), Err(MalformedRecord::NoHead));
     }
 
     /// A `HEAD` is forty or sixty-four hexadecimal digits in either case and
@@ -529,11 +679,12 @@ mod tests {
             assert_eq!(open.head(head), Ok(()), "{name} is one object id");
             assert_eq!(
                 open.head(SHA1.as_bytes()),
-                Err(MalformedAttribute::Head),
+                Err(MalformedRecord::Head),
                 "{name}: a second HEAD is not one object id"
             );
+            open.detached().expect("detached once");
             assert_eq!(
-                open.close().head().map(str::as_bytes),
+                close(open).head().map(str::as_bytes),
                 Some(*head),
                 "{name} is kept as printed"
             );
@@ -560,10 +711,14 @@ mod tests {
             let mut open = open();
             assert_eq!(
                 open.head(head),
-                Err(MalformedAttribute::Head),
+                Err(MalformedRecord::Head),
                 "{name} is not one object id"
             );
-            assert_eq!(open.close().head(), None, "{name} stored nothing");
+            assert_eq!(
+                open.close(),
+                Err(MalformedRecord::NoHead),
+                "{name} stored nothing"
+            );
         }
         assert_eq!(refused.len(), 8, "eight independent refusals");
     }
@@ -584,32 +739,33 @@ mod tests {
             let mut branch = b"refs/heads/ma".to_vec();
             branch.push(byte);
             branch.extend_from_slice(b"in");
-            let mut open = open();
+            let mut open = detached();
             assert_eq!(
                 open.branch(&branch),
-                Err(MalformedAttribute::Branch),
+                Err(MalformedRecord::Branch),
                 "byte {byte:#04x} cannot be in a refname"
             );
             assert_eq!(
-                open.close().branch(),
+                close(open).branch(),
                 None,
                 "byte {byte:#04x} stored nothing"
             );
         }
         assert_eq!(
             open().branch(b""),
-            Err(MalformedAttribute::Branch),
+            Err(MalformedRecord::Branch),
             "a refname is never empty"
         );
 
         let mut twice = open();
+        twice.head(SHA1.as_bytes()).expect("one HEAD");
         assert_eq!(twice.branch(b"refs/heads/main"), Ok(()));
         assert_eq!(
             twice.branch(b"refs/heads/other"),
-            Err(MalformedAttribute::Branch),
+            Err(MalformedRecord::Branch),
             "a second branch is not one refname"
         );
-        assert_eq!(twice.close().branch(), Some(&b"refs/heads/main"[..]));
+        assert_eq!(close(twice).branch(), Some(&b"refs/heads/main"[..]));
 
         let latin1: &[u8] = b"refs/heads/caf\xe9";
         assert_eq!(
@@ -629,13 +785,13 @@ mod tests {
         assert_eq!(open.detached(), Ok(()));
         assert_eq!(
             open.detached(),
-            Err(MalformedAttribute::BooleanTwice),
+            Err(MalformedRecord::BooleanTwice),
             "detached twice"
         );
         assert_eq!(open.bare(), Ok(()), "bare is a different label");
         assert_eq!(
             open.bare(),
-            Err(MalformedAttribute::BooleanTwice),
+            Err(MalformedRecord::BooleanTwice),
             "bare twice"
         );
     }
@@ -666,12 +822,9 @@ mod tests {
         );
         assert!(on_branch("refs/heads/café".as_bytes()).has_checked_out("refs/heads/café"));
 
-        let mut detached = open();
-        detached.head(SHA1.as_bytes()).expect("one HEAD");
-        detached.detached().expect("detached once");
-        let detached = detached.close();
-        assert!(!detached.has_checked_out("refs/heads/main"));
-        assert!(!detached.has_checked_out(""));
+        let apart = close(detached());
+        assert!(!apart.has_checked_out("refs/heads/main"));
+        assert!(!apart.has_checked_out(""));
     }
 
     /// A lock without a reason is a lock (`Some("")`), not an absent
@@ -712,17 +865,13 @@ mod tests {
             assert_eq!(
                 locked.lock_reason().map(str::as_bytes),
                 Some(*reason),
-                "{name} is kept verbatim"
+                "{name} keeps its bytes"
             );
         }
 
-        let verbatim = locked_with(Some(b"why\nnot"), Some(b""));
-        assert_eq!(verbatim.lock_reason(), Some("why\nnot"));
-        assert_eq!(
-            verbatim.prunable_reason(),
-            Some(""),
-            "prunable, with no reason"
-        );
+        let kept = locked_with(Some(b"why\nnot"), Some(b""));
+        assert_eq!(kept.lock_reason(), Some("why\nnot"));
+        assert_eq!(kept.prunable_reason(), Some(""), "prunable, with no reason");
 
         let lossy = locked_with(Some(b"caf\xe9"), Some(b"caf\xe9"));
         assert_eq!(
@@ -739,20 +888,20 @@ mod tests {
             "the prunable reason is not the lock"
         );
 
-        let mut twice = open();
+        let mut twice = detached();
         assert_eq!(twice.locked(b""), Ok(()));
         assert_eq!(
             twice.locked(b"again"),
-            Err(MalformedAttribute::ReasonTwice),
+            Err(MalformedRecord::ReasonTwice),
             "locked twice"
         );
         assert_eq!(twice.prunable(b""), Ok(()), "prunable is a different label");
         assert_eq!(
             twice.prunable(b"again"),
-            Err(MalformedAttribute::ReasonTwice),
+            Err(MalformedRecord::ReasonTwice),
             "prunable twice"
         );
-        let twice = twice.close();
+        let twice = close(twice);
         assert_eq!(twice.lock_reason(), Some(""), "the first reason stands");
         assert_eq!(twice.prunable_reason(), Some(""));
     }
@@ -762,20 +911,36 @@ mod tests {
     #[test]
     fn a_malformed_attribute_reads_as_a_predicate_of_the_record() {
         assert_eq!(
-            MalformedAttribute::Head.to_string(),
+            MalformedRecord::Head.to_string(),
             "has a HEAD that is not one object id"
         );
         assert_eq!(
-            MalformedAttribute::Branch.to_string(),
+            MalformedRecord::Branch.to_string(),
             "has a branch that is not one refname"
         );
         assert_eq!(
-            MalformedAttribute::BooleanTwice.to_string(),
+            MalformedRecord::BooleanTwice.to_string(),
             "has a boolean attribute twice"
         );
         assert_eq!(
-            MalformedAttribute::ReasonTwice.to_string(),
+            MalformedRecord::ReasonTwice.to_string(),
             "has a reason attribute twice"
+        );
+        assert_eq!(
+            MalformedRecord::BareWithCheckout.to_string(),
+            "is bare and also names a HEAD, a branch or a detached checkout"
+        );
+        assert_eq!(
+            MalformedRecord::NoHead.to_string(),
+            "names no HEAD and is not bare"
+        );
+        assert_eq!(
+            MalformedRecord::BranchAndDetached.to_string(),
+            "is on a branch and detached at once"
+        );
+        assert_eq!(
+            MalformedRecord::NeitherBranchNorDetached.to_string(),
+            "names a HEAD but neither a branch nor a detached checkout"
         );
     }
 
@@ -817,7 +982,20 @@ mod tests {
             );
             match failure {
                 VerifyFailure::NotRegistered => seen[0] = true,
-                VerifyFailure::Unpopulated => seen[1] = true,
+                VerifyFailure::Unpopulated => {
+                    seen[1] = true;
+                    // What was observed, not a history the record cannot
+                    // know: a writer's `--reason initializing` on a populated
+                    // worktree reaches this variant too.
+                    assert!(
+                        text.contains("holds an `initializing` lock"),
+                        "{text:?} names the lock it saw"
+                    );
+                    assert!(
+                        !text.contains("never populated"),
+                        "{text:?} does not claim a history"
+                    );
+                }
                 VerifyFailure::ForeignRepository => seen[2] = true,
                 VerifyFailure::Missing => seen[3] = true,
                 VerifyFailure::HeadMismatch { expected, actual } => {
