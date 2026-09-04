@@ -615,8 +615,11 @@ mod tests {
     const HEAD: &[u8] = b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f1510";
     const OID: &str = "88663d58b63b0acaf3c31e98aa723336b24f1510";
 
-    fn admin() -> &'static Path {
-        Path::new("/repository/.git/worktrees/example")
+    /// The registration directory, absolute on this platform: the relative
+    /// branch of `registration_checkout` refuses an admin path that is not,
+    /// and `/repository` alone is relative on Windows.
+    fn admin() -> PathBuf {
+        absolute("/repository/.git/worktrees/example")
     }
 
     fn message(error: UpstrokeError) -> String {
@@ -647,7 +650,7 @@ mod tests {
         let checkout = PathBuf::from(root).join("wt");
         for tail in ["\n", "\r\n", " \t\n", "\n\n", ""] {
             let bytes = format!("{root}/wt/.git{tail}");
-            let decoded = registration_checkout(admin(), bytes.as_bytes())
+            let decoded = registration_checkout(&admin(), bytes.as_bytes())
                 .expect("a trailing line terminator is not part of the path");
             assert_eq!(decoded, checkout, "with tail {tail:?}");
         }
@@ -656,7 +659,7 @@ mod tests {
         // decoded checkout is under the registration directory, never the
         // absolute checkout the bytes resemble.
         let leading = format!(" {root}/wt/.git\n");
-        let decoded = registration_checkout(admin(), leading.as_bytes())
+        let decoded = registration_checkout(&admin(), leading.as_bytes())
             .expect("a leading space makes the path relative, which Git resolves");
         assert_ne!(
             decoded, checkout,
@@ -667,7 +670,7 @@ mod tests {
             "a relative path is joined to the registration directory: {decoded:?}"
         );
         let form_feed = format!("{root}/wt/.git\x0c\n");
-        let refused = registration_checkout(admin(), form_feed.as_bytes())
+        let refused = registration_checkout(&admin(), form_feed.as_bytes())
             .expect_err("a trailing form feed is part of the path, whose name is then not .git");
         assert!(
             message(refused).contains("does not name a checkout .git"),
@@ -699,14 +702,14 @@ mod tests {
             ),
         ];
         for (bytes, expected) in cases {
-            let refused = registration_checkout(admin(), bytes.as_bytes()).expect_err("refused");
+            let refused = registration_checkout(&admin(), bytes.as_bytes()).expect_err("refused");
             let text = message(refused);
             assert!(
                 text.contains(expected),
                 "{bytes:?}: expected {expected:?} in {text:?}"
             );
             assert!(
-                text.contains("worktree registration /repository/.git/worktrees/example"),
+                text.contains(&format!("worktree registration {}", admin().display())),
                 "the refusal names the registration"
             );
         }
@@ -758,7 +761,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn a_registration_that_is_not_utf8_is_refused_with_its_offset() {
-        let refused = registration_checkout(admin(), b"C:\\x\\\xff\\.git\n")
+        let refused = registration_checkout(&admin(), b"C:\\x\\\xff\\.git\n")
             .expect_err("a lossy spelling is not registration identity");
         assert!(
             message(refused).contains("not UTF-8 from byte 5"),
@@ -771,7 +774,7 @@ mod tests {
     fn a_registration_keeps_every_path_byte_on_unix() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let decoded = registration_checkout(admin(), b"/tmp/non-utf8-\xff/.git\n")
+        let decoded = registration_checkout(&admin(), b"/tmp/non-utf8-\xff/.git\n")
             .expect("every byte string is a Unix path");
         assert_eq!(decoded.as_os_str().as_bytes(), b"/tmp/non-utf8-\xff");
     }
