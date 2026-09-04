@@ -6796,18 +6796,28 @@ fn an_add_killed_before_commondir_is_written_is_interrupted_add_residue() {
 /// an error, and the add classifier answered `Io` where it had answered
 /// `After`. A path byte outside UTF-8 needs a Unix path.
 ///
+/// **Linux only, because the other two targets cannot represent the state.**
+/// macOS rejects a filename that is not valid UTF-8 at creation — APFS
+/// answers `EILSEQ`, "Illegal byte sequence", which is how CI's
+/// `test (macos-latest)` leg failed at `f5b75d7` — and a Windows path is
+/// UTF-16, where the byte has no spelling either. So the case exists on Linux
+/// and is exercised there, by the local suite and by CI's
+/// `test (ubuntu-latest)` leg; the `cfg` says so, rather than a runtime skip
+/// that would quietly do nothing on two platforms of three.
+///
 /// Witnessed failing with `git_dir_of`'s `fs::read` restored to
 /// `fs::read_to_string` (the pointer read errors) and, separately, with
 /// `object_directory` restored to `String::from_utf8` (`temporary_object_files`
 /// errors, so `observed_residue_elements` does).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn a_repository_whose_path_is_not_utf8_is_still_classified() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt as _;
     let root = scratch("residue-non-utf8");
     let base = root.join(OsString::from_vec(b"repo-\xff".to_vec()));
-    fs::create_dir(&base).expect("a repository directory whose name is not UTF-8");
+    fs::create_dir(&base)
+        .expect("on Linux a filename is bytes, so this name is creatable and the case exists");
     assert!(
         base.to_str().is_none(),
         "the prerequisite: this path is not representable as UTF-8"
