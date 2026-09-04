@@ -50,7 +50,7 @@ use crate::topology::schema::TOPOLOGY_SCHEMA;
 use crate::util::DurabilityLedger;
 use crate::workspace_manager::{
     EffectHooks, HarnessEffects, WorkspaceManager,
-    fixture::{Fixture, died_by_abort, run_kill_child, write_file},
+    fixture::{Fixture, died_by_abort, run_child_test, write_file},
 };
 
 use super::attempt::{AttemptPlan, GatePlan, ReviewerPlan};
@@ -1377,7 +1377,7 @@ pub(super) fn kill_dir(tag: &str) -> PathBuf {
 /// early would satisfy neither, and a child that panicked would satisfy only
 /// this one.
 pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
-    let status = run_kill_child(
+    let status = run_child_test(
         test,
         &[
             ("UPSTROKE_TEST_KILL_DIR", dir.as_os_str()),
