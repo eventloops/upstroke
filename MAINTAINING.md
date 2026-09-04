@@ -94,13 +94,22 @@ author's too. Closing one that has already had a review pass is the owner's, as 
 delegated the same way.
 
 **The premise was disproved.** Every change is made for a stated reason, and a review or a CI run
-can show that reason to be false. The failure it was meant to fix still happens on its own head;
-the measurement it rested on does not reproduce; the cause it named is not the cause. Stop there.
-Findings keep arriving around a change whose purpose has gone, and repairing them buys nothing. Say
-plainly in the body that the premise failed, and say what the pull request should become: narrowed
-to the part that stands on its own, closed with what it learned kept as findings, or replaced by a
-change that re-opens the question it was answering. Retitle a narrowed pull request. Step 6
-re-validates the live title, and a title still naming a withdrawn fix is the next finding.
+can show that reason to be false: the failure it was meant to fix still happens on its own head,
+the measurement it rested on does not reproduce, the cause it named is not the cause.
+
+What has to be falsified is the stated premise, not the symptom. A message is not a defect and two
+faults print one sentence, so a failure that resembles the old one disproves nothing until it is
+fingerprinted to the defect the change names: the same test failing the same assertion for the same
+reason, or the change's own mechanism measured and shown not to have fired. A shared label does not
+reach that bar, and neither does one red run of a test already known to fail under load. Short of
+it the pull request is converging like any other, and step 5 is what applies.
+
+Once the premise is dead, stop. Findings keep arriving around a change whose purpose has gone, and
+repairing them buys nothing. Say plainly in the body that the premise failed, and say what the pull
+request should become: narrowed to the part that stands on its own, closed with what it learned
+kept as findings, or replaced by a change that re-opens the question it was answering. Retitle a
+narrowed pull request. Step 6 re-validates the live title, and a title still naming a withdrawn fix
+is the next finding.
 
 **Pass N+1 finds a P1 in what pass N's repair added.** A repair that introduces a defect of the same
 severity as the one it fixed is evidence about the shape of the change, not a step towards landing
@@ -117,10 +126,12 @@ tree by itself, so those files land through a change of their own.
 
 **Worked example: PR #125.** It raised the forked helpers' READY budget from two seconds to ten to
 fix a macOS test-leg failure on master. At pass 4 the pull request's own CI showed that failure
-recurring on the exact reviewed head with the ten seconds elapsed, which disproved the premise. It
-ran to pass 8 anyway, each round adding machinery to make the larger budget safe, and from pass 3
-on every pass found a P1 in what an earlier round had added. After pass 7 the budget was withdrawn
-and the pull request narrowed; after pass 8 the coordinator closed it under the owner's written
+recurring on the exact reviewed head with the ten seconds elapsed: the change's own mechanism,
+measured, had not fired, which is the fingerprint this rule asks for rather than the old message
+seen again. It ran to pass 8 anyway, each round adding machinery to make the larger budget safe,
+and from pass 3 on every pass found a P1 in what an earlier round had added. After pass 7 the
+budget was withdrawn and the pull request narrowed; after pass 8 the coordinator closed it under
+the owner's written
 delegation. No code merged, and eleven deferred `PR125-CLOSE-*` rows in `reviews/FINDINGS.md` §49
 are what the eight passes left. The four passes after the disproof were not empty, and reached
 defects that had been on master all along. But five of those eleven rows are about machinery those
