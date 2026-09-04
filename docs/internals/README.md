@@ -65,7 +65,13 @@ Three things do not move, because they are not this standard's to place:
 
 - a `SAFETY:` obligation (§11), which belongs against the `unsafe` block it discharges;
 - a concurrency protocol (§10), where the type cannot carry it;
-- an `#[expect(...)]` reason string, which is an attribute rather than a comment.
+- an `#[expect(...)]` reason string, which is an attribute rather than a comment;
+- the **allowlist-placement marker** above a module-level `#![allow(...)]` of a governed lint.
+  `src/effects/`'s census reads that comment: it requires the words `effects/allowlist.toml` and
+  the section name (`funnel section`, or `LEGACY-EFFECT`) directly above the attribute, so the
+  comment is governance machinery rather than prose and deleting it fails
+  `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`. Keep the marker to those
+  required words and move the explanation.
 
 Where one of these has to stay, it stays, and the notes file says so.
 
