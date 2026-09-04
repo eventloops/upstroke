@@ -3138,7 +3138,7 @@ fn an_add_without_a_durable_intent_refuses_and_leaves_nothing_registered() {
                 .worktree_records()
                 .expect("records")
                 .iter()
-                .all(|record| record.path != path),
+                .all(|record| record.path() != path),
             "and nothing was registered with Git either"
         );
 
@@ -4062,7 +4062,7 @@ fn reclaim_removes_a_registered_but_unpopulated_worktree() {
             .worktree_records()
             .expect("records")
             .iter()
-            .any(|record| record.locked.as_deref() == Some("initializing")),
+            .any(WorktreeRecord::is_initializing),
         "the fixture must really build the residue it is about"
     );
     assert_eq!(
@@ -4083,7 +4083,7 @@ fn reclaim_removes_a_registered_but_unpopulated_worktree() {
             .worktree_records()
             .expect("records")
             .iter()
-            .any(|record| record.path.ends_with("kalpha-g1")),
+            .any(|record| record.path().ends_with("kalpha-g1")),
         "the registration is pruned"
     );
     assert!(!path.exists());
@@ -5408,7 +5408,7 @@ fn forced_removal_clears_every_administrative_residue_and_is_idempotent() {
             .worktree_records()
             .expect("records")
             .iter()
-            .any(|record| record.path.ends_with("kalpha-g1"))
+            .any(|record| record.path().ends_with("kalpha-g1"))
     );
 
     fixture
@@ -5723,7 +5723,7 @@ fn two_generations_of_one_task_key_are_two_worktrees() {
             .worktree_records()
             .expect("records")
             .iter()
-            .filter(|record| record.path.starts_with(fixture.manager.execution_root()))
+            .filter(|record| record.path().starts_with(fixture.manager.execution_root()))
             .count(),
         2,
         "two registrations, not one directory registered twice"
@@ -8496,7 +8496,7 @@ fn recover_sample(fixture: &Fixture, slot: &Slot) -> bool {
             .worktree_records()
             .expect("records")
             .iter()
-            .any(|record| canonical_prefix(&record.path).ok() == canonical_prefix(&path).ok())
+            .any(|record| canonical_prefix(record.path()).ok() == canonical_prefix(&path).ok())
 }
 
 // -----------------------------------------------------------------------
