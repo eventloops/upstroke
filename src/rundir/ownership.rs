@@ -395,9 +395,9 @@ pub(super) fn canonical_public_or_refusal(
 /// carries no commit-record check anywhere on its path, and
 /// [`super::remove_public_husk`] then listed the directory again once the
 /// failure had cleared and removed a committed run's public half,
-/// `events.jsonl` included. That sequence is driven through the real census in
-/// `engine::topology::startup::tests::
-/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`.
+/// `events.jsonl` included. That sequence was measured through the real census;
+/// `engine::topology::startup::tests` records the measurement and why its
+/// fixture cannot be committed as a test in that module.
 ///
 /// A whole-process descriptor exhaustion is **not** that failure: `EMFILE`
 /// refuses `run.lock` as well, [`super::is_running`] calls a lock it cannot

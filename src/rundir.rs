@@ -914,9 +914,10 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
 /// public half on the evidence that it was empty: measured with a public
 /// directory that can be searched but not listed, where the classification
 /// probe's `open` is refused, [`is_running`] still opens `run.lock` and
-/// answers "free", the marker read finds nothing and this listing is refused —
-/// `engine::topology::startup::tests::
-/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`.
+/// answers "free", the marker read finds nothing and this listing is refused.
+/// That measurement is recorded in `engine::topology::startup::tests`, beside
+/// [`retention`]'s reason-agnostic retain arm, along with why the fixture
+/// cannot be committed as a test in that module.
 ///
 /// A **whole-process** descriptor exhaustion is not that failure and is
 /// deliberately not claimed as one: `EMFILE` refuses the `run.lock` open too,

@@ -366,6 +366,11 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # Conjunct 8's expected value, on the same terms as conjunct 12's below it:
+    # it takes the canonicalization that was already performed and answers with
+    # the canonical path or the refusal that stands in for one, performing no
+    # effect of its own.
+    "canonical_public_or_refusal",
     # Conjunct 12's classification, read-only and total: it takes the stat that
     # was already performed and answers whether it *proves* the private commit
     # record absent. Only `NotFound` does.

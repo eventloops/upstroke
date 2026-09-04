@@ -2572,13 +2572,12 @@ fn a_public_husk_removal_that_fails_partway_leaves_the_marker_that_locates_it() 
 ///
 /// **This is a unit witness of the fold, not of the census.** It calls
 /// classify, prove and remove directly, so it never reaches `scan` or
-/// `is_running`; the census-level sequence — including which failures get
-/// past those gates and which do not — is
-/// `engine::topology::startup::tests::
-/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`,
-/// and that is where the production claim lives. Pass 1 of this pull request's
-/// review found the earlier version of this comment claiming an `EMFILE`
-/// sequence that `is_running` gates one layer up, and it was right.
+/// `is_running`. Pass 1 of this pull request's review found the earlier version
+/// of this comment claiming an `EMFILE` sequence that `is_running` gates one
+/// layer up, and it was right: under a whole-process exhaustion the census
+/// skips the husk before reaching any of this. The failure that does reach it
+/// is a selective one, and `engine::topology::startup::tests` records that
+/// measurement and why its fixture cannot be committed as a test there.
 ///
 /// The fold itself, in the order it happens: the marker read at conjunct 1 and
 /// the listing under it both fail, `read_dir_names` answered `[]` for the
