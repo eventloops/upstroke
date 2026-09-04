@@ -3787,10 +3787,10 @@ fn an_integration_ref_checked_out_in_a_second_worktree_is_refused() {
 // Intents: synced before the add, and reclaimed
 // -----------------------------------------------------------------------
 
-/// **The ordering half of this test's old name is not here, deliberately.**
-/// It read `HookHarness::coverage()` — a *first-observation* log — for the
-/// index of `Worktree.WriteIntent/After` and of `Worktree.Add/Before`, and
-/// asserted the first came earlier. `write_intent` and `add_worktree` are two
+/// **The hook-order assertion this test used to end with is gone,
+/// deliberately.** It read `HookHarness::coverage()` — a *first-observation*
+/// log — for the index of `Worktree.WriteIntent/After` and of
+/// `Worktree.Add/Before`, and asserted the first came earlier. `write_intent` and `add_worktree` are two
 /// separate calls this test makes in that order, so the log records them in
 /// that order whatever either funnel does, and no edit to either could have
 /// moved it: the assertion restated the test's own script. It is the
@@ -3800,7 +3800,10 @@ fn an_integration_ref_checked_out_in_a_second_worktree_is_refused() {
 /// enforced rather than merely performed:
 /// `an_add_without_a_durable_intent_refuses_and_leaves_nothing_registered` for
 /// the ordering, and `the_intent_and_its_directory_are_synced_before_the_add_begins`
-/// for what "durable" means at the moment the add begins.
+/// for what "durable" means at the moment the add begins. What stays here is
+/// what this fixture can still witness: the intent is a durable file while no
+/// worktree exists — the interrupted-add prefix the name is about — and
+/// reclaim removes it.
 #[test]
 fn the_intent_is_durable_before_the_add_and_reclaim_removes_it() {
     let fixture = Fixture::created("intent-order");
@@ -6122,10 +6125,14 @@ fn every_change_kind_reaches_the_region_including_both_rename_endpoints() {
 }
 
 /// `candidate_diff` produces the text a reviewer judges, and until this sweep
-/// **nothing asserted anything about it**: its one appearance in the crate is
-/// the hostile-slot-name grid above, where every call is expected to fail, so
-/// a body that returned `Err` for every slot passed the whole suite and no
-/// test named the diff it hands a reviewer.
+/// **nothing in this suite asserted anything about it**: its one appearance in
+/// this file is the hostile-slot-name grid above, where every call is expected
+/// to fail, so a body returning `Err` for every slot passed this module's
+/// whole suite. What caught that mutation crate-wide was
+/// `engine::topology::recover`'s driver tests, fourteen of which went red —
+/// two modules away, and for reasons that say nothing about the diff. §12 asks
+/// for the lowest layer that can observe the failure, and the three claims
+/// below are not observable there at all.
 ///
 /// Three claims, one fixture, each with the mutation it is witnessed against:
 ///
