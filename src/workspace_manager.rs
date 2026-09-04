@@ -957,18 +957,18 @@ impl WorkspaceManager {
         self.revalidate_chain(&self.execution_root)?;
         let root = canonical_prefix(&self.execution_root)?;
         for record in self.worktree_records()? {
-            let worktree = canonical_prefix(&record.path)?;
+            let worktree = canonical_prefix(record.path())?;
             if is_at_or_inside(&worktree, &root) {
                 return Err(Refusal::RootInsideRepositoryWorktree {
                     root,
-                    worktree: record.path,
+                    worktree: record.into_path(),
                 }
                 .into());
             }
             if is_at_or_inside(&root, &worktree) && !self.is_manager_slot_path(&root, &worktree) {
                 return Err(Refusal::WorktreeInsideRoot {
                     root,
-                    worktree: record.path,
+                    worktree: record.into_path(),
                 }
                 .into());
             }
@@ -1706,7 +1706,7 @@ impl WorkspaceManager {
         let Some(record) = self.worktree_record(path)? else {
             return Ok(Err(VerifyFailure::NotRegistered));
         };
-        if record.locked.as_deref() == Some("initializing") {
+        if record.is_initializing() {
             return Ok(Err(VerifyFailure::Unpopulated));
         }
         if !path.is_dir() {
@@ -2240,12 +2240,23 @@ impl WorkspaceManager {
     ///
     /// [`Refusal::SymbolicRef`] or [`Refusal::CheckedOutRef`].
     pub fn assert_publishable(&self, refname: &str) -> Result<(), UpstrokeError> {
+        // **Two limits of this check, neither of them closed here.** The
+        // comparison is exact bytes, so on a case-insensitive filesystem with
+        // the files ref backend a worktree holding another spelling of the
+        // same loose ref is not seen (`SWEEP-WORKTREE-015`); and this runs
+        // before its caller's funnel opens, so a checkout that happens
+        // between the answer and `git update-ref` is not seen either, which
+        // was reproduced on Git 2.43.0 (`SWEEP-WORKTREE-016`). Both are this
+        // module's to repair, in its own sweep (queue row 11): the first
+        // needs the repository's backend, the second needs the check to run
+        // inside the funnel after the Before hook and a statement of what the
+        // funnel then guarantees.
         self.refuse_symbolic(refname)?;
         for record in self.worktree_records()? {
-            if record.branch.as_deref() == Some(refname) {
+            if record.has_checked_out(refname) {
                 return Err(Refusal::CheckedOutRef {
                     refname: refname.to_owned(),
-                    worktree: record.path,
+                    worktree: record.into_path(),
                 }
                 .into());
             }
@@ -2964,7 +2975,7 @@ impl WorkspaceManager {
     fn worktree_record(&self, path: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
         let wanted = canonical_prefix(path)?;
         for record in self.worktree_records()? {
-            if canonical_prefix(&record.path)? == wanted {
+            if canonical_prefix(record.path())? == wanted {
                 return Ok(Some(record));
             }
         }
@@ -3347,7 +3358,7 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
     let output = read_only_git_ok(repository, &["worktree", "list", "--porcelain", "-z"])?;
     let wanted = canonical_prefix(worktree)?;
     for record in parse_worktree_records(&output)? {
-        if canonical_prefix(&record.path)? == wanted {
+        if canonical_prefix(record.path())? == wanted {
             return Ok(Some(record));
         }
     }
