@@ -1585,10 +1585,16 @@ fn the_budget_is_the_files_length_and_a_line_past_the_window_is_still_read() {
 /// and_stops` and `a_run_directory_whose_log_never_ends_is_still_classified`
 /// carry that.
 ///
-/// `Husk` is also the safe direction: a husk is never deleted on shape
-/// alone — deletion additionally requires the ownership proof, which
-/// requires `committed.json` to be absent, and a run that reached
-/// `run_started` published one at P5b.
+/// `Husk` is the safe direction here, but **not for the reason this comment
+/// used to give**. It said a husk is never deleted on shape alone because
+/// deletion requires the ownership proof and the proof requires
+/// `committed.json` to be absent. That is true of
+/// `PrivateHalfOwnership::Proven` and false of `NothingBound`, which reclaims
+/// the public half with no commit-record check at all. What retains this
+/// directory is that `unbound_shape` reclaims only a bare directory or one
+/// holding the staging file alone, and this one holds an `events.jsonl`.
+/// `first_committed_line` carries the whole argument and the residual
+/// (`SWEEP-CLASSIFY-009`).
 #[test]
 fn a_log_with_no_newline_at_all_is_a_husk_however_long_it_is() {
     let root = scratch("no-newline");

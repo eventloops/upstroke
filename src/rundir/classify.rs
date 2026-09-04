@@ -6,6 +6,17 @@
 //! (anything else)". Read-only, and bounded rather than total: the census
 //! holds the physical worktree lock across it, so an entry that never
 //! classifies is a lock held for ever, and every bound here exists for that.
+//! **What `startup_census` is, since this module cites it throughout.** It is a
+//! sentence of the retired `sequential_substrate` packet. Neither `DESIGN.md`
+//! nor any `design/` section states it at this SHA — measured, not assumed — so
+//! every quotation of it in this file is the wording this module was built to
+//! and this module's own reasoning for behaving that way, and none of it is
+//! design authority. A citation below that reads as though the design required
+//! something should be read as: this is what the module does, and this is why.
+//! That the design carries no classification rule for a run directory is a gap
+//! rather than a licence to invent one here; it is `SWEEP-CLASSIFY-013`, and
+//! closing it is an owner-level design change rather than this pull request's.
+//!
 //! What is not bounded is named where it lives, and it is one syscall.
 //! [`first_committed_line`] refuses to open anything whose *name* is not a
 //! regular file, and the window between that check and the `open` is still
@@ -14,16 +25,27 @@
 //!
 //! **Measured rather than restated, and then decided.** The block is real
 //! (`SWEEP-CLASSIFY-003`, with the reproduction and its output in
-//! `reviews/FINDINGS.md`), and the usual close on Unix — open with
-//! `O_NONBLOCK` and take the file type from the descriptor — cannot be written
-//! here: every non-blocking open is a governed primitive. `clippy.toml` denies
-//! `std::fs::File::options` and the `std::fs::OpenOptions` it hands out, and
-//! `libc::open` and `libc::fcntl` beside them; an allowance is a module-level
-//! attribute in a file listed in `effects/allowlist.toml`, which is exactly the
-//! posture this module deliberately does not take (below). So the close belongs
-//! to the funnel parent, as a site-taking non-blocking read-only open, and it is
-//! a deferred row against `src/rundir.rs` rather than a sentence here saying the
-//! race is somebody else's.
+//! `reviews/FINDINGS.md`). The usual close on Unix — open with `O_NONBLOCK` and
+//! take the file type from the descriptor — reaches a governed primitive:
+//! `clippy.toml` denies `std::fs::File::options` and the `std::fs::OpenOptions`
+//! it hands out, and `libc::open` and `libc::fcntl` beside them.
+//!
+//! **That is not a bar to writing it here, and an earlier version of this
+//! paragraph wrongly said it was.** `standards/02` admits a per-site
+//! `#[expect]` of a governed lint below module level in a file whose
+//! `effects/allowlist.toml` row records the lint and the exact annotation
+//! count, and `src/effects/tests.rs`'s placement census requires that file to
+//! **deny** the lint at module level — so this module's deny posture is the
+//! mechanism's precondition rather than the thing an allowance would replace.
+//! The close is available locally, at the cost of an allowlist row.
+//!
+//! It is deferred anyway, as a **preference and not a constraint**: a governed
+//! primitive belongs in the funnel parent as a site-taking non-blocking
+//! read-only open, and the round that would have added it here is the round a
+//! frontier pass found a P1 inside the machinery this file's previous round
+//! added — which is the standing signal to narrow rather than to reach for one
+//! more mechanism. `SWEEP-CLASSIFY-003` carries that reasoning and the
+//! measurement it rests on.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree and not by the file, so an out-of-line
@@ -98,7 +120,8 @@ pub(super) const FIRST_LINE_WINDOW: u64 = 1 << 20;
 ///
 /// That is the *scan*'s memory, and not the probe's: a first line that is found
 /// is then materialised at its own length by [`first_line_within`], which the
-/// packet requires and this constant does not bound. See that function.
+/// rule this module implements requires and this constant does not bound. See
+/// that function.
 pub(super) const SCAN_CHUNK: usize = 64 * 1024;
 
 /// How many `Interrupted` reads one pass over a source retries before it gives
@@ -214,13 +237,17 @@ fn first_committed_line(public: &Path) -> Option<RunStartedHeader> {
     // public directory".
     //
     // The residual is that the listing is a *second* observation of a directory
-    // this probe already failed to read once, and `super::read_dir_names`
-    // answers `[]` for a `read_dir` that failed — which is the reclaiming
-    // answer. A transient whole-process failure (`EMFILE`, `ENFILE`) fails the
-    // `open` below, the marker read and that listing at the same moment, and
-    // `remove_public_husk` lists the directory again once it has passed. Neither
-    // fold is in this file; both are `SWEEP-CLASSIFY-009`, a deferred row
-    // against `src/rundir.rs` and `src/rundir/ownership.rs`.
+    // this probe already failed to read once, and `super::read_dir_names` folds
+    // two different failures into `[]` — the reclaiming answer. It answers `[]`
+    // when `read_dir` itself fails, and its `.flatten()` drops an entry whose
+    // iteration step fails, so a directory that opened but could not be walked
+    // past `events.jsonl` also reads as bare. A transient whole-process failure
+    // (`EMFILE`, `ENFILE`) reaches the `open` below, the marker read and that
+    // listing at the same moment, and `remove_public_husk` lists the directory
+    // again once it has passed. Neither fold is in this file; both are
+    // `SWEEP-CLASSIFY-009`, deferred against `src/rundir.rs` and
+    // `src/rundir/ownership.rs`, and `read_dir_names` is PR #139's subject
+    // while this is written — do not repair it from here.
     if !fs::symlink_metadata(&path).is_ok_and(|entry| entry.is_file()) {
         return None;
     }
@@ -289,8 +316,9 @@ pub(super) fn first_line(file: &mut File) -> Option<Vec<u8>> {
 /// **The scan is constant memory and the answer is not.** A source with no
 /// newline in it costs one [`SCAN_CHUNK`] buffer however long it is, which is
 /// the shape the window exists for; a first line that *is* found is then
-/// materialised at its own length, because `startup_census` states no size
-/// exception and the parse needs the whole line. So the probe's peak memory is
+/// materialised at its own length, because the rule this module implements
+/// states no size exception and the parse needs the whole line. So the probe's
+/// peak memory is
 /// the length of the log's first line, and a census of a directory holding a
 /// hostile one pays it. Bounding that is a decision about what the census may
 /// spend rather than about what a first line is, so it is `SWEEP-CLASSIFY-012`,
@@ -321,7 +349,7 @@ pub(super) fn first_line_within<R: Read + Seek>(source: &mut R, bound: u64) -> O
     // check and one rewritten so it lands later fails the second. `Husk` is the
     // safe direction for all three, and it is the one the shrunk log already
     // took — the other two used to return bytes that were not a first line at
-    // all, and the terminator requirement `startup_census` states is exactly
+    // all, and the terminator requirement this module classifies by is exactly
     // what they broke.
     let want = length.saturating_add(1);
     source.seek(SeekFrom::Start(0)).ok()?;
