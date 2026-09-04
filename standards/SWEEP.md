@@ -99,20 +99,28 @@ wave, not across the history of the tree.
 | 54 | `src/config.rs` | 2,875 | #123 | 2026-09-03 |
 | 55 | `examples/probe.rs` | 70 | — | — |
 
-**Row 12 has had a first pass and is not swept.** PR #137 landed correctness repairs in
-`src/rundir/classify.rs` — a probe that did not terminate on an interrupted read, a first line
-re-read that carried the scan's proof onto bytes the scan never saw, an unreachable `?`, an
-unclamped short read, and a module comment that stated a safety property the code does not have —
-with four tests and their mutations. It did **not** discharge §7 for the file. Six inspections
-still fold an I/O failure the filesystem declined to explain into the same `Husk` as an honest
-absence: the `symlink_metadata` guard, the `open`, the `fstat` that takes the bound, the two
-reads and the seek. Making those errors changes `classify_run_dir`'s public signature, the `pub`
-`RunDirClass` re-export, `RunDirEntry`'s `pub` class field in the engine's census, and both
-`list_runs` and `list_husks` in `src/rundir/discovery.rs` (queue row 13) — three production call
-sites in three files and thirty-six call sites in all, which is past any reading of a sweep's
-own-file bound. Listing the file here would activate §6 and §7 over it in full, and recording a
-violation does not satisfy a standard, so the row stays open and a successor takes the folds
-with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
+**Row 12 has had two passes and is not swept.** PR #137 landed correctness repairs in
+`src/rundir/classify.rs` — a first-line re-read that carried the scan's proof onto bytes the scan
+never saw, an unreachable `?`, an unclamped short read, and a module comment that stated a safety
+property the code does not have — with three tests and their mutations. It also **found a P1 it
+could not repair**: the probe does not terminate on a source answering `Interrupted`, the census
+holds the physical worktree lock across it, and both repairs attempted were wrong — the second
+because an exhausted retry bound has to answer `Husk`, which is the reclaiming classification, so
+it traded a hang for a deletion. The interrupted-read behaviour is master's and the defect is
+`SWEEP-CLASSIFY-001`, an open P1 whose row carries both unbounded doors, the reproduction and why a
+cap cannot be the fix. A repair needs a classification that is neither `Committed` nor `Husk`, so
+it needs the same signature change as the folds below. It did **not** discharge §7 for the file.
+**Seven** inspections still fold an I/O failure the filesystem declined to explain into the same
+`Husk` as an honest absence: the `symlink_metadata` guard, the `open`, the `fstat` that takes the
+bound, the window read, the scan read's own `Err(_)` arm, the seek and the re-read. Seven is
+derived rather than counted -- PR #137's body carries the command that enumerates the sites, after
+two frontier passes corrected the number twice. Making those errors changes `classify_run_dir`'s
+public signature, the `pub` `RunDirClass` re-export, `RunDirEntry`'s `pub` class field in the
+engine's census, and both `list_runs` and `list_husks` in `src/rundir/discovery.rs` (queue row 13)
+— three production call sites in three files and thirty-six call sites in all, which is past any
+reading of a sweep's own-file bound. Listing the file here would activate §6 and §7 over it in
+full, and recording a violation does not satisfy a standard, so the row stays open and a successor
+takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and
