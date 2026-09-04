@@ -193,7 +193,8 @@ fn first_committed_line(public: &Path) -> Option<RunStartedHeader> {
     // `NothingBound` reclaims the **public** half through
     // `super::remove_public_husk` with no commit-record check anywhere on the
     // path — and it is what the proof answers as soon as the marker cannot be
-    // read, which is every committed run, since the marker is removed at P6.
+    // read, which every committed run past P7 is, since P7 is the step that
+    // removes the marker.
     // What stops it is `super::ownership`'s `unbound_shape`, which reclaims only
     // a bare directory or one holding the staging file alone: an `events.jsonl`
     // this probe failed to read is an entry in that listing, so the answer is
