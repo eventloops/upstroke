@@ -2212,10 +2212,22 @@ fn staged(path: &Path) -> bool {
 /// A path as the records spell it: canonical when the filesystem can say, and
 /// the path itself when it cannot.
 ///
-/// The fallback matters and is deliberate: the proof compares the record against
-/// `canonicalize(<public>)` with the same fallback, so a filesystem that will
-/// not canonicalize produces two equal non-canonical strings rather than one
-/// canonical and one not.
+/// **The fallback is no longer symmetric, and this comment used to say it was.**
+/// It said the proof compares the record against `canonicalize(<public>)` with
+/// the same fallback, so that a filesystem which will not canonicalize produces
+/// two equal non-canonical strings. That was true, and it was the defect: two
+/// lookups failing together carried conjunct 8 and produced `Proven`, which
+/// mints a private-half deletion token. `rundir::ownership` now refuses when it
+/// cannot canonicalize, and compares paths rather than lossy strings, so a
+/// record written through this fallback — or written from a path that is not
+/// valid UTF-8 — is retained and reported rather than proven.
+///
+/// This function is left as it is on purpose. Changing what the recorder
+/// *writes* changes a persisted record's shape, and `OwnerRecord.public_dir`,
+/// `CreatingMarker.private_dir` and `run_started.private_dir` all carry the same
+/// `String`; the policy question has a parked owner-level record in PR #39. The
+/// proof side is where a deletion is authorised, so that is where the refusal
+/// belongs.
 fn canonical_string(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())

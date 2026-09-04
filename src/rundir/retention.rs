@@ -134,11 +134,30 @@ impl RetainReason {
     }
 
     /// Which owner-record field disagreed, when that is what happened.
+    ///
+    /// Exhaustive rather than wildcarded. `CODING_STANDARDS.md` §5 requires a
+    /// closed-domain match to force a decision per variant, and [`Self::KINDS`]
+    /// is that closed domain: under `_ => None` a variant added later answers
+    /// "no field" by default, which is right for most of them and would be
+    /// wrong, silently, for any later variant that carries one. An earlier
+    /// version of this pull request's body presented the absence of new arms
+    /// here as a virtue; pass 2 of its review pointed out that it is the
+    /// finding.
     #[must_use]
     pub const fn owner_field(&self) -> Option<OwnerField> {
         match self {
             Self::OwnerRecordDisagrees { field, .. } => Some(*field),
-            _ => None,
+            Self::MarkerUnparseable
+            | Self::MarkerRunIdMismatch { .. }
+            | Self::MarkerRepoKeyMismatch { .. }
+            | Self::TargetUndecidable { .. }
+            | Self::LocatorOutsideAuthorizedRoot { .. }
+            | Self::LocatorThroughReparsePoint { .. }
+            | Self::OwnerRecordMissing
+            | Self::OwnerRecordUnparseable
+            | Self::MarkerlessWithContent
+            | Self::ListingUnreadable { .. }
+            | Self::PossiblyCommitted => None,
         }
     }
 }

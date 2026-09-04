@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     CensusInputs, FailedStep, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome,
-    WorktreeLocked, apply, census_run_dirs, startup_census,
+    WorktreeLocked, apply, census_run_dirs, scan, startup_census,
 };
 use crate::error::UpstrokeError;
 use crate::events::log::EventLog;
@@ -1020,6 +1020,80 @@ fn locator_through_reparse_point_retained() {
         "the private target must be byte-identical afterwards"
     );
     assert!(exists(&husk.public()));
+}
+
+/// **`scan` turns the proof's refusal into a plan that deletes nothing, and
+/// its reclaiming answer into one that deletes.** Both halves, one fixture,
+/// no privileged primitive.
+///
+/// This is the composition pass 2 found untested. The rundir suite asserts
+/// what `prove_private_half_ownership` answers, and
+/// [`every_retain_reason_kind_deletes_nothing`] asserts what `apply` does with
+/// a `Planned::Retain` handed to it directly — but nothing asserted that `scan`
+/// carries the one into the other. A mutation that special-cased
+/// `ListingUnreadable` into `ReclaimPublicOnly(Bare)` inside `scan` left every
+/// added test green while the real sequence deleted a committed run's log.
+///
+/// The unreadable-listing answer is reached here without touching a permission
+/// bit: a run id whose public directory **does not exist** classifies `Husk`
+/// (the log cannot be opened), `is_running` answers false (the lock file is
+/// absent, which is `NotFound` and therefore an answer), the marker read is
+/// `NotFound`, and `read_dir` is `NotFound` — which this pull request's rule
+/// treats as a listing that did not happen rather than an empty directory. So
+/// the proof answers `Retained(ListingUnreadable)` and `scan` must plan a
+/// retention.
+///
+/// The second half is the control, and it is what stops the first half being
+/// satisfied by a `scan` that retains everything: a **bare** public directory
+/// is the shape the census is *supposed* to reclaim, and the same call must
+/// answer `ReclaimPublicOnly(Bare)` for it. One mutation dies on each.
+#[test]
+fn scan_plans_a_retention_for_a_listing_that_did_not_answer_and_a_reclaim_for_a_bare_husk() {
+    let fixture = Fixture::new("scan-composition");
+
+    // (1) The refusal. No directory at all, so nothing to plant and nothing to
+    // chmod: every probe on this path answers `NotFound`.
+    let absent = "01ABSENTPUBLICDIR000000000";
+    let scanned = scan(absent, &fixture.inputs(), None);
+    assert_eq!(
+        scanned.class,
+        RunDirClass::Husk,
+        "a directory that is not there is not a committed run"
+    );
+    match &scanned.plan {
+        Planned::Retain(reason) => assert_eq!(
+            reason.kind(),
+            "listing-unreadable",
+            "the proof's refusal must arrive as a retention: {reason}"
+        ),
+        other => panic!(
+            "`scan` turned a listing that did not answer into {other:?}, which is the plan \
+             that deletes"
+        ),
+    }
+    let outcome = apply(&mut rundir::NoHooks, &scanned.public, scanned.plan);
+    assert!(
+        !outcome.reclaimed_anything(),
+        "and the plan it produced reclaims nothing: {outcome:?}"
+    );
+
+    // (2) The control. A bare public directory is what the census reclaims, so
+    // a `scan` that retained everything would fail here.
+    let bare = "01BAREPUBLICDIR0000000000";
+    let husk = Husk::at_p0(&fixture, bare);
+    assert!(exists(&husk.public()), "P0 made the bare directory");
+    let scanned = scan(bare, &fixture.inputs(), None);
+    match &scanned.plan {
+        Planned::ReclaimPublicOnly(shape) => assert_eq!(
+            *shape,
+            UnboundShape::Bare,
+            "a bare husk is still reclaimed, and by its shape"
+        ),
+        other => panic!("`scan` refused to reclaim a bare husk: {other:?}"),
+    }
+    let outcome = apply(&mut rundir::NoHooks, &scanned.public, scanned.plan);
+    assert_eq!(outcome, RunDirOutcome::ReclaimedPublicOnly(UnboundShape::Bare));
+    assert!(!exists(&husk.public()), "and the bare husk is gone");
 }
 
 /// **The census-level witness for a listing that cannot be read is not here,
