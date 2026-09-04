@@ -38,6 +38,14 @@ panicked at src/engine/topology/emit/tests.rs:1180:5: the private half was remov
 **One test out of 1,924.** Not "one of the guards" — the only one. Every other spelling of the name
 follows the constant and moves with it.
 
+This row is the **canonical home** of that count. `src/rundir/names.rs`, `standards/SWEEP.md`,
+`SWEEP-NAMES-008` and the pull request body point here rather than restating it, because a number
+restated in five places is a number that drifts in four of them — which is exactly how
+`SWEEP-NAMES-008` came to claim a green suite that this measurement contradicts. There is one
+deliberate exception: the comment at `src/engine/topology/emit/tests.rs` repeats the count, because
+its whole purpose is to stop a reader who has never opened this file from deleting the assertion,
+and a pointer they do not follow protects nothing.
+
 So the sequence this row would create if applied before `SWEEP-NAMES-008`:
 
 1. A sweep of `emit/tests.rs` follows this row and changes that assertion to join `COMMIT_RECORD`.

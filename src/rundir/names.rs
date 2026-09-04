@@ -17,7 +17,7 @@
 //! ownership proof in `ownership.rs`, below. Pinning them:
 //! `the_names_on_disk_are_the_names_the_packet_writes` in `tests.rs` binds
 //! every const to its literal. A second test,
-//! `the_event_log_and_the_plan_are_reached_through_their_constants`, fails on
+//! `the_event_log_and_plan_accessors_return_the_paths_their_constants_name`, fails on
 //! an **accessor drift** — a `RunPaths` accessor spelling something other than
 //! its const. It does not fail on a change to the const, which moves both sides
 //! of its assertion, and it cannot witness the substitution that put accessor
@@ -54,12 +54,11 @@
 //! boundary. The missing compatibility contract is `SWEEP-NAMES-008`, deferred:
 //! it belongs in §15 and `DESIGN.md` is the owner's.
 //!
-//! What stands between that and a green suite today is **one test**, measured:
-//! rename [`COMMIT_RECORD`] and its staged sibling, update the literal-pinning
-//! test the way a renamer would, and exactly one test of 1,924 fails —
-//! `engine::topology::emit::tests::torn_first_line_is_husk_or_possibly_committed_per_commit_record`,
-//! which joins `"committed.json"` by hand. `SWEEP-NAMES-003` records that
-//! literal as a guard to keep rather than a duplicate to tidy away.
+//! One test stands between that and a green suite today, and it is not in this
+//! module: `engine/topology/emit/tests.rs` joins `"committed.json"` by hand.
+//! `SWEEP-NAMES-003` holds the measurement and states the count; it is not
+//! repeated here, because a number restated in four places is a number that
+//! drifts in three of them.
 //!
 //! Nothing in `src/` stands in for that, and nothing here tries to. A retired
 //! decision record establishes no product contract, and neither does

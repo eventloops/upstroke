@@ -24,9 +24,14 @@ refactor. `committed.json` is the concrete case, and the sequence is:
 1. A run is killed after old P5b. Its private half holds a file named `committed.json` — the one
    file whose existence is the deletion boundary (`src/engine/topology/create.rs`: "There is
    exactly one, it is the existence of `<private>/committed.json`").
-2. Someone renames `COMMIT_RECORD`. This is a well-behaved change: every call site moves with the
-   constant, and `the_names_on_disk_are_the_names_the_packet_writes` moves with it too, since it
-   pins the constant to a literal and both are edited together. The suite is green.
+2. Someone renames `COMMIT_RECORD`. Every call site moves with the constant, and
+   `the_names_on_disk_are_the_names_the_packet_writes` moves with it too, since it pins the
+   constant to a literal and both are edited together. **The suite is not green at this head, and
+   that is the only thing stopping this sequence**: exactly one test still fails, because
+   `engine/topology/emit/tests.rs` joins `"committed.json"` by hand. `SWEEP-NAMES-003` holds that
+   measurement and the count, and is blocked on this finding for precisely that reason. The steps
+   below are what happens once that guard is gone — by the tidy-up `SWEEP-NAMES-003` originally
+   prescribed, or by anyone rewriting that test without knowing what the literal is for.
 3. A later `startup_census` reaches that husk and runs `prove_private_half_ownership`. Conjunct 12
    stats the **new** name (`src/rundir/ownership.rs:245`, `fs::symlink_metadata(locator.join(
    COMMIT_RECORD))`) and gets `NotFound`.
@@ -43,9 +48,10 @@ version: validate schema, bounds and invariants before constructing domain state
 
 Nothing in `src/` can close this. A retired decision record establishes no product contract, and
 neither does implementation or test code quoting one — which is why
-`decisions.workspace_candidates.run_creation` is no longer cited in
-`src/rundir/names.rs`, and why the pinning test is described there as pinning the byte string and
-nothing with design standing.
+`decisions.workspace_candidates.run_creation` is no longer cited in `src/rundir/names.rs`, and why
+the pinning test is described there as pinning the byte string and nothing with design standing.
+And one accidental assertion in a test about torn first appends is not a compatibility contract
+either; it is what happens to be in the way today.
 
 ## Why this is recorded rather than fixed
 

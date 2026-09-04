@@ -2406,37 +2406,30 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
     );
 }
 
-/// The two `RunPaths` accessors reach their constant rather than an equal
-/// literal (`SWEEP-NAMES-001`).
+/// `RunPaths::events` and `RunPaths::plan_json` return the paths [`EVENT_LOG`]
+/// and [`PLAN`] name (`SWEEP-NAMES-001`).
 ///
-/// **What this test cannot do, said before what it can.** Substituting a
-/// constant for a literal of equal value is behaviour-neutral *by
-/// construction*, so no assertion over values can fail on the pre-repair code:
-/// revert both accessors to `"events.jsonl"` and `"plan.normalized.json"` and
-/// this test still passes. A test that could tell the two apart would have to
-/// assert over source text, and a sibling helper satisfies every text
-/// assertion. So this is not the repair's witness and is not offered as one.
+/// **That is the whole sentence, and it is deliberately weaker than "the
+/// accessors use the constants".** Restore either accessor to its equal literal
+/// and this test still passes, because the path it returns is still the path
+/// the constant names. No assertion over values can do better: substituting a
+/// constant for a literal of equal value is behaviour-neutral by construction,
+/// and a test that could tell them apart would have to assert over source text,
+/// which a sibling helper satisfies. Pass 3 was right that the previous name
+/// claimed more than the body proves.
 ///
-/// **What it is.** A pin against an **accessor drift**: it fails when a
-/// `RunPaths` accessor spells something other than its constant.
-/// `RunPaths::events` changed to `"events.json"` fails it, while
+/// **What it does catch is an accessor drift** — an accessor spelling something
+/// other than what its constant names. `RunPaths::events` changed to
+/// `"events.json"` fails this test while
 /// `the_names_on_disk_are_the_names_the_packet_writes` passes, so the two are
-/// not redundant. A change to the *constant* does **not** fail it here — both
-/// sides of the assertion move together — though it did on master's accessor,
-/// which never read the constant. That asymmetry is the only sense in which the
-/// routing is observable from a test at all.
+/// not redundant. A change to the *constant* does not fail it here: both sides
+/// of the assertion move together.
 ///
-/// **What does witness the repair is a measurement, not an assertion.** With
-/// `EVENT_LOG` changed to `"events.jsonlx"`, the crate suite fails 100 tests at
-/// master and 92 at the repaired head. The eight-test difference is what
-/// routing these two accessors changed, and that is the whole of what the
-/// experiment shows: it mutates one constant, so it says nothing about the two
-/// `PLAN` sites, and the tests it newly reddens are literal readers in the
-/// suite rather than the production sites of `SWEEP-NAMES-002`. It is a
-/// measurement of writer/test coupling, not a census. The pull request body
-/// carries the command, both numbers and that boundary.
+/// The repair this test accompanies is witnessed by a measurement rather than
+/// by an assertion. That measurement is stated once, in the pull request body's
+/// Validation section, and is not restated here.
 #[test]
-fn the_event_log_and_the_plan_are_reached_through_their_constants() {
+fn the_event_log_and_plan_accessors_return_the_paths_their_constants_name() {
     // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
     // needs no scratch tree and leaves none.
     let paths = paths_in(Path::new("names-through-consts"), BOUND_RUN);
