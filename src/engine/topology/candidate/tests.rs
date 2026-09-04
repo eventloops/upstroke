@@ -461,6 +461,12 @@ impl EffectHooks for ArmedEffects {
     fn durability_ledger(&self) -> DurabilityLedger {
         self.inner.durability_ledger()
     }
+
+    // Forwarded, so a poison the inner observer found is reported as poison
+    // and not as a fault this double armed.
+    fn refusal_cause(&self) -> Option<String> {
+        self.inner.refusal_cause()
+    }
 }
 
 /// The order the funnels ran in, which is what an ordering clause is about.

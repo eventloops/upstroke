@@ -85,7 +85,7 @@ use crate::util::{DurabilityLedger, DurableStep};
 
 mod hooks;
 pub use self::hooks::{EffectHooks, HarnessEffects, NoHooks};
-use self::hooks::{apply, funnel, point};
+use self::hooks::{consult, funnel, point};
 
 // ---------------------------------------------------------------------------
 // Refusals
@@ -400,11 +400,10 @@ pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> P
 /// refusal names what was offered: non-empty, ASCII alphanumerics, `-` and
 /// `_` only, no leading `-`. That excludes every separator on every
 /// platform, `.`, `..`, a prefix such as `C:` and the trailing dot or space
-/// Win32 rewrites. It is a restatement rather than a call because
-/// `safe_component` is being reshaped into a `Result` carrying the same
-/// messages on another branch; the two fold into one helper in the parent's
-/// own sweep (`src/workspace_manager.rs` in `standards/SWEEP.md`'s queue),
-/// and until then
+/// Win32 rewrites. It is a restatement rather than a call so that the
+/// refusal names a run id and not a slot component; the two fold into one
+/// helper in the parent's own sweep (`src/workspace_manager.rs` in
+/// `standards/SWEEP.md`'s queue), and until then
 /// `a_run_id_and_a_slot_component_are_refused_by_the_same_rule` holds them
 /// to the same verdicts so the restatement cannot drift.
 fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
@@ -540,7 +539,9 @@ impl Primitive {
 
 mod naming;
 use self::naming::safe_component;
-pub use self::naming::{IntentRecord, Slot, SnapshotName};
+pub use self::naming::{
+    IntentKind, IntentRecord, IntentRecordError, Slot, SlotId, SlotIdError, SnapshotName,
+};
 
 /// The slot's effect-site vocabulary: which [`EffectSiteId`] each of its four
 /// funnel positions runs under, and the [`ResourceRow`] that accounts for it.
@@ -1061,7 +1062,7 @@ impl WorkspaceManager {
             Some("tasks") | Some("merge") | Some("snapshots")
         ) && name
             .to_str()
-            .is_some_and(|name| safe_component(name).is_none())
+            .is_some_and(|name| safe_component(name).is_ok())
     }
 
     /// The slot's path, with its name validated first.
@@ -1256,26 +1257,9 @@ impl WorkspaceManager {
         slot.validate()?;
         self.revalidate()?;
         let path = self.intent_path(slot);
-        // The record is a persisted schema, and its slot text is identity:
-        // a validated slot is ASCII, so the checked conversion cannot fail,
-        // and it is checked rather than lossy so that it never could silently.
-        let relative = slot.relative();
-        let slot_text = relative
-            .to_str()
-            .ok_or_else(|| UpstrokeError::Refused {
-                message: format!(
-                    "refusing to record the {} slot {}: its path is not UTF-8",
-                    slot.kind(),
-                    relative.display()
-                ),
-            })?
-            .replace('\\', "/");
-        let record = IntentRecord {
-            kind: slot.kind().to_owned(),
-            slot: slot_text,
-            run_id: self.run_id.clone(),
-            incarnation: self.incarnation.clone(),
-        };
+        // Owned snapshots: the record is persisted, and serde owns its
+        // fields.
+        let record = IntentRecord::new(slot, self.run_id.clone(), self.incarnation.clone())?;
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
             self.revalidate_acted_through(Primitive::WriteIntent, Some(slot), None)?;
@@ -2237,11 +2221,7 @@ impl WorkspaceManager {
         parent: &str,
         message: &str,
     ) -> Result<String, UpstrokeError> {
-        apply(
-            hooks.phase(site, HookPhase::Before),
-            site,
-            HookPhase::Before,
-        )?;
+        consult(hooks, site, HookPhase::Before)?;
         let output = self.git_with_identity(
             &self.base,
             &[
@@ -2270,7 +2250,7 @@ impl WorkspaceManager {
             })?
             .trim()
             .to_owned();
-        apply(hooks.phase(site, HookPhase::After), site, HookPhase::After)?;
+        consult(hooks, site, HookPhase::After)?;
         Ok(id)
     }
 

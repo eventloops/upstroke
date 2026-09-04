@@ -1122,6 +1122,10 @@ fn a_private_root_exchanged_between_the_before_hook_and_the_effect_is_still_refu
             }
             Injection::Proceed
         }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
     }
 
     let fixture = Fixture::new("anchor-exchanged-in-funnel");
@@ -1316,7 +1320,7 @@ fn a_run_id_and_a_slot_component_are_refused_by_the_same_rule() {
         "é",
     ] {
         assert_eq!(
-            safe_component(input).is_some(),
+            safe_component(input).is_err(),
             refuse_unplain_run_id(input).is_err(),
             "{input:?}: the run-id rule and the slot-component rule must agree"
         );
@@ -1475,6 +1479,10 @@ impl EffectHooks for ExchangeAtBefore {
         }
         Injection::Proceed
     }
+
+    fn refusal_cause(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Every Git command runs with `core.hooksPath` at `<root>/hooks-none`, and
@@ -1623,6 +1631,10 @@ fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
                 fs::remove_file(&self.intent).expect("remove the intent");
             }
             Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
 
@@ -1993,6 +2005,10 @@ impl EffectHooks for SubstituteAtBefore {
         }
         Injection::Proceed
     }
+
+    fn refusal_cause(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The regular files directly inside `from`, copied into `into`.
@@ -2213,6 +2229,10 @@ fn a_hook_written_into_hooks_none_at_the_before_hook_refuses_the_worktree_add_an
                 }
             }
             Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
 
@@ -3580,6 +3600,10 @@ fn a_refusal_at_the_adds_before_hook_leaves_the_filesystem_untouched() {
             }
             Injection::Proceed
         }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
     }
 
     let fixture = Fixture::created("add-before-refusal");
@@ -3662,6 +3686,10 @@ fn the_intent_and_its_directory_are_synced_before_the_add_begins() {
 
         fn durability_ledger(&self) -> DurabilityLedger {
             self.inner.durability_ledger()
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            self.inner.refusal_cause()
         }
     }
 
@@ -3790,6 +3818,55 @@ fn reclaim_removes_a_registered_but_unpopulated_worktree() {
     assert!(!fixture.manager.intent_path(&slot).exists());
 }
 
+/// A non-canonical intent name beside the canonical one is refused before
+/// anything is removed (`PR118-RECLAIM-REGRESSION-PINNED-AT-PARSER-ONLY`).
+///
+/// `str::parse` reads `03` as 3, so before `Slot::from_intent_name` compared
+/// the parsed slot with its own rendering, `tasks.kalpha-g03.intent` produced
+/// the slot whose intent file is `tasks.kalpha-g3.intent`: reclaim removed the
+/// legitimate worktree and the canonical intent and left the `g03` file for
+/// every later start to enumerate again. The parser's own test pins the
+/// verdict; this one pins the composition through `intents()` and
+/// `reclaim_intents()`: the walk refuses the file it cannot account for, the
+/// refusal names the file, and it comes before any removal.
+#[test]
+fn reclaim_refuses_a_non_canonical_intent_name_before_removing_anything() {
+    let fixture = Fixture::created("non-canonical-intent");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 3);
+    let worktree = fixture.manager.slot_path(&slot);
+    let canonical = fixture.manager.intent_path(&slot);
+    assert!(
+        worktree.is_dir() && canonical.is_file(),
+        "the legitimate slot exists before the stray file is planted"
+    );
+    let bytes = fs::read(&canonical).expect("read the canonical intent");
+    let stray = canonical.with_file_name("tasks.kalpha-g03.intent");
+    fs::write(&stray, &bytes).expect("plant the non-canonical intent");
+
+    let error = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect_err("the walk refuses a file no slot renders");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Git { message }
+                if message.contains("unexpected file `tasks.kalpha-g03.intent`")
+        ),
+        "refused for the wrong reason: {error}"
+    );
+    assert!(worktree.is_dir(), "the legitimate worktree is untouched");
+    assert_eq!(
+        fs::read(&canonical).expect("read the canonical intent back"),
+        bytes,
+        "the canonical intent is untouched"
+    );
+    assert!(
+        stray.is_file(),
+        "the stray file is left for the operator: nothing is deleted on inference"
+    );
+}
+
 #[test]
 fn reclaim_removes_the_registration_whose_commondir_is_empty() {
     let fixture = Fixture::created("empty-commondir");
@@ -3900,6 +3977,10 @@ fn a_registration_rebound_after_validation_keeps_its_admin_state() {
                     .expect("replace the registration identity");
             }
             Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
 
@@ -5702,6 +5783,10 @@ fn id_unread_kill_helper() {
                 } => Injection::Kill,
                 _ => Injection::Proceed,
             }
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
     let _ = manager.candidate_commit_tree(&mut KillAtIdUnread, &tree, &head, "candidate");

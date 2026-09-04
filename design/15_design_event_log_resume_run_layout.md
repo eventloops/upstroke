@@ -31,6 +31,17 @@ The execution root is created only when the managed base is a real directory, th
 
 Current host-process crash containment is deliberately platform-specific. On Unix, ordinary descendants remain in an isolated process group and a separate cleanup reaper retains the run's cleanup lease if the conductor is killed; code that deliberately daemonises out of that group remains outside the host-runner contract. On Windows, each command is created suspended, assigned to a private kill-on-close Job Object, and only then resumed. Direct-child success and timeout both terminate and boundedly observe that job empty; abrupt conductor death closes its non-inheritable handle and lets the kernel terminate ordinary descendants. PID scanning and `taskkill` are not part of the ownership protocol. Exact gate/review worktrees likewise record and sync a private intent before `git worktree add`; resume reclaims every such registration before it switches branches or dispatches another worker.
 
+**Synced intents.** Each intent file is one JSON object with exactly four string fields, in this
+order: `kind`, `slot`, `run_id`, `incarnation`. `kind` is one of `task`, `staging` or `snapshot`.
+`slot` is the slot's identifier, `<namespace>/<component>`, the canonical spelling of a slot the
+engine validated; it names the slot for whoever reads the record, and the filesystem path is
+derived from the intent's file name and the execution root, never from this field. A reader
+accepts no other key, no alias for a key or a kind word, no default for a missing field, and no
+record whose `kind` disagrees with the namespace of its `slot`; any of those is refused. No code
+in the engine acts on a record's contents: reclaim trusts the intent's file name alone, and the
+record is provenance for an operator and for any future reader, which this contract binds. The
+implementation is `IntentRecord` in `src/workspace_manager/naming.rs`.
+
 Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file.
 
 **One fold, not two.** The engine never mutates run state directly: it appends an event and folds it back in through the same function `resume` and `status` use to rebuild state from the file, and it applies the event *as it will be read back* rather than as constructed. A live run and a replay of its own log are therefore the same computation, not two that agree by inspection. Two things deliberately do not survive replay — a session id and its `resume_next` flag, because both describe a conversation that believed it had left edits in a working tree that a crash has since rolled back (§14 pairs session-resume with tree retention precisely so the two never diverge).

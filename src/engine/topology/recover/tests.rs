@@ -6113,6 +6113,12 @@ impl crate::workspace_manager::EffectHooks for TracedEffects {
     fn durability_ledger(&self) -> crate::util::DurabilityLedger {
         self.inner.durability_ledger()
     }
+
+    // Forwarded, so a poison the inner observer found is reported as poison
+    // and not as a fault this double armed.
+    fn refusal_cause(&self) -> Option<String> {
+        self.inner.refusal_cause()
+    }
 }
 
 struct TracedEvents {
