@@ -36,9 +36,17 @@ whose omissions surface as a run whose log the exporter, `status`, `resume`,
 `validate` and the capacity read cannot find, rather than as a compile error.
 
 Measured by mutating `EVENT_LOG` to `"events.jsonlx"` and running
-`cargo test --lib`: 92 failures on this branch against 100 at master, at
-`7724ed1d628070b35948819095a68a38cd0c5d0a` versus `74537be` and again after the
-merge-in of master `93d6337`. Routing `rundir`'s own two accessors through the constants
+`cargo test --lib`, every run under `flock /tmp/w1-eight.lock`: 92 failures on
+this branch against 100 at master, at `7724ed1d628070b35948819095a68a38cd0c5d0a`
+versus `74537be` and again after the merge-in of master `93d6337`.
+
+The net 8 is 13 against 5, and the 5 are this finding's own argument. Thirteen
+tests stop failing once `rundir`'s accessor reads the constant, because the
+writer and the census agree again. Five **start** failing, and they are literal
+readers this repair did not reach: `src/engine/topology/settle/tests.rs:1729`'s
+`committed()` helper joins `"events.jsonl"` by hand, and `src/rundir/tests.rs:105`
+spells `".upstroke/runs/RUN1/events.jsonl"`. That is what a half-routed name
+costs — moving the writer breaks every reader still spelling the string. Routing `rundir`'s own two accessors through the constants
 closed 8 of those; the remaining gap is these five files. Nothing is broken
 today — the strings agree — and the drift is loudly caught if it ever happens,
 which is why this is P3 and not higher.
