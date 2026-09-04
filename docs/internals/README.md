@@ -2,10 +2,14 @@
 
 Extended notes for the crate, one file per module, mirroring `src/`.
 
-This directory holds the **expository** material that used to sit in source comments: module
-orientation, historical rationale, worked examples, and the records of what an earlier shape got
-wrong. It exists because that material is valuable and dense enough to fill a reader's attention —
-human or agent — before they reach the code. Moving it here makes loading it a choice.
+This directory holds a module's **whole prose**: its API contracts, module orientation, historical
+rationale, worked examples, and the records of what an earlier shape got wrong. It exists because
+that material is valuable and dense enough to fill a reader's attention — human or agent — before
+they reach the code. Moving it here makes loading it a choice.
+
+Where a module has a notes file, its source carries **no rustdoc and no inline comments**, only a
+single pointer in the module header. The code is expected to read for itself; the notes are the
+backup for the context the code cannot carry. `CODING_STANDARDS.md` §13 is the rule.
 
 It is **not** a second source of truth. `DESIGN.md` is the living authority for product design and
 `CODING_STANDARDS.md` for implementation; a note here that disagrees with either is a defect in the
@@ -33,38 +37,45 @@ the code.
 
 ## Getting from the code to a note
 
-Where prose was removed, the source keeps a marker on one line:
+One marker, in the module header, and nothing else:
 
 ```rust
+//! The host runner: `host-v1`.
+//!
 //! Extended notes: `docs/internals/runner/host.md`
-```
-
-and, for a note about one item rather than the module:
-
-```rust
-    // Extended notes: `docs/internals/runner/host.md#hostrunnerresolved`
 ```
 
 The path is repo-root-relative so it means the same thing from any file, and it is plain text
 rather than a Markdown link so that `rustdoc` does not try to resolve it as an intra-doc link.
-`grep -rn 'docs/internals/' src/` is the full inventory of markers.
+`grep -rn 'Extended notes:' src/` is the full inventory — one line per module that has notes.
 
-## What lives here and what stays in the source
+There are no per-item markers. A reader who opens the notes reads the file; a reader who opens the
+code reads the code. Splitting the pointer across every item costs tokens on every read to save a
+scroll on a few, and `.github/scripts/test-internals-notes.sh` refuses a second marker for that
+reason.
 
-The dividing question is **adjacency**: *if the code beneath this comment changed, would this
-comment have to change?*
+## What moves
 
-**Yes — it stays in the source.** Reasoning a standard requires at its site: why a lock is held or
-a value cloned (§6), why a `?` or a refusal is deliberate (§7), a `SAFETY:` obligation (§11), a
-concurrency protocol (§10). The `# Errors`, `# Panics` and `# Safety` sections of a public item
-(§13). The one-sentence statement of what an item is and what it guarantees. A platform constraint
-that explains the line under it. The citation of an invariant that governs the adjacent code —
-`INV-18`, `DESIGN.md:612` — even when the argument behind it moves here.
+Everything. A module that gets a notes file gets *all* of its prose moved: the module essay, every
+item's rustdoc including its `# Errors` and `# Panics` sections, every inline comment, the section
+banners. The notes file opens with an *Item contracts* section so the API documentation is still
+one place, and carries the rationale below it.
 
-**No — it moves here.** Module-level orientation essays. Historical rationale: what an earlier
-shape was, what a review round found, what a past pull request got wrong. Worked examples and
-enumerated alternatives. Records of evidence that is not a test — "these four forms were each
-planted and each rejected". Explanation repeated across modules that is better stated once.
+Three things do not move, because they are not this standard's to place:
 
-A comment that is doing both is split: the load-bearing sentence stays, the essay moves, and the
-marker joins them.
+- a `SAFETY:` obligation (§11), which belongs against the `unsafe` block it discharges;
+- a concurrency protocol (§10), where the type cannot carry it;
+- an `#[expect(...)]` reason string, which is an attribute rather than a comment.
+
+Where one of these has to stay, it stays, and the notes file says so.
+
+## Keeping them honest
+
+`.github/scripts/test-internals-notes.sh` runs in CI's `lint` job. It checks that every marker
+names a notes file that exists and an anchor some heading generates; that every notes file mirrors
+a live module and links back to it resolvably; that a module with notes carries exactly one marker,
+in its header; and that the marker spelling is uniform. It refuses to pass with zero markers or
+zero notes files, so it cannot go quietly inert.
+
+What it cannot check is whether a note is still *true*. That is a review duty, and §4's rule that a
+stale comment is a defect applies to a stale note in the same way.

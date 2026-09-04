@@ -1,25 +1,7 @@
 //! The host runner: `host-v1`.
 //!
-//! Everything DESIGN.md:118 gives a runner — "cwd, mounts, environment,
-//! supervision, and timeout" — for the boundary that is this machine. It wraps
-//! the process funnel in [`crate::agent::proc`] rather than reimplementing it.
-//!
-//! Three things live here that are not in the funnel:
-//!
-//! * **Environment composition** (DESIGN.md:258-264). The Upstroke environment is
-//!   the base; the runner supplies the reserved keys; `CommandSpec.env` is an
-//!   overlay applied last and refused pre-flight if it names a reserved key.
-//! * **The `RunnerPreflight` shell probe** (INV-23). The recorded shell
-//!   executing `exit 0` **through the Runner**, role `probe(shell)`,
-//!   non-slotted, a registered invocation.
-//! * **The write-command startup step** (INV-18). On Windows the coordinator
-//!   joins its ambient kill-on-close Job Object before any spawn; a failure
-//!   refuses the write command with a diagnostic.
-//!
 //! Extended notes: `docs/internals/runner/host.md`
-// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, which
-// carries this module's review clause -- effects only inside site-taking APIs,
-// no writable handle returned. `decisions.effect_site_inventory.mechanism` (2).
+
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -45,35 +27,17 @@ use crate::topology::events::RunnerPolicy;
 mod probe;
 pub use self::probe::{SHELL_PROBE_COMMAND, SHELL_PROBE_TIMEOUT, run_shell_probe};
 
-// ---------------------------------------------------------------------------
-// Environment composition
-// ---------------------------------------------------------------------------
-
 mod environment;
 pub use self::environment::{HostEnvironment, KeyCase};
 
-/// The environment keys `host-v1` owns.
-///
-/// DESIGN.md:260-262. `USERPROFILE` is reserved beside `HOME` because on
-/// Windows it *is* the home variable.
-///
-/// Extended notes: `docs/internals/runner/host.md#reserved_always`
 pub const RESERVED_ALWAYS: &[&str] = &["PATH", "HOME", "USERPROFILE"];
 
-/// Each agent's credential *location* variable — a config **directory**, never
-/// a token.
-///
-/// Each is the vendor's own profile mechanism, and each is reserved for
-/// **every** request rather than only for the agent a request binds.
-///
-/// Extended notes: `docs/internals/runner/host.md#credential_locations`
 pub const CREDENTIAL_LOCATIONS: &[(&str, &str)] = &[
     (claude::ADAPTER_ID, "CLAUDE_CONFIG_DIR"),
     (copilot::ADAPTER_ID, "COPILOT_HOME"),
     (codex::ADAPTER_ID, "CODEX_HOME"),
 ];
 
-/// Every key an overlay may not name.
 #[must_use]
 pub fn reserved_keys() -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = RESERVED_ALWAYS.to_vec();
@@ -81,7 +45,6 @@ pub fn reserved_keys() -> Vec<&'static str> {
     keys
 }
 
-/// The credential-location variable of one agent, if the host knows one.
 #[must_use]
 pub fn credential_location(agent: &AgentId) -> Option<&'static str> {
     CREDENTIAL_LOCATIONS
@@ -90,12 +53,6 @@ pub fn credential_location(agent: &AgentId) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
-/// Whether `host-v1` tells this role where an agent's credentials live.
-///
-/// Exhaustive with no wildcard: a role added later has to be classified here
-/// rather than defaulting into the side that hands out credentials.
-///
-/// Extended notes: `docs/internals/runner/host.md#supplies_credentials`
 const fn supplies_credentials(role: &ExecutionRole) -> bool {
     match role {
         ExecutionRole::Implement
@@ -105,42 +62,14 @@ const fn supplies_credentials(role: &ExecutionRole) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The runner
-// ---------------------------------------------------------------------------
-
-/// The `Host` / `host-v1` [`Runner`].
 pub struct HostRunner {
     policy: RunnerPolicy,
     digest: String,
     environment: HostEnvironment,
-    /// Held for the whole of one `run`, so one `HostRunner` supervises one
-    /// process at a time — not a limitation while `Runner::run` is synchronous
-    /// and the substrate is sequential.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerhooks`
     hooks: Mutex<Box<dyn SpawnHooks + Send>>,
-    /// What this runner has already decided a program name is —
-    /// `PR6-LANED-001`.
-    ///
-    /// The lock is held across one get-or-insert of this map and released
-    /// before the spawn, so the memo is per-runner state and not a resource
-    /// with a lifecycle.
-    ///
-    /// Per [`HostRunner`] — per *boundary* (DESIGN.md:612) — and keyed on the
-    /// **question**: the program string with the composed `PATH` and
-    /// `PATHEXT`, never the whole environment.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerresolved`
     resolved: Mutex<BTreeMap<ProgramQuestion, Result<PathBuf, String>>>,
 }
 
-/// Everything that decides which file a program name is, at one boundary.
-///
-/// The key of [`HostRunner::resolved`]. `None` is "the composed environment
-/// does not carry that key at all", which is not "carries it empty".
-///
-/// Extended notes: `docs/internals/runner/host.md#programquestion`
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ProgramQuestion {
     program: String,
@@ -165,12 +94,6 @@ impl Default for HostRunner {
 }
 
 impl HostRunner {
-    /// A host runner over this process's environment.
-    ///
-    /// Infallible; [`crate::runner::policy::resolve_host`] is the checked
-    /// entry point and returns the same record.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnernew`
     #[must_use]
     pub fn new() -> Self {
         let policy = host_policy();
@@ -184,20 +107,12 @@ impl HostRunner {
         }
     }
 
-    /// A host runner over an explicit environment.
-    ///
-    /// It does **not** clear [`Self::resolved`], and that is a decision rather
-    /// than an omission.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerwith_environment`
     #[must_use]
     pub fn with_environment(mut self, environment: HostEnvironment) -> Self {
         self.environment = environment;
         self
     }
 
-    /// Observe (and, for the ST-07 subset, inject at) the containment
-    /// sub-effect points of every spawn this runner performs.
     #[must_use]
     pub fn with_hooks(self, hooks: Box<dyn SpawnHooks + Send>) -> Self {
         Self {
@@ -206,57 +121,26 @@ impl HostRunner {
         }
     }
 
-    /// The record this runner declares: `RunnerPolicy{kind: Host, policy:
-    /// host-v1, image: None, credential_volumes: None}`.
-    ///
-    /// Exposed because INV-23 records it in three places.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerpolicy`
     #[must_use]
     pub const fn policy(&self) -> &RunnerPolicy {
         &self.policy
     }
 
-    /// `runner_policy_sha256` of [`Self::policy`] — the marker's value and the
-    /// value every container intent carries.
     #[must_use]
     pub fn policy_digest(&self) -> &str {
         &self.digest
     }
 
-    /// The environment contract this runner composes under.
     #[must_use]
     pub const fn environment(&self) -> &HostEnvironment {
         &self.environment
     }
 
-    /// The write command's containment startup step (INV-18, host portion).
-    ///
-    /// Called once, **before any spawn**. On Unix there is nothing to join and
-    /// this returns `Ok` having done nothing.
-    ///
-    /// The same step as the free [`contain_write_command`], with **this
-    /// runner's** observer attached; it calls that function rather than
-    /// repeating it.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerstart_write_command`
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot
-    /// be created or joined. The caller refuses the write command before any
-    /// effect.
     pub fn start_write_command(&self) -> Result<Contained, UpstrokeError> {
         let mut hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
         contain_write_command(&mut **hooks)
     }
 
-    /// The `RunnerPreflight` shell probe, executed through this runner.
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] when the recorded shell cannot be spawned, is
-    /// killed by the probe timeout, or does not exit 0.
     pub fn shell_probe(
         &self,
         shell: ShellKind,
@@ -266,26 +150,6 @@ impl HostRunner {
         run_shell_probe(self, shell, workspace.to_path_buf(), invocation)
     }
 
-    /// Which file `program` is, at **this** boundary — decided once and then
-    /// remembered.
-    ///
-    /// The `PR6-LANED-001` repair. [`resolve_program`] answers the question by
-    /// searching a filesystem; this decides *whether the question is asked*,
-    /// and it is asked at most once per [`ProgramQuestion`] per runner. See
-    /// [`Self::resolved`] for why per-runner.
-    ///
-    /// **A refusal is remembered too**, fail-closed, and replays byte for
-    /// byte.
-    ///
-    /// Increments [`program_resolutions`] on entry; [`program_searches`] moves
-    /// only when the filesystem is reached.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#hostrunnerprogram_for`
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] — [`resolve_program`]'s, first-hand or
-    /// replayed.
     fn program_for(
         &self,
         program: &str,
@@ -323,25 +187,9 @@ impl Runner for HostRunner {
             request.agent.as_ref(),
             &request.command.env,
         )?;
-        // Which file the program *name* is, decided here and nowhere else.
-        //
-        // **After `compose` and before anything is spawned**, both
-        // load-bearing, and once per boundary rather than once per spawn
-        // (`PR6-LANED-001`, DESIGN.md:612).
-        //
-        // Extended notes: `docs/internals/runner/host.md#where-the-program-name-is-resolved`
         let program = self.program_for(&request.command.program, &composed)?;
         let mut command = build_command_at(&request.command, &program);
         command.current_dir(&request.workspace);
-        // The composed environment *is* the environment: base, reserved
-        // values, overlay, and nothing arriving by a route the record does not
-        // describe (DESIGN.md:263).
-        //
-        // Bounded by `std::env::vars_os()`, so anything that iterator does
-        // not yield is not inherited either — on Windows, the `=C:`-style
-        // per-drive current-directory variables, which no process this runner
-        // starts can be resolving against because every one is given an
-        // absolute `current_dir`.
         command.env_clear();
         command.envs(composed);
         let mut hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
@@ -356,18 +204,6 @@ impl Runner for HostRunner {
     }
 }
 
-/// Build a [`Command`] for a spec whose program the runner has already
-/// resolved to a file.
-///
-/// On Windows the tail after `cmd.exe`'s `/C` or `/K` goes through `raw_arg`,
-/// because `cmd.exe` does not un-escape std's `CommandLineToArgvW` quoting and
-/// re-quoting it would change what a gate command means. Everything else, and
-/// every argument on Unix, goes through `Command::arg`.
-///
-/// The rule is keyed on the program **that will execute**, so it survives
-/// resolution.
-///
-/// Extended notes: `docs/internals/runner/host.md#build_command_at`
 fn build_command_at(spec: &CommandSpec, program: &Path) -> Command {
     let mut command = Command::new(program);
     #[cfg(windows)]
@@ -387,8 +223,6 @@ fn build_command_at(spec: &CommandSpec, program: &Path) -> Command {
     command
 }
 
-/// The index of `cmd.exe`'s `/C` or `/K` switch, when this spec invokes
-/// `cmd.exe` at all.
 #[cfg(windows)]
 fn cmd_switch_index(program: &Path, spec: &CommandSpec) -> Option<usize> {
     let stem = program
@@ -403,106 +237,39 @@ fn cmd_switch_index(program: &Path, spec: &CommandSpec) -> Option<usize> {
         .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
 }
 
-// ---------------------------------------------------------------------------
-// Program resolution
-// ---------------------------------------------------------------------------
-
 mod naming;
 use self::naming::{ProgramNaming, composed_value, resolve_program};
 
 thread_local! {
-    /// See [`program_resolutions`].
     static RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// See [`program_searches`].
     static SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many program names **this thread** has resolved at the host boundary.
-///
-/// Incremented by [`HostRunner::program_for`] on entry, so a spawn that took
-/// its answer from the runner's memo and a spawn that searched for it are
-/// counted alike: this is "was the program decided for this spawn, and when",
-/// not "did the filesystem move". [`program_searches`] is the other question.
-///
-/// Extended notes: `docs/internals/runner/host.md#program_resolutions-and-program_searches`
 #[must_use]
 pub fn program_resolutions() -> u64 {
     RESOLUTIONS.with(std::cell::Cell::get)
 }
 
-/// How many program names **this thread** has actually searched a filesystem
-/// for.
-///
-/// [`program_resolutions`]'s sibling and the observable of the
-/// `PR6-LANED-001` repair: `HostRunner` resolves a name **once per boundary**,
-/// not once per spawn (DESIGN.md:612). N spawns of one name through one runner
-/// move [`program_resolutions`] by N and this by one.
-///
-/// Incremented by [`resolve_program`] on entry, so the count moves for a
-/// program that names a location as well as for one that is searched for — the
-/// question asked is the same, and what differs is the answer.
-///
-/// Extended notes: `docs/internals/runner/host.md#program_resolutions-and-program_searches`
 #[must_use]
 pub fn program_searches() -> u64 {
     SEARCHES.with(std::cell::Cell::get)
 }
 
-/// The containment proof and its sole mint, in a module with no descendants.
-///
-/// `Contained`'s field is private to **this** module rather than to
-/// `runner::host`, which is the whole point: Rust privacy reaches a module
-/// and everything below it, so a field private to `runner::host` is
-/// constructible from `runner::host::naming`, `::environment` and `::probe`.
-/// `proof` has no children, so its siblings cannot reach the field and the
-/// only route to a value is [`contain_write_command`], which performs the
-/// join. The mint stays with the type as a local implementation invariant of this
-/// module: a proof and the only code that may create it are read together or not
-/// at all.
 mod proof {
     use super::ESTABLISHMENTS;
     use crate::agent::proc::{self, SpawnHooks};
     use crate::error::UpstrokeError;
 
-    /// Proof that this process has performed its write-command containment
-    /// startup (INV-18, host portion).
-    ///
-    /// **The field is private to this module, and this module has no
-    /// descendants** — so no sibling of `runner::host`'s children, and not
-    /// `runner::host` itself, can name it. The only values of it in the crate
-    /// are the ones [`contain_write_command`] returns after
-    /// [`proc::join_ambient_job`] has succeeded.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#contained`
     #[derive(Debug)]
     pub struct Contained(());
 
     impl Contained {
-        /// The only constructor, and it is private: a token exists exactly when
-        /// the containment step ran and returned `Ok`.
         fn new() -> Self {
             ESTABLISHMENTS.with(|count| count.set(count.get() + 1));
             Self(())
         }
     }
 
-    /// The write-command containment startup step (INV-18, host portion), and the
-    /// proof that it ran.
-    ///
-    /// What `src/main.rs` calls at the top of every write command, before any
-    /// dispatch arm runs, and what the engine's write coordinator calls before it
-    /// touches anything (`crash_reconstruction`).
-    ///
-    /// A free function because the ambient job is a property of the
-    /// *process*, not of a runner value, and idempotent for the same reason.
-    ///
-    /// Extended notes: `docs/internals/runner/host.md#contain_write_command`
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
-    /// created or joined. On Unix this cannot fail: containment there is the
-    /// per-invocation reaper and the isolated process group.
     pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
         proc::join_ambient_job(hooks).map(|()| Contained::new())
     }
@@ -511,43 +278,18 @@ mod proof {
 pub use self::proof::{Contained, contain_write_command};
 
 thread_local! {
-    /// See [`containment_establishments`].
     static ESTABLISHMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times **this thread** has established write-command containment.
-///
-/// Incremented by [`Contained::new`], so the count and the tokens cannot
-/// disagree.
-///
-/// Extended notes: `docs/internals/runner/host.md#containment_establishments`
 #[must_use]
 pub fn containment_establishments() -> u64 {
     ESTABLISHMENTS.with(std::cell::Cell::get)
 }
 
-/// [`contain_write_command`] for a caller with nothing to prove it to.
-///
-/// `src/main.rs` is that caller. It carries the observer through for the same
-/// reason [`contain_write_command`] takes one.
-///
-/// Extended notes: `docs/internals/runner/host.md#start_write_command-free-function`
-///
-/// # Errors
-///
-/// Whatever [`contain_write_command`] refuses.
 pub fn start_write_command(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
     contain_write_command(hooks).map(|_contained| ())
 }
 
-/// The shell probe's request, for any [`Runner`].
-///
-/// A free function because both runners implement the same probe (INV-23).
-///
-/// The argument vector is taken from [`ShellKind::command`] rather than
-/// rebuilt, so the probe runs under exactly the invocation a gate would.
-///
-/// Extended notes: `docs/internals/runner/host.md#shell_probe_request`
 #[must_use]
 pub fn shell_probe_request(
     shell: ShellKind,
@@ -557,10 +299,8 @@ pub fn shell_probe_request(
     RunnerRequest {
         command: shell.spec(SHELL_PROBE_COMMAND),
         workspace,
-        // Non-slotted, and the role says so rather than a comment.
         role: ExecutionRole::Probe(ProbeTarget::Shell),
         timeout: SHELL_PROBE_TIMEOUT,
-        // No agent: this probe certifies the shell, not a CLI.
         agent: None,
         invocation,
     }
@@ -570,8 +310,6 @@ pub fn shell_probe_request(
 pub(crate) mod test_support {
     use super::*;
 
-    /// Test-only translation witness. Production construction stays inside
-    /// the Process funnel.
     pub(crate) fn build_command(spec: &CommandSpec) -> Command {
         build_command_at(spec, Path::new(&spec.program))
     }

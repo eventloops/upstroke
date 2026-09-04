@@ -1,8 +1,12 @@
 # `src/runner/host.rs` — the host runner, `host-v1`
 
-Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs). The code is the authority;
-this file holds the expository material moved out of it. Section headings are the item names as
-they are spelled in the source.
+Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs). The code is the authority
+for what it does; this file is the whole of its prose. The module carries no rustdoc and no inline
+comments — only a pointer to this file — so *Item contracts* below is the API documentation and the
+sections after it are the rationale, history and worked examples.
+
+Section headings are the item names as they are spelled in the source, so a heading is the grep
+string that finds the code.
 
 ## Module overview
 
@@ -28,6 +32,95 @@ Three things live here that are not in the funnel:
 The **funnel section** of `effects/allowlist.toml`, which carries this module's review clause —
 effects only inside site-taking APIs, no writable handle returned.
 `decisions.effect_site_inventory.mechanism` (2).
+
+## Item contracts
+
+Every item in the module, with what it guarantees and what it refuses. The source carries no
+rustdoc; this section is it.
+
+### Environment composition
+
+| Item | Contract |
+|---|---|
+| `RESERVED_ALWAYS` | The environment keys `host-v1` owns: `PATH`, `HOME`, `USERPROFILE`. |
+| `CREDENTIAL_LOCATIONS` | Each agent's credential *location* variable — a config **directory**, never a token. |
+| `reserved_keys()` | Every key an overlay may not name: `RESERVED_ALWAYS` plus every credential location. |
+| `credential_location(agent)` | The credential-location variable of one agent, if the host knows one. |
+| `supplies_credentials(role)` | Whether `host-v1` tells this role where an agent's credentials live. Exhaustive with no wildcard: a role added later has to be classified here rather than defaulting into the side that hands out credentials. |
+
+### `HostRunner`
+
+The `Host` / `host-v1` `Runner`.
+
+| Item | Contract |
+|---|---|
+| `new()` | A host runner over this process's environment. Infallible; `crate::runner::policy::resolve_host` is the checked entry point and returns the same record. |
+| `with_environment(env)` | A host runner over an explicit environment. Does **not** clear `resolved` — a decision, not an omission. |
+| `with_hooks(hooks)` | Observe (and, for the ST-07 subset, inject at) the containment sub-effect points of every spawn this runner performs. |
+| `policy()` | The record this runner declares: `RunnerPolicy{kind: Host, policy: host-v1, image: None, credential_volumes: None}`. Exposed because INV-23 records it in three places. |
+| `policy_digest()` | `runner_policy_sha256` of `policy()` — the marker's value and the value every container intent carries. |
+| `environment()` | The environment contract this runner composes under. |
+| `start_write_command()` | The write command's containment startup step (INV-18, host portion). Called once, **before any spawn**. On Unix there is nothing to join and it returns `Ok` having done nothing. The same step as the free `contain_write_command`, with this runner's observer attached; it calls that function rather than repeating it. **Errors:** `UpstrokeError::Refused` with a diagnostic when the ambient job cannot be created or joined. The caller refuses the write command before any effect. |
+| `shell_probe(shell, workspace, invocation)` | The `RunnerPreflight` shell probe, executed through this runner. **Errors:** `UpstrokeError::Refused` when the recorded shell cannot be spawned, is killed by the probe timeout, or does not exit 0. |
+| `program_for(program, composed)` | Which file `program` is, at **this** boundary — decided once and then remembered, at most once per `ProgramQuestion` per runner. Increments `program_resolutions` on entry; `program_searches` moves only when the filesystem is reached. **Errors:** `UpstrokeError::Refused` — `resolve_program`'s, first-hand or replayed. |
+
+**Fields.** `hooks` is held for the whole of one `run`, so one `HostRunner` supervises one process at
+a time — not a limitation while `Runner::run` is synchronous and the substrate is sequential.
+`resolved` is what this runner has already decided a program name is (`PR6-LANED-001`); its lock is
+held across one get-or-insert and released before the spawn, so the memo is per-runner state and not
+a resource with a lifecycle.
+
+### `ProgramQuestion`
+
+Everything that decides which file a program name is, at one boundary — the key of
+`HostRunner::resolved`. `program` is `CommandSpec::program` verbatim; `path` and `pathext` are the
+composed values. `None` is "the composed environment does not carry that key at all", which is not
+"carries it empty", and is why they are `Option` rather than defaulted.
+
+### Command construction
+
+| Item | Contract |
+|---|---|
+| `build_command_at(spec, program)` | Build a `Command` for a spec whose program the runner has already resolved to a file. On Windows the tail after `cmd.exe`'s `/C` or `/K` goes through `raw_arg`; everything else, and every argument on Unix, goes through `Command::arg`. |
+| `cmd_switch_index(program, spec)` | The index of `cmd.exe`'s `/C` or `/K` switch, when this spec invokes `cmd.exe` at all. Windows only. |
+
+### Observables
+
+| Item | Contract |
+|---|---|
+| `program_resolutions()` | How many program names **this thread** has resolved at the host boundary. Incremented by `HostRunner::program_for` on entry, so a spawn that took its answer from the memo and one that searched are counted alike. |
+| `program_searches()` | How many program names **this thread** has actually searched a filesystem for. Incremented by `resolve_program` on entry. |
+| `containment_establishments()` | How many times **this thread** has established write-command containment. Incremented by `Contained::new`, so the count and the tokens cannot disagree. |
+
+`RESOLUTIONS`, `SEARCHES` and `ESTABLISHMENTS` are the thread-local cells behind the three.
+
+### Containment
+
+| Item | Contract |
+|---|---|
+| `Contained` | Proof that this process has performed its write-command containment startup (INV-18, host portion). Field private to `mod proof`, which has no descendants. |
+| `Contained::new()` | The only constructor, and it is private: a token exists exactly when the containment step ran and returned `Ok`. |
+| `contain_write_command(hooks)` | The write-command containment startup step and the proof that it ran. What `src/main.rs` calls at the top of every write command, before any dispatch arm runs, and what the engine's write coordinator calls before it touches anything (`crash_reconstruction`). A free function because the ambient job is a property of the *process*, not of a runner value, and idempotent for the same reason. **Errors:** `UpstrokeError::Refused` with a diagnostic when the ambient job cannot be created or joined. On Unix this cannot fail. |
+| `start_write_command(hooks)` (free) | `contain_write_command` for a caller with nothing to prove it to — `src/main.rs`. **Errors:** whatever `contain_write_command` refuses. |
+
+### Probe
+
+| Item | Contract |
+|---|---|
+| `shell_probe_request(shell, workspace, invocation)` | The shell probe's request, for any `Runner`. A free function because both runners implement the same probe (INV-23). The argument vector is taken from `ShellKind::command` rather than rebuilt, so the probe runs under exactly the invocation a gate would. The role is `Probe(Shell)` — non-slotted — and `agent` is `None`, because this probe certifies the shell, not a CLI. |
+| `test_support::build_command(spec)` | Test-only translation witness. Production construction stays inside the Process funnel. |
+
+Re-exported from `mod probe`: `SHELL_PROBE_COMMAND`, `SHELL_PROBE_TIMEOUT`, `run_shell_probe`.
+
+### `mod proof`
+
+The containment proof and its sole mint, in a module with no descendants. `Contained`'s field is
+private to **that** module rather than to `runner::host`, which is the whole point: Rust privacy
+reaches a module and everything below it, so a field private to `runner::host` would be
+constructible from `runner::host::naming`, `::environment` and `::probe`. `proof` has no children,
+so its siblings cannot reach the field and the only route to a value is `contain_write_command`,
+which performs the join. The mint stays with the type as a local implementation invariant of that
+module: a proof and the only code that may create it are read together or not at all.
 
 ## `HostRunner::resolved`
 

@@ -9,6 +9,10 @@
 #   N4  The marker spelling is uniform, so `grep -rn 'Extended notes:' src/` is
 #       the whole inventory. A marker names its path in backticks and nothing
 #       else on the line.
+#   N5  A module with a notes file carries exactly one marker, in its module
+#       header. The notes carry the module's prose; the source carries none, so
+#       one pointer at the top is the whole of the cross-reference and a second
+#       marker further down means prose crept back in beside it.
 #
 # Drift this catches: a module renamed or split out from under its notes, a
 # notes file deleted while markers still point at it, an anchor that stopped
@@ -84,6 +88,21 @@ while IFS= read -r hit; do
 done < <(grep -rn 'Extended notes:' src/ --include='*.rs' || true)
 
 (( marker_count > 0 )) || error "no \`Extended notes:\` markers found in src/; this gate is inert"
+
+# --- N5. one marker per module, in the module header ------------------------
+
+while IFS= read -r module; do
+  count="$(grep -c 'Extended notes:' "$module" || true)"
+  if (( count != 1 )); then
+    error "$module carries $count \`Extended notes:\` markers; a module with notes carries exactly one"
+    continue
+  fi
+  at="$(grep -n 'Extended notes:' "$module" | cut -d: -f1)"
+  first_code="$(grep -n -v -e '^[[:space:]]*//' -e '^[[:space:]]*$' "$module" | head -1 | cut -d: -f1)"
+  if (( at > first_code )); then
+    error "$module has its marker at line $at, below the first code at line $first_code; it belongs in the module header"
+  fi
+done < <(grep -rl 'Extended notes:' src/ --include='*.rs' | sort)
 
 # --- N2 + N3. every notes file mirrors a live module -------------------------
 
