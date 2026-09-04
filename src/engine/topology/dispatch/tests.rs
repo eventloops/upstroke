@@ -71,7 +71,7 @@ fn healthy_at(manager: &WorkspaceManager, worktree: &Path, base: &str) -> bool {
         .worktree_records()
         .expect("worktree records")
         .into_iter()
-        .any(|record| crate::util::same_path(&record.path, worktree));
+        .any(|record| crate::util::same_path(record.path(), worktree));
     registered && git(worktree, &["rev-parse", "HEAD"]) == base
 }
 
