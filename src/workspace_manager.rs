@@ -85,7 +85,7 @@ use crate::util::{DurabilityLedger, DurableStep};
 
 mod hooks;
 pub use self::hooks::{EffectHooks, HarnessEffects, NoHooks};
-use self::hooks::{apply, funnel, point};
+use self::hooks::{consult, funnel, point};
 
 // ---------------------------------------------------------------------------
 // Refusals
@@ -1640,11 +1640,7 @@ impl WorkspaceManager {
         parent: &str,
         message: &str,
     ) -> Result<String, UpstrokeError> {
-        apply(
-            hooks.phase(site, HookPhase::Before),
-            site,
-            HookPhase::Before,
-        )?;
+        consult(hooks, site, HookPhase::Before)?;
         let output = self.git_with_identity(
             &self.base,
             &[
@@ -1673,7 +1669,7 @@ impl WorkspaceManager {
             })?
             .trim()
             .to_owned();
-        apply(hooks.phase(site, HookPhase::After), site, HookPhase::After)?;
+        consult(hooks, site, HookPhase::After)?;
         Ok(id)
     }
 

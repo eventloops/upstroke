@@ -2014,6 +2014,10 @@ fn a_refusal_at_the_adds_before_hook_leaves_the_filesystem_untouched() {
             }
             Injection::Proceed
         }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
     }
 
     let fixture = Fixture::created("add-before-refusal");
@@ -2096,6 +2100,10 @@ fn the_intent_and_its_directory_are_synced_before_the_add_begins() {
 
         fn durability_ledger(&self) -> DurabilityLedger {
             self.inner.durability_ledger()
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            self.inner.refusal_cause()
         }
     }
 
@@ -2374,6 +2382,10 @@ fn a_registration_rebound_after_validation_keeps_its_admin_state() {
                     .expect("replace the registration identity");
             }
             Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
 
@@ -4176,6 +4188,10 @@ fn id_unread_kill_helper() {
                 } => Injection::Kill,
                 _ => Injection::Proceed,
             }
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
         }
     }
     let _ = manager.candidate_commit_tree(&mut KillAtIdUnread, &tree, &head, "candidate");
