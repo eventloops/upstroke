@@ -6060,6 +6060,160 @@ fn classify_object_residue_refuses_a_site_that_registers_no_class() {
     );
 }
 
+/// Every residue name the classifier read went through `Path::exists`, which
+/// answers `false` for a permission failure, a symlink loop and a transient
+/// I/O error as well as for an absent name: a git dir this process could not
+/// search classified as `None`, and `administrative_residue_at` called the
+/// worktree quiescent. §7: only an actual not-found is absence, and a failed
+/// inspection is an error naming the name. Evaluated on the Unix legs, where
+/// a mode bit binds a non-root user.
+///
+/// `administrative_residue_at` is driven directly: its one caller,
+/// `quiescence`, answers `Missing` for a git dir `git rev-parse` cannot read
+/// before it reaches the residue read (the parent's fold, deferred to the
+/// parent's sweep), so the error is not observable through it today.
+///
+/// Witnessed failing with `name_present` reduced to
+/// `Ok(dir.join(name).exists())`: every assertion below then sees an answer.
+#[cfg(unix)]
+#[test]
+fn a_git_dir_that_cannot_be_searched_is_an_error_and_not_an_absent_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("residue-unsearchable");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let git_dir = git_dir_of(&path)
+        .expect("git dir")
+        .expect("linked worktree");
+    let lock = git_dir.join("index.lock");
+    let _restore = RestoreMode {
+        path: git_dir.clone(),
+    };
+    fs::set_permissions(&git_dir, fs::Permissions::from_mode(0o000)).expect("make it unsearchable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // reads through a mode of 000, and this test would then measure nothing.
+    assert!(
+        fs::symlink_metadata(&lock)
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound),
+        "prerequisite not met: the mode bit did not bind (running as root or with \
+         CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+    );
+    let site = EffectSiteId::Object(ObjectSite::CandidateStage);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+
+    let error = observed_residue_elements(site, &target)
+        .expect_err("a name that cannot be inspected is not a name that is absent");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &lock),
+        "the error names the lock it could not inspect: {error}"
+    );
+    let error = classify_object_residue(site, &target)
+        .expect_err("the classifier does not answer for a git dir it could not search");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &lock),
+        "the error names the lock it could not inspect: {error}"
+    );
+    let error = administrative_residue_at(&git_dir)
+        .expect_err("an unsearchable git dir is not a quiescent one");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &lock),
+        "the error names the first name it could not inspect: {error}"
+    );
+}
+
+/// The three adds read "populated" from `worktree.join(".git").exists()`, so
+/// a pointer file a kill left empty, or one holding anything but a `gitdir:`
+/// line, was the after phase. Populated means a git dir is behind the
+/// pointer as `git_dir_of` reads it, and its absence, with the worktree
+/// registered, is the `RegisteredUnpopulatedWorktree` the site registers.
+///
+/// Witnessed failing with the after arm's `git_dir_of(worktree)?.is_some()`
+/// restored to `worktree.join(".git").exists()` (the classifier answers
+/// `After`), and separately with the element arm's `git_dir.is_none()`
+/// restored to `!worktree.join(".git").exists()` (no element is observed).
+#[test]
+fn a_git_pointer_that_names_no_git_dir_is_a_registered_unpopulated_worktree() {
+    let fixture = Fixture::created("residue-empty-pointer");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert_eq!(
+        classify(site, &target),
+        ObjectResidue::After,
+        "the control: a populated worktree is the after phase"
+    );
+    let pointer = path.join(".git");
+    for content in ["", "not a pointer\n"] {
+        fs::write(&pointer, content).expect("rewrite the pointer");
+        assert!(
+            pointer.exists(),
+            "the name is still there; only what is behind it changed"
+        );
+        assert_eq!(
+            classify(site, &target),
+            ObjectResidue::Internal,
+            "a pointer holding {content:?} names no git dir"
+        );
+        assert_eq!(
+            observed_residue_elements(site, &target).expect("observe"),
+            vec![ResidueElement::RegisteredUnpopulatedWorktree],
+            "a pointer holding {content:?} names no git dir"
+        );
+    }
+}
+
+/// `name_present` reads the name's own metadata and does not follow a
+/// symlink: these are names Git takes with `O_EXCL` and releases by
+/// unlinking, so the name is the fact whatever it points at. The measurement
+/// is executed here rather than quoted: with `index.lock` a dangling symlink,
+/// `git add -A` fails with "File exists" (git 2.43). A metadata read that
+/// followed the link would call that lock absent. A file link needs a
+/// symlink, which the Windows guest's test user cannot create.
+///
+/// Witnessed failing with `symlink_metadata` replaced by `metadata` in
+/// `name_present`.
+#[cfg(unix)]
+#[test]
+fn a_dangling_index_lock_symlink_is_the_lock_git_sees() {
+    let fixture = Fixture::created("residue-dangling-lock");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let git_dir = git_dir_of(&path)
+        .expect("git dir")
+        .expect("linked worktree");
+    let lock = git_dir.join("index.lock");
+    std::os::unix::fs::symlink(git_dir.join("missing"), &lock).expect("plant the dangling link");
+    assert!(fs::metadata(&lock).is_err(), "the link dangles");
+
+    // The measurement: Git takes the name as the lock and refuses.
+    fs::write(path.join("new"), "x\n").expect("something to stage");
+    let output = git_out(&path, &["add", "-A"]);
+    assert!(
+        !output.status.success(),
+        "`git add` must refuse under a surviving lock name"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("File exists"),
+        "git names the lock as the reason: {stderr}"
+    );
+
+    let site = EffectSiteId::Object(ObjectSite::CandidateStage);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert!(
+        observed_residue_elements(site, &target)
+            .expect("observe")
+            .contains(&ResidueElement::IndexLock),
+        "the dangling link is the lock"
+    );
+    assert_eq!(classify(site, &target), ObjectResidue::Internal);
+    assert_eq!(
+        administrative_residue_at(&git_dir).expect("read"),
+        vec![ResidueElement::IndexLock]
+    );
+}
+
 /// `command_internal_sub_effects`: "the classifier is **total** over
 /// `{None, Internal, After}` for every Object site and for `Worktree.Add` /
 /// `Snapshot.Add`".
