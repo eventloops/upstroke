@@ -749,37 +749,28 @@ pub struct WorkspaceManager {
 /// reaches. Give either race the other's budget and both stop working: the handoff
 /// would sleep for a microsecond problem, and this would spin through a dead process's
 /// handles long before they closed.
-/// Record that a removal attempt has completed, so a test can observe the retry.
+/// How many times [`remove_tree_once_handles_close`] tries before it calls a
+/// handle a lock rather than a closing process.
 ///
-/// This is the only thing in this file that exists for a test, and it is here
-/// because nothing outside the loop can see an *attempt*. The funnel's `Before`
-/// phase — the last seam a test otherwise has — fires before the primitive is
-/// entered, so a control built on it can only assume that its first attempt ran
-/// against the condition it planted. That assumption is what
-/// `PR109-ORACLE-OBSERVES-TIMING-NOT-ATTEMPTS` records as unsound: a remover
-/// descheduled between the hook and the loop lets the condition clear first, and
-/// the retry-deleted mutant then passes.
+/// Module scope rather than a function-local `const`, because the control that
+/// proves the retry has to reason about the budget in the units that produce it
+/// and must not restate them: `ATTEMPTS * STEP` is what decides whether a
+/// process closing its handles `d` after the removal starts is tolerated, and a
+/// test asserting only "more than one attempt" passes with the budget cut to two
+/// -- measured, and the reason this is not a local any more.
+#[cfg(windows)]
+const ATTEMPTS: u32 = 40;
+
+/// How long [`remove_tree_once_handles_close`] sleeps between attempts.
 ///
-/// In a production build this is the no-op below and the call compiles away. The
-/// `#[cfg(test)]` twin is declared at the **bottom** of this file, beside the
-/// other test-only declarations: `effects::production_region` truncates a source
-/// at its first `#[cfg(test)]`, so putting the twin here would take every funnel
-/// below it out of the census that proves this group has them
-/// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`). `#[cfg(not(test))]` carries no such
-/// cut, which is why this half can sit where it is read.
-///
-/// The shape — a `#[cfg(test)]` item and a `#[cfg(not(test))]` twin of the same
-/// name — is `engine::coordinator::legacy_append_hooks`'s, already in the tree.
-#[cfg(not(test))]
-#[inline]
-fn note_removal_attempt(_attempt: u32) {}
+/// The loop sleeps *between* attempts and not after the last, so it sleeps
+/// `(ATTEMPTS - 1) * STEP`. See [`ATTEMPTS`] for why both are visible here.
+#[cfg(windows)]
+const STEP: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[cfg(windows)]
 fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-
-    const ATTEMPTS: u32 = 40;
-    const STEP: std::time::Duration = std::time::Duration::from_millis(25);
 
     let mut attempt = 1_u32;
     loop {
@@ -830,6 +821,31 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
         other => other,
     }
 }
+
+/// Record that a removal attempt has completed, so a test can observe the retry.
+///
+/// This is the only thing in this file that exists for a test, and it is here
+/// because nothing outside the loop can see an *attempt*. The funnel's `Before`
+/// phase — the last seam a test otherwise has — fires before the primitive is
+/// entered, so a control built on it can only assume that its first attempt ran
+/// against the condition it planted. That assumption is what
+/// `PR109-ORACLE-OBSERVES-TIMING-NOT-ATTEMPTS` records as unsound: a remover
+/// descheduled between the hook and the loop lets the condition clear first, and
+/// the retry-deleted mutant then passes.
+///
+/// In a production build this is the no-op below and the call compiles away. The
+/// `#[cfg(test)]` twin is declared at the **bottom** of this file, beside the
+/// other test-only declarations: `effects::production_region` truncates a source
+/// at its first `#[cfg(test)]`, so putting the twin here would take every funnel
+/// below it out of the census that proves this group has them
+/// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`). `#[cfg(not(test))]` carries no such
+/// cut, which is why this half can sit where it is read.
+///
+/// The shape — a `#[cfg(test)]` item and a `#[cfg(not(test))]` twin of the same
+/// name — is `engine::coordinator::legacy_append_hooks`'s, already in the tree.
+#[cfg(not(test))]
+#[inline]
+fn note_removal_attempt(_attempt: u32) {}
 
 impl WorkspaceManager {
     /// Derive the execution root of `run_id` from the managed base and the

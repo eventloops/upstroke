@@ -764,23 +764,38 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
     /// and **6.5–7.6s** pinned to 4 CPUs at `--test-threads=16`.
     const FAIL_SAFE: std::time::Duration = std::time::Duration::from_secs(600);
 
-    /// Releases the holder, waits for it, and re-raises whatever it panicked with.
+    /// Releases the holder, waits for it, joins it, and re-raises its panic.
     ///
-    /// Three things, all of which the previous shape got wrong and the frontier
-    /// pass named. Dropping a `JoinHandle` only detaches its thread, so a failing
-    /// assertion left `Fixture::drop` — one best-effort `remove_dir_all` that
-    /// ignores its result — racing a handle that had not closed. Joining without
-    /// a bound is the unbounded wait §12 forbids. And discarding the join result
-    /// makes a holder panic invisible: the file drops, the closing case can then
-    /// succeed without ever exercising a retry, and §10 asks that a worker panic
-    /// be a *defined* outcome rather than a silent one.
+    /// Every clause of that sentence was got wrong at least once, and the last
+    /// frontier pass named the two that survived. Dropping a `JoinHandle` only
+    /// detaches its thread, so a failing assertion left `Fixture::drop` — one
+    /// best-effort `remove_dir_all` that ignores its result — racing a handle
+    /// that had not closed. Discarding the join result makes a holder panic
+    /// invisible: the file drops, the closing case can then succeed without ever
+    /// exercising a retry, and §10 asks that a worker panic be a *defined*
+    /// outcome. And the shape before this one **signalled too early** — the
+    /// worker sent on `finished` from inside its own body, so a deschedule
+    /// between that send and the thread's end left this `Drop` past its wait and
+    /// inside an unbounded `join`, with the deadline no longer applying.
     ///
-    /// So: disconnect first, because the holder blocks on that channel and
-    /// joining ahead of it is the deadlock; wait for the thread to signal or
-    /// disappear, bounded by what is left of the deadline; then join, which by
-    /// then returns at once, and re-raise a panic on the thread that was
-    /// waiting for it. During an unwind a panic here would abort the process, so
-    /// there it is reported instead — `std::thread::panicking` is the test.
+    /// So the readiness signal is now the channel's **disconnection** and
+    /// nothing is ever sent on it: the `Sender` is moved into the worker's
+    /// closure and drops when that closure does, which is after the body has
+    /// returned — on a panic as well as on a normal return. `Disconnected`
+    /// therefore means the body is finished and the `join` that follows waits
+    /// only for thread teardown. `standards/12_standards_tests.md`'s readiness
+    /// rule, applied to a thread rather than a file: the signal is published by
+    /// the completion of the state it announces, never alongside it.
+    ///
+    /// **On expiry it still joins.** §12 wants the wait bounded and §10 forbids
+    /// the detached worker, and when a worker is genuinely wedged those pull
+    /// apart: the only way not to wait is to abandon the handle. This resolves
+    /// it in §10's favour and pays for it by reporting *first* — the diagnostic
+    /// is on stderr before the join is entered, so an operator whose job is then
+    /// killed by its own timeout still learns why, which is exactly what
+    /// detaching would deny them. The expiry is also close to unreachable by
+    /// construction: the holder's only wait is on the channel this `Drop`
+    /// disconnects one line earlier.
     ///
     /// Declared *after* the fixture, so it drops *before* it.
     struct Holder {
@@ -792,32 +807,43 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
 
     impl Drop for Holder {
         fn drop(&mut self) {
+            // First, always: the holder's only wait is on this channel, so
+            // joining ahead of the disconnect is the deadlock.
             drop(self.close_now.take());
             let Some(handle) = self.handle.take() else {
                 return;
             };
+            let mut wedged = false;
             if let Some(finished) = self.finished.take() {
-                // `Disconnected` is the thread's stack going away, which is the
-                // same news as its explicit send and arrives on a panic too.
-                if let Err(mpsc::RecvTimeoutError::Timeout) =
-                    finished.recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+                match finished.recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
                 {
-                    if std::thread::panicking() {
+                    // Nothing is ever sent on this channel. `Disconnected` is the
+                    // worker's closure being dropped, which happens after its body
+                    // has returned -- by a normal return or by a panic -- so the
+                    // join below waits only for thread teardown.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        wedged = true;
+                        // Reported *before* the join, not after: if the worker is
+                        // genuinely wedged the join will not return and the job
+                        // will be killed by its own timeout, and this line is then
+                        // the only thing that says why. Detaching instead would
+                        // leave no worker to observe at all, which is the failure
+                        // `standards/10_standards_concurrency.md` names.
                         eprintln!(
-                            "the holder had not finished within {FAIL_SAFE:?} and the test was \
-                             already unwinding; the thread is left detached"
-                        );
-                    } else {
-                        panic!(
                             "the holder had not finished within {FAIL_SAFE:?} of this case \
-                             starting, so joining it here would be the unbounded wait the \
-                             deadline exists to prevent"
+                             starting; joining it anyway rather than detaching it, so this \
+                             message may be the last output of the job"
                         );
                     }
-                    return;
+                    // Unreachable: the sender is moved into the worker and never
+                    // used. Treated as "finished" rather than asserted, because a
+                    // `Drop` is the wrong place to discover a contradiction.
+                    Ok(()) => {}
                 }
             }
-            if let Err(payload) = handle.join() {
+            let joined = handle.join();
+            if let Err(payload) = joined {
                 if std::thread::panicking() {
                     eprintln!(
                         "the holder thread panicked while the test was already unwinding; its \
@@ -826,15 +852,47 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
                 } else {
                     std::panic::resume_unwind(payload);
                 }
+            } else if wedged && !std::thread::panicking() {
+                panic!(
+                    "the holder did not finish within {FAIL_SAFE:?} of this case starting, and \
+                     the join that followed did return -- so the wait was bounded and the worker \
+                     was not detached, but something held it past the deadline"
+                );
             }
         }
     }
 
-    // `true`: a process whose last handle closes once the first attempt has
+    /// The closing window this control is sized against: a killed process whose
+    /// last handle clears 300ms after the removal starts.
+    ///
+    /// It is the test's own number, not production's, which is what keeps the
+    /// assertion below from being a self-oracle.
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+
+    // The floor the retry budget has to clear, *derived* rather than restated:
+    // covering `HOLD` at `STEP` per attempt takes `HOLD / STEP` of them. With
+    // production's 25ms that is 12, against a budget of 40.
+    //
+    // Asserting only "more than one attempt" was not enough, and the frontier
+    // pass proved it: cut `ATTEMPTS` from 40 to 2 and the closing case still
+    // passes -- attempt 1 hands over, attempt 2 succeeds -- while the engine
+    // would now refuse a real handle closing after 300ms about one 25ms interval
+    // in. Deriving the floor from the two quantities that produce it means a
+    // budget too small to tolerate `HOLD` fails here, and means the test still
+    // says nothing about the exact value of `ATTEMPTS`, which is production's to
+    // choose.
+    let floor = u32::try_from(HOLD.as_millis() / STEP.as_millis())
+        .expect("the derived attempt floor fits in the counter the seam reports");
+    assert!(
+        floor > 1,
+        "the floor must be a real budget rather than the 'more than one attempt' this replaces:          HOLD {HOLD:?} over STEP {STEP:?} gives {floor}"
+    );
+
+    // `true`: a process whose last handle closes once `floor` attempts have
     // provably run, which is the window the retry exists to cross. `false`: one
     // that is still holding when the assertion runs, which is a locked worktree
     // however many attempts the loop spent reaching that conclusion.
-    for (releases_after_the_first_attempt, expected_removal) in [(true, true), (false, false)] {
+    for (releases_after_the_floor, expected_removal) in [(true, true), (false, false)] {
         let fixture = Fixture::created("closing-handle");
         let slot = fixture.task("alpha", 1);
         fixture
@@ -854,7 +912,14 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         let held = target.join("held-by-the-dying-child");
         fs::write(&held, b"bytes the child had open").expect("plant the file");
 
-        let deadline = Instant::now() + FAIL_SAFE;
+        let case_began = Instant::now();
+        let deadline = case_began + FAIL_SAFE;
+        // Milliseconds into the case at which the removal's first attempt
+        // returned; 0 means it never made one. The fail-safe's diagnostic reads
+        // it, because "the fail-safe fired" and "the removal was slow" are two
+        // different facts and the old assertion asserted the second from the
+        // first.
+        let first_attempt_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (opened, ready) = mpsc::channel::<()>();
         let (close_now, may_close) = mpsc::channel::<()>();
         let (closed, has_closed) = mpsc::channel::<()>();
@@ -890,10 +955,15 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
                 fired.store(true, Ordering::SeqCst);
             }
             drop(file);
-            // Both are best-effort: an error means the observer or the guard is
-            // already gone, which is not this thread's business to report.
+            // Best-effort: an error means the observer is already gone, which is
+            // not this thread's business to report.
             let _ = closed.send(());
-            let _ = finished_here.send(());
+            // `finished_here` is never sent on. It is moved into this closure so
+            // that its *drop* -- after this body returns, on a panic as well as
+            // on a normal return -- is what tells `Holder` the body is over. See
+            // that guard's doc: signalling from inside the body announced a
+            // completion that had not happened.
+            drop(finished_here);
         });
         // After `fixture`, so it drops before it. Nothing below may `join` this
         // thread by hand: the guard owns every half precisely so the
@@ -912,18 +982,32 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         // Declared after the guard, so it drops *before* it: the closing case's
         // observer owns a second sender, and the held case's channel cannot
         // disconnect until every sender is gone.
-        let observing = if releases_after_the_first_attempt {
+        // Both observers record when the removal actually entered the loop, so a
+        // fail-safe fire can be told apart from a removal that never began.
+        let began = Arc::clone(&first_attempt_ms);
+        let stamp = move || {
+            let ms = u64::try_from(case_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // `.max(1)` so "the first attempt landed inside the first
+            // millisecond" is never confused with the 0 that means "never".
+            let _ = began.compare_exchange(0, ms.max(1), Ordering::SeqCst, Ordering::SeqCst);
+        };
+        let observing = if releases_after_the_floor {
             let tell = observer_may_tell;
             let wait_for_the_close = has_closed;
             let unseen = Arc::clone(&close_never_seen);
             super::fixture::observe_removal_attempts(Box::new(move |attempt| {
-                if attempt != 1 {
+                if attempt == 1 {
+                    stamp();
+                }
+                if attempt != floor {
                     return;
                 }
-                // Ordered against the attempt rather than against a clock: the
-                // attempt has already returned, so it ran with the handle open,
-                // and waiting for the close here means the next attempt runs
-                // after it. Both facts hold whatever the scheduler does.
+                // Ordered against an attempt rather than against a clock: every
+                // attempt up to and including this one has already returned, so
+                // each ran with the handle open, and waiting for the close here
+                // means the next attempt runs after it. Both facts hold whatever
+                // the scheduler does, and holding for `floor` attempts rather
+                // than one is what makes the budget itself the subject.
                 let _ = tell.send(());
                 if wait_for_the_close
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -938,7 +1022,11 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
             // drop, which is the hang the deadline would then have to catch.
             drop(observer_may_tell);
             drop(has_closed);
-            super::fixture::observe_removal_attempts(Box::new(|_| {}))
+            super::fixture::observe_removal_attempts(Box::new(move |attempt| {
+                if attempt == 1 {
+                    stamp();
+                }
+            }))
         };
         ready
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -951,15 +1039,34 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
 
         // Read before the outcome is interpreted, so the diagnostic names the
         // real fault rather than whatever the freed handle then permitted.
-        assert!(
-            !fail_safe_fired.load(Ordering::SeqCst),
-            "the fail-safe released the handle {FAIL_SAFE:?} after this case began, with removal \
-             still inside the funnel, and removal then returned in {took:?} as {} after \
-             {attempts} attempt(s). That establishes the bound it crossed -- a removal slower \
-             than the fail-safe -- and not the reason for it: an unbounded retry is why this \
-             bound exists, but a thread that stopped being scheduled reads the same",
-            if outcome.is_ok() { "Ok" } else { "Err" }
-        );
+        //
+        // The fail-safe measures the case, which starts before removal does, so
+        // firing does NOT by itself mean the removal was slow: this thread could
+        // simply not have been scheduled to enter the funnel. The two are told
+        // apart by whether an attempt was ever recorded, and the message says
+        // which happened rather than asserting the one from the other -- that
+        // conflation is `SOL-8D4-03`.
+        if fail_safe_fired.load(Ordering::SeqCst) {
+            let entered_at = first_attempt_ms.load(Ordering::SeqCst);
+            assert!(
+                entered_at != 0,
+                "the fail-safe expired {FAIL_SAFE:?} after this case began and the removal had \
+                 not completed a single attempt by then, so this thread was never scheduled to \
+                 reach the retry at all. That is a scheduling failure of the test and says \
+                 nothing about how long a removal took: it returned in {took:?} as {} after \
+                 {attempts} attempt(s)",
+                if outcome.is_ok() { "Ok" } else { "Err" }
+            );
+            panic!(
+                "the fail-safe expired {FAIL_SAFE:?} after this case began with removal still \
+                 inside the funnel -- its first attempt completed {entered_at}ms into the case, \
+                 so the bound was spent on the removal and not on reaching it. Removal then \
+                 returned in {took:?} as {} after {attempts} attempt(s). That establishes the \
+                 bound it crossed and not the reason for it: an unbounded retry is why this \
+                 bound exists, but a remover that stopped being scheduled reads the same",
+                if outcome.is_ok() { "Ok" } else { "Err" }
+            );
+        }
         assert!(
             !close_never_seen.load(Ordering::SeqCst),
             "the holder never reported closing the handle within {FAIL_SAFE:?}, so the attempts \
@@ -971,10 +1078,12 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         // a handle happened to still be open when the single attempt ran, which
         // is a race the test used to be on the wrong side of.
         assert!(
-            attempts > 1,
-            "the removal must have retried: the loop reported {attempts} attempt(s) in {took:?}, \
-             so nothing here is about the retry. A single attempt means either the budget is \
-             gone or the primitive was never entered"
+            attempts > floor,
+            "the removal's budget must cover the closing window this control is sized against: \
+             the loop reported {attempts} attempt(s) in {took:?}, and {HOLD:?} at {STEP:?} per \
+             attempt needs more than {floor}. A count at or below the floor means the budget is \
+             too small to tolerate a handle that clears in {HOLD:?} -- or, at one attempt, that \
+             the retry is gone or the primitive was never entered"
         );
 
         if expected_removal {
@@ -1048,19 +1157,25 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
     }
 }
 
-/// The attempt seam counts attempts, and the Unix arm makes exactly one.
+/// The Unix arm makes exactly one attempt, and the seam reports that one.
 ///
 /// The seam exists for the Windows control above, which is the only place a
 /// retry can happen — so on every other leg it would be code nothing exercises,
-/// and a mis-wiring of it (counting calls rather than attempts, never resetting
-/// between observations, or the production no-op silently taking the place of
-/// the `#[cfg(test)]` twin) would show up only on the one platform whose suite
-/// is hardest to run. This pins it where CI runs it every time.
+/// and a mis-wiring of it would show up only on the platform whose suite is
+/// hardest to run. This pins it where CI runs it every time.
 ///
 /// One attempt, not "at least one": `remove_tree_once_handles_close` is called a
 /// second time for the Git admin directory when a killed `worktree add` left an
 /// empty `commondir`, and this fixture is an ordinary worktree, so a count above
 /// one here would mean the seam is counting something other than what it says.
+///
+/// **What this deliberately does not claim.** An earlier version said it proved
+/// the observer runs "once per attempt rather than once per call". It cannot: a
+/// Unix removal has exactly one attempt, so one call and one attempt are the
+/// same number and no assertion here can separate them. That property is only
+/// observable where a retry is, and the Windows control observes it directly by
+/// requiring a count above its derived floor. The claim was removed rather than
+/// dressed up, which is the `SOL-8D4-04` repair.
 #[cfg(not(windows))]
 #[test]
 fn a_removal_records_the_one_attempt_the_unix_arm_makes() {
@@ -1099,7 +1214,7 @@ fn a_removal_records_the_one_attempt_the_unix_arm_makes() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "the observer runs once per attempt, not once per removal call"
+        "the observer ran once, for that one attempt"
     );
     assert_eq!(
         ordinals.load(Ordering::SeqCst),
@@ -1108,7 +1223,7 @@ fn a_removal_records_the_one_attempt_the_unix_arm_makes() {
     );
 }
 
-/// The observation is per-thread, and ends when its guard is dropped.
+/// The observation is this thread's, and the guard's drop ends it.
 ///
 /// Both halves matter to the control above. The suite runs at
 /// `--test-threads=16` and several of its tests remove worktrees, so a
@@ -1116,9 +1231,19 @@ fn a_removal_records_the_one_attempt_the_unix_arm_makes() {
 /// a guard that left its observer installed would hand the closure to whatever
 /// ran next on the same thread, which for a test that unwinds is a closure
 /// holding channels nobody is reading.
+///
+/// **The second half is asserted through the observer rather than the counter**,
+/// and that is the `SOL-8D4-04` repair. Reading `count()` after the drop proves
+/// nothing about the drop: the next observation resets the counter to zero on
+/// the way in, so the assertion passed whether or not the guard had uninstalled
+/// anything, and deleting `AttemptObservation`'s `Drop` left the test green. A
+/// counting observer that outlives its guard is a different matter — if the
+/// uninstall does not happen, the removal below reaches it and the count moves.
 #[cfg(not(windows))]
 #[test]
 fn the_attempt_observation_is_this_threads_and_ends_with_its_guard() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     let fixture = Fixture::created("attempt-seam-scope");
     let slot = fixture.task("alpha", 1);
     fixture
@@ -1130,7 +1255,14 @@ fn the_attempt_observation_is_this_threads_and_ends_with_its_guard() {
         .add_worktree(&mut NoHooks, &slot, &fixture.head)
         .expect("the worktree to remove");
 
-    let observing = super::fixture::observe_removal_attempts(Box::new(|_| {}));
+    // Counting, not a no-op: this is the only thing that can still be observed
+    // once the guard is gone, so it is what the second assertion reads.
+    let reached = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&reached);
+    let observing = super::fixture::observe_removal_attempts(Box::new(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    }));
+
     // A removal on ANOTHER thread must not reach this observation. The second
     // fixture is that thread's own, because two removals of one slot are a
     // different test.
@@ -1157,19 +1289,24 @@ fn the_attempt_observation_is_this_threads_and_ends_with_its_guard() {
         0,
         "another thread's removal is not this observation's attempt"
     );
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "and it does not reach this thread's observer either"
+    );
 
     drop(observing);
-    // With the guard gone the observer is uninstalled, so this removal runs
-    // through the seam and reaches nothing.
+    // With the guard gone the observer must be uninstalled, so this removal --
+    // on this very thread, where it would otherwise be seen -- reaches nothing.
     fixture
         .manager
         .remove_worktree(&mut NoHooks, &slot)
         .expect("an unheld worktree is removed");
-    let after = super::fixture::observe_removal_attempts(Box::new(|_| {}));
     assert_eq!(
-        after.count(),
+        reached.load(Ordering::SeqCst),
         0,
-        "a fresh observation starts at zero rather than at the last one's total"
+        "the guard's drop must uninstall the observer: a removal after it reached the closure, \
+         so the observation outlived the guard that owns it"
     );
 }
 
