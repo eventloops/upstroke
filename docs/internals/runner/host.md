@@ -57,7 +57,7 @@ than an optimisation — `host-v1` supplies credential locations *role-scoped*
 and a memo keyed on the environment would miss on exactly the pair DESIGN.md:612 requires to agree.
 The three fields that decide the answer are the three the key carries.
 
-### `HostRunner::hooks`
+## `HostRunner::hooks`
 
 Held for the whole of one `run`, so one `HostRunner` supervises one process at a time. That is not a
 limitation today — `Runner::run` is synchronous until PR11 and the substrate is sequential — but
@@ -124,6 +124,11 @@ The composed environment *is* the environment: base, reserved values, overlay, a
 by a route the record does not describe. "Probe and execution compose the same base, mounts,
 reserved values, and overlay, so pre-flight certifies the environment that will actually spend"
 (DESIGN.md:263).
+
+Bounded, and named so it cannot grow silently: the base is `std::env::vars_os()`, so anything that
+iterator does not yield is not inherited either. On Windows that is the `=C:`-style per-drive
+current-directory variables, which only affect drive-relative paths like `D:sub`. Every process this
+runner starts is given an absolute `current_dir`, so none of them can be resolving one.
 
 ## `build_command_at`
 
@@ -292,8 +297,58 @@ else.
 DESIGN.md:260-262: "each supplies role-scoped `HOME`, `PATH`, and credential locations. Adapter
 overrides may select profiles or CLI behavior but may not conflict with runner-reserved keys."
 
+`USERPROFILE` is here beside `HOME` because on Windows it *is* the home variable —
+`crate::util::user_upstroke_dir` reads it first there and falls back to `HOME`, precisely because
+Git Bash sets `HOME` to an MSYS path the Windows file APIs cannot open. Reserving one and not the
+other would let an adapter move the home directory on one platform through the name the other
+platform trusts.
+
 ## `CREDENTIAL_LOCATIONS`
 
 `src/capacity.rs:36-37` names two of the three as the vendors' own profile mechanism: "`COPILOT_HOME`
 (documented) and `CLAUDE_CONFIG_DIR` (works, undocumented as of Aug 2026)"; `CODEX_HOME` is
 codex-cli's equivalent.
+
+They are reserved for **every** request rather than only for the agent a request binds: the narrower
+rule would let a gate — repository-controlled code, the one thing on the host that no agent
+permission surface bounds — point another agent's CLI at a directory of its choosing.
+
+## `supplies_credentials`
+
+The one thing the host has to scope by role, and the reason the packet's word is "role-scoped": a
+gate is repository-controlled code — the one thing on the host that no agent permission surface
+bounds — and the shell probe is a shell running `exit 0`. Neither runs an agent CLI, so neither is
+handed the directory an agent's credentials live in, even when the request names an agent. The
+worker, the review and an agent probe all execute an agent CLI and all need it.
+
+## `ProgramQuestion`
+
+`program` is `CommandSpec::program` verbatim; `path` and `pathext` are the composed values, `None`
+when the composed environment does not carry that key at all — which is a different question from
+carrying it empty, and is why they are `Option` rather than defaulted here.
+
+## `HostRunner::new`
+
+Infallible because `host-v1`'s record is a constant with nothing to inspect;
+`crate::runner::policy::resolve_host` is the checked entry point and returns the same record, which
+`new_resolves_the_same_record_as_resolve_host` asserts.
+
+## `HostRunner::policy`
+
+Exposed because INV-23 records it in three places — digested into the marker (P1), in full in the
+private owner record (P3b), and in `run_started(4).runner` (P6).
+
+## `HostRunner::start_write_command`
+
+The write command's containment startup step (INV-18, host portion):
+
+> on Windows every host child is a member of the coordinator's ambient kill-on-close Job Object from
+> creation … enforced by "ambient job joined at write-command startup (refusal otherwise)"
+
+Called once, **before any spawn** — the contract's `side_effect_vs_effect_ordering` is "no events;
+ambient job before any spawn". On Unix there is nothing to join: containment there is the
+per-invocation reaper and the isolated process group, and this returns `Ok` having done nothing.
+
+The same step as the free `contain_write_command`, with **this runner's** observer attached rather
+than production's `NoHooks`; it calls that function rather than repeating it, so there is one join
+and one mint in the crate and not two.
