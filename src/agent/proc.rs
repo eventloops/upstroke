@@ -1517,6 +1517,25 @@ mod termination {
     /// before it, watches this instead of sleeping.
     #[cfg(test)]
     static READY_WAITS_BEGUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    /// When the last reaper READY wait ended, as nanoseconds on `test_clock`,
+    /// recorded immediately after the wait returns and before the reaper is
+    /// abandoned. A test that bounds the wait's own end by the flag reads
+    /// this; the launch's failure comes later, after a kill and a reap whose
+    /// cost on a loaded runner the wait does not control.
+    #[cfg(test)]
+    static READY_WAIT_ENDED_NANOS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    /// One instant every test-only timestamp in this module counts from.
+    #[cfg(test)]
+    fn test_clock() -> &'static Instant {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now)
+    }
+    /// Nanoseconds since `test_clock`, saturating.
+    #[cfg(test)]
+    fn test_clock_nanos() -> u64 {
+        u64::try_from(test_clock().elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
     /// A stall a test injects into `read_guard_ack_until`, the one seam that
     /// turns a duration back into a deadline, before it does so: for the
     /// descriptor named here only, since every acknowledgement wait in this
@@ -2708,6 +2727,8 @@ mod termination {
         #[cfg(test)]
         READY_WAITS_BEGUN.fetch_add(1, Ordering::SeqCst);
         let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
+        #[cfg(test)]
+        READY_WAIT_ENDED_NANOS.store(test_clock_nanos(), Ordering::SeqCst);
         // A termination that arrived during the wait, or with READY, wins:
         // the caller holds the launch barrier, and releasing it is what lets
         // the monitor act on the groups already running. The abandonment is
@@ -5450,13 +5471,20 @@ mod termination {
             );
             // The wait ends within a slice of the flag: the poll in flight
             // when the flag turns runs out, and one more slice covers the
-            // kill and reap of the abandoned reaper and the scheduling of
-            // this thread on a loaded runner.
+            // scheduling of this thread on a loaded runner. The wait's own
+            // end is what is measured (`READY_WAIT_ENDED_NANOS`, recorded
+            // before the reaper is abandoned), not the launch's failure: the
+            // failure comes after a kill and a bounded reap of the abandoned
+            // reaper, up to `HELPER_EXIT_BUDGET`, whose cost on a loaded
+            // runner the wait does not control (CI at ee0e914 measured the
+            // launch at 134.7 ms after the flag on macOS). The launch is
+            // bounded separately by that sum.
             let bound = LAUNCH_INTERRUPT_SLICE * 2;
+            let launch_bound = bound + HELPER_EXIT_BUDGET;
             assert!(
-                bound < ready_delay,
-                "the bound {bound:?} must fall before READY at {ready_delay:?}, or a launch that \
-                 waited for READY and only then looked would pass"
+                launch_bound < ready_delay,
+                "the bound {launch_bound:?} must fall before READY at {ready_delay:?}, or a \
+                 launch that waited for READY and only then looked would pass"
             );
             let setter = thread::spawn(move || {
                 let patience = Instant::now() + Duration::from_secs(5);
@@ -5466,26 +5494,35 @@ mod termination {
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
-                let turned = Instant::now();
+                let turned = test_clock_nanos();
                 set_pending_termination();
                 Some(turned)
             });
             let outcome = launch(&mut super::super::NoHooks);
-            let failed = Instant::now();
+            let failed = test_clock_nanos();
+            let ended = READY_WAIT_ENDED_NANOS.load(Ordering::SeqCst);
             let turned = setter
                 .join()
                 .expect("the flag-setting thread")
                 .expect("the READY wait never began, so the flag was never turned");
             interruption_message(outcome, "during the READY wait");
             assert!(
-                failed >= turned,
-                "the launch failed before the flag turned, so the wait was not what refused it"
+                ended >= turned,
+                "the READY wait ended before the flag turned, so the wait was not what refused \
+                 the launch"
             );
-            let after_flag = failed.duration_since(turned);
+            let after_flag = Duration::from_nanos(ended - turned);
             assert!(
                 after_flag < bound,
-                "a termination pending during the READY wait held the launch for {after_flag:?} \
+                "a termination pending during the READY wait held the wait for {after_flag:?} \
                  after the flag turned, past {bound:?}"
+            );
+            let launch_after_flag = Duration::from_nanos(failed.saturating_sub(turned));
+            assert!(
+                launch_after_flag < launch_bound,
+                "a termination pending during the READY wait held the launch for \
+                 {launch_after_flag:?} after the flag turned, past {launch_bound:?} (two slices \
+                 for the wait and {HELPER_EXIT_BUDGET:?} for the reap of the abandoned reaper)"
             );
             assert_eq!(
                 READY_WAITS_BEGUN.load(Ordering::SeqCst),
