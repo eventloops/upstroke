@@ -45,7 +45,7 @@ use std::str::Utf8Error;
 use crate::error::UpstrokeError;
 use crate::topology::paths::{GitPath, PathSet};
 
-use super::WorktreeRecord;
+use super::worktree::{Attributes, WorktreeRecord};
 
 /// Trim what Git trims when it reads a `gitdir` file, and nothing more.
 ///
@@ -429,23 +429,6 @@ fn status_endpoints(status: &[u8]) -> Option<usize> {
     }
 }
 
-/// Whether `value` is an object id as `git worktree list` prints one: every
-/// byte a hexadecimal digit, forty of them (SHA-1) or sixty-four (SHA-256).
-fn is_object_id(value: &[u8]) -> bool {
-    matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit)
-}
-
-/// Whether `value` can be a refname at all: `git check-ref-format` forbids
-/// ASCII control characters, space, DEL and the seven bytes `~ ^ : ? * [ \`
-/// anywhere in one. Not the whole rule (the `..`, `@{` and `.lock` clauses are
-/// not applied), but everything a stray or hostile byte could add to a name.
-fn can_be_refname(value: &[u8]) -> bool {
-    !value.is_empty()
-        && !value
-            .iter()
-            .any(|byte| *byte <= b' ' || *byte == 0x7f || b"~^:?*[\\".contains(byte))
-}
-
 /// Parse `git worktree list --porcelain -z`.
 ///
 /// # The record grammar
@@ -470,15 +453,16 @@ fn can_be_refname(value: &[u8]) -> bool {
 ///
 /// The path is taken as bytes through [`decode_path`], because a repository
 /// path need not be UTF-8 on Unix and a lossy spelling is not the path; under
-/// `-z` it is verbatim, and a space is a legal byte of one. The structural
-/// attributes are held to their own grammars: `HEAD` is an object id
-/// ([`is_object_id`]), `branch` is a refname's byte set ([`can_be_refname`],
-/// which forbids whitespace), `detached` and `bare` are labels with no value,
-/// and none of the four appears twice in a record. `locked` and `prunable` are
-/// Git's own reasons, verbatim (a lock reason may carry a newline, which is why
-/// `-z` exists), read lossily into the [`String`]s [`WorktreeRecord`] gives
-/// them and consulted only for the word `initializing`. A label this parser
-/// does not know is skipped, since Git may add one.
+/// `-z` it is verbatim, and a space is a legal byte of one. This parser owns
+/// the framing: `HEAD` and `branch` carry a value, `detached` and `bare` are
+/// labels with no value, and none of the four appears twice in a record. The
+/// grammar of the values is the record's own, applied once when the record
+/// closes ([`WorktreeRecord::from_porcelain`]): `HEAD` is an object id,
+/// `branch` is a refname's byte set (which forbids whitespace) and is kept as
+/// the bytes Git printed, and `locked` and `prunable` are Git's own reasons,
+/// verbatim (a lock reason may carry a newline, which is why `-z` exists),
+/// consulted only for the word `initializing`. A label this parser does not
+/// know is skipped, since Git may add one.
 ///
 /// # Errors
 ///
@@ -500,12 +484,16 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
         });
     };
     let mut records: Vec<WorktreeRecord> = Vec::new();
-    let mut current: Option<WorktreeRecord> = None;
+    let mut current: Option<Attributes<'_>> = None;
     for field in body.split(|byte| *byte == 0) {
         let index = records.len();
         if field.is_empty() {
-            let Some(record) = current.take() else {
+            let Some(open) = current.take() else {
                 return Err(refuse(index, "is closed before it is opened"));
+            };
+            let record = match WorktreeRecord::from_porcelain(open) {
+                Ok(record) => record,
+                Err(malformed) => return Err(refuse(index, &malformed.to_string())),
             };
             records.push(record);
             continue;
@@ -529,7 +517,7 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
                     });
                 }
             };
-            current = Some(WorktreeRecord {
+            current = Some(Attributes {
                 path,
                 head: None,
                 branch: None,
@@ -538,7 +526,7 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
             });
             continue;
         }
-        let Some(record) = current.as_mut() else {
+        let Some(open) = current.as_mut() else {
             return Err(refuse(index, "has an attribute before its worktree line"));
         };
         let (label, value) = match field.iter().position(|byte| *byte == b' ') {
@@ -546,23 +534,19 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
             None => (field, None),
         };
         match (label, value) {
-            (b"HEAD", Some(value)) if is_object_id(value) && record.head.is_none() => {
-                record.head = Some(String::from_utf8_lossy(value).into_owned());
-            }
+            (b"HEAD", Some(value)) if open.head.is_none() => open.head = Some(value),
             (b"HEAD", _) => return Err(refuse(index, "has a HEAD that is not one object id")),
-            (b"branch", Some(value)) if can_be_refname(value) && record.branch.is_none() => {
-                record.branch = Some(String::from_utf8_lossy(value).into_owned());
-            }
+            (b"branch", Some(value)) if open.branch.is_none() => open.branch = Some(value),
             (b"branch", _) => return Err(refuse(index, "has a branch that is not one refname")),
             (b"detached" | b"bare", None) => {}
             (b"detached" | b"bare", Some(_)) => {
                 return Err(refuse(index, "has a boolean attribute carrying a value"));
             }
-            (b"locked", value) if record.locked.is_none() => {
-                record.locked = Some(reason(value));
+            (b"locked", value) if open.locked.is_none() => {
+                open.locked = Some(value.unwrap_or(&[]));
             }
-            (b"prunable", value) if record.prunable.is_none() => {
-                record.prunable = Some(reason(value));
+            (b"prunable", value) if open.prunable.is_none() => {
+                open.prunable = Some(value.unwrap_or(&[]));
             }
             (b"locked" | b"prunable", _) => {
                 return Err(refuse(index, "has a reason attribute twice"));
@@ -577,14 +561,6 @@ pub(super) fn parse_worktree_records(bytes: &[u8]) -> Result<Vec<WorktreeRecord>
         ));
     }
     Ok(records)
-}
-
-/// A `locked` or `prunable` reason as Git printed it: empty for the bare
-/// label, otherwise the bytes after the label's one space, verbatim.
-fn reason(value: Option<&[u8]>) -> String {
-    value.map_or_else(String::new, |value| {
-        String::from_utf8_lossy(value).into_owned()
-    })
 }
 
 #[cfg(test)]
@@ -624,6 +600,24 @@ mod tests {
 
     fn message(error: UpstrokeError) -> String {
         error.to_string()
+    }
+
+    /// The record the porcelain spells, built through the one constructor.
+    fn worktree_record(
+        path: &str,
+        head: Option<&str>,
+        branch: Option<&[u8]>,
+        locked: Option<&[u8]>,
+        prunable: Option<&[u8]>,
+    ) -> WorktreeRecord {
+        WorktreeRecord::from_porcelain(Attributes {
+            path: platform(path),
+            head: head.map(str::as_bytes),
+            branch,
+            locked,
+            prunable,
+        })
+        .expect("a record inside the grammar")
     }
 
     /// `path`, spelled with this platform's separator.
@@ -1018,29 +1012,23 @@ mod tests {
         ]);
         let records = parse_worktree_records(&bytes).expect("Git's own grammar");
         let expected = vec![
-            WorktreeRecord {
-                path: platform("/repo"),
-                head: Some(OID.to_owned()),
-                branch: Some("refs/heads/master".to_owned()),
-                locked: None,
-                prunable: None,
-            },
-            WorktreeRecord {
-                path: platform("/repo/wt"),
-                head: Some(OID.to_owned()),
-                branch: None,
-                locked: Some("why\nnot ".to_owned()),
-                prunable: Some("gitdir file points to non-existent location".to_owned()),
-            },
-            WorktreeRecord {
-                path: platform("/repo/bare"),
-                head: None,
-                branch: None,
-                locked: Some(String::new()),
-                prunable: Some(String::new()),
-            },
+            worktree_record("/repo", Some(OID), Some(b"refs/heads/master"), None, None),
+            worktree_record(
+                "/repo/wt",
+                Some(OID),
+                None,
+                Some(b"why\nnot "),
+                Some(b"gitdir file points to non-existent location"),
+            ),
+            worktree_record("/repo/bare", None, None, Some(b""), Some(b"")),
         ];
         assert_eq!(records, expected);
+        assert_eq!(
+            records[2].lock_reason(),
+            Some(""),
+            "a bare `locked` is a lock without a reason, not an absent attribute"
+        );
+        assert_eq!(records[2].prunable_reason(), Some(""));
         let refused = parse_worktree_records(b"").expect_err("Git never lists nothing");
         assert!(message(refused).contains("worktree list is empty"));
     }
@@ -1192,7 +1180,7 @@ mod tests {
 
         let verbatim = porcelain(&[b"worktree /repo", HEAD, b"locked initializing ", b""]);
         let records = parse_worktree_records(&verbatim).expect("a reason is verbatim");
-        assert_eq!(records[0].locked.as_deref(), Some("initializing "));
+        assert_eq!(records[0].lock_reason(), Some("initializing "));
         let sha256 = porcelain(&[
             b"worktree /repo",
             b"HEAD 88663d58b63b0acaf3c31e98aa723336b24f151088663d58b63b0acaf3c31e98",
@@ -1212,7 +1200,7 @@ mod tests {
         let records = parse_worktree_records(&porcelain(&[b"worktree /repo/caf\xe9", HEAD, b""]))
             .expect("every byte string is a Unix path");
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path.as_os_str().as_bytes(), b"/repo/caf\xe9");
+        assert_eq!(records[0].path().as_os_str().as_bytes(), b"/repo/caf\xe9");
     }
 
     #[cfg(not(unix))]
