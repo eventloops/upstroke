@@ -8564,8 +8564,9 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 }
 
                 // **What the group kill answered is recorded and printed, and
-                // not asserted on**, which is the same treatment `kill_error`
-                // has three assertions above and is here for a related reason.
+                // asserted only on Linux** (below), which on the other Unix is
+                // the same treatment `kill_error` has three assertions above,
+                // and is here for a related reason.
                 // The first version of this test asserted `Delivered` on the
                 // strength of a sentence that was true on Linux and false on
                 // Darwin: a signal to a group whose only surviving member is
@@ -8643,23 +8644,10 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 // remove. This is an assertion about the world rather than
                 // about a return value, and no errno disagreement between
                 // platforms can weaken it.
-                let unsettled: Vec<GroupSettle> = shape
-                    .iter()
-                    .map(|launch| launch.settled)
-                    .filter(|settled| {
-                        !matches!(settled, GroupSettle::AtOnce | GroupSettle::After(_))
-                    })
-                    .collect();
-                assert!(
-                    unsettled.is_empty(),
-                    "{label}: {unsettled:?} — a sampled child's process group had not \
-                         emptied when the sample was about to be classified and removed. \
-                         `TimedOut` means a descendant outlived a SIGKILL by \
-                         {GROUP_SETTLE_BOUND:?}, which is a fault of its own; \
-                         `NotItsOwnGroup` means there was no group to wait for and is \
-                         the same failure the assertion above names"
-                );
-
+                // A settle that did not happen never reaches this list: it
+                // is a hard failure inside `kill_git_child`, at the instant
+                // it is detected and before the sample reads anything (pass
+                // 2, finding 1). What is left to do here is report the cost.
                 // How long that cost, printed rather than asserted. It is
                 // normally one `kill(-pgid, 0)` answering `ESRCH`, and a
                 // sample that had to wait is the interesting one: see the
@@ -9282,6 +9270,28 @@ const _: () = assert!(
 /// refusal.
 const RESIDUE_INSPECTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// What the sampler knows about whether the sampled command is finished
+/// writing, before it reads the worktree.
+///
+/// PR #145 pass 2, finding 2. The retry's premise is that a second read sees
+/// the same tree as the first; that is true only when nothing of the sampled
+/// command is alive. On Unix the settle barrier establishes it. Elsewhere the
+/// only thing that does is the child having reached its own exit -- `git`
+/// waits for its checkout, so `Completed` covers the descendants too. A
+/// **killed** child on a platform with no barrier establishes nothing, and a
+/// refusal there is not retried: the sequence the reviewer wrote -- a sharing
+/// violation from a live checkout, retried, and the completed checkout then
+/// classified `After` under a kill sample -- must fail, not pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeAtRest {
+    /// The whole process group is gone (Unix, after `settle_group`).
+    Settled,
+    /// The child reached its own exit, and so did everything it waited for.
+    Completed,
+    /// Nothing established. A refusal is final on its first attempt.
+    Unknown,
+}
+
 /// One sample's inspection: what it answered, what it cost, and every refusal
 /// it met on the way -- including the ones a later attempt rescued.
 #[derive(Debug)]
@@ -9326,7 +9336,10 @@ struct Inspection {
 /// printed and written to the evidence file as though it were the one being
 /// spent. Measured against this code before the parameter was removed. Read
 /// here, the only way to change what is spent is to change what is reported.
-fn inspect_sample(mut inspect: impl FnMut() -> Result<ObjectResidue, UpstrokeError>) -> Inspection {
+fn inspect_sample(
+    quiescence: TreeAtRest,
+    mut inspect: impl FnMut() -> Result<ObjectResidue, UpstrokeError>,
+) -> Inspection {
     let bound = RESIDUE_INSPECTION_ATTEMPTS;
     let mut refusals = Vec::new();
     let mut attempts = 0;
@@ -9344,10 +9357,22 @@ fn inspect_sample(mut inspect: impl FnMut() -> Result<ObjectResidue, UpstrokeErr
                 // is reportable. Those were one question in the first version
                 // and that is finding 3: an error that was not retried was
                 // also not kept.
-                let again = retryable(&error);
+                // Two gates, and the record says which one closed. The
+                // failure's kind decides whether asking again could help;
+                // the quiescence decides whether asking again is *sound*,
+                // which is the one pass 2 found missing.
+                let kind_allows = retryable(&error);
+                let rest_allows = quiescence != TreeAtRest::Unknown;
+                let again = kind_allows && rest_allows;
                 refusals.push(format!(
                     "attempt {attempts}/{bound}{}: {error}",
-                    if again { "" } else { " (not retryable)" }
+                    if again {
+                        ""
+                    } else if !kind_allows {
+                        " (not retryable)"
+                    } else {
+                        " (not retried: the tree is not known to be at rest)"
+                    }
                 ));
                 if !again {
                     break;
@@ -9428,7 +9453,7 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
     //    attempt's words are kept, and the sample is unclassified rather than
     //    classified `None`.
     let mut calls = 0_u32;
-    let refused = inspect_sample(|| {
+    let refused = inspect_sample(TreeAtRest::Settled, || {
         calls += 1;
         Err(refusal())
     });
@@ -9469,7 +9494,7 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
     // 2. An inspection that stops refusing. What the retry is for: the answer
     //    is the class the residue really had.
     let mut calls = 0_u32;
-    let rescued = inspect_sample(|| {
+    let rescued = inspect_sample(TreeAtRest::Settled, || {
         calls += 1;
         if calls < RESIDUE_INSPECTION_ATTEMPTS {
             Err(refusal())
@@ -9491,7 +9516,7 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
     //    nothing. The bound is a ceiling on a failure, not a repetition of a
     //    healthy read.
     let mut calls = 0_u32;
-    let clean = inspect_sample(|| {
+    let clean = inspect_sample(TreeAtRest::Completed, || {
         calls += 1;
         Ok(ObjectResidue::After)
     });
@@ -9509,7 +9534,7 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
     //    and asking again 50 ms later cannot make it true; spending the bound
     //    on it would also delay the sample by 150 ms for nothing.
     let mut calls = 0_u32;
-    let refused_once = inspect_sample(|| {
+    let refused_once = inspect_sample(TreeAtRest::Settled, || {
         calls += 1;
         Err(UpstrokeError::Git {
             message: "worktree registration has an empty gitdir".to_owned(),
@@ -9542,7 +9567,7 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
     //    nobody could name. The retry may spare it from the verdict; §7 does
     //    not let it spare it from the record.
     let mut calls = 0_u32;
-    let masked = inspect_sample(|| {
+    let masked = inspect_sample(TreeAtRest::Settled, || {
         calls += 1;
         if calls == 1 {
             Err(UpstrokeError::Io {
@@ -9571,6 +9596,44 @@ fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
             .contains("corrupt-under-the-read"),
         "carrying the path, which is the whole of what makes it identifiable: {:?}",
         masked.refusals
+    );
+
+    // 6. **A refusal is not retried when the tree is not known to be at
+    //    rest** (PR #145 pass 2, finding 2). This is the reviewer's sequence
+    //    with the second half made to fail: on a platform with no settle
+    //    barrier, a killed `git worktree add` leaves its checkout running, the
+    //    first read meets a sharing violation, and the *same* closure would
+    //    answer `After` fifty milliseconds later because the checkout has
+    //    finished in the meantime. Retrying would record completion state
+    //    under a kill sample. The refusal has to be the answer -- the very
+    //    same case 2 above rescues when the tree is known to be at rest.
+    let mut calls = 0_u32;
+    let unrested = inspect_sample(TreeAtRest::Unknown, || {
+        calls += 1;
+        if calls == 1 {
+            Err(refusal())
+        } else {
+            Ok(ObjectResidue::After)
+        }
+    });
+    assert_eq!(
+        calls, 1,
+        "nothing vouched for the tree, so it is not asked again"
+    );
+    assert_eq!(unrested.attempts, 1);
+    assert_eq!(
+        unrested.answer, None,
+        "a refusal that could not be safely retried stays a refusal; `After` would have \
+         been a completed checkout filed under a kill"
+    );
+    assert!(
+        unrested
+            .refusals
+            .first()
+            .expect("the refusal is recorded")
+            .contains("not retried: the tree is not known to be at rest"),
+        "the record says which gate closed: {:?}",
+        unrested.refusals
     );
 }
 
@@ -9620,7 +9683,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
 
         let (args, cwd) = sampled_command(site, &fixture, &slot);
         let delay = budget.mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1));
-        kill_git_child(&cwd, &args, delay);
+        let quiescence = kill_git_child(&cwd, &args, delay);
 
         let target = ResidueTarget::new(&base).at(&path).from_base(&fixture.head);
         // Bounded retry, and then `.ok()`. The `.ok()` is what the tally
@@ -9631,7 +9694,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         // with defined observability, so every attempt's own words are kept
         // and go into that assertion's message. The bound and the argument
         // for retrying at all are at [`RESIDUE_INSPECTION_ATTEMPTS`].
-        let inspected = inspect_sample(|| classify_object_residue(site, &target));
+        let inspected = inspect_sample(quiescence, || classify_object_residue(site, &target));
         attempts.push(inspected.attempts);
         // **Two lists, because a refusal that a later attempt rescued is not
         // the same event as one that ended the bound** (PR #145 pass 1,
@@ -9640,6 +9703,20 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         // inside 50 ms and leave nothing behind.
         if !inspected.refusals.is_empty() {
             let line = format!("run {run}: {}", inspected.refusals.join(" | "));
+            // **Printed here, before `recover_sample` can panic** (PR #145
+            // pass 2, finding 3). The lists below reach stdout and the
+            // evidence file only after every sample has run, and a later
+            // sample's recovery panic unwinds through both of those without
+            // running either. Stdout at the point of detection is the
+            // record that survives an unwind; the artifact is the summary.
+            println!(
+                "residue inspection {site}: {} refusal, {line}",
+                if inspected.answer.is_some() {
+                    "rescued"
+                } else {
+                    "unrescued"
+                }
+            );
             if inspected.answer.is_some() {
                 rescued.push(line);
             } else {
@@ -10114,8 +10191,9 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// to `-pgid`, which is what production does. What the sampling test asserts
 /// of that, per launch, is the kernel's confirmation that the child leads its
 /// own group -- the deterministic half, and the half that is false for every
-/// child the pre-repair sampler spawned. What the kill *answered* is printed
-/// and not asserted, for the reason at [`Self::kill_group`]. **Unix only**:
+/// child the pre-repair sampler spawned. What the kill *answered* is asserted
+/// on Linux, where it is measured deterministic, and printed on Darwin, for
+/// the reason at [`Self::kill_group`]. **Unix only**:
 /// `std` offers no
 /// portable group kill, and the Windows half of production's containment is
 /// a Job Object private to `agent::proc`.
@@ -10155,14 +10233,6 @@ struct SampledChild {
     group_kill: Option<GroupKill>,
 }
 
-/// What the process-group kill did to one sampled child.
-///
-/// Three outcomes and not two, because "the kill was not delivered" and "there
-/// was no group of this child's own to deliver it to" are different failures
-/// with different repairs, and the second is also the one that must never be
-/// *attempted*: with `process_group(0)` gone the child sits in this test
-/// binary's group, and `kill(-pid, SIGKILL)` would then name whatever group
-/// happens to carry that id.
 /// How long the child's process group took to empty after the kill.
 ///
 /// PR #145 pass 1, finding 2. `kill(-pgid, SIGKILL)` **queues** signals and
@@ -10185,26 +10255,47 @@ enum GroupSettle {
     /// Empty, after this long.
     After(std::time::Duration),
     /// Still not empty at [`GROUP_SETTLE_BOUND`]. A descendant outliving a
-    /// `SIGKILL` by that much is a fault in its own right, so this is
-    /// asserted against rather than reported.
+    /// `SIGKILL` by that much is a fault in its own right, so this is a hard
+    /// failure **at the point it is detected**, inside `kill_git_child`,
+    /// before anything reads the worktree (PR #145 pass 2, finding 1: the
+    /// first version recorded it and let the sample go on to classify and
+    /// force removal against the writer it had just failed to wait for).
     TimedOut(std::time::Duration),
+    /// The existence query itself was refused with this `errno`.
+    ///
+    /// Pass 2, finding 1: `kill(-pgid, 0) != 0` is not proof the group is
+    /// gone. Only `ESRCH` is. `EPERM` means a group with that id exists and
+    /// this process may not signal it -- every member of *our* group is ours
+    /// to signal, so that is a foreign group wearing a recycled id, and
+    /// anything else is a bug. Neither is "settled", and both fail at the
+    /// point of detection.
+    Refused(i32),
     /// Not waited for, because the child never led a group of its own. The
     /// same refusal [`GroupKill::NotItsOwnGroup`] is, and the sampling test
     /// fails on it there.
     NotItsOwnGroup,
 }
 
-/// How long a sampled child's process group may take to empty after the kill.
+/// How long a sampled child may take to be reaped after the kill, and on
+/// Unix how long its process group may then take to empty.
 ///
-/// Generous by design: what it is guarding against is a descendant that
-/// **never** goes away, and a bound tight enough to catch a slow one would be
-/// a bound that reddens the suite on a loaded machine. A `SIGKILL`ed process
-/// that is not stuck in an uninterruptible read is gone in microseconds; the
-/// whole of this wait is normally the one `kill(-pgid, 0)` that answers
-/// `ESRCH`.
-#[cfg(unix)]
+/// One bound for both halves (pass 2, finding 1: the first version bounded
+/// only the second, after an unbounded `Child::wait`). Generous by design:
+/// what it is guarding against is a process that **never** goes away, and a
+/// bound tight enough to catch a slow one would be a bound that reddens the
+/// suite on a loaded machine. A `SIGKILL`ed process that is not stuck in an
+/// uninterruptible read is gone in microseconds; the whole of the group wait
+/// is normally the one `kill(-pgid, 0)` that answers `ESRCH`.
 const GROUP_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What the process-group kill did to one sampled child.
+///
+/// Three outcomes and not two, because "the kill was not delivered" and "there
+/// was no group of this child's own to deliver it to" are different failures
+/// with different repairs, and the second is also the one that must never be
+/// *attempted*: with `process_group(0)` gone the child sits in this test
+/// binary's group, and `kill(-pid, SIGKILL)` would then name whatever group
+/// happens to carry that id.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupKill {
@@ -10300,14 +10391,17 @@ impl SampledChild {
     /// is the shape whose children most often reach their own exit before the
     /// kill lands — `Refused(1)` against `Delivered`, one failed test in 1917.
     ///
-    /// So the answer is recorded and printed and **not asserted on**, which is
-    /// the treatment [`Child::kill`]'s own answer already has here and for a
-    /// related reason: what the call reports depends on whether the child was
-    /// alive at the instant it ran, that is a race, and a second observation
-    /// taken at a second instant cannot settle it from inside this process.
-    /// What *is* asserted is the half that is deterministic — that the kernel
-    /// says this child leads its own group, which is false for every child the
-    /// pre-repair sampler spawned.
+    /// So the answer is recorded and printed, and asserted **only where it is
+    /// measured deterministic**: on Linux, 640 of 640 kills answered
+    /// `Delivered`, `git add` included, so there it is asserted per launch and
+    /// catches a kill replaced by a constant. On Darwin it is printed with its
+    /// errno and not asserted, which is the treatment [`Child::kill`]'s own
+    /// answer already has here and for a related reason: what the call reports
+    /// depends on whether the child was alive at the instant it ran, that is a
+    /// race, and a second observation cannot settle it from inside this
+    /// process. Asserted everywhere is the half that is deterministic
+    /// everywhere — that the kernel says this child leads its own group, which
+    /// is false for every child the pre-repair sampler spawned.
     ///
     /// [`Child::kill`]: std::process::Child::kill
     #[cfg(unix)]
@@ -10332,8 +10426,28 @@ impl SampledChild {
         }
     }
 
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait()
+    /// Reap the child, within [`GROUP_SETTLE_BOUND`].
+    ///
+    /// Pass 2, finding 1: the ten-second bound on the group used to start
+    /// only after an unbounded `Child::wait`, so "bounded" described the
+    /// second half of the wait and not the first. Now one bound covers both,
+    /// and a leader that a `SIGKILL` does not reap inside it is the same
+    /// hard failure as a descendant that does not.
+    fn wait(&mut self) -> std::process::ExitStatus {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll the sampled git child") {
+                return status;
+            }
+            let waited = start.elapsed();
+            assert!(
+                waited < GROUP_SETTLE_BOUND,
+                "the sampled git child was not reaped {waited:?} after its kill; a leader a \
+                 SIGKILL does not end inside {GROUP_SETTLE_BOUND:?} is stuck in the kernel, \
+                 and nothing about its residue can be sampled"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
     }
 
     /// Wait until nothing is left in the child's process group.
@@ -10344,10 +10458,12 @@ impl SampledChild {
     /// this function itself prevents.
     ///
     /// `kill(-pgid, 0)` delivers no signal; it reports whether the group has a
-    /// member this process could signal. A non-zero answer is `ESRCH` when the
-    /// group is gone, and `EPERM` if the id has already been reused by a group
-    /// this process may not signal -- both of which mean *our* group is gone,
-    /// which is the question being asked, so the errno is not distinguished.
+    /// member this process could signal. **Only `ESRCH` is taken as absence**
+    /// (pass 2, finding 1). `EPERM` means a group with that id exists and is
+    /// not ours to signal -- a recycled id -- and is returned as
+    /// [`GroupSettle::Refused`] rather than folded into "gone", because the
+    /// question is whether *anything* is alive in that group, and a foreign
+    /// answer is not a no.
     ///
     /// What this buys is the premise the rest of the sample rests on: by the
     /// time the residue is classified and the tabled recovery runs, no
@@ -10368,6 +10484,12 @@ impl SampledChild {
             // query, it borrows nothing, and a negative pid asks it of the
             // group rather than of one process.
             if unsafe { libc::kill(-pid, 0) } != 0 {
+                // Only `ESRCH` is absence. Anything else is a group that
+                // exists and answered, and it is not ours.
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::ESRCH {
+                    return GroupSettle::Refused(errno);
+                }
                 return if asked == 0 {
                     GroupSettle::AtOnce
                 } else {
@@ -10384,7 +10506,7 @@ impl SampledChild {
     }
 }
 
-fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
+fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) -> TreeAtRest {
     let mut child = SampledChild::spawn(cwd, args);
     std::thread::sleep(after);
     // Kept, not discarded. A kill of a child that has already reached its own
@@ -10394,14 +10516,28 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
     // with how the child ended.
     let kill_error = child.kill().err().map(|error| error.to_string());
     // Reaped rather than discarded: this status is the whole observation.
-    let status = child.wait().expect("reap the sampled git child");
+    let status = child.wait();
     // **Then wait for the group, not just for the child** (PR #145 pass 1,
     // finding 2). The caller's next act is to classify the residue and force
     // the worktree's removal, and both of those race any descendant still
     // finishing a write. `kill` returns once the signals are queued, so
     // reaping the leader is not the barrier it looks like.
+    //
+    // **And fail here, not later** (pass 2, finding 1). A settle that did
+    // not happen is a live writer this sample is about to read past; the
+    // first version recorded it, let the sample classify and force removal,
+    // and refused it only after every sample had run -- which is a barrier
+    // that holds everywhere except where it matters.
     #[cfg(unix)]
     let settled = child.settle_group();
+    #[cfg(unix)]
+    assert!(
+        matches!(settled, GroupSettle::AtOnce | GroupSettle::After(_)),
+        "{settled:?} -- the sampled child's process group is not known to be empty, so \
+         nothing may read the worktree yet. `TimedOut` is a descendant that outlived a \
+         SIGKILL by {GROUP_SETTLE_BOUND:?}; `Refused` is a group with this id that is not \
+         ours to signal; `NotItsOwnGroup` is a child `process_group(0)` never reached"
+    );
     SAMPLED_LAUNCHES
         .lock()
         .expect("the launch log")
@@ -10416,6 +10552,23 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
             settled,
             end: launch_end(&status),
         });
+    // **What the caller may rely on** (pass 2, finding 2). On Unix the group
+    // is empty, asserted just above. Elsewhere the only rest this harness
+    // can vouch for is a child that reached its own exit: `git` waits for
+    // its checkout, so `Completed` means the descendants are done too, and a
+    // killed child on a platform with no barrier vouches for nothing.
+    #[cfg(unix)]
+    {
+        let _ = launch_end(&status);
+        TreeAtRest::Settled
+    }
+    #[cfg(not(unix))]
+    {
+        match launch_end(&status) {
+            LaunchEnd::Completed => TreeAtRest::Completed,
+            LaunchEnd::Killed | LaunchEnd::Failed(_) => TreeAtRest::Unknown,
+        }
+    }
 }
 
 /// The tabled recovery for whatever the sample left: forced removal of the

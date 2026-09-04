@@ -51,12 +51,27 @@ because this sampler has nothing to orphan yet.
 
 ## What the change that takes this up should do
 
-The same repair, which is four lines: spawn with `process_group(0)` on Unix, `SIGKILL` the group
-before the child, refuse to aim a group kill at a child the kernel does not confirm leads its own
-group, and record the outcome inside the kill so that deleting it is a compile error rather than a
-weaker sampler. `SampledChild` in `src/workspace_manager/tests.rs` is that repair written out, with
-its witness (`crate::agent::proc::child_leads_its_own_group`, production's own kernel oracle for the
-same fact) and the argument for the Unix-only `cfg`.
+The same repair, and it is **not** four lines — PR #145's first pass showed the four-line version
+insufficient, and a durable finding that advertises a known-insufficient repair is worse than none.
+It is two pieces:
+
+1. **The group kill.** Spawn with `process_group(0)` on Unix, `SIGKILL` the group before the child,
+   refuse to aim a group kill at a child the kernel does not confirm leads its own group, and record
+   the outcome inside the kill so that deleting it is a compile error rather than a weaker sampler.
+2. **The barrier, without which the first piece closes nothing.** `kill(-pgid, SIGKILL)` queues
+   signals and returns; `agent::proc::tests::kill_tree_settles_the_whole_unix_group_before_it_returns`
+   says so. So after reaping the leader, poll `kill(-pgid, 0)` until it answers **`ESRCH`** — only
+   `ESRCH` is absence; `EPERM` is a foreign group wearing a recycled id and is a failure, not a
+   settle — bounded, and treat a timeout as a hard failure **at the point it is detected**, before
+   the sample reads anything. Measured next door: on `git worktree add`, six to seven of every eight
+   samples still had a live group when the four-line version went on to classify and remove.
+
+`SampledChild` in `src/workspace_manager/tests.rs` is both pieces written out — `kill_group` and
+`settle_group` — with the witness for the first (`crate::agent::proc::child_leads_its_own_group`,
+production's own kernel oracle for the same fact), the Linux-only delivery assertion and why it is
+Linux-only, and the argument for the Unix `cfg`. Anything that inspects the residue afterwards must
+also refuse to *retry* a read unless the tree is known to be at rest, which is what `TreeAtRest`
+there is for.
 
 Doing it before a site with descendants is added is worth more than doing it after, because after
 means diagnosing an intermittent red first. The alternative — a comment on `sampled_argv` saying

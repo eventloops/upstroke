@@ -34,8 +34,9 @@ and an assertion and nothing else, and a repair for either leaves the other exac
 
 ## Failure sequence
 
-The engine dies — a crash, a `SIGKILL`, a host reset — while `WorkspaceManager::add_worktree` has a
-`git worktree add` in flight. Nothing kills that child: the engine's own Git children are never
+The engine dies — a crash, a `SIGKILL` — while `WorkspaceManager::add_worktree` has a
+`git worktree add` in flight. (Not a host reset: that ends the descendants with everything else and
+can leave only inert residue, which is the other finding's subject.) Nothing kills that child: the engine's own Git children are never
 killed, and there is no coordinator left to kill them. Its descendants (`git checkout` and what
 that spawns) are reparented and **keep writing into the new worktree**. On the next run, recovery
 takes the tabled before-phase action for the residue it finds, which is forced removal of the
