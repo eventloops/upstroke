@@ -1532,7 +1532,7 @@ fn kill_after_ephemeral_snapshot_commit_before_worktree_leaves_gc_owned_object()
             .expect("worktree records")
             .iter()
             .any(|record| record
-                .path
+                .path()
                 .starts_with(run.fixture.manager.execution_root().join("snapshots"))),
         "and no snapshot worktree was ever registered"
     );
@@ -1963,7 +1963,7 @@ fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scr
                 .worktree_records()
                 .expect("records")
                 .iter()
-                .any(|record| crate::util::same_path(&record.path, &worktree)),
+                .any(|record| crate::util::same_path(record.path(), &worktree)),
             "{element:?}: and it is no longer registered"
         );
         assert!(
@@ -2280,7 +2280,7 @@ fn sample_once(
                 .worktree_records()
                 .expect("records")
                 .iter()
-                .any(|record| crate::util::same_path(&record.path, &path));
+                .any(|record| crate::util::same_path(record.path(), &path));
 
         samples.push(Sample {
             argv,
