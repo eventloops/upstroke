@@ -30,8 +30,9 @@ keeps its number and says so. Each file ends with the mechanism that enforces it
 | 17 | Upstream references | [standards/17_standards_upstream_references.md](standards/17_standards_upstream_references.md) |
 
 [standards/SWEEP.md](standards/SWEEP.md) tracks the file-by-file cleanup under the §6 and §7
-rules tightened on 2026-09-03; until a file is listed there, those two sections bind only the code
-a change adds or rewrites, under the activation rule that file states.
+rules tightened on 2026-09-03 and §7's panic surface tightened on 2026-09-04; until a file is
+listed there, those sections bind only the code a change adds or rewrites, under the activation
+rule that file states.
 
 The hard requirements most changes meet head-on: edition 2024 with MSRV 1.85; no `.unwrap()` or
 `.expect()` in production and no `.unwrap()` in tests (§7, lint-enforced); `anyhow` only at the
