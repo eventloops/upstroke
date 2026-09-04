@@ -83,60 +83,62 @@ least one of:
 The reviewer's label does not decide this; the owner classifies, and a P1 whose failure needs
 speculative preconditions is reclassified down with a ledger row saying why.
 
-### When to stop repairing
+### When a pull request may be looping
 
 Repair rounds are not free. A push waits on both required contexts, and a repaired serious P1 costs
-another frontier pass under step 5. They also do not always converge. Two signals say a pull request
-should be re-scoped rather than repaired again. Both are the author's to raise the moment they
-appear, not the reviewer's to keep finding: step 5 makes the author responsible for the pull request
-until it lands, and that responsibility includes saying when it should not. Narrowing it is the
-author's too. Closing one that has already had a review pass is the owner's, as the merge is, and is
-delegated the same way.
+another frontier pass under step 5. They also do not always converge. Two signals say a pull
+request may be looping rather than converging, and each obliges the author to say so.
 
-**The premise was disproved.** Every change is made for a stated reason, and a review or a CI run
-can show that reason to be false: the failure it was meant to fix still happens on its own head,
-the measurement it rested on does not reproduce, the cause it named is not the cause.
+**This subsection never overrides step 5.** Neither signal withdraws a fix, closes a pull request
+or decides anything by itself. When one appears, the author writes in the body that it has
+appeared, what the evidence is, and why the pull request should continue — or proposes narrowing or
+closing it, and the decision goes where steps 5 and 7 already send it. Raising a signal is the
+author's, the moment it appears, and not the reviewer's to keep finding: step 5 makes the author
+responsible for the pull request until it lands, and that responsibility includes saying when it
+may not. Narrowing is the author's too. Closing a pull request that has already had a review pass
+is the owner's, as the merge is, and is delegated the same way.
 
-What has to be falsified is the stated premise, not the symptom. A message is not a defect and two
-faults print one sentence, so a failure that resembles the old one disproves nothing until it is
-fingerprinted to the defect the change names: the same test failing the same assertion for the same
-reason, or the change's own mechanism measured and shown not to have fired. A shared label does not
-reach that bar, and neither does one red run of a test already known to fail under load. Short of
-it the pull request is converging like any other, and step 5 is what applies.
+**The premise looks disproved.** Every change is made for a stated reason, and a review or a CI run
+can put that reason in doubt: the failure it was meant to fix happens again on its own head, the
+measurement it rested on does not reproduce, the cause it named looks not to be the cause. Say so,
+and say what the evidence does not establish as well as what it does. A message is not a defect and
+two faults print one sentence, so a recurrence is worth exactly its fingerprint — the same test
+failing the same assertion for the same reason, or the change's own mechanism measured and shown
+not to have fired, is evidence; a shared label is not, and neither is one red run of a test already
+known to fail under load. Then say which the pull request is: still converging on the defect it
+names, narrowed to the part that stands on its own, or finished, with what it learned kept as
+findings and the question it was answering re-opened. A narrowed pull request is retitled; step 6
+re-validates the live title, and a title still naming a withdrawn fix is the next finding.
 
-Once the premise is dead, stop. Findings keep arriving around a change whose purpose has gone, and
-repairing them buys nothing. Say plainly in the body that the premise failed, and say what the pull
-request should become: narrowed to the part that stands on its own, closed with what it learned
-kept as findings, or replaced by a change that re-opens the question it was answering. Retitle a
-narrowed pull request. Step 6 re-validates the live title, and a title still naming a withdrawn fix
-is the next finding.
+**Pass N+1 finds a P1 in what pass N's repair added.** Say that too, and say why the next repair
+converges where the last one did not: what the defect in the repair was, what the fix is, and what
+test holds it. An inverted condition with a regression test is not the same animal as a third round
+of machinery invented to keep the second round's machinery safe, and which one it is shows only
+when someone writes it down. When it is the second, the smaller change is the one to propose: keep
+what has survived a pass, drop the machinery the last round invented, and record what it was for as
+a finding carrying its proposal.
 
-**Pass N+1 finds a P1 in what pass N's repair added.** A repair that introduces a defect of the same
-severity as the one it fixed is evidence about the shape of the change, not a step towards landing
-it. Once that has happened, the next round starts from a smaller change: keep what has survived a
-pass, drop the machinery the last round invented, and record what that machinery was for as a
-finding carrying its proposal. Do not carry the machinery forward on the theory that one more check
-will settle it; that theory is what the signal denies.
-
-Neither signal is a licence to abandon a real defect, and neither relaxes step 5 for a pull request
-that is still converging. What is dropped is preserved where step 5 puts any open finding, one file
-each under `reviews/findings/`, saying what the change that takes it up should do, so the next
-person starts where this one stopped. A pull request that does not merge carries nothing into the
-tree by itself, so those files land through a change of their own.
+Neither signal is a licence to abandon a real defect. A relevant serious P1 is fixed and
+re-reviewed under step 5 whatever the signals say, and what a narrowing drops is preserved where
+step 5 puts any open finding: one file each under `reviews/findings/`, saying what the change that
+takes it up should do. A pull request that does not merge carries nothing into the tree by itself,
+so those files land through a change of their own. What a signal costs is a paragraph.
 
 **Worked example: PR #125.** It raised the forked helpers' READY budget from two seconds to ten to
-fix a macOS test-leg failure on master. At pass 4 the pull request's own CI showed that failure
-recurring on the exact reviewed head with the ten seconds elapsed: the change's own mechanism,
-measured, had not fired, which is the fingerprint this rule asks for rather than the old message
-seen again. It ran to pass 8 anyway, each round adding machinery to make the larger budget safe,
-and from pass 3 on every pass found a P1 in what an earlier round had added. After pass 7 the
-budget was withdrawn and the pull request narrowed; after pass 8 the coordinator closed it under
-the owner's written
-delegation. No code merged, and eleven deferred `PR125-CLOSE-*` rows in `reviews/FINDINGS.md` §49
-are what the eight passes left. The four passes after the disproof were not empty, and reached
-defects that had been on master all along. But five of those eleven rows are about machinery those
-rounds invented and the narrowing then discarded, and the rounds that produced them are what the
-two signals above exist to prevent.
+fix a macOS test-leg failure on master. At pass 4 its own CI failed on the exact reviewed head with
+the enlarged budget exhausted: the change had run, and the failure had happened anyway. That was
+not proof the premise was false — the cause was never established, and a parent that polls on time
+measures nothing about the child — but it is the evidence the first signal is about, and the body
+called that failure outside its diff rather than weighing it. The pull request ran to pass 8, and
+from pass 3 on every pass found a P1 in what an earlier round had added. After pass 7 the budget
+was withdrawn and the pull request narrowed; after pass 8 the coordinator closed it under the
+owner's written delegation, with no code merged. Eleven deferred `PR125-CLOSE-*` rows in
+`reviews/FINDINGS.md` §49 are what the eight passes left. Six name defects on master, three of them
+first surfaced at pass 6 or later, so the later passes were not empty. The other five are bound to
+the closing head `33604e6`, all of them originating after pass 4: they belong to the final attempt,
+and they went when the pull request closed. What the two signals ask for is the paragraph nobody
+wrote — at pass 4 that the premise was in doubt, with the evidence and the reason to continue, and
+from pass 3 on that each round's repair was producing the next round's P1.
 
 ### Tech debt sweeps
 
