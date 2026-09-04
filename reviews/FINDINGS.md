@@ -6344,10 +6344,19 @@ any frontier pass; the passes the coordinator launches append their rows below t
 findings are fixed and P3 and lower are recorded; the P3 rows marked `fixed` are ones the sweep
 itself repairs in the same commit, and the `deferred` rows each name the file that owns them.
 
-**The section number.** §52 landed on master with PR #131 (`c61880f`) and §53 with PR #109
-(`5f661fa`), so this section takes §54. Both merges are in this branch: `origin/master` `c61880f`
-was merged in first, and `5f661fa` after, the second with one append-at-the-tail conflict in this
-file, resolved as the union with master's §53 before this §54.
+**Why this section is in a file marked closed.** PR #138 (`d91e84a`) replaced this layout: a
+finding recorded after 2026-09-04 is its own file under `reviews/findings/`, which ends the merge
+conflicts this single file caused and retires the practice of sessions reserving section numbers
+from one another. §54 was written on 2026-09-04, before that landed, and pass 1 reviewed it here;
+converting twenty-six rows to the new layout mid-round would make the next pass's diff a wholesale
+move rather than the four repairs it has to check. So it is finished in place on the coordinator's
+direction, and it is the last section this file takes. **Every finding this session records from
+here on goes in `reviews/findings/`**, and the number it happens to carry — §54, the next after
+§52 from PR #131 and §53 from PR #109 — is an artefact of the convention it is the last user of.
+
+Four merges of `origin/master` are in this branch: `c61880f`, then `5f661fa` — one
+append-at-the-tail conflict in this file, resolved as the union with master's §53 before this §54
+— then `ff34031`, then `d91e84a`, the last two clean.
 
 **§6 and §7 in this file, re-derived by reading the tree rather than from recollection**
 (PR #136 pass 1, finding 5 corrects the first version of this paragraph, which said "no `Arc` and
