@@ -29,10 +29,7 @@ source, documentation, workflows, release machinery and this file.
      repaired head gets a fresh pass.
    - A relevant finding that is not serious is fixed at the author's discretion or logged as tech
      debt: a ledger row with a stable id, an honest failure sequence, and disposition `deferred`
-     or `accepted-risk`. Rows that outlive the pull request become one file each under `reviews/findings/`, named and
-     shaped as `reviews/findings/README.md` states. `reviews/FINDINGS.md` is the historical ledger
-     up to 2026-09-04 and is closed to new sections; its section numbers are cited from source and
-     design and do not move.
+     or `accepted-risk`.
    - A finding that is **not relevant to the change** — pre-existing, out of scope, or against an
      unswept file under a transitional standard (`standards/SWEEP.md`) — is logged the same way or
      `rejected` with the reason, and blocks nothing.
@@ -41,6 +38,15 @@ source, documentation, workflows, release machinery and this file.
      mutation witness is fixed whatever its severity. Either may be `rejected` only by a row
      showing the evidence invalid: a `MUST` the code does not breach, a witness that does not
      reproduce on the head.
+
+   **Every open finding gets its own file, and the file is deleted when it is resolved.** One file
+   per finding, never one per pull request and never one per review pass: a pass that returns six
+   findings produces six files. Severity leads the filename so `reviews/findings/` sorts worst
+   first and an `ls` is the outstanding work; name and shape them as `reviews/findings/README.md`
+   states. A finding fixed before merge needs no file at all — the body's ledger row is its
+   permanent record, and that row is required whatever the disposition. `reviews/FINDINGS.md` is
+   the same ledger up to 2026-09-04, closed to new sections; its section numbers are cited from
+   source and design and do not move.
 
    A repair-only push after a pass that found no serious P1 needs no second pass: the owner reads
    `git diff <reviewed> <head>`, confirms it contains those repairs and nothing else — never a
