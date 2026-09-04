@@ -287,8 +287,11 @@ pub fn check_bijection(
     // same invariant the constructor does.
     for (index, entry) in entries.iter().enumerate() {
         let key = entry.key();
-        if entries[..index].iter().any(|held| held.key() == key) {
-            // Already reported at its first occurrence.
+        if entries.iter().take(index).any(|held| held.key() == key) {
+            // Already reported at its first occurrence. `take(index)` rather
+            // than `entries[..index]`: §7 denies a panicking slice in
+            // production code, and a bound this loop's own `enumerate` makes
+            // safe is still a bound a later edit can move.
             continue;
         }
         let count = entries.iter().filter(|held| held.key() == key).count();

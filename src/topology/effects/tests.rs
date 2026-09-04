@@ -3352,10 +3352,14 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     // that exists for what no hook can reach.
     let mut hook = hook_entry(site, EntryPhase::Before);
     hook.label = EvidenceLabel::RecoveryProven;
-    hook.evidence = match sound.evidence.clone() {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!("the sound entry is recovery-proven"),
-    };
+    // An assertion naming the premise rather than an `unreachable!` arm: §7
+    // denies `unreachable!` in tests too, having no Clippy allowance to take,
+    // and a test that fails its own setup says which premise failed.
+    assert!(
+        matches!(sound.evidence, Evidence::RecoveryProven { .. }),
+        "the sound entry is recovery-proven"
+    );
+    hook.evidence = sound.evidence.clone();
     let error = FaultRegistry::new()
         .insert(hook.clone())
         .expect_err("a before-phase claiming recovery-proven evidence");
