@@ -5658,10 +5658,14 @@ cross-reference it; none of them restates it.
 Append-only. The §6/§7 sweep of `src/workspace_manager/hooks.rs` (PR #119) took three frontier
 passes: `a1b319c` (three findings), `6a13e1d` after the finding-2 repair (six findings), and
 `ac466e9` after the second repair and a base merge-in (six findings). Every verdict was
-`CHANGES_REQUIRED`, none P1. Under the owner's direction that a
-file's refinement pass fixes every finding, every row is `fixed` except the sweep queue, which
-PR #122 repairs. The macOS exit-budget observation this pull request also produced stays where it
-was filed, in §2 as `PR119-MACOS-PROC-SUSPEND-CONTINUE-EXIT-BUDGET`.
+`CHANGES_REQUIRED`, none P1. The pass-1 and pass-2 rows are `fixed` under the owner's direction
+of the time that a file's refinement pass fixes every finding, except the sweep queue, which
+PR #122 repairs. The pass-3 rows follow the owner's amendment 1 of 2026-09-04: on the sweep pull
+requests P1 and P2 findings are fixed and P3 and lower are recorded. The coordinator classed
+findings 1 and 3 P2, fixed in code; finding 2 is fixed by PR #122 through the base merge-in; and
+findings 4 to 6, body and ledger text, are corrected as text and recorded `fixed` with the docs
+commit. The macOS exit-budget observation this pull request also produced stays where it was
+filed, in §2 as `PR119-MACOS-PROC-SUSPEND-CONTINUE-EXIT-BUDGET`.
 
 | ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
 |---|---|---|---|---|---|---|---|---|
