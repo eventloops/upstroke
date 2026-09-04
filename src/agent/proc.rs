@@ -2495,13 +2495,12 @@ mod termination {
             if !lock_cleanup_paths(&cleanup_paths) {
                 unsafe { libc::_exit(1) };
             }
-            // Test subprocesses can hold READY back past the parent's deadline
-            // so the late-reaper path is driven deterministically.
-            let mut delay_left = ready_delay_ms;
-            while delay_left > 0 {
-                raw_sleep_10ms();
-                delay_left = delay_left.saturating_sub(10);
-            }
+            // Test subprocesses can hold READY back, past the parent's
+            // deadline or inside it, so both halves of the budget are driven
+            // deterministically. One sleep, not a chain of 10 ms ones: each
+            // wake on a loaded macOS runner overshoots, and four hundred of
+            // them turned a four-second delay into more than ten.
+            raw_sleep_ms(ready_delay_ms);
             reaper_loop(
                 parent,
                 command[0],
@@ -3157,12 +3156,8 @@ mod termination {
             close_inherited_fds(&[command[0], ack[1], wake[0], wake[1], probe[1]], open_max);
             // Test subprocesses can hold READY back past or inside the
             // parent's budget, as the reaper's
-            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS` does.
-            let mut delay_left = ready_delay_ms;
-            while delay_left > 0 {
-                raw_sleep_10ms();
-                delay_left = delay_left.saturating_sub(10);
-            }
+            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS` does, in one sleep.
+            raw_sleep_ms(ready_delay_ms);
             guard_loop(parent, command[0], ack[1], wake[0], probe[1], probe_pid);
         }
 
@@ -3558,6 +3553,27 @@ mod termination {
         }
     }
 
+    /// Sleep `ms` in one `nanosleep`, resumed after a signal from where it
+    /// left off; a fork-only helper's sleep, so no allocation and no Rust
+    /// timer.
+    fn raw_sleep_ms(ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        // The field types are the platform's; a delay that does not fit
+        // them is a test's mistake and sleeps for nothing.
+        let mut remaining = libc::timespec {
+            tv_sec: (ms / 1_000).try_into().unwrap_or(0),
+            tv_nsec: ((ms % 1_000) * 1_000_000).try_into().unwrap_or(0),
+        };
+        loop {
+            let result = unsafe { libc::nanosleep(&remaining, &mut remaining) };
+            if result == 0 || !last_errno_is_interrupted() {
+                return;
+            }
+        }
+    }
+
     fn raw_sleep_10ms() {
         let request = libc::timespec {
             tv_sec: 0,
@@ -3935,13 +3951,23 @@ mod termination {
 
     #[cfg(target_os = "macos")]
     fn helper_open_descriptors(pid: libc::pid_t) -> Option<usize> {
-        // `PROC_PIDLISTFDS` with no buffer answers with the size one would
-        // need: one `proc_fdinfo`, an `i32` and a `u32`, per open descriptor.
+        // `PROC_PIDLISTFDS` fills one `proc_fdinfo`, an `i32` and a `u32`,
+        // per open descriptor and answers with the bytes it filled. With no
+        // buffer it answers with the size of the descriptor table plus
+        // twenty entries, which is what a first run of this reported as the
+        // count; the count is the second call's answer.
         const PROC_PIDLISTFDS: libc::c_int = 1;
         const PROC_FDINFO_SIZE: usize = 8;
         // SAFETY: a null buffer of length zero asks only for the size.
-        let bytes = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-        usize::try_from(bytes)
+        let needed =
+            unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        let mut buffer = vec![0_u8; usize::try_from(needed).ok()?];
+        let length = libc::c_int::try_from(buffer.len()).ok()?;
+        // SAFETY: `buffer` is writable for exactly the length passed.
+        let filled = unsafe {
+            libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer.as_mut_ptr().cast(), length)
+        };
+        usize::try_from(filled)
             .ok()
             .map(|bytes| bytes / PROC_FDINFO_SIZE)
     }
