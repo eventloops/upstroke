@@ -676,7 +676,7 @@ pub struct WorkspaceManager {
 /// This matters because the engine kills agents as ordinary control flow rather than
 /// as an error path: the container runner reclaims on every cancellation, so removal
 /// *races* that closure instead of meeting it occasionally. Without the retry the
-/// engine reports a hard `Io` failure for a condition that was already resolving.
+/// engine reports a hard `Filesystem` failure for a condition that was already resolving.
 ///
 /// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
 /// so the first attempt succeeds — and the retry is not compiled in there. The bound
@@ -705,6 +705,31 @@ pub struct WorkspaceManager {
 /// reaches. Give either race the other's budget and both stop working: the handoff
 /// would sleep for a microsecond problem, and this would spin through a dead process's
 /// handles long before they closed.
+/// Record that a removal attempt has completed, so a test can observe the retry.
+///
+/// This is the only thing in this file that exists for a test, and it is here
+/// because nothing outside the loop can see an *attempt*. The funnel's `Before`
+/// phase — the last seam a test otherwise has — fires before the primitive is
+/// entered, so a control built on it can only assume that its first attempt ran
+/// against the condition it planted. That assumption is what
+/// `PR109-ORACLE-OBSERVES-TIMING-NOT-ATTEMPTS` records as unsound: a remover
+/// descheduled between the hook and the loop lets the condition clear first, and
+/// the retry-deleted mutant then passes.
+///
+/// In a production build this is the no-op below and the call compiles away. The
+/// `#[cfg(test)]` twin is declared at the **bottom** of this file, beside the
+/// other test-only declarations: `effects::production_region` truncates a source
+/// at its first `#[cfg(test)]`, so putting the twin here would take every funnel
+/// below it out of the census that proves this group has them
+/// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`). `#[cfg(not(test))]` carries no such
+/// cut, which is why this half can sit where it is read.
+///
+/// The shape — a `#[cfg(test)]` item and a `#[cfg(not(test))]` twin of the same
+/// name — is `engine::coordinator::legacy_append_hooks`'s, already in the tree.
+#[cfg(not(test))]
+#[inline]
+fn note_removal_attempt(_attempt: u32) {}
+
 #[cfg(windows)]
 fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
@@ -714,7 +739,12 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
 
     let mut attempt = 1_u32;
     loop {
-        let error = match fs::remove_dir_all(path) {
+        let outcome = fs::remove_dir_all(path);
+        // After the attempt has returned and before its result is interpreted,
+        // so an observer released from here is released against an attempt that
+        // has already happened rather than one that is about to.
+        note_removal_attempt(attempt);
+        let error = match outcome {
             Ok(()) => return Ok(()),
             // The path is gone, which for a *removal* is the requested outcome.
             // On Windows this is exactly how a delete-pending name resolves: an
@@ -742,7 +772,13 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(path) {
+    let outcome = fs::remove_dir_all(path);
+    // One attempt, and it is recorded like the Windows arm's so that "how many
+    // attempts did this removal make" is a question with the same meaning on
+    // both platforms — and so the production no-op above is never dead code on
+    // the leg that does not compile the retry.
+    note_removal_attempt(1);
+    match outcome {
         // Same convergence rule as the Windows arm, so the two agree on what a
         // removal *means*. Unix reaches it only by racing another remover rather
         // than by delete-pending, but the answer is the same: the path is gone.
@@ -3310,6 +3346,14 @@ fn common_git_dir(inside: &Path) -> Result<PathBuf, UpstrokeError> {
 /// disagrees silently is the one a census stands on.
 #[cfg(test)]
 pub(crate) mod fixture;
+
+/// The `#[cfg(test)]` half of the removal-attempt seam; see the
+/// `#[cfg(not(test))]` twin beside `remove_tree_once_handles_close`.
+#[cfg(test)]
+#[inline]
+fn note_removal_attempt(attempt: u32) {
+    fixture::note_removal_attempt(attempt);
+}
 
 #[cfg(test)]
 mod tests;

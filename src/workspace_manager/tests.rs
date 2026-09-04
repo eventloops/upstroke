@@ -680,197 +680,155 @@ fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
 /// leaves a handle, so it proves the condition exists but cannot be re-run to
 /// prove a fix. Here the handle is held on purpose.
 ///
-/// The second half is the one that matters. A handle held **past** the retry
-/// budget must still fail: a retry that waits forever is not a fix, it is a
-/// hang, and one that swallows the error hides a genuinely locked worktree.
+/// **The oracle is the attempt count, not the clock and not the outcome.** Both
+/// cases assert that the removal made more than one attempt, reading the count
+/// from `fixture::observe_removal_attempts`; the primitive records an attempt
+/// after it has returned and before its result is interpreted. Everything else
+/// in this test exists to make that count mean something.
 ///
-/// That half is held by a **handshake rather than a timer**, and the difference
-/// is a measured failure rather than a preference. It first held the file for
-/// five seconds and read the margin over the retry budget — 39 sleeps of 25ms,
-/// so under a second — as decisive. It is not. Those five seconds had to cover
-/// *everything* between the handle opening and the last retry attempt, and on a
-/// starved scheduler two separate stretches can eat them: the loop's own wall
-/// clock, since `STEP` bounds sleeping rather than elapsed time and every wake
-/// queues behind the runnable threads ahead of it; and the gap before removal
-/// even begins, since this thread must also be scheduled between `ready.recv()`
-/// and the call. Observed once on a 4-vCPU Windows guest at `--test-threads=16`:
-/// the holder released, a late attempt succeeded, and the control that exists to
-/// prove a held worktree is *reported* watched it get removed instead.
+/// The first version had no such reading and could not get one: nothing outside
+/// the loop can see an attempt, and the funnel's `Before` phase — the closest
+/// seam a test otherwise has — fires *before* the primitive is entered. So the
+/// closing case asserted the retry indirectly, by expecting a removal to
+/// succeed against a handle it *believed* was open on the first attempt. That
+/// belief is a scheduling assumption, and the frontier pass on `86fa1d8` showed
+/// it is unsound in both directions:
 ///
-/// **Which stretch consumed the margin was not measured.** Raising `STEP`
-/// reproduces the first one deterministically, but no per-attempt timing was
-/// captured from the original occurrence, so nothing here claims the loop itself
-/// outlived the timer. The handshake settles both without deciding between
-/// them, because it stops the oracle depending on a timer that has to *beat*
-/// the loop. Two wall-clock quantities remain and neither is that race:
-/// `FAIL_SAFE`, a watchdog whose firing is provably a removal that really did
-/// take longer than it; and the closing case's hold, which the paragraph below
-/// measures from the start of removal rather than from the handle's opening.
+/// * **The retry-deleted mutant survived.** Deschedule the remover between the
+///   hook and the loop, let the holder's timed release expire first, and the
+///   single remaining attempt succeeds unaided. `ATTEMPTS = 1` then passes.
+/// * **And correct code could fail.** The same interleaving, unmutated, is a
+///   removal that never needed the retry, which the old oracle also could not
+///   tell from one that did.
 ///
-/// The **first** half is anchored to a handshake too, for a different reason:
-/// it is what makes the retry falsifiable. `SignalOnRemoval` releases the holder
-/// into its 300ms hold from *inside* `remove_worktree` — at the remove funnel's
-/// `Before` phase, past `revalidate_removal` and one `exists`/`contained` pair
-/// short of the loop itself — so the handle is open when the first attempt runs
-/// and that attempt must fail. Delete the retry (`ATTEMPTS = 1`) and this case
-/// reports a refusal where it expects a removal. Timed from the handle's
-/// *opening* instead, as it was, the 300ms could expire before removal even
-/// began; the first attempt would then succeed unaided and an engine with no
-/// retry left in it would pass this test unchanged.
+/// Reading the count settles both, and the release is now driven from the same
+/// seam. The holder does not close on a timer or on the funnel's signal; it
+/// closes when it is told that **attempt 1 has already completed**, and the
+/// observer then waits for the close before letting the loop continue. So
+/// attempt 1 provably ran with the handle open, attempt 2 provably ran after it
+/// closed, and neither fact depends on which thread the scheduler favours. The
+/// 300ms hold and the five-second timer that preceded it are both gone, and
+/// with them `FIND-109-CLOSING-CASE-HOLDER-STARVATION`, which existed only
+/// because the release could not be ordered against an attempt.
 ///
-/// A duration survives there because nothing outside the loop can observe an
-/// *attempt*. The funnel is the last seam before the primitive, so the hook is
-/// the whole of what a test is allowed to see without instrumenting production
-/// code. What it removes is everything the five-second version raced: the
-/// fixture, the `ready` handshake, this thread's scheduling, and the funnel's
-/// own preamble. The hold is sized against what remains rather than against the
-/// budget — 300ms against a loop that sleeps 39 x 25ms.
+/// The **held** case is the other half, and it is where the retry has to stop:
+/// a handle held past the whole budget is a locked worktree, and reporting it
+/// is the behaviour a retry that waits forever would destroy. That case never
+/// releases until the assertions have run, so "was the handle still open?" is
+/// not a question about scheduling there — the only thing that can close it is
+/// `Holder`'s drop.
 ///
-/// **That margin is against delay, not against starvation, and the difference
-/// is this control's limit.** Spread a per-wakeup delay evenly and the margin
-/// widens, since the loop needs 39 wakeups to this thread's two and no uniform
-/// delay lets it finish first. What it does not survive is *this thread
-/// specifically* not being scheduled while the remover runs: descheduled for
-/// the length of the loop's window, the holder has not closed by the fortieth
-/// attempt, a correct bounded implementation returns `Err`, and the case fails
-/// on correct behaviour. Closing "after the first attempt" is what would settle
-/// it, and nothing outside the loop can observe an attempt — the funnel is the
-/// last seam, and a partial `remove_dir_all` deletes nothing at all when the
-/// held name sorts first, which was measured rather than assumed. So the
-/// residual is recorded in `reviews/FINDINGS.md` instead of being papered over
-/// here.
-///
-/// A handshake alone would deadlock on the one regression this control is for,
-/// which is why `FAIL_SAFE` exists below: if the retry ever became unbounded,
-/// removal would never return, the sender would never drop, and the holder would
-/// wait behind a test that is itself waiting for removal — a hang to the CI job
-/// timeout in place of a failure. The timer version caught that case by accident;
-/// the fail-safe catches it on purpose, and reports it as the unbounded retry it
-/// is.
+/// **Every wait is bounded, and bounded by one deadline rather than one each.**
+/// `FAIL_SAFE` is taken once, before the holder starts, and every receive in
+/// the test and in the holder waits only for what is left of it. The previous
+/// shape gave each of the holder's two receives its own 600 seconds, so a
+/// wedged removal could hold the job for twenty minutes and be killed by the
+/// Windows job timeout with no verdict at all — which is the opposite of what a
+/// fail-safe is for. `CODING_STANDARDS.md` §12.
 #[cfg(windows)]
 #[test]
 fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::time::Instant;
 
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    /// How long the held case waits for the handshake before releasing anyway.
+    /// One deadline for the whole of one case, and the only wall clock left.
     ///
-    /// It exists so an unbounded retry is *reported here* rather than hanging
-    /// until CI kills the job with no verdict at all. It bounds **both** of the
-    /// holder's waits — for the funnel's signal, and then for the release — so
-    /// there is no window in which this thread is parked with nothing bounding
-    /// it. `CODING_STANDARDS.md` §12: every wait is bounded, and the bound
-    /// bounds a wedged producer.
+    /// It converts a wedge into a verdict: if the retry ever became unbounded,
+    /// removal would never return, the holder would never be released and the
+    /// test would hang to the CI job timeout with nothing to read. Taken once
+    /// and shared, so the *sum* of every wait is bounded by it — the shape it
+    /// replaces gave two receives 600 seconds each, and nearly twenty minutes
+    /// is longer than the Windows job has.
     ///
     /// **What a fire establishes is the bound it crossed, and not the reason.**
-    /// Firing on the first wait says removal did not reach the funnel in time;
-    /// firing on the second says it entered and did not return. Neither says
-    /// *why*, because an unbounded retry and a thread that stopped being
-    /// scheduled read identically from here. The assertions below say only the
-    /// former, and quote the elapsed time so the reader can tell them apart.
-    /// The claim this doc used to make — that a fire proves an unbounded retry —
-    /// was more than the mechanism can deliver.
+    /// An unbounded retry and a thread that stopped being scheduled read
+    /// identically from here. The assertions say only the former and quote the
+    /// elapsed time so a reader can tell them apart.
     ///
-    /// **It bounds exactly the interval the test measures.** The window opens
-    /// when the holder observes `removal_started`, which `SignalOnRemoval` sends
-    /// from inside `remove_worktree` — necessarily after `started` was taken, so
-    /// the window opens after `took` began and a fire on that second wait
-    /// implies `took >= FAIL_SAFE` rather than merely suggesting it. (The first
-    /// wait opens earlier, at the handle's opening, which is the price of
-    /// bounding it at all; its fire is reported as the different thing it is.)
-    /// The first version
-    /// opened the window at the handle's opening instead, so it covered the
-    /// handshake and this thread's scheduling too — the same mistake the
-    /// five-second timer made, at a different scale, and the reason the
-    /// measurements below did not size the interval being bounded.
-    ///
-    /// **The value is a wedge detector, not a percentile.** Two minutes was tried
+    /// Ten minutes is a wedge detector, not a percentile. Two minutes was tried
     /// and fired on a full-suite run of a loaded guest — `CODING_STANDARDS.md`
-    /// §12's own warning, that a bound short enough to expire on a loaded runner
-    /// has become the signal itself. Measured with the whole suite running, the
-    /// locked case's `remove_worktree` returns in **1.0s** unpinned and
-    /// **6.5–7.6s** pinned to 4 CPUs at `--test-threads=16`; what consumed two
-    /// minutes was never re-derived, and nothing here claims those figures
-    /// describe its tail. Ten minutes is chosen because it is far above every
-    /// value measured, well inside the CI job timeout, and self-diagnosing if it
-    /// ever fires on a loop that was merely slow: the assertion quotes the
-    /// elapsed time.
+    /// §12's own warning, that a bound short enough to expire on a loaded
+    /// runner has become the signal itself. Measured with the whole suite
+    /// running, the locked case's `remove_worktree` returns in **1.0s** unpinned
+    /// and **6.5–7.6s** pinned to 4 CPUs at `--test-threads=16`.
     const FAIL_SAFE: std::time::Duration = std::time::Duration::from_secs(600);
 
-    /// Releases the handshake and joins the holder — while unwinding, too.
+    /// Releases the holder, waits for it, and re-raises whatever it panicked with.
     ///
-    /// Dropping a `JoinHandle` only detaches its thread. Without this guard a
-    /// failing assertion left `Fixture::drop` — a single best-effort
-    /// `remove_dir_all` that ignores its result — racing a handle that had not
-    /// closed yet, so a failed run could leave its scratch worktree behind.
+    /// Three things, all of which the previous shape got wrong and the frontier
+    /// pass named. Dropping a `JoinHandle` only detaches its thread, so a failing
+    /// assertion left `Fixture::drop` — one best-effort `remove_dir_all` that
+    /// ignores its result — racing a handle that had not closed. Joining without
+    /// a bound is the unbounded wait §12 forbids. And discarding the join result
+    /// makes a holder panic invisible: the file drops, the closing case can then
+    /// succeed without ever exercising a retry, and §10 asks that a worker panic
+    /// be a *defined* outcome rather than a silent one.
+    ///
+    /// So: disconnect first, because the holder blocks on that channel and
+    /// joining ahead of it is the deadlock; wait for the thread to signal or
+    /// disappear, bounded by what is left of the deadline; then join, which by
+    /// then returns at once, and re-raise a panic on the thread that was
+    /// waiting for it. During an unwind a panic here would abort the process, so
+    /// there it is reported instead — `std::thread::panicking` is the test.
+    ///
     /// Declared *after* the fixture, so it drops *before* it.
-    ///
-    /// The holder blocks on the *other* channel first, so `SignalOnRemoval`
-    /// below is declared after this guard and disconnects before it: a run that
-    /// unwinds before removal is reached must free both waits, in that order, or
-    /// the join here is the deadlock.
     struct Holder {
-        release: Option<mpsc::Sender<()>>,
+        close_now: Option<mpsc::Sender<()>>,
+        finished: Option<mpsc::Receiver<()>>,
         handle: Option<std::thread::JoinHandle<()>>,
+        deadline: Instant,
     }
 
     impl Drop for Holder {
         fn drop(&mut self) {
-            // Disconnect before joining, always: the holder blocks on this
-            // sender, so joining first is the deadlock.
-            drop(self.release.take());
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    /// Releases the holder from inside the removal, and only there.
-    ///
-    /// The funnel consults this immediately before the primitive that contains
-    /// the retry loop, which is the closest a test can get to "the first attempt
-    /// is about to run" without instrumenting `remove_tree_once_handles_close`
-    /// itself. Every answer is `Injection::Proceed`, so what the funnel *does*
-    /// is exactly what `NoHooks` would have made it do.
-    struct SignalOnRemoval {
-        start: Option<mpsc::Sender<()>>,
-    }
-
-    impl EffectHooks for SignalOnRemoval {
-        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-            if site == EffectSiteId::Worktree(WorktreeSite::Remove) && phase == HookPhase::Before {
-                // Taken, so the signal is once and the sender is dropped here:
-                // the holder has its value, and nothing is left holding a
-                // channel open behind the guard's join.
-                if let Some(start) = self.start.take() {
-                    // An error means the holder is already gone, which is not
-                    // this observer's business to report.
-                    let _ = start.send(());
+            drop(self.close_now.take());
+            let Some(handle) = self.handle.take() else {
+                return;
+            };
+            if let Some(finished) = self.finished.take() {
+                // `Disconnected` is the thread's stack going away, which is the
+                // same news as its explicit send and arrives on a panic too.
+                if let Err(mpsc::RecvTimeoutError::Timeout) =
+                    finished.recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+                {
+                    if std::thread::panicking() {
+                        eprintln!(
+                            "the holder had not finished within {FAIL_SAFE:?} and the test was \
+                             already unwinding; the thread is left detached"
+                        );
+                    } else {
+                        panic!(
+                            "the holder had not finished within {FAIL_SAFE:?} of this case \
+                             starting, so joining it here would be the unbounded wait the \
+                             deadline exists to prevent"
+                        );
+                    }
+                    return;
                 }
             }
-            Injection::Proceed
-        }
-
-        // Never `Injection::Error`, and nothing is wrapped, so there is no
-        // refusal of its own to explain.
-        fn refusal_cause(&self) -> Option<String> {
-            None
+            if let Err(payload) = handle.join() {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "the holder thread panicked while the test was already unwinding; its \
+                         payload cannot be re-raised without aborting"
+                    );
+                } else {
+                    std::panic::resume_unwind(payload);
+                }
+            }
         }
     }
 
-    // `Some(d)`: a process whose last handle closes `d` after removal is
-    // *entered*, which is the window the retry exists to cross and the reason
-    // the hold starts at the handshake rather than at the open. `None`: one that
-    // is still holding when the assertion runs, which is a locked worktree
-    // however long the loop took to reach that conclusion.
-    for (hold, expected_removal) in [
-        (Some(std::time::Duration::from_millis(300)), true),
-        (None, false),
-    ] {
+    // `true`: a process whose last handle closes once the first attempt has
+    // provably run, which is the window the retry exists to cross. `false`: one
+    // that is still holding when the assertion runs, which is a locked worktree
+    // however many attempts the loop spent reaching that conclusion.
+    for (releases_after_the_first_attempt, expected_removal) in [(true, true), (false, false)] {
         let fixture = Fixture::created("closing-handle");
         let slot = fixture.task("alpha", 1);
         fixture
@@ -885,19 +843,21 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
         // A file inside the worktree, held open with the sharing mode a running
         // process has. Opened on another thread so the handle outlives this
         // statement -- exactly the shape of a process that has exited while its
-        // last handle is still closing. Neither case starts counting until
-        // removal does: the closing case then releases on a timer, the held case
-        // only when `Holder` is dropped.
+        // last handle is still closing.
         let target = fixture.manager.execution_root().join(slot.relative());
         let held = target.join("held-by-the-dying-child");
         fs::write(&held, b"bytes the child had open").expect("plant the file");
-        let (opened, ready) = mpsc::channel();
-        let (start, removal_started) = mpsc::channel::<()>();
-        let (release, released) = mpsc::channel::<()>();
+
+        let deadline = Instant::now() + FAIL_SAFE;
+        let (opened, ready) = mpsc::channel::<()>();
+        let (close_now, may_close) = mpsc::channel::<()>();
+        let (closed, has_closed) = mpsc::channel::<()>();
+        let (finished_here, finished) = mpsc::channel::<()>();
         let fail_safe_fired = Arc::new(AtomicBool::new(false));
         let fired = Arc::clone(&fail_safe_fired);
-        let signal_never_arrived = Arc::new(AtomicBool::new(false));
-        let unsignalled = Arc::clone(&signal_never_arrived);
+        let close_never_seen = Arc::new(AtomicBool::new(false));
+
+        let held_by_the_child = held.clone();
         let handle = std::thread::spawn(move || {
             // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
             // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
@@ -908,95 +868,109 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
             let file = fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ)
-                .open(&held)
+                .open(&held_by_the_child)
                 .expect("hold the file open the way a git child does");
             opened.send(()).expect("announce the handle is held");
-            // Nothing about the hold begins until the removal funnel says it
-            // has. `Ok(())` is the signal and `Disconnected` is the run
-            // unwinding before removal was reached -- a handle held past *that*
-            // would only obstruct the fixture's own cleanup -- and both
-            // continue.
-            //
-            // Bounded, because §12 asks that every wait bound a wedged producer
-            // and this one has one. A retry that never returns never reaches
-            // the funnel's `After` and never fails either, so an unbounded wait
-            // here could leave this thread parked with the fail-safe below --
-            // the thing that turns a hang into a verdict -- never armed at all.
-            if let Err(mpsc::RecvTimeoutError::Timeout) = removal_started.recv_timeout(FAIL_SAFE) {
-                unsignalled.store(true, Ordering::SeqCst);
-            }
-            match hold {
-                Some(hold) => std::thread::sleep(hold),
-                // Held until `Holder` drops the sender, which happens only once
-                // the assertions have run -- and during unwinding, so a failing
-                // assertion releases the handle rather than leaving the tree
-                // locked against the fixture's own cleanup. A timer here could
-                // only ever prove the loop is shorter than that timer, which is
-                // the assumption that made this test a flake.
-                //
-                // `Disconnected` is that release. `Timeout` is the fail-safe, and
-                // reaching it means removal never returned -- recorded rather
-                // than acted on, so the assertion below can name the unbounded
-                // retry instead of whatever the freed handle then allowed.
-                None => {
-                    if let Err(mpsc::RecvTimeoutError::Timeout) = released.recv_timeout(FAIL_SAFE) {
-                        fired.store(true, Ordering::SeqCst);
-                    }
-                }
+            // `Ok(())` is the closing case, told from inside the loop that an
+            // attempt has completed. `Disconnected` is the held case, where the
+            // only thing that closes this handle is `Holder`'s drop, after the
+            // assertions have run -- and during an unwind too, so a failing
+            // assertion does not leave the tree locked against the fixture's own
+            // cleanup. `Timeout` is the fail-safe, recorded rather than acted on
+            // so the assertion below can name it.
+            if let Err(mpsc::RecvTimeoutError::Timeout) =
+                may_close.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                fired.store(true, Ordering::SeqCst);
             }
             drop(file);
+            // Both are best-effort: an error means the observer or the guard is
+            // already gone, which is not this thread's business to report.
+            let _ = closed.send(());
+            let _ = finished_here.send(());
         });
         // After `fixture`, so it drops before it. Nothing below may `join` this
-        // thread by hand: the guard owns both halves precisely so the
-        // disconnect-then-join order holds on every path out of the loop.
+        // thread by hand: the guard owns every half precisely so the
+        // disconnect-then-wait-then-join order holds on every path out.
+        // Cloned before the guard takes the original, because the closing
+        // case's observer needs one of its own. The held case drops it below:
+        // that channel disconnects only when the *last* sender goes, and the
+        // guard's is meant to be the last.
+        let observer_may_tell = close_now.clone();
         let _holder = Holder {
-            release: Some(release),
+            close_now: Some(close_now),
+            finished: Some(finished),
             handle: Some(handle),
+            deadline,
         };
-        // After the guard, so it drops before it: an unwind between here and the
-        // call leaves the holder waiting on `removal_started`, and the guard's
-        // join would wait on that wait.
-        let mut signal = SignalOnRemoval { start: Some(start) };
+        // Declared after the guard, so it drops *before* it: the closing case's
+        // observer owns a second sender, and the held case's channel cannot
+        // disconnect until every sender is gone.
+        let observing = if releases_after_the_first_attempt {
+            let tell = observer_may_tell;
+            let wait_for_the_close = has_closed;
+            let unseen = Arc::clone(&close_never_seen);
+            super::fixture::observe_removal_attempts(Box::new(move |attempt| {
+                if attempt != 1 {
+                    return;
+                }
+                // Ordered against the attempt rather than against a clock: the
+                // attempt has already returned, so it ran with the handle open,
+                // and waiting for the close here means the next attempt runs
+                // after it. Both facts hold whatever the scheduler does.
+                let _ = tell.send(());
+                if wait_for_the_close
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_err()
+                {
+                    unseen.store(true, Ordering::SeqCst);
+                }
+            }))
+        } else {
+            // Neither is wanted here, and both must go before the wait below:
+            // the sender would keep `may_close` connected past the guard's
+            // drop, which is the hang the deadline would then have to catch.
+            drop(observer_may_tell);
+            drop(has_closed);
+            super::fixture::observe_removal_attempts(Box::new(|_| {}))
+        };
         ready
-            .recv()
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("the handle is held before removal is attempted");
 
-        // `started` is taken before the call, and the signal is sent from within
-        // it, so the fail-safe window cannot open before `took` begins. That is
-        // what makes a fire mean `took >= FAIL_SAFE` rather than merely suggest
-        // it.
-        let started = std::time::Instant::now();
-        let outcome = fixture.manager.remove_worktree(&mut signal, &slot);
+        let started = Instant::now();
+        let outcome = fixture.manager.remove_worktree(&mut NoHooks, &slot);
         let took = started.elapsed();
-        // Both cases depend on the hold having started where the funnel says it
-        // did. Without this a site that stopped matching would leave the holder
-        // waiting, and the closing case would report a refused removal -- a true
-        // statement about a test that never ran its own premise.
-        assert!(
-            signal.start.is_none(),
-            "the remove funnel must have signalled the holder, or nothing below \
-             is about the retry at all"
-        );
+        let attempts = observing.count();
+
         // Read before the outcome is interpreted, so the diagnostic names the
-        // real fault rather than whatever the freed handle then permitted. The
-        // first says removal never reached the funnel; the second says it
-        // reached it and did not come back. Both quote the elapsed time, since
-        // that is the number saying which bound needs changing.
-        assert!(
-            !signal_never_arrived.load(Ordering::SeqCst),
-            "removal did not reach the remove funnel within {FAIL_SAFE:?} of the handle being \
-             opened, and then returned in {took:?}: whatever this run measured it was not the \
-             retry, because the hold had not begun while the loop ran"
-        );
+        // real fault rather than whatever the freed handle then permitted.
         assert!(
             !fail_safe_fired.load(Ordering::SeqCst),
-            "the fail-safe released the handle after {FAIL_SAFE:?} with removal still inside the \
-             funnel, and removal then returned in {took:?} as {}. That establishes the bound it \
-             crossed -- a removal slower than the fail-safe -- and not the reason for it: an \
-             unbounded retry is why this bound exists, but a thread that stopped being scheduled \
-             reads the same",
+            "the fail-safe released the handle {FAIL_SAFE:?} after this case began, with removal \
+             still inside the funnel, and removal then returned in {took:?} as {} after \
+             {attempts} attempt(s). That establishes the bound it crossed -- a removal slower \
+             than the fail-safe -- and not the reason for it: an unbounded retry is why this \
+             bound exists, but a thread that stopped being scheduled reads the same",
             if outcome.is_ok() { "Ok" } else { "Err" }
         );
+        assert!(
+            !close_never_seen.load(Ordering::SeqCst),
+            "the holder never reported closing the handle within {FAIL_SAFE:?}, so the attempts \
+             after the first ran against an unknown state and this run measured nothing: \
+             {attempts} attempt(s) in {took:?}"
+        );
+        // The whole oracle. Both cases require a real retry, so the mutant that
+        // deletes it (`ATTEMPTS = 1`) fails here by the count -- not by whether
+        // a handle happened to still be open when the single attempt ran, which
+        // is a race the test used to be on the wrong side of.
+        assert!(
+            attempts > 1,
+            "the removal must have retried: the loop reported {attempts} attempt(s) in {took:?}, \
+             so nothing here is about the retry. A single attempt means either the budget is \
+             gone or the primitive was never entered"
+        );
+
         if expected_removal {
             outcome.expect("removal retries across the closing handle");
             assert!(
@@ -1066,6 +1040,131 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
             );
         }
     }
+}
+
+/// The attempt seam counts attempts, and the Unix arm makes exactly one.
+///
+/// The seam exists for the Windows control above, which is the only place a
+/// retry can happen — so on every other leg it would be code nothing exercises,
+/// and a mis-wiring of it (counting calls rather than attempts, never resetting
+/// between observations, or the production no-op silently taking the place of
+/// the `#[cfg(test)]` twin) would show up only on the one platform whose suite
+/// is hardest to run. This pins it where CI runs it every time.
+///
+/// One attempt, not "at least one": `remove_tree_once_handles_close` is called a
+/// second time for the Git admin directory when a killed `worktree add` left an
+/// empty `commondir`, and this fixture is an ordinary worktree, so a count above
+/// one here would mean the seam is counting something other than what it says.
+#[cfg(not(windows))]
+#[test]
+fn a_removal_records_the_one_attempt_the_unix_arm_makes() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let fixture = Fixture::created("attempt-seam");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("the intent must be durable");
+    fixture
+        .manager
+        .add_worktree(&mut NoHooks, &slot, &fixture.head)
+        .expect("the worktree to remove");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let ordinals = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let seen = Arc::clone(&ordinals);
+    let observing = super::fixture::observe_removal_attempts(Box::new(move |attempt| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        seen.fetch_max(attempt, Ordering::SeqCst);
+    }));
+
+    fixture
+        .manager
+        .remove_worktree(&mut NoHooks, &slot)
+        .expect("an unheld worktree is removed on the first attempt");
+
+    assert_eq!(
+        observing.count(),
+        1,
+        "the removal made one attempt and the seam must say so"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the observer runs once per attempt, not once per removal call"
+    );
+    assert_eq!(
+        ordinals.load(Ordering::SeqCst),
+        1,
+        "the attempt is numbered from one, which is what the retry assertions read"
+    );
+}
+
+/// The observation is per-thread, and ends when its guard is dropped.
+///
+/// Both halves matter to the control above. The suite runs at
+/// `--test-threads=16` and several of its tests remove worktrees, so a
+/// process-wide counter would report a neighbour's removals as this test's; and
+/// a guard that left its observer installed would hand the closure to whatever
+/// ran next on the same thread, which for a test that unwinds is a closure
+/// holding channels nobody is reading.
+#[cfg(not(windows))]
+#[test]
+fn the_attempt_observation_is_this_threads_and_ends_with_its_guard() {
+    let fixture = Fixture::created("attempt-seam-scope");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("the intent must be durable");
+    fixture
+        .manager
+        .add_worktree(&mut NoHooks, &slot, &fixture.head)
+        .expect("the worktree to remove");
+
+    let observing = super::fixture::observe_removal_attempts(Box::new(|_| {}));
+    // A removal on ANOTHER thread must not reach this observation. The second
+    // fixture is that thread's own, because two removals of one slot are a
+    // different test.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let other = Fixture::created("attempt-seam-elsewhere");
+            let slot = other.task("beta", 1);
+            other
+                .manager
+                .write_intent(&mut NoHooks, &slot)
+                .expect("the intent must be durable");
+            other
+                .manager
+                .add_worktree(&mut NoHooks, &slot, &other.head)
+                .expect("the worktree to remove");
+            other
+                .manager
+                .remove_worktree(&mut NoHooks, &slot)
+                .expect("removed on its own thread");
+        });
+    });
+    assert_eq!(
+        observing.count(),
+        0,
+        "another thread's removal is not this observation's attempt"
+    );
+
+    drop(observing);
+    // With the guard gone the observer is uninstalled, so this removal runs
+    // through the seam and reaches nothing.
+    fixture
+        .manager
+        .remove_worktree(&mut NoHooks, &slot)
+        .expect("an unheld worktree is removed");
+    let after = super::fixture::observe_removal_attempts(Box::new(|_| {}));
+    assert_eq!(
+        after.count(),
+        0,
+        "a fresh observation starts at zero rather than at the last one's total"
+    );
 }
 
 /// The Windows half of `expected_failures_refusals[0]`: a **junction** is a

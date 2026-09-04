@@ -18,7 +18,9 @@ use super::*;
 
 // `OsStr` came from the parent's import list until the `m4-workspace` split
 // moved its last production user into a child; named here for the same reason.
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // -----------------------------------------------------------------------
@@ -26,6 +28,102 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // -----------------------------------------------------------------------
 
 pub(crate) static SCRATCH: AtomicU32 = AtomicU32::new(0);
+
+// -----------------------------------------------------------------------
+// Observing the removal retry
+// -----------------------------------------------------------------------
+
+/// What to run after each of this thread's removal attempts.
+///
+/// A named alias because the raw shape trips `clippy::type_complexity`, and
+/// because the two `thread_local!` slots below read better for having it.
+type AttemptObserver = Box<dyn FnMut(u32)>;
+
+// Attempts `remove_tree_once_handles_close` has made **on this thread**, and
+// the observer to run after each.
+//
+// Thread-local rather than global, and that is the whole reason it is sound:
+// the suite runs tests in parallel and several of them remove worktrees, so a
+// process-wide counter would be another test's number as often as this one's.
+// The primitive runs on the thread that called `remove_worktree`, so a
+// thread-local counts exactly the removals the observing test drove.
+//
+// `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN` is why the parent's half of this seam
+// is declared at the bottom of `src/workspace_manager.rs` rather than beside
+// the primitive: `effects::production_region` truncates a source at its first
+// `#[cfg(test)]`, so a `#[cfg(test)]` item above the funnels would take every
+// one of them out of the census that proves the Worktree group has them.
+//
+// `//` rather than `///`: rustdoc does not document a macro invocation, and
+// `-D unused-doc-comments` says so.
+thread_local! {
+    static REMOVAL_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
+    static REMOVAL_ATTEMPT_OBSERVER: RefCell<Option<AttemptObserver>> =
+        const { RefCell::new(None) };
+}
+
+/// A live observation of this thread's removal attempts, ended by dropping it.
+///
+/// Held by the observing test for exactly as long as the observation is wanted;
+/// its `Drop` uninstalls the observer, so a test that unwinds cannot leave a
+/// closure behind for whatever runs next on this thread.
+pub(crate) struct AttemptObservation {
+    /// Not `Send`: the counter and the observer are this thread's.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl AttemptObservation {
+    /// Attempts made since the observation began.
+    pub(crate) fn count(&self) -> u32 {
+        REMOVAL_ATTEMPTS.with(Cell::get)
+    }
+}
+
+impl Drop for AttemptObservation {
+    fn drop(&mut self) {
+        REMOVAL_ATTEMPT_OBSERVER.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = None;
+            }
+        });
+    }
+}
+
+/// Start counting this thread's removal attempts, running `observer` after each.
+///
+/// The observer runs **on the removing thread, after the attempt has already
+/// returned**, which is the property the closing-handle control is built on: a
+/// test that releases a held handle from here knows the attempt it is releasing
+/// against has completed, rather than hoping it has. Nothing outside the loop
+/// can establish that, which is why this seam exists at all.
+pub(crate) fn observe_removal_attempts(observer: AttemptObserver) -> AttemptObservation {
+    REMOVAL_ATTEMPTS.with(|count| count.set(0));
+    REMOVAL_ATTEMPT_OBSERVER.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = Some(observer);
+        }
+    });
+    AttemptObservation {
+        _not_send: PhantomData,
+    }
+}
+
+/// Record that attempt `attempt` has completed, and run the observer.
+///
+/// Called from `super::note_removal_attempt`, the `#[cfg(test)]` half of the
+/// primitive's seam. `try_borrow_mut` rather than `borrow_mut` so that an
+/// observer which somehow removes a tree of its own is a no-op here instead of
+/// a panic inside production code.
+pub(crate) fn note_removal_attempt(attempt: u32) {
+    REMOVAL_ATTEMPTS.with(|count| count.set(attempt));
+    REMOVAL_ATTEMPT_OBSERVER.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(observer) = slot.as_mut() {
+                observer(attempt);
+            }
+        }
+    });
+}
 
 /// A scratch directory unique to this process *and* to this call, because
 /// the suite runs tests in parallel and two fixtures sharing a directory
