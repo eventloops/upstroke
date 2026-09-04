@@ -1477,6 +1477,103 @@ impl EffectHooks for ExchangeAtBefore {
     }
 }
 
+/// A prefix that resolves to a regular file cannot carry components below
+/// it, and the filesystem said so; rejoining them lexically would hand back
+/// exactly the unverified path `canonical_prefix` exists not to. Reported as
+/// `NotADirectory` at the file, on every platform.
+#[test]
+fn canonical_prefix_refuses_a_prefix_that_is_a_regular_file_with_components_below_it() {
+    let tree =
+        acquire(&std::env::temp_dir(), "canonical-file-prefix").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
+    let file = real.join("file");
+    fs::write(&file, "not a directory\n").expect("plant the file");
+    let error = canonical_prefix(&file.join("child"))
+        .expect_err("a regular file cannot carry components below it");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &file && source.kind() == std::io::ErrorKind::NotADirectory
+        ),
+        "the error names the file and says it is not a directory: {error}"
+    );
+}
+
+/// Restores a directory's mode on drop, so a fixture made unreadable or
+/// unwritable for one assertion is reclaimable again whatever the assertion
+/// did.
+#[cfg(unix)]
+struct RestoreMode {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755))
+            .expect("restore the directory's mode");
+    }
+}
+
+/// `add_worktree` read its intent with `is_file()`, which folds every
+/// metadata failure into `false`: an `intents/` the process cannot search
+/// answered `AddWithoutIntent`, "its durable intent does not exist", for an
+/// intent that was there. A read failure is an error naming the intent.
+/// Evaluated on the Unix legs, where a mode bit binds a non-root user.
+#[cfg(unix)]
+#[test]
+fn an_intent_that_cannot_be_read_is_an_error_and_not_an_absent_intent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("intent-unreadable");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let _restore = RestoreMode {
+        path: intents.clone(),
+    };
+    fs::set_permissions(&intents, fs::Permissions::from_mode(0o000)).expect("make it unsearchable");
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut NoHooks, &slot, &fixture.head)
+        .expect_err("an intent that cannot be read is not an intent that is absent");
+    let intent = fixture.manager.intent_path(&slot);
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &intent),
+        "the error names the intent it could not read: {error}"
+    );
+}
+
+/// `remove_execution_root` discarded the result of removing an empty
+/// scaffolding directory with `let _ =`, so a scaffolding directory nothing
+/// could remove kept the root and the caller learnt only `Ok(false)`. The
+/// failure now names the directory. Evaluated on the Unix legs, where a
+/// mode bit binds a non-root user.
+#[cfg(unix)]
+#[test]
+fn a_scaffolding_directory_that_cannot_be_removed_is_reported_not_swallowed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("scaffolding-unremovable");
+    let root = fixture.manager.execution_root().to_path_buf();
+    let _restore = RestoreMode { path: root.clone() };
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o555))
+        .expect("make the root unwritable");
+
+    let error = fixture
+        .manager
+        .remove_execution_root(&mut NoHooks)
+        .expect_err("a scaffolding directory that cannot be removed is reported");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path.starts_with(&root) && path != &root),
+        "the error names the scaffolding directory it could not remove: {error}"
+    );
+}
+
 /// A **deletion** revalidates the chain, and refuses before it acts
 /// (`PR5-WORKSPACE-009`).
 ///
