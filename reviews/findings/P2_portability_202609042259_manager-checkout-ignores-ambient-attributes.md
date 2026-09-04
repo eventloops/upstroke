@@ -21,6 +21,13 @@ checked-out content against what it wrote fails on that machine alone.
 The fixture's own door does not reach it: this module clears the environment for the commands **it**
 builds, and the manager's are not among them.
 
+## Why this pull request does not fix it
+
+Pre-existing, in `src/workspace_manager.rs`, the parent, which is queue row 11 and reserved last by
+amendment 8 so that its sweep reads every child's call sites. Under `MAINTAINING.md`'s triage clause
+a finding against an unswept file is logged and blocks nothing; this pull request's brief forbids
+editing the parent for the same reason.
+
 ## What the change that takes this up should do
 
 Pin the attributes source where the manager's commands are built, beside the `core.hooksPath`,

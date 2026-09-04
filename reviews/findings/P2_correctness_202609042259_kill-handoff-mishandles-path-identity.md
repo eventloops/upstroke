@@ -22,6 +22,14 @@ environment read is a third defect at the same site.
 
 Reproduced by the pass-3 reviewer at the exact head.
 
+## Why this pull request does not fix it
+
+Pre-existing, in a file this pull request does not sweep: both lines are master's — verified at
+`943ae61`, `hand_off` at `scaffold.rs:1103` with `to_string_lossy()` at 1106, and the
+`std::env::var(...).expect(...)` read at 1401 — and `src/engine/topology/scaffold.rs` is
+byte-identical to master at this pull request's head. Under `MAINTAINING.md`'s triage clause a
+finding against an unswept file is logged and blocks nothing; that is the rule and not an exception.
+
 ## What the change that takes this up should do
 
 Carry the path as bytes end to end, or refuse a non-UTF-8 root explicitly rather than altering it.

@@ -42,5 +42,11 @@ Three shapes were tried and all three were faulted by a frontier pass:
 Authenticate the handoff, or accept that the fixture cannot own an adopted tree. A parent cannot
 prove it owns a tree its child created, and a child that dies by `std::process::abort()` cannot
 hand anything back. Any design that closes this needs the token to survive a process boundary —
-which is a design question for `rundir::scratch_tree`, not a repair to a fixture. Until then both
-removals stay untokened and this file stays open.
+which is a design question for `rundir::scratch_tree`, not a repair to a fixture.
+
+**Beyond reach, not out of scope.** Deferring for scope would promise that a later sweep of this
+file picks it up; no sweep of this file can, because the remedy is not in it. **A later pass that
+labels this P1 or P2 escalates to the owner rather than re-deferring it** — three shapes have been
+tried under four frontier passes and each was faulted, so a fifth attempt from inside a fixture is
+not a plan. Until an authenticated handoff exists, both removals stay untokened and this file stays
+open.

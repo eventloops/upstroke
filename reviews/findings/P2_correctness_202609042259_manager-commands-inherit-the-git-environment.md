@@ -23,6 +23,12 @@ Measured on git 2.43.0 for the fixture's own commands: with `GIT_DIR` set, `git 
 -b main` creates no repository at `<fresh>` at all, re-initialises the one `GIT_DIR` names, and exits
 0. The fixture's commands are immune from this pull request; the manager's are not.
 
+## Why this pull request does not fix it
+
+Pre-existing, in `src/workspace_manager.rs`, the parent, which is queue row 11 and reserved last by
+amendment 8. Under `MAINTAINING.md`'s triage clause a finding against an unswept file is logged and
+blocks nothing; this pull request's brief forbids editing the parent for the same reason.
+
 ## What the change that takes this up should do
 
 Clear and rebuild the environment where the manager's commands are built, as this pull request does

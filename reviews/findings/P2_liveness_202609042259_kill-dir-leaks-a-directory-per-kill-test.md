@@ -24,6 +24,14 @@ already been reclaimed. Measured separately on the build box the same day: 1,221
 `/tmp`, 996,414 of them `upstroke-*` older than six hours, and deleting those moved inodes from 68%
 to 60%.
 
+## Why this pull request does not fix it
+
+Pre-existing, in a file this pull request does not sweep — `kill_dir` is master's, unchanged here,
+and `src/engine/topology/scaffold.rs` is byte-identical to master at this pull request's head. Under
+`MAINTAINING.md`'s triage clause a finding against an unswept file is logged and blocks nothing;
+that is the rule itself and not an exception granted to this pull request. Reopening the file to fix
+it would also break the one-command check that the withdrawn kill-scratch protocol is really gone.
+
 ## What the change that takes this up should do
 
 The class is repository-wide rather than fixture-local, and this box has been stopped by it twice.
