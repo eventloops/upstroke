@@ -1070,7 +1070,10 @@ fn the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read() 
     // A committed run has a `run.lock` from P2. Taken and released through the
     // real API, so the file on disk is the one a live run leaves behind.
     drop(RunLock::acquire(&public).expect("the run lock"));
-    assert!(exists(&rundir::lock_file(&public)), "the lock file is there");
+    assert!(
+        exists(&rundir::lock_file(&public)),
+        "the lock file is there"
+    );
     assert_eq!(
         rundir::classify_run_dir(&public),
         RunDirClass::Committed,

@@ -254,14 +254,11 @@ pub fn prove_private_half_ownership(
     // in a free function the suite can assert directly, and the reachable
     // shapes go through the whole proof. See
     // [`canonical_public_or_refusal`].
-    let canonical_public = match canonical_public_or_refusal(
-        public,
-        fs::canonicalize(public),
-        &owner.public_dir,
-    ) {
-        Ok(path) => path,
-        Err(reason) => return PrivateHalfOwnership::Retained(reason),
-    };
+    let canonical_public =
+        match canonical_public_or_refusal(public, fs::canonicalize(public), &owner.public_dir) {
+            Ok(path) => path,
+            Err(reason) => return PrivateHalfOwnership::Retained(reason),
+        };
     let disagreements = [
         (OwnerField::RunId, owner.run_id.clone(), basename.clone()),
         (
@@ -392,13 +389,21 @@ pub(super) fn canonical_public_or_refusal(
 /// caller has already failed to read once — it is reached only from conjunct
 /// 1's error arm — and [`super::read_dir_names`] used to answer `[]` for a
 /// `read_dir` that failed, which is this function's `Bare` arm and the
-/// reclaiming one. A transient whole-process descriptor exhaustion (`EMFILE`,
-/// `ENFILE`) fails the classification probe's `open`, the marker read and this
-/// listing in the same moment; the plan became `ReclaimPublicOnly`, which
+/// reclaiming one. Under a failure that refuses the listing while the census's
+/// earlier gates still answer — a public directory that can be searched but not
+/// listed is the measured one — the plan became `ReclaimPublicOnly`, which
 /// carries no commit-record check anywhere on its path, and
-/// [`super::remove_public_husk`] then listed the directory again after the
-/// transient had cleared and removed a committed run's public half,
-/// `events.jsonl` included.
+/// [`super::remove_public_husk`] then listed the directory again once the
+/// failure had cleared and removed a committed run's public half,
+/// `events.jsonl` included. That sequence is driven through the real census in
+/// `engine::topology::startup::tests::
+/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`.
+///
+/// A whole-process descriptor exhaustion is **not** that failure: `EMFILE`
+/// refuses `run.lock` as well, [`super::is_running`] calls a lock it cannot
+/// inspect held, and the census skips the husk before reaching this proof. The
+/// refusal here is a second, independent point of the same rule, not a
+/// restatement of that gate.
 ///
 /// So a listing that did not answer is [`RetainReason::ListingUnreadable`]: no
 /// token, nothing deleted, the husk reported with the error that stopped the

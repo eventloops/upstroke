@@ -909,11 +909,20 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
 /// per-entry error with `flatten()`, so "I could not read this directory" and
 /// "this directory is empty" were the same value — and empty is the *reclaiming*
 /// answer at `unbound_shape` and the *nothing to remove* answer in
-/// [`remove_public_husk`]. Under a whole-process descriptor exhaustion
-/// (`EMFILE`, `ENFILE`, which are ordinary on a busy machine and transient) the
-/// classification probe's `open`, the marker read and this listing fail
-/// together, and a committed run's public half was removed on the evidence that
-/// it was empty.
+/// [`remove_public_husk`]. A failure that refuses this listing while the
+/// census's earlier gates still answer therefore removed a committed run's
+/// public half on the evidence that it was empty: measured with a public
+/// directory that can be searched but not listed, where the classification
+/// probe's `open` is refused, [`is_running`] still opens `run.lock` and
+/// answers "free", the marker read finds nothing and this listing is refused —
+/// `engine::topology::startup::tests::
+/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`.
+///
+/// A **whole-process** descriptor exhaustion is not that failure and is
+/// deliberately not claimed as one: `EMFILE` refuses the `run.lock` open too,
+/// [`is_running`] maps every non-`NotFound` error to "held", and the census
+/// skips the husk before it reaches any of this. That gate is the same rule
+/// one layer up; this function is the same rule where the deletion is.
 ///
 /// So the answer is a `Result` and every caller decides for itself. The two on
 /// the reclaim path both decide the same way — refuse — and this function makes

@@ -2499,17 +2499,24 @@ fn a_public_husk_removal_that_fails_partway_leaves_the_marker_that_locates_it() 
 /// `SWEEP-CLASSIFY-009`: a committed run whose directory could not be read
 /// is **not** an empty one, and its public half is still there afterwards.
 ///
-/// The mechanism, in the order it happens. A transient whole-process
-/// descriptor exhaustion — `EMFILE`, `ENFILE`, ordinary on a busy machine —
-/// fails the classification probe's `open`, the marker read at conjunct 1
-/// and the listing under it in the same moment. `read_dir_names` answered
-/// `[]` for that failed listing and `[]` is `unbound_shape`'s `Bare` arm, so
-/// the census classified `Husk`, the proof answered `NothingBound(Bare)` and
-/// the plan became `ReclaimPublicOnly` — which carries no commit-record check
-/// anywhere on its path. Both call sites do the same thing with that answer
-/// (`engine::topology::startup::apply`'s `ReclaimPublicOnly` arm and
-/// `create.rs`'s `stat_after_error`): they call `remove_public_husk`, which
-/// lists the directory a **second** time, after the transient has cleared,
+/// **This is a unit witness of the fold, not of the census.** It calls
+/// classify, prove and remove directly, so it never reaches `scan` or
+/// `is_running`; the census-level sequence — including which failures get
+/// past those gates and which do not — is
+/// `engine::topology::startup::tests::
+/// the_census_refuses_to_reclaim_a_committed_run_whose_listing_it_cannot_read`,
+/// and that is where the production claim lives. Pass 1 of this pull request's
+/// review found the earlier version of this comment claiming an `EMFILE`
+/// sequence that `is_running` gates one layer up, and it was right.
+///
+/// The fold itself, in the order it happens: the marker read at conjunct 1 and
+/// the listing under it both fail, `read_dir_names` answered `[]` for the
+/// failed listing, `[]` is `unbound_shape`'s `Bare` arm, so the proof answers
+/// `NothingBound(Bare)` and the plan is `ReclaimPublicOnly` — which carries no
+/// commit-record check anywhere on its path. Both call sites do the same thing
+/// with that answer (`engine::topology::startup::apply`'s `ReclaimPublicOnly`
+/// arm and `create.rs`'s `stat_after_error`): they call `remove_public_husk`,
+/// which lists the directory a **second** time, once the failure has cleared,
 /// and removes what it finds.
 ///
 /// So the fixture is that sequence and nothing else: the answer is taken
@@ -2687,7 +2694,10 @@ fn two_entries_with_one_lossy_rendering_stay_two_entries() {
         "whose lossy renderings are the same, or this witnesses nothing"
     );
     write(&public.join(raw), b"the entry a lossy listing loses");
-    write(&public.join(neighbour), b"the valid neighbour it was removed in place of");
+    write(
+        &public.join(neighbour),
+        b"the valid neighbour it was removed in place of",
+    );
 
     let listed = read_dir_names(&public).expect("the husk lists");
     let distinct: std::collections::BTreeSet<&std::ffi::OsString> = listed.iter().collect();
@@ -2697,7 +2707,9 @@ fn two_entries_with_one_lossy_rendering_stay_two_entries() {
         "two entries collapsed to one name in the listing: {listed:?}"
     );
     assert!(
-        listed.iter().all(|name| public.join(name).symlink_metadata().is_ok()),
+        listed
+            .iter()
+            .all(|name| public.join(name).symlink_metadata().is_ok()),
         "every name the listing gives must name an entry that is there: {listed:?}"
     );
 
