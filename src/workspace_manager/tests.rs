@@ -673,7 +673,7 @@ fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
 /// A process the engine killed can still be closing its handles, and on Windows
 /// that makes `remove_dir_all` answer `ERROR_SHARING_VIOLATION` for a worktree
 /// that is about to become removable. `remove_worktree` retries across that
-/// window rather than reporting a hard `Io` failure.
+/// window rather than reporting a hard `Filesystem` failure.
 ///
 /// This is the deterministic form of what the residue sampler hits at random:
 /// the sampler kills a real `git` child at an unseeded point and *sometimes*
@@ -1019,8 +1019,21 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
                 "and the worktree is still there, which is what the error says: {}",
                 refusal_of(&error)
             );
-            let (io_path, code) = match &error {
-                UpstrokeError::Io { path, source } => (Some(path.as_path()), source.raw_os_error()),
+            // `Filesystem`, and the operation is matched rather than assumed.
+            // Master's sweep of this module split the two variants by §7's
+            // operation-context rule -- a removal that fails did not fail to
+            // *read* -- so `remove_worktree` now maps this failure to
+            // `Filesystem { operation: "remove" }`. That split reached this
+            // branch through a base merge that was textually clean, which is
+            // why the destructure below went on compiling against a variant the
+            // engine no longer returns: `code` and the path both fell to `None`
+            // and the two assertions after them could not pass on any run.
+            let (refused_path, code) = match &error {
+                UpstrokeError::Filesystem {
+                    operation: "remove",
+                    path,
+                    source,
+                } => (Some(path.as_path()), source.raw_os_error()),
                 _ => (None, None),
             };
             assert!(
@@ -1033,16 +1046,20 @@ fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
                 "the refusal must be the kernel's answer about the held handle: {}",
                 refusal_of(&error)
             );
-            // ...and it must have come from the removal itself. The code alone
-            // cannot say so: `revalidate_removal` reports its own `Io` failures --
-            // an unreadable `.git/worktrees` answers error 5 too -- before the
-            // funnel is entered, leaving the target on disk, so both assertions
-            // above would hold without the loop ever running. Only
-            // `remove_tree_once_handles_close`'s error names the contained
-            // worktree, and `same_path` compares directories rather than
-            // spellings, which is what the earlier path cannot match.
+            // ...and it must have come from the removal itself. Neither the code
+            // nor the variant alone says so. `revalidate_removal` runs before
+            // the funnel is entered and reports its own failures -- an
+            // unreadable `.git/worktrees` answers error 5 too -- leaving the
+            // target on disk, so the `exists` assertion above would hold without
+            // the loop ever running; the variant now excludes *that* step, since
+            // those failures are reads and stay `Io`, but not the funnel's other
+            // removals, which carry the same operation against the `locked` file
+            // and the admin directory. Only `remove_tree_once_handles_close`'s
+            // error names the contained worktree, and `same_path` compares
+            // directories rather than spellings, which is what the earlier path
+            // cannot match.
             assert!(
-                io_path.is_some_and(|path| crate::util::same_path(path, &target)),
+                refused_path.is_some_and(|path| crate::util::same_path(path, &target)),
                 "the refusal must name the worktree the loop failed to remove, so that it \
                  is the budget being reported and not an earlier step: {}",
                 refusal_of(&error)
