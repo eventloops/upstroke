@@ -1577,11 +1577,16 @@ impl WorkspaceManager {
     /// recovery-proven evidence would no longer describe the funnel's real
     /// child.
     ///
-    /// So the transcription is gone. There is one list per command, the funnel
-    /// and the sampler both read it, and
-    /// `no_sampled_funnel_builds_its_argv_from_a_literal` fails if a funnel
-    /// grows an argument that does not come through here. It does **not** make
-    /// the kill go through the process funnel — that is
+    /// So the transcription is gone. There is one list per command, and the
+    /// funnel and the sampler both read it, which is what makes a divergence
+    /// impossible *by transcription*. What it does not make impossible is a
+    /// funnel appending an argument beside the list:
+    /// `no_sampled_funnel_builds_its_argv_from_a_literal` is a tripwire over
+    /// this file's source that catches a careless inline literal and can be
+    /// walked around three ways, which that test documents in full and PR
+    /// #136's rows record. **It is not a guarantee that the sampled child runs
+    /// the funnel's argv**, and this comment previously said it was. It does
+    /// **not** make the kill go through the process funnel either — that is
     /// `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` in `reviews/FINDINGS.md`, owned by
     /// PR6/PR7 with `src/runner/**` frozen — and this comment does not claim it
     /// does.

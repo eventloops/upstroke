@@ -3377,9 +3377,8 @@ const HOSTILE_SLOT_NAMES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every public primitive that turns a `&Slot` into a path refuses a
-/// hostile name — over a list **derived from this module's own
-/// signatures**, not from the ones the author remembered.
+/// Every public primitive **this scan can see** that turns a `&Slot` into a
+/// path refuses a hostile name.
 ///
 /// `a_slot_name_that_could_escape_the_root_refuses` exercises exactly one
 /// primitive, `write_intent`. That is the `bounded_grid` failure this
@@ -3392,9 +3391,22 @@ const HOSTILE_SLOT_NAMES: &[(&str, &str)] = &[
 /// are `pub`, so the name is caller data at every one of those entry
 /// points.
 ///
-/// The derivation is the scan below: a primitive that can refuse is a
-/// `pub fn` taking `slot: &Slot` and returning a `Result`. Adding one
-/// without an arm here fails this test by name.
+/// **What the scan is, and what it cannot see** (PR #136 pass 3, finding 2;
+/// noticed by this sweep at its start and not acted on, which is the honest
+/// provenance). The set comes from matching two exact spellings in this
+/// module's source — `slot: &Slot` and `-> Result<` — so it is a tripwire and
+/// not a derivation. A primitive spelt `target: &Slot`, or one returning
+/// `std::result::Result<…>`, is **invisible to it**: the derived set, this
+/// grid and the scan's own positive control all stay green while that
+/// primitive turns caller data into a path with nothing refusing for it. The
+/// `seen_fns > 30` check below is a floor that says the scan read something,
+/// not a boundary that says it read everything, and §12 asks for the second.
+///
+/// So the claim is: *adding a primitive spelt the way the existing eleven are
+/// spelt, without an arm here, fails this test by name.* Adding one spelt
+/// otherwise does not, and no third census is being written to chase it — two
+/// text censuses in this file have now been walked around three times between
+/// them. The row records both invisible spellings.
 #[test]
 fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     let fixture = Fixture::created("slot-grid");
@@ -3545,8 +3557,10 @@ fn every_slot_taking_primitive_refuses_a_hostile_slot_name() {
     );
 }
 
-/// The names of this module's `pub fn`s that take `slot: &Slot` and return
-/// a `Result` — read out of the source rather than listed.
+/// The names of this module's `pub fn`s **spelt** `slot: &Slot` and
+/// `-> Result<` — matched in the source rather than listed, and matched by
+/// spelling rather than derived, which is the limit
+/// `every_slot_taking_primitive_refuses_a_hostile_slot_name` states in full.
 ///
 /// `slot_path` and `intent_path` are deliberately not in this set: they
 /// return a `PathBuf` infallibly and are path arithmetic, which is why the
@@ -8363,36 +8377,29 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                      invisible to every count taken over all four"
             );
 
-            // **And every kill that ran either worked, or failed at a child
-            // that had already reached its own exit** (PR #136 pass 1,
-            // finding 4). Firing is not killing: `fired` is written by the
-            // statement that calls `kill`, whatever `kill` answers, and the
-            // answer was discarded. So a shape whose kills all *fail* while
-            // its children exit normally passed the count above with nothing
-            // killed, and the global floor below was then satisfied by some
-            // other shape's kills — four shapes certified, one never killed.
+            // **What the kill answered is recorded and printed, and not
+            // asserted on** (PR #136 pass 3, finding 3). The assertion that
+            // stood here paired a kill error with a `try_wait` taken
+            // immediately before the kill, and the reviewer reproduced the
+            // false green: on Unix an exited-but-unreaped child is a zombie,
+            // `kill(SIGKILL)` on it returns **success**, and the wait reports
+            // the child's own exit — so in the race window the error is empty,
+            // this check passed, and another shape's kills satisfied the
+            // global floor while this shape killed nothing. The claim in the
+            // deleted comment that the race was "one-sided, a false red and
+            // never a false green" was wrong.
             //
-            // The discriminator is `already_exited`, read immediately before
-            // the kill: a kill of an exited child fails on both platforms and
-            // is legal, because the ladder deliberately reaches past the end
-            // of a fast run; a kill that fails at a child still running is
-            // not. The residual is the window between that read and the kill
-            // itself, in which a child may exit — narrow, one-sided (it can
-            // only produce a false red, never a false green), and the only
-            // shape available without a second process watching this one.
-            let unkilled: Vec<&String> = shape
+            // No third attempt is being made. Two observations taken at two
+            // instants cannot decide this from inside the process, and the row
+            // says what a sound version needs instead: the child watched from
+            // outside it.
+            let errors: Vec<&String> = shape
                 .iter()
-                .filter(|launch| !launch.already_exited)
                 .filter_map(|launch| launch.kill_error.as_ref())
                 .collect();
-            assert!(
-                unkilled.is_empty(),
-                "{label}: {} of this command's {launched} kills answered an error at a child \
-                     that had not exited, so its `fired` count above counts attempts and not \
-                     kills, and the global floor below can be satisfied entirely by another \
-                     shape: {unkilled:?}",
-                unkilled.len()
-            );
+            if !errors.is_empty() {
+                println!("kill errors {label}: {errors:?}");
+            }
 
             // **When each kill fired**, read off the clock by the kill
             // rather than off the delay the caller asked for
@@ -8610,24 +8617,40 @@ fn tally(observed: &[Option<ObjectResidue>]) -> (ClassHistogram, u32) {
 /// list* and the *call site that uses it*: sharing covers the first, and only
 /// reading the call sites can see the second.
 ///
-/// **What this census can and cannot say** (PR #136 pass 1, finding 3). It
-/// reads source text, and a census over source text cannot hold a behaviour
-/// claim, because a sibling spelling always satisfies it. The claim it used to
-/// carry — that it "stops a funnel growing an argument beside its list" — was
-/// too strong and is withdrawn: the reviewer's `"--ignore-errors".into()` adds
-/// a fixed Git argument beside the shared list and moves neither
-/// `OsString::from` count. What it says now is narrower and true: **every
-/// string literal in each sampled funnel's body is declared here**, so an
-/// argument spelt as a literal in any form is a number that stops matching.
-/// A `const`, a variable or a call still passes, and the structural
-/// version — comparing what the funnel passes with what `sampled_command`
-/// passes, as values at run time — is a deferred row, because the seam it
-/// needs is in the parent's argv construction rather than in this file.
+/// # This is a tripwire, not a guarantee, and it says so
 ///
-/// The dynamic arguments each funnel legitimately adds — a path, a commit —
-/// are counted rather than forbidden, so growing one is a change to a number
-/// rather than a silent widening; the same is now true of every literal,
-/// whether or not it is an argument.
+/// **Every claim this census used to make has been withdrawn**, over three
+/// frontier passes that each walked around it a different way (PR #136,
+/// findings `PR136-P3-SAMPLED-ARGV-CENSUS-IS-FAIL-OPEN`,
+/// `PR136-PASS2-P1-CENSUS-EXTENT-FORGED-BY-A-LITERAL` and
+/// `PR136-PASS3-P1-CENSUS-EXTENT-FORGED-BY-A-DECOY`). A census over source
+/// text cannot hold a behaviour claim, and this one has now been shown not to
+/// three times:
+///
+/// * a sibling spelling: `argv.push("--ignore-errors".into())` adds a fixed
+///   Git argument and moves neither `OsString::from` count;
+/// * a false boundary: a raw string holding a line of four spaces and a brace
+///   ended the body early, so the declared counts were satisfied by what was
+///   injected before the cut;
+/// * a decoy: the scan takes the **first global** `.find` of the signature and
+///   never proves the match is in `impl WorkspaceManager`, so an earlier
+///   method of that name with an empty body on another type absorbs it while
+///   the real one grows an argument.
+///
+/// The first two are closed — literals are counted, the extent comes from the
+/// blanked text. **The third is not, and no third repair is being attempted**:
+/// two passes produced two forgeries, and a third piece of machinery in the
+/// same place is what this pull request stopped doing.
+///
+/// So what it asserts is exactly this and nothing more: **these four funnel
+/// bodies contain no inline literal Git argument, and hold the declared number
+/// of literals and `OsString::from` arguments, today.** It is a tripwire that
+/// catches a careless edit. It does not establish that the sampled child runs
+/// the funnel's argv, and **§12's domain-boundary requirement is unmet here**,
+/// which the row records rather than this doc pretending otherwise. The
+/// structural version — comparing what the funnel passes against what
+/// `sampled_command` passes, as values at run time — needs a seam in the
+/// parent's argv construction and is a deferred row.
 #[test]
 fn no_sampled_funnel_builds_its_argv_from_a_literal() {
     // (function, how many `OsString::from(<expression>)` arguments it adds
@@ -8686,17 +8709,6 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
                  added here may be a Git argument the kill sampler does not run",
             counts.literals
         );
-        // The domain's boundary, asserted rather than assumed (§12, and
-        // PR #136 pass 2, finding 1). Every count above is over a body whose
-        // end came from the blanked text; this says the body a naive scan
-        // would have taken is the same one, so no literal in this funnel is
-        // carrying a false closing brace today.
-        assert!(
-            !counts.false_boundary,
-            "`{signature}` holds a string literal carrying what looks like the function's \
-                 closing brace, so a scan over unblanked text reads a truncated body; the \
-                 counts above are over the real one, and this is the boundary saying so"
-        );
     }
 }
 
@@ -8740,11 +8752,6 @@ fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
         + structural[start..]
             .find("\n    }\n")
             .expect("the function ends");
-    // What the naive scan — over text that still carries its literals — would
-    // have taken as the end. Keeping both is the domain-boundary assertion
-    // §12 asks for: a literal that carries a boundary makes the two disagree,
-    // and the census reports that rather than silently reading less.
-    let naive_end = source[start..].find("\n    }\n").map(|at| start + at);
     let body = crate::effects::blank_comments(&source[start..end]);
     let bytes = body.as_bytes();
     let mut literals = 0_usize;
@@ -8763,7 +8770,6 @@ fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
         from_literal: body.matches("OsString::from(\"").count(),
         dynamic: body.matches("OsString::from(").count(),
         literals,
-        false_boundary: naive_end.is_some_and(|naive| naive < end),
     }
 }
 
@@ -8785,26 +8791,22 @@ struct SampledArgvCounts {
     /// which is why the claim this census carries is narrowed to what it can
     /// actually support and the structural version is a deferred row.
     literals: usize,
-    /// Whether a string literal in this body carries what looks like the
-    /// function's closing brace, so the naive scan would stop before the real
-    /// end. The census asserts this is false for every sampled funnel: it is
-    /// the boundary of the domain, and §12 asks a census to assert it.
-    false_boundary: bool,
 }
 
-/// The census's own positive controls (§12), one per thing it can miss.
+/// The tripwire's own controls: what it does catch, and one thing it does not.
 ///
 /// The first violation is the one the census was written for — a fixed Git
 /// argument spelt `OsString::from("…")` beside the shared list. The second is
-/// **the reviewer's**, PR #136 pass 1, finding 3: `"--ignore-errors".into()`
-/// is the same defect in another spelling, and it leaves both
-/// `OsString::from` counts exactly where they were. It is the reason this
-/// census now counts literals at all, and the reason the claim it carries is
-/// narrowed: a `const`, a variable or a call would still pass all three
-/// counts, which no amount of text-matching fixes.
+/// pass 1's: `"--ignore-errors".into()` is the same defect in another
+/// spelling, and it left both `OsString::from` counts where they were, which
+/// is why literals are counted at all. The negative case is the same text in a
+/// comment, which is what blanking is for; the third case shows the extent is
+/// taken from the blanked text, so a literal cannot end the body early.
 ///
-/// The negative case is the same text in a comment, which is what blanking is
-/// for.
+/// **None of this makes the census a guarantee.** A `const`, a variable, a
+/// call, or the decoy function of pass 3's finding 1 all pass every assertion
+/// here. The controls prove it catches what it claims to catch, and the claim
+/// is small.
 #[test]
 fn the_sampled_argv_census_counts_code_and_never_comments() {
     let clean = "\
@@ -8823,7 +8825,6 @@ impl WorkspaceManager {
             from_literal: 0,
             dynamic: 1,
             literals: 0,
-            false_boundary: false,
         },
         "a comment naming either construct is prose and is not an argument"
     );
@@ -8835,7 +8836,6 @@ impl WorkspaceManager {
             from_literal: 1,
             dynamic: 2,
             literals: 1,
-            false_boundary: false,
         },
         "an argument spelt `OsString::from(\"…\")` must move every count that can see it"
     );
@@ -8845,24 +8845,22 @@ impl WorkspaceManager {
     // added together with a Git argument. Over unblanked text the scan stops
     // inside that raw string and reads a body short of the real one, and the
     // injected argument makes the truncated counts match what was declared.
-    // The structural extent is not fooled, so the counts are the true ones
-    // and `false_boundary` reports the attempt.
+    // The structural extent is not fooled, so the counts are the true ones.
     let truncating = clean.replace(
         comment,
         "argv.push(OsString::from(flag));\n        let _boundary = r\"\n    }\n\";",
     );
-    let counts = sampled_argv_counts(&truncating, "pub fn sampled(");
     assert_eq!(
-        (counts.from_literal, counts.dynamic, counts.literals),
-        (0, 2, 1),
+        sampled_argv_counts(&truncating, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 0,
+            dynamic: 2,
+            literals: 1,
+        },
         "the extent comes from the blanked text, so the whole body is read: two \
          `OsString::from(` and one literal, the raw string itself — a scan that stopped \
          inside that raw string would see the second `argv.push` and neither of the \
-         literals after it: {counts:?}"
-    );
-    assert!(
-        counts.false_boundary,
-        "…and the false boundary is reported, which is what the census asserts against"
+         literals after it"
     );
 
     let sibling = clean.replace(comment, "argv.push(\"--ignore-errors\".into());");
@@ -9296,12 +9294,11 @@ struct SampledLaunch {
     /// fired at, none was `Failed` — and another shape's successful kills
     /// satisfied the one global floor. The suite could then certify killing all
     /// four command shapes with one of them never killed. §7 asks a discard to
-    /// be best-effort with a defined failure path; this is the definition, and
-    /// the assertion beside the firing count is the path.
+    /// be best-effort with a defined failure path, and **the path is
+    /// observability, not an assertion**: the value is recorded here and
+    /// printed beside the per-shape counts. Pass 3 showed why it cannot be
+    /// asserted on — see the note at that printing.
     kill_error: Option<String>,
-    /// [`SampledChild::already_exited`], carried out so the assertion can pair
-    /// it with `kill_error`: an error is legal exactly when this is true.
-    already_exited: bool,
     end: LaunchEnd,
 }
 
@@ -9366,17 +9363,6 @@ struct SampledChild {
     /// What the clock said when a kill fired at this child, or `None` if
     /// none ever did. Written only by [`Self::kill`].
     fired: Option<std::time::Duration>,
-    /// Whether the child had **already reached its own exit** when the kill
-    /// fired, read by [`Self::kill`] immediately before killing.
-    ///
-    /// This is the discriminator the kill's error value needs. A kill of an
-    /// exited child fails on both platforms — `ERROR_ACCESS_DENIED` from
-    /// `TerminateProcess`, `InvalidInput` from a `Child` already reaped by
-    /// `try_wait` — and that failure is legal, because the ladder deliberately
-    /// reaches past the end of a fast run. A kill that fails at a child which
-    /// is still *running* is not legal, and nothing else in this harness can
-    /// tell the two apart.
-    already_exited: bool,
 }
 
 impl SampledChild {
@@ -9395,7 +9381,6 @@ impl SampledChild {
             child,
             spawned: std::time::Instant::now(),
             fired: None,
-            already_exited: false,
         }
     }
 
@@ -9406,7 +9391,8 @@ impl SampledChild {
     /// actual timing rather than the timing it was asked for; stored after
     /// the call, the record cannot outlive the call's removal, because
     /// deleting `self.child.kill()` leaves `outcome` unbound and the module
-    /// stops compiling.
+    /// stops compiling. The kill's own answer is returned and recorded by the
+    /// caller; nothing here decides what it means.
     ///
     /// What that still leaves reachable is a fake that keeps the call and
     /// throws its effect away. The kill floor at the end of the sampling
@@ -9414,14 +9400,8 @@ impl SampledChild {
     /// but a real kill produces.
     fn kill(&mut self) -> std::io::Result<()> {
         let fired = self.spawned.elapsed();
-        // Read before the kill, because afterwards it cannot be read at all:
-        // once the kill has run, an exit and a kill are the same wait status.
-        // `try_wait` reaps an already-exited child, and `Child::wait` returns
-        // the status it cached, so the reap below still answers.
-        let already_exited = matches!(self.child.try_wait(), Ok(Some(_)));
         let outcome = self.child.kill();
         self.fired = Some(fired);
-        self.already_exited = already_exited;
         outcome
     }
 
@@ -9449,7 +9429,6 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
             after,
             fired: child.fired,
             kill_error,
-            already_exited: child.already_exited,
             end: launch_end(&status),
         });
 }
