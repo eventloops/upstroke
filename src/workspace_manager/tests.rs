@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 // The repository fixture and the three Git helpers are `fixture`'s, not
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
-use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_child_test, scratch};
+use super::fixture::{Fixture, died_by_abort, died_by_kill, git, git_out, run_kill_child, scratch};
 
 /// `value`, which the fixture read from Git, as the [`ObjectId`] every
 /// snapshot input is built from.
@@ -7197,7 +7197,7 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
     // this CRT, moments before the comparison — so the oracle is the exit
     // status an abort actually produces here, and `exit(1)` is not equal to
     // it on either platform.
-    let aborted = run_child_test(
+    let aborted = run_kill_child(
         "workspace_manager::tests::abort_probe_helper",
         &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
     );
@@ -7290,11 +7290,11 @@ fn exit_one_probe_helper() {
 /// comparing against a *measured* abort does not.
 #[test]
 fn the_abort_oracle_separates_an_abort_from_an_exit_of_one() {
-    let aborted = run_child_test(
+    let aborted = run_kill_child(
         "workspace_manager::tests::abort_probe_helper",
         &[(ABORT_PROBE, std::ffi::OsStr::new("1"))],
     );
-    let exited = run_child_test(
+    let exited = run_kill_child(
         "workspace_manager::tests::exit_one_probe_helper",
         &[(EXIT_ONE_PROBE, std::ffi::OsStr::new("1"))],
     );

@@ -50,7 +50,7 @@ use crate::topology::schema::TOPOLOGY_SCHEMA;
 use crate::util::DurabilityLedger;
 use crate::workspace_manager::{
     EffectHooks, HarnessEffects, WorkspaceManager,
-    fixture::{Fixture, died_by_abort, run_child_test, write_file},
+    fixture::{Fixture, died_by_abort, run_kill_child, write_file},
 };
 
 use super::attempt::{AttemptPlan, GatePlan, ReviewerPlan};
@@ -1383,7 +1383,7 @@ pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
     // still owns. Without it the adopted tree outlived every kill test, and a
     // temporary directory leaked per fixture is what exhausted this box's
     // inodes once already.
-    let status = run_child_test(
+    let status = run_kill_child(
         test,
         &[
             ("UPSTROKE_TEST_KILL_DIR", dir.as_os_str()),

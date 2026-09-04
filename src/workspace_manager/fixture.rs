@@ -271,7 +271,18 @@ pub(crate) fn scratch(tag: &str) -> PathBuf {
 fn absent() -> &'static Path {
     static ABSENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ABSENT.get_or_init(|| {
-        std::env::temp_dir().join(format!("upstroke-fixture-absent-{}", crate::ulid::ulid()))
+        // **Two components, and the second is why this holds.** A path whose
+        // parent exists is one Git will create: measured on git 2.43.0, `git
+        // config --global i18n.commitEncoding ISO-8859-1` through the exported
+        // helper creates the file `GIT_CONFIG_GLOBAL` names and exits 0, and
+        // every later fixture command then loads it. With the parent absent
+        // the same command refuses -- `could not lock config file …: No such
+        // file or directory`, exit 255, nothing created -- while reads stay
+        // silent and successful. Nothing creates the directory below, so the
+        // guarantee is Git's rather than this module's discipline.
+        std::env::temp_dir()
+            .join(format!("upstroke-fixture-absent-{}", crate::ulid::ulid()))
+            .join("absent")
     })
 }
 
@@ -649,7 +660,6 @@ impl Fixture {
     /// and passes the guard here. `root` is then a subtree of what `owner`
     /// names, and dropping this fixture reclaims both.
     pub(crate) fn adopt(root: PathBuf) -> Self {
-        let reclaim = Reclaim::Adopted(root.clone());
         let base = root.join("repo");
         let private = root.join("private");
         let head = git(&base, &["rev-parse", "main"]);
@@ -663,14 +673,25 @@ impl Fixture {
         let manager = WorkspaceManager::derive(&base, &private, RUN_ID, "inc-1")
             .expect("derive the manager over an adopted fixture");
         Self {
-            root,
             base,
             private,
             manager,
             seed,
             head,
             side,
-            _reclaim: reclaim,
+            // **Built last, in the struct literal, and that is the whole
+            // point.** Every line above can fail — a stale or malformed
+            // handoff, a repository without `main` or `side`, a `derive` that
+            // refuses — and while this value existed before them, unwinding
+            // dropped it and recursively deleted the root it was handed. That
+            // deletes another tree when the handoff is wrong, and it destroys
+            // the failed child's evidence exactly when somebody needs to look
+            // at it. Master built the droppable `Fixture` only after these
+            // steps succeeded; so does this.
+            // `an_adoption_that_fails_validation_leaves_the_tree_alone` is the
+            // witness, because construction order is invisible in review.
+            _reclaim: Reclaim::Adopted(root.clone()),
+            root,
         }
     }
 
@@ -766,208 +787,37 @@ pub(crate) fn remove_file(path: &Path) {
     }
 }
 
-/// What a libtest harness prints before it runs the one test a filter selected.
-///
-/// Line-buffered, so it reaches the parent even from a child that dies by
-/// `std::process::abort()` a moment later (measured).
-const SELECTED_ONE: &str = "running 1 test";
-
 /// What a Rust process exits with when a panic unwinds out of main.
 const PANIC_EXIT: i32 = 101;
 
-/// How much of each of the child's streams is kept.
-///
-/// §9 asks a subprocess integration to define its stdout and stderr size
-/// behaviour, and `Command::output` defines none: it buffers whatever arrives.
-/// A child that loops while logging would exhaust this process before its
-/// status could be reported, which is why the capture is bounded here and the
-/// reading continues past the bound so the child is never blocked on a full
-/// pipe. What a caller sees when the bound is hit is the first
-/// [`CHILD_CAPTURE_LIMIT`] bytes of each stream and a line saying so.
-const CHILD_CAPTURE_LIMIT: usize = 64 * 1024;
-
-/// How long a child is given before it is killed and reported.
-///
-/// §9 asks for a timeout, and this bounds a wedged child rather than timing a
-/// healthy one (§12): the longest of these children builds a fixture, runs a
-/// schema-4 run and dies at an injection, which is seconds. A child that
-/// reaches this bound is killed, reaped, and reported as having reached it,
-/// with whatever it had said quoted — never returned as an ordinary status.
-const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Read to end of stream, keeping at most [`CHILD_CAPTURE_LIMIT`] bytes.
-///
-/// Reading continues after the bound and the bytes are dropped, because a
-/// reader that stops reading leaves the child blocked on a full pipe, which
-/// turns a bounded capture into a hang.
-fn read_capped(mut stream: impl std::io::Read, what: &str) -> Vec<u8> {
-    let mut kept = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut dropped = 0_usize;
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                let room = CHILD_CAPTURE_LIMIT.saturating_sub(kept.len());
-                let take = read.min(room);
-                kept.extend_from_slice(&buffer[..take]);
-                dropped += read - take;
-            }
-            Err(error) => {
-                kept.extend_from_slice(
-                    format!("\n[reading the child's {what} failed: {error}]").as_bytes(),
-                );
-                break;
-            }
-        }
-    }
-    if dropped > 0 {
-        kept.extend_from_slice(
-            format!("\n[{dropped} further bytes of the child's {what} were dropped at the {CHILD_CAPTURE_LIMIT}-byte bound]")
-                .as_bytes(),
-        );
-    }
-    kept
-}
-
-/// Take a reader's bytes, or say that it did not finish inside the bound.
-///
-/// The join is bounded for the same reason the wait is: a grandchild that
-/// inherited the pipe can hold it open after the child is gone, and an
-/// unbounded join there is the hang the deadline exists to prevent.
-fn join_within(
-    handle: std::thread::JoinHandle<Vec<u8>>,
-    deadline: std::time::Instant,
-    what: &str,
-) -> (Vec<u8>, bool) {
-    while !handle.is_finished() {
-        if std::time::Instant::now() >= deadline {
-            return (
-                format!("[the reader for the child's {what} did not finish inside the bound]")
-                    .into_bytes(),
-                false,
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let bytes = handle
-        .join()
-        .unwrap_or_else(|_| format!("[the reader for the child's {what} panicked]").into_bytes());
-    (bytes, true)
-}
-
 /// Run this test binary again, `--exact --ignored`, with `env` set, and
-/// return its exit status.///
+/// return its exit status.
+///
 /// The kill-test shape `src/rundir.rs` established: `Injection::Kill` is
 /// `std::process::abort()`, a real process death, so the child has to be a
-/// real process and the claim is what it left on disk. It is not only a kill
-/// shape — anything that needs a fresh process, an environment this one cannot
-/// safely set for itself, runs this way. `env` is a list rather than a map so a
-/// caller can pass the same key twice and see the last win, exactly as
-/// [`Command`] does.
+/// real process and the claim is what it left on disk. `env` is a list
+/// rather than a map so a caller can pass the same key twice and see the
+/// last win, exactly as `Command` does.
 ///
-/// # Panics
-///
-/// **If the harness did not select exactly one test.** `--exact` against a name
-/// no test has runs nothing and exits **0** (measured), which every caller here
-/// reads as the child having completed — so a renamed or un-`#[ignore]`d child
-/// reports as whatever the caller expected a successful exit to mean, and the
-/// caller's own message then blames the injection. That is the one failure this
-/// helper can tell apart, so it does, and it quotes what the child said.
-///
-/// **If the child panicked.** Its streams are captured, so a panic in the
-/// child's *setup* would otherwise reach the caller as a bare exit code with
-/// the diagnostic thrown away; no caller expects a panicking child, and
-/// [`died_by_abort`] excludes this code on both platforms.
-///
-/// **If the child did not end inside [`CHILD_DEADLINE`]**, having been killed
-/// and reaped first, quoting what it had said.
-pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process::ExitStatus {
+/// **This is master's, restored.** Three frontier passes found defects in the
+/// capture that replaced it — unbounded buffering, no timeout, a child that
+/// exits with a grandchild holding the pipe and a reader still attached — and
+/// the third ruled that a fixture may not grow its own process containment.
+/// What goes with the capture, and is named here rather than lost: the check
+/// that the harness selected exactly one test. `--exact` against a name no
+/// test has runs nothing and exits 0, which reads to a caller as a child that
+/// completed, and that check had fixed a real misdiagnosis. It needs the
+/// child's stdout, and the capture that reads it is what was withdrawn.
+pub(crate) fn run_kill_child(test: &str, env: &[(&str, &OsStr)]) -> std::process::ExitStatus {
     let mut command = Command::new(std::env::current_exe().expect("this test binary"));
     command
         .args(["--exact", test, "--ignored", "--nocapture"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawning the child that runs `{test}`: {error}"));
-    let stdout = child.stdout.take().expect("the child's piped stdout");
-    let stderr = child.stderr.take().expect("the child's piped stderr");
-    let reading_out = std::thread::spawn(move || read_capped(stdout, "stdout"));
-    let reading_err = std::thread::spawn(move || read_capped(stderr, "stderr"));
-
-    let deadline = std::time::Instant::now() + CHILD_DEADLINE;
-    let mut overran = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                // Cleaned up before the panic: a `try_wait` that failed leaves
-                // a child this process has stopped watching, and panicking
-                // first would leave it running.
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("waiting for the child that runs `{test}`: {error}");
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            overran = true;
-            // The kill's own failure is reported rather than discarded: it is
-            // the difference between a child that was killed and one that was
-            // not, and the reaping `wait` below would then be unbounded.
-            let killed = child.kill();
-            break child.wait().unwrap_or_else(|error| {
-                panic!(
-                    "reaping the child that runs `{test}` after its deadline: {error}; \
-                     the kill itself answered {killed:?}"
-                )
-            });
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-
-    // The readers are given the same deadline again, measured from here, so a
-    // grandchild holding the pipe bounds the report rather than the process.
-    let reap_by = std::time::Instant::now() + CHILD_DEADLINE;
-    let (out_bytes, out_finished) = join_within(reading_out, reap_by, "stdout");
-    let (err_bytes, err_finished) = join_within(reading_err, reap_by, "stderr");
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out_bytes),
-        String::from_utf8_lossy(&err_bytes)
-    );
-
-    // **A reader still running is a descendant still running.** A child can
-    // exit 0 having left a grandchild holding the pipe, and without this the
-    // parent returned success with both alive. This refuses that; killing the
-    // grandchild is the runner's process-group machinery and a deferred row,
-    // not a second copy built here.
-    assert!(
-        out_finished && err_finished,
-        "the child running `{test}` exited, but a reader was still attached to its streams, so \
-         something it started is still running. It said: {said}"
-    );
-    assert!(
-        !overran,
-        "the child running `{test}` did not end within {CHILD_DEADLINE:?} and was killed. It said: \
-         {said}"
-    );
-    assert!(
-        said.contains(SELECTED_ONE),
-        "the child was asked for `{test}` with `--exact --ignored` and its harness never said \
-         `{SELECTED_ONE}`, so no test ran: the name is wrong, or it is not `#[ignore]`d. It said: \
-         {said}"
-    );
-    assert!(
-        status.code() != Some(PANIC_EXIT),
-        "the child running `{test}` panicked rather than reaching its injection. It said: {said}"
-    );
-    status
+    command.status().expect("spawn the kill child")
 }
 
 /// A `git` child a test can kill at a chosen moment.
@@ -1142,14 +992,14 @@ pub(crate) fn died_by_abort(status: &std::process::ExitStatus) -> bool {
 ///
 /// # Panics
 ///
-/// Through [`run_child_test`], if the probe cannot be run or does not run its
+/// Through [`run_kill_child`], if the probe cannot be run or does not run its
 /// one test — a probe that silently stopped aborting would otherwise make the
 /// oracle accept whatever the probe returned instead.
 #[cfg(windows)]
 fn measured_abort_end() -> Option<i32> {
     static END: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
     *END.get_or_init(|| {
-        let probe = run_child_test(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
+        let probe = run_kill_child(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
         assert!(
             !probe.success(),
             "the abort probe exited successfully, so it did not abort: {probe:?}"
@@ -1225,15 +1075,12 @@ mod tests {
 
     /// The harness name of [`ambient_environment_child`], which
     /// [`the_fixture_is_immune_to_the_ambient_git_environment`] runs as a
-    /// child. `run_child_test` refuses a name no test has, so a rename here
+    /// child. `run_kill_child` refuses a name no test has, so a rename here
     /// fails loudly rather than passing vacuously.
     const AMBIENT_CHILD: &str = "workspace_manager::fixture::tests::ambient_environment_child";
 
     /// The harness name of [`exiting_child`].
     const EXITING_CHILD: &str = "workspace_manager::fixture::tests::exiting_child";
-
-    /// The harness name of [`panicking_child`].
-    const PANICKING_CHILD: &str = "workspace_manager::fixture::tests::panicking_child";
 
     /// The harness name of [`ambient_config_child`], run the same way.
     const CONFIG_CHILD: &str = "workspace_manager::fixture::tests::ambient_config_child";
@@ -1360,7 +1207,7 @@ mod tests {
         let victim_git_dir = victim.base.join(".git");
         let victim_index = victim_git_dir.join("index");
 
-        let status = run_child_test(
+        let status = run_kill_child(
             AMBIENT_CHILD,
             &[
                 (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
@@ -1453,34 +1300,6 @@ mod tests {
         git(&fixture.base, &["add", "-A"]);
         git(&fixture.base, &["commit", "-q", "-m", "bytes"]);
         let _ = git(&fixture.base, &["cat-file", "blob", "HEAD:bytes.bin"]);
-    }
-
-    /// `--exact` against a name no test has runs nothing and exits 0, which
-    /// every caller reads as the child having completed its injection.
-    #[test]
-    #[should_panic(expected = "running 1 test")]
-    fn a_child_whose_harness_selected_no_test_is_not_a_child_that_succeeded() {
-        let _ = run_child_test(
-            "workspace_manager::fixture::tests::no_test_has_this_name",
-            &[],
-        );
-    }
-
-    /// A child that panicked before it reached its injection is not a child
-    /// whose injection stopped killing, and its streams are captured, so the
-    /// diagnostic would otherwise be thrown away and only an exit code reach
-    /// the caller.
-    #[test]
-    #[should_panic(expected = "panicked rather than reaching its injection")]
-    fn a_child_that_panicked_says_so_and_quotes_what_it_said() {
-        let _ = run_child_test(PANICKING_CHILD, &[]);
-    }
-
-    /// The child half of [`a_child_that_panicked_says_so_and_quotes_what_it_said`].
-    #[test]
-    #[ignore = "spawned by `a_child_that_panicked_says_so_and_quotes_what_it_said`"]
-    fn panicking_child() {
-        panic!("the child's own diagnostic");
     }
 
     /// `std::process::Child` neither kills nor reaps on its own drop, so a
@@ -1673,7 +1492,7 @@ mod tests {
         let config_path = hostile.join("config");
         write_file(&config_path, &config);
 
-        let status = run_child_test(
+        let status = run_kill_child(
             CONFIG_CHILD,
             &[
                 (AMBIENT_EXPECT, OsStr::new(expected.as_str())),
@@ -1741,52 +1560,6 @@ mod tests {
         );
     }
 
-    /// The capture is bounded and the reading is not: a child that keeps
-    /// writing must not be blocked on a full pipe, and must not be able to
-    /// exhaust this process either.
-    #[test]
-    fn a_childs_stream_is_captured_up_to_the_bound_and_read_past_it() {
-        use std::io::Read as _;
-
-        let written = CHILD_CAPTURE_LIMIT * 3;
-        let kept = read_capped(std::io::repeat(b'x').take(written as u64), "stdout");
-        let text = String::from_utf8_lossy(&kept);
-        assert!(
-            kept.len() > CHILD_CAPTURE_LIMIT && kept.len() < CHILD_CAPTURE_LIMIT + 512,
-            "the capture kept {} bytes, which is not the bound plus its own note",
-            kept.len()
-        );
-        assert!(
-            text.contains("were dropped at the"),
-            "the caller is not told that bytes were dropped: {text}"
-        );
-    }
-
-    /// The join is bounded too, because a grandchild holding the pipe would
-    /// otherwise hang the parent after the child itself is gone.
-    #[test]
-    fn a_reader_that_does_not_finish_inside_the_bound_is_reported() {
-        let (sender, receiver) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            // Ends when the test lets it, not on a timer, so nothing here
-            // sleeps as synchronisation.
-            let _ = receiver.recv();
-            Vec::new()
-        });
-        let (reported, finished) = join_within(handle, std::time::Instant::now(), "stdout");
-        let text = String::from_utf8_lossy(&reported);
-        assert!(
-            !finished,
-            "a reader that has not finished must be reported as unfinished, so the caller can \
-             refuse it: {text}"
-        );
-        assert!(
-            text.contains("did not finish inside the bound"),
-            "an unfinished reader must be reported rather than waited on: {text}"
-        );
-        drop(sender);
-    }
-
     /// The oracle itself, run on **every** platform, because the arm a leg
     /// compiles is the only arm that leg can measure: the Unix arm names
     /// `SIGABRT` and cannot see the Windows arm's defect, which is why this
@@ -1798,8 +1571,8 @@ mod tests {
     /// second. The negation it replaces said yes to both.
     #[test]
     fn the_abort_oracle_separates_an_abort_from_an_ordinary_failure() {
-        let aborted = run_child_test(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
-        let exited = run_child_test(EXITING_CHILD, &[]);
+        let aborted = run_kill_child(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
+        let exited = run_kill_child(EXITING_CHILD, &[]);
 
         // Premises first, so a probe that stopped working is loud rather than
         // vacuous.
@@ -1934,6 +1707,82 @@ mod tests {
             "the tree the child left behind outlived the fixture that adopted it: {}",
             root.display()
         );
+    }
+
+    /// An adoption that fails validation must leave the tree alone.
+    ///
+    /// Construction order is invisible in review and no existing test
+    /// exercised it, which is how `Reclaim::Adopted` came to be built before
+    /// any of the four validation steps: an unwind then deleted the root the
+    /// caller supplied, so a stale or malformed handoff destroyed another tree
+    /// and a failed child's evidence went with it. This fails at `1bcc12e` and
+    /// passes here.
+    #[test]
+    fn an_adoption_that_fails_validation_leaves_the_tree_alone() {
+        let tree = scratch_tree("adopt-refused");
+        let root = tree.path().to_path_buf();
+        // A tree that is not a fixture: `adopt` reaches `rev-parse main` and
+        // fails there, which is what a stale handoff looks like.
+        write_file(
+            &root.join("repo").join("evidence.txt"),
+            b"a failed child's tree\n",
+        );
+
+        let refused = std::panic::catch_unwind({
+            let root = root.clone();
+            move || Fixture::adopt(root)
+        });
+        assert!(
+            refused.is_err(),
+            "adopting a tree that is not a repository must fail"
+        );
+        assert!(
+            root.join("repo").join("evidence.txt").exists(),
+            "the failed adoption deleted the tree it was handed, and the evidence with it: {}",
+            root.display()
+        );
+    }
+
+    /// The absent path the pins name is one Git will not create.
+    ///
+    /// The pass-3 reviewer's own sequence: a test can reach the exported `git`
+    /// and run `config --global`, and Git creates whatever
+    /// `GIT_CONFIG_GLOBAL` names without the caller knowing the randomised
+    /// name. It only holds because the path's parent does not exist either.
+    #[test]
+    fn the_absent_path_is_one_git_refuses_to_create() {
+        let fixture = Fixture::new("absent-write");
+        let attempt = git_out(
+            &fixture.base,
+            &["config", "--global", "i18n.commitEncoding", "ISO-8859-1"],
+        );
+        assert!(
+            !attempt.status.success(),
+            "Git wrote a global config file through the fixture's own pins: {}",
+            String::from_utf8_lossy(&attempt.stderr)
+        );
+        // And the door still holds afterwards: nothing outside the repository.
+        let listed = git(&fixture.base, &["config", "--show-origin", "--list"]);
+        let repository = fixture
+            .base
+            .join(".git")
+            .join("config")
+            .canonicalize()
+            .expect("canonicalize the repository's own config");
+        for origin in listed
+            .lines()
+            .filter_map(|line| line.split_once('\t').map(|(origin, _)| origin))
+        {
+            if origin.starts_with("command line:") {
+                continue;
+            }
+            let named = origin.strip_prefix("file:").unwrap_or(origin);
+            assert_eq!(
+                fixture.base.join(named).canonicalize().ok(),
+                Some(repository.clone()),
+                "a fixture command read configuration from {origin}"
+            );
+        }
     }
 
     /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
