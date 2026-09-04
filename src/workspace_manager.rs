@@ -344,7 +344,7 @@ use self::containment::{
 mod naming;
 use self::naming::safe_component;
 pub use self::naming::{
-    IntentKind, IntentRecord, IntentRecordError, Slot, SlotId, SlotPathError, SnapshotName,
+    IntentKind, IntentRecord, IntentRecordError, Slot, SlotId, SlotIdError, SnapshotName,
 };
 
 /// The slot's effect-site vocabulary: which [`EffectSiteId`] each of its four
@@ -807,14 +807,9 @@ impl WorkspaceManager {
         slot.validate()?;
         self.revalidate()?;
         let path = self.intent_path(slot);
-        let record = IntentRecord {
-            kind: slot.intent_kind(),
-            slot: slot.id()?,
-            // Owned snapshots: the record is persisted, and serde owns its
-            // fields.
-            run_id: self.run_id.clone(),
-            incarnation: self.incarnation.clone(),
-        };
+        // Owned snapshots: the record is persisted, and serde owns its
+        // fields.
+        let record = IntentRecord::new(slot, self.run_id.clone(), self.incarnation.clone())?;
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {

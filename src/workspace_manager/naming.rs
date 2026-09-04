@@ -354,44 +354,93 @@ impl Slot {
 /// contained, idempotent, and never establishes authority") is then structural
 /// rather than checked.
 ///
-/// **This is a persisted schema.** The wire format is four JSON strings in
-/// the order of [`Self::FIELDS`] — `kind`, `slot`, `run_id`, `incarnation`
-/// — with no defaults and no aliases: the reader is written by hand against
-/// that literal list, so there is no attribute an alias could ride in on,
-/// and a key outside the list is refused as unknown. The test on this type
-/// pins the exact bytes and compares the list to a serialized record's
-/// keys. Reading a record then checks it three ways before one exists:
-/// `kind` is an [`IntentKind`], so a kind outside the three words is
-/// refused; `slot` is a [`SlotId`], so a slot that is not the canonical
-/// spelling of a slot passing [`Slot::validate`] is refused; and the two
-/// must agree, so a `task` record naming a `merge/` slot is refused. Reclaim
-/// still trusts the file's name and nothing inside the file; the typing
-/// keeps a record honest for whoever reads it, it grants nothing.
+/// **This is a persisted schema**, and `design/15_design_event_log_resume_run_layout.md`
+/// states its contract under the run layout ("Synced intents"). The wire
+/// format is four JSON strings in the order of [`Self::FIELDS`] — `kind`,
+/// `slot`, `run_id`, `incarnation` — with no defaults and no aliases. This
+/// type derives `Serialize` and `Deserialize`; what is written by hand is
+/// underneath: the reader of the wire shape, [`IntentRecordWire`], accepts a
+/// key only by finding it in `FIELDS`, [`IntentKind`] is read only by
+/// matching one of its own [`IntentKind::WORDS`], and [`SlotId`] is parsed
+/// through the slot grammar. So there is no attribute an alias could ride in
+/// on, and a key or word outside the lists is refused. The test on this type
+/// pins the exact bytes and compares `FIELDS` to a serialized record's keys.
 ///
-/// Written by [`WorkspaceManager::write_intent`] from a slot that passed
-/// [`Slot::validate`]: `kind` from [`Slot::intent_kind`], `slot` from
-/// [`Slot::id`].
+/// Reading a record checks it three ways before one exists: `kind` is an
+/// [`IntentKind`]; `slot` is a [`SlotId`], the canonical spelling of a slot
+/// passing [`Slot::validate`]; and the two must agree, so a `task` record
+/// naming a `merge/` slot is refused. The fields are private and the only
+/// other way to hold a record is [`Self::new`], which takes the kind from
+/// the slot, so a record cannot be built or changed into a state its reader
+/// refuses: what it writes, it reads back. Reclaim still trusts the file's
+/// name and nothing inside the file; the typing keeps a record honest for
+/// whoever reads it, it grants nothing.
+///
+/// Written by [`WorkspaceManager::write_intent`] through [`Self::new`].
 ///
 /// [`WorkspaceManager::write_intent`]: super::WorkspaceManager::write_intent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "IntentRecordWire")]
 pub struct IntentRecord {
-    /// `task`, `staging`, or `snapshot`.
-    pub kind: IntentKind,
+    /// `task`, `staging`, or `snapshot`: always the slot's own kind.
+    kind: IntentKind,
     /// The slot's identifier, from [`Slot::id`]: `<namespace>/<component>`,
     /// mirroring the relative path so an operator can find the directory.
-    pub slot: SlotId,
+    slot: SlotId,
     /// The run that owns it.
-    pub run_id: String,
+    run_id: String,
     /// The coordinator incarnation that wrote it, so a later incarnation of the
     /// same run can tell its own residue from a live sibling's.
-    pub incarnation: String,
+    incarnation: String,
 }
 
 impl IntentRecord {
-    /// The wire field names, in wire order. The hand-written reader below
-    /// accepts exactly these and nothing else.
+    /// The wire field names, in wire order. [`WireField::ALL`] is the same
+    /// list as variants, and the reader accepts a key by looking it up here,
+    /// so these names are the only keys a record can be read from.
     pub const FIELDS: [&'static str; 4] = ["kind", "slot", "run_id", "incarnation"];
+
+    /// The record for `slot`, which must pass [`Slot::validate`]. The kind
+    /// is the slot's own, so a record cannot be built with a kind that
+    /// disagrees with its slot; the fields are private, so it cannot be
+    /// changed into one afterwards either. This and the reader are the only
+    /// two ways to hold a record, and both hold the same invariant.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::SlotName`], from [`Slot::validate`] through [`Slot::id`].
+    pub fn new(slot: &Slot, run_id: String, incarnation: String) -> Result<Self, Refusal> {
+        Ok(Self {
+            kind: slot.intent_kind(),
+            slot: slot.id()?,
+            run_id,
+            incarnation,
+        })
+    }
+
+    /// `task`, `staging`, or `snapshot`: the kind of [`Self::slot`].
+    #[must_use]
+    pub fn kind(&self) -> IntentKind {
+        self.kind
+    }
+
+    /// The slot's identifier.
+    #[must_use]
+    pub fn slot(&self) -> &SlotId {
+        &self.slot
+    }
+
+    /// The run that owns the slot.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// The coordinator incarnation that wrote the record.
+    #[must_use]
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
 }
 
 /// [`IntentRecord`] as it is read: the same four fields, each typed, before
@@ -403,12 +452,24 @@ struct IntentRecordWire {
     incarnation: String,
 }
 
-/// One of [`IntentRecord::FIELDS`], by name; any other key is unknown.
+/// One of [`IntentRecord::FIELDS`], by position; any other key is unknown.
+#[derive(Clone, Copy)]
 enum WireField {
     Kind,
     Slot,
     RunId,
     Incarnation,
+}
+
+impl WireField {
+    /// The variants in the order of [`IntentRecord::FIELDS`]: the two lists
+    /// are one table, and a key is accepted only by being found in `FIELDS`.
+    const ALL: [WireField; 4] = [
+        WireField::Kind,
+        WireField::Slot,
+        WireField::RunId,
+        WireField::Incarnation,
+    ];
 }
 
 impl<'de> Deserialize<'de> for WireField {
@@ -423,13 +484,12 @@ impl<'de> Deserialize<'de> for WireField {
             }
 
             fn visit_str<E: de::Error>(self, key: &str) -> Result<WireField, E> {
-                match key {
-                    "kind" => Ok(WireField::Kind),
-                    "slot" => Ok(WireField::Slot),
-                    "run_id" => Ok(WireField::RunId),
-                    "incarnation" => Ok(WireField::Incarnation),
-                    other => Err(de::Error::unknown_field(other, &IntentRecord::FIELDS)),
-                }
+                IntentRecord::FIELDS
+                    .iter()
+                    .zip(WireField::ALL)
+                    .find(|(name, _)| **name == key)
+                    .map(|(_, field)| field)
+                    .ok_or_else(|| de::Error::unknown_field(key, &IntentRecord::FIELDS))
             }
         }
 
@@ -545,12 +605,21 @@ pub enum IntentKind {
 }
 
 impl IntentKind {
-    /// The three wire spellings, in variant order.
-    pub const WORDS: [&'static str; 3] = ["task", "staging", "snapshot"];
+    /// The variants, in wire order.
+    pub const ALL: [IntentKind; 3] = [IntentKind::Task, IntentKind::Staging, IntentKind::Snapshot];
+
+    /// The three wire spellings, in variant order: [`Self::as_str`] of each
+    /// of [`Self::ALL`], so the words written and the words read are one
+    /// list, and a word is read only by matching one of these.
+    pub const WORDS: [&'static str; 3] = [
+        Self::ALL[0].as_str(),
+        Self::ALL[1].as_str(),
+        Self::ALL[2].as_str(),
+    ];
 
     /// The word the record and the refusals use.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Task => "task",
             Self::Staging => "staging",
@@ -577,12 +646,10 @@ impl<'de> Deserialize<'de> for IntentKind {
             }
 
             fn visit_str<E: de::Error>(self, word: &str) -> Result<IntentKind, E> {
-                match word {
-                    "task" => Ok(IntentKind::Task),
-                    "staging" => Ok(IntentKind::Staging),
-                    "snapshot" => Ok(IntentKind::Snapshot),
-                    other => Err(de::Error::unknown_variant(other, &IntentKind::WORDS)),
-                }
+                IntentKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.as_str() == word)
+                    .ok_or_else(|| de::Error::unknown_variant(word, &IntentKind::WORDS))
             }
         }
 
@@ -627,7 +694,7 @@ pub struct SlotId {
 }
 
 impl SlotId {
-    /// The path as the record spells it.
+    /// The identifier as the record spells it.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
@@ -663,7 +730,7 @@ impl SlotId {
 }
 
 impl TryFrom<String> for SlotId {
-    type Error = SlotPathError;
+    type Error = SlotIdError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         match Self::parse(&value) {
@@ -671,7 +738,7 @@ impl TryFrom<String> for SlotId {
                 kind: slot.intent_kind(),
                 text: value,
             }),
-            Err(why) => Err(SlotPathError { value, why }),
+            Err(why) => Err(SlotIdError { value, why }),
         }
     }
 }
@@ -697,7 +764,7 @@ impl fmt::Display for SlotId {
 /// A string offered as a [`SlotId`] that is not one.
 #[derive(Debug, thiserror::Error)]
 #[error("`{value}` is not a slot id: {why}")]
-pub struct SlotPathError {
+pub struct SlotIdError {
     /// The value as it was offered.
     value: String,
     /// The first objection, from [`SlotId`]'s grammar.
@@ -872,12 +939,15 @@ mod tests {
     /// fields' own tests below.
     #[test]
     fn the_intent_record_schema_is_pinned() {
-        let record = IntentRecord {
-            kind: IntentKind::Task,
-            slot: SlotId::try_from("tasks/kalpha-g1".to_owned()).expect("a slot path"),
-            run_id: "run".to_owned(),
-            incarnation: "01".to_owned(),
-        };
+        let record = IntentRecord::new(
+            &Slot::Task {
+                key: "alpha".to_owned(),
+                generation: 1,
+            },
+            "run".to_owned(),
+            "01".to_owned(),
+        )
+        .expect("a valid slot makes a record");
         let json = serde_json::to_string(&record).expect("a record serializes");
         assert_eq!(
             json, r#"{"kind":"task","slot":"tasks/kalpha-g1","run_id":"run","incarnation":"01"}"#,
@@ -962,7 +1032,7 @@ mod tests {
             ("snapshot", IntentKind::Snapshot, "snapshots/g1-a1-gates"),
         ] {
             let record = with_kind(&format!("\"{word}\""), slot).expect("a known kind reads");
-            assert_eq!(record.kind, kind);
+            assert_eq!(record.kind(), kind);
             assert_eq!(kind.as_str(), word, "and renders back to the same word");
         }
         for bogus in ["\"bogus\"", "\"Task\"", "\"\"", "0", "null", "[\"task\"]"] {
@@ -984,10 +1054,11 @@ mod tests {
             ))
         };
         let record = with_slot("tasks/kalpha-g1").expect("a slot path in the grammar reads");
-        assert_eq!(record.slot.as_str(), "tasks/kalpha-g1");
-        assert_eq!(record.slot.kind(), IntentKind::Task);
+        assert_eq!(record.slot().as_str(), "tasks/kalpha-g1");
+        assert_eq!(record.slot().kind(), IntentKind::Task);
+        assert_eq!(record.kind(), record.slot().kind());
         assert_eq!(
-            String::from(record.slot),
+            String::from(SlotId::try_from("tasks/kalpha-g1".to_owned()).expect("a slot id")),
             "tasks/kalpha-g1",
             "and converts back to the same text"
         );
@@ -1045,7 +1116,7 @@ mod tests {
             ("snapshot", "snapshots/g1-a1-gates"),
         ] {
             let record = with(kind, slot).expect("a kind and a slot of that kind read");
-            assert_eq!(record.kind, record.slot.kind());
+            assert_eq!(record.kind(), record.slot().kind());
         }
         for (kind, slot) in [
             ("task", "merge/s1"),
@@ -1067,12 +1138,14 @@ mod tests {
     /// in it, and a fourth kind word are refused.
     #[test]
     fn the_reader_accepts_exactly_the_fields_a_record_writes() {
-        let record = IntentRecord {
-            kind: IntentKind::Snapshot,
-            slot: SlotId::try_from("snapshots/g1-a1-gates".to_owned()).expect("a slot id"),
-            run_id: "run".to_owned(),
-            incarnation: "01".to_owned(),
-        };
+        let record = IntentRecord::new(
+            &Slot::Snapshot {
+                name: SnapshotName::gates(1, 1),
+            },
+            "run".to_owned(),
+            "01".to_owned(),
+        )
+        .expect("a valid slot makes a record");
         let json = serde_json::to_string(&record).expect("a record serializes");
         let positions: Vec<usize> = IntentRecord::FIELDS
             .iter()
@@ -1116,11 +1189,61 @@ mod tests {
         ]) {
             assert_eq!(kind.as_str(), *word, "WORDS is in variant order");
         }
-        let error = serde_json::from_str::<IntentKind>("\"worktree\"")
-            .expect_err("a fourth word is refused");
+        for word in ["worktree", "job", "Task", ""] {
+            let error = serde_json::from_str::<IntentKind>(&format!("\"{word}\""))
+                .expect_err("a word outside WORDS is refused");
+            assert!(
+                error.to_string().contains("unknown variant"),
+                "{word}: {error}"
+            );
+        }
+        for (word, kind) in IntentKind::WORDS.iter().zip(IntentKind::ALL) {
+            let read: IntentKind =
+                serde_json::from_str(&format!("\"{word}\"")).expect("each word reads");
+            assert_eq!(read, kind, "and reads as the variant that writes it");
+        }
+        for key in ["old_kind", "Kind", "kind "] {
+            let aliased = json.replacen("\"kind\":", &format!("\"{key}\":"), 1);
+            let error = serde_json::from_str::<IntentRecord>(&aliased)
+                .expect_err("a key outside FIELDS is refused, whatever it is called");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{key}: {error}"
+            );
+        }
+    }
+
+    /// What a record writes, it reads back, and a record cannot be made to
+    /// write what it would refuse: the fields are private, the constructor
+    /// takes the kind from the slot, and the reader checks agreement.
+    #[test]
+    fn a_record_round_trips_and_cannot_be_built_disagreeing() {
+        for slot in every_shape() {
+            let record = IntentRecord::new(&slot, "run".to_owned(), "01".to_owned())
+                .expect("every fixture slot makes a record");
+            assert_eq!(record.kind(), slot.intent_kind());
+            assert_eq!(
+                record.slot().as_str(),
+                slot.id().expect("a valid slot").as_str()
+            );
+            assert_eq!(record.run_id(), "run");
+            assert_eq!(record.incarnation(), "01");
+            let json = serde_json::to_string(&record).expect("serializes");
+            let read: IntentRecord = serde_json::from_str(&json).expect("reads back");
+            assert_eq!(read, record, "the record read back is the record written");
+            assert_eq!(
+                serde_json::to_string(&read).expect("serializes again"),
+                json,
+                "and writes the same bytes again"
+            );
+        }
+        let invalid = Slot::Task {
+            key: String::new(),
+            generation: 0,
+        };
         assert!(
-            error.to_string().contains("unknown variant `worktree`"),
-            "{error}"
+            IntentRecord::new(&invalid, "run".to_owned(), "01".to_owned()).is_err(),
+            "a slot that validate refuses makes no record"
         );
     }
 
