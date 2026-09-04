@@ -8,7 +8,7 @@ reviewed_sha: e5e42ac6aa7dbb5a14443df41506c53ab6ce723b
 location: src/workspace_manager/tests.rs:9866
 provenance: pre_existing
 first_bad:
-guard: the change that gives a test module reach to `agent::proc`'s Job Object, or moves that containment somewhere a harness may use
+guard: the `#117` `agent/proc` family, whose live stream is on `ambient.rs` and whose queue row is 51 -- a test-only seam there mirroring `child_leads_its_own_group`; escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
 ---
 
 ## What is fixed and what is not
@@ -44,6 +44,15 @@ duplicated-platform-fact shape this tree has been bitten by repeatedly, and the 
 asks `agent::proc::child_leads_its_own_group` rather than writing its own `getpgid`. Widening
 `agent::proc`'s surface so a harness can borrow the real one is a change to a funnel module's public
 shape, with its own review.
+
+## Why this is deferred under a rule that says P2s are fixed
+
+Two reasons, both measured on PR #145 itself. The fix needs a test-only seam in a production module
+(`src/agent/proc.rs`, queue row 51) whose family already has a live stream; and it can only be
+*measured* on the winguest leg — no session on the build box can run it — and this pull request is
+the one that had a platform claim disproved by CI for exactly that reason. A fix that cannot be
+measured is a second unmeasured platform claim, not a fix. **If a later pass labels this P1 or P2
+rather than accepting the deferral, it escalates to the owner rather than re-defers.**
 
 ## What the change that takes this up should do
 

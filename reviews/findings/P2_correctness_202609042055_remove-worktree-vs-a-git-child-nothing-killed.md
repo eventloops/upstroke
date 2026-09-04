@@ -8,7 +8,7 @@ reviewed_sha: ead3573882c931f9c7eaf0846a81be3bffd404a8
 location: src/workspace_manager.rs:1868
 provenance: pre_existing
 first_bad:
-guard: the change that gives the engine a kill path for its own Git children, or a sampler that models the engine's own death rather than a killed child
+guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence, which holds this and `SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR` together because a shape chosen for either constrains the other; escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
 ---
 
 ## Why this file exists at all
@@ -44,9 +44,20 @@ worktree and its intent -> `remove_worktree` walks a directory a live writer is 
 the removal fails, `Filesystem { operation: "remove", … DirectoryNotEmpty }`, and recovery does not
 converge.
 
-That is a **sequence, not an observation.** No run of anything in this repository has been seen to
-produce it. It is written concretely because a finding that says "convergence is unproven" is not
-actionable and this one is.
+**What has and has not been observed.** The first version of this file said nothing in the tree had been seen to produce this sequence.
+**That was too strong, and it is corrected here rather than left.** The sampler's bare-child arm —
+`git worktree add` killed while its checkout descendant runs on as an orphan writer — is exactly
+the state this sequence ends in, and it produced `Filesystem { operation: "remove", …
+DirectoryNotEmpty }` 7 times in 100 runs across two independent measurements (5/50 on the
+pre-repair tree, 2/50 at PR #145's head, alternating under load). What remains unmeasured is only
+the *path* to that state named in the title — the engine's own death — not the state or the
+non-convergence. `remove_worktree` racing a live writer is reproduced; whether an engine crash
+leaves one is not.
+
+Under the owner's rule that a P2 is fixed or rejected with a measurement: this one is reproduced,
+so it is not rejected, and its remedy is a funnel change — `remove_worktree` converging against a
+live writer — outside a harness change's scope. **If a later pass labels this P1 or P2 rather than
+accepting the deferral, it escalates to the owner rather than re-defers.**
 
 ## What was measured, and exactly what it does not answer
 

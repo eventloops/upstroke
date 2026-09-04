@@ -8,7 +8,7 @@ reviewed_sha: 93d63378f746dae74e36ff556287a3c0f900dea9
 location: src/workspace_manager.rs:3018
 provenance: pre_existing
 first_bad:
-guard: the change that reconciles the tabled recovery for `registered_unpopulated_worktree` with `revalidate_removal`'s refusal -- a funnel and contract decision, not a harness one
+guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence, which holds this and `PR136-REMOVE-WORKTREE-VS-A-GIT-CHILD-NOTHING-KILLED` together because a shape chosen for either constrains the other; escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
 ---
 
 ## The two fingerprints, now split
@@ -82,6 +82,15 @@ fail in, and it is the direction this module's table takes on every refusing row
 **Not P3.** It is observed rather than hypothesised, it makes a test intermittently red on master
 and on every branch that merges master, and the code path is the engine's own recovery rather than a
 test's.
+
+## Why this is deferred under a rule that says P2s are fixed
+
+The owner's rule 2 says a P2 is fixed or rejected with a measurement. This one is measured — it
+reproduces — so it is not rejected; and its fix is a funnel-and-contract decision with three
+candidate shapes, in a module a sweep of one test file does not own. The coordinator's resolution,
+recorded on PR #145: an owner *now* rather than a deferral, and never a widened pull request. That
+owner is the stream named in `guard`. **If a later pass labels this P1 or P2 rather than accepting
+the deferral, it escalates to the owner rather than re-defers.**
 
 ## What the change that takes this up should do
 
