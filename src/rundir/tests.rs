@@ -2700,12 +2700,16 @@ fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
 /// later census repeated it. A pull request about not deleting the wrong thing
 /// on bad evidence cannot itself name the wrong thing.
 ///
-/// Unix only, and stated rather than skipped: a filename that is not valid
-/// UTF-8 is constructible on Unix through `OsStrExt` and not on Windows, whose
-/// names are UTF-16. The leg that proves this is `test (ubuntu-latest)` and
-/// `test (macos-latest)`; the Windows guest compiles the change but does not
-/// witness this property.
-#[cfg(unix)]
+/// **Linux only, and that bound is measured rather than assumed.** The fixture
+/// needs a filename that is not valid UTF-8. Windows names are UTF-16, so it
+/// cannot be built there; and macOS refuses to create one at all — CI's
+/// `test (macos-latest)` leg, job `101160788949`, failed this test with
+/// `write: Os { code: 92, kind: Uncategorized, message: "Illegal byte
+/// sequence" }`, because APFS and HFS+ enforce UTF-8 in names. So the leg that
+/// witnesses this property is `test (ubuntu-latest)`; the other two compile the
+/// change without exercising it. The first version of this test said `cfg(unix)`
+/// and named macOS as a proving leg, and CI falsified that.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_entry_whose_name_is_not_utf8_is_removed_by_its_real_name() {
     use std::os::unix::ffi::OsStrExt as _;
@@ -2743,8 +2747,8 @@ fn an_entry_whose_name_is_not_utf8_is_removed_by_its_real_name() {
 /// The listing is asserted directly as well as through the removal, because
 /// the removal alone cannot say *which* of the two it took.
 ///
-/// Unix only, for the reason given above.
-#[cfg(unix)]
+/// Linux only, for the reason measured above.
+#[cfg(target_os = "linux")]
 #[test]
 fn two_entries_with_one_lossy_rendering_stay_two_entries() {
     use std::os::unix::ffi::OsStrExt as _;
