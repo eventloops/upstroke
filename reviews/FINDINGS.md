@@ -6330,3 +6330,36 @@ third sighting lands on a head without that increment, this paragraph is what to
 **Consequence.** This row exists to be found when that fingerprint fires a third time. The
 disposition of the prior row is its owner's to rule on, not this pull request's; nothing in it has
 been edited.
+
+## 57. `SWEEP-CLASSIFY-009` — an unreadable listing is not an empty one (2026-09-04)
+
+The `src/rundir/classify.rs` sweep (PR #137) traced a path that deletes a committed run's public
+half and deferred it: both folds are in files that pull request does not own, and the fix changes
+the deletion authority's behaviour, which needs those files' own review. This pull request is that
+change, scoped to the one row and nothing else. The two files whose sweeps will come — `src/rundir.rs`
+(review queue row 19) and `src/rundir/ownership.rs` (row 15) — are **not** swept here.
+
+**The section number is 57.** Master's last is 53; PR #136, #135 and #137 hold 54, 55 and 56 on
+their own branches. 57 collides with none of them.
+
+**The mechanism, as it was measured.** `read_dir_names` answered `Vec::new()` for a `read_dir` that
+failed and dropped every per-entry error with `flatten()`, so a directory it could not read and one
+that is empty were the same value. Empty is the reclaiming answer: `unbound_shape`'s `[]` arm is
+`NothingBound(UnboundShape::Bare)`, whose plan is `ReclaimPublicOnly`, and that plan carries no
+commit-record check anywhere on its path. A transient whole-process descriptor exhaustion —
+`EMFILE`, `ENFILE`, ordinary on a busy machine and reachable without anything hostile — fails the
+classification probe's `open`, the marker read at conjunct 1 and that listing in the same moment.
+`remove_public_husk` then listed the directory a second time, after the transient had cleared, and
+removed what it found, `events.jsonl` included.
+
+**What closes it.** The listing is an `io::Result`, and both consumers on the reclaim path refuse
+rather than delete: `unbound_shape` answers the new `RetainReason::ListingUnreadable`, which is a
+retention and mints no token, and `remove_public_husk` takes its whole listing before it removes
+anything. The witness is
+`rundir::tests::a_committed_run_the_census_could_not_read_is_not_reclaimed`, which takes the proof's
+answer while the directory cannot be read, restores the permissions before the reclaim, and runs the
+reclaim exactly when the answer licenses it: against the pre-fix body it reports `the committed log
+is GONE`.
+
+**The row is closed here, not carried.** It appears in this pull request's ledger with disposition
+`fixed`; PR #137's own row records the deferral and the sequence, and nothing in it has been edited.
