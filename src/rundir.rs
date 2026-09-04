@@ -27,6 +27,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -843,7 +844,9 @@ pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<
                 source,
             })?;
             for entry in entries {
-                if entry == MARKER {
+                // `OsStr`, so the comparison is against the name the
+                // filesystem gave rather than a lossy rendering of it.
+                if entry == OsStr::new(MARKER) {
                     continue;
                 }
                 let path = public.join(&entry);
@@ -898,7 +901,8 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
     }
 }
 
-/// Every name in `dir`, sorted — or the failure that stopped the listing.
+/// Every name in `dir` **as the filesystem spells it**, sorted — or the
+/// failure that stopped the listing.
 ///
 /// **A listing that did not happen is not an empty one** (`SWEEP-CLASSIFY-009`).
 /// This returned `Vec::new()` for a `read_dir` that failed and dropped every
@@ -931,10 +935,23 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
 /// The file already answers two other unanswerable probes this way and this was
 /// the one that did not: [`is_running`] calls a lock it cannot inspect held, and
 /// [`commit_record_after_error`] calls a stat it cannot take `Unknown`.
-fn read_dir_names(dir: &Path) -> io::Result<Vec<String>> {
+///
+/// **`OsString`, not `String`, and that is a correctness property rather than a
+/// style one.** This mapped every name through `to_string_lossy()`, and
+/// [`remove_public_husk`] joined the results back into paths — so a Unix entry
+/// named with the bytes `x\\xff` was listed as `x` followed by
+/// `U+FFFD` and the removal targeted a **different filename**: `NotFound`, the
+/// real entry and the marker left behind, and every later census repeating it.
+/// Worse, a directory holding both that entry and a genuine `x` + `U+FFFD`
+/// listed one name twice, so the valid neighbour was removed in the mangled
+/// entry's place. A lossy name is not the name, and this function's answer is
+/// fed straight to a deletion. It is also `CODING_STANDARDS.md` §8 and
+/// `CLAUDE.md`'s "all paths through `std::path`", which a `String` round trip
+/// breaks outright.
+fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
-        names.push(entry?.file_name().to_string_lossy().into_owned());
+        names.push(entry?.file_name());
     }
     names.sort();
     Ok(names)

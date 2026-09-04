@@ -2612,6 +2612,99 @@ fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
     );
 }
 
+/// A name the listing cannot render as UTF-8 is still removed **by its real
+/// name**, rather than missed.
+///
+/// `read_dir_names` mapped every entry through `to_string_lossy()` and
+/// `remove_public_husk` joined the result back into a path, so an entry named
+/// with the bytes `x` + `0xff` — a perfectly ordinary Unix filename — was
+/// listed as `x` + `U+FFFD` and the removal targeted a **different file**. It
+/// returned `NotFound`, left the real entry and the marker behind, and every
+/// later census repeated it. A pull request about not deleting the wrong thing
+/// on bad evidence cannot itself name the wrong thing.
+///
+/// Unix only, and stated rather than skipped: a filename that is not valid
+/// UTF-8 is constructible on Unix through `OsStrExt` and not on Windows, whose
+/// names are UTF-16. The leg that proves this is `test (ubuntu-latest)` and
+/// `test (macos-latest)`; the Windows guest compiles the change but does not
+/// witness this property.
+#[cfg(unix)]
+#[test]
+fn an_entry_whose_name_is_not_utf8_is_removed_by_its_real_name() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let husk = BoundHusk::new("lossy-miss");
+    husk.publish();
+    let public = husk.public();
+    let raw = OsStr::from_bytes(b"x\xff");
+    write(&public.join(raw), b"the entry the removal must target");
+    assert!(
+        public.join(raw).is_file(),
+        "the fixture needs an entry whose name is not valid UTF-8"
+    );
+
+    remove_public_husk(&public, &mut NoHooks)
+        .expect("the removal names every entry exactly as the filesystem spells it");
+
+    assert!(
+        !public.exists(),
+        "the husk is gone: the entry that could not be rendered was removed rather than missed"
+    );
+}
+
+/// Two entries whose lossy renderings are equal stay **two entries**, so the
+/// removal cannot take a valid neighbour in a mangled entry's place.
+///
+/// This is the second half of the same defect and the dangerous one. A
+/// directory holding both `x` + `0xff` and a genuine `x` + `U+FFFD` listed one
+/// name twice under `to_string_lossy()`: the removal deleted the valid
+/// neighbour, then failed `NotFound` on the second copy of that name, and the
+/// entry it was actually asked to remove survived. So the wrong file was
+/// deleted — the failure mode this pull request exists to close, reached
+/// through the name rather than through the listing.
+///
+/// The listing is asserted directly as well as through the removal, because
+/// the removal alone cannot say *which* of the two it took.
+///
+/// Unix only, for the reason given above.
+#[cfg(unix)]
+#[test]
+fn two_entries_with_one_lossy_rendering_stay_two_entries() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let husk = BoundHusk::new("lossy-collision");
+    husk.publish();
+    let public = husk.public();
+    let raw = OsStr::from_bytes(b"x\xff");
+    let neighbour = OsStr::new("x\u{FFFD}");
+    assert_ne!(
+        raw, neighbour,
+        "the fixture needs two genuinely different names"
+    );
+    assert_eq!(
+        raw.to_string_lossy(),
+        neighbour.to_string_lossy(),
+        "whose lossy renderings are the same, or this witnesses nothing"
+    );
+    write(&public.join(raw), b"the entry a lossy listing loses");
+    write(&public.join(neighbour), b"the valid neighbour it was removed in place of");
+
+    let listed = read_dir_names(&public).expect("the husk lists");
+    let distinct: std::collections::BTreeSet<&std::ffi::OsString> = listed.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        listed.len(),
+        "two entries collapsed to one name in the listing: {listed:?}"
+    );
+    assert!(
+        listed.iter().all(|name| public.join(name).symlink_metadata().is_ok()),
+        "every name the listing gives must name an entry that is there: {listed:?}"
+    );
+
+    remove_public_husk(&public, &mut NoHooks).expect("both entries are removed, each by its name");
+    assert!(!public.exists(), "and the husk is gone");
+}
+
 /// A private target the census cannot ask about is not a target that is
 /// gone, and the marker that locates it survives.
 ///
@@ -2836,7 +2929,7 @@ fn p0_creates_the_public_directory_and_nothing_private() {
     assert!(public.is_dir(), "P0 created the public run directory");
     assert_eq!(
         read_dir_names(&public).expect("the public directory lists"),
-        Vec::<String>::new(),
+        Vec::<std::ffi::OsString>::new(),
         "and it is bare: no skeleton, no marker, no private half beneath it"
     );
     assert!(
@@ -2868,21 +2961,21 @@ fn the_owner_record_is_the_first_content_of_a_private_half() {
     create_private_dir(&private, &mut NoHooks).expect("P3");
     assert_eq!(
         read_dir_names(&private).expect("the private half lists"),
-        Vec::<String>::new(),
+        Vec::<std::ffi::OsString>::new(),
         "immediately after P3 the private half is empty"
     );
 
     stage_owner_record(&private, &owner, &mut NoHooks).expect("P3a");
     assert_eq!(
         read_dir_names(&private).expect("the private half lists"),
-        vec![OWNER_RECORD_STAGED.to_owned()],
+        vec![std::ffi::OsString::from(OWNER_RECORD_STAGED)],
         "the staged owner record is the only thing in it"
     );
 
     publish_owner_record(&private, &mut NoHooks).expect("P3b");
     assert_eq!(
         read_dir_names(&private).expect("the private half lists"),
-        vec![OWNER_RECORD.to_owned()],
+        vec![std::ffi::OsString::from(OWNER_RECORD)],
         "and after publication the owner record is the only content there has ever been"
     );
 }

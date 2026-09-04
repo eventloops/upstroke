@@ -50,8 +50,8 @@
 )]
 
 use super::{
-    COMMIT_RECORD, CreatingMarker, MARKER, MARKER_STAGED, OWNER_RECORD, OwnerField, OwnerRecord,
-    Path, PathBuf, PrivateHalfOwnership, RepoKey, RetainReason, UnboundShape, fs, io,
+    COMMIT_RECORD, CreatingMarker, MARKER, MARKER_STAGED, OWNER_RECORD, OsStr, OwnerField,
+    OwnerRecord, Path, PathBuf, PrivateHalfOwnership, RepoKey, RetainReason, UnboundShape, fs, io,
     read_dir_names, runner_policy_sha256,
 };
 
@@ -236,7 +236,32 @@ pub fn prove_private_half_ownership(
         },
         Err(_) => return PrivateHalfOwnership::Retained(RetainReason::OwnerRecordMissing),
     };
-    let canonical_public = fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf());
+    // Conjunct 8's own expected value, fail-closed. This was
+    // `fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf())`, and
+    // that fold is a worse shape than the three above it: those turned a
+    // failure into a *reclaiming* answer, this one turns a failure into a
+    // **proving** one. The fallback supplies the value the comparison then
+    // uses, so a canonicalization that failed can carry the conjunct — and
+    // `create.rs`'s `canonical_string` uses the identical fallback when
+    // *recording* `owner.public_dir`, so both sides degrade the same way and
+    // match. A proof that passes because two lookups failed together mints the
+    // token `remove_private_husk` accepts.
+    //
+    // The refusal is `OwnerRecordDisagrees` on the public-directory field
+    // rather than a kind of its own, and that mirrors conjunct 12 exactly: the
+    // shape is not constructible single-threaded — a `public` this proof has
+    // already read a marker out of canonicalizes — so the classification lives
+    // in a free function the suite can assert directly, and the reachable
+    // shapes go through the whole proof. See
+    // [`canonical_public_or_refusal`].
+    let canonical_public = match canonical_public_or_refusal(
+        public,
+        fs::canonicalize(public),
+        &owner.public_dir,
+    ) {
+        Ok(path) => path,
+        Err(reason) => return PrivateHalfOwnership::Retained(reason),
+    };
     let disagreements = [
         (OwnerField::RunId, owner.run_id.clone(), basename.clone()),
         (
@@ -312,6 +337,49 @@ pub(super) fn commit_record_proves_absence(stat: &io::Result<fs::Metadata>) -> b
     matches!(stat, Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
+/// Conjunct 8's expected value: the husk's **canonical** path, or the refusal
+/// that stands in for one that could not be resolved.
+///
+/// `startup_census` (ii) says the owner record must record `public_dir ==` the
+/// canonical path of this husk. A canonicalization that failed produces no
+/// canonical path, so there is nothing to compare and the conjunct cannot be
+/// carried: the answer is a refusal naming the public-directory field, with the
+/// error in the expected side so an operator can see that the comparison did not
+/// happen rather than that it failed.
+///
+/// **Why this refuses rather than falling back to the given path.** The fallback
+/// it replaces was the only fold in this file that could turn an I/O failure
+/// into `Proven`. `create.rs`'s `canonical_string` uses the same fallback when
+/// writing `owner.public_dir`, so a recorder and a prover that both failed to
+/// canonicalize agreed on the un-canonical spelling and the conjunct passed —
+/// establishing nothing while minting the token that authorises deleting a
+/// private half.
+///
+/// **A free function for the same reason as
+/// [`commit_record_proves_absence`].** A `public` this proof has already read a
+/// marker out of will canonicalize; making it fail here needs a race, so the
+/// classification is not constructible from a single-threaded test through the
+/// real filesystem. Extracting it makes the decision itself assertable, and the
+/// reachable shape — a canonicalization that succeeds and a record that agrees
+/// or disagrees — is exercised through the whole proof by the grid.
+pub(super) fn canonical_public_or_refusal(
+    public: &Path,
+    canonical: io::Result<PathBuf>,
+    recorded: &str,
+) -> Result<PathBuf, RetainReason> {
+    match canonical {
+        Ok(path) => Ok(path),
+        Err(error) => Err(RetainReason::OwnerRecordDisagrees {
+            field: OwnerField::PublicDir,
+            recorded: recorded.to_owned(),
+            expected: format!(
+                "the canonical path of {}, which could not be resolved: {error}",
+                public.display()
+            ),
+        }),
+    }
+}
+
 /// A husk with no marker: `startup_census` (i) reclaims "a bare directory
 /// or one holding only a staged `.creating.tmp` (no marker, **no other
 /// content**)", and (iii) retains "a marker-less husk carrying run-scoped
@@ -349,7 +417,9 @@ fn unbound_shape(public: &Path) -> PrivateHalfOwnership {
     };
     match names.as_slice() {
         [] => PrivateHalfOwnership::NothingBound(UnboundShape::Bare),
-        [only] if only == MARKER_STAGED => {
+        // Compared as an `OsStr`: the listing carries the name the filesystem
+        // gave, and only an exact match is the staging file.
+        [only] if only == OsStr::new(MARKER_STAGED) => {
             PrivateHalfOwnership::NothingBound(UnboundShape::StagedMarkerOnly)
         }
         _ => PrivateHalfOwnership::Retained(RetainReason::MarkerlessWithContent),
