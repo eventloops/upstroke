@@ -32,6 +32,13 @@ use std::collections::BTreeSet;
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
 use super::fixture::{Fixture, git, git_out, scratch};
+// The observing scratch tree: its drop reclaims the directory and reports a
+// reclaim that failed, where `scratch` above hands back a bare path nothing
+// removes. The `canonical_prefix` tests below build no repository, so this is
+// the fixture they take.
+use crate::rundir::scratch_tree::acquire;
+// The slot-component grammar, named so the run-id restatement of it can be
+// held to the same verdicts.
 // Named here rather than borrowed from the parent's import list. The split
 // moved the items that needed them into children -- the hook observers, the
 // residue classifier, the slot vocabulary and the changed-path decoder -- so
@@ -164,8 +171,13 @@ fn the_repo_key_is_the_repositorys_and_not_the_worktrees() {
             &fixture.head,
         ],
     );
-    let from_linked =
-        WorkspaceManager::derive(&linked, &fixture.private, "run-2", "inc-1").expect("derive");
+    let from_linked = WorkspaceManager::derive(
+        &linked,
+        &fixture.private,
+        "01KZSWEEP00000000000000002",
+        "inc-1",
+    )
+    .expect("derive");
     assert_eq!(
         from_linked.repo_key(),
         fixture.manager.repo_key(),
@@ -202,7 +214,7 @@ fn the_execution_root_is_the_path_the_packet_names() {
     )
     .join("workspaces")
     .join(fixture.manager.repo_key())
-    .join("run-1");
+    .join(super::fixture::RUN_ID);
     assert_eq!(fixture.manager.execution_root(), expected.as_path());
     assert!(
         !fixture
@@ -865,8 +877,13 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     let real = fixture.base.canonicalize().expect("canonical base");
     let link = fixture.root.join("base-link");
     plant_directory_link(&real, &link);
-    let error = WorkspaceManager::derive(&link, &fixture.private, "run-9", "inc-1")
-        .expect_err("a managed base that is a link refuses");
+    let error = WorkspaceManager::derive(
+        &link,
+        &fixture.private,
+        "01KZSWEEP00000000000000009",
+        "inc-1",
+    )
+    .expect_err("a managed base that is a link refuses");
     refused.push(("derive/base", refusal_of(&error)));
 
     // (2) derive's private root.
@@ -874,8 +891,9 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     let real = fixture.private.canonicalize().expect("canonical private");
     let link = fixture.root.join("private-link");
     plant_directory_link(&real, &link);
-    let error = WorkspaceManager::derive(&fixture.base, &link, "run-9", "inc-1")
-        .expect_err("a private root that is a link refuses");
+    let error =
+        WorkspaceManager::derive(&fixture.base, &link, "01KZSWEEP00000000000000009", "inc-1")
+            .expect_err("a private root that is a link refuses");
     refused.push(("derive/private-root", refusal_of(&error)));
 
     // (3) revalidate's base — the link arrives *after* derive succeeded.
@@ -906,6 +924,1666 @@ fn a_managed_base_or_private_root_that_is_itself_a_link_refuses_before_any_effec
     // Distinct paths named, so one refusal cannot stand in for three.
     let named: std::collections::BTreeSet<&str> = refused.iter().map(|(site, _)| *site).collect();
     assert_eq!(named.len(), 3, "three distinct call sites: {named:?}");
+}
+
+/// The walk's own guarantee, driven directly: a root that is not plain
+/// components below the anchor — `..` in the remainder, or no common prefix
+/// at all — is refused rather than walked. The walk answered "no reparse
+/// point" for such a root, true of a chain it never inspected, and on Linux
+/// `derive` then succeeded with `<private>/workspaces/<key>/../../../escape`
+/// as its execution root. Through `derive` these shapes are now refused
+/// earlier, as run ids; this pins the arm behind that one.
+#[test]
+fn an_execution_root_with_no_plain_chain_below_the_private_root_refuses_before_any_effect() {
+    let fixture = Fixture::new("root-not-below");
+    let anchor = fixture.manager.private_root().to_path_buf();
+    for root in [
+        anchor
+            .join("workspaces")
+            .join("k")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("escape"),
+        fixture.root.join("escape"),
+    ] {
+        let error = refuse_reparse_points(&anchor, &root, Leaf::Directory)
+            .expect_err("a root with no plain chain below the anchor refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("does not lie below the authorized private root"),
+            "{}: the refusal must name its reason: {message}",
+            root.display()
+        );
+    }
+    assert!(
+        !fixture.root.join("escape").exists() && !anchor.join("workspaces").exists(),
+        "and perform no effect"
+    );
+}
+
+/// A run id is one plain component, refused at `derive` before any path is
+/// built. `Path::join` lets an absolute id replace the whole prefix, so an
+/// absolute id naming a peer run's root aliased that root: `revalidate`
+/// treated the peer's worktree as this manager's slot and `remove_worktree`
+/// could have deleted its checkout and Git admin entry. `.` passed the walk
+/// because `components()` folds a non-leading `.` away, aliasing the repo-key
+/// directory. Every shape, on every platform.
+#[test]
+fn a_run_id_that_is_not_one_plain_component_is_refused_before_any_path_is_built() {
+    let victim = Fixture::created("alias-victim");
+    let slot = victim.add_task(&mut NoHooks, "k1", 1);
+    let victim_root = victim
+        .manager
+        .execution_root()
+        .to_str()
+        .expect("a UTF-8 scratch path")
+        .to_owned();
+    for run_id in [
+        victim_root.as_str(),
+        ".",
+        "..",
+        "",
+        "../../../escape",
+        "/escape",
+        "a/b",
+        "-run",
+        "run.",
+    ] {
+        let error = WorkspaceManager::derive(&victim.base, &victim.private, run_id, "inc-2")
+            .expect_err("a run id that is not one plain component refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("refusing the run id"),
+            "{run_id:?}: the refusal must name its reason: {message}"
+        );
+    }
+    assert!(
+        victim.manager.slot_path(&slot).is_dir(),
+        "and the peer's worktree is untouched"
+    );
+    assert!(
+        !victim.root.join("escape").exists(),
+        "and nothing was built"
+    );
+}
+
+/// `execution_root`: "every create/reclaim/delete revalidates". The walk
+/// pushed the first child before its first `symlink_metadata`, so the private
+/// root itself was never examined: renamed away after `derive` and replaced
+/// by a link to an unrelated directory, every component under it was read
+/// through the link and `create_execution_root` built the hierarchy under
+/// the link's target. A symlink here, a junction on Windows.
+#[test]
+fn a_private_root_replaced_by_a_link_after_derive_refuses_every_revalidation() {
+    let fixture = Fixture::new("anchor-link");
+    let private = fixture.manager.private_root().to_path_buf();
+    let elsewhere = fixture.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the unrelated directory");
+    let moved = fixture.root.join("private-moved");
+    fs::rename(&private, &moved).expect("move the real private root aside");
+    plant_directory_link(&elsewhere, &private);
+
+    let error = fixture
+        .manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("a private root that became a link refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !elsewhere.join("workspaces").exists() && !moved.join("workspaces").exists(),
+        "and nothing is built under the link's target"
+    );
+}
+
+/// The same exchange one level up: the private root is still a real
+/// directory at its recorded path, but an ancestor is now a link, so the
+/// recorded canonical root no longer resolves to itself. The anchored walk
+/// never looks above the anchor; the canonical pin does.
+#[test]
+fn a_link_planted_above_the_private_root_after_derive_refuses_every_revalidation() {
+    let fixture = Fixture::new("anchor-ancestor");
+    let holder = fixture.root.join("holder");
+    fs::create_dir_all(holder.join("private")).expect("the held private root");
+    let manager = WorkspaceManager::derive(
+        &fixture.base,
+        &holder.join("private"),
+        "01KZSWEEP00000000000000007",
+        "inc-1",
+    )
+    .expect("derive under the holder");
+    let moved = fixture.root.join("holder-moved");
+    fs::rename(&holder, &moved).expect("move the holder aside");
+    plant_directory_link(&moved, &holder);
+
+    let error = manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("a link above the private root refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !moved.join("private").join("workspaces").exists(),
+        "and nothing is built through the link"
+    );
+}
+
+/// A regular file where a directory of the chain should be is a broken
+/// chain, reported where it stands and on every platform alike: the walk
+/// reads the component's type rather than waiting for the `ENOTDIR` only
+/// Unix raises one component later, and never walks past it. Walking past
+/// handed the failure to the next effect, or to none: `remove_execution_root`
+/// asks `exists()`, which folded the file into "nothing to remove" and
+/// answered `Ok(false)` with no path named.
+#[test]
+fn a_regular_file_on_the_chain_is_reported_where_it_stands_and_never_as_nothing_to_remove() {
+    let fixture = Fixture::new("file-on-chain");
+    let file = fixture.manager.private_root().join("workspaces");
+    fs::write(&file, "not a directory\n").expect("plant the file");
+
+    let error = fixture
+        .manager
+        .revalidate()
+        .expect_err("a file on the chain is a broken chain, not absence");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &file && source.kind() == std::io::ErrorKind::NotADirectory
+        ),
+        "the walk names the file itself, as not a directory: {error}"
+    );
+    fixture
+        .manager
+        .create_execution_root(&mut NoHooks)
+        .expect_err("the create revalidates and refuses");
+    fixture
+        .manager
+        .remove_execution_root(&mut NoHooks)
+        .expect_err(
+            "the removal revalidates and refuses rather than answering \"nothing to remove\"",
+        );
+}
+
+/// `DESIGN.md` §15: every create, reclaim and delete revalidates inside its
+/// effect funnel, after the before-hook and immediately before the effect. A
+/// revalidation outside the funnel left a window: a `Before` hook — the seam
+/// `a_registration_rebound_after_validation_keeps_its_admin_state` already
+/// drives — that renamed the private root away and planted a link in its
+/// place after the check had passed, and `create_dir_all` then built the
+/// hierarchy under the link's target. The hook here does exactly that at the
+/// create's `Before`, so the only check that can refuse is the one inside.
+#[test]
+fn a_private_root_exchanged_between_the_before_hook_and_the_effect_is_still_refused() {
+    struct ExchangeAtBefore {
+        private: PathBuf,
+        moved: PathBuf,
+        elsewhere: PathBuf,
+    }
+
+    impl EffectHooks for ExchangeAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot)
+                && phase == HookPhase::Before
+            {
+                fs::rename(&self.private, &self.moved).expect("move the real private root aside");
+                plant_directory_link(&self.elsewhere, &self.private);
+            }
+            Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
+    }
+
+    let fixture = Fixture::new("anchor-exchanged-in-funnel");
+    let elsewhere = fixture.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the unrelated directory");
+    let mut hooks = ExchangeAtBefore {
+        private: fixture.manager.private_root().to_path_buf(),
+        moved: fixture.root.join("private-moved"),
+        elsewhere: elsewhere.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .create_execution_root(&mut hooks)
+        .expect_err("the check inside the funnel sees the exchanged root");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !elsewhere.join("workspaces").exists() && !hooks.moved.join("workspaces").exists(),
+        "and nothing is built under the link's target or the moved root"
+    );
+}
+
+/// An absent managed base, or an absent private root, is "not a real
+/// directory" — the refusal `execution_root` names — and not an I/O failure
+/// to read it. Only an actual not-found becomes absence; a leaf that cannot
+/// be read for any other reason stays an error.
+#[test]
+fn an_absent_managed_base_or_private_root_refuses_as_not_a_real_directory() {
+    let fixture = Fixture::new("absent-leaf");
+    let absent = fixture.root.join("absent");
+    for (site, base, private) in [
+        ("derive/base", absent.as_path(), fixture.private.as_path()),
+        (
+            "derive/private-root",
+            fixture.base.as_path(),
+            absent.as_path(),
+        ),
+    ] {
+        let error = WorkspaceManager::derive(base, private, "01KZSWEEP00000000000000009", "inc-1")
+            .expect_err("an absent leaf refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("not a real directory"),
+            "{site}: the refusal must name its reason: {message}"
+        );
+        assert!(
+            message.contains(&absent.display().to_string()),
+            "{site}: and the path: {message}"
+        );
+    }
+}
+
+/// `canonical_prefix` peels past **absence** only. A prefix the filesystem
+/// refuses to resolve for any other reason is an error, not a component to
+/// rejoin lexically: the peel used to discard every `canonicalize` failure,
+/// so a link loop under the root produced a "canonical" path the filesystem
+/// had never verified. Evaluated on the Unix legs; a loop needs a symbolic
+/// link, which the Windows guest's test user cannot create.
+#[cfg(unix)]
+#[test]
+fn canonical_prefix_propagates_a_resolution_failure_that_is_not_absence() {
+    let tree = acquire(&std::env::temp_dir(), "canonical-loop").expect("acquire a scratch tree");
+    let real = tree.path().canonicalize().expect("canonical scratch");
+    let link = real.join("loop");
+    std::os::unix::fs::symlink(&link, &link).expect("plant the loop");
+    let below = link.join("child");
+    let error = canonical_prefix(&below).expect_err("a link loop is not absence");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &below && source.kind() != std::io::ErrorKind::NotFound
+        ),
+        "the error names the path that could not be resolved and its reason: {error}"
+    );
+}
+
+/// A `..` below a component that does not exist has no directory to refer
+/// to. POSIX cannot traverse the absent directory, so the peel meets the
+/// `..`, finds no plain component left to peel, and returns that failure
+/// naming the prefix it stopped at — rather than the raw path, whose lexical
+/// `starts_with` would have answered "inside" for a path the filesystem
+/// never resolved. Evaluated on the Unix legs; Win32 resolves the same shape
+/// before the filesystem sees it, and the test below pins that answer.
+#[cfg(unix)]
+#[test]
+fn a_dot_dot_below_an_absent_component_is_refused_rather_than_compared_lexically() {
+    let tree = acquire(&std::env::temp_dir(), "canonical-dotdot").expect("acquire a scratch tree");
+    let real = tree.path().canonicalize().expect("canonical scratch");
+    let path = real.join("missing").join("..").join("x");
+    let error = canonical_prefix(&path).expect_err("no canonical form exists");
+    let stopped_at = real.join("missing").join("..");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &stopped_at && source.kind() == std::io::ErrorKind::NotFound
+        ),
+        "the error names the prefix the peel stopped at: {error}"
+    );
+}
+
+/// A relative path is anchored at the current directory, so `missing` and
+/// `./missing` resolve alike. The peel used to stop at the empty parent and
+/// report the first component as a failed prefix, while the same path spelt
+/// `./missing` peeled to `.` and resolved — two answers for one path, and a
+/// public caller (`quiescence`) failed as I/O on one spelling and reached its
+/// ordinary verdict on the other.
+#[test]
+fn canonical_prefix_anchors_a_relative_path_at_the_current_directory() {
+    let first = PathBuf::from(format!("upstroke-absent-{}", std::process::id()));
+    let cwd = strip_verbatim(
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory"),
+    );
+    let expected = cwd.join(&first).join("x");
+    assert_eq!(
+        canonical_prefix(&first.join("x")).expect("anchored at the current directory"),
+        expected
+    );
+    assert_eq!(
+        canonical_prefix(&Path::new(".").join(&first).join("x"))
+            .expect("the same path spelt with `.`"),
+        expected
+    );
+}
+
+/// A relative path whose first component exists and whose next does not:
+/// the peel finds the existing prefix under the current directory and
+/// rejoins the rest, exactly as it does for an absolute path. `src/` exists
+/// at the crate root, which is where the suite runs.
+#[test]
+fn canonical_prefix_resolves_an_existing_relative_prefix_and_rejoins_the_rest() {
+    let cwd = strip_verbatim(
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory"),
+    );
+    let absent = format!("upstroke-absent-{}", std::process::id());
+    let path = Path::new("src").join(&absent).join("x");
+    assert_eq!(
+        canonical_prefix(&path).expect("an existing relative prefix resolves"),
+        cwd.join("src").join(&absent).join("x")
+    );
+}
+
+/// An anchor that names nothing is the same refusal as one that is a file
+/// or a link — at the anchor's own check, and at its canonical pin should it
+/// vanish between the two, which routes absence through the same predicate.
+/// That race cannot be staged from a test; the arm is decided by the rule
+/// this drives at the function's edge.
+#[test]
+fn an_absent_anchor_refuses_as_not_a_real_directory() {
+    let fixture = Fixture::new("absent-anchor");
+    let anchor = fixture.root.join("never-created");
+    let error = refuse_reparse_points(&anchor, &anchor.join("workspaces"), Leaf::Directory)
+        .expect_err("an absent anchor refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("not a real directory"),
+        "the refusal must name its reason: {message}"
+    );
+}
+
+/// A run id is the canonical ULID `DESIGN.md` §15 specifies, as this crate's
+/// generator spells it, and nothing else by shape: a lowercase or mixed-case
+/// spelling names the same root as its uppercase twin on a case-insensitive
+/// filesystem, so two managers of one root cannot be derived through a case
+/// variant, and the "manager's own slot" classification cannot be reached
+/// through a non-canonical id at all.
+#[test]
+fn a_run_id_is_the_canonical_ulid_and_a_case_variant_is_refused() {
+    let fixture = Fixture::new("run-id-canonical");
+    let generated = crate::ulid::ulid();
+    WorkspaceManager::derive(&fixture.base, &fixture.private, &generated, "inc-1")
+        .expect("a generated id is the canonical spelling");
+    let lowered = generated.to_ascii_lowercase();
+    let mixed: String = generated
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    for run_id in [
+        "run1",
+        "RUN1",
+        lowered.as_str(),
+        mixed.as_str(),
+        "8ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ] {
+        let error = WorkspaceManager::derive(&fixture.base, &fixture.private, run_id, "inc-1")
+            .expect_err("a non-canonical run id refuses");
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("refusing the run id"),
+            "{run_id:?}: the refusal must name its reason: {message}"
+        );
+    }
+    assert!(
+        !fixture.private.join("workspaces").exists(),
+        "and nothing was built for any of them"
+    );
+}
+
+/// The Windows half of the test above: Win32 resolves `..` lexically before
+/// the filesystem sees it, so `missing\..` canonicalizes to the scratch
+/// directory and the peel rejoins `x` onto it. Evaluated on `test (winguest)`.
+#[cfg(windows)]
+#[test]
+fn windows_resolves_a_dot_dot_below_an_absent_component_before_the_filesystem_sees_it() {
+    let tree = acquire(&std::env::temp_dir(), "canonical-dotdot").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
+    let path = real.join("missing").join("..").join("x");
+    assert_eq!(
+        canonical_prefix(&path).expect("Win32 resolves the `..`"),
+        real.join("x")
+    );
+}
+
+/// The in-funnel check walks down to the directory the effect acts in, not
+/// only to the root. A non-recursive `remove_file` on `<root>/intents/<name>`
+/// follows a link in its *parent*: an `intents/` exchanged at the `Before`
+/// hook for a link to a victim directory holding a file of the same name
+/// deleted the victim's file with every check passed. The write direction
+/// and the `tasks/` direction are the two tests below.
+#[test]
+fn an_intents_directory_exchanged_at_the_before_hook_refuses_the_intent_removal() {
+    let fixture = Fixture::created("intents-exchanged-remove");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let intent = fixture.manager.intent_path(&slot);
+    let name = intent
+        .file_name()
+        .expect("an intent file name")
+        .to_os_string();
+    let victim = fixture.root.join("victim");
+    fs::create_dir_all(&victim).expect("victim directory");
+    let victim_file = victim.join(&name);
+    fs::write(&victim_file, "not yours\n").expect("victim file");
+    let intents = fixture.manager.execution_root().join("intents");
+    let mut hooks = ExchangeAtBefore {
+        site: slot.remove_intent_site(),
+        original: intents.clone(),
+        moved: fixture.root.join("intents-moved"),
+        victim,
+    };
+
+    let error = fixture
+        .manager
+        .remove_intent(&mut hooks, &slot)
+        .expect_err("the check inside the funnel sees the exchanged intents directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intents.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert!(victim_file.exists(), "the victim's file is untouched");
+    assert!(
+        hooks.moved.join(&name).exists(),
+        "and the real intent is still where the hook moved it"
+    );
+}
+
+/// The write direction: `write_intent` stages and renames inside `intents/`,
+/// so an exchanged `intents/` would put the record, and its staging file, in
+/// the victim directory.
+#[test]
+fn an_intents_directory_exchanged_at_the_before_hook_refuses_the_intent_write() {
+    let fixture = Fixture::created("intents-exchanged-write");
+    let slot = fixture.task("beta", 1);
+    let victim = fixture.root.join("victim");
+    fs::create_dir_all(&victim).expect("victim directory");
+    let intents = fixture.manager.execution_root().join("intents");
+    let mut hooks = ExchangeAtBefore {
+        site: slot.write_intent_site(),
+        original: intents.clone(),
+        moved: fixture.root.join("intents-moved"),
+        victim: victim.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .write_intent(&mut hooks, &slot)
+        .expect_err("the check inside the funnel sees the exchanged intents directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intents.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(
+        fs::read_dir(&victim).expect("victim listing").count(),
+        0,
+        "nothing was staged or written in the victim directory"
+    );
+}
+
+/// The `tasks/` direction: `add_worktree` creates the slot's parent and runs
+/// `git worktree add` at the slot path, so an exchanged `tasks/` would put a
+/// checkout in the victim directory.
+#[test]
+fn a_tasks_directory_exchanged_at_the_before_hook_refuses_the_worktree_add() {
+    let fixture = Fixture::created("tasks-exchanged-add");
+    let slot = fixture.task("gamma", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let victim = fixture.root.join("victim");
+    fs::create_dir_all(&victim).expect("victim directory");
+    let tasks = fixture.manager.execution_root().join("tasks");
+    let mut hooks = ExchangeAtBefore {
+        site: slot.add_site(),
+        original: tasks.clone(),
+        moved: fixture.root.join("tasks-moved"),
+        victim: victim.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the check inside the funnel sees the exchanged tasks directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&tasks.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(
+        fs::read_dir(&victim).expect("victim listing").count(),
+        0,
+        "no checkout was created in the victim directory"
+    );
+}
+
+/// A `Before` hook that exchanges one directory under the execution root for
+/// a link to `victim`, at one site.
+struct ExchangeAtBefore {
+    site: EffectSiteId,
+    original: PathBuf,
+    moved: PathBuf,
+    victim: PathBuf,
+}
+
+impl EffectHooks for ExchangeAtBefore {
+    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        if site == self.site && phase == HookPhase::Before {
+            fs::rename(&self.original, &self.moved).expect("move the real directory aside");
+            plant_directory_link(&self.victim, &self.original);
+        }
+        Injection::Proceed
+    }
+
+    fn refusal_cause(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Every Git command runs with `core.hooksPath` at `<root>/hooks-none`, and
+/// the in-funnel chain check walks the effect's target, not that path. A
+/// `hooks-none` exchanged at the `Before` hook for a link to an outside
+/// directory holding an executable `post-checkout` had `git worktree add`
+/// run it. The Git runner now walks the hooks path immediately before every
+/// command.
+#[test]
+fn a_hooks_path_exchanged_at_the_before_hook_refuses_the_worktree_add_and_runs_no_hook() {
+    let fixture = Fixture::created("hooks-exchanged");
+    let slot = fixture.task("delta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let outside = fixture.root.join("outside-hooks");
+    fs::create_dir_all(&outside).expect("outside hooks directory");
+    let marker = fixture.root.join("hook-ran.marker");
+    let script = outside.join("post-checkout");
+    fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display())).expect("hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    }
+    let hooks_dir = fixture.manager.execution_root().join("hooks-none");
+    let mut hooks = ExchangeAtBefore {
+        site: slot.add_site(),
+        original: hooks_dir.clone(),
+        moved: fixture.root.join("hooks-moved"),
+        victim: outside,
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the Git runner sees the exchanged hooks path");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&hooks_dir.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert!(!marker.exists(), "the outside hook never ran");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// `write_intent` staged through a fixed name, `<intent>.tmp`, opened with
+/// `File::create`, which follows a link planted there: the record went into
+/// the victim file the link named, and the link was renamed into place as
+/// the intent. The staging name is now unique per call and opened
+/// `create_new`, so a planted name is never followed. A file link needs a
+/// symlink, which the Windows guest's test user cannot create.
+#[cfg(unix)]
+#[test]
+fn a_link_planted_at_the_old_staging_name_is_never_followed_by_the_intent_write() {
+    let fixture = Fixture::created("staging-planted");
+    let slot = fixture.task("epsilon", 1);
+    let victim = fixture.root.join("victim.txt");
+    fs::write(&victim, "victim bytes\n").expect("victim");
+    let intent = fixture.manager.intent_path(&slot);
+    let old_staging = intent.with_extension("tmp");
+    std::os::unix::fs::symlink(&victim, &old_staging).expect("plant the link at the old name");
+
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("the write stages through its own unique name and lands");
+    assert_eq!(
+        fs::read(&victim).expect("victim"),
+        b"victim bytes\n",
+        "the victim is untouched"
+    );
+    let landed = fs::symlink_metadata(&intent).expect("the intent");
+    assert!(
+        landed.is_file() && landed.len() > 0,
+        "the intent landed as a regular file with the record"
+    );
+    assert!(
+        fs::symlink_metadata(&old_staging)
+            .expect("the planted link")
+            .file_type()
+            .is_symlink(),
+        "the planted link is still a link, and not what landed"
+    );
+}
+
+/// A link planted at the intent's own name is a reparse point on a path the
+/// write acts through (its rename target), and refuses like a link anywhere
+/// else on the chain: the victim it named is untouched and nothing lands. A
+/// file link needs a symlink, which the Windows guest's test user cannot
+/// create.
+#[cfg(unix)]
+#[test]
+fn a_link_planted_at_the_intent_name_refuses_the_intent_write() {
+    let fixture = Fixture::created("intent-name-planted");
+    let slot = fixture.task("eta", 1);
+    let victim = fixture.root.join("victim.txt");
+    fs::write(&victim, "victim bytes\n").expect("victim");
+    let intent = fixture.manager.intent_path(&slot);
+    std::os::unix::fs::symlink(&victim, &intent).expect("plant the link at the intent's name");
+
+    let error = fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect_err("a link at the intent's name refuses the write");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intent.display().to_string()),
+        "the refusal must name its reason and the link: {message}"
+    );
+    assert_eq!(
+        fs::read(&victim).expect("victim"),
+        b"victim bytes\n",
+        "the victim is untouched"
+    );
+    assert!(
+        fs::symlink_metadata(&intent)
+            .expect("the link")
+            .file_type()
+            .is_symlink(),
+        "and the planted link is still a link: nothing landed"
+    );
+}
+
+/// The durable-intent precondition sat before the funnel, so an intent
+/// removed at the `Before` hook still yielded a worktree, one that
+/// `reclaim_intents` could never find. The check now runs inside the funnel
+/// after the hook, and afterwards `intents()` and `reclaim_intents` agree
+/// that there is nothing.
+#[test]
+fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
+    struct RemoveIntentAtBefore {
+        site: EffectSiteId,
+        intent: PathBuf,
+    }
+
+    impl EffectHooks for RemoveIntentAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == self.site && phase == HookPhase::Before {
+                fs::remove_file(&self.intent).expect("remove the intent");
+            }
+            Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
+    }
+
+    let fixture = Fixture::created("intent-removed-in-hook");
+    let slot = fixture.task("zeta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let mut hooks = RemoveIntentAtBefore {
+        site: slot.add_site(),
+        intent: fixture.manager.intent_path(&slot),
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the check inside the funnel sees the removed intent");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("durable intent"),
+        "the refusal must name its reason: {message}"
+    );
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+    let recorded = fixture.manager.intents().expect("intents").len();
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect("reclaim")
+        .slots
+        .len();
+    assert_eq!(
+        (recorded, reclaimed),
+        (0, 0),
+        "nothing is recorded and nothing is reclaimed, so the two agree"
+    );
+}
+
+/// One substitution per path the table names for a primitive: a `Before`
+/// hook exchanges the path for a link to an outside victim, the primitive
+/// must refuse naming the substituted component, and the victim must be
+/// untouched. Generated from `every_primitive` and `acted_through_paths`, so
+/// every path the table names is driven; the case count is pinned as a
+/// regression pin on the table's own size — a path dropped from the table
+/// is a case that stops being generated and a number that stops matching —
+/// and it is not a proof that the table is complete, which it is not (see
+/// `ActedThrough`). A file link needs a symlink, which the Windows guest's
+/// test user cannot create, so the file-leaf cases run on the Unix legs and
+/// are counted as skipped on Windows.
+#[test]
+fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook() {
+    let mut driven = 0_usize;
+    let mut skipped = 0_usize;
+    let mut driven_primitives = BTreeSet::new();
+    for primitive in every_primitive() {
+        let count = SubstitutionCase::new(primitive).paths().len();
+        assert!(count > 0, "{primitive:?} acts through nothing?");
+        for index in 0..count {
+            let case = SubstitutionCase::new(primitive);
+            let (_, target, leaf) = case.paths()[index].clone();
+            let existing_kind = fs::symlink_metadata(&target).ok().map(|m| m.file_type());
+            let file_link = leaf == Leaf::Entry && existing_kind.is_some_and(|k| k.is_file());
+            if file_link && cfg!(windows) {
+                skipped += 1;
+                continue;
+            }
+            let victim = case.fixture.root.join(format!("victim-{index}"));
+            let mut hooks = SubstituteAtBefore {
+                site: case.site,
+                target: target.clone(),
+                moved: target.with_extension("moved-away"),
+                victim: victim.clone(),
+                file_link,
+            };
+            // The victim carries a sentinel, and a copy of whatever the
+            // primitive would have found through the link (the intent, the
+            // registration's `gitdir` and `locked`), so a walk that followed
+            // the link would find a plausible tree, not an empty one.
+            if file_link {
+                fs::write(&victim, b"victim bytes\n").expect("victim file");
+            } else {
+                fs::create_dir_all(&victim).expect("victim directory");
+                fs::write(victim.join("sentinel.txt"), b"sentinel\n").expect("sentinel");
+                if existing_kind.is_some_and(|k| k.is_dir()) {
+                    copy_files_shallow(&target, &victim);
+                }
+            }
+            let before = snapshot(&victim);
+
+            let error = case.run(&mut hooks).expect_err(&format!(
+                "{primitive:?} through a link at {} must refuse",
+                target.display()
+            ));
+            let message = refusal_of(&error);
+            assert!(
+                message.contains("symlink or reparse point")
+                    && message.contains(&target.display().to_string()),
+                "{primitive:?}: the refusal must name its reason and the substituted \
+                 component {}: {message}",
+                target.display()
+            );
+            assert_eq!(
+                snapshot(&victim),
+                before,
+                "{primitive:?}: the victim behind {} is untouched",
+                target.display()
+            );
+            driven += 1;
+            driven_primitives.insert(format!("{primitive:?}"));
+        }
+    }
+    assert_eq!(
+        driven_primitives.len(),
+        every_primitive().len(),
+        "every primitive was driven: {driven_primitives:?}"
+    );
+    // The pinned count: the table's paths, resolved. Scaffolding is five
+    // paths and Registration three, so the fourteen primitives resolve to
+    // twelve root cases, four intent, five add, ten Git working directory,
+    // five removal and three ref cases.
+    let expected_total = 39;
+    assert_eq!(
+        driven + skipped,
+        expected_total,
+        "the table generated {driven} driven and {skipped} skipped cases; a path added to or \
+         dropped from `Primitive::acted_through` changes this number"
+    );
+    if cfg!(unix) {
+        assert_eq!(skipped, 0, "every case runs on Unix");
+    }
+}
+
+/// Every funnel primitive, listed here rather than in production (§12: a
+/// test-only item mid-file cuts the effects census's production region) and
+/// pinned complete by the exhaustive match below, which stops compiling when
+/// a variant is added without a place in the list.
+fn every_primitive() -> Vec<Primitive> {
+    use Primitive as P;
+    let all = vec![
+        P::CreateExecutionRoot,
+        P::RemoveExecutionRoot,
+        P::WriteIntent,
+        P::RemoveIntent,
+        P::AddWorktree,
+        P::VerifyWorktree,
+        P::RemoveWorktree,
+        P::CandidateStage,
+        P::CandidateWriteTree,
+        P::ProposalCherryPick,
+        P::RepairMaterialize,
+        P::CreateRef,
+        P::CompareAndSwapRef,
+        P::DeleteRef,
+    ];
+    for primitive in &all {
+        match primitive {
+            P::CreateExecutionRoot
+            | P::RemoveExecutionRoot
+            | P::WriteIntent
+            | P::RemoveIntent
+            | P::AddWorktree
+            | P::VerifyWorktree
+            | P::RemoveWorktree
+            | P::CandidateStage
+            | P::CandidateWriteTree
+            | P::ProposalCherryPick
+            | P::RepairMaterialize
+            | P::CreateRef
+            | P::CompareAndSwapRef
+            | P::DeleteRef => {}
+        }
+    }
+    assert_eq!(all.len(), 14, "one entry per variant");
+    all
+}
+
+/// One generated case's fixture, in the state its primitive needs.
+struct SubstitutionCase {
+    fixture: Fixture,
+    primitive: Primitive,
+    slot: Option<Slot>,
+    registration: Option<PathBuf>,
+    site: EffectSiteId,
+    refname: String,
+}
+
+impl SubstitutionCase {
+    fn new(primitive: Primitive) -> Self {
+        use Primitive as P;
+        let created = !matches!(primitive, P::CreateExecutionRoot);
+        let fixture = if created {
+            Fixture::created("acted-through")
+        } else {
+            Fixture::new("acted-through")
+        };
+        let slot = fixture.task("table", 1);
+        let refname = "refs/upstroke/test/table".to_owned();
+        let mut registration = None;
+        match primitive {
+            P::RemoveIntent | P::AddWorktree => {
+                fixture
+                    .manager
+                    .write_intent(&mut NoHooks, &slot)
+                    .expect("write the intent");
+            }
+            P::VerifyWorktree
+            | P::RemoveWorktree
+            | P::CandidateStage
+            | P::CandidateWriteTree
+            | P::ProposalCherryPick
+            | P::RepairMaterialize => {
+                fixture.add_task(&mut NoHooks, "table", 1);
+                if primitive == P::RemoveWorktree {
+                    let path = fixture.manager.slot_path(&slot);
+                    registration = fixture
+                        .manager
+                        .revalidate_removal(&path)
+                        .expect("the registration");
+                    assert!(registration.is_some(), "the added worktree is registered");
+                }
+            }
+            P::CompareAndSwapRef | P::DeleteRef => {
+                fixture
+                    .manager
+                    .create_ref_zero_old(
+                        &mut NoHooks,
+                        RefSite::CreateCandidates,
+                        &refname,
+                        &fixture.head,
+                    )
+                    .expect("the ref to move or delete");
+            }
+            P::CreateExecutionRoot | P::RemoveExecutionRoot | P::WriteIntent | P::CreateRef => {}
+        }
+        let site = match primitive {
+            P::CreateExecutionRoot => EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
+            P::RemoveExecutionRoot => EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
+            P::WriteIntent => slot.write_intent_site(),
+            P::RemoveIntent => slot.remove_intent_site(),
+            P::AddWorktree => slot.add_site(),
+            P::VerifyWorktree => EffectSiteId::Worktree(WorktreeSite::Verify),
+            P::RemoveWorktree => slot.remove_site(),
+            P::CandidateStage => EffectSiteId::Object(ObjectSite::CandidateStage),
+            P::CandidateWriteTree => EffectSiteId::Object(ObjectSite::CandidateWriteTree),
+            P::ProposalCherryPick => EffectSiteId::Object(ObjectSite::ProposalCherryPick),
+            P::RepairMaterialize => EffectSiteId::Object(ObjectSite::RepairMaterialize),
+            P::CreateRef => EffectSiteId::Ref(RefSite::CreateCandidates),
+            P::CompareAndSwapRef => EffectSiteId::Ref(RefSite::CompareAndSwapIntegration),
+            P::DeleteRef => EffectSiteId::Ref(RefSite::DeleteCandidatePin),
+        };
+        let slot = if matches!(
+            primitive,
+            P::CreateExecutionRoot
+                | P::RemoveExecutionRoot
+                | P::CreateRef
+                | P::CompareAndSwapRef
+                | P::DeleteRef
+        ) {
+            None
+        } else {
+            Some(slot)
+        };
+        Self {
+            fixture,
+            primitive,
+            slot,
+            registration,
+            site,
+            refname,
+        }
+    }
+
+    fn paths(&self) -> Vec<(PathBuf, PathBuf, Leaf)> {
+        self.fixture
+            .manager
+            .acted_through_paths(
+                self.primitive,
+                self.slot.as_ref(),
+                self.registration.as_deref(),
+            )
+            .expect("the table resolves for a case built for it")
+    }
+
+    fn run(&self, hooks: &mut dyn EffectHooks) -> Result<(), UpstrokeError> {
+        use Primitive as P;
+        let manager = &self.fixture.manager;
+        let slot = self.slot.as_ref();
+        let head = &self.fixture.head;
+        let side = &self.fixture.side;
+        let slot_of = || slot.expect("a slot primitive has a slot");
+        match self.primitive {
+            P::CreateExecutionRoot => manager.create_execution_root(hooks),
+            P::RemoveExecutionRoot => manager.remove_execution_root(hooks).map(drop),
+            P::WriteIntent => manager.write_intent(hooks, slot_of()),
+            P::RemoveIntent => manager.remove_intent(hooks, slot_of()),
+            P::AddWorktree => manager.add_worktree(hooks, slot_of(), head).map(drop),
+            P::VerifyWorktree => manager
+                .verify_worktree(hooks, slot_of(), &Quiescence::AtBase(head.clone()))
+                .map(drop),
+            P::RemoveWorktree => manager.remove_worktree(hooks, slot_of()),
+            P::CandidateStage => manager.candidate_stage(hooks, slot_of()),
+            P::CandidateWriteTree => manager.candidate_write_tree(hooks, slot_of()).map(drop),
+            P::ProposalCherryPick => manager
+                .proposal_cherry_pick(hooks, slot_of(), side)
+                .map(drop),
+            P::RepairMaterialize => manager.repair_materialize(hooks, slot_of(), side),
+            P::CreateRef => {
+                manager.create_ref_zero_old(hooks, RefSite::CreateCandidates, &self.refname, head)
+            }
+            P::CompareAndSwapRef => manager.compare_and_swap_ref(
+                hooks,
+                RefSite::CompareAndSwapIntegration,
+                &self.refname,
+                head,
+                side,
+            ),
+            P::DeleteRef => manager.delete_ref_expected_old(
+                hooks,
+                RefSite::DeleteCandidatePin,
+                &self.refname,
+                head,
+            ),
+        }
+    }
+}
+
+/// A `Before` hook that exchanges `target` for a link to `victim`: a
+/// directory link (a junction on Windows), or a file symlink on Unix.
+struct SubstituteAtBefore {
+    site: EffectSiteId,
+    target: PathBuf,
+    moved: PathBuf,
+    victim: PathBuf,
+    file_link: bool,
+}
+
+impl EffectHooks for SubstituteAtBefore {
+    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        if site == self.site && phase == HookPhase::Before {
+            if fs::symlink_metadata(&self.target).is_ok() {
+                fs::rename(&self.target, &self.moved).expect("move the real path aside");
+            } else if let Some(parent) = self.target.parent() {
+                fs::create_dir_all(parent).expect("the substituted path's parent");
+            }
+            if self.file_link {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&self.victim, &self.target)
+                    .expect("plant the file link");
+                #[cfg(windows)]
+                panic!("file-link cases are skipped on Windows");
+            } else {
+                plant_directory_link(&self.victim, &self.target);
+            }
+        }
+        Injection::Proceed
+    }
+
+    fn refusal_cause(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The regular files directly inside `from`, copied into `into`.
+fn copy_files_shallow(from: &Path, into: &Path) {
+    for entry in fs::read_dir(from).expect("list the moved directory") {
+        let entry = entry.expect("entry");
+        if entry.file_type().expect("type").is_file() {
+            fs::copy(entry.path(), into.join(entry.file_name())).expect("copy into the victim");
+        }
+    }
+}
+
+/// A victim's state: its bytes if a file, otherwise every entry's name and
+/// kind one level down and every file's bytes.
+fn snapshot(victim: &Path) -> Vec<(String, Vec<u8>)> {
+    let metadata = fs::symlink_metadata(victim).expect("the victim exists");
+    if metadata.is_file() {
+        return vec![("<file>".to_owned(), fs::read(victim).expect("victim bytes"))];
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(victim).expect("list the victim") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type().expect("type");
+        let bytes = if kind.is_file() {
+            fs::read(entry.path()).expect("file bytes")
+        } else if kind.is_dir() {
+            b"<dir>".to_vec()
+        } else {
+            b"<link>".to_vec()
+        };
+        entries.push((name, bytes));
+    }
+    entries.sort();
+    entries
+}
+
+/// The reviewer's P1 sequence, by name: the registration's admin directory
+/// captured before the `Before` hook is exchanged for a link to a victim
+/// holding copied `gitdir` and `locked` entries; `registration_still_names`
+/// used to follow it and `remove_file(admin/locked)` deleted the victim's
+/// file. The generated test above covers it too; this is the named witness.
+#[test]
+fn a_registration_admin_directory_exchanged_at_the_before_hook_refuses_the_worktree_removal() {
+    let fixture = Fixture::created("admin-exchanged");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("registration")
+        .expect("registered");
+    fs::write(admin.join("locked"), b"do not remove\n").expect("the locked marker");
+    let victim = fixture.root.join("victim-admin");
+    fs::create_dir_all(&victim).expect("victim");
+    copy_files_shallow(&admin, &victim);
+    let before = snapshot(&victim);
+    let mut hooks = SubstituteAtBefore {
+        site: slot.remove_site(),
+        target: admin.clone(),
+        moved: admin.with_extension("moved-away"),
+        victim: victim.clone(),
+        file_link: false,
+    };
+
+    let error = fixture
+        .manager
+        .remove_worktree(&mut hooks, &slot)
+        .expect_err("the walk sees the exchanged admin directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&admin.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(
+        snapshot(&victim),
+        before,
+        "the victim's `locked` and `gitdir` are untouched"
+    );
+    assert!(
+        path.exists(),
+        "and the checkout was not deleted either: every check runs first"
+    );
+}
+
+/// The reviewer's P2 sequence for the add, by name: `intents/` exchanged for
+/// a link to a victim holding a same-named intent file, through which the
+/// add's metadata read used to authorise a worktree whose intent lived
+/// outside the root.
+#[test]
+fn an_intents_directory_exchanged_at_the_before_hook_refuses_the_worktree_add() {
+    let fixture = Fixture::created("intents-exchanged-add");
+    let slot = fixture.task("beta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let victim = fixture.root.join("victim-intents");
+    fs::create_dir_all(&victim).expect("victim");
+    copy_files_shallow(&intents, &victim);
+    let before = snapshot(&victim);
+    let mut hooks = SubstituteAtBefore {
+        site: slot.add_site(),
+        target: intents.clone(),
+        moved: intents.with_extension("moved-away"),
+        victim: victim.clone(),
+        file_link: false,
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the walk sees the exchanged intents directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intents.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(snapshot(&victim), before, "the victim is untouched");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// The staging name carries no part of the record's name, so a slot at the
+/// old maximum still lands: a 207-byte task key gives a 224-byte intent name,
+/// and the previous `.<intent>.<ULID>.tmp` staging name was 256 bytes, one
+/// over `NAME_MAX`.
+#[test]
+fn a_slot_name_at_the_old_maximum_still_lands_its_intent() {
+    let fixture = Fixture::created("long-key");
+    let key = "a".repeat(207);
+    let slot = fixture.task(&key, 1);
+    assert_eq!(
+        slot.intent_name().len(),
+        224,
+        "the premise: the intent name is at the old maximum"
+    );
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a valid slot name at the old maximum lands");
+    assert!(fixture.manager.intent_path(&slot).is_file());
+    assert_eq!(
+        fixture.manager.intents().expect("intents"),
+        vec![slot],
+        "and the record is listed"
+    );
+}
+
+/// The §8 staging protocol's recovery rule: a staging file is never an
+/// intent, and no filename proves who wrote a file. An orphan a crash left
+/// behind used to fail `intents()` forever, which blocked every reclaim;
+/// `intents()` ignores it, `reclaim_intents` reports it on its outcome and
+/// leaves it in place, and a retry of the write lands beside it. The orphan
+/// has the exact shape `write_intent` produces, a real ULID included.
+#[test]
+fn a_staging_orphan_is_ignored_by_intents_reported_by_reclaim_and_never_removed() {
+    let fixture = Fixture::created("staging-orphan");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a real intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let orphan = intents.join(format!(".stage-task-{}.tmp", crate::ulid::ulid()));
+    fs::write(&orphan, b"{\"half\":").expect("plant the orphan");
+
+    assert_eq!(
+        fixture
+            .manager
+            .intents()
+            .expect("intents ignore the orphan"),
+        vec![slot.clone()],
+        "the real intent is listed and the orphan is not"
+    );
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect("reclaim reports the orphan and removes the rest");
+    assert_eq!(reclaimed.slots, vec![slot.clone()]);
+    assert_eq!(
+        reclaimed.staging_leftovers,
+        vec![orphan.clone()],
+        "the orphan is reported on the outcome"
+    );
+    assert!(
+        orphan.exists(),
+        "and left where it was: no filename proves who wrote it"
+    );
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a retry of the write lands beside it");
+    assert!(fixture.manager.intent_path(&slot).is_file());
+    assert!(orphan.exists(), "the retry staged under its own fresh name");
+}
+
+/// `hooks-none` must be empty, not only a real link-free directory: a hook
+/// written into it runs under every Git command. A `Before` hook writes an
+/// executable `post-checkout` into the existing directory; the add refuses
+/// naming the entry, and the hook never runs.
+#[test]
+fn a_hook_written_into_hooks_none_at_the_before_hook_refuses_the_worktree_add_and_never_runs() {
+    struct WriteHookAtBefore {
+        site: EffectSiteId,
+        script: PathBuf,
+        marker: PathBuf,
+    }
+
+    impl EffectHooks for WriteHookAtBefore {
+        fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if site == self.site && phase == HookPhase::Before {
+                fs::write(
+                    &self.script,
+                    format!("#!/bin/sh\n: > '{}'\n", self.marker.display()),
+                )
+                .expect("write the hook");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&self.script, fs::Permissions::from_mode(0o755))
+                        .expect("executable hook");
+                }
+            }
+            Injection::Proceed
+        }
+
+        fn refusal_cause(&self) -> Option<String> {
+            None
+        }
+    }
+
+    let fixture = Fixture::created("hooks-none-written");
+    let slot = fixture.task("theta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let hooks_dir = fixture.manager.execution_root().join("hooks-none");
+    let marker = fixture.root.join("hook-ran.marker");
+    let mut hooks = WriteHookAtBefore {
+        site: slot.add_site(),
+        script: hooks_dir.join("post-checkout"),
+        marker: marker.clone(),
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("a hooks path that holds a hook refuses");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("hook-free") && message.contains("post-checkout"),
+        "the refusal must name its reason and the entry: {message}"
+    );
+    assert!(!marker.exists(), "the hook never ran");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// `NotFound` from `canonicalize` does not say a component is absent: a link
+/// that exists with an absent target answers the same, and the peel used to
+/// walk past it and reconstruct the path through a link that is there. The
+/// link is read without following, and refuses as a reparse point on the
+/// chain. A dangling link needs a symlink, which the Windows guest's test
+/// user cannot create.
+#[cfg(unix)]
+#[test]
+fn canonical_prefix_refuses_a_dangling_link_rather_than_peeling_past_it() {
+    let tree =
+        acquire(&std::env::temp_dir(), "canonical-dangling").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
+    let link = real.join("link");
+    std::os::unix::fs::symlink(real.join("missing"), &link).expect("plant the dangling link");
+    let error = canonical_prefix(&link.join("child"))
+        .expect_err("a dangling link on the chain is a reparse point, not absence");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&link.display().to_string()),
+        "the refusal must name its reason and the link: {message}"
+    );
+}
+
+/// Only the exact shape `write_intent` produces is a staging file. A name
+/// that merely resembles one is nobody's to hide or delete: `intents()`
+/// reports it as the malformed file it is, and `reclaim_intents` leaves it
+/// where it is.
+#[test]
+fn a_name_that_merely_resembles_a_staging_file_is_neither_hidden_nor_removed() {
+    let fixture = Fixture::created("staging-lookalike");
+    let intents = fixture.manager.execution_root().join("intents");
+    let lookalike = intents.join(".stage-report.tmp");
+    fs::write(&lookalike, b"someone's report\n").expect("plant the lookalike");
+
+    let listed = fixture
+        .manager
+        .intents()
+        .expect_err("a malformed name in the intent directory is reported");
+    assert!(
+        refusal_of(&listed).contains("unexpected file"),
+        "reported as the malformed file it is: {listed}"
+    );
+    fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect_err("reclaim stops at the malformed name too");
+    assert_eq!(
+        fs::read(&lookalike).expect("the lookalike"),
+        b"someone's report\n",
+        "and it is untouched"
+    );
+}
+
+/// An orphan of each kind is reported and left in place, whatever its
+/// spelling within the generator's range, and no removal site fires for it:
+/// deleting it would be cleanup that infers ownership from a filename (§8).
+#[test]
+fn a_staging_orphan_of_each_kind_is_reported_and_no_removal_site_fires() {
+    let fixture = Fixture::created("staging-orphan-kinds");
+    let intents = fixture.manager.execution_root().join("intents");
+    let mut orphans = Vec::new();
+    for kind in ["task", "staging", "snapshot"] {
+        let orphan = intents.join(format!(".stage-{kind}-{}.tmp", crate::ulid::ulid()));
+        fs::write(&orphan, b"{").expect("plant the orphan");
+        orphans.push(orphan);
+    }
+    orphans.sort();
+    let (mut hooks, shared) = harness();
+
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut hooks)
+        .expect("reclaim reports every orphan");
+    assert!(
+        reclaimed.slots.is_empty(),
+        "no intent was recorded, so none is reclaimed"
+    );
+    assert_eq!(
+        reclaimed.staging_leftovers, orphans,
+        "every orphan is reported, in order"
+    );
+    for orphan in &orphans {
+        assert!(orphan.exists(), "{} is still there", orphan.display());
+    }
+    let observed = shared.lock().expect("harness").coverage().to_vec();
+    for site in [
+        EffectSiteId::Worktree(WorktreeSite::RemoveIntent),
+        EffectSiteId::Worktree(WorktreeSite::RemoveStagingIntent),
+        EffectSiteId::Snapshot(SnapshotSite::RemoveIntent),
+    ] {
+        assert!(
+            !observed.iter().any(|seen| seen.site == site),
+            "no removal ran under {site} for a leftover nobody can prove they own: {observed:?}"
+        );
+    }
+}
+
+/// `commit_parent` and `commit_tree_sha` used to fold every failure of the
+/// command into `None` through `git_ok(..).ok()`, a containment refusal
+/// included: an entry appearing in `hooks-none` between the gate's own
+/// `worktree list` and the lookup's `rev-parse` made the per-command check
+/// refuse, and `.ok()` turned that refusal into "not a commit". The gate
+/// reads the hooks path through the same runner, so from the public methods
+/// it refuses first; the lookup itself is driven here directly, as the
+/// second command in that sequence. Only Git's own quiet "no such object"
+/// (exit status 1, nothing on stderr) is `None`; a refusal and a Git failure
+/// that speaks both propagate.
+#[test]
+fn a_hook_planted_in_hooks_none_makes_the_object_lookups_refuse_rather_than_answer_none() {
+    let fixture = Fixture::created("lookup-refuses");
+    let lookup = |spec: String| {
+        [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(spec),
+        ]
+    };
+
+    // A Git failure that speaks is an error, not absence: peeling a tree to
+    // a commit exits 1 with a message.
+    let spoken = fixture
+        .manager
+        .quiet_object_lookup(&lookup(format!("{}^{{tree}}^{{commit}}", fixture.head)))
+        .expect_err("a Git failure that speaks propagates");
+    assert!(
+        matches!(&spoken, UpstrokeError::Git { message } if message.contains("rev-parse")),
+        "the error names the command: {spoken}"
+    );
+
+    fs::write(
+        fixture
+            .manager
+            .execution_root()
+            .join("hooks-none")
+            .join("post-checkout"),
+        b"#!/bin/sh\nexit 0\n",
+    )
+    .expect("plant a hook");
+    let refused = fixture
+        .manager
+        .quiet_object_lookup(&lookup(format!("{}^{{commit}}^", fixture.head)))
+        .expect_err("the lookup propagates the runner's refusal rather than answering None");
+    let message = refusal_of(&refused);
+    assert!(
+        message.contains("hook-free") && message.contains("post-checkout"),
+        "the refusal must name its reason: {message}"
+    );
+    for (name, result) in [
+        (
+            "commit_parent",
+            fixture.manager.commit_parent(&fixture.head),
+        ),
+        (
+            "commit_tree_sha",
+            fixture.manager.commit_tree_sha(&fixture.head),
+        ),
+    ] {
+        let error = result.expect_err(&format!("{name} must refuse, not answer None"));
+        let message = refusal_of(&error);
+        assert!(
+            message.contains("hook-free") && message.contains("post-checkout"),
+            "{name}: the refusal must name its reason: {message}"
+        );
+    }
+}
+
+/// A prefix that resolves to a regular file cannot carry components below
+/// it, and the filesystem said so; rejoining them lexically would hand back
+/// exactly the unverified path `canonical_prefix` exists not to. Reported as
+/// `NotADirectory` at the file, on every platform.
+#[test]
+fn canonical_prefix_refuses_a_prefix_that_is_a_regular_file_with_components_below_it() {
+    let tree =
+        acquire(&std::env::temp_dir(), "canonical-file-prefix").expect("acquire a scratch tree");
+    let real = strip_verbatim(tree.path().canonicalize().expect("canonical scratch"));
+    let file = real.join("file");
+    fs::write(&file, "not a directory\n").expect("plant the file");
+    let error = canonical_prefix(&file.join("child"))
+        .expect_err("a regular file cannot carry components below it");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Io { path, source }
+                if path == &file && source.kind() == std::io::ErrorKind::NotADirectory
+        ),
+        "the error names the file and says it is not a directory: {error}"
+    );
+}
+
+/// Restores a directory's mode on drop, so a fixture made unreadable or
+/// unwritable for one assertion is reclaimable again whatever the assertion
+/// did.
+#[cfg(unix)]
+struct RestoreMode {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        match fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755)) {
+            Ok(()) => {}
+            // Already gone: nothing to restore, and a second panic while
+            // unwinding would abort the whole test process.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("restore the mode of {}: {error}", self.path.display()),
+        }
+    }
+}
+
+/// `add_worktree` read its intent with `is_file()`, which folds every
+/// metadata failure into `false`: an `intents/` the process cannot search
+/// answered `AddWithoutIntent`, "its durable intent does not exist", for an
+/// intent that was there. A read failure is an error naming the intent.
+/// Evaluated on the Unix legs, where a mode bit binds a non-root user.
+#[cfg(unix)]
+#[test]
+fn an_intent_that_cannot_be_read_is_an_error_and_not_an_absent_intent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("intent-unreadable");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let _restore = RestoreMode {
+        path: intents.clone(),
+    };
+    fs::set_permissions(&intents, fs::Permissions::from_mode(0o000)).expect("make it unsearchable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // reads through a mode of 000, and this test would then measure nothing.
+    let intent = fixture.manager.intent_path(&slot);
+    assert!(
+        fs::symlink_metadata(&intent).is_err(),
+        "prerequisite not met: the mode bit did not bind (running as root or with \
+         CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+    );
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut NoHooks, &slot, &fixture.head)
+        .expect_err("an intent that cannot be read is not an intent that is absent");
+    assert!(
+        matches!(&error, UpstrokeError::Io { path, .. } if path == &intent),
+        "the error names the intent it could not read: {error}"
+    );
+}
+
+/// `remove_execution_root` discarded the result of removing an empty
+/// scaffolding directory with `let _ =`, so a scaffolding directory nothing
+/// could remove kept the root and the caller learnt only `Ok(false)`. The
+/// failure now names the directory. Evaluated on the Unix legs, where a
+/// mode bit binds a non-root user.
+#[cfg(unix)]
+#[test]
+fn a_scaffolding_directory_that_cannot_be_removed_is_reported_not_swallowed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::created("scaffolding-unremovable");
+    let root = fixture.manager.execution_root().to_path_buf();
+    let _restore = RestoreMode { path: root.clone() };
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o555))
+        .expect("make the root unwritable");
+    // The injection must bite: root, or a process holding CAP_DAC_OVERRIDE,
+    // writes through a mode of 555, the removal would then succeed and the
+    // fixture's root would be gone before the assertion.
+    let probe = root.join("probe-write");
+    if fs::create_dir(&probe).is_ok() {
+        fs::remove_dir(&probe).expect("remove the probe");
+        panic!(
+            "prerequisite not met: the mode bit did not bind (running as root or with \
+             CAP_DAC_OVERRIDE); this test needs an unprivileged user"
+        );
+    }
+
+    let error = fixture
+        .manager
+        .remove_execution_root(&mut NoHooks)
+        .expect_err("a scaffolding directory that cannot be removed is reported");
+    assert!(
+        matches!(
+            &error,
+            UpstrokeError::Filesystem { operation: "remove", path, .. }
+                if path.starts_with(&root) && path != &root
+        ),
+        "the error names the removal and the scaffolding directory it could not remove: {error}"
+    );
 }
 
 /// A **deletion** revalidates the chain, and refuses before it acts
@@ -1031,8 +2709,13 @@ fn a_root_inside_a_repository_worktree_refuses() {
     let fixture = Fixture::new("root-inside");
     // The private root *is* the repository checkout: the execution root
     // would then live inside a worktree of the repository it manages.
-    let error = WorkspaceManager::derive(&fixture.base, &fixture.base, "run-3", "inc-1")
-        .expect_err("a root inside a repository worktree refuses");
+    let error = WorkspaceManager::derive(
+        &fixture.base,
+        &fixture.base,
+        "01KZSWEEP00000000000000003",
+        "inc-1",
+    )
+    .expect_err("a root inside a repository worktree refuses");
     let message = refusal_of(&error);
     assert!(
         message.contains("inside the repository worktree"),
@@ -1410,7 +3093,7 @@ fn an_add_without_a_durable_intent_refuses_and_leaves_nothing_registered() {
         .reclaim_intents(&mut NoHooks)
         .expect("reclaim");
     assert_eq!(
-        reclaimed.iter().collect::<BTreeSet<_>>(),
+        reclaimed.slots.iter().collect::<BTreeSet<_>>(),
         slots.iter().collect::<BTreeSet<_>>(),
         "reclaim walks intents, so an add without one would leave a worktree it never sees"
     );
@@ -2060,7 +3743,7 @@ fn the_intent_is_durable_before_the_add_and_reclaim_removes_it() {
         .manager
         .reclaim_intents(&mut hooks)
         .expect("reclaim");
-    assert_eq!(reclaimed, vec![slot.clone()]);
+    assert_eq!(reclaimed.slots, vec![slot.clone()]);
     assert!(!fixture.manager.intent_path(&slot).exists());
     assert!(fixture.manager.intents().expect("intents").is_empty());
 
@@ -2258,10 +3941,19 @@ fn the_intent_and_its_directory_are_synced_before_the_add_begins() {
         steps, expected,
         "the durability sequence complete at the moment the add begins: {at_add:?}"
     );
-    assert_eq!(
-        at_add[0].path,
-        intent.with_extension("tmp"),
-        "the sync is of the staged intent, before it has its published name"
+    // The staged name is unique per call and never the published one; what
+    // is pinned is where it lived and that it is gone once published.
+    let staged = &at_add[0].path;
+    assert!(
+        staged.parent() == Some(intents_dir.as_path())
+            && staged != &intent
+            && staged
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+            && !staged.exists(),
+        "the sync is of the staged intent, in the intents directory, under a name that is \
+         not the published one and is gone once published: {}",
+        staged.display()
     );
     assert_eq!(
         at_add[0].len,
