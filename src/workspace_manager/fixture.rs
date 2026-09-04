@@ -249,16 +249,31 @@ pub(crate) fn scratch(tag: &str) -> PathBuf {
     scratch_tree(tag).disarm().path().to_path_buf()
 }
 
-/// A name nothing under a fixture directory ever creates.
+/// A path that does not exist, cannot be predicted, and is outside every
+/// repository this module builds.
 ///
 /// `core.hooksPath`, `core.attributesFile` and `core.excludesFile` point at
 /// it, and so do `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME` and
 /// `XDG_CONFIG_HOME`. Git runs no hook from a path that does not exist, reads
 /// an absent config, attributes or excludes file as empty, and finds no `~`
-/// configuration under a home that is not there — the same "absence is
-/// allowed" `WorkspaceManager::revalidate_hooks_path` states for the manager's
-/// own hooks directory.
-const ABSENT: &str = "upstroke-fixture-absent";
+/// configuration under a home that is not there.
+///
+/// **It used to be a bare name joined to the command's own directory**, which
+/// put it *inside the repository*: `<repo>/upstroke-fixture-absent` is an
+/// ordinary filename a test can write or a branch can carry, and a file there
+/// is a **loaded global configuration file**. Measured on git 2.43.0 under
+/// exactly these pins: planting `[i18n] commitEncoding = ISO-8859-1` at that
+/// name made `git config --show-origin --list` report it as loaded, which is
+/// the door's own claim falsified by an ordinary `git add`. The path is now
+/// absolute, under the temporary directory, and carries a fresh ULID, so no
+/// test can name it and nothing creates it. One per process, because a
+/// constant path shared by every process is predictable again.
+fn absent() -> &'static Path {
+    static ABSENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ABSENT.get_or_init(|| {
+        std::env::temp_dir().join(format!("upstroke-fixture-absent-{}", crate::ulid::ulid()))
+    })
+}
 
 /// The whole of what a Git child inherits from this process.
 ///
@@ -308,7 +323,7 @@ const INHERITED: [&str; 12] = [
 /// `protocol.file.allow`, which the manager pins on its own commands, is not
 /// here: nothing this module runs speaks the file transport.
 fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
-    let absent = dir.join(ABSENT);
+    let absent = absent();
     let mut command = Command::new("git");
     // The door. Everything this process holds goes, and only the names on the
     // allowlist come back, so no `GIT_*` variable and no pointer to a config,
@@ -458,6 +473,38 @@ impl ObjectFormat {
     }
 }
 
+/// How a [`Fixture`] reclaims its tree.
+///
+/// Two arms because the two cases have different authority. A fixture this
+/// process built acquired its tree through §8's token and spends that token on
+/// the way out. A fixture *adopted* from a tree another process built has no
+/// token and cannot mint one, so it keeps master's behaviour: a best-effort
+/// recursive removal of the root it was handed. That second arm is a §8
+/// deviation this pull request does not close — see [`Fixture::adopt`].
+enum Reclaim {
+    /// Token-carried, for a tree this process acquired. Underscored because
+    /// nothing reads the guard: it is held so that its own `Drop` spends the
+    /// token.
+    Owned(#[allow(dead_code)] ScratchTree),
+    /// Master's, for a tree another process built and this one was handed.
+    Adopted(PathBuf),
+}
+
+impl Drop for Reclaim {
+    fn drop(&mut self) {
+        match self {
+            // The guard spends the token itself.
+            Self::Owned(_) => {}
+            // Best effort, exactly as master's `Fixture::drop` was: there is
+            // no error path from a `Drop`, and a tree left behind is the
+            // inode class this pull request rows rather than a silent success.
+            Self::Adopted(root) => {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+}
+
 pub(crate) struct Fixture {
     /// The root of the scratch tree, as a field because six files read it that
     /// way and an accessor would edit `src/workspace_manager/tests.rs`, which
@@ -473,16 +520,12 @@ pub(crate) struct Fixture {
     pub(crate) head: String,
     /// A commit on a side branch, based on `seed`, for the cherry-picks.
     pub(crate) side: String,
-    /// The tree's ownership, and with it the authority to remove it.
+    /// How the tree is reclaimed, and with what authority.
     ///
     /// **Last field, so it drops last** and the tree outlives everything that
-    /// reads from it. Always `Some` today: [`Fixture::new`] acquires its own
-    /// and [`Fixture::adopt`] is handed the one its caller minted. The `Option`
-    /// is what lets the field be moved out of in a future shape rather than a
-    /// state that happens.
-    /// Underscored because nothing reads it: it is held for its `Drop`, which
-    /// is where the tree is reclaimed.
-    _scratch: Option<ScratchTree>,
+    /// reads from it. Underscored because nothing reads it: it is held for its
+    /// `Drop`.
+    _reclaim: Reclaim,
 }
 
 impl Fixture {
@@ -499,34 +542,11 @@ impl Fixture {
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
         let scratch = scratch_tree(tag);
         let root = scratch.path().to_path_buf();
-        Self::at(root, Some(scratch), object_format)
-    }
-
-    /// [`Self::new`] **in** a tree the caller already acquired.
-    ///
-    /// The kill protocol's shape: a parent acquires a tree, tells its child to
-    /// build in it, and keeps the guard, so a child that dies by
-    /// `std::process::abort()` leaves a tree the parent still owns. The child
-    /// holds no guard of its own here, and the tree is `parent` itself rather
-    /// than a subtree of it — **one directory level, deliberately.** Nesting a
-    /// second acquisition under the first added two ULID-named components to
-    /// every path beneath it and pushed the manager's worktrees past Windows'
-    /// path limit: measured on the guest, `git worktree add` failed with
-    /// `Filename too long` for every kill test.
-    ///
-    /// The caller gives one tree to one fixture, and names it when it acquires
-    /// it, so there is no tag to take here.
-    pub(crate) fn under(parent: &Path) -> Self {
-        Self::at(parent.to_path_buf(), None, ObjectFormat::Sha1)
-    }
-
-    /// [`Self::created`] in a tree the caller already acquired.
-    pub(crate) fn created_under(parent: &Path) -> Self {
-        Self::under(parent).with_execution_root()
+        Self::at(root, Reclaim::Owned(scratch), object_format)
     }
 
     /// The body every constructor shares, over a root and whatever owns it.
-    fn at(root: PathBuf, scratch: Option<ScratchTree>, object_format: ObjectFormat) -> Self {
+    fn at(root: PathBuf, reclaim: Reclaim, object_format: ObjectFormat) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
         fs::create_dir_all(&base).expect("the fixture's repository directory");
@@ -586,11 +606,23 @@ impl Fixture {
             seed,
             head,
             side,
-            _scratch: scratch,
+            _reclaim: reclaim,
         }
     }
 
     /// Re-open a fixture a **previous process** built.
+    ///
+    /// **The adopted tree is reclaimed exactly as master reclaims it**, and
+    /// that is a deliberate limit rather than an oversight. A token cannot be
+    /// minted from a path, so this process cannot take ownership of a tree its
+    /// child created. The shape that tried — the parent minting the tree and
+    /// handing the child an environment variable naming it — was an
+    /// unauthenticated protocol that reinitialised any repository the variable
+    /// pointed at, and it is withdrawn. Leaving the tree behind instead would
+    /// add a leak master does not have, on a box that has twice run out of
+    /// inodes to exactly this class. So this arm keeps master's best-effort
+    /// removal; the §8 deviation it carries is a deferred row, and closing it
+    /// needs an ownership handoff somebody can authenticate.
     ///
     /// A kill child dies by `std::process::abort()`, so its `Drop` never
     /// runs and its scratch tree survives it. The parent then has to speak
@@ -616,7 +648,8 @@ impl Fixture {
     /// the caller acquires the tree first, hands the child [`SCRATCH_ROOT`],
     /// and passes the guard here. `root` is then a subtree of what `owner`
     /// names, and dropping this fixture reclaims both.
-    pub(crate) fn adopt(root: PathBuf, owner: ScratchTree) -> Self {
+    pub(crate) fn adopt(root: PathBuf) -> Self {
+        let reclaim = Reclaim::Adopted(root.clone());
         let base = root.join("repo");
         let private = root.join("private");
         let head = git(&base, &["rev-parse", "main"]);
@@ -637,7 +670,7 @@ impl Fixture {
             seed,
             head,
             side,
-            _scratch: Some(owner),
+            _reclaim: reclaim,
         }
     }
 
@@ -806,17 +839,21 @@ fn join_within(
     handle: std::thread::JoinHandle<Vec<u8>>,
     deadline: std::time::Instant,
     what: &str,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
-            return format!("[the reader for the child's {what} did not finish inside the bound]")
-                .into_bytes();
+            return (
+                format!("[the reader for the child's {what} did not finish inside the bound]")
+                    .into_bytes(),
+                false,
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    handle
+    let bytes = handle
         .join()
-        .unwrap_or_else(|_| format!("[the reader for the child's {what} panicked]").into_bytes())
+        .unwrap_or_else(|_| format!("[the reader for the child's {what} panicked]").into_bytes());
+    (bytes, true)
 }
 
 /// Run this test binary again, `--exact --ignored`, with `env` set, and
@@ -869,13 +906,26 @@ pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
-            Err(error) => panic!("waiting for the child that runs `{test}`: {error}"),
+            Err(error) => {
+                // Cleaned up before the panic: a `try_wait` that failed leaves
+                // a child this process has stopped watching, and panicking
+                // first would leave it running.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("waiting for the child that runs `{test}`: {error}");
+            }
         }
         if std::time::Instant::now() >= deadline {
             overran = true;
-            let _ = child.kill();
+            // The kill's own failure is reported rather than discarded: it is
+            // the difference between a child that was killed and one that was
+            // not, and the reaping `wait` below would then be unbounded.
+            let killed = child.kill();
             break child.wait().unwrap_or_else(|error| {
-                panic!("reaping the child that runs `{test}` after its deadline: {error}")
+                panic!(
+                    "reaping the child that runs `{test}` after its deadline: {error}; \
+                     the kill itself answered {killed:?}"
+                )
             });
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -884,12 +934,24 @@ pub(crate) fn run_child_test(test: &str, env: &[(&str, &OsStr)]) -> std::process
     // The readers are given the same deadline again, measured from here, so a
     // grandchild holding the pipe bounds the report rather than the process.
     let reap_by = std::time::Instant::now() + CHILD_DEADLINE;
+    let (out_bytes, out_finished) = join_within(reading_out, reap_by, "stdout");
+    let (err_bytes, err_finished) = join_within(reading_err, reap_by, "stderr");
     let said = format!(
         "{}{}",
-        String::from_utf8_lossy(&join_within(reading_out, reap_by, "stdout")),
-        String::from_utf8_lossy(&join_within(reading_err, reap_by, "stderr"))
+        String::from_utf8_lossy(&out_bytes),
+        String::from_utf8_lossy(&err_bytes)
     );
 
+    // **A reader still running is a descendant still running.** A child can
+    // exit 0 having left a grandchild holding the pipe, and without this the
+    // parent returned success with both alive. This refuses that; killing the
+    // grandchild is the runner's process-group machinery and a deferred row,
+    // not a second copy built here.
+    assert!(
+        out_finished && err_finished,
+        "the child running `{test}` exited, but a reader was still attached to its streams, so \
+         something it started is still running. It said: {said}"
+    );
     assert!(
         !overran,
         "the child running `{test}` did not end within {CHILD_DEADLINE:?} and was killed. It said: \
@@ -1350,16 +1412,12 @@ mod tests {
     /// have spoken about a different commit than the one that built it.
     #[test]
     fn adopt_re_derives_the_first_commit_after_main_has_moved_on() {
-        // The kill protocol's shape without a second process: an owner tree,
-        // a fixture in a subtree of it, and the owner handed to `adopt`.
-        let owner = scratch_tree("adopt-owner");
-        let owner_root = owner.path().to_path_buf();
-        let fixture = Fixture::under(&owner_root);
+        let fixture = Fixture::new("adopt-root");
         write_file(&fixture.base.join("d.txt"), b"third\n");
         git(&fixture.base, &["add", "-A"]);
         git(&fixture.base, &["commit", "-q", "-m", "third"]);
 
-        let adopted = Fixture::adopt(fixture.root.clone(), owner);
+        let adopted = Fixture::adopt(fixture.root.clone());
         assert_eq!(adopted.seed, fixture.seed, "the first commit is re-derived");
         assert_eq!(adopted.side, fixture.side, "and so is the side commit");
         assert_ne!(
@@ -1490,6 +1548,15 @@ mod tests {
     #[test]
     fn the_only_config_a_fixture_command_reads_is_the_repositorys_own() {
         let fixture = Fixture::new("config-origins");
+        // The pass-2 reviewer's own reproduction: the pins used to name a bare
+        // filename joined to the command's directory, so a file at that
+        // ordinary name inside the repository was read as a loaded global
+        // configuration file. Planted here as valid Git config that would
+        // change every commit id if it were loaded.
+        write_file(
+            &fixture.base.join("upstroke-fixture-absent"),
+            b"[i18n]\n\tcommitEncoding = ISO-8859-1\n",
+        );
         let listed = git(&fixture.base, &["config", "--show-origin", "--list"]);
         let mut origins: Vec<&str> = listed
             .lines()
@@ -1706,8 +1773,13 @@ mod tests {
             let _ = receiver.recv();
             Vec::new()
         });
-        let reported = join_within(handle, std::time::Instant::now(), "stdout");
+        let (reported, finished) = join_within(handle, std::time::Instant::now(), "stdout");
         let text = String::from_utf8_lossy(&reported);
+        assert!(
+            !finished,
+            "a reader that has not finished must be reported as unfinished, so the caller can \
+             refuse it: {text}"
+        );
         assert!(
             text.contains("did not finish inside the bound"),
             "an unfinished reader must be reported rather than waited on: {text}"
@@ -1823,19 +1895,19 @@ mod tests {
         std::process::exit(1);
     }
 
-    /// The leak the token fix introduced, and the guard that closes it.
+    /// An adopted fixture reclaims the tree it adopted, which is master's
+    /// behaviour and is kept deliberately.
     ///
     /// `std::mem::forget` is the aborting child, exactly: its `Drop` never
-    /// runs, so its own subtree survives it. The parent minted the tree before
-    /// the child existed and holds the guard, so dropping the adopted fixture
-    /// takes the whole thing — which is what `Fixture::drop` used to do and
-    /// what putting `scratch` on the token had stopped doing.
+    /// runs, so its tree survives it. The pull request that tried to give this
+    /// process a *token* for that tree built an unauthenticated protocol and
+    /// withdrew it; what is left is master's best-effort removal, and the
+    /// alternative — reclaiming nothing — would add a leak master does not
+    /// have. The tree must still be there while the adopting fixture is alive,
+    /// or the removal has eaten the repository it is about to read.
     #[test]
-    fn an_adopted_fixture_reclaims_the_tree_its_caller_minted() {
-        let owner = scratch_tree("adopt-reclaims");
-        let owner_root = owner.path().to_path_buf();
-
-        let fixture = Fixture::under(&owner_root);
+    fn an_adopted_fixture_reclaims_the_tree_it_adopted() {
+        let fixture = Fixture::new("adopted");
         let root = fixture.root.clone();
         // The child died by `abort()`: nothing of its own is reclaimed.
         std::mem::forget(fixture);
@@ -1844,10 +1916,7 @@ mod tests {
             "the abandoned tree is the premise of this test"
         );
 
-        let adopted = Fixture::adopt(root.clone(), owner);
-        // Held, not dropped on the way in: an `adopt` that took the guard and
-        // let it fall would reclaim the tree it is about to read from, which
-        // is the other way to get this wrong and the one a `None` field takes.
+        let adopted = Fixture::adopt(root.clone());
         assert!(
             root.exists(),
             "the tree was reclaimed while the fixture adopting it was still alive: {}",
@@ -1864,11 +1933,6 @@ mod tests {
             !root.exists(),
             "the tree the child left behind outlived the fixture that adopted it: {}",
             root.display()
-        );
-        assert!(
-            !owner_root.exists(),
-            "the tree its caller minted outlived the fixture that adopted it: {}",
-            owner_root.display()
         );
     }
 

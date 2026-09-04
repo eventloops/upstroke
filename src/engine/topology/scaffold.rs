@@ -50,7 +50,7 @@ use crate::topology::schema::TOPOLOGY_SCHEMA;
 use crate::util::DurabilityLedger;
 use crate::workspace_manager::{
     EffectHooks, HarnessEffects, WorkspaceManager,
-    fixture::{self, Fixture, died_by_abort, run_child_test, write_file},
+    fixture::{Fixture, died_by_abort, run_child_test, write_file},
 };
 
 use super::attempt::{AttemptPlan, GatePlan, ReviewerPlan};
@@ -874,27 +874,7 @@ pub(super) struct Run {
 impl Run {
     /// A started schema-4 run over a fresh repository.
     pub(super) fn started(tag: &str) -> Self {
-        // Under the parent's tree when this is a kill child, so what an abort
-        // leaves behind is still owned; under the temporary directory
-        // otherwise, which is every ordinary test.
-        let fixture = match std::env::var_os(KILL_SCRATCH) {
-            Some(parent) => {
-                let parent = PathBuf::from(parent);
-                // Validated rather than trusted, even though the blast radius
-                // of a wrong value is pollution and not deletion: nothing
-                // removes this path, because the guard belongs to the parent's
-                // own tree and the child holds none. A stray value would
-                // otherwise build a repository somewhere surprising and fail
-                // later, somewhere else.
-                assert!(
-                    parent.is_absolute() && parent.is_dir(),
-                    "`{KILL_SCRATCH}` must name an existing absolute directory, and named {}",
-                    parent.display()
-                );
-                Fixture::created_under(&parent)
-            }
-            None => Fixture::created(tag),
-        };
+        let fixture = Fixture::created(tag);
         let harness = Arc::new(Mutex::new(HookHarness::new()));
         let timeline = Timeline::default();
         let log = EventLog::open(
@@ -1064,8 +1044,8 @@ impl Run {
     /// it. What it is is the smallest thing that makes the child's durable log
     /// readable, so an assertion can be about the log rather than about a
     /// message the child never got to send.
-    pub(super) fn adopt(root: PathBuf, owner: crate::rundir::scratch_tree::ScratchTree) -> Self {
-        let fixture = Fixture::adopt(root, owner);
+    pub(super) fn adopt(root: PathBuf) -> Self {
+        let fixture = Fixture::adopt(root);
         let harness = Arc::new(Mutex::new(HookHarness::new()));
         let timeline = Timeline::default();
         let log_path = fixture.private.join("events.jsonl");
@@ -1377,17 +1357,6 @@ impl Run {
 /// The file a kill child writes its repository root into.
 const HANDOFF: &str = "fixture-root";
 
-/// The tree a kill child must build its fixture under.
-///
-/// **This protocol's variable, read here and nowhere else.** The parent
-/// acquires the tree before the child exists and keeps the guard, so a child
-/// that dies by `std::process::abort()` — which is every child this protocol
-/// runs — leaves a subtree the parent still owns and reclaims. It is not read
-/// inside `workspace_manager::fixture`, which takes a path argument instead:
-/// that module's whole claim this round is that it trusts no ambient input,
-/// and a variable it read would be that claim's own counterexample.
-const KILL_SCRATCH: &str = "UPSTROKE_TEST_KILL_SCRATCH";
-
 /// A directory this process owns, unique to this call, for one kill test.
 pub(super) fn kill_dir(tag: &str) -> PathBuf {
     static ORDINAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1414,17 +1383,11 @@ pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
     // still owns. Without it the adopted tree outlived every kill test, and a
     // temporary directory leaked per fixture is what exhausted this box's
     // inodes once already.
-    // Under the temporary directory and not under `dir`: every component here
-    // is a prefix of the manager's worktree paths inside the child, and the
-    // Windows guest refuses `git worktree add` with `Filename too long` once
-    // they run long. A short tag, one level.
-    let owner = fixture::scratch_tree("kc");
     let status = run_child_test(
         test,
         &[
             ("UPSTROKE_TEST_KILL_DIR", dir.as_os_str()),
             ("UPSTROKE_TEST_KILL_SITE", std::ffi::OsStr::new(site)),
-            (KILL_SCRATCH, owner.path().as_os_str()),
         ],
     );
     assert!(
@@ -1435,7 +1398,7 @@ pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
     );
     let root = std::fs::read_to_string(dir.join(HANDOFF))
         .unwrap_or_else(|error| panic!("`{site}`: the child left no handoff: {error}"));
-    Run::adopt(PathBuf::from(root), owner)
+    Run::adopt(PathBuf::from(root))
 }
 
 /// The directory and site a kill child is given.
