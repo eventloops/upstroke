@@ -2904,25 +2904,61 @@ fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
 fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, UpstrokeError> {
     let output = read_only_git(cwd, args)?;
     if !output.status.success() {
-        return Err(UpstrokeError::Git {
-            message: format!(
-                "git {} failed in {}: {}",
-                args.join(" "),
-                cwd.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
+        return Err(read_only_git_failure(cwd, args, &output));
     }
     Ok(output.stdout)
 }
 
+/// The error a read-only Git command that exited non-zero is: the command, the
+/// directory it ran in, and what it said.
+fn read_only_git_failure(cwd: &Path, args: &[&str], output: &Output) -> UpstrokeError {
+    UpstrokeError::Git {
+        message: format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// `rev-parse --verify --quiet <spec>` as a read-only lookup: the id, `None`
+/// when Git says there is nothing at `spec`, and every other failure as the
+/// error it is.
+///
+/// `--verify --quiet` answers a missing object, an unpeelable spec and an
+/// unborn `HEAD` with exit status 1 and nothing on stderr (measured on git
+/// 2.43); that, and only that, is absence. A repository Git cannot open, an
+/// object store it cannot read, or a spawn failure is the error. The free
+/// twin of [`WorkspaceManager::quiet_object_lookup`], for the residue
+/// classifier's inspections, which run without a manager.
+fn read_only_verify(cwd: &Path, spec: &str) -> Result<Option<String>, UpstrokeError> {
+    let args = ["rev-parse", "--verify", "--quiet", spec];
+    let output = read_only_git(cwd, &args)?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) && output.stderr.is_empty() {
+            return Ok(None);
+        }
+        return Err(read_only_git_failure(cwd, &args, &output));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
+        message: format!("`git rev-parse --verify` returned non-UTF-8: {error}"),
+    })?;
+    Ok(Some(text.trim().to_owned()))
+}
+
 /// Every object `git fsck --unreachable` reports, and nothing else.
+///
+/// A fsck that did not finish reports nothing, so its exit status is read: an
+/// empty answer is the answer only when Git exited 0 (which it does with
+/// unreachable objects present; they are a report, not an error).
 ///
 /// # Errors
 ///
-/// A Git error.
+/// A Git error, naming the command and the repository, for a fsck that
+/// failed or a repository Git could not open.
 pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, UpstrokeError> {
-    let output = read_only_git(
+    let output = read_only_git_ok(
         worktree,
         &[
             "fsck",
@@ -2932,7 +2968,7 @@ pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, UpstrokeError
             "--connectivity-only",
         ],
     )?;
-    let listing = String::from_utf8_lossy(&output.stdout);
+    let listing = String::from_utf8_lossy(&output);
     Ok(listing
         .lines()
         .filter_map(|line| line.strip_prefix("unreachable "))
@@ -3000,19 +3036,17 @@ pub fn object_directory(worktree: &Path) -> Result<PathBuf, UpstrokeError> {
     Ok(PathBuf::from(text.trim()))
 }
 
+/// Whether `object` is in the object store, through [`read_only_verify`] on
+/// the peeled spec: `cat-file -e <object>^{}` exits 128 for a missing object
+/// and for a repository it cannot open alike (measured on git 2.43), so it
+/// cannot tell absence from failure; `rev-parse --verify --quiet` can.
 fn object_exists(worktree: &Path, object: &str) -> Result<bool, UpstrokeError> {
-    let output = read_only_git(worktree, &["cat-file", "-e", &format!("{object}^{{}}")])?;
-    Ok(output.status.success())
+    Ok(read_only_verify(worktree, &format!("{object}^{{}}"))?.is_some())
 }
 
+/// The commit `HEAD` names, or `None` on an unborn branch.
 fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
-    let output = read_only_git(worktree, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(
-        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-    ))
+    read_only_verify(worktree, "HEAD")
 }
 
 /// Whether anything in the working tree is not yet in the index.
@@ -3044,9 +3078,19 @@ fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, UpstrokeError>
 }
 
 /// Whether the index has anything staged against HEAD.
+///
+/// `diff --quiet` answers with its exit status, 0 for no difference and 1 for
+/// a difference, and those two are the answers; anything else (a directory
+/// that is not a repository answers 129, a usage error) is the failure it is,
+/// never "differs".
 fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
-    let output = read_only_git(worktree, &["diff", "--cached", "--quiet"])?;
-    Ok(!output.status.success())
+    let args = ["diff", "--cached", "--quiet"];
+    let output = read_only_git(worktree, &args)?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(read_only_git_failure(worktree, &args, &output)),
+    }
 }
 
 /// The registration `repository` holds for `worktree`, if any.
@@ -3056,13 +3100,15 @@ fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
 /// exist, and asking a directory that is not there — or asking its parent, which
 /// is inside the execution root and is not a repository at all — would answer
 /// "nothing is registered" for exactly the residue this is here to see.
+///
+/// `None` is what a listing that succeeded does not contain. A listing that
+/// failed (a repository Git cannot open) is the error, not an empty
+/// registration: the three add sites would read that as "nothing registered"
+/// and classify a state they could not inspect.
 fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
-    let output = read_only_git(repository, &["worktree", "list", "--porcelain", "-z"])?;
-    if !output.status.success() {
-        return Ok(None);
-    }
+    let listing = read_only_git_ok(repository, &["worktree", "list", "--porcelain", "-z"])?;
     let wanted = canonical_prefix(worktree)?;
-    for record in parse_worktree_records(&output.stdout) {
+    for record in parse_worktree_records(&listing) {
         if canonical_prefix(&record.path)? == wanted {
             return Ok(Some(record));
         }

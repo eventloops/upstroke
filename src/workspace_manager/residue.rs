@@ -11,9 +11,9 @@
 //! touches an index -- a classifier that had to *compute* a content-addressed
 //! name would be performing the very effect it is classifying, which is why
 //! [`ResidueTarget::published`] carries the parent's record instead. The Git
-//! inspections it reads through (`git fsck --unreachable`, `cat-file -e`,
-//! `worktree list`, `status`, `diff --cached`) are the parent's helpers, and so
-//! is every process start.
+//! inspections it reads through (`git fsck --unreachable`, `rev-parse --verify
+//! --quiet`, `worktree list`, `status`, `diff --cached`) are the parent's
+//! helpers, and so is every process start.
 //!
 //! **§6 and §7.** No shared ownership, lock or clone: [`ResidueTarget`] is
 //! four borrows and is `Copy`. Every `?` in this module propagates the
@@ -31,6 +31,11 @@
 //! a transient I/O error is an `Io` error naming the name. Before the sweep
 //! every name went through `Path::exists`, which answers `false` for all of
 //! those, so a git dir this process could not search classified as `None`.
+//! The parent's inspections hold the same line on their side: each answers
+//! only for the exit status that is Git's answer (`rev-parse --verify --quiet`
+//! exiting 1 in silence, `diff --quiet` exiting 0 or 1) and is the error for
+//! anything else, so a repository Git cannot open is never `None`, and never
+//! `After`.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -222,19 +227,11 @@ fn after_reference_present(
     // already names its git command and worktree, or its path (module doc,
     // §7).
     match site {
-        // The three adds: registered *and* populated, where populated means a
-        // git dir is behind the worktree's `.git` as `git_dir_of` reads it. A
-        // pointer file a kill left empty, or one that is not a pointer, is not
-        // a populated worktree, whatever `Path::exists` says of the name.
-        // `git worktree add` holds an `initializing` lock for the whole of its
-        // run, so a surviving lock is Git's own statement that the population
-        // did not finish.
+        // The three adds: the after phase is the populated state of
+        // `add_state`, and their one residue element is its unpopulated state.
         EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
         | EffectSiteId::Snapshot(SnapshotSite::Add) => {
-            let Some(record) = record_for(repository, worktree)? else {
-                return Ok(false);
-            };
-            Ok(record.locked.as_deref() != Some("initializing") && git_dir_of(worktree)?.is_some())
+            Ok(add_state(repository, worktree)? == AddState::Populated)
         }
         // `git add -A` publishes its blobs by renaming index.lock over index.
         // A surviving lock is proof the publication did not happen; otherwise
@@ -352,15 +349,8 @@ pub fn observed_residue_elements(
             ResidueElement::MergeMsg => in_git_dir("MERGE_MSG")?,
             ResidueElement::OrigHead => in_git_dir("ORIG_HEAD")?,
             ResidueElement::SequencerState => in_git_dir("sequencer")?,
-            // Registered and not populated: the complement of the adds' after
-            // phase in `after_reference_present`, read the same way.
             ResidueElement::RegisteredUnpopulatedWorktree => {
-                match record_for(repository, worktree)? {
-                    Some(record) => {
-                        record.locked.as_deref() == Some("initializing") || git_dir.is_none()
-                    }
-                    None => false,
-                }
+                add_state(repository, worktree)? == AddState::Unpopulated
             }
         };
         if seen {
@@ -434,6 +424,38 @@ pub(super) fn administrative_residue_at(
         }
     }
     Ok(present)
+}
+
+/// What one of the three adds left behind, read once for both the after phase
+/// and the residue element.
+///
+/// The after phase is `Populated` and the site's one residue element,
+/// `RegisteredUnpopulatedWorktree`, is `Unpopulated`: the two are arms of one
+/// reading rather than two readings that happen to be complementary, so no
+/// state can be both, or neither while registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddState {
+    /// `git worktree list` does not name the worktree.
+    Unregistered,
+    /// Registered, and the population did not finish: `git worktree add`
+    /// holds an `initializing` lock for the whole of its run, so a surviving
+    /// lock is Git's own statement to that effect; or no git dir is behind
+    /// the worktree's `.git` as `git_dir_of` reads it, which is where a
+    /// pointer file a kill left empty, or one that is not a pointer, lands,
+    /// whatever `Path::exists` says of the name.
+    Unpopulated,
+    /// Registered, unlocked, and a git dir is behind the pointer.
+    Populated,
+}
+
+fn add_state(repository: &Path, worktree: &Path) -> Result<AddState, UpstrokeError> {
+    let Some(record) = record_for(repository, worktree)? else {
+        return Ok(AddState::Unregistered);
+    };
+    if record.locked.as_deref() == Some("initializing") || git_dir_of(worktree)?.is_none() {
+        return Ok(AddState::Unpopulated);
+    }
+    Ok(AddState::Populated)
 }
 
 /// Whether the worktree's index lock survives.

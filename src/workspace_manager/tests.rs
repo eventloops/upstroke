@@ -6127,10 +6127,12 @@ fn a_git_dir_that_cannot_be_searched_is_an_error_and_not_an_absent_residue() {
 /// pointer as `git_dir_of` reads it, and its absence, with the worktree
 /// registered, is the `RegisteredUnpopulatedWorktree` the site registers.
 ///
-/// Witnessed failing with the after arm's `git_dir_of(worktree)?.is_some()`
-/// restored to `worktree.join(".git").exists()` (the classifier answers
-/// `After`), and separately with the element arm's `git_dir.is_none()`
-/// restored to `!worktree.join(".git").exists()` (no element is observed).
+/// Both arms read `add_state`, one reading with the after phase and the
+/// element as its two states. Witnessed failing with `add_state`'s git-dir
+/// read restored to `worktree.join(".git").exists()` (the classifier answers
+/// `After` for the rewritten pointers), with its `initializing` check dropped
+/// (`After` under the lock), and with the after arm reading `Unpopulated`
+/// (every populated control answers `Internal`).
 #[test]
 fn a_git_pointer_that_names_no_git_dir_is_a_registered_unpopulated_worktree() {
     let fixture = Fixture::created("residue-empty-pointer");
@@ -6144,6 +6146,7 @@ fn a_git_pointer_that_names_no_git_dir_is_a_registered_unpopulated_worktree() {
         "the control: a populated worktree is the after phase"
     );
     let pointer = path.join(".git");
+    let original = fs::read(&pointer).expect("the pointer");
     for content in ["", "not a pointer\n"] {
         fs::write(&pointer, content).expect("rewrite the pointer");
         assert!(
@@ -6161,6 +6164,26 @@ fn a_git_pointer_that_names_no_git_dir_is_a_registered_unpopulated_worktree() {
             "a pointer holding {content:?} names no git dir"
         );
     }
+
+    // And the other unpopulated state: a populated checkout whose registration
+    // still holds `git worktree add`'s `initializing` lock.
+    fs::write(&pointer, original).expect("restore the pointer");
+    assert_eq!(classify(site, &target), ObjectResidue::After, "restored");
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("admin dir")
+        .expect("the worktree is registered");
+    fs::write(admin.join("locked"), "initializing\n").expect("hold the initializing lock");
+    assert_eq!(
+        classify(site, &target),
+        ObjectResidue::Internal,
+        "an initializing lock is Git's statement that the population did not finish"
+    );
+    assert_eq!(
+        observed_residue_elements(site, &target).expect("observe"),
+        vec![ResidueElement::RegisteredUnpopulatedWorktree]
+    );
 }
 
 /// `name_present` reads the name's own metadata and does not follow a
@@ -6212,6 +6235,130 @@ fn a_dangling_index_lock_symlink_is_the_lock_git_sees() {
         administrative_residue_at(&git_dir).expect("read"),
         vec![ResidueElement::IndexLock]
     );
+}
+
+/// A directory that is not a repository is a failure of every inspection the
+/// classifier reads through, and the classifier reports it at every site it
+/// is total over rather than answering. Before the sweep four of the parent's
+/// helpers answered here (`record_for` "not registered", `object_exists` "no
+/// such object", `head_commit` "no HEAD", `unreachable_objects` "nothing
+/// unreachable") and one answered the other way (`index_differs_from_head`
+/// "differs", exit 129 read as a difference), so the adds classified `None`
+/// and `RepairMaterialize` classified `After` for a state nothing inspected.
+///
+/// Witnessed failing with `record_for`'s failed listing restored to `None`
+/// (the three adds answer) and with `index_differs_from_head` restored to
+/// `!status.success()` (`RepairMaterialize` answers `After`). The other three
+/// helpers are witnessed one by one in
+/// `the_classifiers_inspections_report_a_git_failure_instead_of_answering`,
+/// because at their sites another inspection fails first.
+#[test]
+fn a_directory_that_is_not_a_repository_is_an_error_at_every_classified_site() {
+    let fixture = Fixture::created("residue-not-a-repository");
+    let elsewhere = fixture.root.join("not-a-repository");
+    fs::create_dir(&elsewhere).expect("an empty directory");
+    for site in residue_classified_sites() {
+        for target in [
+            ResidueTarget::new(&elsewhere).at(&elsewhere),
+            ResidueTarget::new(&elsewhere)
+                .at(&elsewhere)
+                .published(&fixture.head),
+        ] {
+            let error = classify_object_residue(site, &target)
+                .expect_err("a directory that is not a repository is not a classified state");
+            assert!(
+                matches!(&error, UpstrokeError::Git { message } if message.contains("failed in")),
+                "`{site}`: the error names the command that failed and where: {error}"
+            );
+            let error = observed_residue_elements(site, &target)
+                .expect_err("no element can be observed where nothing can be inspected");
+            assert!(
+                matches!(&error, UpstrokeError::Git { message } if message.contains("failed in")),
+                "`{site}`: the error names the command that failed and where: {error}"
+            );
+        }
+    }
+}
+
+/// Each of the five inspections the classifier reads through, driven
+/// directly, so that each fold has a witness of its own (through the
+/// classifier, the first inspection to fail at a site hides the rest). The
+/// answers are still answers: a missing object is `false`, `HEAD` is the
+/// commit, a clean index does not differ and a staged one does, an
+/// unreachable blob is listed. A directory that is not a repository is the
+/// error, naming the command and the directory.
+///
+/// Witnessed failing, one at a time, with `object_exists` restored to
+/// `cat-file -e` (the missing-object answer becomes the error, since
+/// `cat-file -e <id>^{}` exits 128 for both), `head_commit` restored to
+/// `None` on any failure, `index_differs_from_head` restored to
+/// `!status.success()`, `unreachable_objects` restored to ignoring the exit
+/// status, and `record_for` restored to `None` on a failed listing.
+#[test]
+fn the_classifiers_inspections_report_a_git_failure_instead_of_answering() {
+    let fixture = Fixture::created("residue-inspections");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let missing = "1".repeat(fixture.head.len());
+    let elsewhere = fixture.root.join("not-a-repository");
+    fs::create_dir(&elsewhere).expect("an empty directory");
+
+    // The answers.
+    assert!(object_exists(&fixture.base, &fixture.head).expect("present"));
+    assert!(!object_exists(&fixture.base, &missing).expect("a missing object is an answer"));
+    assert_eq!(
+        head_commit(&path).expect("HEAD").as_deref(),
+        Some(fixture.head.as_str())
+    );
+    assert!(!index_differs_from_head(&path).expect("clean"));
+    fs::write(path.join("staged"), "x\n").expect("something to stage");
+    git(&path, &["add", "staged"]);
+    assert!(index_differs_from_head(&path).expect("staged"));
+    let blob = git(&path, &["rev-parse", ":staged"]);
+    git(&path, &["rm", "-q", "--cached", "staged"]);
+    assert!(
+        unreachable_objects(&fixture.base)
+            .expect("fsck")
+            .contains(&blob),
+        "the unstaged blob is reported unreachable"
+    );
+    assert!(
+        record_for(&fixture.base, &path).expect("listing").is_some(),
+        "the task worktree is registered"
+    );
+
+    // The failures, each naming its command and the directory.
+    let failures: [(&str, Result<(), UpstrokeError>); 5] = [
+        (
+            "rev-parse --verify --quiet",
+            object_exists(&elsewhere, &fixture.head).map(|_| ()),
+        ),
+        (
+            "rev-parse --verify --quiet HEAD",
+            head_commit(&elsewhere).map(|_| ()),
+        ),
+        (
+            "diff --cached --quiet",
+            index_differs_from_head(&elsewhere).map(|_| ()),
+        ),
+        (
+            "fsck --unreachable",
+            unreachable_objects(&elsewhere).map(|_| ()),
+        ),
+        (
+            "worktree list --porcelain -z",
+            record_for(&elsewhere, &path).map(|_| ()),
+        ),
+    ];
+    for (command, answer) in failures {
+        let error = answer.expect_err("a directory that is not a repository is not an answer");
+        let expected = format!("git {command}");
+        assert!(
+            matches!(&error, UpstrokeError::Git { message }
+                if message.contains(&expected) && message.contains(&elsewhere.display().to_string())),
+            "the error names `{expected}` and the directory: {error}"
+        );
+    }
 }
 
 /// `command_internal_sub_effects`: "the classifier is **total** over
