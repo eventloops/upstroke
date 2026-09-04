@@ -5952,9 +5952,12 @@ expects the retry in `remove_tree_once_handles_close` to cross the closing windo
 ### FIND-109-CLOSING-CASE-HOLDER-STARVATION
 
 **Fingerprint.** Windows only. `panicked at src/workspace_manager/tests.rs`, assertion
-`removal retries across the closing handle`, with an `Io` error carrying os error 32
-(`ERROR_SHARING_VIOLATION`) or 5 (`ERROR_ACCESS_DENIED`) naming the slot directory. A red matching
-that fingerprint is this row until shown otherwise; a red that does not match it is a regression.
+`removal retries across the closing handle`, with a `Filesystem` error carrying os error 32
+(`ERROR_SHARING_VIOLATION`) or 5 (`ERROR_ACCESS_DENIED`) naming the slot directory. It read `Io`
+until the base merge `b7ee896` brought in master's split of that variant by §7's operation-context
+rule; a red recorded before that merge spells the same refusal `Io`, and so do the mutation
+witnesses quoted in PR #109's body, which were measured on a head that predates it. A red matching
+this fingerprint is this row until shown otherwise; a red that does not match it is a regression.
 
 **Mechanism, and why it is not a rate question.** The holder thread closes the handle 300ms after
 the remove funnel's `Before` phase signals it. If that thread is not scheduled at all for the length
