@@ -6330,3 +6330,98 @@ third sighting lands on a head without that increment, this paragraph is what to
 **Consequence.** This row exists to be found when that fingerprint fires a third time. The
 disposition of the prior row is its owner's to rule on, not this pull request's; nothing in it has
 been edited.
+
+## 55. PR sweep of `src/rundir/classify.rs` (2026-09-04)
+
+Append-only. The sweep of `src/rundir/classify.rs`, row 12 of the `standards/SWEEP.md` review
+queue and the first file of the `#107 rundir` family, read against `origin/master`
+`5f661fa7f8d5c45471cc33746a70df1cd192c61e` by one session whose only subject was that file. The
+cleanup is `70989560d9d9e93f969a9ca11f05b4dc3dcfb830`. Under the owner's amendment 7 the four
+readings are correctness, a better implementation, the standards and the tests; under the owner's
+rule of 2026-09-04 for the sweep pull requests, P1 and P2 findings are fixed and P3 and lower are
+recorded. The exceptions to that here are stated rather than shaded: `SWEEP-CLASSIFY-003` and
+`SWEEP-CLASSIFY-009` are P2 and deferred, the first because closing it in this module was measured
+impossible under the effect governance and the second because both folds are in files this pull
+request does not own. Neither severity was lowered to fit the disposition.
+
+**The section number is 55.** Master's last section is 53; PR #135 and PR #136 have each taken 54
+on their own branches. 55 collides with neither.
+
+### The `.ok()?` inventory, settled one at a time
+
+The brief asks what each fold means and what the census does with the answer, and this is the
+whole list at the reviewed head. Two are honest absence: a first line that is not UTF-8 and one
+that is not this header are not a valid `run_started`, which is exactly what `startup_census` asks,
+and nothing is lost at either. One was unreachable and is gone (`SWEEP-CLASSIFY-005`). The
+remaining five — the stat of the name, the `open`, the `fstat` for the bound, the two reads and the
+seek — fold an I/O failure the filesystem declined to explain into the same `None` as "there is
+nothing here".
+
+`startup_census` defines the classification as `Committed` or "anything else", so `Husk` is the
+answer the packet gives for all five and this pull request does not change it. What the census then
+*does* with that answer is the part worth stating, because the module's own comment had it wrong
+(`SWEEP-CLASSIFY-004`). A `Husk` is not deleted because a proof requires `committed.json` to be
+absent; that holds only of `PrivateHalfOwnership::Proven`. The answer a failed marker read actually
+produces is `NothingBound`, which reclaims the public half with no commit-record check anywhere on
+the path. What protects a directory this probe could not read is `unbound_shape`, which reclaims
+only a bare directory or one holding the staging file alone: an `events.jsonl` that could not be
+opened is still an entry in the listing, so the answer is `RetainReason::MarkerlessWithContent` and
+the directory is retained and reported.
+
+That leaves exactly one hole, and it is `SWEEP-CLASSIFY-009`: the listing is a *second* observation
+of a directory the classifier already failed to read once, and `read_dir_names` answers `[]` for a
+`read_dir` that failed. A transient whole-process failure — `EMFILE`, `ENFILE` — fails the `open`,
+the marker read and the listing at the same moment, and `remove_public_husk` then lists the
+directory again, after the transient has passed, and deletes what it finds. Both folds are in
+`src/rundir.rs` and `src/rundir/ownership.rs`, and the row is deferred to their queue rows with the
+sequence written out.
+
+### The fifo race, measured rather than restated
+
+The module doc named an unbounded `open(2)` and called it byte-identical to the parent's. Measured
+on this box (Linux 6.8.0-137-generic), against a fifo `mkfifo` created with no writer, `stat`
+reporting `fifo` for it:
+
+* `std::fs::File::open` was still blocked when a five-second `timeout` killed it (exit 124, no
+  output);
+* the same open with `O_NONBLOCK` through `OpenOptions::custom_flags` returned `Ok` in 3.737
+  microseconds.
+
+So the usual close works, and it cannot be written here. Adding either spelling to this module was
+measured emitting clippy's disallowed-method error for `std::fs::File::options` and its
+disallowed-type error for `std::fs::OpenOptions`, each naming this module's own `#![deny(` as the
+level; `libc::open` and `libc::fcntl` are denied beside them. An allowance is a module-level
+attribute in a file listed in `effects/allowlist.toml`, which would replace the deny posture
+`PR6-LANEF-004` put here. The close therefore belongs to the funnel parent as a site-taking
+non-blocking read-only open, and the module doc now says that instead of saying the race is
+somebody else's.
+
+### The bounds, checked on every path
+
+`FIRST_LINE_WINDOW` bounds the window read; the file's own `fstat` length bounds the scan, so a
+file growing under the read cannot unbound it; `SCAN_CHUNK` bounds the scan's memory. Two paths
+evaded a bound and both are fixed: the `Interrupted` branch spent none of the budget
+(`SWEEP-CLASSIFY-001`), and a `Read` implementation answering more than its buffer indexed past the
+chunk and underflowed the budget (`SWEEP-CLASSIFY-006`). One bound is absent by design and is now
+documented rather than implied: the line that is found is materialised at its own length
+(`SWEEP-CLASSIFY-012`).
+
+### The rows
+
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| SWEEP-CLASSIFY-001 | P2 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:236 | the scan retried an `Interrupted` read with a bare `continue`, which is the one branch of the loop that spends no budget -> a source that answers `Interrupted` for ever is scanned for ever, and the function's own termination proof asserted "every iteration either returns or spends at least one byte of budget" two clauses before naming the branch that made it false -> `startup_census` holds the physical worktree lock across `classify_run_dir`, so a scan that does not return is the lock held for ever and no later command in that worktree can run; a regular file does not produce `Interrupted`, so the source that reaches it is a device or fifo swapped in past the guard, meeting a signal | pre_existing | liveness | 7a83e69 | fixed: the retries are bounded by `INTERRUPTED_RETRIES` and the doc states the three-way termination it now has; `the_scan_retries_an_interrupted_read_and_stops_retrying` asserts both halves and the count of interruptions actually handed out, and was witnessed failing under a cap that never fires and under `Interrupted` treated as an end of file, each of which still terminates so neither mutation can hang the suite | fixed |
+| SWEEP-CLASSIFY-002 | P2 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:209 | `first_line_within` reads twice, a constant-memory scan for the newline's offset and then a re-read of that many bytes from the start, and the only property checked on the re-read was its length -> a source rewritten between the two reads returns bytes the scan proved nothing about: a rewrite that keeps the length and moves a newline earlier returns a "line" with a newline inside it, and one that moves it later returns bytes with no terminator at all, which is the requirement `startup_census` states -> the probe hands `serde_json` something that is not the first newline-terminated line and can classify `Committed` on it; the log is append-only under a lock, so the reachable writer is hostile or broken | pre_existing | correctness | 7a83e69 | fixed: the re-read takes `length + 1` bytes and re-establishes every property on the bytes returned, the last of them the terminator and none of the others one; `a_source_rewritten_between_the_scan_and_the_reread_has_no_first_line` drives one case per guard plus an unchanged-source control, and each of the three guards was witnessed by exactly one case failing when that guard alone was removed | fixed |
+| SWEEP-CLASSIFY-003 | P2 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:139 | `first_committed_line` takes the file type from the *name* and then opens it, so the window between the two is open -> a path swapped inside it for a writer-less fifo blocks in `open(2)` before any bound on the read applies -> the census never classifies that entry and holds the physical worktree lock for ever; measured on this box at Linux 6.8.0-137-generic, where `std::fs::File::open` on a writer-less fifo was still blocked when a 5-second timeout killed it (exit 124) and the same open with `O_NONBLOCK` returned in 3.737 microseconds | pre_existing | liveness | 7a83e69 | deferred with the reproduction and the measured reason it cannot be closed in this module: every non-blocking open is a governed primitive, and adding one here was measured emitting clippy's disallowed-method error for `std::fs::File::options` and its disallowed-type error for `std::fs::OpenOptions`, both citing this module's own `#![deny(` as the level. An allowance is a module-level attribute in a file listed in `effects/allowlist.toml`, which would replace this module's deny posture; the close therefore belongs to the funnel parent as a site-taking non-blocking read-only open. The module doc states what remains rather than calling the race somebody else's, and `a_run_directory_whose_log_blocks_on_open_is_still_classified` keeps the guard that narrows it | deferred |
+| SWEEP-CLASSIFY-004 | P2 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:133 | the module said a `Husk` is safe because "a husk is never deleted on shape alone -- deletion additionally requires the ownership proof, which requires `committed.json` to be absent" -> that is true of `PrivateHalfOwnership::Proven`, which reclaims both halves, and false of `NothingBound`, which reclaims the public half through `remove_public_husk` with no commit-record check anywhere on the path and is what the proof answers as soon as the marker cannot be read -> a reader of this file takes a safety property the code does not have, and the fold below it was licensed by an argument that does not cover the path it reaches | pre_existing | docs-contract | 7a83e69 | fixed as text: the comment now says what actually protects a directory this probe could not read, which is `unbound_shape` reclaiming only a bare directory or one holding the staging file alone, so an `events.jsonl` in the listing is `RetainReason::MarkerlessWithContent`; both halves were already pinned by the proof grid's "marker-less husk carrying run-scoped content" and "bare public directory" cases, which the comment now cites, and the residual the corrected argument exposes is `SWEEP-CLASSIFY-009` | fixed |
+| SWEEP-CLASSIFY-005 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:231 | the chunk size was `usize::try_from(budget.min(SCAN_CHUNK as u64)).ok()?` -> the value converted is at most `SCAN_CHUNK`, so the conversion cannot fail on any target this crate builds for, and the `?` answers `Husk` for a case that does not exist -> a `?` that decides nothing, against §7's rule that each one is deliberate | pre_existing | docs-contract | 7a83e69 | fixed: the chunk size is the smaller of two `usize` values and there is no `?`; `the_first_line_probe_spends_its_budget_and_stops` asserts the exact byte count the scan spends, which is what the sizing decides | fixed |
+| SWEEP-CLASSIFY-006 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:239 | the scan indexed `chunk[..read]` and then subtracted `read` from the budget with whatever a `Read` implementation returned -> a reader answering more than the buffer it was given panics on the slice index, or underflows the budget -> a panic on an I/O outcome in a generic function, which §7's panic policy forbids; `File` honours the contract, so no production path reaches it | pre_existing | correctness | 7a83e69 | fixed: the count is clamped to the buffer at the site with the reason on the line. Not witnessed by a test, and the reason is disclosed in the body: the only source that reaches it violates `Read`'s contract, and driving one through `first_line_within` meets std's own `read_to_end` buffer handling before this loop | fixed |
+| SWEEP-CLASSIFY-007 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:136 | the guard is `symlink_metadata` rather than `metadata` and the module states the difference as deliberate, since refusing the link itself narrows the residual race to replacing a directory entry the census owns -> the suite's only planted link points at `/dev/zero`, which `metadata` refuses too because a character device is not a regular file, so both spellings pass every test -> the one behaviour that separates them, a link to a valid committed log, was unmeasured and the guard could have been widened silently | pre_existing | correctness | 7a83e69 | fixed: `a_symlinked_event_log_is_a_husk_however_valid_its_target` points the link at a log it first asserts is `Committed` when read as a file, and was witnessed failing with `symlink_metadata` replaced by `metadata` | fixed |
+| SWEEP-CLASSIFY-008 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:278 | `run_started_sha256` and `first_line_digest` are two independent spellings of one number and recovery compares a value produced by each, the commit record's written from `first_line_digest` at P5b and the check recomputed with `run_started_sha256` -> every test on either side computes its oracle with the same function it is testing, so nothing asserted the two agree -> either format string could change alone and every schema-4 recovery would begin refusing, with both digests looking correct where they were computed | pre_existing | correctness | 7a83e69 | fixed: `the_two_spellings_of_the_first_line_digest_agree` asserts the pairing production makes, over a log with a second event after the first line so a whole-file digest cannot satisfy it, and was witnessed failing with one of the two format strings changed | fixed |
+| SWEEP-CLASSIFY-009 | P2 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir.rs:890 | `read_dir_names` answers `[]` for a `read_dir` that failed, and `[]` is `unbound_shape`'s reclaiming answer -> a transient whole-process failure fails `File::open` in the classifier, `fs::read_to_string` on the marker in the proof and that listing at the same moment, so the census classifies `Husk`, the proof answers `NothingBound(Bare)` and the plan is `ReclaimPublicOnly` with no commit-record check on the path -> `remove_public_husk` then lists the directory a second time, once the transient has passed, and deletes what it finds, so a committed run's public half including `events.jsonl` is removed on evidence that it was empty; needs the failure to be transient, which `EMFILE` and `ENFILE` are | pre_existing | correctness | 7a83e69 | deferred to the sweeps of `src/rundir.rs` (queue row 19) and `src/rundir/ownership.rs` (queue row 15), which own both folds; neither is in this file and the fix changes the deletion authority's behaviour, which needs that file's own review. The precedent is explicit: the same repair class was attempted across `src/workspace_manager.rs` in PR #128 and reverted after three passes, each round's repair introducing the next defect. The corrected argument in `first_committed_line` names this residual where a reader of the fold will see it | deferred |
+| SWEEP-CLASSIFY-010 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/engine/topology/startup.rs:807 | five of the folds in `first_committed_line` turn an I/O failure the filesystem declined to explain into the same `None` as an honest absence -> `classify_run_dir` returns `Committed` or `Husk` and has nowhere to put the difference, and the census stores only that answer in `RunDirEntry` -> an operator whose `events.jsonl` could not be read is told the run "never recorded a committed run_started", `list_runs` drops it and resume refuses; nothing is deleted, because the directory listing retains it | pre_existing | correctness | 7a83e69 | deferred to `src/engine/topology/startup.rs`, which owns the census report: `startup_census` defines the classification as `Committed` or "anything else", so the reason belongs beside the class in `RunDirEntry` rather than inside the binary answer, and adding a third class here would contradict the packet. `first_committed_line` states which folds are honest absence and which are not, at the return that loses the difference | deferred |
+| SWEEP-CLASSIFY-011 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:278 | `run_started_sha256` returns a `String` and `CommitRecord.run_started_sha256` holds one -> a digest and any other string are the same type, so a ref name, a truncated digest or an empty value is assignable and comparable where a digest is meant, and two functions in two modules each build the `sha256:` spelling with their own `format!` -> nothing refuses a malformed value at the boundary the way `workspace_manager::object` refuses an object id, and the two producers agree only by inspection | pre_existing | docs-contract | 7a83e69 | deferred to `src/events/log.rs` and `src/rundir.rs`, with the proposal named: one definition of the spelling, with `first_line_digest` delegating to it, and a validating predicate applied where the record is read, which is the shape `is_object_id` takes rather than a newtype through a serde field. `the_two_spellings_of_the_first_line_digest_agree` pins the agreement in the meantime | deferred |
+| SWEEP-CLASSIFY-012 | P3 | 5f661fa7f8d5c45471cc33746a70df1cd192c61e / src/rundir/classify.rs:206 | the scan is constant memory and the answer is not: a first line that is found is materialised at its own length, because the packet states no size exception and the parse needs the whole line -> a run directory whose `events.jsonl` has a first newline gigabytes in costs the census that many bytes of process memory -> the module documents `SCAN_CHUNK` as the cost of "there is no newline" and said nothing about the cost of finding one; no allocation failure is reachable from any log this project writes | pre_existing | performance | 7a83e69 | deferred: the doc on `first_line_within` now states the property where a reader meets it, and what to bound is what a census may spend rather than what a first line is, which is a decision for the census and its design sentence rather than a constant invented in this module | deferred |
+
+Frontier-pass rows are appended below these as the passes happen, with the pull request's number as
+their prefix.
