@@ -53,7 +53,6 @@ wave, not across the history of the tree.
 |---|---|---|---|---|
 | 1 | `src/workspace_manager/containment.rs` | 235 | #110 | 2026-09-03 |
 | 3 | `src/workspace_manager/naming.rs` | 254 | #110 | 2026-09-03 |
-| 4 | `src/workspace_manager/object.rs` | 68 | #110 | 2026-09-03 |
 | 5 | `src/workspace_manager/parsers.rs` | 274 | #110 | 2026-09-03 |
 | 6 | `src/workspace_manager/residue.rs` | 400 | #110 | 2026-09-03 |
 | 7 | `src/workspace_manager/snapshot_ref.rs` | 56 | #110 | 2026-09-03 |
@@ -128,3 +127,4 @@ Baseline at the tightening (master `cfec136`, 114 Rust files under `src/`):
 | File | Swept at (commit) | Date | Notes |
 |---|---|---|---|
 | `src/workspace_manager/hooks.rs` | `f58747a` | 2026-09-03 | `Arc<Mutex<HookHarness>>`, the lock and the two ledger clones kept with their lifecycle, protected invariant and handle semantics stated; the three `?` in `funnel` kept as deliberate and documented at the site; `point` now applies a refusal at the mode that answered (it named `kill` whatever fired); a test module for the protocol itself. After review (PR #119): a poisoned harness refuses wherever a refusal is legal and proceeds unrecorded at a `Kill`-only point (`c265536`). |
+| `src/workspace_manager/object.rs` | `af382fa` | 2026-09-04 | No shared ownership, lock or clone: a refusal copies the ref name and the offered value into the error value it returns. The two refusals return `Refusal` rather than the parent's flattened `UpstrokeError`, so a caller or a test matches the variant, and the two `?` are same-type propagation stated at the site. The hash lengths are named. The null id is now refused on the new side of a create or compare-and-swap too (`Refusal::NullNew`; the parent's two call sites and import moved with it): measured on git 2.43 it deletes the ref through the CAS and creates nothing with exit 0. A test module in the file drives both predicates and the three refusals at both hash lengths and the length and alphabet boundaries; each test was witnessed failing under a mutation. |
