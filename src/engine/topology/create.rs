@@ -466,8 +466,13 @@ pub trait IntegrationRefs {
     ///
     /// # Errors
     ///
-    /// A Git error, including the zero-old failure when the ref appeared
-    /// between [`Self::direct_target`] and this call.
+    /// [`UpstrokeError::Refused`] when `new` is not a full hexadecimal object
+    /// id or is the null id (`workspace_manager::Refusal::MalformedObjectId`
+    /// and `NullNew`, the latter what Git would read as "must not exist
+    /// afterwards"); every implementation, the test doubles included, applies
+    /// `workspace_manager::refuse_new` for it. A Git error, including the
+    /// zero-old failure when the ref appeared between [`Self::direct_target`]
+    /// and this call.
     fn create_zero_old(
         &self,
         hooks: &mut dyn crate::workspace_manager::EffectHooks,
@@ -2156,14 +2161,18 @@ fn p8_create_integration_ref(
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Refused`] when the ref is symbolic, checked out, or at any
-/// SHA other than `base`; a Git error from the creation.
+/// [`UpstrokeError::Refused`] when `base` is not a full hexadecimal object id
+/// or is the null id (`workspace_manager::Refusal::MalformedObjectId`,
+/// `NullNew`), checked here before anything is read so that a ref already at
+/// the null id is not adopted as "already there"; when the ref is symbolic,
+/// checked out, or at any SHA other than `base`; a Git error from the creation.
 pub fn ensure_integration_ref(
     refs: &dyn IntegrationRefs,
     hooks: &mut dyn crate::workspace_manager::EffectHooks,
     refname: &str,
     base: &str,
 ) -> Result<(), UpstrokeError> {
+    crate::workspace_manager::refuse_new(refname, base)?;
     refs.assert_publishable(refname)?;
     match refs.direct_target(refname)? {
         None => refs.create_zero_old(hooks, refname, base),

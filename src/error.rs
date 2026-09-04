@@ -27,6 +27,18 @@ pub enum UpstrokeError {
         source: std::io::Error,
     },
 
+    /// A filesystem operation on a path the engine owns failed. Named for
+    /// the operation, because a removal, a write or a rename that fails did
+    /// not fail to read (§7's operation-context rule); `Io` stays the
+    /// variant for reads.
+    #[error("failed to {operation} {}: {source}", .path.display())]
+    Filesystem {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("plan parse error: {message}")]
     Parse { message: String },
 

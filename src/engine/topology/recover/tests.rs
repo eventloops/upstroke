@@ -1121,6 +1121,9 @@ impl IntegrationRefs for RecordingRefs {
         refname: &str,
         new: &str,
     ) -> Result<(), UpstrokeError> {
+        // The contract's refusal, before the funnel is entered: the real
+        // primitive refuses a malformed or null value before its funnel runs.
+        crate::workspace_manager::refuse_new(refname, new)?;
         let site = EffectSiteId::Ref(RefSite::CreateIntegration);
         self.entered
             .lock()
@@ -1148,6 +1151,33 @@ impl IntegrationRefs for RecordingRefs {
             .push((refname.to_owned(), new.to_owned()));
         injected(hooks.phase(site, HookPhase::After), site, HookPhase::After)
     }
+}
+
+/// The contract [`IntegrationRefs::create_zero_old`] states binds this double
+/// as it binds `WorkspaceManager` (`PR126-REVIEW2-DOUBLES-ACCEPT-NULL-NEW`):
+/// a null value is refused before the funnel is entered, and nothing is stored.
+#[test]
+fn the_recording_refs_refuse_a_null_new_value_as_the_real_primitive_does() {
+    let refs = RecordingRefs::with_log(Path::new("no-log"), RefShape::Direct, None);
+    let null = "0".repeat(40);
+    let error = refs
+        .create_zero_old(
+            &mut crate::workspace_manager::NoHooks,
+            "refs/heads/upstroke/run-1",
+            &null,
+        )
+        .expect_err("the double refuses a null new value");
+    assert!(
+        error.to_string().contains("null object id"),
+        "the refusal must name its reason: {error}"
+    );
+    assert_eq!(refs.created(), Vec::<(String, String)>::new());
+    assert_eq!(refs.target(), None);
+    assert_eq!(
+        refs.log_bytes_at_entries(),
+        Vec::<Vec<u8>>::new(),
+        "the funnel was not entered"
+    );
 }
 
 /// `workspace_manager::apply`, which is private to that module — the same three
