@@ -1377,12 +1377,6 @@ pub(super) fn kill_dir(tag: &str) -> PathBuf {
 /// early would satisfy neither, and a child that panicked would satisfy only
 /// this one.
 pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
-    // Minted here, before the child exists, because a token cannot be made
-    // from a path: the child builds its own subtree inside this one, and a
-    // child that dies by `std::process::abort()` leaves a tree this guard
-    // still owns. Without it the adopted tree outlived every kill test, and a
-    // temporary directory leaked per fixture is what exhausted this box's
-    // inodes once already.
     let status = run_kill_child(
         test,
         &[
