@@ -1839,6 +1839,41 @@ mod tests {
         std::process::exit(1);
     }
 
+    /// The leak the token fix introduced, and the guard that closes it.
+    ///
+    /// `std::mem::forget` is the aborting child, exactly: its `Drop` never
+    /// runs, so its own subtree survives it. The parent minted the tree before
+    /// the child existed and holds the guard, so dropping the adopted fixture
+    /// takes the whole thing — which is what `Fixture::drop` used to do and
+    /// what putting `scratch` on the token had stopped doing.
+    #[test]
+    fn an_adopted_fixture_reclaims_the_tree_its_caller_minted() {
+        let owner = scratch_tree("adopt-reclaims");
+        let owner_root = owner.path().to_path_buf();
+
+        let fixture = Fixture::under(&owner_root, "adopted");
+        let root = fixture.root.clone();
+        // The child died by `abort()`: nothing of its own is reclaimed.
+        std::mem::forget(fixture);
+        assert!(
+            root.exists(),
+            "the abandoned tree is the premise of this test"
+        );
+
+        drop(Fixture::adopt(root.clone(), owner));
+
+        assert!(
+            !root.exists(),
+            "the tree the child left behind outlived the fixture that adopted it: {}",
+            root.display()
+        );
+        assert!(
+            !owner_root.exists(),
+            "the tree its caller minted outlived the fixture that adopted it: {}",
+            owner_root.display()
+        );
+    }
+
     /// The child half of [`the_fixture_is_immune_to_an_ambient_config_and_template`].
     #[test]
     #[ignore = "spawned by `the_fixture_is_immune_to_an_ambient_config_and_template` with a \
