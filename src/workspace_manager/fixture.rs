@@ -805,6 +805,9 @@ mod tests {
     /// fails loudly rather than passing vacuously.
     const AMBIENT_CHILD: &str = "workspace_manager::fixture::tests::ambient_environment_child";
 
+    /// The harness name of [`panicking_child`].
+    const PANICKING_CHILD: &str = "workspace_manager::fixture::tests::panicking_child";
+
     /// The harness name of [`ambient_config_child`], run the same way.
     const CONFIG_CHILD: &str = "workspace_manager::fixture::tests::ambient_config_child";
 
@@ -1031,6 +1034,23 @@ mod tests {
             "workspace_manager::fixture::tests::no_test_has_this_name",
             &[],
         );
+    }
+
+    /// A child that panicked before it reached its injection is not a child
+    /// whose injection stopped killing, and its streams are captured, so the
+    /// diagnostic would otherwise be thrown away and only an exit code reach
+    /// the caller.
+    #[test]
+    #[should_panic(expected = "panicked rather than reaching its injection")]
+    fn a_child_that_panicked_says_so_and_quotes_what_it_said() {
+        let _ = run_child_test(PANICKING_CHILD, &[]);
+    }
+
+    /// The child half of [`a_child_that_panicked_says_so_and_quotes_what_it_said`].
+    #[test]
+    #[ignore = "spawned by `a_child_that_panicked_says_so_and_quotes_what_it_said`"]
+    fn panicking_child() {
+        panic!("the child's own diagnostic");
     }
 
     /// `std::process::Child` neither kills nor reaps on its own drop, so a
