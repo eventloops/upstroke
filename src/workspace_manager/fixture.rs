@@ -335,16 +335,16 @@ fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
         }
     }
     command
-        .env("GIT_CONFIG_GLOBAL", &absent)
-        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_GLOBAL", absent)
+        .env("GIT_CONFIG_SYSTEM", absent)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         // Empty rather than absent: measured on git 2.43.0, an empty value
         // copies no template at all and warns about nothing, and it beats both
         // `init.templateDir` and the built-in template directory.
         .env("GIT_TEMPLATE_DIR", "")
-        .env("HOME", &absent)
-        .env("XDG_CONFIG_HOME", &absent)
+        .env("HOME", absent)
+        .env("XDG_CONFIG_HOME", absent)
         .env("GIT_AUTHOR_NAME", COMMITTER_NAME)
         .env("GIT_AUTHOR_EMAIL", COMMITTER_EMAIL)
         .env("GIT_AUTHOR_DATE", COMMITTER_DATE)
@@ -358,7 +358,7 @@ fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
     for key in ["core.hooksPath", "core.attributesFile", "core.excludesFile"] {
         let mut setting = OsString::from(key);
         setting.push("=");
-        setting.push(&absent);
+        setting.push(absent);
         command.arg("-c").arg(setting);
     }
     command
