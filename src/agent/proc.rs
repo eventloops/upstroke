@@ -1432,7 +1432,7 @@ mod termination {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::error::UpstrokeError;
     use crate::topology::effects::ProcessSite;
@@ -1454,8 +1454,14 @@ mod termination {
     const GUARD_CANCELLED: u8 = 0xc1;
     const GUARD_DISARM: u8 = 0xd1;
 
-    /// How long a forked helper (the cleanup reaper, the job-control guard)
-    /// has to report READY at startup. Before it does, the child closes every
+    /// How long the parent waits for a forked helper (the cleanup reaper, the
+    /// job-control guard) to report READY at startup. The budget bounds the
+    /// parent's wait, not the latest instant at which READY is accepted: the
+    /// wait ends with a final look at the pipe, so a READY written after the
+    /// budget, while the parent was off the CPU, is read and accepted, which
+    /// is the safe direction, since the helper is up. What the budget
+    /// promises is that a helper silent for the whole of it fails its launch.
+    /// Before a helper reports, the child closes every
     /// inherited descriptor; Linux does that in a handful of `close_range`
     /// calls, one per gap between the descriptors it keeps, but Darwin and
     /// the other hosts close them one syscall at a time up to the descriptor
@@ -1501,11 +1507,41 @@ mod termination {
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(10);
     /// How long a READY wait goes between looks at the termination flag.
     const LAUNCH_INTERRUPT_SLICE: Duration = Duration::from_millis(50);
+    /// How long a helper that has been sent `SIGKILL` is given to exit before
+    /// it is left for the process's exit to collect (`kill_and_reap_helper`).
+    const HELPER_EXIT_BUDGET: Duration = Duration::from_millis(500);
+    /// How long `kill_and_reap_helper` goes between looks at a killed helper.
+    const HELPER_EXIT_POLL: Duration = Duration::from_millis(10);
     /// How many reaper READY waits this process has begun. A test that must
     /// turn the termination flag while a wait is in progress, rather than
     /// before it, watches this instead of sleeping.
     #[cfg(test)]
     static READY_WAITS_BEGUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    /// A stall a test injects into `read_guard_ack_until`, the one seam that
+    /// turns a duration back into a deadline, before it does so: for the
+    /// descriptor named here only, since every acknowledgement wait in this
+    /// process reads through that seam, and skipping the first read on it so
+    /// that a whole budget has been computed before the stall lands. The
+    /// CANCEL wait never reaches the seam; the test that sets this says why.
+    #[cfg(test)]
+    static DEADLINE_SEAM_STALL_FD: AtomicI32 = AtomicI32::new(-1);
+    #[cfg(test)]
+    static DEADLINE_SEAM_STALL_READS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    #[cfg(test)]
+    const DEADLINE_SEAM_STALL: Duration = Duration::from_secs(3);
+    /// The one pid whose kill a test watches. `kill_helper` records the
+    /// `SIGKILL` it would send to that pid instead of sending it, for two
+    /// reasons: a signal that should not have been sent is otherwise
+    /// unobservable, since the bounded reap answers the same whether or not
+    /// it was sent; and a child whose kill is withheld stands in for one that
+    /// `SIGKILL` cannot end within the budget, which no test can fabricate.
+    /// Keyed to one pid, because the tests of this module run in one process
+    /// and a helper another test is ending would otherwise answer for it.
+    #[cfg(test)]
+    static WATCHED_KILL_PID: AtomicI32 = AtomicI32::new(-1);
+    #[cfg(test)]
+    static WATCHED_KILL_SENT: AtomicBool = AtomicBool::new(false);
     const GUARD_PROBE: u8 = 0xe1;
 
     /// Whether a launch in progress should be given up: a termination is
@@ -2389,35 +2425,163 @@ mod termination {
             self.close_and_wait();
         }
 
-        /// Give up on a reaper that has not said READY.
+        /// Give up on a reaper that has not said READY, or said it with a
+        /// termination pending.
         ///
         /// No agent has been spawned and no group registered — `prepare` runs
         /// only after `begin` has returned — so there is nothing for this
         /// reaper to settle and nothing to fail closed about. Kill it and reap
-        /// it; the launch fails with an ordinary error. Arming process-wide
-        /// `SIGTERM` here guarded a state that cannot exist yet, and on macOS,
-        /// where a forked helper's startup runs long under load, it killed the
-        /// test harness with no diagnostic (`C-004`).
-        fn abandon(self) {
-            // SAFETY: `pid` is the unreaped reaper this process forked. It is
-            // the only member of its own process group and holds nothing but
-            // its shared cleanup lease, which its exit releases.
-            unsafe {
-                let _ = libc::kill(self.pid, libc::SIGKILL);
-            }
-            self.close_and_wait();
+        /// it, within `HELPER_EXIT_BUDGET` and only while the pid is still
+        /// ours (`kill_and_reap_helper`); the launch fails with an ordinary
+        /// error that says what became of it. Arming process-wide `SIGTERM`
+        /// here guarded a state that cannot exist yet, and on macOS, where a
+        /// forked helper's startup runs long under load, it killed the test
+        /// harness with no diagnostic (`C-004`).
+        fn abandon(self) -> HelperEnd {
+            let end = kill_and_reap_helper(self.pid);
+            close_fd(self.command_fd);
+            close_fd(self.ack_fd);
+            close_fd(self._command_keepalive_fd);
+            end
         }
 
+        /// The acknowledged-exit path: `cleanup` and `cancel` arrive here
+        /// after the reaper has agreed to exit, and its exit is what releases
+        /// its shared cleanup lease, which the caller depends on. This wait is
+        /// therefore unbounded by design; a reaper that has not agreed goes
+        /// through `abandon`, whose wait is bounded.
         fn close_and_wait(self) {
             close_fd(self.command_fd);
             close_fd(self.ack_fd);
             close_fd(self._command_keepalive_fd);
             loop {
+                // SAFETY: `pid` is the reaper this process forked, which has
+                // acknowledged its exit and is not yet reaped; a null status
+                // discards the exit code.
                 let waited = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
                 if waited == self.pid || (waited < 0 && !last_errno_is_interrupted()) {
                     return;
                 }
             }
+        }
+    }
+
+    /// What became of a helper `kill_and_reap_helper` was asked to end.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HelperEnd {
+        /// Reaped here: it had already exited, or it exited within
+        /// `HELPER_EXIT_BUDGET` of the kill.
+        Reaped,
+        /// Sent `SIGKILL` and still not exited at the end of the budget; left
+        /// unreaped for the process's exit to collect.
+        Left,
+        /// Another waiter reaped it, before the kill or after it, so the
+        /// number is no longer this process's to signal; nothing was sent
+        /// after that answer.
+        ReapedElsewhere,
+    }
+
+    impl std::fmt::Display for HelperEnd {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                HelperEnd::Reaped => "killed and reaped",
+                HelperEnd::Left => "killed and left unreaped for the process's exit to collect",
+                HelperEnd::ReapedElsewhere => "reaped by another waiter and not signalled",
+            })
+        }
+    }
+
+    /// What one non-blocking `waitpid` says about a child of this process.
+    enum ChildLook {
+        /// It had exited, and this look reaped it.
+        Reaped,
+        /// Alive (or stopped) and this process's unreaped child.
+        Alive,
+        /// Not this process's child: `ECHILD`, another waiter having reaped
+        /// it, or a query the host refused.
+        NotOurs,
+    }
+
+    fn look_at_child(pid: libc::pid_t) -> ChildLook {
+        loop {
+            // SAFETY: `WNOHANG` inspects the process table for `pid` alone and
+            // returns at once; a null status discards the exit code.
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if waited == pid {
+                return ChildLook::Reaped;
+            }
+            if waited == 0 {
+                return ChildLook::Alive;
+            }
+            if last_errno_is_interrupted() {
+                continue;
+            }
+            return ChildLook::NotOurs;
+        }
+    }
+
+    /// End a forked helper this process no longer wants: kill it only while
+    /// it is ours, and reap it within a bound.
+    ///
+    /// `waitpid(pid, WNOHANG)` is asked first and is the authority on whether
+    /// the number still names this process's unreaped child. `pid` back means
+    /// it had exited and is now reaped, so there is nothing to signal.
+    /// `ECHILD` means another waiter took it (a library host's `SIGCHLD`
+    /// handler, a `waitpid(-1)` elsewhere in the process), the number may
+    /// already name a stranger, and nothing is sent. `0` means alive and ours,
+    /// and it is sent `SIGKILL`. The reap then polls, `HELPER_EXIT_POLL`
+    /// apart, to `HELPER_EXIT_BUDGET`. A child that has not exited by then is
+    /// in a state `SIGKILL` cannot end at once, uninterruptible I/O in a
+    /// stalled `open` or `close` of an inherited descriptor, and is left for
+    /// the process's exit to collect. That is the better outcome because of
+    /// where the callers stand: the reaper's callers hold the launch barrier,
+    /// and the monitor refuses to kill or stop any registered group while it
+    /// is held, so a wait that outlasted the child would hold every running
+    /// agent past a termination for as long as the kernel took, where an
+    /// unreaped child collected at exit costs a process-table entry and
+    /// nothing else. The guard's callers are initialising the supervisor and
+    /// have the same interest in reporting the failure promptly.
+    ///
+    /// What remains is the window between the look and the signal: a wildcard
+    /// waiter that reaps the child inside it frees the number before the
+    /// kill lands. Closing that needs a handle on the process rather than its
+    /// number (`pidfd_open` on Linux), which is deferred, not done here.
+    fn kill_and_reap_helper(pid: libc::pid_t) -> HelperEnd {
+        match look_at_child(pid) {
+            ChildLook::Reaped => return HelperEnd::Reaped,
+            ChildLook::NotOurs => return HelperEnd::ReapedElsewhere,
+            ChildLook::Alive => {}
+        }
+        kill_helper(pid);
+        let deadline = Instant::now() + HELPER_EXIT_BUDGET;
+        loop {
+            match look_at_child(pid) {
+                ChildLook::Reaped => return HelperEnd::Reaped,
+                ChildLook::NotOurs => return HelperEnd::ReapedElsewhere,
+                ChildLook::Alive => {}
+            }
+            if Instant::now() >= deadline {
+                return HelperEnd::Left;
+            }
+            thread::sleep(HELPER_EXIT_POLL);
+        }
+    }
+
+    /// `SIGKILL` to a helper `look_at_child` has just called alive and ours.
+    fn kill_helper(pid: libc::pid_t) {
+        #[cfg(test)]
+        {
+            if WATCHED_KILL_PID.load(Ordering::SeqCst) == pid {
+                WATCHED_KILL_SENT.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+        // SAFETY: `waitpid(pid, WNOHANG)` answered 0 for `pid` on this thread
+        // a moment ago, so it is an unreaped child of this process, and a
+        // positive pid targets that one process. The window between that
+        // answer and this signal is stated on `kill_and_reap_helper`.
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
         }
     }
 
@@ -2526,12 +2690,9 @@ mod termination {
                 for fd in [command[0], command[1], ack[0], ack[1]] {
                     close_fd(fd);
                 }
-                unsafe {
-                    let _ = libc::kill(pid, libc::SIGKILL);
-                    let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
+                let end = kill_and_reap_helper(pid);
                 return Err(format!(
-                    "isolating Unix cleanup reaper: {}",
+                    "isolating Unix cleanup reaper: {}; the reaper was {end}",
                     std::io::Error::from_raw_os_error(error)
                 ));
             }
@@ -2543,13 +2704,14 @@ mod termination {
             _command_keepalive_fd: command[0],
             pid,
         };
-        let ready_wait = std::time::Instant::now();
+        let ready_wait = Instant::now();
         #[cfg(test)]
         READY_WAITS_BEGUN.fetch_add(1, Ordering::SeqCst);
         let ready = read_guard_ack_until(ack[0], HELPER_READY_BUDGET, launch_interrupted);
         // A termination that arrived during the wait, or with READY, wins:
         // the caller holds the launch barrier, and releasing it is what lets
-        // the monitor act on the groups already running.
+        // the monitor act on the groups already running. The abandonment is
+        // bounded for the same reason (`kill_and_reap_helper`).
         if launch_interrupted() {
             reaper.abandon();
             return Err("process launch interrupted by a termination signal".to_owned());
@@ -2566,11 +2728,11 @@ mod termination {
             // how far a close loop over every descriptor number had got,
             // since that loop closes numbers whether or not they are open.
             let snapshot = helper_snapshot(pid);
-            reaper.abandon();
+            let end = reaper.abandon();
             return Err(format!(
                 "Unix cleanup reaper did not initialize (waited {waited:?} of \
                  {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; the reaper \
-                 was {snapshot})"
+                 was {snapshot}, then {end})"
             ));
         }
         #[cfg(test)]
@@ -2874,19 +3036,10 @@ mod termination {
             for fd in [self.command_fd, self.ack_fd, self._command_keepalive_fd] {
                 close_fd(fd);
             }
-            // SAFETY: `pid` is the unreaped child returned by `fork`. Killing
-            // the guard closes its probe pipe, so the descriptor-scrubbed
-            // grandchild exits as well.
-            unsafe {
-                let _ = libc::kill(self.pid, libc::SIGKILL);
-                loop {
-                    if libc::waitpid(self.pid, std::ptr::null_mut(), 0) >= 0
-                        || !last_errno_is_interrupted()
-                    {
-                        break;
-                    }
-                }
-            }
+            // Killing the guard closes its probe pipe, so the
+            // descriptor-scrubbed grandchild exits as well. Bounded, and
+            // only while the pid is ours (`kill_and_reap_helper`).
+            kill_and_reap_helper(self.pid);
         }
 
         fn arm(self) -> bool {
@@ -2927,8 +3080,37 @@ mod termination {
         read_guard_ack_until(fd, timeout, || false)
     }
 
-    /// One byte from `fd` within `timeout`, unless `interrupted` says to stop
-    /// waiting first.
+    /// One byte from `fd` within `timeout` of now, unless `interrupted` says
+    /// to stop waiting first: `read_guard_ack_by` with the deadline taken
+    /// here. A wait that must share one deadline across several reads, as
+    /// `acknowledged` does, takes the deadline form directly, because this is
+    /// the one place a duration is turned back into a deadline, and a thread
+    /// descheduled between computing what is left and arriving here would
+    /// start its wait again from whenever it ran.
+    fn read_guard_ack_until(
+        fd: libc::c_int,
+        timeout: Duration,
+        interrupted: impl Fn() -> bool,
+    ) -> Option<u8> {
+        #[cfg(test)]
+        stall_at_the_deadline_seam(fd);
+        read_guard_ack_by(fd, Instant::now() + timeout, interrupted)
+    }
+
+    /// The test-only stall described on `DEADLINE_SEAM_STALL_FD`.
+    #[cfg(test)]
+    fn stall_at_the_deadline_seam(fd: libc::c_int) {
+        if fd < 0 || DEADLINE_SEAM_STALL_FD.load(Ordering::SeqCst) != fd {
+            return;
+        }
+        if DEADLINE_SEAM_STALL_READS.fetch_add(1, Ordering::SeqCst) == 0 {
+            return;
+        }
+        thread::sleep(DEADLINE_SEAM_STALL);
+    }
+
+    /// One byte from `fd` before `deadline`, unless `interrupted` says to
+    /// stop waiting first.
     ///
     /// The wait polls in slices no longer than `LAUNCH_INTERRUPT_SLICE` and
     /// asks `interrupted` after each empty slice, so a caller holding the
@@ -2941,14 +3123,13 @@ mod termination {
     /// used to be. `None` for a timeout, an interruption, EOF and a read
     /// error alike; a caller that needs to tell interruption apart asks its
     /// predicate again.
-    fn read_guard_ack_until(
+    fn read_guard_ack_by(
         fd: libc::c_int,
-        timeout: Duration,
+        deadline: Instant,
         interrupted: impl Fn() -> bool,
     ) -> Option<u8> {
-        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             // The deadline is a final look, not a return: a byte that arrived
             // while this thread was off the CPU past the deadline is still in
             // the pipe, and a zero-timeout poll reads it where returning here
@@ -3017,19 +3198,24 @@ mod termination {
     /// stale byte queued ahead of its CANCEL acknowledgement; judging the first
     /// byte alone failed a cancel the reaper had accepted (`C-004`).
     ///
-    /// One deadline. While it stands, an unexpected byte is skipped and the
-    /// wait goes on with what is left; once it has passed, the reader's
-    /// zero-timeout final look is the last read, and an unexpected byte there
-    /// ends the wait as a timeout would. So the wait is bounded by `timeout`
-    /// plus one look however many bytes a failed or reused pipe supplies,
-    /// which matters because `Reaper::cancel` runs under the launch barrier.
+    /// One deadline, computed here once and handed as an instant to every
+    /// read (`read_guard_ack_by`), never as what is left of it: a duration
+    /// handed down is turned back into a deadline when the callee runs, and
+    /// a thread descheduled in between would start its wait again. While
+    /// the deadline stands, an unexpected byte is skipped and the wait goes
+    /// on; once it has passed, which the skip arm asks the clock rather than
+    /// a value read before the call, the reader's zero-timeout final look is
+    /// the last read, and an unexpected byte there ends the wait as a
+    /// timeout would. So the wait is bounded by `timeout` plus one look
+    /// however many bytes a failed or reused pipe supplies and however the
+    /// thread is scheduled, which matters because `Reaper::cancel` runs
+    /// under the launch barrier.
     fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match read_guard_ack(fd, remaining) {
+            match read_guard_ack_by(fd, deadline, || false) {
                 Some(byte) if byte == expected => return true,
-                Some(_) if !remaining.is_zero() => continue,
+                Some(_) if Instant::now() < deadline => continue,
                 Some(_) | None => return false,
             }
         }
@@ -3188,11 +3374,10 @@ mod termination {
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
-            unsafe {
-                let _ = libc::kill(pid, libc::SIGKILL);
-                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
-            return Err("configuring Unix job-control guard descriptors".to_owned());
+            let end = kill_and_reap_helper(pid);
+            return Err(format!(
+                "configuring Unix job-control guard descriptors; the guard was {end}"
+            ));
         }
         let guard = Guard {
             command_fd: command[1],
@@ -3216,13 +3401,13 @@ mod termination {
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
-            // SAFETY: `pid` is the child returned by fork and has not been
-            // reaped. A failed setup acknowledgement must not leave it alive.
-            unsafe {
-                let _ = libc::kill(pid, libc::SIGKILL);
-                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
-            return Err("Unix job-control guard did not initialize".to_owned());
+            // A failed setup acknowledgement must not leave the guard alive:
+            // killed and reaped within a bound, only while the pid is ours
+            // (`kill_and_reap_helper`).
+            let end = kill_and_reap_helper(pid);
+            return Err(format!(
+                "Unix job-control guard did not initialize; the guard was {end}"
+            ));
         }
         PROBE_PID.store(i32::from_ne_bytes(probe_pid_bytes), Ordering::SeqCst);
         GUARD_COMMAND_FD.store(command[1], Ordering::SeqCst);
@@ -4723,7 +4908,6 @@ mod termination {
     mod tests {
         use super::*;
         use std::process::{Command, Stdio};
-        use std::time::Instant;
 
         static REAPED_CHILD_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -4896,18 +5080,26 @@ mod termination {
             }
             // The parent holds READY back past `HELPER_READY_BUDGET`, and past
             // the further 2 s a cancel would then have waited, through
-            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`. The launch must fail
-            // promptly, arm nothing, and leave no child behind.
+            // `UPSTROKE_TEST_REAPER_READY_DELAY_MS`, so the reaper is silent
+            // for the whole budget. The launch must wait that budget out,
+            // fail promptly after it, arm nothing, and leave no child behind.
+            // What the budget does not promise is refusal of a READY written
+            // after it while the parent was off the CPU: the wait ends with
+            // a final look, and such a byte is read and accepted.
             let started = Instant::now();
             let launch = spawn_reaper();
             let elapsed = started.elapsed();
             assert!(
                 launch.is_err(),
-                "a reaper that missed its READY deadline was accepted as initialized"
+                "a reaper silent for the whole READY budget was accepted as initialized"
+            );
+            assert!(
+                elapsed >= HELPER_READY_BUDGET,
+                "the launch gave up after {elapsed:?}, before its {HELPER_READY_BUDGET:?} budget"
             );
             assert!(
                 elapsed < HELPER_READY_BUDGET + Duration::from_secs(2),
-                "the late reaper held the launch for {elapsed:?}, past its own deadline"
+                "the silent reaper held the launch for {elapsed:?}, past its budget"
             );
             assert_eq!(
                 PENDING_TERMINATION.load(Ordering::SeqCst),
@@ -4959,11 +5151,12 @@ mod termination {
             );
         }
 
-        /// `C-004`: a reaper that misses its READY deadline is an ordinary
-        /// failed launch, and a CANCEL acknowledged behind a stale READY is a
-        /// cancel that succeeded. Neither arms process-wide termination.
+        /// `C-004`: a reaper silent for the whole READY budget is an ordinary
+        /// failed launch, waited out and then refused, and a CANCEL
+        /// acknowledged behind a stale READY is a cancel that succeeded.
+        /// Neither arms process-wide termination.
         #[test]
-        fn a_late_reaper_fails_its_launch_without_arming_termination() {
+        fn a_reaper_silent_for_the_whole_budget_fails_its_launch_without_arming_termination() {
             use std::os::unix::process::CommandExt;
 
             let output = Command::new(std::env::current_exe().expect("test executable"))
@@ -5586,6 +5779,242 @@ mod termination {
             close_fd(pipe[0]);
             close_fd(pipe[1]);
             flood.join().expect("the flooding thread");
+        }
+
+        /// `acknowledged` computes one deadline and hands that instant to
+        /// every read. The stall this test injects lands at a seam the head
+        /// does not have: `read_guard_ack_until` is the one place a duration
+        /// is turned back into a deadline, and `acknowledged` reads through
+        /// the deadline form, not through it, so on the head the stall never
+        /// fires and the wait ends at its two-second budget. A shape that
+        /// hands each read what is left of the budget as a duration reaches
+        /// the seam on the read after the skipped byte, stalls three seconds
+        /// there with the whole budget already computed, and then starts a
+        /// whole budget again: five seconds. The bound is the budget plus a
+        /// second. A regression pin against that shape, then, rather than an
+        /// exercise of the head.
+        #[test]
+        fn a_cancel_that_skips_a_byte_keeps_its_one_deadline() {
+            let pipe = create_cloexec_pipe().expect("an acknowledgement pipe");
+            assert!(
+                write_raw(pipe[1], &[REAPER_FAIL]),
+                "queue the byte the wait skips"
+            );
+            DEADLINE_SEAM_STALL_READS.store(0, Ordering::SeqCst);
+            DEADLINE_SEAM_STALL_FD.store(pipe[0], Ordering::SeqCst);
+            let timeout = Duration::from_secs(2);
+            let bound = timeout + Duration::from_secs(1);
+            let (sent, received) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            thread::spawn(move || {
+                let answer = acknowledged(pipe[0], REAPER_OK, timeout);
+                let _ = sent.send((answer, started.elapsed()));
+            });
+            let outcome = received.recv_timeout(bound + DEADLINE_SEAM_STALL + timeout);
+            DEADLINE_SEAM_STALL_FD.store(-1, Ordering::SeqCst);
+            let (answer, elapsed) = outcome.expect("a CANCEL that skipped a byte never returned");
+            assert!(!answer, "a skipped byte was taken for the acknowledgement");
+            assert!(
+                elapsed >= timeout,
+                "the wait gave up after {elapsed:?}, before its {timeout:?} deadline"
+            );
+            assert!(
+                elapsed < bound,
+                "a CANCEL that skipped a byte waited {elapsed:?}, past {bound:?}: its deadline \
+                 was rebuilt after the skip"
+            );
+            close_fd(pipe[0]);
+            close_fd(pipe[1]);
+        }
+
+        /// Watch the kill of one pid for the test holding this: recorded, not
+        /// sent (`WATCHED_KILL_PID`). The held lock, never read, serialises
+        /// the tests that watch, since there is one watched pid in the
+        /// process.
+        struct WatchedKill(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+        fn watch_kill_of(pid: libc::pid_t) -> WatchedKill {
+            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+            let held = ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            WATCHED_KILL_SENT.store(false, Ordering::SeqCst);
+            WATCHED_KILL_PID.store(pid, Ordering::SeqCst);
+            WatchedKill(held)
+        }
+
+        impl WatchedKill {
+            fn sent(&self) -> bool {
+                WATCHED_KILL_SENT.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Drop for WatchedKill {
+            fn drop(&mut self) {
+                WATCHED_KILL_PID.store(-1, Ordering::SeqCst);
+            }
+        }
+
+        /// A child of this process that calls only `pause` until it is
+        /// killed, owned by a `ForkedChild` so a failing assertion cannot
+        /// leave it behind.
+        fn fork_a_pausing_child() -> ForkedChild {
+            // SAFETY: the child calls only `pause` until it is killed.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            assert!(pid > 0, "fork a pausing child");
+            ForkedChild(pid)
+        }
+
+        /// A child of this process that exits at once, left unreaped and
+        /// waited for, without reaping, until it has.
+        fn fork_an_exited_child() -> libc::pid_t {
+            // SAFETY: the child calls only `_exit`.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            assert!(pid > 0, "fork a child that exits at once");
+            // SAFETY: `siginfo_t` is a plain C struct for which all-zero bytes
+            // is a valid value; `WNOWAIT` leaves the child unreaped, so the
+            // look under test finds a child that has exited, not a race with
+            // its exit.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let waited = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if waited == 0 {
+                    return pid;
+                }
+                assert!(
+                    last_errno_is_interrupted(),
+                    "wait for the child to exit without reaping it (errno {})",
+                    last_errno()
+                );
+            }
+        }
+
+        /// `kill_and_reap_helper` asks `waitpid` before it signals, and the
+        /// answer is the authority: a child that has already exited is reaped
+        /// and not signalled, and a pid another waiter has reaped is neither
+        /// ours nor signalled. The signal's absence is not observable, so
+        /// the kill is watched (`watch_kill_of`); a shape that kills first
+        /// and looks afterwards sends it in both halves and fails here.
+        #[test]
+        fn a_helper_that_has_exited_or_been_reaped_elsewhere_is_not_signalled() {
+            let exited = fork_an_exited_child();
+            let watch = watch_kill_of(exited);
+            assert_eq!(
+                kill_and_reap_helper(exited),
+                HelperEnd::Reaped,
+                "a child that had exited was not reaped as ours"
+            );
+            assert!(
+                !watch.sent(),
+                "a child that had already exited was sent SIGKILL"
+            );
+            assert!(
+                matches!(look_at_child(exited), ChildLook::NotOurs),
+                "the exited child is still unreaped"
+            );
+            drop(watch);
+
+            let taken = fork_an_exited_child();
+            // The other waiter: a library host's SIGCHLD handler, or a
+            // `waitpid(-1)` elsewhere in the process, takes the child first.
+            // SAFETY: `taken` is this process's unreaped child.
+            let waited = unsafe { libc::waitpid(taken, std::ptr::null_mut(), 0) };
+            assert_eq!(waited, taken, "the other waiter reaps the child");
+            let watch = watch_kill_of(taken);
+            assert_eq!(
+                kill_and_reap_helper(taken),
+                HelperEnd::ReapedElsewhere,
+                "a pid another waiter had reaped was treated as ours"
+            );
+            assert!(
+                !watch.sent(),
+                "a pid another waiter had reaped, and which may name a stranger by now, was \
+                 sent SIGKILL"
+            );
+        }
+
+        /// A killed helper that exits is reaped inside the budget, and an
+        /// ordinary child is: the bound is a bound, not the ordinary cost.
+        #[test]
+        fn a_killed_helper_that_exits_is_reaped_within_the_budget() {
+            let mut child = fork_a_pausing_child();
+            let started = Instant::now();
+            assert_eq!(
+                kill_and_reap_helper(child.0),
+                HelperEnd::Reaped,
+                "a killed child that exited was not reaped"
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < HELPER_EXIT_BUDGET,
+                "reaping a killed child took {elapsed:?}, the whole budget"
+            );
+            assert!(
+                matches!(look_at_child(child.0), ChildLook::NotOurs),
+                "the killed child is still unreaped"
+            );
+            // Reaped already; the drop must not wait on it.
+            child.0 = -1;
+        }
+
+        /// A killed helper that does not exit within `HELPER_EXIT_BUDGET` is
+        /// left for the process's exit to collect, and the caller gets its
+        /// thread back at the budget. The child's kill is withheld by the
+        /// watch, standing in for a child in uninterruptible I/O that
+        /// `SIGKILL` cannot end at once, which no test can fabricate. An
+        /// unbounded `waitpid` after the kill never returns here, so the
+        /// answer is collected with a bound and its absence fails the test.
+        #[test]
+        fn a_killed_helper_that_does_not_exit_within_the_budget_is_left_for_the_exit_to_collect() {
+            let child = fork_a_pausing_child();
+            let pid = child.0;
+            let watch = watch_kill_of(pid);
+            let bound = HELPER_EXIT_BUDGET + Duration::from_secs(1);
+            let (sent, received) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            thread::spawn(move || {
+                let end = kill_and_reap_helper(pid);
+                let _ = sent.send((end, started.elapsed()));
+            });
+            let (end, elapsed) = received
+                .recv_timeout(bound + Duration::from_secs(2))
+                .expect("the reap of a child that would not die never returned");
+            assert_eq!(
+                end,
+                HelperEnd::Left,
+                "a child that did not exit within the budget was not reported left"
+            );
+            assert!(watch.sent(), "a live child of ours was not sent SIGKILL");
+            assert!(
+                elapsed >= HELPER_EXIT_BUDGET,
+                "the reap gave up after {elapsed:?}, before its {HELPER_EXIT_BUDGET:?} budget"
+            );
+            assert!(
+                elapsed < bound,
+                "the reap of a child that would not die held its caller for {elapsed:?}, past \
+                 {bound:?}"
+            );
+            assert!(
+                matches!(look_at_child(pid), ChildLook::Alive),
+                "the child left behind is not still ours to collect"
+            );
+            drop(watch);
+            drop(child);
         }
 
         /// The sliced reader does not report a timeout on a readable
