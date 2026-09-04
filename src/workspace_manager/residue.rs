@@ -11,9 +11,38 @@
 //! touches an index -- a classifier that had to *compute* a content-addressed
 //! name would be performing the very effect it is classifying, which is why
 //! [`ResidueTarget::published`] carries the parent's record instead. The Git
-//! inspections it reads through (`git fsck --unreachable`, `cat-file -e`,
-//! `worktree list`, `status`, `diff --cached`) are the parent's helpers, and so
-//! is every process start.
+//! inspections it reads through (`git fsck --unreachable`, `rev-parse --verify
+//! --quiet`, `worktree list`, `status`, `diff --cached`) are the parent's
+//! helpers, and so is every process start.
+//!
+//! **§6 and §7.** No shared ownership, lock or clone: [`ResidueTarget`] is
+//! four borrows and is `Copy`. Every `?` in this module propagates the
+//! parent's `UpstrokeError` unchanged, and each is deliberate in §7's sense:
+//! the helper that failed already names what a reader of the failure needs
+//! (the git command and the worktree it ran in, or the path an I/O error was
+//! about); the crate's error type has no variant that wraps one error in
+//! another, so a `map_err` here would flatten an `Io` into a `Git` message and
+//! lose its kind; and the classifier's callers (`candidate::verify_object`,
+//! `WorkspaceManager::quiescence`, the sampling harnesses) propagate or record
+//! the error rather than match on it. What the module decides itself is the
+//! one thing §7 puts on it: **an inspection that fails is an error, never an
+//! answer.** Every residue name is read through [`name_present`], which makes
+//! only an actual not-found "absent"; a permission failure, a symlink loop or
+//! a transient I/O error is an `Io` error naming the name. Before the sweep
+//! every name went through `Path::exists`, which answers `false` for all of
+//! those, so a git dir this process could not search classified as `None`.
+//!
+//! **What this module cannot promise, and where the promise belongs.** The
+//! line above holds for the names this module reads itself. It does not hold
+//! for what it reads *through*: the parent's inspections still fold some Git
+//! failures into an answer before the `?` here ever sees them — a failed
+//! `worktree list` or `cat-file`, a `show-ref` that could not run, a `fsck`
+//! that did not finish. Making those trustworthy means reading a repository
+//! the way Git reads it (its gitfile grammar, its linked-worktree reader, its
+//! trace-polluted streams, with a bound on every read of a
+//! repository-controlled file), which is the parent's work and not a child
+//! classifier's: `reviews/FINDINGS.md` §51 carries a row per case for the
+//! sweep of `src/workspace_manager.rs`, the queue's last row of this family.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -30,6 +59,7 @@
     clippy::disallowed_macros
 )]
 
+use std::fs;
 use std::path::Path;
 
 use crate::error::UpstrokeError;
@@ -38,8 +68,8 @@ use crate::topology::effects::{
 };
 
 use super::{
-    git_dir_of, head_commit, index_differs_from_head, index_lock_present, object_exists,
-    record_for, temporary_object_files, unreachable_objects, worktree_has_unstaged_changes,
+    git_dir_of, head_commit, index_differs_from_head, object_exists, record_for,
+    temporary_object_files, unreachable_objects, worktree_has_unstaged_changes,
 };
 
 /// What the parent recorded of a site's after-phase publication.
@@ -57,7 +87,9 @@ use super::{
 /// absence of.
 ///
 /// [`Self::new`] is the five-site form; [`Self::published`] adds the record.
-#[derive(Debug, Clone)]
+// `Copy` (§6): four borrows and nothing owned, so a copy is the value's
+// intended semantics and no caller has to clone it.
+#[derive(Debug, Clone, Copy)]
 pub struct ResidueTarget<'a> {
     repository: &'a Path,
     worktree: &'a Path,
@@ -163,9 +195,14 @@ pub fn residue_classified_sites() -> Vec<EffectSiteId> {
 ///
 /// # Errors
 ///
-/// A Git or I/O error, or [`UpstrokeError::Refused`] for a site the frozen enums
-/// register no residue class for — the classifier is total over its domain and
-/// silent outside it, rather than answering `None` for a question nobody asked.
+/// [`UpstrokeError::Git`] from one of the parent's read-only inspections;
+/// [`UpstrokeError::Io`] naming a path this module could not inspect — a
+/// residue name in a git dir, or the worktree's `.git` pointer (§7: only an
+/// actual not-found is absence, and an inspection this module makes and
+/// cannot complete is never an answer); or [`UpstrokeError::Refused`] for a
+/// site the frozen enums register no residue class for — the classifier is
+/// total over its domain and silent outside it, rather than answering `None`
+/// for a question nobody asked.
 pub fn classify_object_residue(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
@@ -178,6 +215,21 @@ pub fn classify_object_residue(
             ),
         });
     }
+    // The three adds are one reading: `add_state` is read once here, and its
+    // three states are the three classes, so no transition between an
+    // after-phase read and a residue read can yield `None` for a registered
+    // worktree. (`observed_residue_elements` reads it again for its own
+    // callers; a caller that calls both reads twice, and this function does
+    // not.)
+    if let EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
+    | EffectSiteId::Snapshot(SnapshotSite::Add) = site
+    {
+        return Ok(match add_state(target.repository, target.worktree)? {
+            AddState::Populated => ObjectResidue::After,
+            AddState::Unpopulated => ObjectResidue::Internal,
+            AddState::Unregistered => ObjectResidue::None,
+        });
+    }
     if after_reference_present(site, target)? {
         return Ok(ObjectResidue::After);
     }
@@ -187,24 +239,21 @@ pub fn classify_object_residue(
     Ok(ObjectResidue::None)
 }
 
-/// Whether the site's after-phase reference is present.
+/// Whether the site's after-phase reference is present, for the Object sites.
+///
+/// The three adds are classified in [`classify_object_residue`] from one
+/// `add_state` reading and never reach here; an add site here is the refusal
+/// at the bottom, as any site without an arm is.
 fn after_reference_present(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
 ) -> Result<bool, UpstrokeError> {
     let worktree = target.worktree;
     let repository = target.repository;
+    // Every `?` here propagates a parent inspection unchanged: the failure
+    // already names its git command and worktree, or its path (module doc,
+    // §7).
     match site {
-        // The three adds: registered *and* populated. `git worktree add` holds
-        // an `initializing` lock for the whole of its run, so a surviving lock
-        // is Git's own statement that the population did not finish.
-        EffectSiteId::Worktree(WorktreeSite::Add | WorktreeSite::AddStaging)
-        | EffectSiteId::Snapshot(SnapshotSite::Add) => {
-            let Some(record) = record_for(repository, worktree)? else {
-                return Ok(false);
-            };
-            Ok(record.locked.as_deref() != Some("initializing") && worktree.join(".git").exists())
-        }
         // `git add -A` publishes its blobs by renaming index.lock over index.
         // A surviving lock is proof the publication did not happen; otherwise
         // the after state is an index that reflects the working tree.
@@ -287,7 +336,9 @@ fn internal_residue_present(
 ///
 /// # Errors
 ///
-/// A Git or I/O error.
+/// [`UpstrokeError::Git`] from one of the parent's read-only inspections, or
+/// [`UpstrokeError::Io`] naming a path this module could not inspect: a
+/// residue name in a git dir, or the worktree's `.git` pointer.
 pub fn observed_residue_elements(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
@@ -295,7 +346,14 @@ pub fn observed_residue_elements(
     let worktree = target.worktree;
     let repository = target.repository;
     let mut present = Vec::new();
+    // Every `?` here propagates a parent inspection unchanged (module doc,
+    // §7); the one read this module makes itself is `name_present`.
     let git_dir = git_dir_of(worktree)?;
+    // A name in the owning worktree's git dir; no git dir, no name.
+    let in_git_dir = |name: &str| match git_dir.as_deref() {
+        Some(dir) => name_present(dir, name),
+        None => Ok(false),
+    };
     for element in site.residue_elements() {
         let seen = match element {
             ResidueElement::UnreferencedObject => {
@@ -306,29 +364,15 @@ pub fn observed_residue_elements(
                 }
             }
             ResidueElement::TemporaryObjectFile => temporary_object_files(repository)?,
-            ResidueElement::IndexLock => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("index.lock").exists()),
-            ResidueElement::CherryPickHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("CHERRY_PICK_HEAD").exists()),
-            ResidueElement::MergeHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("MERGE_HEAD").exists()),
-            ResidueElement::MergeMsg => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("MERGE_MSG").exists()),
-            ResidueElement::OrigHead => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("ORIG_HEAD").exists()),
-            ResidueElement::SequencerState => git_dir
-                .as_ref()
-                .is_some_and(|dir| dir.join("sequencer").exists()),
-            ResidueElement::RegisteredUnpopulatedWorktree => record_for(repository, worktree)?
-                .is_some_and(|record| {
-                    record.locked.as_deref() == Some("initializing")
-                        || !worktree.join(".git").exists()
-                }),
+            ResidueElement::IndexLock => in_git_dir("index.lock")?,
+            ResidueElement::CherryPickHead => in_git_dir("CHERRY_PICK_HEAD")?,
+            ResidueElement::MergeHead => in_git_dir("MERGE_HEAD")?,
+            ResidueElement::MergeMsg => in_git_dir("MERGE_MSG")?,
+            ResidueElement::OrigHead => in_git_dir("ORIG_HEAD")?,
+            ResidueElement::SequencerState => in_git_dir("sequencer")?,
+            ResidueElement::RegisteredUnpopulatedWorktree => {
+                add_state(repository, worktree)? == AddState::Unpopulated
+            }
         };
         if seen {
             present.push(*element);
@@ -378,6 +422,10 @@ pub const fn element_breaks_quiescence(element: ResidueElement) -> bool {
 /// `git rebase` all write one in the ordinary course of events, so reading it
 /// as evidence of an interrupted command would close generations that are
 /// perfectly reusable. Recorded rather than silently dropped.
+///
+/// # Errors
+///
+/// An I/O error naming a name in the git dir this process could not inspect.
 pub(super) fn administrative_residue_at(
     git_dir: &Path,
 ) -> Result<Vec<ResidueElement>, UpstrokeError> {
@@ -392,9 +440,80 @@ pub(super) fn administrative_residue_at(
         ("rebase-apply", ResidueElement::SequencerState),
         ("REVERT_HEAD", ResidueElement::SequencerState),
     ] {
-        if git_dir.join(name).exists() {
+        if name_present(git_dir, name)? {
             present.push(element);
         }
     }
     Ok(present)
+}
+
+/// What one of the three adds left behind: their three residue classes.
+///
+/// The after phase is `Populated` and the site's one residue element,
+/// `RegisteredUnpopulatedWorktree`, is `Unpopulated`: [`classify_object_residue`]
+/// reads this once and maps the three states to the three classes, so no
+/// state can be both, or neither while registered, and no transition between
+/// two reads can be read as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddState {
+    /// `git worktree list` does not name the worktree.
+    Unregistered,
+    /// Registered, and the population did not finish: `git worktree add`
+    /// holds an `initializing` lock for the whole of its run, so a surviving
+    /// lock is Git's own statement to that effect; or no git dir is behind
+    /// the worktree's `.git` as `git_dir_of` reads it, which is where a
+    /// pointer file a kill left empty, or one that is not a pointer, lands,
+    /// whatever `Path::exists` says of the name.
+    Unpopulated,
+    /// Registered, unlocked, and a git dir is behind the pointer.
+    Populated,
+}
+
+///
+/// What it reads is the parent's `record_for` and `git_dir_of`, so it is only
+/// as trustworthy as those are: `record_for` answers `None` for a `worktree
+/// list` that failed, and `git_dir_of` accepts any target text after
+/// `gitdir:`. Both are rows for the parent's sweep in `reviews/FINDINGS.md`
+/// §51; this function's own contribution is that the after phase and the
+/// residue element are two arms of one reading rather than two hand-written
+/// complements.
+fn add_state(repository: &Path, worktree: &Path) -> Result<AddState, UpstrokeError> {
+    let Some(record) = record_for(repository, worktree)? else {
+        return Ok(AddState::Unregistered);
+    };
+    if record.locked.as_deref() == Some("initializing") || git_dir_of(worktree)?.is_none() {
+        return Ok(AddState::Unpopulated);
+    }
+    Ok(AddState::Populated)
+}
+
+/// Whether the worktree's index lock survives.
+///
+/// `git add`, `write-tree` and the cherry-picks all publish through
+/// `index.lock` renamed over `index`, so a surviving lock is the interrupted
+/// prefix. No git dir behind the worktree's `.git`, no lock.
+fn index_lock_present(worktree: &Path) -> Result<bool, UpstrokeError> {
+    match git_dir_of(worktree)? {
+        Some(dir) => name_present(&dir, "index.lock"),
+        None => Ok(false),
+    }
+}
+
+/// Whether `name` is present in `dir`, from the name's own metadata.
+///
+/// §7: only an actual not-found is absence. `Path::exists` answers `false` for
+/// a permission failure, a symlink loop and a transient I/O error as well, and
+/// every question this module asks of a name is a residue question, so a name
+/// it could not inspect is an `Io` error naming the name, never "no residue".
+/// The read does not follow a symlink: these are names Git takes with `O_EXCL`
+/// and releases by unlinking, so the name is the fact whatever it points at —
+/// measured on git 2.43, an `index.lock` that is a dangling symlink makes
+/// `git add` fail with "File exists".
+fn name_present(dir: &Path, name: &str) -> Result<bool, UpstrokeError> {
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(UpstrokeError::Io { path, source }),
+    }
 }
