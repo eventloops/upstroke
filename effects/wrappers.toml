@@ -236,6 +236,7 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "apply",
+    "consult",
     "durability_ledger",
     "funnel",
     "harness",
@@ -243,7 +244,9 @@ effect_free = [
     "new",
     "phase",
     "point",
+    "poisoned",
     "recording_durability",
+    "refusal_cause",
 ]
 
 # Slot and snapshot name arithmetic, and the intent record they are written into. Pure string and path work; not one of these eleven reads or writes the filesystem. `Slot`'s five effect-site accessors are deliberately NOT here -- they stay in the parent, where the site-inventory census reads them by path.

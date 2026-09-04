@@ -434,6 +434,13 @@ impl EffectHooks for ArmedEffects {
     fn durability_ledger(&self) -> DurabilityLedger {
         self.inner.durability_ledger()
     }
+
+    // Forwarded, so a poison the inner observer found is reported as poison
+    // and not as a fault this bundle armed; the method is not defaulted for
+    // exactly this reason.
+    fn refusal_cause(&self) -> Option<String> {
+        self.inner.refusal_cause()
+    }
 }
 
 /// The five families, with [`ArmedEffects`] in the git seat.
