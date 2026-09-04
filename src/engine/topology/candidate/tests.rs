@@ -1735,7 +1735,7 @@ fn snapshot_residue_reclaimed() {
         .reclaim_intents(hooks.effects())
         .expect("reclaim");
     assert!(
-        reclaimed.contains(&review.slot),
+        reclaimed.slots.contains(&review.slot),
         "the reviewer's snapshot is reclaimed as residue: {reclaimed:?}"
     );
     assert!(!review.path.exists(), "its worktree is gone");

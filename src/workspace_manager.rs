@@ -103,9 +103,8 @@ pub enum Refusal {
     /// `transaction_fault_matrix[T-DISPATCH].refusal_condition`: "worktree path
     /// outside execution root **or on a reparse point**".
     #[error(
-        "refusing {}: `{}` on the chain is a symlink or reparse point, and \
-         decisions.workspace_candidates.execution_root creates a root only when the chain carries \
-         none",
+        "refusing {}: `{}` on the chain is a symlink or reparse point, and DESIGN.md §15 creates an \
+         execution root only when the chain from the authorized private root carries none",
         .chain.display(),
         .at.display()
     )]
@@ -114,6 +113,48 @@ pub enum Refusal {
         chain: PathBuf,
         /// The component that is a symlink, junction, or other reparse point.
         at: PathBuf,
+    },
+
+    /// `DESIGN.md` §15 places the execution root at
+    /// `<private root>/workspaces/<repo-key>/<run-id>`, recorded exactly. The
+    /// reparse-point walk is anchored at the authorized private root and
+    /// inspects the chain **below** it, one plain component at a time. A root
+    /// that does not lie below the private root as plain components — no
+    /// common prefix, or a prefix, a root or `..` in the remainder — has no
+    /// such chain, and the walk refuses it rather than answer "no reparse
+    /// point" for a chain it never inspected. [`Refusal::RunId`] refuses the
+    /// run ids that would build such a root before any path exists; this is
+    /// the walk's own guarantee behind that one.
+    #[error(
+        "refusing execution root {}: it does not lie below the authorized private root {} as a \
+         chain of plain components, and DESIGN.md §15 places every execution root at \
+         <private root>/workspaces/<repo-key>/<run-id>",
+        .root.display(),
+        .private_root.display()
+    )]
+    RootOutsidePrivateRoot {
+        /// The candidate execution root.
+        root: PathBuf,
+        /// The authorized private root the walk is anchored at.
+        private_root: PathBuf,
+    },
+
+    /// Every Git command runs with `core.hooksPath` at `hooks-none`, an
+    /// empty directory, so that no repository hook runs inside an engine
+    /// worktree; an entry in it is a hook Git would run, and a directory that
+    /// is real and link-free but holds one is exactly what a check for the
+    /// directory alone does not see.
+    #[error(
+        "refusing to run Git: {} carries `{}`, and every command runs hook-free with \
+         `core.hooksPath` at an empty directory",
+        .path.display(),
+        .entry.to_string_lossy()
+    )]
+    HooksPathNotEmpty {
+        /// The hooks path.
+        path: PathBuf,
+        /// The first entry found in it.
+        entry: OsString,
     },
 
     /// `execution_root`: "the canonical root is inside no repository worktree".
@@ -274,6 +315,27 @@ pub enum Refusal {
         why: &'static str,
     },
 
+    /// A run id that is not the canonical ULID `DESIGN.md` §15 specifies.
+    ///
+    /// §15 places the execution root at
+    /// `<private root>/workspaces/<repo-key>/<run-id>` with "run-id = ULID".
+    /// `Path::join` would let an absolute id replace that prefix while `.`,
+    /// `..` and an empty id alias the repo-key directory or a peer run's
+    /// root, and a lowercase spelling of an uppercase id names the same root
+    /// on a case-insensitive filesystem. So only the generator's own spelling
+    /// is accepted — twenty-six uppercase Crockford base32 characters, the
+    /// first `0` to `7` — refused before any path is built.
+    #[error(
+        "refusing the run id `{name}`: {why}, and DESIGN.md §15 places every execution root at \
+         <private root>/workspaces/<repo-key>/<run-id>"
+    )]
+    RunId {
+        /// The id as it was offered.
+        name: String,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+
     /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
     /// intents **synced before** the add".
     ///
@@ -344,9 +406,43 @@ pub fn repo_key_v1(canonical_common_git_dir: &Path) -> String {
 }
 
 /// `<private_root>/workspaces/<repo_key>/<run_id>`, recorded exactly.
+///
+/// `run_id` is the canonical ULID: [`WorkspaceManager::derive`] refuses any
+/// other spelling with [`refuse_unplain_run_id`] before calling this, because
+/// `join` would let an absolute id replace the prefix, `.` or `..` would name
+/// another directory, and a case variant would name this one twice.
 #[must_use]
 pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> PathBuf {
     private_root.join("workspaces").join(repo_key).join(run_id)
+}
+
+/// [`Refusal::RunId`] unless `run_id` is the canonical run id.
+///
+/// `DESIGN.md` §15: "run-id = ULID". The canonical spelling is the one
+/// [`crate::ulid::ulid`] produces — twenty-six uppercase Crockford base32
+/// characters, the first `0` to `7` — and nothing else is accepted, by
+/// shape: not a lowercase or mixed-case spelling of the same id, which on a
+/// case-insensitive filesystem names the same root as its uppercase twin and
+/// would make two managers of one root; not a shorter or longer string; not
+/// a path. Refused before any path is built.
+fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
+    if is_canonical_ulid(run_id) {
+        return Ok(());
+    }
+    let why = if run_id.is_empty() {
+        "it is empty"
+    } else if run_id.len() != 26 {
+        "a run id is a ULID of twenty-six characters (DESIGN.md §15)"
+    } else if run_id.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        "a run id is spelt in uppercase Crockford base32, since a case-insensitive filesystem \
+         would give two spellings one root"
+    } else {
+        "a run id is a ULID: uppercase Crockford base32, the first character 0 to 7"
+    };
+    Err(Refusal::RunId {
+        name: run_id.to_owned(),
+        why,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -355,9 +451,116 @@ pub fn execution_root_of(private_root: &Path, repo_key: &str, run_id: &str) -> P
 
 mod containment;
 use self::containment::{
-    canonical_prefix, is_at_or_inside, refuse_reparse_points, refuse_unreal_directory,
+    Leaf, canonical_prefix, is_at_or_inside, refuse_reparse_points, refuse_unreal_directory,
     strip_verbatim,
 };
+
+// ---------------------------------------------------------------------------
+// The paths each funnel primitive acts through
+// ---------------------------------------------------------------------------
+
+/// One kind of path a funnel primitive acts through after its `Before` hook.
+///
+/// A primitive's set is data ([`Primitive::acted_through`]) so that one helper
+/// can walk all of it immediately before the syscalls and one test can plant a
+/// link at each path in turn. The table is these nine roles and no more. It
+/// does not name Git's own repository-discovery paths — the `.git` file or
+/// link of the checkout and of the base, and `commondir`, `objects`, `refs`,
+/// `packed-refs`, `index` and `config` behind them — and the two commit-tree
+/// funnels have no variant. Git follows those on every command, so a link
+/// planted at `base/.git` after a check has passed lands a ref in the
+/// repository it names; that is the parent's funnel design and its sweep's
+/// (`standards/SWEEP.md` queue row 11), and the durable fix is
+/// directory-handle-relative operations or a stated trust boundary for what
+/// may write inside the execution root, a design question (`DESIGN.md` §4,
+/// `CODING_STANDARDS.md` §14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActedThrough {
+    /// The execution root, as a directory.
+    ExecutionRoot,
+    /// The five scaffolding directories under the root.
+    Scaffolding,
+    /// `intents/`, as a directory: what an intent write, removal or read
+    /// resolves through.
+    IntentsDirectory,
+    /// The slot's intent file: the record an add authorises on, a write's
+    /// rename target, a removal's target.
+    IntentFile,
+    /// The slot's parent directory (`tasks/`, `merge/` or `snapshots/`).
+    SlotParent,
+    /// The slot's checkout as Git's working directory.
+    SlotCheckoutDirectory,
+    /// The slot's checkout as a target that may be anything yet: what an add
+    /// creates, what a removal deletes.
+    SlotCheckoutEntry,
+    /// `hooks-none`, every Git command's `core.hooksPath`.
+    HooksPath,
+    /// The worktree's registration under the common git dir: its admin
+    /// directory, and the `gitdir` and `locked` entries inside it.
+    Registration,
+}
+
+/// What [`WorkspaceManager::reclaim_intents`] did and what it left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// The slots whose intents were found and whose worktree and intent were
+    /// removed, in directory order.
+    pub slots: Vec<Slot>,
+    /// Leftovers of the staging shape `write_intent` produces, reported and
+    /// left in place: a write interrupted before its rename was not durable,
+    /// but no filename proves who wrote a file, so this crate deletes none.
+    pub staging_leftovers: Vec<PathBuf>,
+}
+
+/// The funnel primitives, each with the paths it acts through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Primitive {
+    CreateExecutionRoot,
+    RemoveExecutionRoot,
+    WriteIntent,
+    RemoveIntent,
+    AddWorktree,
+    VerifyWorktree,
+    RemoveWorktree,
+    CandidateStage,
+    CandidateWriteTree,
+    ProposalCherryPick,
+    RepairMaterialize,
+    CreateRef,
+    CompareAndSwapRef,
+    DeleteRef,
+}
+
+impl Primitive {
+    /// The paths of the nine roles this primitive acts through after its
+    /// `Before` hook, in the order they are walked. The Git-running primitives
+    /// list `HooksPath` even though the Git runner walks it again for every
+    /// command ([`WorkspaceManager::revalidate_hooks_path`]); the runner's
+    /// walk is what also covers the reads and the reference transactions.
+    pub(crate) fn acted_through(self) -> &'static [ActedThrough] {
+        use ActedThrough as A;
+        match self {
+            Self::CreateExecutionRoot | Self::RemoveExecutionRoot => {
+                &[A::ExecutionRoot, A::Scaffolding]
+            }
+            Self::WriteIntent | Self::RemoveIntent => &[A::IntentsDirectory, A::IntentFile],
+            Self::AddWorktree => &[
+                A::SlotParent,
+                A::SlotCheckoutEntry,
+                A::IntentsDirectory,
+                A::IntentFile,
+                A::HooksPath,
+            ],
+            Self::VerifyWorktree
+            | Self::CandidateStage
+            | Self::CandidateWriteTree
+            | Self::ProposalCherryPick
+            | Self::RepairMaterialize => &[A::SlotCheckoutDirectory, A::HooksPath],
+            Self::RemoveWorktree => &[A::SlotCheckoutEntry, A::HooksPath, A::Registration],
+            Self::CreateRef | Self::CompareAndSwapRef | Self::DeleteRef => &[A::HooksPath],
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Slots: the worktree, staging, and snapshot names the packet gives
@@ -539,20 +742,23 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
 impl WorkspaceManager {
     /// Derive the execution root of `run_id` from the managed base and the
     /// authorized private root, and refuse every containment condition
-    /// `decisions.workspace_candidates.execution_root` names.
+    /// `DESIGN.md` §15 names.
     ///
     /// # Errors
     ///
-    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::ReparsePointOnChain`],
-    /// [`Refusal::RootInsideRepositoryWorktree`], and
-    /// [`Refusal::WorktreeInsideRoot`], plus a Git error when the base is not a
-    /// repository.
+    /// [`Refusal::RunId`], [`Refusal::BaseIsNotADirectory`],
+    /// [`Refusal::RootOutsidePrivateRoot`], [`Refusal::ReparsePointOnChain`],
+    /// [`Refusal::RootInsideRepositoryWorktree`] and
+    /// [`Refusal::WorktreeInsideRoot`]; [`UpstrokeError::Io`] when the base,
+    /// the private root or a registered worktree cannot be read or resolved;
+    /// and a Git error when the base is not a repository.
     pub fn derive(
         base: &Path,
         private_root: &Path,
         run_id: &str,
         incarnation: &str,
     ) -> Result<Self, UpstrokeError> {
+        refuse_unplain_run_id(run_id)?;
         refuse_unreal_directory(base)?;
         refuse_unreal_directory(private_root)?;
 
@@ -618,6 +824,12 @@ impl WorkspaceManager {
 
     /// The three containment conditions, re-checked.
     ///
+    /// This is the **gate**, run before a funnel is entered: it refuses
+    /// before any hook runs, and it is the check that asks Git for the
+    /// worktree list. The chain half of it runs again *inside* every funnel
+    /// primitive, immediately before the effect, as
+    /// [`Self::revalidate_chain`]; that doc says why the two are separate.
+    ///
     /// `execution_root`: "created only when the managed base is a real
     /// directory with no symlink/reparse point on the chain, the canonical root
     /// is inside no repository worktree, and no repository worktree is inside
@@ -634,8 +846,7 @@ impl WorkspaceManager {
     ///
     /// The containment refusals, or a Git error reading the worktree list.
     pub fn revalidate(&self) -> Result<(), UpstrokeError> {
-        refuse_unreal_directory(&self.base)?;
-        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        self.revalidate_chain(&self.execution_root)?;
         let root = canonical_prefix(&self.execution_root)?;
         for record in self.worktree_records()? {
             let worktree = canonical_prefix(&record.path)?;
@@ -655,6 +866,209 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    /// The chain half of [`Self::revalidate`], re-run inside every funnel
+    /// primitive immediately before its effect: the managed base is a real
+    /// directory, the authorized private root is still the directory it was
+    /// resolved as, and the chain below it **down to `below`** is plain
+    /// components with no reparse point or regular file among them.
+    ///
+    /// `below` is the deepest path the effect acts through — the execution
+    /// root, a scaffolding directory, an intent's `intents/` directory, a
+    /// slot's checkout — so the walk covers the effect's own parent and not
+    /// only the root. A non-recursive `remove_file` or a `create_dir_all`
+    /// follows a link in its parent as readily as a link at the root, and an
+    /// `intents/` exchanged for a link to a victim directory between the
+    /// gate and the effect would otherwise delete or write there with every
+    /// check passed. The one path every Git-running primitive acts through
+    /// besides its target, `hooks-none`, is walked by the Git runner itself
+    /// immediately before each command ([`Self::revalidate_hooks_path`]).
+    ///
+    /// `DESIGN.md` §15: every create, reclaim and delete revalidates before
+    /// its funnel and re-checks the chain inside it. Between the gate and the
+    /// effect sit the funnel's `Before` hook and whatever else the machine
+    /// does in that window, and a private root exchanged for a link there
+    /// would have every path under it resolve elsewhere with nothing left to
+    /// notice — `a_registration_rebound_after_validation_keeps_its_admin_state`
+    /// already drives a `Before` hook that rewrites filesystem identity. So
+    /// the checks that decide *where the effect lands* run again here,
+    /// adjacent to the syscall.
+    ///
+    /// Only these, and not the whole gate: `git worktree list` inside a
+    /// primitive would make a removal depend on Git parsing the very
+    /// registration that recovery exists to remove (see
+    /// [`Self::revalidate_removal`]), and the worktree comparisons the gate
+    /// makes need no filesystem effect to stay true. The window this leaves
+    /// is the one between this check and the syscall itself: a writer that
+    /// exchanges a component in that gap is not seen, and no re-check closes
+    /// it. Only directory-relative syscalls close it — `openat` and
+    /// `unlinkat` against a directory descriptor held from the check — and
+    /// that is platform code for a later change, not this one.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+    /// [`Refusal::ReparsePointOnChain`], or an I/O error naming the component
+    /// that could not be read or is a regular file.
+    fn revalidate_chain(&self, below: &Path) -> Result<(), UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        refuse_reparse_points(&self.private_root, below, Leaf::Directory)
+    }
+
+    /// Every path `primitive` acts through, resolved for this manager: the
+    /// anchor its chain is walked from, the path, and what its leaf may be.
+    ///
+    /// `slot` is required by the slot roles and `registration` by
+    /// [`ActedThrough::Registration`]; a primitive whose table names a role
+    /// its caller cannot supply is a programming error, reported rather than
+    /// skipped, because a skipped path is exactly an unwalked one.
+    ///
+    /// # Errors
+    ///
+    /// The role's requirement not met.
+    pub(crate) fn acted_through_paths(
+        &self,
+        primitive: Primitive,
+        slot: Option<&Slot>,
+        registration: Option<&Path>,
+    ) -> Result<Vec<(PathBuf, PathBuf, Leaf)>, UpstrokeError> {
+        let mut paths = Vec::new();
+        let anchor = self.private_root.clone();
+        let need_slot = |role: ActedThrough| {
+            slot.ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "internal: {primitive:?} acts through {role:?} but was given no slot"
+                ),
+            })
+        };
+        for role in primitive.acted_through() {
+            match role {
+                ActedThrough::ExecutionRoot => {
+                    paths.push((anchor.clone(), self.execution_root.clone(), Leaf::Directory));
+                }
+                ActedThrough::Scaffolding => {
+                    for directory in [
+                        self.execution_root.join("intents"),
+                        self.execution_root.join("tasks"),
+                        self.execution_root.join("merge"),
+                        self.execution_root.join("snapshots"),
+                        self.hooks_dir(),
+                    ] {
+                        paths.push((anchor.clone(), directory, Leaf::Directory));
+                    }
+                }
+                ActedThrough::IntentsDirectory => {
+                    paths.push((
+                        anchor.clone(),
+                        self.execution_root.join("intents"),
+                        Leaf::Directory,
+                    ));
+                }
+                ActedThrough::IntentFile => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.intent_path(slot), Leaf::Entry));
+                }
+                ActedThrough::SlotParent => {
+                    let slot = need_slot(*role)?;
+                    let parent = self
+                        .slot_path(slot)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.execution_root.clone());
+                    paths.push((anchor.clone(), parent, Leaf::Directory));
+                }
+                ActedThrough::SlotCheckoutDirectory => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.slot_path(slot), Leaf::Directory));
+                }
+                ActedThrough::SlotCheckoutEntry => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.slot_path(slot), Leaf::Entry));
+                }
+                ActedThrough::HooksPath => {
+                    paths.push((anchor.clone(), self.hooks_dir(), Leaf::Directory));
+                }
+                ActedThrough::Registration => {
+                    if let Some(admin) = registration {
+                        let git_dir = self.common_git_dir.clone();
+                        paths.push((git_dir.clone(), admin.to_path_buf(), Leaf::Directory));
+                        paths.push((git_dir.clone(), admin.join("gitdir"), Leaf::Entry));
+                        paths.push((git_dir, admin.join("locked"), Leaf::Entry));
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Walk every path the table names for `primitive`, immediately before
+    /// its syscalls: the managed base is a real directory, and each path's
+    /// chain from its anchor down is plain components, each a real directory
+    /// (or, at an [`Leaf::Entry`] leaf, anything but a reparse point), read
+    /// with `symlink_metadata` so that no link anywhere on it is followed;
+    /// and a hooks path in the set is proven empty as well.
+    ///
+    /// This runs inside the funnel, after the `Before` hook, so a path
+    /// exchanged for a link there refuses. The window that remains is between
+    /// this walk and each syscall, which only directory-relative syscalls
+    /// close.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+    /// [`Refusal::ReparsePointOnChain`], or an I/O error naming the component
+    /// that could not be read or is a regular file where a directory must be.
+    fn revalidate_acted_through(
+        &self,
+        primitive: Primitive,
+        slot: Option<&Slot>,
+        registration: Option<&Path>,
+    ) -> Result<(), UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        for (anchor, path, leaf) in self.acted_through_paths(primitive, slot, registration)? {
+            refuse_reparse_points(&anchor, &path, leaf)?;
+        }
+        if primitive.acted_through().contains(&ActedThrough::HooksPath) {
+            self.refuse_hooks_entries()?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a `hooks-none` that holds anything at all.
+    ///
+    /// A real, link-free directory is not enough: a hook written into it
+    /// runs under every Git command. Absence is fine — a root not yet
+    /// created has no hooks directory, and Git runs no hook from a path that
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::HooksPathNotEmpty`], or an I/O error reading the directory.
+    fn refuse_hooks_entries(&self) -> Result<(), UpstrokeError> {
+        let hooks = self.hooks_dir();
+        let mut entries = match fs::read_dir(&hooks) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(UpstrokeError::Io {
+                    path: hooks,
+                    source,
+                });
+            }
+        };
+        match entries.next() {
+            None => Ok(()),
+            Some(Ok(entry)) => Err(Refusal::HooksPathNotEmpty {
+                path: hooks,
+                entry: entry.file_name(),
+            }
+            .into()),
+            Some(Err(source)) => Err(UpstrokeError::Io {
+                path: hooks,
+                source,
+            }),
+        }
     }
 
     /// Whether `worktree` occupies one of this manager's own slot namespaces.
@@ -734,15 +1148,23 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
             || {
+                self.revalidate_acted_through(Primitive::CreateExecutionRoot, None, None)?;
+                fs::create_dir_all(&self.execution_root).map_err(|source| {
+                    UpstrokeError::Filesystem {
+                        operation: "create",
+                        path: self.execution_root.clone(),
+                        source,
+                    }
+                })?;
                 for directory in [
-                    self.execution_root.clone(),
                     self.execution_root.join("intents"),
                     self.execution_root.join("tasks"),
                     self.execution_root.join("merge"),
                     self.execution_root.join("snapshots"),
                     self.hooks_dir(),
                 ] {
-                    fs::create_dir_all(&directory).map_err(|source| UpstrokeError::Io {
+                    fs::create_dir_all(&directory).map_err(|source| UpstrokeError::Filesystem {
+                        operation: "create",
                         path: directory,
                         source,
                     })?;
@@ -770,8 +1192,18 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
             || {
-                if !self.execution_root.exists() {
-                    return Ok(false);
+                self.revalidate_acted_through(Primitive::RemoveExecutionRoot, None, None)?;
+                match fs::symlink_metadata(&self.execution_root) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(false);
+                    }
+                    Err(source) => {
+                        return Err(UpstrokeError::Io {
+                            path: self.execution_root.clone(),
+                            source,
+                        });
+                    }
                 }
                 for scaffolding in [
                     self.hooks_dir(),
@@ -780,18 +1212,38 @@ impl WorkspaceManager {
                     self.execution_root.join("merge"),
                     self.execution_root.join("snapshots"),
                 ] {
-                    if directory_is_empty(&scaffolding)? {
-                        let _ = fs::remove_dir(&scaffolding);
+                    if !directory_is_empty(&scaffolding)? {
+                        continue;
+                    }
+                    // Empty a moment ago, so a failure to remove it is a
+                    // failure to report, not a race to swallow: a scaffolding
+                    // directory nothing can remove is what keeps the root.
+                    match fs::remove_dir(&scaffolding) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(source) => {
+                            return Err(UpstrokeError::Filesystem {
+                                operation: "remove",
+                                path: scaffolding,
+                                source,
+                            });
+                        }
                     }
                 }
                 if !directory_is_empty(&self.execution_root)? {
                     return Ok(false);
                 }
-                fs::remove_dir(&self.execution_root).map_err(|source| UpstrokeError::Io {
-                    path: self.execution_root.clone(),
-                    source,
-                })?;
-                Ok(true)
+                // Empty a moment ago; gone now means another remover won,
+                // and the answer is the same: the root is pruned.
+                match fs::remove_dir(&self.execution_root) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                    Err(source) => Err(UpstrokeError::Filesystem {
+                        operation: "remove",
+                        path: self.execution_root.clone(),
+                        source,
+                    }),
+                }
             },
         )
     }
@@ -813,10 +1265,20 @@ impl WorkspaceManager {
     /// `Snapshot.WriteIntent`.
     ///
     /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
-    /// intents **synced before add**". The record is written to a temporary,
-    /// fsynced, renamed, and the directory fsynced, so an interrupted write
-    /// leaves either nothing or a complete record — never a half-parsed one
-    /// that reclaim would refuse.
+    /// intents **synced before add**". The record is written to a staging
+    /// file under a fresh `.stage-<kind>-<ULID>.tmp` name — the slot's kind
+    /// (`task`, `staging` or `snapshot`) and a ULID as this crate's generator
+    /// spells it, at most 46 bytes whatever the slot is called, so no valid
+    /// slot name is narrowed against `NAME_MAX` — fsynced, renamed, and the
+    /// directory fsynced, so an interrupted write leaves either nothing, a
+    /// complete record, or a staging file, never a half-parsed record that
+    /// reclaim would refuse. **The recovery rule for that leftover lives
+    /// here.** A file of exactly the staging shape is never an intent:
+    /// [`Self::intents`] ignores it, so it cannot poison recovery, and
+    /// [`Self::reclaim_intents`] reports it on its outcome and leaves it in
+    /// place, because no filename proves who wrote a file and this crate
+    /// deletes nothing it cannot prove it owns (§8). A retried write stages
+    /// under a fresh name beside it.
     ///
     /// # Errors
     ///
@@ -834,10 +1296,11 @@ impl WorkspaceManager {
         let record = IntentRecord::new(slot, self.run_id.clone(), self.incarnation.clone())?;
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
+            self.revalidate_acted_through(Primitive::WriteIntent, Some(slot), None)?;
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
                 message: format!("serializing the {} intent: {error}", slot.kind()),
             })?;
-            write_synced(&path, &bytes, &ledger)
+            write_synced(&path, &bytes, &ledger, slot.kind())
         })
     }
 
@@ -857,13 +1320,19 @@ impl WorkspaceManager {
     ) -> Result<(), UpstrokeError> {
         slot.validate()?;
         self.revalidate()?;
-        let path = self.intent_path(slot);
+        let directory = self.execution_root.join("intents");
+        let path = directory.join(slot.intent_name());
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.remove_intent_site(), || {
+            self.revalidate_acted_through(Primitive::RemoveIntent, Some(slot), None)?;
             match fs::remove_file(&path) {
-                Ok(()) => sync_directory(path.parent().unwrap_or(&self.execution_root), &ledger),
+                Ok(()) => sync_directory(&directory, &ledger),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(source) => Err(UpstrokeError::Io { path, source }),
+                Err(source) => Err(UpstrokeError::Filesystem {
+                    operation: "remove",
+                    path,
+                    source,
+                }),
             }
         })
     }
@@ -895,6 +1364,12 @@ impl WorkspaceManager {
             let name = name.to_str().ok_or_else(|| UpstrokeError::Git {
                 message: format!("intent {} has a non-UTF-8 name", entry.path().display()),
             })?;
+            // A staging file of the exact shape `write_intent` produces is
+            // never an intent; `reclaim_intents` removes it. Anything else
+            // that is not an intent name is the malformed file it is.
+            if staging_kind(name).is_some() {
+                continue;
+            }
             let slot = Slot::from_intent_name(name).ok_or_else(|| UpstrokeError::Git {
                 message: format!(
                     "unexpected file `{name}` in the intent directory of {}",
@@ -909,7 +1384,7 @@ impl WorkspaceManager {
     }
 
     /// Reclaim every intent this execution root carries: forced removal of the
-    /// worktree, then the intent.
+    /// worktree, then the intent; staging leftovers are reported, not removed.
     ///
     /// `enforcement_domains.external_physical`: intents are "reclaimed at
     /// process start (never 'empty')".
@@ -922,7 +1397,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals or a Git or I/O error.
-    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, UpstrokeError> {
+    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Reclaimed, UpstrokeError> {
         let slots = self.intents()?;
         // Revalidate even when there are no intents: callers rely on reclaim
         // as a fresh containment check. With nothing to remove, Git's ordinary
@@ -936,7 +1411,45 @@ impl WorkspaceManager {
             self.remove_worktree(hooks, slot)?;
             self.remove_intent(hooks, slot)?;
         }
-        Ok(slots)
+        let staging_leftovers = self.staging_leftovers()?;
+        Ok(Reclaimed {
+            slots,
+            staging_leftovers,
+        })
+    }
+
+    /// Every file of the staging shape `write_intent` produces that is still
+    /// in `intents/`, in directory order — reported, never removed.
+    ///
+    /// The §8 staging protocol's recovery rule (see `staging_kind`): a write
+    /// interrupted before its rename was not durable, so its leftover is not
+    /// an intent and [`Self::intents`] never lists it; and no filename proves
+    /// who wrote a file, so this crate does not delete it either. Reclaim
+    /// reports the names on its outcome and leaves them where they are.
+    fn staging_leftovers(&self) -> Result<Vec<PathBuf>, UpstrokeError> {
+        let directory = self.execution_root.join("intents");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(UpstrokeError::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        let mut leftovers = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+            if entry.file_name().to_str().and_then(staging_kind).is_some() {
+                leftovers.push(entry.path());
+            }
+        }
+        leftovers.sort();
+        Ok(leftovers)
     }
 
     // -----------------------------------------------------------------------
@@ -995,14 +1508,32 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         self.revalidate()?;
         let intent = self.intent_path(slot);
-        if !intent.is_file() {
-            return Err(Refusal::AddWithoutIntent {
-                slot: slot.relative().display().to_string(),
-                intent,
+        funnel(hooks, slot.add_site(), move || {
+            self.revalidate_acted_through(Primitive::AddWorktree, Some(slot), None)?;
+            // Inside the funnel, after the `Before` hook: an intent removed
+            // between a check outside and the add would leave a worktree that
+            // `reclaim_intents` can never find. Absent is the refusal;
+            // anything that is not a regular file is the same refusal, since
+            // only a file is a durable record; a metadata failure — a loop
+            // planted at the intent's name, permission — is an error, not
+            // "no intent".
+            let durable = match fs::symlink_metadata(&intent) {
+                Ok(metadata) => metadata.is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(source) => {
+                    return Err(UpstrokeError::Io {
+                        path: intent,
+                        source,
+                    });
+                }
+            };
+            if !durable {
+                return Err(Refusal::AddWithoutIntent {
+                    slot: slot.relative().display().to_string(),
+                    intent,
+                }
+                .into());
             }
-            .into());
-        }
-        funnel(hooks, slot.add_site(), || {
             // Inside the funnel, not before it (`PR5-CONF-003`). `identity` says
             // "the funnel itself calls hook(Before, site) -> primitive ->
             // hook(After, site)" and `scope` requires "every effect through
@@ -1013,17 +1544,18 @@ impl WorkspaceManager {
             // scaffolding directory was removed, the refusal arrived and the
             // directory existed.
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
+                fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
+                    operation: "create",
                     path: parent.to_path_buf(),
                     source,
                 })?;
             }
             let mut argv: Vec<OsString> =
                 Self::WORKTREE_ADD_ARGV.iter().map(OsString::from).collect();
-            argv.push(path.clone().into_os_string());
+            argv.push(path.as_os_str().to_os_string());
             argv.push(OsString::from(commit));
             self.git_ok(&self.base, &argv)?;
-            Ok(path.clone())
+            Ok(path)
         })
     }
 
@@ -1047,6 +1579,7 @@ impl WorkspaceManager {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(hooks, EffectSiteId::Worktree(WorktreeSite::Verify), || {
+            self.revalidate_acted_through(Primitive::VerifyWorktree, Some(slot), None)?;
             self.quiescence(&path, expected)
         })
     }
@@ -1232,11 +1765,29 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
-            if path.exists() {
+            self.revalidate_acted_through(
+                Primitive::RemoveWorktree,
+                Some(slot),
+                registration.as_deref(),
+            )?;
+            let present = match fs::symlink_metadata(&path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(source) => {
+                    return Err(UpstrokeError::Io {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            };
+            if present {
                 let contained = self.contained(&path)?;
-                remove_tree_once_handles_close(&contained).map_err(|source| UpstrokeError::Io {
-                    path: contained,
-                    source,
+                remove_tree_once_handles_close(&contained).map_err(|source| {
+                    UpstrokeError::Filesystem {
+                        operation: "remove",
+                        path: contained,
+                        source,
+                    }
                 })?;
             }
             if let Some(admin) = registration.as_ref() {
@@ -1254,7 +1805,8 @@ impl WorkspaceManager {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => {
-                        return Err(UpstrokeError::Io {
+                        return Err(UpstrokeError::Filesystem {
+                            operation: "remove",
                             path: locked,
                             source,
                         });
@@ -1266,7 +1818,20 @@ impl WorkspaceManager {
                 // directory to the exact, contained slot from its byte-safe
                 // `gitdir` before the checkout was deleted. Only that proved
                 // registration may be removed directly.
-                if fs::metadata(admin.join("commondir")).is_ok_and(|metadata| metadata.len() == 0) {
+                let commondir = admin.join("commondir");
+                let commondir_empty = match fs::metadata(&commondir) {
+                    Ok(metadata) => metadata.len() == 0,
+                    // No `commondir` at all is Git's to prune; only a read
+                    // failure is ours to report.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(source) => {
+                        return Err(UpstrokeError::Io {
+                            path: commondir,
+                            source,
+                        });
+                    }
+                };
+                if commondir_empty {
                     if !self.registration_still_names(admin, &path)? {
                         self.git_ok(
                             &self.base,
@@ -1274,9 +1839,12 @@ impl WorkspaceManager {
                         )?;
                         return Ok(());
                     }
-                    remove_tree_once_handles_close(admin).map_err(|source| UpstrokeError::Io {
-                        path: admin.clone(),
-                        source,
+                    remove_tree_once_handles_close(admin).map_err(|source| {
+                        UpstrokeError::Filesystem {
+                            operation: "remove",
+                            path: admin.clone(),
+                            source,
+                        }
                     })?;
                 }
             }
@@ -1372,6 +1940,7 @@ impl WorkspaceManager {
         self.refuse_symbolic(refname)?;
         refuse_new(refname, new)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::CreateRef, None, None)?;
             self.update_ref(&["--no-deref", refname, new, ""])
         })
     }
@@ -1396,6 +1965,7 @@ impl WorkspaceManager {
         refuse_new(refname, new)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::CompareAndSwapRef, None, None)?;
             self.update_ref(&["--no-deref", refname, new, old])
         })
     }
@@ -1416,6 +1986,7 @@ impl WorkspaceManager {
         self.refuse_symbolic(refname)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::DeleteRef, None, None)?;
             self.update_ref(&["--no-deref", "-d", refname, old])
         })
     }
@@ -1566,6 +2137,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateStage),
             || {
+                self.revalidate_acted_through(Primitive::CandidateStage, Some(slot), None)?;
                 self.git_ok(
                     &path,
                     &Self::CANDIDATE_STAGE_ARGV
@@ -1593,7 +2165,10 @@ impl WorkspaceManager {
         funnel(
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateWriteTree),
-            || self.git_line(&path, &Self::CANDIDATE_WRITE_TREE_ARGV),
+            || {
+                self.revalidate_acted_through(Primitive::CandidateWriteTree, Some(slot), None)?;
+                self.git_line(&path, &Self::CANDIDATE_WRITE_TREE_ARGV)
+            },
         )
     }
 
@@ -1721,6 +2296,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::ProposalCherryPick),
             || {
+                self.revalidate_acted_through(Primitive::ProposalCherryPick, Some(slot), None)?;
                 let mut argv: Vec<OsString> = Self::PROPOSAL_CHERRY_PICK_ARGV
                     .iter()
                     .map(OsString::from)
@@ -1755,6 +2331,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::RepairMaterialize),
             || {
+                self.revalidate_acted_through(Primitive::RepairMaterialize, Some(slot), None)?;
                 self.git_ok(
                     &path,
                     &[
@@ -1899,7 +2476,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// The containment refusals.
+    /// The containment refusals, the hooks path's among them, a Git failure
+    /// other than "no such object", or non-UTF-8 output.
     pub fn commit_parent(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
         self.revalidate()?;
         let argv = [
@@ -1908,12 +2486,7 @@ impl WorkspaceManager {
             OsString::from("--quiet"),
             OsString::from(format!("{commit}^{{commit}}^")),
         ];
-        Ok(self
-            .git_ok(self.base(), &argv)
-            .ok()
-            .and_then(|out| String::from_utf8(out).ok())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty()))
+        self.quiet_object_lookup(&argv)
     }
 
     /// The tree a commit points at, or `None` if it is not a commit.
@@ -1930,7 +2503,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// The containment refusals.
+    /// The containment refusals, the hooks path's among them, a Git failure
+    /// other than "no such object", or non-UTF-8 output.
     pub fn commit_tree_sha(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
         self.revalidate()?;
         let argv = [
@@ -1939,20 +2513,88 @@ impl WorkspaceManager {
             OsString::from("--quiet"),
             OsString::from(format!("{commit}^{{commit}}^{{tree}}")),
         ];
-        Ok(self
-            .git_ok(self.base(), &argv)
-            .ok()
-            .and_then(|out| String::from_utf8(out).ok())
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty()))
+        self.quiet_object_lookup(&argv)
+    }
+
+    /// `rev-parse --verify --quiet <spec>`, as an object lookup: the object's
+    /// id, `None` when Git says there is no such object, and every other
+    /// failure as the error it is.
+    ///
+    /// `--verify --quiet` answers a missing or unpeelable object with exit
+    /// status 1 and nothing on stderr; that, and only that, is absence. A
+    /// containment refusal from the runner (the hooks path exchanged or
+    /// holding a hook), a spawn failure, or a Git failure that speaks is
+    /// propagated, where `git_ok(..).ok()` used to fold all of them into
+    /// `None` and a candidate check read a refusal as "not a commit".
+    fn quiet_object_lookup(&self, argv: &[OsString]) -> Result<Option<String>, UpstrokeError> {
+        let output = self.git(self.base(), argv)?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) && output.stderr.is_empty() {
+                return Ok(None);
+            }
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "git {} failed in {}: {}",
+                    argv.iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    self.base().display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
+            message: format!("`git rev-parse` returned non-UTF-8: {error}"),
+        })?;
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 
     // -----------------------------------------------------------------------
     // Git plumbing
     // -----------------------------------------------------------------------
 
+    /// The hooks path, walked immediately before every command the manager
+    /// runs through [`Self::git`] and [`Self::git_with_identity`].
+    ///
+    /// That set is the funnel primitives' commands (`worktree add`, `worktree
+    /// prune`, `add`, `write-tree`, `cherry-pick`, `commit-tree`, `update-ref`)
+    /// and the manager's reads through the same runner (`worktree list`,
+    /// `for-each-ref`, `show-ref`, `rev-parse`, `diff`). The two free
+    /// functions `read_only_git` and `read_only_git_ok` are not in it: they
+    /// have no manager and set no `core.hooksPath`, and the plumbing they run
+    /// (`rev-parse`, `cat-file`, `fsck`, `diff`, `status`, `worktree list`) invokes no
+    /// hook, so there is nothing for the check to guard there; a check would
+    /// need the private root they do not have, and is not added.
+    ///
+    /// Every command run here uses `core.hooksPath` at [`Self::hooks_dir`], and a
+    /// hook that ran from there would be an effect no site accounts for. The
+    /// in-funnel chain check walks the effect's own target and not this path,
+    /// so a `hooks-none` exchanged for a link to a directory holding an
+    /// executable `post-checkout` after that check would have Git execute it.
+    /// So the chain from the private root down to `hooks-none` is walked
+    /// here, adjacent to the spawn, for every command: each component a real
+    /// directory and no reparse point, and the directory itself empty, since
+    /// a hook written into a real `hooks-none` runs too. Absence is allowed — a root not yet
+    /// created has no hooks directory, and Git runs no hook from a path that
+    /// does not exist — and the same window between check and spawn remains
+    /// that [`Self::revalidate_chain`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::ReparsePointOnChain`], or
+    /// an I/O error naming the component that could not be read.
+    fn revalidate_hooks_path(&self) -> Result<(), UpstrokeError> {
+        refuse_reparse_points(&self.private_root, &self.hooks_dir(), Leaf::Directory)?;
+        self.refuse_hooks_entries()
+    }
+
     /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
+    ///
+    /// The hooks path is walked first ([`Self::revalidate_hooks_path`]).
     fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
+        self.revalidate_hooks_path()?;
         self.command(cwd, args)
             .output()
             .map_err(|error| UpstrokeError::Git {
@@ -1977,6 +2619,7 @@ impl WorkspaceManager {
     }
 
     fn git_with_identity(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
+        self.revalidate_hooks_path()?;
         self.command(cwd, args)
             // Environment identity overrides repository and global config and
             // any inherited GIT_AUTHOR_*/GIT_COMMITTER_*, so a commit-tree is a
@@ -2077,8 +2720,7 @@ impl WorkspaceManager {
     /// partial `gitdir` refuses; guessing from the admin directory's basename
     /// would authorize deletion from a Git-generated, collision-suffixed name.
     fn revalidate_removal(&self, target: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-        refuse_unreal_directory(&self.base)?;
-        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        self.revalidate_chain(&self.execution_root)?;
         let root = canonical_prefix(&self.execution_root)?;
         let target = canonical_prefix(target)?;
         let base = canonical_prefix(&self.base)?;
@@ -2100,8 +2742,22 @@ impl WorkspaceManager {
         let worktrees = self.common_git_dir.join("worktrees");
         let entries = match fs::read_dir(&worktrees) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !target.exists() => {
-                return Ok(None);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // No registrations at all. Nothing to remove only if the
+                // target is absent too; a target that is there with no
+                // registration directory is the I/O failure it looks like,
+                // and a target that cannot be read is its own.
+                return match fs::symlink_metadata(&target) {
+                    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Ok(_) => Err(UpstrokeError::Io {
+                        path: worktrees,
+                        source: error,
+                    }),
+                    Err(source) => Err(UpstrokeError::Io {
+                        path: target,
+                        source,
+                    }),
+                };
             }
             Err(source) => {
                 return Err(UpstrokeError::Io {
@@ -2435,36 +3091,124 @@ pub use self::object::{is_null_object_id, is_object_id};
 /// evidence with it. The residual boundary is the same one the Event lane
 /// states in writing: deleting the `sync_all` line *inside* the fused helper is
 /// still undetectable by any test on a machine that does not lose power.
-fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<(), UpstrokeError> {
+fn write_synced(
+    path: &Path,
+    bytes: &[u8],
+    ledger: &DurabilityLedger,
+    kind: &'static str,
+) -> Result<(), UpstrokeError> {
     let parent = path.parent().ok_or_else(|| UpstrokeError::Git {
         message: format!("{} has no parent directory", path.display()),
     })?;
-    fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
+    fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
+        operation: "create",
         path: parent.to_path_buf(),
         source,
     })?;
-    let staged = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&staged).map_err(|source| UpstrokeError::Io {
-            path: staged.clone(),
+    // A per-call unique staging name of bounded length, and `create_new`: a
+    // fixed name is a name anyone can plant, and `File::create` follows a
+    // link planted there to whatever it names; `create_new` refuses an
+    // existing name of any kind, link included, so the staged file is this
+    // call's alone. The name carries the record's kind and a ULID, and no
+    // part of the record's own name, so it is at most 46 bytes whatever the
+    // slot is called and narrows no valid slot name against `NAME_MAX`;
+    // `staging_kind` is what recognises it again, and only it.
+    let staged = parent.join(staging_name(kind));
+    let written = {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|source| UpstrokeError::Filesystem {
+                operation: "create",
+                path: staged.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| UpstrokeError::Filesystem {
+                operation: "write",
+                path: staged.clone(),
+                source,
+            })
+            .and_then(|()| sync_file_recorded(&file, &staged, ledger))
+    };
+    let landed = written.and_then(|()| {
+        fs::rename(&staged, path).map_err(|source| UpstrokeError::Filesystem {
+            operation: "rename",
+            path: path.to_path_buf(),
             source,
-        })?;
-        file.write_all(bytes).map_err(|source| UpstrokeError::Io {
-            path: staged.clone(),
-            source,
-        })?;
-        sync_file_recorded(&file, &staged, ledger)?;
+        })
+    });
+    if let Err(error) = landed {
+        // The staged file is ours alone, so a refused attempt leaves nothing
+        // behind — or names what it left.
+        return Err(match fs::remove_file(&staged) {
+            Ok(()) => error,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
+            Err(cleanup) => UpstrokeError::Filesystem {
+                operation: "remove",
+                path: staged,
+                source: std::io::Error::new(
+                    cleanup.kind(),
+                    format!("{error}; and the staged file could not be removed: {cleanup}"),
+                ),
+            },
+        });
     }
-    fs::rename(&staged, path).map_err(|source| UpstrokeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    ledger.record(
-        DurableStep::Renamed,
-        path,
-        fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-    );
+    let length = fs::metadata(path)
+        .map(|meta| meta.len())
+        .map_err(|source| UpstrokeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    ledger.record(DurableStep::Renamed, path, length);
     sync_directory(parent, ledger)
+}
+
+/// A fresh staging name: `.stage-<kind>-<ULID>.tmp`, unique per call and at
+/// most 46 bytes (`snapshot` is the longest kind).
+fn staging_name(kind: &'static str) -> String {
+    format!(".stage-{kind}-{}.tmp", crate::ulid::ulid())
+}
+
+/// The intent kind a name of exactly the shape [`staging_name`] produces
+/// carries, or `None` for any other name.
+///
+/// Exact: the prefix, one of the three kinds, one `-`, a ULID as this
+/// crate's generator spells it — twenty-six uppercase Crockford base32
+/// characters, the first `0` to `7` because 128 bits fill 26 characters
+/// with two bits to spare — and the suffix. The §8 staging protocol's
+/// recovery rule: a staging file is never an intent, so
+/// `WorkspaceManager::intents` ignores this shape and a leftover can never
+/// poison recovery; and no filename proves who wrote a file, so
+/// `WorkspaceManager::reclaim_intents` reports leftovers on its outcome and
+/// this crate deletes none of them. A name that merely resembles one, such
+/// as `.stage-report.tmp`, is reported by `intents` as the malformed file it
+/// is.
+fn staging_kind(name: &str) -> Option<&'static str> {
+    let rest = name.strip_prefix(".stage-")?.strip_suffix(".tmp")?;
+    let (kind, ulid) = rest.rsplit_once('-')?;
+    if !is_canonical_ulid(ulid) {
+        return None;
+    }
+    match kind {
+        "task" => Some("task"),
+        "staging" => Some("staging"),
+        "snapshot" => Some("snapshot"),
+        _ => None,
+    }
+}
+
+/// Whether `text` is a ULID as this crate's generator spells it: twenty-six
+/// uppercase Crockford base32 characters, the first `0` to `7`.
+fn is_canonical_ulid(text: &str) -> bool {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    text.len() == 26
+        && text.bytes().all(|byte| CROCKFORD.contains(&byte))
+        && text
+            .as_bytes()
+            .first()
+            .is_some_and(|first| (b'0'..=b'7').contains(first))
 }
 
 /// fsync `file` and record what was made durable, in one call.

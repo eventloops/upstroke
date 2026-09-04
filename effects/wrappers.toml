@@ -60,6 +60,8 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "acted_through",
+    "acted_through_paths",
     "add_snapshot",
     "assert_publishable",
     "base",
