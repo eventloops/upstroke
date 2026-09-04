@@ -32,6 +32,12 @@ use std::collections::BTreeSet;
 // this module's: `src/engine/topology/**` needs them too and cannot reach
 // an effect primitive of its own. See that module for why they moved.
 use super::fixture::{Fixture, git, git_out, scratch};
+
+/// `value`, which the fixture read from Git, as the [`ObjectId`] every
+/// snapshot input is built from.
+fn oid(value: &str) -> ObjectId {
+    ObjectId::new(value.to_owned()).expect("an id the fixture read from Git")
+}
 // The observing scratch tree: its drop reclaims the directory and reports a
 // reclaim that failed, where `scratch` above hands back a bare path nothing
 // removes. The `canonical_prefix` tests below build no repository, so this is
@@ -4461,8 +4467,8 @@ fn an_ephemeral_snapshot_commit_created_before_the_intent_is_left_to_git() {
             &mut measured,
             &SnapshotName::gates(2, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("snapshot");
@@ -4494,11 +4500,11 @@ fn an_ephemeral_snapshot_commit_created_before_the_intent_is_left_to_git() {
         1,
         "this add's commit-tree fired exactly once, on a log that began empty"
     );
-    assert_eq!(snapshot.ephemeral.as_deref(), Some(snapshot.head.as_str()));
+    assert_eq!(snapshot.ephemeral(), Some(snapshot.head()));
     assert!(
         !unreachable_objects(&fixture.base)
             .expect("fsck")
-            .contains(&snapshot.head),
+            .contains(&snapshot.head().to_string()),
         "and the add makes it the snapshot HEAD: R24, no longer R27"
     );
 }
@@ -4545,15 +4551,17 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
         .add_snapshot(
             &mut NoHooks,
             &SnapshotName::integration(1),
-            &SnapshotInput::Commit(fixture.head.clone()),
+            &SnapshotInput::Commit(oid(&fixture.head)),
         )
         .expect("Snapshot.WriteIntent + Snapshot.Add");
     assert_eq!(
-        integration.head, fixture.head,
+        integration.head().as_str(),
+        fixture.head,
         "an integration snapshot checks out the commit it was given"
     );
     assert_eq!(
-        integration.ephemeral, None,
+        integration.ephemeral(),
+        None,
         "…and records no ephemeral commit, because it created none"
     );
     assert_eq!(
@@ -4563,7 +4571,7 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
              checks out the proposal or head commit and **creates no object**"
     );
     assert_eq!(
-        git(&integration.path, &["rev-parse", "HEAD"]),
+        git(integration.path(), &["rev-parse", "HEAD"]),
         fixture.head,
         "and the checkout really is at that commit"
     );
@@ -4577,8 +4585,8 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::gates(1, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("the gate snapshot");
@@ -4588,33 +4596,34 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::review(1, 1, 0),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("a reviewer's snapshot on the same judged tree");
 
     assert_ne!(
-        gates.slot, reviewer.slot,
+        gates.slot(),
+        reviewer.slot(),
         "the gate set and a reviewer are different roles and must not share a slot"
     );
     assert_ne!(
-        gates.path,
-        reviewer.path,
+        gates.path(),
+        reviewer.path(),
         "…and therefore not a checkout either: {} vs {}",
-        gates.path.display(),
-        reviewer.path.display()
+        gates.path().display(),
+        reviewer.path().display()
     );
     assert!(
-        gates.path.is_dir() && reviewer.path.is_dir(),
+        gates.path().is_dir() && reviewer.path().is_dir(),
         "both snapshots are live at once; that is what 'never reused across roles \
              or attempts' means and what no fixture built"
     );
     // Not merely different names for one directory: each is separately
     // registered, and the kernel agrees they are two.
     assert_ne!(
-        git(&gates.path, &["rev-parse", "--absolute-git-dir"]),
-        git(&reviewer.path, &["rev-parse", "--absolute-git-dir"]),
+        git(gates.path(), &["rev-parse", "--absolute-git-dir"]),
+        git(reviewer.path(), &["rev-parse", "--absolute-git-dir"]),
         "two registered worktrees, not one directory under two names"
     );
 
@@ -4625,13 +4634,14 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             &mut NoHooks,
             &SnapshotName::gates(1, 2),
             &SnapshotInput::Tree {
-                tree,
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("the gate snapshot of the next attempt");
     assert_ne!(
-        retry.path, gates.path,
+        retry.path(),
+        gates.path(),
         "attempt 2's gate snapshot must not be attempt 1's checkout"
     );
 
@@ -4641,6 +4651,387 @@ fn snapshots_create_no_object_for_a_commit_and_never_share_a_checkout() {
             .remove_snapshot(&mut NoHooks, snapshot)
             .expect("Snapshot.Remove + Snapshot.RemoveIntent");
     }
+}
+
+/// A snapshot input the repository does not resolve to itself is refused by
+/// name, before the ephemeral commit and before the intent (PR #130, pass 1).
+///
+/// `ObjectId` is a spelling, and a ref spelt as hexadecimal of the *other*
+/// object format's length is one: measured on git 2.43, in a SHA-256
+/// repository `git worktree add --detach <forty hex characters>` follows a
+/// branch of that name to wherever it points, and the inverse in a SHA-1
+/// repository. The branch here is created at the seed and moved to the head,
+/// so that a checkout that followed it would be observable as one at the head.
+/// The funnel resolves each id to the object type its role requires and
+/// accepts only an answer equal to the input; the refusal carries what Git
+/// answered. Witnessed failing with the resolution removed from
+/// `add_snapshot` (the head's lexical-only check) in both repositories.
+#[test]
+fn a_snapshot_input_spelt_as_hexadecimal_of_the_other_formats_length_is_refused_by_name() {
+    for (fixture, other_len, own_len) in [
+        (Fixture::created("resolve-sha1"), 64, 40),
+        (Fixture::created_sha256("resolve-sha256"), 40, 64),
+    ] {
+        assert_eq!(
+            fixture.head.len(),
+            own_len,
+            "the fixture's object format is pinned"
+        );
+        let name: String = "0123456789abcdef".chars().cycle().take(other_len).collect();
+        git(&fixture.base, &["branch", &name, &fixture.seed]);
+        git(&fixture.base, &["branch", "-f", &name, &fixture.head]);
+        assert_eq!(
+            git(
+                &fixture.base,
+                &["rev-parse", "--verify", &format!("{name}^{{commit}}")]
+            ),
+            fixture.head,
+            "Git resolves the hexadecimal name to the head the branch was moved to"
+        );
+        let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+        let common = PathBuf::from(git(
+            &fixture.base,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let objects_before = loose_objects(&common);
+        let worktrees_before = git(&fixture.base, &["worktree", "list", "--porcelain"]);
+        let missing: String = "f".repeat(own_len);
+
+        let cases = [
+            (
+                1,
+                SnapshotInput::Commit(oid(&name)),
+                SnapshotObject::Commit,
+                Some(fixture.head.clone()),
+                name.clone(),
+            ),
+            (
+                2,
+                SnapshotInput::Tree {
+                    tree: oid(&name),
+                    parent: oid(&fixture.head),
+                },
+                SnapshotObject::Tree,
+                Some(tree.clone()),
+                name.clone(),
+            ),
+            (
+                3,
+                SnapshotInput::Tree {
+                    tree: oid(&tree),
+                    parent: oid(&name),
+                },
+                SnapshotObject::Parent,
+                Some(fixture.head.clone()),
+                name.clone(),
+            ),
+            (
+                4,
+                SnapshotInput::Commit(oid(&missing)),
+                SnapshotObject::Commit,
+                None,
+                missing.clone(),
+            ),
+        ];
+        for (attempt, input, role, resolved, value) in cases {
+            let slot_name = SnapshotName::gates(1, attempt);
+            let error = fixture
+                .manager
+                .add_snapshot(&mut NoHooks, &slot_name, &input)
+                .expect_err("an input the repository does not resolve to itself is refused");
+            let expected = Refusal::SnapshotInputResolvesElsewhere {
+                role,
+                value,
+                resolved,
+                found_type: None,
+            };
+            assert!(
+                matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+                "{role} at {own_len}: expected `{expected}`, got `{error}`"
+            );
+            let slot = Slot::Snapshot { name: slot_name };
+            assert!(
+                !fixture.manager.intent_path(&slot).exists(),
+                "{role} at {own_len}: the refusal precedes the intent"
+            );
+        }
+        assert_eq!(
+            git(&fixture.base, &["worktree", "list", "--porcelain"]),
+            worktrees_before,
+            "at {own_len}: nothing was checked out, so nothing followed the branch"
+        );
+        assert_eq!(
+            loose_objects(&common),
+            objects_before,
+            "at {own_len}: the refusal precedes the ephemeral commit"
+        );
+    }
+}
+
+/// A full id of the repository's own format is accepted, and the snapshot's
+/// HEAD is what Git reports for the checkout, in a repository of each object
+/// format (PR #130, pass 1). The branch spelt as the head's own id points at
+/// the seed: Git resolves the full id to the object, not to the ref, so the
+/// snapshot is at the head and not where the branch points.
+#[test]
+fn a_full_id_of_the_repositorys_own_format_is_accepted_and_the_head_is_what_git_reports() {
+    for (fixture, own_len) in [
+        (Fixture::created("own-format-sha1"), 40),
+        (Fixture::created_sha256("own-format-sha256"), 64),
+    ] {
+        assert_eq!(
+            fixture.head.len(),
+            own_len,
+            "the fixture's object format is pinned"
+        );
+        git(&fixture.base, &["branch", &fixture.head, &fixture.seed]);
+
+        let integration = fixture
+            .manager
+            .add_snapshot(
+                &mut NoHooks,
+                &SnapshotName::integration(1),
+                &SnapshotInput::Commit(oid(&fixture.head)),
+            )
+            .expect("a full id of the repository's own format is accepted");
+        assert_eq!(integration.head().as_str(), fixture.head);
+        assert_eq!(
+            git(integration.path(), &["rev-parse", "HEAD"]),
+            fixture.head,
+            "at {own_len}: the checkout is at the object, not where the same-named branch points"
+        );
+        assert_ne!(fixture.seed, fixture.head, "the branch points elsewhere");
+
+        let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+        let gates = fixture
+            .manager
+            .add_snapshot(
+                &mut NoHooks,
+                &SnapshotName::gates(1, 1),
+                &SnapshotInput::Tree {
+                    tree: oid(&tree),
+                    parent: oid(&fixture.head),
+                },
+            )
+            .expect("a tree and parent of the repository's own format are accepted");
+        assert_eq!(
+            gates.head().as_str().len(),
+            own_len,
+            "the ephemeral commit is of the repository's format"
+        );
+        assert_eq!(
+            git(gates.path(), &["rev-parse", "HEAD"]),
+            gates.head().as_str(),
+            "at {own_len}: the snapshot's HEAD is what Git reports for the checkout"
+        );
+        assert_eq!(gates.ephemeral(), Some(gates.head()));
+
+        for snapshot in [&integration, &gates] {
+            fixture
+                .manager
+                .remove_snapshot(&mut NoHooks, snapshot)
+                .expect("Snapshot.Remove + Snapshot.RemoveIntent");
+        }
+    }
+}
+
+/// A snapshot of a tree with a replacement object in place materialises the
+/// tree that was judged, not its replacement (PR #130, pass 2's P1).
+///
+/// `git replace A B` makes Git read `B` wherever `A` is named while
+/// `rev-parse` still prints `A`, so `add_snapshot`'s resolve-once check
+/// cannot see it: measured on git 2.43, `commit-tree A -p P` records the raw
+/// tree `A` and `worktree add --detach` on that commit writes the *contents
+/// of `B`*, so gates and reviewers would run over another tree entirely,
+/// against `DESIGN.md` §15's exact snapshot. The manager sets
+/// `GIT_NO_REPLACE_OBJECTS=1` on every command it runs, so the mechanism is
+/// gone rather than detected.
+///
+/// The assertion is on the materialised bytes and on the recorded commit's
+/// raw tree, since the head is unchanged under a tree replacement and a test
+/// that read only the head could not see this. Witnessed failing with the
+/// environment variable removed from `command`: the checkout holds `B`.
+#[test]
+fn a_snapshot_ignores_a_replacement_object_and_materialises_the_judged_tree() {
+    let fixture = Fixture::created("replace-objects");
+    let file = fixture.base.join("replaced.txt");
+
+    fs::write(&file, "A\n").expect("the judged content");
+    git(&fixture.base, &["add", "replaced.txt"]);
+    git(&fixture.base, &["commit", "-q", "-m", "the judged tree"]);
+    let judged_commit = git(&fixture.base, &["rev-parse", "HEAD"]);
+    let judged_tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+
+    fs::write(&file, "B\n").expect("the other content");
+    git(&fixture.base, &["add", "replaced.txt"]);
+    git(&fixture.base, &["commit", "-q", "-m", "the other tree"]);
+    let other_commit = git(&fixture.base, &["rev-parse", "HEAD"]);
+    let other_tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+    assert_ne!(judged_tree, other_tree, "two distinct trees");
+
+    // Back to the judged commit, and the replacement in place.
+    git(
+        &fixture.base,
+        &["checkout", "--detach", "--quiet", &judged_commit],
+    );
+    git(&fixture.base, &["replace", &judged_tree, &other_tree]);
+    assert_eq!(
+        git(&fixture.base, &["replace", "-l"]),
+        judged_tree,
+        "the replacement is in place"
+    );
+    assert_eq!(
+        git(
+            &fixture.base,
+            &["rev-parse", "--verify", &format!("{judged_tree}^{{tree}}")]
+        ),
+        judged_tree,
+        "and `rev-parse` still prints the judged tree, which is why the funnel's \
+         resolve-once check cannot see the replacement"
+    );
+
+    let snapshot = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(1, 1),
+            &SnapshotInput::Tree {
+                tree: oid(&judged_tree),
+                parent: oid(&other_commit),
+            },
+        )
+        .expect("the judged tree is a tree of this repository");
+
+    // The fixture pins `core.autocrlf=false` and `core.eol=lf`, so the bytes
+    // checked out are the bytes committed on every platform and this
+    // comparison is about which blob, not about line endings.
+    assert_eq!(
+        fs::read_to_string(snapshot.path().join("replaced.txt")).expect("the checkout"),
+        "A\n",
+        "the snapshot materialises the judged tree, not the object replacing it"
+    );
+    let recorded = git(
+        &fixture.base,
+        &["cat-file", "commit", snapshot.head().as_str()],
+    );
+    assert!(
+        recorded.contains(&format!("tree {judged_tree}")),
+        "the ephemeral commit records the judged tree: {recorded}"
+    );
+
+    fixture
+        .manager
+        .remove_snapshot(&mut NoHooks, &snapshot)
+        .expect("Snapshot.Remove + Snapshot.RemoveIntent");
+}
+
+/// A full object id of the wrong type for its role is refused as what it is:
+/// the message names the role's object type and what the repository peeled the
+/// value to, and never says a full object id is not one (PR #130, pass 2).
+///
+/// A commit id offered as the `tree` peels to that commit's tree, so the
+/// resolve-once check refuses it; the diagnostic at the reviewed head said it
+/// "is not a full object id of this repository", which is false of a commit
+/// id. Witnessed failing with the message's `{role.object_type()}` replaced by
+/// the role's own name, which spells the parent's required type `parent`.
+#[test]
+fn a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requires() {
+    let fixture = Fixture::created("wrong-object-type");
+    let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+    let commit = fixture.head.clone();
+
+    // A commit where a tree is required: it peels to that commit's tree.
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 1),
+            &SnapshotInput::Tree {
+                tree: oid(&commit),
+                parent: oid(&commit),
+            },
+        )
+        .expect_err("a commit is not a tree");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Tree,
+        value: commit.clone(),
+        resolved: Some(tree.clone()),
+        found_type: None,
+    };
+    assert!(
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "expected `{expected}`, got `{error}`"
+    );
+    let message = expected.to_string();
+    assert!(
+        message.contains("does not name a tree of this repository"),
+        "the message names the object type the role requires: {message}"
+    );
+    assert!(
+        !message.contains("is not a full object id"),
+        "and never calls a full object id something other than one: {message}"
+    );
+
+    // A tree where a commit is required cannot be peeled at all: Git exits
+    // non-zero with "expected commit type" on stderr rather than the silent
+    // exit 1 the lookup reads as absence (measured, git 2.43). That is still
+    // the caller offering the wrong kind of object, so it is the same refusal
+    // and not a Git error, and it names the type the value does name.
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 2),
+            &SnapshotInput::Tree {
+                tree: oid(&tree),
+                parent: oid(&tree),
+            },
+        )
+        .expect_err("a tree is not a commit");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Parent,
+        value: tree.clone(),
+        resolved: None,
+        found_type: Some("tree".to_owned()),
+    };
+    assert!(
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "an unpeelable type is this refusal, not a Git error: expected `{expected}`, got \
+         `{error}`"
+    );
+    let message = expected.to_string();
+    assert!(
+        message.contains("does not name a commit of this repository")
+            && message.contains("(it names a tree)"),
+        "the parent role requires a commit, and the message says what the value is: {message}"
+    );
+
+    // An id of the repository's own format naming no object at all keeps the
+    // refusal too, with nothing to say about its type: the repository will not
+    // name one.
+    let absent = "f".repeat(fixture.head.len());
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 3),
+            &SnapshotInput::Commit(oid(&absent)),
+        )
+        .expect_err("no such object");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Commit,
+        value: absent,
+        resolved: None,
+        found_type: None,
+    };
+    assert!(
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "expected `{expected}`, got `{error}`"
+    );
+    assert!(
+        !expected.to_string().contains("it names a"),
+        "and claims no type for an object the repository does not have: {expected}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -7777,8 +8168,8 @@ fn every_site_this_lane_owns_executes_both_hook_phases() {
             &mut hooks,
             &SnapshotName::gates(1, 1),
             &SnapshotInput::Tree {
-                tree: tree.clone(),
-                parent: fixture.head.clone(),
+                tree: oid(&tree),
+                parent: oid(&fixture.head),
             },
         )
         .expect("Object.SnapshotCommitTree + Snapshot.WriteIntent + Snapshot.Add");

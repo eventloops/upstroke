@@ -27,7 +27,7 @@ use crate::topology::registry::TaskRegistry;
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 use crate::util::DurabilityLedger;
 use crate::workspace_manager::{
-    EffectHooks, HarnessEffects, SnapshotInput, SnapshotName, unreachable_objects,
+    EffectHooks, HarnessEffects, ObjectId, SnapshotInput, SnapshotName, unreachable_objects,
 };
 
 const RUN_ID: &str = "01KZCAND00000000000000000G";
@@ -1695,8 +1695,8 @@ fn snapshot_residue_reclaimed() {
     let fixture = Fixture::new("snapshot-residue");
     let mut hooks = Hooks::new();
     let input = SnapshotInput::Tree {
-        tree: fixture.tree_sha.0.clone(),
-        parent: fixture.base_sha.0.clone(),
+        tree: ObjectId::new(fixture.tree_sha.0.clone()).expect("the judged tree is an object id"),
+        parent: ObjectId::new(fixture.base_sha.0.clone()).expect("the base is an object id"),
     };
 
     // One snapshot for the gate set, one for the reviewer: `snapshots` says
@@ -1709,14 +1709,14 @@ fn snapshot_residue_reclaimed() {
         .manager
         .add_snapshot(hooks.effects(), &SnapshotName::review(0, 1, 0), &input)
         .expect("the reviewer's snapshot");
-    let ephemeral = gates.ephemeral.clone().expect("a tree input commits");
+    let ephemeral = gates.ephemeral().expect("a tree input commits");
     assert_eq!(
         ephemeral,
-        review.ephemeral.clone().expect("and so does the other"),
+        review.ephemeral().expect("and so does the other"),
         "the same tree on the same parent is the same commit"
     );
     assert!(
-        !fixture.is_unreachable(&ephemeral),
+        !fixture.is_unreachable(ephemeral.as_str()),
         "while a snapshot has it checked out it is R24, not R27"
     );
 
@@ -1725,8 +1725,8 @@ fn snapshot_residue_reclaimed() {
         .manager
         .remove_snapshot(hooks.effects(), &gates)
         .expect("prune the gate snapshot");
-    assert!(!gates.path.exists());
-    assert!(!fixture.manager.intent_path(&gates.slot).exists());
+    assert!(!gates.path().exists());
+    assert!(!fixture.manager.intent_path(gates.slot()).exists());
 
     // Half two: the reviewer's snapshot is left as a dead process would
     // leave it, and the next process's reclaim finds it by its intent.
@@ -1735,23 +1735,23 @@ fn snapshot_residue_reclaimed() {
         .reclaim_intents(hooks.effects())
         .expect("reclaim");
     assert!(
-        reclaimed.slots.contains(&review.slot),
+        reclaimed.slots.contains(review.slot()),
         "the reviewer's snapshot is reclaimed as residue: {reclaimed:?}"
     );
-    assert!(!review.path.exists(), "its worktree is gone");
+    assert!(!review.path().exists(), "its worktree is gone");
     assert!(
-        !fixture.manager.intent_path(&review.slot).exists(),
+        !fixture.manager.intent_path(review.slot()).exists(),
         "and so is its intent"
     );
 
     // The object half: with no snapshot and no ref holding it, the
     // ephemeral commit is Git's again.
     assert!(
-        fixture.is_unreachable(&ephemeral),
+        fixture.is_unreachable(ephemeral.as_str()),
         "the ephemeral snapshot commit returns to R27"
     );
     assert!(
-        fixture.object_present(&ephemeral),
+        fixture.object_present(ephemeral.as_str()),
         "returned to R27, not deleted"
     );
     assert!(
