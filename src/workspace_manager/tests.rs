@@ -6725,14 +6725,47 @@ fn the_candidate_diff_is_of_the_recorded_objects_and_survives_operator_diff_conf
         .candidate_write_tree(&mut NoHooks, &slot)
         .expect("write-tree");
 
-    // HEAD moves off the recorded parent, index kept: the one manipulation
-    // that separates a primitive honouring its argument from one re-reading
-    // the world.
+    // **Both** recorded arguments are moved off the world, because each has
+    // its own way of being ignored.
+    //
+    // HEAD moves off the recorded parent: that separates a body honouring
+    // `parent` from one re-reading HEAD.
     git(&path, &["reset", "-q", "--soft", &fixture.seed]);
     assert_eq!(
         git(&path, &["rev-parse", "HEAD"]),
         fixture.seed,
         "the worktree's HEAD really moved off the recorded base"
+    );
+    // And the **index** moves off the recorded tree (PR #136 pass 1,
+    // finding 1). `reset --soft` deliberately leaves the index equal to the
+    // tree just captured, so with only the step above a body that ignored
+    // `tree` and ran `git diff --cached <parent> --` produced byte-identical
+    // output and passed every assertion here. Staging one more file after the
+    // capture is what makes the argument the only route to the expected
+    // answer. The harm it stands for is `DESIGN.md` §14's exact-tree
+    // guarantee: the index moves on after a capture, and a reviewer shown the
+    // index is shown a tree the candidate does not commit.
+    fs::write(path.join("after-capture.txt"), "staged after the capture\n")
+        .expect("a file staged after the tree was captured");
+    git(&path, &["add", "after-capture.txt"]);
+
+    // The premises, asserted before the answer is read, so neither
+    // discriminator can quietly stop discriminating.
+    assert_ne!(
+        git(&path, &["write-tree"]),
+        tree,
+        "the index must no longer hold the recorded tree, or `tree` is not the only \
+         way to the expected diff"
+    );
+    let from_index = git(&path, &["diff", "--cached", "--name-only", &fixture.head]);
+    assert!(
+        from_index.contains("after-capture.txt"),
+        "a body reading the index rather than the recorded tree would carry \
+         after-capture.txt: {from_index}"
+    );
+    assert!(
+        git(&path, &["diff", "--name-only", &fixture.seed, &tree]).contains("b.txt"),
+        "and a body reading current HEAD rather than the recorded parent would carry b.txt"
     );
 
     let diff = fixture
@@ -6740,11 +6773,9 @@ fn the_candidate_diff_is_of_the_recorded_objects_and_survives_operator_diff_conf
         .candidate_diff(&slot, &fixture.head, &tree)
         .expect("the diff of the recorded objects");
 
-    // The two readings really differ here, so the assertion below is not
-    // passing for want of a distinction.
     assert!(
-        git(&path, &["diff", "--name-only", &fixture.seed, &tree]).contains("b.txt"),
-        "the fixture does not separate the recorded parent from current HEAD"
+        !diff.contains("after-capture.txt"),
+        "the diff is of the recorded tree, not of whatever the index holds now: {diff}"
     );
     assert!(
         !diff.contains("b.txt"),
@@ -8005,6 +8036,25 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             "one observation per sample, or the tally below is over the wrong list"
         );
 
+        // **The refusals first** (PR #136 pass 1, finding 2). A classifier
+        // refusal becomes `None` in `observed`, so `tally` leaves it out of
+        // every bucket and the histogram total falls short of `SAMPLING_N` —
+        // which means the generic total assertion below fired first and the
+        // words explaining *why* the classifier refused were never printed.
+        // The diagnostic this sweep added was therefore unreachable on the
+        // one failure it exists to diagnose. It is asserted here, before
+        // anything derived from the tally, because a refusal is a different
+        // failure from an unclassifiable residue and deserves to be reported
+        // as itself.
+        assert!(
+            run.refusals.is_empty(),
+            "{site}: the classifier refused {} of {SAMPLING_N} samples, which is not the \
+                 same thing as a residue in no class — it is an inspection that failed, and \
+                 the assertions below would have called it unclassified: {:?}",
+            run.refusals.len(),
+            run.refusals
+        );
+
         // The independent tally. Not `tally()` again — a second call to the
         // code under test agrees with itself by construction — but a count
         // per class written out separately, so a bucket incremented under
@@ -8040,10 +8090,9 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         );
         assert_eq!(
             record.unclassified, 0,
-            "an unclassifiable residue is durable state no tabled action recovers; \
-             a classifier refusal reads the same here and is not the same thing, so \
-             the refusals it did make are: {:?}",
-            run.refusals
+            "an unclassifiable residue is durable state no tabled action recovers; a \
+             classifier refusal reads the same here and is reported by its own assertion \
+             above, which found none"
         );
         assert!(
             record.recovered,
@@ -8170,6 +8219,37 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                      never fired at — the contract names this command among the four whose \
                      Git child this harness kills, and a kill skipped for one of the four is \
                      invisible to every count taken over all four"
+            );
+
+            // **And every kill that ran either worked, or failed at a child
+            // that had already reached its own exit** (PR #136 pass 1,
+            // finding 4). Firing is not killing: `fired` is written by the
+            // statement that calls `kill`, whatever `kill` answers, and the
+            // answer was discarded. So a shape whose kills all *fail* while
+            // its children exit normally passed the count above with nothing
+            // killed, and the global floor below was then satisfied by some
+            // other shape's kills — four shapes certified, one never killed.
+            //
+            // The discriminator is `already_exited`, read immediately before
+            // the kill: a kill of an exited child fails on both platforms and
+            // is legal, because the ladder deliberately reaches past the end
+            // of a fast run; a kill that fails at a child still running is
+            // not. The residual is the window between that read and the kill
+            // itself, in which a child may exit — narrow, one-sided (it can
+            // only produce a false red, never a false green), and the only
+            // shape available without a second process watching this one.
+            let unkilled: Vec<&String> = shape
+                .iter()
+                .filter(|launch| !launch.already_exited)
+                .filter_map(|launch| launch.kill_error.as_ref())
+                .collect();
+            assert!(
+                unkilled.is_empty(),
+                "{label}: {} of this command's {launched} kills answered an error at a child \
+                     that had not exited, so its `fired` count above counts attempts and not \
+                     kills, and the global floor below can be satisfied entirely by another \
+                     shape: {unkilled:?}",
+                unkilled.len()
             );
 
             // **When each kill fired**, read off the clock by the kill
@@ -8381,31 +8461,54 @@ fn tally(observed: &[Option<ObjectResidue>]) -> (ClassHistogram, u32) {
 /// No sampled funnel builds a Git argument from a literal (Fable's
 /// `PR5-CONF-004`).
 ///
-/// Sharing the lists makes the *transcription* impossible; this is what
-/// stops a funnel growing an argument beside its list and putting the
-/// divergence back. `command_internal_sub_effects` (ii) says the sampled
-/// child is "the Git child of the site", and a child spawned with a
-/// different argv is a different child however faithful the list is.
+/// Sharing the lists makes the *transcription* impossible.
+/// `command_internal_sub_effects` (ii) says the sampled child is "the Git
+/// child of the site", and a child spawned with a different argv is a
+/// different child however faithful the list is. The two axes are the *shared
+/// list* and the *call site that uses it*: sharing covers the first, and only
+/// reading the call sites can see the second.
 ///
-/// The two axes are the *shared list* and the *call site that uses it*.
-/// Sharing covers the first; a funnel that appends `"--force"` inline is
-/// still an un-shared argument, and only reading the call sites can see it.
+/// **What this census can and cannot say** (PR #136 pass 1, finding 3). It
+/// reads source text, and a census over source text cannot hold a behaviour
+/// claim, because a sibling spelling always satisfies it. The claim it used to
+/// carry — that it "stops a funnel growing an argument beside its list" — was
+/// too strong and is withdrawn: the reviewer's `"--ignore-errors".into()` adds
+/// a fixed Git argument beside the shared list and moves neither
+/// `OsString::from` count. What it says now is narrower and true: **every
+/// string literal in each sampled funnel's body is declared here**, so an
+/// argument spelt as a literal in any form is a number that stops matching.
+/// A `const`, a variable or a call still passes, and the structural
+/// version — comparing what the funnel passes with what `sampled_command`
+/// passes, as values at run time — is a deferred row, because the seam it
+/// needs is in the parent's argv construction rather than in this file.
+///
 /// The dynamic arguments each funnel legitimately adds — a path, a commit —
-/// are counted rather than forbidden, so growing one is a change to this
-/// number rather than a silent widening.
+/// are counted rather than forbidden, so growing one is a change to a number
+/// rather than a silent widening; the same is now true of every literal,
+/// whether or not it is an argument.
 #[test]
 fn no_sampled_funnel_builds_its_argv_from_a_literal() {
     // (function, how many `OsString::from(<expression>)` arguments it adds
-    // beyond its shared list, and what they are).
-    const SAMPLED: &[(&str, usize, &str)] = &[
+    // beyond its shared list, how many string literals its body holds at all,
+    // and what those literals are).
+    const SAMPLED: &[(&str, usize, usize, &str)] = &[
         (
             "pub fn add_worktree(",
             1,
-            "the commit; the path is a PathBuf",
+            1,
+            "the commit is the dynamic argument, the path is a PathBuf; the one literal is \
+             the `operation: \"create\"` field of a Filesystem error, not a Git argument",
         ),
-        ("pub fn candidate_stage(", 0, "none"),
-        ("pub fn candidate_write_tree(", 0, "none"),
-        ("pub fn proposal_cherry_pick(", 1, "the commit to pick"),
+        ("pub fn candidate_stage(", 0, 0, "none of either"),
+        ("pub fn candidate_write_tree(", 0, 0, "none of either"),
+        (
+            "pub fn proposal_cherry_pick(",
+            1,
+            2,
+            "the commit to pick is the dynamic argument; the two literals are the argv of a \
+             SECOND, unsampled Git child, `git rev-parse HEAD`, which this funnel runs after \
+             the pick to read the proposal commit",
+        ),
     ];
     // CRLF normalized first: the Windows guest checks this tree out with it,
     // and `find("\n    }\n")` does not match `\r\n    }\r\n`. Measured — this
@@ -8414,18 +8517,32 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace_manager.rs"))
             .expect("the funnel module's source")
             .replace("\r\n", "\n");
-    for (signature, dynamic, what) in SAMPLED {
-        let (literals, dynamics) = sampled_argv_counts(&source, signature);
+    for (signature, dynamic, literal, what) in SAMPLED {
+        let counts = sampled_argv_counts(&source, signature);
         assert_eq!(
-            literals, 0,
-            "`{signature}` builds {literals} Git argument(s) from a string literal; \
-                 every fixed argument belongs in the shared list the kill sampler reads, \
-                 or the sampler stops running the command the funnel runs"
+            counts.from_literal, 0,
+            "`{signature}` builds {} Git argument(s) from a string literal; every fixed \
+                 argument belongs in the shared list the kill sampler reads, or the sampler \
+                 stops running the command the funnel runs",
+            counts.from_literal
         );
         assert_eq!(
-            dynamics, *dynamic,
-            "`{signature}` adds {dynamics} dynamic Git argument(s), not {dynamic} \
-                 ({what}); if that is deliberate, `sampled_command` needs the same one"
+            counts.dynamic, *dynamic,
+            "`{signature}` adds {} dynamic Git argument(s), not {dynamic} ({what}); if that \
+                 is deliberate, `sampled_command` needs the same one",
+            counts.dynamic
+        );
+        // The literal count, which is what the two above do not see (PR #136
+        // pass 1, finding 3): `"--ignore-errors".into()` is a fixed Git
+        // argument beside the shared list and moves neither of them. Every
+        // literal a body holds is declared, so growing one — for an argument
+        // or for anything else — is a number that stops matching rather than
+        // a change nobody reads.
+        assert_eq!(
+            counts.literals, *literal,
+            "`{signature}` holds {} string literal(s), not {literal} ({what}); a literal \
+                 added here may be a Git argument the kill sampler does not run",
+            counts.literals
         );
     }
 }
@@ -8445,27 +8562,73 @@ fn no_sampled_funnel_builds_its_argv_from_a_literal() {
 /// Takes the source as text so
 /// [`the_sampled_argv_census_counts_code_and_never_comments`] can drive it
 /// against an injected violation.
-fn sampled_argv_counts(source: &str, signature: &str) -> (usize, usize) {
+fn sampled_argv_counts(source: &str, signature: &str) -> SampledArgvCounts {
     let blanked = crate::effects::blank_comments(source);
     let body = blanked
         .split_once(signature)
         .unwrap_or_else(|| panic!("`{signature}` is no longer in this file"))
         .1;
     let body = &body[..body.find("\n    }\n").expect("the function ends")];
-    (
-        body.matches("OsString::from(\"").count(),
-        body.matches("OsString::from(").count(),
-    )
+    // Every string literal in the body, however it is spelt, counted by
+    // walking the text rather than by matching one construct. A literal is
+    // `"` … `"` with `\"` escaped; the body is already comment-blanked, so
+    // what is left is code.
+    let bytes = body.as_bytes();
+    let mut literals = 0_usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            literals += 1;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+        }
+        i += 1;
+    }
+    SampledArgvCounts {
+        from_literal: body.matches("OsString::from(\"").count(),
+        dynamic: body.matches("OsString::from(").count(),
+        literals,
+    }
 }
 
-/// The census's own positive control (§12).
+/// What [`sampled_argv_counts`] found in one funnel body.
+#[derive(Debug, PartialEq, Eq)]
+struct SampledArgvCounts {
+    /// `OsString::from("…")` — a fixed Git argument spelt inline.
+    from_literal: usize,
+    /// `OsString::from(…)` of any kind, fixed or dynamic.
+    dynamic: usize,
+    /// **Every** string literal in the body, whatever it is for.
+    ///
+    /// The two counts above match two exact spellings, and a census over
+    /// source text is satisfied by any sibling spelling — PR #136 pass 1,
+    /// finding 3, with the reproduction `"--ignore-errors".into()`, which adds
+    /// a fixed Git argument beside the shared list while leaving both of them
+    /// unchanged. This count is not fooled by that one, because the argument
+    /// is still a literal. It is fooled by a `const`, a variable or a call,
+    /// which is why the claim this census carries is narrowed to what it can
+    /// actually support and the structural version is a deferred row.
+    literals: usize,
+}
+
+/// The census's own positive controls (§12), one per thing it can miss.
 ///
-/// The violation is the one the census exists to catch — a fixed Git argument
-/// built from a literal beside the shared list — and the negative case is the
-/// same text in a comment, which is what blanking is for.
+/// The first violation is the one the census was written for — a fixed Git
+/// argument spelt `OsString::from("…")` beside the shared list. The second is
+/// **the reviewer's**, PR #136 pass 1, finding 3: `"--ignore-errors".into()`
+/// is the same defect in another spelling, and it leaves both
+/// `OsString::from` counts exactly where they were. It is the reason this
+/// census now counts literals at all, and the reason the claim it carries is
+/// narrowed: a `const`, a variable or a call would still pass all three
+/// counts, which no amount of text-matching fixes.
+///
+/// The negative case is the same text in a comment, which is what blanking is
+/// for.
 #[test]
 fn the_sampled_argv_census_counts_code_and_never_comments() {
-    let commented = "\
+    let clean = "\
 impl WorkspaceManager {
     pub fn sampled(&self) {
         let mut argv = fixed(&Self::SAMPLED_ARGV);
@@ -8474,20 +8637,39 @@ impl WorkspaceManager {
     }
 }
 ";
+    let comment = "// Never OsString::from(\"--force\") here: it belongs in the list.";
     assert_eq!(
-        sampled_argv_counts(commented, "pub fn sampled("),
-        (0, 1),
-        "a comment naming the construct is prose and is not an argument"
+        sampled_argv_counts(clean, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 0,
+            dynamic: 1,
+            literals: 0,
+        },
+        "a comment naming either construct is prose and is not an argument"
     );
 
-    let violating = commented.replace(
-        "// Never OsString::from(\"--force\") here: it belongs in the list.",
-        "argv.push(OsString::from(\"--force\"));",
+    let inline = clean.replace(comment, "argv.push(OsString::from(\"--force\"));");
+    assert_eq!(
+        sampled_argv_counts(&inline, "pub fn sampled("),
+        SampledArgvCounts {
+            from_literal: 1,
+            dynamic: 2,
+            literals: 1,
+        },
+        "an argument spelt `OsString::from(\"…\")` must move every count that can see it"
+    );
+
+    let sibling = clean.replace(comment, "argv.push(\"--ignore-errors\".into());");
+    let counts = sampled_argv_counts(&sibling, "pub fn sampled(");
+    assert_eq!(
+        (counts.from_literal, counts.dynamic),
+        (0, 1),
+        "the reviewer's reproduction: `.into()` moves neither `OsString::from` count, which \
+         is exactly why this census was fail-open"
     );
     assert_eq!(
-        sampled_argv_counts(&violating, "pub fn sampled("),
-        (1, 2),
-        "the injected literal argument must be counted, or this census cannot fail"
+        counts.literals, 1,
+        "…and it is the literal count that sees it, which is the repair"
     );
 }
 
@@ -8899,6 +9081,21 @@ struct SampledLaunch {
     argv: Vec<String>,
     after: std::time::Duration,
     fired: Option<std::time::Duration>,
+    /// What [`SampledChild::kill`] answered, when it answered an error.
+    ///
+    /// **`fired` says a kill ran at this child; it does not say the kill
+    /// worked** (PR #136 pass 1, finding 4). The result was discarded at the
+    /// call site with `let _ =`, so a shape whose kills all *failed* while its
+    /// children exited normally passed its per-shape checks — every child was
+    /// fired at, none was `Failed` — and another shape's successful kills
+    /// satisfied the one global floor. The suite could then certify killing all
+    /// four command shapes with one of them never killed. §7 asks a discard to
+    /// be best-effort with a defined failure path; this is the definition, and
+    /// the assertion beside the firing count is the path.
+    kill_error: Option<String>,
+    /// [`SampledChild::already_exited`], carried out so the assertion can pair
+    /// it with `kill_error`: an error is legal exactly when this is true.
+    already_exited: bool,
     end: LaunchEnd,
 }
 
@@ -8963,6 +9160,17 @@ struct SampledChild {
     /// What the clock said when a kill fired at this child, or `None` if
     /// none ever did. Written only by [`Self::kill`].
     fired: Option<std::time::Duration>,
+    /// Whether the child had **already reached its own exit** when the kill
+    /// fired, read by [`Self::kill`] immediately before killing.
+    ///
+    /// This is the discriminator the kill's error value needs. A kill of an
+    /// exited child fails on both platforms — `ERROR_ACCESS_DENIED` from
+    /// `TerminateProcess`, `InvalidInput` from a `Child` already reaped by
+    /// `try_wait` — and that failure is legal, because the ladder deliberately
+    /// reaches past the end of a fast run. A kill that fails at a child which
+    /// is still *running* is not legal, and nothing else in this harness can
+    /// tell the two apart.
+    already_exited: bool,
 }
 
 impl SampledChild {
@@ -8981,6 +9189,7 @@ impl SampledChild {
             child,
             spawned: std::time::Instant::now(),
             fired: None,
+            already_exited: false,
         }
     }
 
@@ -8999,8 +9208,14 @@ impl SampledChild {
     /// but a real kill produces.
     fn kill(&mut self) -> std::io::Result<()> {
         let fired = self.spawned.elapsed();
+        // Read before the kill, because afterwards it cannot be read at all:
+        // once the kill has run, an exit and a kill are the same wait status.
+        // `try_wait` reaps an already-exited child, and `Child::wait` returns
+        // the status it cached, so the reap below still answers.
+        let already_exited = matches!(self.child.try_wait(), Ok(Some(_)));
         let outcome = self.child.kill();
         self.fired = Some(fired);
+        self.already_exited = already_exited;
         outcome
     }
 
@@ -9012,7 +9227,12 @@ impl SampledChild {
 fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
     let mut child = SampledChild::spawn(cwd, args);
     std::thread::sleep(after);
-    let _ = child.kill();
+    // Kept, not discarded. A kill of a child that has already reached its own
+    // exit legitimately fails on Windows -- `TerminateProcess` answers
+    // `ERROR_ACCESS_DENIED` for an exited process -- so this is not an
+    // `expect`; what it is is evidence, and the per-shape assertion pairs it
+    // with how the child ended.
+    let kill_error = child.kill().err().map(|error| error.to_string());
     // Reaped rather than discarded: this status is the whole observation.
     let status = child.wait().expect("reap the sampled git child");
     SAMPLED_LAUNCHES
@@ -9022,6 +9242,8 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) {
             argv: args.to_vec(),
             after,
             fired: child.fired,
+            kill_error,
+            already_exited: child.already_exited,
             end: launch_end(&status),
         });
 }

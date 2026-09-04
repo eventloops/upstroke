@@ -6344,15 +6344,35 @@ itself repairs in the same commit, and the `deferred` rows each name the file th
 was merged in first, and `5f661fa` after, the second with one append-at-the-tail conflict in this
 file, resolved as the union with master's §53 before this §54.
 
-**§6 and §7 in this file.** No `Rc`, no `Arc` and no lock the file owns: the one `Arc<Mutex<_>>`
-is `HookHarness`', constructed by the `harness()` helper because `HarnessEffects::new` takes one,
-and it is the shared observer whose lifecycle `src/workspace_manager/hooks.rs` states. There is no
-`.unwrap()` anywhere in the file, and the three `?` sites are all inside `parse_budget_spec`,
-where each maps into a `BudgetSpecError` variant that names what was wrong with the operator's
-spec. What §7 did find is the discard rule: four `let _ =` and three `.ok()`, of which two are
-repaired here (`let _ = &slot`/`let _ = &absent` were keeping a fixture alive that nothing read,
-`let _ = &intents_dir` was standing in for an assertion the Windows leg was not running) and the
-rest are recorded, one fixed by keeping the discarded error's words for the diagnostic.
+**§6 and §7 in this file, re-derived by reading the tree rather than from recollection**
+(PR #136 pass 1, finding 5 corrects the first version of this paragraph, which said "no `Arc` and
+no lock the file owns" and was false in both halves). There is no `Rc`. There are three kinds of
+shared ownership, and each has a reason at its site:
+
+* `Arc<Mutex<HookHarness>>`, built by the `harness()` helper and once inline in
+  `the_intent_and_its_directory_are_synced_before_the_add_begins`. Two holders with independent
+  lifetimes — the `HarnessEffects` moved into the funnel, and the test that reads the log after
+  it returns — which is §6's stated exception; `src/workspace_manager/hooks.rs`, already swept,
+  states the protected invariant.
+* `static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>>`, **a lock this file does own**,
+  process-global and appended to inside `kill_git_child`. Its long doc comment gives the reason:
+  the record must be written by the statement that performs the kill, and an observer threaded
+  from the test to that statement is one an edit can walk past — which is what `PR5-R5-002`
+  measured. It is a `Mutex` rather than a channel because the readers are assertions that run
+  after every sample.
+* Six `Arc<Atomic…>` values in the closing-handle and removal-attempt tests, each cloned into a
+  spawned thread or an observer closure, which is §6's "transfer to another thread". **These
+  arrived with the `5f661fa` merge-in (PR #109) and are not this sweep's lines**; they are
+  recorded here because the file is being listed as swept and a reader of that table should not
+  have to discover them.
+
+§7: there is no `.unwrap()` anywhere in the file, and the three `?` sites are all inside
+`parse_budget_spec`, each mapping into a `BudgetSpecError` variant that names what was wrong with
+the operator's spec. What the rule found was the discard clause — `let _ =` and `.ok()` sites, of
+which this pull request repairs four (`let _ = &slot`/`let _ = &absent` kept a fixture alive that
+nothing read; `let _ = &intents_dir` stood in for an assertion the Windows leg was not running;
+`let _ = child.kill()` discarded the one answer that says whether a kill killed) and records the
+rest.
 
 **What the four limbs found.** The census of the suite's tests is in the pull-request body ---
 126 `#[test]` items at the base, of which 122 compile on Linux, four are Windows-only and
