@@ -27,8 +27,12 @@ after a red run. A check over one document cannot observe a property of two, so 
 this file can hold the freeze. The same limit sits one level up: `Evidence::Executed` names its
 test as free text, and nothing in the crate checks that a test of that name exists or that it ran.
 
-The check is not wrong about anything it claims. What is missing is an authority outside the
-document for the numbers the document asserts, and the module said nothing about the gap.
+What is missing is an authority outside the document for the numbers the document asserts, and
+the module said nothing about the gap. (An earlier version of this file said the check was not
+wrong about anything it claims. Pass 1 on `ffe26ca` disproved that: the accounting sum saturated,
+so `n = u32::MAX` with a histogram one sample over passed. That is fixed at `aa52b41` and is a
+`fixed` row of PR #146's ledger, not this finding — this finding is about the authority for `n`,
+which the fix does not and cannot supply.)
 
 ## Why this is deferred as beyond reach, not as out of scope
 

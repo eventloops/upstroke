@@ -31,6 +31,21 @@ the section to change in the same pull request as the decision. For the `#106 ef
 that rule has nothing to bind to. A reviewer asked to check that this file enforces what the design
 says has no design to check it against, and is left checking it against its own comments.
 
+## What pass 1 on `ffe26ca` said, and where the decision sits
+
+The frontier reviewer (finding 2, `CHANGES_REQUIRED`) holds that deferring this does not satisfy
+the binding rule that `DESIGN.md` is the sole living authority, that having `DESIGN.md` merely
+declare an external authority contradicts the same rule, and that **the binding ST-07 contract
+must be placed in `DESIGN.md` before this file can be marked swept.** PR #146 accordingly does not
+claim `src/topology/effects/bijection.rs` swept: the row stays in the review queue with a note,
+and the code improvements land on their own.
+
+The remedy is a `DESIGN.md` change, which is the owner's, and this is the third pull request on
+2026-09-04 blocked on the same rule (#139 and #143 are the others). The coordinator is
+consolidating the three into one decision for the owner. **Beyond reach, not out of scope:** no
+sweep session can settle it, so if a later pass labels this P1 or P2 the disposition becomes
+escalate-to-owner rather than still-deferred.
+
 ## What the change that takes this up should do
 
 This is the family's question, not one file's, and the natural place to settle it is
