@@ -414,9 +414,121 @@ fn refuse_unplain_run_id(run_id: &str) -> Result<(), Refusal> {
 
 mod containment;
 use self::containment::{
-    canonical_prefix, is_at_or_inside, refuse_reparse_points, refuse_unreal_directory,
+    Leaf, canonical_prefix, is_at_or_inside, refuse_reparse_points, refuse_unreal_directory,
     strip_verbatim,
 };
+
+// ---------------------------------------------------------------------------
+// The paths each funnel primitive acts through
+// ---------------------------------------------------------------------------
+
+/// One kind of path a funnel primitive acts through after its `Before` hook.
+///
+/// A primitive's set is data ([`Primitive::acted_through`]) so that one helper
+/// can walk all of it immediately before the syscalls and one test can plant a
+/// link at each path in turn. The lesson of four review passes: repairing the
+/// path a reviewer names leaves its sibling open — the root, then
+/// `hooks-none`, then the staging leaf, then the admin directory and the
+/// intent — and only the enumerated set closes the class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActedThrough {
+    /// The execution root, as a directory.
+    ExecutionRoot,
+    /// The five scaffolding directories under the root.
+    Scaffolding,
+    /// `intents/`, as a directory: what an intent write, removal or read
+    /// resolves through.
+    IntentsDirectory,
+    /// The slot's intent file: the record an add authorises on, a write's
+    /// rename target, a removal's target.
+    IntentFile,
+    /// The slot's parent directory (`tasks/`, `merge/` or `snapshots/`).
+    SlotParent,
+    /// The slot's checkout as Git's working directory.
+    SlotCheckoutDirectory,
+    /// The slot's checkout as a target that may be anything yet: what an add
+    /// creates, what a removal deletes.
+    SlotCheckoutEntry,
+    /// `hooks-none`, every Git command's `core.hooksPath`.
+    HooksPath,
+    /// The worktree's registration under the common git dir: its admin
+    /// directory, and the `gitdir` and `locked` entries inside it.
+    Registration,
+}
+
+/// The funnel primitives, each with the paths it acts through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Primitive {
+    CreateExecutionRoot,
+    RemoveExecutionRoot,
+    WriteIntent,
+    RemoveIntent,
+    /// The removal of a staging orphan by [`WorkspaceManager::reclaim_intents`].
+    ReclaimStagingOrphan,
+    AddWorktree,
+    VerifyWorktree,
+    RemoveWorktree,
+    CandidateStage,
+    CandidateWriteTree,
+    ProposalCherryPick,
+    RepairMaterialize,
+    CreateRef,
+    CompareAndSwapRef,
+    DeleteRef,
+}
+
+impl Primitive {
+    /// Every primitive, for a test to iterate.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 15] = [
+        Self::CreateExecutionRoot,
+        Self::RemoveExecutionRoot,
+        Self::WriteIntent,
+        Self::RemoveIntent,
+        Self::ReclaimStagingOrphan,
+        Self::AddWorktree,
+        Self::VerifyWorktree,
+        Self::RemoveWorktree,
+        Self::CandidateStage,
+        Self::CandidateWriteTree,
+        Self::ProposalCherryPick,
+        Self::RepairMaterialize,
+        Self::CreateRef,
+        Self::CompareAndSwapRef,
+        Self::DeleteRef,
+    ];
+
+    /// The paths this primitive acts through after its `Before` hook, in the
+    /// order they are walked. The Git-running primitives list `HooksPath`
+    /// even though the Git runner walks it again for every command
+    /// ([`WorkspaceManager::revalidate_hooks_path`]): the table is the set the
+    /// containment doc claims, and the runner's walk is what also covers the
+    /// reads and the reference transactions.
+    pub(crate) fn acted_through(self) -> &'static [ActedThrough] {
+        use ActedThrough as A;
+        match self {
+            Self::CreateExecutionRoot | Self::RemoveExecutionRoot => {
+                &[A::ExecutionRoot, A::Scaffolding]
+            }
+            Self::WriteIntent | Self::RemoveIntent => &[A::IntentsDirectory, A::IntentFile],
+            Self::ReclaimStagingOrphan => &[A::IntentsDirectory],
+            Self::AddWorktree => &[
+                A::SlotParent,
+                A::SlotCheckoutEntry,
+                A::IntentsDirectory,
+                A::IntentFile,
+                A::HooksPath,
+            ],
+            Self::VerifyWorktree
+            | Self::CandidateStage
+            | Self::CandidateWriteTree
+            | Self::ProposalCherryPick
+            | Self::RepairMaterialize => &[A::SlotCheckoutDirectory, A::HooksPath],
+            Self::RemoveWorktree => &[A::SlotCheckoutEntry, A::HooksPath, A::Registration],
+            Self::CreateRef | Self::CompareAndSwapRef | Self::DeleteRef => &[A::HooksPath],
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Slots: the worktree, staging, and snapshot names the packet gives
@@ -767,7 +879,122 @@ impl WorkspaceManager {
     /// that could not be read or is a regular file.
     fn revalidate_chain(&self, below: &Path) -> Result<(), UpstrokeError> {
         refuse_unreal_directory(&self.base)?;
-        refuse_reparse_points(&self.private_root, below)
+        refuse_reparse_points(&self.private_root, below, Leaf::Directory)
+    }
+
+    /// Every path `primitive` acts through, resolved for this manager: the
+    /// anchor its chain is walked from, the path, and what its leaf may be.
+    ///
+    /// `slot` is required by the slot roles and `registration` by
+    /// [`ActedThrough::Registration`]; a primitive whose table names a role
+    /// its caller cannot supply is a programming error, reported rather than
+    /// skipped, because a skipped path is exactly an unwalked one.
+    ///
+    /// # Errors
+    ///
+    /// The role's requirement not met.
+    pub(crate) fn acted_through_paths(
+        &self,
+        primitive: Primitive,
+        slot: Option<&Slot>,
+        registration: Option<&Path>,
+    ) -> Result<Vec<(PathBuf, PathBuf, Leaf)>, UpstrokeError> {
+        let mut paths = Vec::new();
+        let anchor = self.private_root.clone();
+        let need_slot = |role: ActedThrough| {
+            slot.ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "internal: {primitive:?} acts through {role:?} but was given no slot"
+                ),
+            })
+        };
+        for role in primitive.acted_through() {
+            match role {
+                ActedThrough::ExecutionRoot => {
+                    paths.push((anchor.clone(), self.execution_root.clone(), Leaf::Directory));
+                }
+                ActedThrough::Scaffolding => {
+                    for directory in [
+                        self.execution_root.join("intents"),
+                        self.execution_root.join("tasks"),
+                        self.execution_root.join("merge"),
+                        self.execution_root.join("snapshots"),
+                        self.hooks_dir(),
+                    ] {
+                        paths.push((anchor.clone(), directory, Leaf::Directory));
+                    }
+                }
+                ActedThrough::IntentsDirectory => {
+                    paths.push((
+                        anchor.clone(),
+                        self.execution_root.join("intents"),
+                        Leaf::Directory,
+                    ));
+                }
+                ActedThrough::IntentFile => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.intent_path(slot), Leaf::Entry));
+                }
+                ActedThrough::SlotParent => {
+                    let slot = need_slot(*role)?;
+                    let parent = self
+                        .slot_path(slot)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.execution_root.clone());
+                    paths.push((anchor.clone(), parent, Leaf::Directory));
+                }
+                ActedThrough::SlotCheckoutDirectory => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.slot_path(slot), Leaf::Directory));
+                }
+                ActedThrough::SlotCheckoutEntry => {
+                    let slot = need_slot(*role)?;
+                    paths.push((anchor.clone(), self.slot_path(slot), Leaf::Entry));
+                }
+                ActedThrough::HooksPath => {
+                    paths.push((anchor.clone(), self.hooks_dir(), Leaf::Directory));
+                }
+                ActedThrough::Registration => {
+                    if let Some(admin) = registration {
+                        let git_dir = self.common_git_dir.clone();
+                        paths.push((git_dir.clone(), admin.to_path_buf(), Leaf::Directory));
+                        paths.push((git_dir.clone(), admin.join("gitdir"), Leaf::Entry));
+                        paths.push((git_dir, admin.join("locked"), Leaf::Entry));
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Walk every path `primitive` acts through, immediately before its
+    /// syscalls: the managed base is a real directory, and each path's chain
+    /// from its anchor down is plain components, each a real directory
+    /// (or, at an [`Leaf::Entry`] leaf, anything but a reparse point), read
+    /// with `symlink_metadata` so that no link anywhere on it is followed.
+    ///
+    /// This runs inside the funnel, after the `Before` hook, so a path
+    /// exchanged for a link there refuses. The window that remains is between
+    /// this walk and each syscall, which only directory-relative syscalls
+    /// close.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::BaseIsNotADirectory`], [`Refusal::RootOutsidePrivateRoot`],
+    /// [`Refusal::ReparsePointOnChain`], or an I/O error naming the component
+    /// that could not be read or is a regular file where a directory must be.
+    fn revalidate_acted_through(
+        &self,
+        primitive: Primitive,
+        slot: Option<&Slot>,
+        registration: Option<&Path>,
+    ) -> Result<(), UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        for (anchor, path, leaf) in self.acted_through_paths(primitive, slot, registration)? {
+            refuse_reparse_points(&anchor, &path, leaf)?;
+        }
+        Ok(())
     }
 
     /// Whether `worktree` occupies one of this manager's own slot namespaces.
@@ -847,7 +1074,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
             || {
-                self.revalidate_chain(&self.execution_root)?;
+                self.revalidate_acted_through(Primitive::CreateExecutionRoot, None, None)?;
                 fs::create_dir_all(&self.execution_root).map_err(|source| UpstrokeError::Io {
                     path: self.execution_root.clone(),
                     source,
@@ -859,7 +1086,6 @@ impl WorkspaceManager {
                     self.execution_root.join("snapshots"),
                     self.hooks_dir(),
                 ] {
-                    self.revalidate_chain(&directory)?;
                     fs::create_dir_all(&directory).map_err(|source| UpstrokeError::Io {
                         path: directory,
                         source,
@@ -888,7 +1114,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
             || {
-                self.revalidate_chain(&self.execution_root)?;
+                self.revalidate_acted_through(Primitive::RemoveExecutionRoot, None, None)?;
                 match fs::symlink_metadata(&self.execution_root) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -908,7 +1134,6 @@ impl WorkspaceManager {
                     self.execution_root.join("merge"),
                     self.execution_root.join("snapshots"),
                 ] {
-                    self.revalidate_chain(&scaffolding)?;
                     if !directory_is_empty(&scaffolding)? {
                         continue;
                     }
@@ -955,10 +1180,15 @@ impl WorkspaceManager {
     /// `Snapshot.WriteIntent`.
     ///
     /// `slice_contract.invariants_introduced[1]`: "worktree and snapshot
-    /// intents **synced before add**". The record is written to a temporary,
-    /// fsynced, renamed, and the directory fsynced, so an interrupted write
-    /// leaves either nothing or a complete record — never a half-parsed one
-    /// that reclaim would refuse.
+    /// intents **synced before add**". The record is written to a staging
+    /// file under a fresh `.stage-<ULID>.tmp` name, fsynced, renamed, and the
+    /// directory fsynced, so an interrupted write leaves either nothing, a
+    /// complete record, or a staging file — never a half-parsed record that
+    /// reclaim would refuse. A staging file is never an intent: `intents`
+    /// ignores the shape and `reclaim_intents` removes it, since a write
+    /// interrupted before its rename was not durable. The staging name is
+    /// 37 bytes whatever the slot is called, so no valid slot name is
+    /// narrowed against `NAME_MAX`.
     ///
     /// # Errors
     ///
@@ -992,9 +1222,8 @@ impl WorkspaceManager {
             incarnation: self.incarnation.clone(),
         };
         let ledger = hooks.durability_ledger();
-        let directory = self.execution_root.join("intents");
         funnel(hooks, slot.write_intent_site(), || {
-            self.revalidate_chain(&directory)?;
+            self.revalidate_acted_through(Primitive::WriteIntent, Some(slot), None)?;
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
                 message: format!("serializing the {} intent: {error}", slot.kind()),
             })?;
@@ -1022,7 +1251,7 @@ impl WorkspaceManager {
         let path = directory.join(slot.intent_name());
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.remove_intent_site(), || {
-            self.revalidate_chain(&directory)?;
+            self.revalidate_acted_through(Primitive::RemoveIntent, Some(slot), None)?;
             match fs::remove_file(&path) {
                 Ok(()) => sync_directory(&directory, &ledger),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1058,6 +1287,10 @@ impl WorkspaceManager {
             let name = name.to_str().ok_or_else(|| UpstrokeError::Git {
                 message: format!("intent {} has a non-UTF-8 name", entry.path().display()),
             })?;
+            // A staging file is never an intent; `reclaim_intents` removes it.
+            if is_staging_name(name) {
+                continue;
+            }
             let slot = Slot::from_intent_name(name).ok_or_else(|| UpstrokeError::Git {
                 message: format!(
                     "unexpected file `{name}` in the intent directory of {}",
@@ -1099,7 +1332,56 @@ impl WorkspaceManager {
             self.remove_worktree(hooks, slot)?;
             self.remove_intent(hooks, slot)?;
         }
+        self.reclaim_staging_orphans(hooks)?;
         Ok(slots)
+    }
+
+    /// Remove every staging file a crashed `write_intent` left in `intents/`.
+    ///
+    /// The §8 staging protocol's recovery rule (see `is_staging_name`): a
+    /// write interrupted before its rename was not durable, and its leftover
+    /// is not an intent. Each removal runs under the intent-removal site, the
+    /// row the leftover would have joined.
+    fn reclaim_staging_orphans(&self, hooks: &mut dyn EffectHooks) -> Result<(), UpstrokeError> {
+        let directory = self.execution_root.join("intents");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(UpstrokeError::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        let ledger = hooks.durability_ledger();
+        for entry in entries {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+            let name = entry.file_name();
+            if !name.to_str().is_some_and(is_staging_name) {
+                continue;
+            }
+            let orphan = entry.path();
+            funnel(
+                hooks,
+                EffectSiteId::Worktree(WorktreeSite::RemoveIntent),
+                || {
+                    self.revalidate_acted_through(Primitive::ReclaimStagingOrphan, None, None)?;
+                    match fs::remove_file(&orphan) {
+                        Ok(()) => sync_directory(&directory, &ledger),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(source) => Err(UpstrokeError::Io {
+                            path: orphan.clone(),
+                            source,
+                        }),
+                    }
+                },
+            )?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1159,7 +1441,7 @@ impl WorkspaceManager {
         self.revalidate()?;
         let intent = self.intent_path(slot);
         funnel(hooks, slot.add_site(), move || {
-            self.revalidate_chain(&path)?;
+            self.revalidate_acted_through(Primitive::AddWorktree, Some(slot), None)?;
             // Inside the funnel, after the `Before` hook: an intent removed
             // between a check outside and the add would leave a worktree that
             // `reclaim_intents` can never find. Absent is the refusal;
@@ -1228,7 +1510,7 @@ impl WorkspaceManager {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(hooks, EffectSiteId::Worktree(WorktreeSite::Verify), || {
-            self.revalidate_chain(&path)?;
+            self.revalidate_acted_through(Primitive::VerifyWorktree, Some(slot), None)?;
             self.quiescence(&path, expected)
         })
     }
@@ -1414,7 +1696,11 @@ impl WorkspaceManager {
         let path = self.slot_target(slot)?;
         let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
-            self.revalidate_chain(&path)?;
+            self.revalidate_acted_through(
+                Primitive::RemoveWorktree,
+                Some(slot),
+                registration.as_deref(),
+            )?;
             let present = match fs::symlink_metadata(&path) {
                 Ok(_) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1577,6 +1863,7 @@ impl WorkspaceManager {
         self.refuse_symbolic(refname)?;
         refuse_malformed_object_id(refname, "new", new)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::CreateRef, None, None)?;
             self.update_ref(&["--no-deref", refname, new, ""])
         })
     }
@@ -1599,6 +1886,7 @@ impl WorkspaceManager {
         refuse_malformed_object_id(refname, "new", new)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::CompareAndSwapRef, None, None)?;
             self.update_ref(&["--no-deref", refname, new, old])
         })
     }
@@ -1619,6 +1907,7 @@ impl WorkspaceManager {
         self.refuse_symbolic(refname)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
+            self.revalidate_acted_through(Primitive::DeleteRef, None, None)?;
             self.update_ref(&["--no-deref", "-d", refname, old])
         })
     }
@@ -1769,7 +2058,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateStage),
             || {
-                self.revalidate_chain(&path)?;
+                self.revalidate_acted_through(Primitive::CandidateStage, Some(slot), None)?;
                 self.git_ok(
                     &path,
                     &Self::CANDIDATE_STAGE_ARGV
@@ -1798,7 +2087,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateWriteTree),
             || {
-                self.revalidate_chain(&path)?;
+                self.revalidate_acted_through(Primitive::CandidateWriteTree, Some(slot), None)?;
                 self.git_line(&path, &Self::CANDIDATE_WRITE_TREE_ARGV)
             },
         )
@@ -1932,7 +2221,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::ProposalCherryPick),
             || {
-                self.revalidate_chain(&path)?;
+                self.revalidate_acted_through(Primitive::ProposalCherryPick, Some(slot), None)?;
                 let mut argv: Vec<OsString> = Self::PROPOSAL_CHERRY_PICK_ARGV
                     .iter()
                     .map(OsString::from)
@@ -1967,7 +2256,7 @@ impl WorkspaceManager {
             hooks,
             EffectSiteId::Object(ObjectSite::RepairMaterialize),
             || {
-                self.revalidate_chain(&path)?;
+                self.revalidate_acted_through(Primitive::RepairMaterialize, Some(slot), None)?;
                 self.git_ok(
                     &path,
                     &[
@@ -2183,7 +2472,7 @@ impl WorkspaceManager {
     /// [`Refusal::BaseIsNotADirectory`], [`Refusal::ReparsePointOnChain`], or
     /// an I/O error naming the component that could not be read.
     fn revalidate_hooks_path(&self) -> Result<(), UpstrokeError> {
-        refuse_reparse_points(&self.private_root, &self.hooks_dir())
+        refuse_reparse_points(&self.private_root, &self.hooks_dir(), Leaf::Directory)
     }
 
     /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
@@ -2698,17 +2987,14 @@ fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<
         path: parent.to_path_buf(),
         source,
     })?;
-    let name = path.file_name().ok_or_else(|| UpstrokeError::Git {
-        message: format!("{} has no file name", path.display()),
-    })?;
-    // A per-call unique staging name, and `create_new`: a fixed name is a
-    // name anyone can plant, and `File::create` follows a link planted there
-    // to whatever it names. `create_new` refuses an existing name of any
-    // kind, link included, so the staged file is this call's alone.
-    let mut staged_name = OsString::from(".");
-    staged_name.push(name);
-    staged_name.push(format!(".{}.tmp", crate::ulid::ulid()));
-    let staged = parent.join(staged_name);
+    // A per-call unique staging name of fixed length, and `create_new`: a
+    // fixed name is a name anyone can plant, and `File::create` follows a
+    // link planted there to whatever it names; `create_new` refuses an
+    // existing name of any kind, link included, so the staged file is this
+    // call's alone. The name carries no part of the record's own name, so it
+    // is 37 bytes whatever the slot is called and narrows no valid slot name
+    // against `NAME_MAX`; `is_staging_name` is what recognises it again.
+    let staged = parent.join(staging_name());
     let written = {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -2754,6 +3040,22 @@ fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<
         })?;
     ledger.record(DurableStep::Renamed, path, length);
     sync_directory(parent, ledger)
+}
+
+/// A fresh staging name: `.stage-<ULID>.tmp`, 37 bytes, unique per call.
+fn staging_name() -> String {
+    format!(".stage-{}.tmp", crate::ulid::ulid())
+}
+
+/// Whether `name` has the shape [`staging_name`] produces.
+///
+/// The §8 staging protocol's recovery rule: a staging file is never an
+/// intent. `WorkspaceManager::intents` ignores this shape, and
+/// `WorkspaceManager::reclaim_intents` removes it — a write interrupted
+/// before its rename was not durable, by `write_intent`'s contract, and its
+/// leftover is reclaimed with the rest.
+fn is_staging_name(name: &str) -> bool {
+    name.starts_with(".stage-") && name.ends_with(".tmp")
 }
 
 /// fsync `file` and record what was made durable, in one call.

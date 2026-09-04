@@ -937,7 +937,7 @@ fn an_execution_root_with_no_plain_chain_below_the_private_root_refuses_before_a
             .join("escape"),
         fixture.root.join("escape"),
     ] {
-        let error = refuse_reparse_points(&anchor, &root)
+        let error = refuse_reparse_points(&anchor, &root, Leaf::Directory)
             .expect_err("a root with no plain chain below the anchor refuses");
         let message = refusal_of(&error);
         assert!(
@@ -1284,7 +1284,7 @@ fn canonical_prefix_resolves_an_existing_relative_prefix_and_rejoins_the_rest() 
 fn an_absent_anchor_refuses_as_not_a_real_directory() {
     let fixture = Fixture::new("absent-anchor");
     let anchor = fixture.root.join("never-created");
-    let error = refuse_reparse_points(&anchor, &anchor.join("workspaces"))
+    let error = refuse_reparse_points(&anchor, &anchor.join("workspaces"), Leaf::Directory)
         .expect_err("an absent anchor refuses");
     let message = refusal_of(&error);
     assert!(
@@ -1566,12 +1566,14 @@ fn a_link_planted_at_the_old_staging_name_is_never_followed_by_the_intent_write(
     );
 }
 
-/// A link planted at the intent's own name is replaced by the rename, which
-/// does not follow it: the victim it named is untouched and the intent lands
-/// as a regular file. The valid call lands atomically over a hostile leaf.
+/// A link planted at the intent's own name is a reparse point on a path the
+/// write acts through (its rename target), and refuses like a link anywhere
+/// else on the chain: the victim it named is untouched and nothing lands. A
+/// file link needs a symlink, which the Windows guest's test user cannot
+/// create.
 #[cfg(unix)]
 #[test]
-fn a_link_planted_at_the_intent_name_is_replaced_not_followed_by_the_intent_write() {
+fn a_link_planted_at_the_intent_name_refuses_the_intent_write() {
     let fixture = Fixture::created("intent-name-planted");
     let slot = fixture.task("eta", 1);
     let victim = fixture.root.join("victim.txt");
@@ -1579,19 +1581,27 @@ fn a_link_planted_at_the_intent_name_is_replaced_not_followed_by_the_intent_writ
     let intent = fixture.manager.intent_path(&slot);
     std::os::unix::fs::symlink(&victim, &intent).expect("plant the link at the intent's name");
 
-    fixture
+    let error = fixture
         .manager
         .write_intent(&mut NoHooks, &slot)
-        .expect("the write lands over the planted link");
+        .expect_err("a link at the intent's name refuses the write");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intent.display().to_string()),
+        "the refusal must name its reason and the link: {message}"
+    );
     assert_eq!(
         fs::read(&victim).expect("victim"),
         b"victim bytes\n",
         "the victim is untouched"
     );
-    let landed = fs::symlink_metadata(&intent).expect("the intent");
     assert!(
-        landed.is_file() && landed.len() > 0,
-        "the intent is a regular file with the record, not the link"
+        fs::symlink_metadata(&intent)
+            .expect("the link")
+            .file_type()
+            .is_symlink(),
+        "and the planted link is still a link: nothing landed"
     );
 }
 
@@ -1651,6 +1661,479 @@ fn an_intent_removed_at_the_before_hook_refuses_the_worktree_add() {
         (0, 0),
         "nothing is recorded and nothing is reclaimed, so the two agree"
     );
+}
+
+/// One substitution per path a primitive acts through: a `Before` hook
+/// exchanges the path for a link to an outside victim, the primitive must
+/// refuse naming the substituted component, and the victim must be
+/// untouched. Generated from `Primitive::ALL` and `acted_through_paths`, so
+/// every path the table names is driven; the case count is pinned so that a
+/// path dropped from the table is a case that stops being generated and a
+/// number that stops matching. A file link needs a symlink, which the
+/// Windows guest's test user cannot create, so the file-leaf cases run on
+/// the Unix legs and are counted as skipped on Windows.
+#[test]
+fn every_path_a_primitive_acts_through_refuses_a_link_planted_at_the_before_hook() {
+    let mut driven = 0_usize;
+    let mut skipped = 0_usize;
+    let mut driven_primitives = BTreeSet::new();
+    for primitive in Primitive::ALL {
+        let count = SubstitutionCase::new(primitive).paths().len();
+        assert!(count > 0, "{primitive:?} acts through nothing?");
+        for index in 0..count {
+            let case = SubstitutionCase::new(primitive);
+            let (_, target, leaf) = case.paths()[index].clone();
+            let existing_kind = fs::symlink_metadata(&target).ok().map(|m| m.file_type());
+            let file_link = leaf == Leaf::Entry && existing_kind.is_some_and(|k| k.is_file());
+            if file_link && cfg!(windows) {
+                skipped += 1;
+                continue;
+            }
+            let victim = case.fixture.root.join(format!("victim-{index}"));
+            let mut hooks = SubstituteAtBefore {
+                site: case.site,
+                target: target.clone(),
+                moved: target.with_extension("moved-away"),
+                victim: victim.clone(),
+                file_link,
+            };
+            // The victim carries a sentinel, and a copy of whatever the
+            // primitive would have found through the link (the intent, the
+            // registration's `gitdir` and `locked`), so a walk that followed
+            // the link would find a plausible tree, not an empty one.
+            if file_link {
+                fs::write(&victim, b"victim bytes\n").expect("victim file");
+            } else {
+                fs::create_dir_all(&victim).expect("victim directory");
+                fs::write(victim.join("sentinel.txt"), b"sentinel\n").expect("sentinel");
+                if existing_kind.is_some_and(|k| k.is_dir()) {
+                    copy_files_shallow(&target, &victim);
+                }
+            }
+            let before = snapshot(&victim);
+
+            let error = case.run(&mut hooks).expect_err(&format!(
+                "{primitive:?} through a link at {} must refuse",
+                target.display()
+            ));
+            let message = refusal_of(&error);
+            assert!(
+                message.contains("symlink or reparse point")
+                    && message.contains(&target.display().to_string()),
+                "{primitive:?}: the refusal must name its reason and the substituted \
+                 component {}: {message}",
+                target.display()
+            );
+            assert_eq!(
+                snapshot(&victim),
+                before,
+                "{primitive:?}: the victim behind {} is untouched",
+                target.display()
+            );
+            driven += 1;
+            driven_primitives.insert(format!("{primitive:?}"));
+        }
+    }
+    assert_eq!(
+        driven_primitives.len(),
+        Primitive::ALL.len(),
+        "every primitive was driven: {driven_primitives:?}"
+    );
+    // The pinned count: the table's paths, resolved. Scaffolding is five
+    // paths and Registration three, so the fifteen primitives resolve to
+    // twelve root cases, four intent, one orphan, five add, ten Git working
+    // directory, five removal and three ref cases.
+    let expected_total = 40;
+    assert_eq!(
+        driven + skipped,
+        expected_total,
+        "the table generated {driven} driven and {skipped} skipped cases; a path added to or \
+         dropped from `Primitive::acted_through` changes this number"
+    );
+    if cfg!(unix) {
+        assert_eq!(skipped, 0, "every case runs on Unix");
+    }
+}
+
+/// One generated case's fixture, in the state its primitive needs.
+struct SubstitutionCase {
+    fixture: Fixture,
+    primitive: Primitive,
+    slot: Option<Slot>,
+    registration: Option<PathBuf>,
+    site: EffectSiteId,
+    refname: String,
+}
+
+impl SubstitutionCase {
+    fn new(primitive: Primitive) -> Self {
+        use Primitive as P;
+        let created = !matches!(primitive, P::CreateExecutionRoot);
+        let fixture = if created {
+            Fixture::created("acted-through")
+        } else {
+            Fixture::new("acted-through")
+        };
+        let slot = fixture.task("table", 1);
+        let refname = "refs/upstroke/test/table".to_owned();
+        let mut registration = None;
+        match primitive {
+            P::RemoveIntent | P::AddWorktree => {
+                fixture
+                    .manager
+                    .write_intent(&mut NoHooks, &slot)
+                    .expect("write the intent");
+            }
+            P::ReclaimStagingOrphan => {
+                let orphan = fixture
+                    .manager
+                    .execution_root()
+                    .join("intents")
+                    .join(".stage-01ORPHAN0000000000000000.tmp");
+                fs::write(&orphan, b"{}").expect("plant the orphan");
+            }
+            P::VerifyWorktree
+            | P::RemoveWorktree
+            | P::CandidateStage
+            | P::CandidateWriteTree
+            | P::ProposalCherryPick
+            | P::RepairMaterialize => {
+                fixture.add_task(&mut NoHooks, "table", 1);
+                if primitive == P::RemoveWorktree {
+                    let path = fixture.manager.slot_path(&slot);
+                    registration = fixture
+                        .manager
+                        .revalidate_removal(&path)
+                        .expect("the registration");
+                    assert!(registration.is_some(), "the added worktree is registered");
+                }
+            }
+            P::CompareAndSwapRef | P::DeleteRef => {
+                fixture
+                    .manager
+                    .create_ref_zero_old(
+                        &mut NoHooks,
+                        RefSite::CreateCandidates,
+                        &refname,
+                        &fixture.head,
+                    )
+                    .expect("the ref to move or delete");
+            }
+            P::CreateExecutionRoot | P::RemoveExecutionRoot | P::WriteIntent | P::CreateRef => {}
+        }
+        let site = match primitive {
+            P::CreateExecutionRoot => EffectSiteId::Worktree(WorktreeSite::CreateExecutionRoot),
+            P::RemoveExecutionRoot => EffectSiteId::Worktree(WorktreeSite::RemoveExecutionRoot),
+            P::WriteIntent => slot.write_intent_site(),
+            P::RemoveIntent | P::ReclaimStagingOrphan => slot.remove_intent_site(),
+            P::AddWorktree => slot.add_site(),
+            P::VerifyWorktree => EffectSiteId::Worktree(WorktreeSite::Verify),
+            P::RemoveWorktree => slot.remove_site(),
+            P::CandidateStage => EffectSiteId::Object(ObjectSite::CandidateStage),
+            P::CandidateWriteTree => EffectSiteId::Object(ObjectSite::CandidateWriteTree),
+            P::ProposalCherryPick => EffectSiteId::Object(ObjectSite::ProposalCherryPick),
+            P::RepairMaterialize => EffectSiteId::Object(ObjectSite::RepairMaterialize),
+            P::CreateRef => EffectSiteId::Ref(RefSite::CreateCandidates),
+            P::CompareAndSwapRef => EffectSiteId::Ref(RefSite::CompareAndSwapIntegration),
+            P::DeleteRef => EffectSiteId::Ref(RefSite::DeleteCandidatePin),
+        };
+        let slot = if matches!(
+            primitive,
+            P::CreateExecutionRoot
+                | P::RemoveExecutionRoot
+                | P::ReclaimStagingOrphan
+                | P::CreateRef
+                | P::CompareAndSwapRef
+                | P::DeleteRef
+        ) {
+            None
+        } else {
+            Some(slot)
+        };
+        Self {
+            fixture,
+            primitive,
+            slot,
+            registration,
+            site,
+            refname,
+        }
+    }
+
+    fn paths(&self) -> Vec<(PathBuf, PathBuf, Leaf)> {
+        self.fixture
+            .manager
+            .acted_through_paths(
+                self.primitive,
+                self.slot.as_ref(),
+                self.registration.as_deref(),
+            )
+            .expect("the table resolves for a case built for it")
+    }
+
+    fn run(&self, hooks: &mut dyn EffectHooks) -> Result<(), UpstrokeError> {
+        use Primitive as P;
+        let manager = &self.fixture.manager;
+        let slot = self.slot.as_ref();
+        let head = &self.fixture.head;
+        let side = &self.fixture.side;
+        let slot_of = || slot.expect("a slot primitive has a slot");
+        match self.primitive {
+            P::CreateExecutionRoot => manager.create_execution_root(hooks),
+            P::RemoveExecutionRoot => manager.remove_execution_root(hooks).map(drop),
+            P::WriteIntent => manager.write_intent(hooks, slot_of()),
+            P::RemoveIntent => manager.remove_intent(hooks, slot_of()),
+            P::ReclaimStagingOrphan => manager.reclaim_intents(hooks).map(drop),
+            P::AddWorktree => manager.add_worktree(hooks, slot_of(), head).map(drop),
+            P::VerifyWorktree => manager
+                .verify_worktree(hooks, slot_of(), &Quiescence::AtBase(head.clone()))
+                .map(drop),
+            P::RemoveWorktree => manager.remove_worktree(hooks, slot_of()),
+            P::CandidateStage => manager.candidate_stage(hooks, slot_of()),
+            P::CandidateWriteTree => manager.candidate_write_tree(hooks, slot_of()).map(drop),
+            P::ProposalCherryPick => manager
+                .proposal_cherry_pick(hooks, slot_of(), side)
+                .map(drop),
+            P::RepairMaterialize => manager.repair_materialize(hooks, slot_of(), side),
+            P::CreateRef => {
+                manager.create_ref_zero_old(hooks, RefSite::CreateCandidates, &self.refname, head)
+            }
+            P::CompareAndSwapRef => manager.compare_and_swap_ref(
+                hooks,
+                RefSite::CompareAndSwapIntegration,
+                &self.refname,
+                head,
+                side,
+            ),
+            P::DeleteRef => manager.delete_ref_expected_old(
+                hooks,
+                RefSite::DeleteCandidatePin,
+                &self.refname,
+                head,
+            ),
+        }
+    }
+}
+
+/// A `Before` hook that exchanges `target` for a link to `victim`: a
+/// directory link (a junction on Windows), or a file symlink on Unix.
+struct SubstituteAtBefore {
+    site: EffectSiteId,
+    target: PathBuf,
+    moved: PathBuf,
+    victim: PathBuf,
+    file_link: bool,
+}
+
+impl EffectHooks for SubstituteAtBefore {
+    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        if site == self.site && phase == HookPhase::Before {
+            if fs::symlink_metadata(&self.target).is_ok() {
+                fs::rename(&self.target, &self.moved).expect("move the real path aside");
+            } else if let Some(parent) = self.target.parent() {
+                fs::create_dir_all(parent).expect("the substituted path's parent");
+            }
+            if self.file_link {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&self.victim, &self.target)
+                    .expect("plant the file link");
+                #[cfg(windows)]
+                panic!("file-link cases are skipped on Windows");
+            } else {
+                plant_directory_link(&self.victim, &self.target);
+            }
+        }
+        Injection::Proceed
+    }
+}
+
+/// The regular files directly inside `from`, copied into `into`.
+fn copy_files_shallow(from: &Path, into: &Path) {
+    for entry in fs::read_dir(from).expect("list the moved directory") {
+        let entry = entry.expect("entry");
+        if entry.file_type().expect("type").is_file() {
+            fs::copy(entry.path(), into.join(entry.file_name())).expect("copy into the victim");
+        }
+    }
+}
+
+/// A victim's state: its bytes if a file, otherwise every entry's name and
+/// kind one level down and every file's bytes.
+fn snapshot(victim: &Path) -> Vec<(String, Vec<u8>)> {
+    let metadata = fs::symlink_metadata(victim).expect("the victim exists");
+    if metadata.is_file() {
+        return vec![("<file>".to_owned(), fs::read(victim).expect("victim bytes"))];
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(victim).expect("list the victim") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type().expect("type");
+        let bytes = if kind.is_file() {
+            fs::read(entry.path()).expect("file bytes")
+        } else if kind.is_dir() {
+            b"<dir>".to_vec()
+        } else {
+            b"<link>".to_vec()
+        };
+        entries.push((name, bytes));
+    }
+    entries.sort();
+    entries
+}
+
+/// The reviewer's P1 sequence, by name: the registration's admin directory
+/// captured before the `Before` hook is exchanged for a link to a victim
+/// holding copied `gitdir` and `locked` entries; `registration_still_names`
+/// used to follow it and `remove_file(admin/locked)` deleted the victim's
+/// file. The generated test above covers it too; this is the named witness.
+#[test]
+fn a_registration_admin_directory_exchanged_at_the_before_hook_refuses_the_worktree_removal() {
+    let fixture = Fixture::created("admin-exchanged");
+    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+    let path = fixture.manager.slot_path(&slot);
+    let admin = fixture
+        .manager
+        .revalidate_removal(&path)
+        .expect("registration")
+        .expect("registered");
+    fs::write(admin.join("locked"), b"do not remove\n").expect("the locked marker");
+    let victim = fixture.root.join("victim-admin");
+    fs::create_dir_all(&victim).expect("victim");
+    copy_files_shallow(&admin, &victim);
+    let before = snapshot(&victim);
+    let mut hooks = SubstituteAtBefore {
+        site: slot.remove_site(),
+        target: admin.clone(),
+        moved: admin.with_extension("moved-away"),
+        victim: victim.clone(),
+        file_link: false,
+    };
+
+    let error = fixture
+        .manager
+        .remove_worktree(&mut hooks, &slot)
+        .expect_err("the walk sees the exchanged admin directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&admin.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(
+        snapshot(&victim),
+        before,
+        "the victim's `locked` and `gitdir` are untouched"
+    );
+    assert!(
+        path.exists(),
+        "and the checkout was not deleted either: every check runs first"
+    );
+}
+
+/// The reviewer's P2 sequence for the add, by name: `intents/` exchanged for
+/// a link to a victim holding a same-named intent file, through which the
+/// add's metadata read used to authorise a worktree whose intent lived
+/// outside the root.
+#[test]
+fn an_intents_directory_exchanged_at_the_before_hook_refuses_the_worktree_add() {
+    let fixture = Fixture::created("intents-exchanged-add");
+    let slot = fixture.task("beta", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("write the intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let victim = fixture.root.join("victim-intents");
+    fs::create_dir_all(&victim).expect("victim");
+    copy_files_shallow(&intents, &victim);
+    let before = snapshot(&victim);
+    let mut hooks = SubstituteAtBefore {
+        site: slot.add_site(),
+        target: intents.clone(),
+        moved: intents.with_extension("moved-away"),
+        victim: victim.clone(),
+        file_link: false,
+    };
+
+    let error = fixture
+        .manager
+        .add_worktree(&mut hooks, &slot, &fixture.head)
+        .expect_err("the walk sees the exchanged intents directory");
+    let message = refusal_of(&error);
+    assert!(
+        message.contains("symlink or reparse point")
+            && message.contains(&intents.display().to_string()),
+        "the refusal must name its reason and the substituted component: {message}"
+    );
+    assert_eq!(snapshot(&victim), before, "the victim is untouched");
+    assert!(
+        !fixture.manager.slot_path(&slot).exists(),
+        "and no worktree was created"
+    );
+}
+
+/// The staging name carries no part of the record's name, so a slot at the
+/// old maximum still lands: a 207-byte task key gives a 224-byte intent name,
+/// and the previous `.<intent>.<ULID>.tmp` staging name was 256 bytes, one
+/// over `NAME_MAX`.
+#[test]
+fn a_slot_name_at_the_old_maximum_still_lands_its_intent() {
+    let fixture = Fixture::created("long-key");
+    let key = "a".repeat(207);
+    let slot = fixture.task(&key, 1);
+    assert_eq!(
+        slot.intent_name().len(),
+        224,
+        "the premise: the intent name is at the old maximum"
+    );
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a valid slot name at the old maximum lands");
+    assert!(fixture.manager.intent_path(&slot).is_file());
+    assert_eq!(
+        fixture.manager.intents().expect("intents"),
+        vec![slot],
+        "and the record is listed"
+    );
+}
+
+/// The §8 staging protocol's recovery rule: a staging file is never an
+/// intent. An orphan a crash left behind used to fail `intents()` forever,
+/// which blocked every reclaim; now `intents()` ignores it, `reclaim_intents`
+/// removes it, and a retry of the write lands.
+#[test]
+fn a_staging_orphan_is_ignored_by_intents_and_removed_by_reclaim() {
+    let fixture = Fixture::created("staging-orphan");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a real intent");
+    let intents = fixture.manager.execution_root().join("intents");
+    let orphan = intents.join(".stage-01ORPHAN0000000000000000.tmp");
+    fs::write(&orphan, b"{\"half\":").expect("plant the orphan");
+
+    assert_eq!(
+        fixture
+            .manager
+            .intents()
+            .expect("intents ignore the orphan"),
+        vec![slot.clone()],
+        "the real intent is listed and the orphan is not"
+    );
+    let reclaimed = fixture
+        .manager
+        .reclaim_intents(&mut NoHooks)
+        .expect("reclaim removes the orphan with the rest");
+    assert_eq!(reclaimed, vec![slot.clone()]);
+    assert!(!orphan.exists(), "the orphan is gone");
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("a retry of the write lands");
+    assert!(fixture.manager.intent_path(&slot).is_file());
 }
 
 /// A prefix that resolves to a regular file cannot carry components below

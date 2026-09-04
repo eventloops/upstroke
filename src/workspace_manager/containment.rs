@@ -106,6 +106,19 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
         .collect()
 }
 
+/// What a walk expects at the last component of a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leaf {
+    /// A directory, or nothing yet: the execution root, a scaffolding
+    /// directory, `intents/`, Git's working directory.
+    Directory,
+    /// Any kind but a reparse point, or nothing yet: an intent file, a
+    /// registration's `gitdir` or `locked`, a checkout an add is about to
+    /// create. A regular file is what most of these are, and a link at the
+    /// leaf refuses as a link anywhere else does.
+    Entry,
+}
+
 /// The first component of `anchor` joined with `chain` that is a reparse
 /// point, if any.
 ///
@@ -137,9 +150,16 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 /// parent's other removals never recurse — `remove_dir` on the root and its
 /// own empty scaffolding, `remove_file` on an intent, and on the `locked`
 /// marker inside that admin entry — but a non-recursive removal still
-/// follows a link in its *parent*, so every effect's in-funnel check walks
-/// this chain down to the directory the effect acts in, and an exchanged
-/// `intents/` or `tasks/` refuses exactly as an exchanged root does.
+/// follows a link in its *parent*, and so does every read and every write.
+/// So each funnel primitive names, as data, every path it acts through after
+/// its `Before` hook — the parent's
+/// [`Primitive::acted_through`](super::Primitive::acted_through): the
+/// effect's target, its parent chain, Git's hooks path, the intent it
+/// authorises on, the registration it removes — and one helper walks the
+/// whole set with this predicate immediately before the syscalls. An
+/// exchanged `intents/`, `tasks/`, `hooks-none` or admin directory refuses
+/// exactly as an exchanged root does, and a test generated from that table
+/// plants a link at each path in turn.
 ///
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
@@ -155,15 +175,21 @@ fn plain_chain_below<'a>(anchor: &Path, path: &'a Path) -> Option<Vec<&'a OsStr>
 ///
 /// # Errors
 ///
-/// A component that exists but cannot be read, or that is a regular file,
-/// with its path.
-fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf>, UpstrokeError> {
+/// A component that exists but cannot be read, or that is a regular file
+/// where a directory must be, with its path. `leaf` says what the last
+/// component may be; every component above it must be a directory.
+fn reparse_point_below(
+    anchor: &Path,
+    chain: &[&OsStr],
+    leaf: Leaf,
+) -> Result<Option<PathBuf>, UpstrokeError> {
     let mut walked = anchor.to_path_buf();
-    for name in chain {
+    for (index, name) in chain.iter().enumerate() {
         walked.push(name);
+        let last = index + 1 == chain.len();
         match fs::symlink_metadata(&walked) {
             Ok(metadata) if is_reparse_point(&metadata) => return Ok(Some(walked)),
-            Ok(metadata) if !metadata.is_dir() => {
+            Ok(metadata) if !metadata.is_dir() && !(last && leaf == Leaf::Entry) => {
                 return Err(UpstrokeError::Io {
                     path: walked,
                     source: io::Error::from(io::ErrorKind::NotADirectory),
@@ -184,7 +210,7 @@ fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf
 
 /// Refuse `path` unless `anchor` is still the real directory it was resolved
 /// as and `path`'s chain below it is plain components with no reparse point
-/// among them.
+/// among them, every one a directory except a `leaf` of [`Leaf::Entry`].
 ///
 /// `path` is the execution root and `anchor` the authorized private root at
 /// both call sites, and the refusals name them so.
@@ -214,7 +240,11 @@ fn reparse_point_below(anchor: &Path, chain: &[&OsStr]) -> Result<Option<PathBuf
 /// [`Refusal::ReparsePointOnChain`], or an I/O error: the walk's own, which
 /// already names the component it could not read and is propagated as it
 /// is, or the anchor's resolution failing for a reason other than absence.
-pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
+pub(super) fn refuse_reparse_points(
+    anchor: &Path,
+    path: &Path,
+    leaf: Leaf,
+) -> Result<(), UpstrokeError> {
     refuse_unreal_directory(anchor)?;
     let resolved = match fs::canonicalize(anchor) {
         Ok(resolved) => resolved,
@@ -247,7 +277,7 @@ pub(super) fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), Up
         }
         .into());
     };
-    if let Some(at) = reparse_point_below(anchor, &chain)? {
+    if let Some(at) = reparse_point_below(anchor, &chain, leaf)? {
         return Err(Refusal::ReparsePointOnChain {
             chain: path.to_path_buf(),
             at,
