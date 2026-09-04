@@ -2535,12 +2535,14 @@ fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
     fs::set_permissions(&public, fs::Permissions::from_mode(0o000)).expect("close it");
     assert!(
         fs::read_dir(&public).is_err(),
-        "this fixture needs a listing that fails, and here one does not — a process with          the privilege to ignore the permission bits cannot measure this"
+        "this fixture needs a listing that fails, and here one does not — a process with \
+         the privilege to ignore the permission bits cannot measure this"
     );
     assert_eq!(
         classify_run_dir(&public),
         RunDirClass::Husk,
-        "the classifier's own open fails in the same moment, which is what makes the          census reach the proof at all"
+        "the classifier's own open fails in the same moment, which is what makes the \
+         census reach the proof at all"
     );
     let answer = husk.prove();
     // And it clears, before anything is deleted — which is the whole point:
@@ -2615,7 +2617,8 @@ fn a_public_removal_whose_listing_does_not_answer_removes_nothing() {
     fs::set_permissions(&public, fs::Permissions::from_mode(0o300)).expect("no read bit");
     assert!(
         fs::read_dir(&public).is_err(),
-        "this fixture needs a listing that fails, and here one does not — a process with          the privilege to ignore the permission bits cannot measure this"
+        "this fixture needs a listing that fails, and here one does not — a process with \
+         the privilege to ignore the permission bits cannot measure this"
     );
 
     let error = remove_public_husk(&public, &mut NoHooks)

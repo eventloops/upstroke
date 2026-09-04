@@ -208,7 +208,8 @@ impl std::fmt::Display for RetainReason {
             }
             Self::ListingUnreadable { detail } => write!(
                 f,
-                "its contents could not be listed, so nothing about its shape is                  established: {detail}"
+                "its contents could not be listed, so nothing about its shape is \
+                 established: {detail}"
             ),
             Self::PossiblyCommitted => {
                 f.write_str("its private half carries a commit record, so the run may have started")
