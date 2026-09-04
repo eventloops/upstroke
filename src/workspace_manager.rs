@@ -362,7 +362,9 @@ use self::containment::{
 
 mod naming;
 use self::naming::safe_component;
-pub use self::naming::{IntentRecord, Slot, SnapshotName};
+pub use self::naming::{
+    IntentKind, IntentRecord, IntentRecordError, Slot, SlotId, SlotIdError, SnapshotName,
+};
 
 /// The slot's effect-site vocabulary: which [`EffectSiteId`] each of its four
 /// funnel positions runs under, and the [`ResourceRow`] that accounts for it.
@@ -672,7 +674,7 @@ impl WorkspaceManager {
             Some("tasks") | Some("merge") | Some("snapshots")
         ) && name
             .to_str()
-            .is_some_and(|name| safe_component(name).is_none())
+            .is_some_and(|name| safe_component(name).is_ok())
     }
 
     /// The slot's path, with its name validated first.
@@ -824,12 +826,9 @@ impl WorkspaceManager {
         slot.validate()?;
         self.revalidate()?;
         let path = self.intent_path(slot);
-        let record = IntentRecord {
-            kind: slot.kind().to_owned(),
-            slot: slot.relative().to_string_lossy().replace('\\', "/"),
-            run_id: self.run_id.clone(),
-            incarnation: self.incarnation.clone(),
-        };
+        // Owned snapshots: the record is persisted, and serde owns its
+        // fields.
+        let record = IntentRecord::new(slot, self.run_id.clone(), self.incarnation.clone())?;
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
             let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
