@@ -14,8 +14,11 @@ guard: the change that gives the engine a kill path for its own Git children, or
 ## Why this file exists at all
 
 `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` is closed and its file deleted: the sampler kills
-the process group now, which is what production's only kill path does, and the red suite it was
-filed for is gone. **The question that finding left open is not gone with it.** That entry wrote
+the process group now, which is what production's only kill path does, and it waits for that group
+to empty before it inspects. **What that closes is one of the two error codes that entry recorded,
+and the suite is not thereby green** — `Git { … has an empty gitdir }` is untouched by any kill
+shape and has its own file. **Nor is the question that finding left open gone with it.** That entry
+wrote
 down, in its own last paragraph, what its experiment did *not* establish, and a question does not
 stop being open because the entry carrying it was resolved. It is here, alone, so that closing the
 first one does not close this one by accident — and so that nobody re-runs the sampler comparison
