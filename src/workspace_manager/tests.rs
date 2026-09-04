@@ -8480,18 +8480,22 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 );
             }
 
-            // **Every kill went to the child's own process group**
-            // (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`). Both halves
-            // are asserted, per child, because they fail in different ways
-            // and one is the precondition of the other: `NotItsOwnGroup`
-            // means `process_group(0)` did not run, so there was no group of
-            // this child's own to aim at; a `Refused` errno means the aim was
-            // right and the signal did not land.
+            // **Every kill was aimed at the child's own process group**
+            // (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`). The aim and
+            // the landing are two different facts and only the first is
+            // assertable, which is the same split the `kill_error` printing
+            // above makes and is argued at `SampledChild::kill_group`:
+            // `NotItsOwnGroup` means `process_group(0)` did not run, so there
+            // was no group of this child's own to aim at and none was fired;
+            // a `Refused` errno means the aim was right and the call reported
+            // a failure, which on Darwin it does for a group whose only
+            // member is already an unreaped zombie. The first is asserted,
+            // the second printed.
             //
             // What this is evidence about is *what changed*. Before this
             // repair the sampler killed the bare child, `getpgid(pid) == pid`
-            // was **false** for every one of these children, and both arms
-            // below fail on that code — which is the discrimination a new
+            // was **false** for every one of these children, and the assertion
+            // below fails on that code — which is the discrimination a new
             // assertion has to have and the reason it is not a restatement of
             // the firing count above. What the group kill buys is the
             // descendants `git worktree add` spawns: they survive a bare
@@ -8515,19 +8519,53 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             // the honest oracle for it is the failure rate above rather than
             // an assertion from inside this process.
             #[cfg(unix)]
-            for launch in &shape {
-                let group = launch.group_kill.expect(
-                    "a kill fired at every one of this command's children, asserted just \
-                     above, and the group kill is written by that same statement",
-                );
-                assert_eq!(
-                    group,
-                    GroupKill::Delivered,
-                    "{label}: the process-group kill did not reach this child's own group \
-                         ({group:?}) — the descendants of the sampled command then survive \
-                         the kill and keep writing into the worktree the tabled recovery \
-                         forces the removal of"
-                );
+            {
+                let mut refused = Vec::new();
+                for launch in &shape {
+                    let group = launch.group_kill.expect(
+                        "a kill fired at every one of this command's children, asserted \
+                         just above, and the group kill is written by that same statement",
+                    );
+                    assert_ne!(
+                        group,
+                        GroupKill::NotItsOwnGroup,
+                        "{label}: the sampled child does not lead its own process group, so \
+                             there was no group of its own to aim a kill at and none was \
+                             fired — `process_group(0)` in `SampledChild::spawn` is what puts \
+                             it there, and without it the descendants of the sampled command \
+                             survive the kill and keep writing into the worktree the tabled \
+                             recovery forces the removal of"
+                    );
+                    if let GroupKill::Refused(errno) = group {
+                        refused.push(errno);
+                    }
+                }
+
+                // **What the group kill answered is recorded and printed, and
+                // not asserted on**, which is the same treatment `kill_error`
+                // has three assertions above and is here for a related reason.
+                // The first version of this test asserted `Delivered` on the
+                // strength of a sentence that was true on Linux and false on
+                // Darwin: a signal to a group whose only surviving member is
+                // an unreaped zombie returns 0 on Linux and `EPERM` on macOS.
+                // CI measured it at `036b4bc` — `git add`, the shape whose
+                // children most often reach their own exit before the kill
+                // lands, `Refused(1)` against `Delivered`, one failed test in
+                // 1917 — so the claim is withdrawn rather than given a
+                // platform arm, because what the call reports depends on
+                // whether the child was still alive at the instant it ran and
+                // that is a race this process cannot observe from inside.
+                //
+                // The assertion above is the half that does not depend on it.
+                // `getpgid(pid) == pid` is a kernel fact about the spawn, not
+                // about the kill's timing, and it is **false for every child
+                // the pre-repair sampler spawned** — measured by deleting
+                // `process_group(0)` at this head, which fails it with
+                // `NotItsOwnGroup`. That is what makes it a statement about
+                // the repair rather than a restatement of it.
+                if !refused.is_empty() {
+                    println!("group kill refused {label}: errnos {refused:?}");
+                }
             }
 
             // How many of those N fired kills won their race with the
@@ -9746,7 +9784,12 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// this repair does not make this test green.
 ///
 /// So the sampled child is spawned with `process_group(0)` and the kill goes
-/// to `-pgid`, which is what production does. **Unix only**: `std` offers no
+/// to `-pgid`, which is what production does. What the sampling test asserts
+/// of that, per launch, is the kernel's confirmation that the child leads its
+/// own group -- the deterministic half, and the half that is false for every
+/// child the pre-repair sampler spawned. What the kill *answered* is printed
+/// and not asserted, for the reason at [`Self::kill_group`]. **Unix only**:
+/// `std` offers no
 /// portable group kill, and the Windows half of production's containment is
 /// a Job Object private to `agent::proc`.
 ///
@@ -9877,11 +9920,25 @@ impl SampledChild {
     /// The group is still this child's own even if the child has already
     /// exited: nothing has reaped it — [`Self::wait`] is the caller's next
     /// statement — so the zombie leader holds the group id out of the
-    /// kernel's reuse pool, and the signal cannot land on a stranger. That is
-    /// also why the sampling test can assert on the answer where it cannot
-    /// assert on [`Child::kill`]'s: a signal to a group whose only surviving
-    /// member is a zombie still returns 0, where `TerminateProcess` on an
-    /// exited process does not.
+    /// kernel's reuse pool, and the signal cannot land on a stranger. That
+    /// much is portable and is what makes the call safe.
+    ///
+    /// **What the answer means is not portable, and this file claimed it was.**
+    /// The first version of this doc said "a signal to a group whose only
+    /// surviving member is a zombie still returns 0", and the sampling test
+    /// asserted `Delivered` on the strength of it. That is Linux. On Darwin the
+    /// same call answers `EPERM`: measured on CI at `036b4bc`, `git add`, which
+    /// is the shape whose children most often reach their own exit before the
+    /// kill lands — `Refused(1)` against `Delivered`, one failed test in 1917.
+    ///
+    /// So the answer is recorded and printed and **not asserted on**, which is
+    /// the treatment [`Child::kill`]'s own answer already has here and for a
+    /// related reason: what the call reports depends on whether the child was
+    /// alive at the instant it ran, that is a race, and a second observation
+    /// taken at a second instant cannot settle it from inside this process.
+    /// What *is* asserted is the half that is deterministic — that the kernel
+    /// says this child leads its own group, which is false for every child the
+    /// pre-repair sampler spawned.
     ///
     /// [`Child::kill`]: std::process::Child::kill
     #[cfg(unix)]
