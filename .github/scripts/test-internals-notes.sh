@@ -97,8 +97,12 @@ while IFS= read -r module; do
     error "$module carries $count \`Extended notes:\` markers; a module with notes carries exactly one"
     continue
   fi
-  at="$(grep -n 'Extended notes:' "$module" | cut -d: -f1)"
-  first_code="$(grep -n -v -e '^[[:space:]]*//' -e '^[[:space:]]*$' "$module" | head -1 | cut -d: -f1)"
+  # `awk` reading the file directly, never `grep ... | head`: `head` closing
+  # the pipe early gives `grep` a SIGPIPE, and under `set -o pipefail` that is
+  # a failed pipeline. It depends on buffering, so it passed locally and on
+  # the build box and failed on CI.
+  at="$(awk '/Extended notes:/ { print NR; exit }' "$module")"
+  first_code="$(awk '!/^[[:space:]]*\/\// && NF { print NR; exit }' "$module")"
   if (( at > first_code )); then
     error "$module has its marker at line $at, below the first code at line $first_code; it belongs in the module header"
   fi
@@ -120,7 +124,7 @@ while IFS= read -r notes; do
 
   # N3: the file links back, and the relative link resolves from its own
   # directory.
-  link="$(sed -n 's/.*(\(\.\.[^)]*\.rs\)).*/\1/p' "$notes" | head -1)"
+  link="$(awk 'match($0, /\(\.\.[^)]*\.rs\)/) { print substr($0, RSTART + 1, RLENGTH - 2); exit }' "$notes")"
   if [[ -z "$link" ]]; then
     error "$notes does not link back to its module"
     continue
