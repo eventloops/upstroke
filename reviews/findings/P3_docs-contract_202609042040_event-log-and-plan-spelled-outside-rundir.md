@@ -14,9 +14,12 @@ guard: the sweeps of `src/export.rs`, `src/status.rs`, `src/capacity.rs`, `src/v
 ## Failure sequence
 
 `src/rundir/names.rs` exports `EVENT_LOG` and `PLAN` so that one byte string
-serves every site that must agree on it. Five production sites outside
-`src/rundir` open those two files by spelling the byte string for themselves
-rather than through the constant or through `RunPaths`:
+serves every site that must agree on it. **Seven production sites in five
+files** outside `src/rundir` open those two files by spelling the byte string
+for themselves rather than through the constant or through `RunPaths` — five of
+`events.jsonl` and two of `plan.normalized.json`. This is the one derivation;
+`src/rundir/names.rs`'s module doc and the pull request body quote it in the
+same words.
 
 | Site | Spelling |
 |---|---|
@@ -32,9 +35,10 @@ Seven sites in five files. So a rename of either constant is a multi-file edit
 whose omissions surface as a run whose log the exporter, `status`, `resume`,
 `validate` and the capacity read cannot find, rather than as a compile error.
 
-Measured at `7724ed1d628070b35948819095a68a38cd0c5d0a`, mutating `EVENT_LOG` to
-`"events.jsonlx"` and running `cargo test --lib`: 92 failures, against 100 at
-master `74537be`. Routing `rundir`'s own two accessors through the constants
+Measured by mutating `EVENT_LOG` to `"events.jsonlx"` and running
+`cargo test --lib`: 92 failures on this branch against 100 at master, at
+`7724ed1d628070b35948819095a68a38cd0c5d0a` versus `74537be` and again after the
+merge-in of master `93d6337`. Routing `rundir`'s own two accessors through the constants
 closed 8 of those; the remaining gap is these five files. Nothing is broken
 today — the strings agree — and the drift is loudly caught if it ever happens,
 which is why this is P3 and not higher.
