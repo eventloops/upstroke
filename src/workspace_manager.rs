@@ -224,6 +224,28 @@ pub enum Refusal {
         refname: String,
     },
 
+    /// The other side of the null-id rule (`design/26` step 5): the new value
+    /// of a create or compare-and-swap was the null object id.
+    ///
+    /// Measured, git 2.43: `git update-ref --no-deref <ref> 0{40} <old>`
+    /// **succeeds and deletes the ref** when `<old>` matches, and with `""`
+    /// as the old value succeeds and creates nothing when the ref is absent,
+    /// because a null new value means "must not exist afterwards" (a
+    /// mismatched old value, or an existing ref on the create path, exits 128
+    /// and preserves the ref, as for any new value). A compare-and-swap that
+    /// deletes the integration ref, or a create that reports success with no
+    /// ref behind it, is not what either primitive's name promises, so it is
+    /// refused here.
+    #[error(
+        "refusing to create or swap `{refname}` to the null object id: `git update-ref` reads it \
+         as \"must not exist afterwards\", so it would delete the ref when the expected old \
+         matches, or create nothing while reporting success when the ref is absent"
+    )]
+    NullNew {
+        /// The ref that was to be created or swapped.
+        refname: String,
+    },
+
     /// An object id that is not a full hexadecimal id.
     #[error(
         "refusing `{value}` as the {role} object id of `{refname}`: an engine ref primitive takes \
@@ -1337,7 +1359,8 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::SymbolicRef`], or a Git error — including the zero-old
+    /// [`Refusal::SymbolicRef`]; [`Refusal::MalformedObjectId`] or
+    /// [`Refusal::NullNew`] for `new`; or a Git error — including the zero-old
     /// failure when the ref already exists.
     pub fn create_ref_zero_old(
         &self,
@@ -1347,7 +1370,7 @@ impl WorkspaceManager {
         new: &str,
     ) -> Result<(), UpstrokeError> {
         self.refuse_symbolic(refname)?;
-        refuse_malformed_object_id(refname, "new", new)?;
+        refuse_new(refname, new)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
             self.update_ref(&["--no-deref", refname, new, ""])
         })
@@ -1357,8 +1380,10 @@ impl WorkspaceManager {
     ///
     /// # Errors
     ///
-    /// [`Refusal::SymbolicRef`], [`Refusal::CheckedOutRef`], or a Git error
-    /// when the old value does not match.
+    /// [`Refusal::SymbolicRef`] or [`Refusal::CheckedOutRef`];
+    /// [`Refusal::MalformedObjectId`] or [`Refusal::NullNew`] for `new`;
+    /// [`Refusal::MalformedObjectId`] or [`Refusal::NullExpectedOld`] for
+    /// `old`; or a Git error when the old value does not match.
     pub fn compare_and_swap_ref(
         &self,
         hooks: &mut dyn EffectHooks,
@@ -1368,7 +1393,7 @@ impl WorkspaceManager {
         new: &str,
     ) -> Result<(), UpstrokeError> {
         self.assert_publishable(refname)?;
-        refuse_malformed_object_id(refname, "new", new)?;
+        refuse_new(refname, new)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
             self.update_ref(&["--no-deref", refname, new, old])
@@ -2398,8 +2423,9 @@ fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecor
 // ---------------------------------------------------------------------------
 
 mod object;
+use self::object::refuse_expected_old;
+pub(crate) use self::object::refuse_new;
 pub use self::object::{is_null_object_id, is_object_id};
-use self::object::{refuse_expected_old, refuse_malformed_object_id};
 
 // ---------------------------------------------------------------------------
 // Small filesystem helpers

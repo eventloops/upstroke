@@ -76,14 +76,25 @@ pub(crate) struct Fixture {
 }
 
 impl Fixture {
+    /// A SHA-1 repository, whatever `GIT_DEFAULT_HASH` says in the
+    /// environment: the object format is part of what a test asserts about
+    /// (an object id's length, the null id's spelling), so the fixture pins
+    /// it rather than inheriting it (§12). [`Self::with_object_format`] is
+    /// the other format.
     pub(crate) fn new(tag: &str) -> Self {
+        Self::with_object_format(tag, "sha1")
+    }
+
+    /// A repository of the given object format, `sha1` or `sha256`.
+    pub(crate) fn with_object_format(tag: &str, object_format: &str) -> Self {
         let root = scratch(tag);
         let base = root.join("repo");
         let private = root.join("private");
         fs::create_dir_all(&base).expect("repo directory");
         fs::create_dir_all(&private).expect("private root");
 
-        git(&base, &["init", "-q", "-b", "main"]);
+        let object_format = format!("--object-format={object_format}");
+        git(&base, &["init", "-q", "-b", "main", &object_format]);
         git(&base, &["config", "user.email", "tests@upstroke.local"]);
         git(&base, &["config", "user.name", "upstroke tests"]);
         // `git worktree add` writes a reflog entry; keep the repository
@@ -153,6 +164,17 @@ impl Fixture {
 
     pub(crate) fn created(tag: &str) -> Self {
         let fixture = Self::new(tag);
+        fixture
+            .manager
+            .create_execution_root(&mut NoHooks)
+            .expect("create the execution root");
+        fixture
+    }
+
+    /// [`Self::created`] over a SHA-256 repository, for the tests that assert
+    /// something about both object formats.
+    pub(crate) fn created_sha256(tag: &str) -> Self {
+        let fixture = Self::with_object_format(tag, "sha256");
         fixture
             .manager
             .create_execution_root(&mut NoHooks)
