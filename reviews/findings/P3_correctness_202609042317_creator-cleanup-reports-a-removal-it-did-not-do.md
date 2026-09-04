@@ -1,6 +1,6 @@
 ---
 id: PR139-PASS4-CREATOR-SWALLOWS-REMOVAL-ERROR
-severity: P2
+severity: P3
 disposition: deferred
 category: correctness
 pr: 139
@@ -10,6 +10,19 @@ provenance: pre_existing
 first_bad:
 guard: the sweep of `src/engine/topology/create.rs`, or whichever change next touches `stat_after_error`; the census side of the same call already surfaces the error as `RunDirOutcome::Unreclaimable` and is the shape to copy
 ---
+
+## Severity, and whose it is
+
+**P3, assigned by PR #139's author; review pass 4 assigned none.** The verdict that raised this
+carried no severity, so the label here is the author's and was answered under rule 2 with a
+measurement rather than asserted. The sentence that carries it: **at PR #139's head this is a false
+operator report over correct on-disk state that the next census completes.** The listing refuses
+before anything is touched, the marker survives, and the next census's proof answers `TargetAbsent`
+and either reclaims the husk once it is listable or reports `Unreclaimable` while it is not — both
+already witnessed in that pull request. A later pass that relabels this P2 has that measurement to
+answer, not a bare row: it would need to show an on-disk consequence at this head, and there is
+none. (At master before #139 there *was* one — the marker was unlinked — which is why the row
+existed as P2 in the first place and why it is P3 now.)
 
 ## Failure sequence
 
@@ -39,6 +52,8 @@ now survives the failure. #139's body originally claimed the listing error "reac
 review pass 4 found that it does not reach this one, and the claim is corrected there.
 
 ## What the change that takes this up should do
+
+The repair shape is costed here so that a P2 ruling can be acted on without re-deriving it:
 
 Stop discarding the result. `engine::topology::startup::apply` handles the identical call on the
 census side by turning the error into `RunDirOutcome::Unreclaimable { step, detail }` — a fifth
