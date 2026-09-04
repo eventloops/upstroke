@@ -878,7 +878,7 @@ impl Run {
         // leaves behind is still owned; under the temporary directory
         // otherwise, which is every ordinary test.
         let fixture = match std::env::var_os(KILL_SCRATCH) {
-            Some(parent) => Fixture::created_under(Path::new(&parent), tag),
+            Some(parent) => Fixture::created_under(Path::new(&parent)),
             None => Fixture::created(tag),
         };
         let harness = Arc::new(Mutex::new(HookHarness::new()));
@@ -1400,7 +1400,11 @@ pub(super) fn kill_child_and_adopt(test: &str, dir: &Path, site: &str) -> Run {
     // still owns. Without it the adopted tree outlived every kill test, and a
     // temporary directory leaked per fixture is what exhausted this box's
     // inodes once already.
-    let owner = fixture::scratch_tree_under(dir, "kill-child");
+    // Under the temporary directory and not under `dir`: every component here
+    // is a prefix of the manager's worktree paths inside the child, and the
+    // Windows guest refuses `git worktree add` with `Filename too long` once
+    // they run long. A short tag, one level.
+    let owner = fixture::scratch_tree("kc");
     let status = run_child_test(
         test,
         &[

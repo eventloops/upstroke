@@ -233,30 +233,6 @@ pub(crate) fn scratch_tree(tag: &str) -> ScratchTree {
     }
 }
 
-/// [`scratch_tree`] under a parent the caller names.
-///
-/// **A path argument and not an environment variable.** The kill protocol
-/// needs a parent to own the tree its child builds, and a value this module
-/// read from the environment would be an ambient input in the one file whose
-/// subject is that ambient inputs are not trusted — the door opened from the
-/// inside. So the parent is passed in. Which directory a kill child builds
-/// under is the kill protocol's business and is decided in
-/// `src/engine/topology/scaffold.rs`, which owns that protocol and its
-/// variables; nothing here reads one.
-pub(crate) fn scratch_tree_under(parent: &Path, tag: &str) -> ScratchTree {
-    if let Err(why) = safe_component(tag) {
-        panic!("the fixture's scratch tag `{tag}` is not one path component: {why}");
-    }
-    match acquire(parent, tag) {
-        Ok(tree) => tree,
-        Err(refusal) => panic!(
-            "the fixture could not acquire a scratch tree at {}: {:?}",
-            refusal.root().display(),
-            refusal.source()
-        ),
-    }
-}
-
 /// [`scratch_tree`]'s root, for the one caller that wants a directory and not
 /// a fixture.
 ///
@@ -521,28 +497,36 @@ impl Fixture {
 
     /// A repository of the given object format, under [`scratch_parent`].
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
-        Self::in_tree(scratch_tree(tag), object_format)
+        let scratch = scratch_tree(tag);
+        let root = scratch.path().to_path_buf();
+        Self::at(root, Some(scratch), object_format)
     }
 
-    /// [`Self::new`] in a subtree of `parent`.
+    /// [`Self::new`] **in** a tree the caller already acquired.
     ///
     /// The kill protocol's shape: a parent acquires a tree, tells its child to
-    /// build under it, and keeps the guard, so a child that dies by
-    /// `std::process::abort()` leaves a subtree the parent still owns. The
-    /// child acquires its own subtree here, so a child that exits normally
-    /// still reclaims what it made.
-    pub(crate) fn under(parent: &Path, tag: &str) -> Self {
-        Self::in_tree(scratch_tree_under(parent, tag), ObjectFormat::Sha1)
+    /// build in it, and keeps the guard, so a child that dies by
+    /// `std::process::abort()` leaves a tree the parent still owns. The child
+    /// holds no guard of its own here, and the tree is `parent` itself rather
+    /// than a subtree of it — **one directory level, deliberately.** Nesting a
+    /// second acquisition under the first added two ULID-named components to
+    /// every path beneath it and pushed the manager's worktrees past Windows'
+    /// path limit: measured on the guest, `git worktree add` failed with
+    /// `Filename too long` for every kill test.
+    ///
+    /// The caller gives one tree to one fixture, and names it when it acquires
+    /// it, so there is no tag to take here.
+    pub(crate) fn under(parent: &Path) -> Self {
+        Self::at(parent.to_path_buf(), None, ObjectFormat::Sha1)
     }
 
-    /// [`Self::created`] in a subtree of `parent`.
-    pub(crate) fn created_under(parent: &Path, tag: &str) -> Self {
-        Self::under(parent, tag).with_execution_root()
+    /// [`Self::created`] in a tree the caller already acquired.
+    pub(crate) fn created_under(parent: &Path) -> Self {
+        Self::under(parent).with_execution_root()
     }
 
-    /// The body both constructors share, over a tree already acquired.
-    fn in_tree(scratch: ScratchTree, object_format: ObjectFormat) -> Self {
-        let root = scratch.path().to_path_buf();
+    /// The body every constructor shares, over a root and whatever owns it.
+    fn at(root: PathBuf, scratch: Option<ScratchTree>, object_format: ObjectFormat) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
         fs::create_dir_all(&base).expect("the fixture's repository directory");
@@ -602,7 +586,7 @@ impl Fixture {
             seed,
             head,
             side,
-            _scratch: Some(scratch),
+            _scratch: scratch,
         }
     }
 
@@ -1370,7 +1354,7 @@ mod tests {
         // a fixture in a subtree of it, and the owner handed to `adopt`.
         let owner = scratch_tree("adopt-owner");
         let owner_root = owner.path().to_path_buf();
-        let fixture = Fixture::under(&owner_root, "adopt-root");
+        let fixture = Fixture::under(&owner_root);
         write_file(&fixture.base.join("d.txt"), b"third\n");
         git(&fixture.base, &["add", "-A"]);
         git(&fixture.base, &["commit", "-q", "-m", "third"]);
@@ -1851,7 +1835,7 @@ mod tests {
         let owner = scratch_tree("adopt-reclaims");
         let owner_root = owner.path().to_path_buf();
 
-        let fixture = Fixture::under(&owner_root, "adopted");
+        let fixture = Fixture::under(&owner_root);
         let root = fixture.root.clone();
         // The child died by `abort()`: nothing of its own is reclaimed.
         std::mem::forget(fixture);
@@ -1928,8 +1912,14 @@ mod tests {
             !fixture.base.join("hook-ran.marker").exists(),
             "an ambient hooks path, or a template hook, ran during the fixture's own checkouts"
         );
+        // Canonicalised on both sides: Git answers with forward slashes and no
+        // verbatim prefix, and `canonicalize` on Windows answers `\\?\C:\...`,
+        // so comparing the two spellings fails on the guest for a repository
+        // that is exactly where it should be (measured, winguest).
         assert_eq!(
-            PathBuf::from(git(&fixture.base, &["rev-parse", "--show-toplevel"])),
+            PathBuf::from(git(&fixture.base, &["rev-parse", "--show-toplevel"]))
+                .canonicalize()
+                .expect("canonicalize the worktree Git reported"),
             fixture
                 .base
                 .canonicalize()
