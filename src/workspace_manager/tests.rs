@@ -4743,6 +4743,7 @@ fn a_snapshot_input_spelt_as_hexadecimal_of_the_other_formats_length_is_refused_
                 role,
                 value,
                 resolved,
+                found_type: None,
             };
             assert!(
                 matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
@@ -4955,6 +4956,7 @@ fn a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requir
         role: SnapshotObject::Tree,
         value: commit.clone(),
         resolved: Some(tree.clone()),
+        found_type: None,
     };
     assert!(
         matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
@@ -4970,11 +4972,11 @@ fn a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requir
         "and never calls a full object id something other than one: {message}"
     );
 
-    // A tree where a commit is required cannot be peeled at all, and Git says
-    // so rather than exiting silently: that is not the silent exit 1 the
-    // lookup reads as absence, so it arrives as the Git error it is, naming
-    // the mismatch in Git's own words (measured, git 2.43). Both kinds of
-    // wrong type refuse; only the peelable kind is this module's refusal.
+    // A tree where a commit is required cannot be peeled at all: Git exits
+    // non-zero with "expected commit type" on stderr rather than the silent
+    // exit 1 the lookup reads as absence (measured, git 2.43). That is still
+    // the caller offering the wrong kind of object, so it is the same refusal
+    // and not a Git error, and it names the type the value does name.
     let error = fixture
         .manager
         .add_snapshot(
@@ -4986,26 +4988,49 @@ fn a_full_id_of_the_wrong_object_type_is_refused_naming_the_type_its_role_requir
             },
         )
         .expect_err("a tree is not a commit");
-    let UpstrokeError::Git { message } = &error else {
-        panic!("an unpeelable type is a Git error, not a refusal: {error}");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Parent,
+        value: tree.clone(),
+        resolved: None,
+        found_type: Some("tree".to_owned()),
     };
     assert!(
-        message.contains(&tree) && message.contains("expected commit type"),
-        "the Git error names the value and the mismatch: {message}"
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "an unpeelable type is this refusal, not a Git error: expected `{expected}`, got \
+         `{error}`"
+    );
+    let message = expected.to_string();
+    assert!(
+        message.contains("does not name a commit of this repository")
+            && message.contains("(it names a tree)"),
+        "the parent role requires a commit, and the message says what the value is: {message}"
     );
 
-    // And the parent role's refusal, when Git can peel, names the object type
-    // the role requires rather than the role's own word.
-    let parent_role = Refusal::SnapshotInputResolvesElsewhere {
-        role: SnapshotObject::Parent,
-        value: commit,
-        resolved: Some(tree),
+    // An id of the repository's own format naming no object at all keeps the
+    // refusal too, with nothing to say about its type: the repository will not
+    // name one.
+    let absent = "f".repeat(fixture.head.len());
+    let error = fixture
+        .manager
+        .add_snapshot(
+            &mut NoHooks,
+            &SnapshotName::gates(2, 3),
+            &SnapshotInput::Commit(oid(&absent)),
+        )
+        .expect_err("no such object");
+    let expected = Refusal::SnapshotInputResolvesElsewhere {
+        role: SnapshotObject::Commit,
+        value: absent,
+        resolved: None,
+        found_type: None,
     };
     assert!(
-        parent_role
-            .to_string()
-            .contains("does not name a commit of this repository"),
-        "the parent role requires a commit: {parent_role}"
+        matches!(&error, UpstrokeError::Refused { message } if *message == expected.to_string()),
+        "expected `{expected}`, got `{error}`"
+    );
+    assert!(
+        !expected.to_string().contains("it names a"),
+        "and claims no type for an object the repository does not have: {expected}"
     );
 }
 

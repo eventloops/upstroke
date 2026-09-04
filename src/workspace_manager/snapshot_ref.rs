@@ -30,14 +30,27 @@
 //! because that step measures it as a condition rather than an id, and no
 //! object can be snapshotted at it.
 //!
-//! **Resolving to itself is not the whole of exactness.** `git replace A B`
-//! makes Git read `B` wherever `A` is named while `rev-parse` still prints
-//! `A`, so the check above passes and the checkout materialises `B`
-//! (measured, git 2.43). The engine takes the mechanism out of the picture
-//! rather than detecting it: every command the manager runs carries
-//! `GIT_NO_REPLACE_OBJECTS=1`, set where those commands are built, so a
-//! snapshot is of the objects the repository holds. That, and not the
-//! resolution alone, is what makes the checkout the judged tree.
+//! **Resolving to itself is not the whole of exactness, and neither is what
+//! this pull request adds.** `git replace A B` makes Git read `B` wherever
+//! `A` is named while `rev-parse` still prints `A`, so the check above passes
+//! and the checkout would materialise `B` (measured, git 2.43). Every command
+//! the *manager* runs now carries `GIT_NO_REPLACE_OBJECTS=1`, set where those
+//! commands are built, so the funnel writes and checks out the objects the
+//! repository holds: the snapshot's own filesystem is the judged tree.
+//!
+//! **The guarantee stops at this manager's own children.** A gate or a
+//! reviewer running *inside* the snapshot does not inherit that variable --
+//! the host runner clears the environment and composes its own -- and neither
+//! does `read_only_git`, which `quiescence` uses. Measured: a role process
+//! running `git show HEAD:f` in the snapshot still reads the replacement.
+//! So an exact snapshot is exact on disk and not yet exact for every process
+//! that inspects it, and nothing here should be read as saying the engine
+//! never reads a replacement. Closing that half means composing the variable
+//! into the runner's environment and the read-only path, which is product-wide
+//! behaviour for any repository with rewritten history and needs a `design/`
+//! sentence saying whether an exact snapshot is defined against raw or
+//! replacement objects; it is a deferred row in `reviews/FINDINGS.md` §50
+//! awaiting the owner's design ruling.
 //!
 //! **What a [`Snapshot`] holds together** (§5, §6): its fields are private
 //! and it has one constructor, [`Snapshot::new`], visible to the parent only.

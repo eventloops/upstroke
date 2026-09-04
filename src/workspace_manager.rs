@@ -325,11 +325,12 @@ pub enum Refusal {
     /// snapshot input.
     #[error(
         "refusing `{value}` as the snapshot {role}: the repository peels it to {}, not to \
-         itself, so it does not name a {} of this repository as it stands -- a ref spelt in \
-         hexadecimal, an object of another type (a commit offered as the tree peels to that \
-         commit's tree), an id of the other object format's length, or no object at all",
+         itself, so it does not name a {} of this repository as it stands{} -- a ref spelt in \
+         hexadecimal, an object of another type, an id of the other object format's length, or \
+         no object at all",
         .resolved.as_deref().unwrap_or("nothing"),
-        .role.object_type()
+        .role.object_type(),
+        .found_type.as_deref().map_or_else(String::new, |found| format!(" (it names a {found})"))
     )]
     SnapshotInputResolvesElsewhere {
         /// Which id of the input.
@@ -338,6 +339,10 @@ pub enum Refusal {
         value: String,
         /// What the repository resolved it to, when it resolved it at all.
         resolved: Option<String>,
+        /// The object type the value does name, when the repository was asked
+        /// (only the unpeelable case asks: see
+        /// [`WorkspaceManager::refuse_unless_resolves_to_itself`]).
+        found_type: Option<String>,
     },
 
     /// A slot name that is not the shape `workspace_candidates` gives it.
@@ -1980,24 +1985,32 @@ impl WorkspaceManager {
     /// resolves to itself, even when a ref of the same spelling exists (Git
     /// prefers the object and warns on stderr, which `--verify` tolerates).
     ///
-    /// **The two kinds of wrong type answer differently**, and both refuse.
-    /// A peel Git can perform to another object is this refusal. A peel it
-    /// cannot perform at all -- a tree offered where a commit is required --
-    /// is a Git error that speaks: measured on git 2.43, `rev-parse --verify
-    /// --quiet <tree>^{commit}` exits non-zero with "expected commit type, but
-    /// the object dereferences to tree type" on stderr, which is not the
-    /// silent exit 1 that [`Self::quiet_object_lookup`] reads as absence, so
-    /// it arrives as [`UpstrokeError::Git`] naming the mismatch in Git's own
-    /// words. Nothing has run either way.
+    /// **Both kinds of wrong type are the caller's mistake, and both refuse**
+    /// with this refusal (§7: the classification follows the decision the
+    /// caller can make, not Git's stderr behaviour). A peel Git can perform to
+    /// another object -- a commit offered as the tree -- answers with that
+    /// other id and is refused directly. A peel it cannot perform at all -- a
+    /// tree offered where a commit is required -- is a Git failure that
+    /// speaks: measured on git 2.43, `rev-parse --verify --quiet
+    /// <tree>^{commit}` exits non-zero with "expected commit type, but the
+    /// object dereferences to tree type" on stderr, which is not the silent
+    /// exit 1 [`Self::quiet_object_lookup`] reads as absence. That failure is
+    /// therefore classified rather than propagated: the object's type is asked
+    /// for once (`cat-file -t`), and an answer that is not the type this role
+    /// requires makes it the same refusal, naming the type the value does
+    /// name. Only a repository that will not say -- no such object, or a Git
+    /// failure of any other kind -- keeps the Git error, which is Git
+    /// misbehaving or a value naming nothing rather than a decision the caller
+    /// can act on differently. A bare `rev-parse --verify --quiet <full id>`
+    /// cannot make this distinction: measured, it echoes an absent id and
+    /// exits 0. Nothing has run either way.
     ///
     /// # Errors
     ///
     /// [`Refusal::SnapshotInputResolvesElsewhere`], carrying what the
-    /// repository answered; or a Git failure other than "no such object",
-    /// which [`Self::quiet_object_lookup`] reports as the error it is,
-    /// including the unpeelable type above. The `?` on the lookup is that
-    /// propagation (§7): the error already names the command, the directory
-    /// and Git's own words.
+    /// repository peeled the value to and, for the unpeelable case, the type
+    /// it does name; or a Git failure this cannot classify, which
+    /// [`Self::quiet_object_lookup`] reports as the error it is.
     fn refuse_unless_resolves_to_itself(
         &self,
         role: SnapshotObject,
@@ -2009,7 +2022,28 @@ impl WorkspaceManager {
             OsString::from("--quiet"),
             OsString::from(format!("{id}{}", role.peel())),
         ];
-        let resolved = self.quiet_object_lookup(&argv)?;
+        let resolved = match self.quiet_object_lookup(&argv) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // The peel failed with something to say. If the repository
+                // names the object's type and it is not this role's, the
+                // caller offered the wrong kind of object and gets the
+                // refusal; otherwise the Git error stands.
+                let Some(found) = self.object_type(id)? else {
+                    return Err(error);
+                };
+                if found == role.object_type() {
+                    return Err(error);
+                }
+                return Err(Refusal::SnapshotInputResolvesElsewhere {
+                    role,
+                    value: id.as_str().to_owned(),
+                    resolved: None,
+                    found_type: Some(found),
+                }
+                .into());
+            }
+        };
         if resolved.as_deref() == Some(id.as_str()) {
             return Ok(());
         }
@@ -2017,8 +2051,33 @@ impl WorkspaceManager {
             role,
             value: id.as_str().to_owned(),
             resolved,
+            found_type: None,
         }
         .into())
+    }
+
+    /// The type of the object `id` names, or `None` when the repository will
+    /// not say.
+    ///
+    /// `cat-file -t` on a full id, so no revision syntax is involved: an
+    /// absent object exits 128 (measured, git 2.43), which is the `None` here
+    /// rather than an error, because the caller of this is already reporting a
+    /// failure and this only sharpens it.
+    fn object_type(&self, id: &ObjectId) -> Result<Option<String>, UpstrokeError> {
+        let argv = [
+            OsString::from("cat-file"),
+            OsString::from("-t"),
+            OsString::from(id.as_str()),
+        ];
+        let output = self.git(self.base(), &argv)?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
+            message: format!("`git cat-file -t` returned non-UTF-8: {error}"),
+        })?;
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_owned()))
     }
 
     /// Remove an exact snapshot: forced worktree removal, then the intent.
@@ -2743,9 +2802,21 @@ impl WorkspaceManager {
     /// `update-ref`) and every read the manager makes through
     /// [`Self::git`] and [`Self::git_with_identity`] (`rev-parse`, `worktree
     /// list`, `for-each-ref`, `show-ref`, `diff`) is about the objects the
-    /// repository actually holds. The two free functions `read_only_git` and
-    /// `read_only_git_ok` are outside this builder, as they are outside the
-    /// hooks-path walk; nothing on the snapshot path runs through them.
+    /// repository actually holds.
+    ///
+    /// **What it does not cover, stated precisely.** Only children this
+    /// builder spawns. A gate or a reviewer running inside a snapshot gets the
+    /// environment the host runner composes, which clears the ambient one and
+    /// does not include this; the free functions `read_only_git` and
+    /// `read_only_git_ok`, which `quiescence` uses, are outside this builder
+    /// as they are outside the hooks-path walk. Measured on git 2.43: a role
+    /// process running `git show HEAD:f` in a snapshot of a tree with a
+    /// replacement installed reads the replacement. So the snapshot's
+    /// filesystem is the judged tree while a process inspecting it through Git
+    /// may not see that tree, and this doc claims only the first. Closing the
+    /// second is product-wide behaviour needing a `design/` sentence about
+    /// what an exact snapshot is defined against, and is a deferred row in
+    /// `reviews/FINDINGS.md` §50 awaiting the owner's design ruling.
     fn command(&self, cwd: &Path, args: &[OsString]) -> Command {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(self.hooks_dir());

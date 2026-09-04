@@ -3015,9 +3015,12 @@ fn charge_allowance(&mut self) {}
                  the seven `.env(`, six are the fixed author/committer identity \
                  and dates that make a commit-tree a function of its inputs \
                  rather than of the machine, and the seventh is \
-                 `GIT_NO_REPLACE_OBJECTS=1` on the shared builder, so that every \
-                 command reads the objects the repository holds rather than \
-                 whatever `git replace` has been pointed at them",
+                 `GIT_NO_REPLACE_OBJECTS=1` on the shared builder, so that the \
+                 commands this manager itself spawns read the objects the \
+                 repository holds rather than whatever `git replace` has been \
+                 pointed at them — a gate or reviewer process gets the \
+                 environment this runner composes, which is a separate question \
+                 and a deferred row",
             ),
         ];
 

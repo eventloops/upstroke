@@ -403,6 +403,22 @@ pub struct Capture {
     pub parent: String,
 }
 
+/// One of the capture's recorded ids as an [`ObjectId`], or a Git error.
+///
+/// **§7: whose mistake is it.** These two values are not a caller's: the tree
+/// is `git write-tree`'s own output and the parent is the base commit this run
+/// recorded, both already object ids by the time they are held as strings. A
+/// value here that is not one is the tool or the engine misbehaving, so it is
+/// [`UpstrokeError::Git`] naming where the value came from, as
+/// `add_snapshot` does for a `git commit-tree` line -- not
+/// `UpstrokeError::Refused`, which says the caller offered something it should
+/// not have and which `ObjectId::new`'s refusal would otherwise become here.
+fn captured_object_id(source: &str, value: String) -> Result<ObjectId, UpstrokeError> {
+    ObjectId::new(value).map_err(|refusal| UpstrokeError::Git {
+        message: format!("{source} did not yield an object id: {refusal}"),
+    })
+}
+
 /// What the ladder's **cheap rungs** said, before a gate or a reviewer ran.
 ///
 /// `run_attempt`'s order is "outcome sanity → cheap static provenance → diff
@@ -1066,13 +1082,9 @@ impl AttemptContext<'_> {
         self.manager.add_snapshot(
             self.hooks.effects(),
             &name,
-            // The capture is `git write-tree` and `rev-parse` output held as
-            // strings; each becomes an `ObjectId` here, and the refusal it
-            // returns names the value and why, which is all a reader of the
-            // failure needs (§7).
             &SnapshotInput::Tree {
-                tree: ObjectId::new(capture.tree.clone())?,
-                parent: ObjectId::new(capture.parent.clone())?,
+                tree: captured_object_id("`git write-tree`", capture.tree.clone())?,
+                parent: captured_object_id("the recorded base commit", capture.parent.clone())?,
             },
         )
     }
