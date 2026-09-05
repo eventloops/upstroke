@@ -2,9 +2,8 @@
 
 Extended notes for [`src/connect.rs`](../../src/connect.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+These notes retain the module prose from the landed renderer implementation while
+applying the comment migration. Source fragments in headings identify the matching code.
 
 ## Module
 
@@ -38,44 +37,44 @@ LEGACY-EFFECT: this module is in the **frozen legacy section** of
 `effects/allowlist.toml`, which carries its justification and the condition
 under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 
-## `pub struct ConnectOptions` › `pub pools_path: Option<PathBuf>,`
+## `pub pools_path: Option<PathBuf>,`
 
 Where to write. `None` takes `~/.upstroke/pools.toml`; tests always set
 it, so no test can reach the operator's real pools file.
 
-## `pub struct ConnectOptions` › `pub force: bool,`
+## `pub force: bool,`
 
 Overwrite an existing file that differs.
 
-## `pub enum Wrote {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`
 
 What `connect` did, so the CLI can render it and a test can assert on it
 without parsing prose.
 
-## `pub enum Wrote` › `Written,`
+## `Written,`
 
 The file did not exist, or `--force` replaced one that differed.
 
-## `pub enum Wrote` › `Unchanged,`
+## `Unchanged,`
 
 Configures exactly what is already there, and says exactly the same
-thing about it — compared over [`settings_of`] and [`stable_content`]
+thing about it — compared over [`settings_match`] and [`stable_content`]
 rather than over bytes.
 
-## `pub enum Wrote` › `Refused,`
+## `Refused,`
 
 An existing file differs and `--force` was not given.
 
-## `pub struct ConnectReport` › `pub content: String,`
+## `pub content: String,`
 
 The file `connect` produced — written, or merely proposed when it
 refused to clobber.
 
-## `pub struct ConnectReport` › `pub agents: Vec<AgentReport>,`
+## `pub agents: Vec<AgentReport>,`
 
 One entry per registered adapter, in registry order.
 
-## `pub struct AgentReport` › `pub outcome: Result<Discovery, String>,`
+## `pub outcome: Result<Discovery, String>,`
 
 `Err` means this agent contributed no pool. It never aborts the others:
 a machine with Claude Code and no Copilot is the normal case, not a
@@ -91,7 +90,17 @@ The injectable form: `adapters` supplies the implementations and `ids` the
 registry order, so a test can drive scripted discovery with no CLI on the
 machine at all.
 
-## `let existing_text = fs::read_to_string(&path).ok();`
+### Errors
+
+Returns a refusal when no destination can be determined, an I/O error
+when the existing file cannot be read, or a filesystem error naming a
+failed directory creation or file write.
+
+## `Some(path) => path.clone(),`
+
+The returned report owns its path independently of these options.
+
+## `let existing_text = match fs::read_to_string(&path) {`
 
 Read before anything is written: `--force` must not silently discard the
 keys only an operator can supply.
@@ -133,34 +142,32 @@ settings comparison meant a login between two connects reported
 the other way made every re-connect a conflict resolvable only by
 `--force`, the flag that discards hand edits.
 
-## `fn settings_of(text: &str) -> Vec<String> {`
+## `write_pools(&path, &content)?;`
 
-The settings a pools file actually carries — comments and blank lines
-dropped.
+The write boundary already names the operation and failed path.
 
-"Differs" has to mean *differs in what it configures*, not "differs in
-bytes". The header names the write date, so a byte comparison would make
-two runs a second apart look like a conflict: every re-`connect` would
-refuse, and the only way past it would be `--force`, which is exactly the
-flag that discards hand edits. A refusal an operator is trained to bypass
-protects nothing.
+## `fn write_pools(path: &std::path::Path, content: &str) -> Result<(), UpstrokeError> {`
 
-The other direction holds too: an operator who edits only a comment has
-changed no setting, and being told their file conflicts would be noise.
+Replace the file after the caller has decided that replacement is allowed.
+This reports creation and write failures separately; it provides no atomic
+publication or durability guarantee beyond the underlying filesystem calls.
 
-## `fn strip_comment(line: &str) -> String {`
+## `fn settings_match(existing: &str, proposed: &str) -> bool {`
 
-A line with any comment removed, whole-line or trailing.
+Compare complete TOML documents, preserving the values of every key.
 
-Trailing matters because `connect` writes one: `render::pool_section` decorates
-`reserve` with `# headroom kept for your own interactive sessions`, so the
-single line an operator is most likely to tidy is the one a whole-line-only
-filter would treat as a changed setting. `#` inside a quoted value is not a
-comment, so quotes are tracked.
+Parsing handles quoted keys, escapes, multiline strings, and comments with
+one grammar. The previous line scanner collapsed whitespace inside strings
+and could overwrite an operator's renamed pool. Formatting and table order
+do not change parsed settings; integer and float values remain distinct so
+comparison never rounds an integer into a different value.
+
+A parse failure means there is no evidence that replacement preserves the
+settings. The caller reports Refused unless the operator supplied --force.
 
 ## `fn stable_content(text: &str) -> Vec<&str> {`
 
-Everything except the one line that moves on its own.
+Everything except the first line when it is the generated timestamp header.
 
 The header records when `connect` ran, so comparing whole bytes would call
 two runs a second apart different. Everything else — including every
@@ -172,7 +179,7 @@ current, so it belongs in the comparison that decides whether to rewrite.
 One pool per (agent × discovered account) — today exactly one per agent,
 because nothing enumerates credential profiles (see the module docs).
 
-## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {` › `let kind = discovery.shape.unwrap_or(match agent {`
+## `let kind = discovery.shape.unwrap_or(match agent {`
 
 §13's default where the CLI could not say: Copilot's post-Jun-2026
 billing is credits, and everything else that reports nothing is treated
@@ -181,14 +188,14 @@ conservative of the two. The rendered file carries a comment saying so,
 because a default the operator cannot see is a guess wearing a fact's
 clothes.
 
-## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {` › `Pool::discovered(`
+## `Pool::discovered(`
 
 §13's trust order, minus the sources v0.1 does not read: writing
 `local-logs` into a fresh file would promise interactive-usage awareness
 that has not been built. An operator who wants it recorded can add it —
 the parser accepts it and the estimate says it is unread.
 
-## `struct OperatorKeys {`
+## `#[derive(Debug, Default, PartialEq, serde::Deserialize)]`
 
 The keys only an operator can supply, carried across a `--force`.
 
@@ -200,6 +207,22 @@ refusal message that recommends `--force` never saying so. `profile` in
 particular is the entire point of §13's multi-account seam, and
 `monthly_allowance` is the only thing that makes a self-metered estimate
 possible at all (`Auto` yields `Unknown`).
+
+## `fn apply(self, pool: &mut Pool) -> Result<(), InvalidAllowance> {`
+
+Move the operator's valid keys into the new pool. An invalid allowance
+leaves the discovered Auto default and reports why to the caller, which
+adds the pool name to the visible warning.
+
+## `pool.monthly_allowance = allowance_of(&value)?;`
+
+The error identifies this setting; run_with supplies the pool
+context and decides how to report the rejected value.
+
+## `Ok(crate::capacity::Allowance::Units(*units as f64))`
+
+Every positive i64 fits the finite f64 range. Conversion uses
+the same capacity representation as config::read.
 
 ## `fn operator_keys(text: &str) -> std::collections::BTreeMap<String, OperatorKeys> {`
 
@@ -235,27 +258,37 @@ would change a public path and a census anchor rather than a file boundary.
 A refusal to clobber is not an error the operator can fix by retrying, and
 exit status is how a script tells the difference.
 
-## `mod tests` › `struct FakeAdapter {`
+## `struct FakeAdapter {`
 
 A scripted stand-in, so these tests run on a machine with no agent CLI
 installed at all.
 
-## `fn machine() -> Machine` › `FakeAdapter {`
+## `FakeAdapter {`
 
 Installed nowhere: the normal single-vendor machine.
 
-## `fn what_connect_writes_parses_back_into_the_pools_it_describes() {` › `let path = scratch("roundtrip");`
+## `let old = first.content.replace(`
+
+The previous renderer used f64 Display, which spells 1e16 as this
+valid i64. TOML integers and floats remain distinct in comparison.
+
+## `let annotated = format!("{}{} operator note\n", first.content, render::WRITTEN_BY);`
+
+The first line is the only generated timestamp header. A later
+comment using the same words remains part of the content comparison.
+
+## `let path = scratch("roundtrip");`
 
 The round trip is the whole contract: a file this command writes must
 be one `config::load` accepts, or `upstroke capacity` reports on
 something `connect` cannot produce.
 
-## `fn an_existing_file_that_differs_is_never_clobbered()` › `let path = scratch("clobber");`
+## `let path = scratch("clobber");`
 
 §17 says the file is hand-editable, so silently overwriting a hand
 edit destroys the operator's own record of their subscriptions.
 
-## `fn an_existing_file_that_differs_is_never_clobbered()` › `let forced = connect(&path, true);`
+## `let forced = connect(&path, true);`
 
 --force is the escape hatch, and it really does replace — but it
 carries the operator's own keys across. `profile` is the whole point
@@ -263,7 +296,40 @@ of §13's multi-account seam and discovery cannot supply it, so a
 replacement that dropped it would silently delete the one setting
 the refusal above existed to protect.
 
-## `fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {` › `let path = scratch("idempotent");`
+## `let path = scratch("escapes");`
+
+§13 calls `profile` a config-directory path, and on Windows a path
+holds backslashes. The parent parses the operator's spelling and the
+renderer writes the value back; written raw, `\U` and `\.` are TOML
+escapes, so `--force` produced a file `config::load` refused with a
+parse error and the next `connect` read no keys from — the loss the
+carrying exists to prevent, on the path that recommends `--force`.
+
+## `let again = connect(&path, false);`
+
+The written spelling reads back into the same keys, so a second
+connect carries them again and finds nothing to rewrite — which is
+the round trip the two comparisons in `run_with` depend on.
+
+## `let machine = Machine {`
+
+Pass 1 of PR #168: `run_with` is public and takes any adapter id, and
+the renderer now quotes a name that is not a bare key, so an id
+holding `"` followed by `#` writes `[pools."x\"#A"]`. A `strip_comment`
+that read `\"` as the closing quote cut both that header and the
+operator's renamed `[pools."x\"#B"]` down to `[pools."x\"`, called
+the settings equal, and — since the text differed — rewrote the file,
+undoing the rename without `--force`.
+
+## `let path = scratch("unparseable");`
+
+`operator_keys` reads the existing file leniently: one it cannot
+parse carries no keys at all. The refusal must therefore not tell the
+operator their keys "are carried" — pass 1 of PR #168 found that it
+did — but send them to the proposed text, which is what `--force`
+writes, and say when carrying happens.
+
+## `let path = scratch("idempotent");`
 
 The header names the write date, so a byte comparison would call
 every second run a conflict — and the only way past a conflict is
@@ -271,7 +337,7 @@ every second run a conflict — and the only way past a conflict is
 is trained to bypass protects nothing, so the comparison is over
 settings, not bytes.
 
-## `fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {` › `fs::write(&path, format!("# my own note\n{first}")).expect("annotate");`
+## `fs::write(&path, format!("# my own note\n{first}")).expect("annotate");`
 
 A comment-only difference is never a *conflict* — settings are what
 may not be clobbered — but it is a rewrite, because the comments are
@@ -281,37 +347,37 @@ two connects cannot leave the file insisting they are signed out.
 Their real edits (`profile`, `monthly_allowance`, `endpoint`) survive
 both paths — see `an_existing_file_that_differs_is_never_clobbered`.
 
-## `fn a_login_between_connects_updates_the_file()` › `let path = scratch("relogin");`
+## `let path = scratch("relogin");`
 
 Auth state is rendered only as a comment, so a settings-only
 comparison reported `unchanged` and left the file telling an operator
 who had just logged in that they were not signed in.
 
-## `fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {` › `let machine = Machine {`
+## `let machine = Machine {`
 
 D1's guard. It cannot fire against a real CLI today — neither
 enumerates models — so it is driven through a scripted discovery
 that does, which is the shape the check exists for.
 
-## `fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {` › `models: [`
+## `models: [`
 
 A roster that has moved on without the catalog.
 Overlaps the roster — zero overlap is a format
 mismatch, not a stale catalog — but has moved on from
 the frontier slug the second opinion depends on.
 
-## `fn an_undetectable_plan_shape_takes_a_default_and_says_so()` › `let machine = Machine {`
+## `let machine = Machine {`
 
 The Copilot case: §13 gives it two billing shapes and the CLI
 distinguishes neither. A default is fine; a silent default is not.
 
-## `fn discovery_against_the_real_claude_binary_when_present()` › `let runner = crate::runner::host::HostRunner::new();`
+## `let runner = crate::runner::host::HostRunner::new();`
 
 §13's discovery is a claim about a real CLI, so it is checked against
 one where the machine has it — and skipped cleanly where it does not,
 which is the shape every other binary-touching test here takes.
 
-## `fn discovery_against_the_real_claude_binary_when_present()` › `assert!(`
+## `assert!(`
 
 Whatever it answers, it must be one of the three states and it must
 explain itself — including when the answer is "could not tell".

@@ -4870,6 +4870,280 @@ fn malformed_gitdir_refuses_before_removal() {
     }
 }
 
+/// One entry of a [`tree_bytes`] snapshot: what the name is, and its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeEntry {
+    /// A directory, recorded so a deleted empty one is a difference.
+    Dir,
+    /// A regular file and its bytes.
+    File(Vec<u8>),
+    /// A symbolic link or junction and its target, never followed.
+    Link(PathBuf),
+}
+
+/// Everything under `root`, by path relative to it: every directory, every
+/// regular file with its bytes, every symbolic link or junction with its target. Nothing
+/// is followed, so replacing a file with a link to equal bytes is a
+/// difference, and so is a deleted empty directory.
+fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, TreeEntry>) {
+        for entry in fs::read_dir(dir).expect("list a directory the test created") {
+            let path = entry.expect("a directory entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("an entry is under its root")
+                .to_path_buf();
+            let metadata = fs::symlink_metadata(&path).expect("entry metadata");
+            if is_reparse_point(&metadata) {
+                out.insert(
+                    relative,
+                    TreeEntry::Link(fs::read_link(&path).expect("read a link's target")),
+                );
+            } else if metadata.is_dir() {
+                out.insert(relative, TreeEntry::Dir);
+                walk(root, &path, out);
+            } else {
+                out.insert(
+                    relative,
+                    TreeEntry::File(fs::read(&path).expect("read an entry")),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    // Only an actual not-found is an absent tree, which the empty map records
+    // as a difference from a present one; any other failure is the test's.
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {
+            out.insert(PathBuf::new(), TreeEntry::Dir);
+            walk(root, root, &mut out);
+        }
+        Ok(_) => panic!("{} is not a directory", root.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{}: {error}", root.display()),
+    }
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn tree_bytes_detects_a_file_replaced_by_a_link_to_equal_contents() {
+    let scratch = acquire(&std::env::temp_dir(), "tree-bytes-file-link").expect("scratch tree");
+    let root = scratch.path().join("observed");
+    fs::create_dir(&root).expect("observed directory");
+    let file = root.join("file");
+    let target = scratch.path().join("same-bytes");
+    fs::write(&file, b"unchanged bytes\n").expect("original file");
+    fs::write(&target, b"unchanged bytes\n").expect("equal-content target");
+    let before = tree_bytes(&root);
+
+    fs::remove_file(&file).expect("remove original file");
+    std::os::unix::fs::symlink(&target, &file).expect("substitute the link");
+    assert_eq!(
+        fs::read(&file).expect("read through the link"),
+        b"unchanged bytes\n",
+        "a snapshot that follows the link would see the original bytes"
+    );
+    assert_ne!(
+        tree_bytes(&root),
+        before,
+        "file-to-link substitution must change the refusal snapshot"
+    );
+}
+
+#[test]
+fn tree_bytes_detects_a_directory_replaced_by_a_link_to_equal_contents() {
+    let scratch =
+        acquire(&std::env::temp_dir(), "tree-bytes-directory-link").expect("scratch tree");
+    let root = scratch.path().join("observed");
+    let directory = root.join("directory");
+    let target = scratch.path().join("same-tree");
+    fs::create_dir_all(&directory).expect("original directory");
+    fs::create_dir(&target).expect("target directory");
+    fs::write(directory.join("file"), b"unchanged bytes\n").expect("original contents");
+    fs::write(target.join("file"), b"unchanged bytes\n").expect("equal-content target");
+    let before = tree_bytes(&root);
+
+    fs::remove_file(directory.join("file")).expect("remove original contents");
+    fs::remove_dir(&directory).expect("remove original directory");
+    plant_directory_link(&target, &directory);
+    assert_eq!(
+        fs::read(directory.join("file")).expect("read through the directory link"),
+        b"unchanged bytes\n",
+        "a snapshot that follows the link would see the original subtree"
+    );
+    assert_ne!(
+        tree_bytes(&root),
+        before,
+        "directory-to-link substitution must change the refusal snapshot"
+    );
+}
+
+/// What `git worktree add` leaves when it is killed before it writes `gitdir`,
+/// and what `remove_worktree` does with it. Measured under strace on git
+/// 2.43.0, the add writes in this order: the admin directory, `locked`
+/// (`initializing`), the checkout directory, `gitdir`, the checkout's `.git`
+/// pointer, `HEAD`, `commondir`, then the checkout through child processes; on
+/// the run measured, `locked` was unlinked as the last syscall. A kill between
+/// opening `gitdir` -- which creates it, zero-length -- and writing it leaves
+/// exactly an admin directory holding `locked` and a zero-length `gitdir`, and
+/// an empty checkout directory with no pointer.
+///
+/// Three facts, each asserted because each was believed otherwise once.
+///
+/// The classifier answers `None` for it, and that answer is a **hole**, not a
+/// verdict: `None` is defined as "nothing was written", and here an intent,
+/// an admin directory, `locked`, `gitdir` and a checkout directory were
+/// written. The classifier reads registration through `git worktree list`,
+/// which skips a registration it reads zero bytes from, so `record_for`
+/// answers `None`, the element list is empty, and the state is invisible to
+/// the site's residue contract even though it is durable. The sampler runs
+/// the tabled recovery for every sample and requires every one to recover, so
+/// a sample landing in this window is the sampler's `forced removal
+/// converges` red.
+///
+/// `remove_worktree` **refuses** it, with a diagnostic naming this admin
+/// directory and nothing else, and the residue blocks every removal through
+/// this funnel in the repository, not only this slot's. That is pinned as what
+/// the public `WorkspaceManager` library API does today. The shipped CLI's
+/// `upstroke resume` uses the separate `Workspace::reclaim_gate_workspaces`
+/// path, which never decodes a registration's `gitdir`; this test does not
+/// reproduce a refusal in that path. `DESIGN.md` §15's reclaim sentence is
+/// about those gate/review worktrees. The engine's task-slot callers are in
+/// its crate-private schema-4 topology, and `reclaim_intents` has no non-test
+/// caller within this repository, but external library callers can use the
+/// public manager directly.
+/// The design is silent about a task registration this funnel cannot bind;
+/// `RESIDUE-UNBINDABLE-TASK-REGISTRATION-HAS-NO-DESIGN-SENTENCE` records that
+/// gap and the measurements a sentence needs. On disk this state is
+/// indistinguishable from an add in flight in the same window -- `locked` is
+/// present in both -- and a skip here was measured to delete the checkout
+/// beneath a live writer's registration (PR #151 pass 1), so the refusal is
+/// not to be relaxed on disk state alone.
+///
+/// What each refusal is checked against is a snapshot -- relative path to
+/// directory, bytes or link target -- of four trees, taken before and compared
+/// whole after: the unrelated slot's populated checkout, this slot's empty
+/// checkout directory, the whole `.git/worktrees/` store (the stale entry and
+/// the unrelated slot's administrative directory alike), and the intents
+/// directory. The same four trees at both refusals; the unrelated slot exists
+/// before the first. Checking named files would let a removal that deleted
+/// the rest pass, and checking the checkout without its administrative
+/// directory would let a removal that deleted the unrelated slot's `index`
+/// pass.
+#[test]
+fn an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup() {
+    let fixture = Fixture::created("add-killed-before-gitdir");
+    let slot = fixture.task("alpha", 1);
+    fixture
+        .manager
+        .write_intent(&mut NoHooks, &slot)
+        .expect("intent");
+    let path = fixture.manager.slot_path(&slot);
+    let name = path
+        .file_name()
+        .expect("a slot path has a final component")
+        .to_os_string();
+    let worktrees = fixture.manager.common_git_dir.join("worktrees");
+    let stale = worktrees.join(&name);
+    fs::create_dir_all(&stale).expect("the admin directory the add makes first");
+    fs::write(stale.join("locked"), "initializing\n").expect("the lock the add writes next");
+    fs::write(stale.join("gitdir"), []).expect("the gitdir the add opened and never wrote");
+    fs::create_dir_all(&path).expect("the checkout directory the add made, still empty");
+    let intents = fixture
+        .manager
+        .intent_path(&slot)
+        .parent()
+        .expect("an intent lives in a directory")
+        .to_path_buf();
+    let expected = format!(
+        "worktree registration {} has an empty gitdir",
+        stale.display()
+    );
+
+    // An unrelated, populated slot, present for both refusals: its checkout
+    // and its administrative directory are in every comparison below.
+    let other = fixture.add_task(&mut NoHooks, "beta", 1);
+    let other_path = fixture.manager.slot_path(&other);
+    fs::write(other_path.join("witness.txt"), "unrelated slot\n").expect("plant a file");
+    let snapshot = || {
+        (
+            tree_bytes(&other_path),
+            tree_bytes(&path),
+            tree_bytes(&worktrees),
+            tree_bytes(&intents),
+        )
+    };
+
+    // The classifier's hole: durable state it reads as nothing, because Git
+    // does not list it.
+    let site = EffectSiteId::Worktree(WorktreeSite::Add);
+    let target = ResidueTarget::new(&fixture.base).at(&path);
+    assert!(
+        record_for(&fixture.base, &path)
+            .expect("Git enumerates")
+            .is_none(),
+        "`git worktree list` skips a zero-length gitdir"
+    );
+    assert_eq!(classify(site, &target), ObjectResidue::None);
+    assert_eq!(
+        observed_residue_elements(site, &target).expect("observe"),
+        Vec::<ResidueElement>::new(),
+        "no registered element sees an admin directory Git does not enumerate"
+    );
+
+    // The refusal, for this slot: the diagnostic names this admin directory
+    // and nothing else, and none of the four trees changed.
+    let refused = |error: &UpstrokeError| match error {
+        UpstrokeError::Git { message } => message == &expected,
+        _ => false,
+    };
+    let before = snapshot();
+    assert!(
+        before.0.len() > 3 && before.2.len() > 4,
+        "the unrelated checkout and the worktree store hold more than a named check would \
+         cover: {:?} / {:?}",
+        before.0.keys().collect::<Vec<_>>(),
+        before.2.keys().collect::<Vec<_>>()
+    );
+    let error = fixture
+        .manager
+        .remove_worktree(&mut NoHooks, &slot)
+        .expect_err("a registration that names nothing refuses");
+    assert!(refused(&error), "expected `{expected}`, got: {error}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "the refusal changed nothing in either checkout, the worktree store or the intents"
+    );
+
+    // ... and for every other slot through this funnel, which is what makes
+    // the residue a finding rather than a stuck sample.
+    let before = snapshot();
+    let error = fixture
+        .manager
+        .remove_worktree(&mut NoHooks, &other)
+        .expect_err("identification enumerates every registration");
+    assert!(
+        refused(&error),
+        "the same diagnostic, naming the stale directory, for an unrelated slot: {error}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "the refusal changed nothing in either checkout, the worktree store or the intents"
+    );
+    assert!(
+        fixture
+            .manager
+            .worktree_records()
+            .expect("records")
+            .iter()
+            .any(|record| record.path().ends_with("kbeta-g1")),
+        "the unrelated slot is still registered"
+    );
+}
+
 #[test]
 fn an_absent_registration_gitdir_is_already_gone_for_forced_cleanup() {
     let fixture = Fixture::created("absent-gitdir-converges");

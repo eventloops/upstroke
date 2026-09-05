@@ -1,36 +1,4 @@
-//! The typed identity every Runner process carries.
-//!
-//! `decisions.admission_and_leases.permits.invocation_identity` **enumerates**
-//! it, and the enumeration is the type:
-//!
-//! > InvocationId = (key, generation, attempt, role, ordinal) with role in
-//! > {worker, gate(n), review_pass(n), review_reask(n)}, or (sequence, role,
-//! > ordinal) with role in {gate(n), review_pass(n), review_reask(n)}, or
-//! > (probe, target: Agent(name) | Shell, ordinal) at pre-flight (the shell
-//! > probe is target Shell, non-slotted; agent probes are slotted); unique per
-//! > process; a retry attempt has a new attempt number; **deterministic in the
-//! > sequential substrate**; every RunnerRequest carries it
-//!
-//! Three closed forms, nine role/target members, and no fourth shape. The
-//! properties follow from the shape rather than from a generator:
-//!
-//! * *unique per process* — distinct tuples render distinctly
-//!   ([`InvocationId::render`] is injective; `distinct_tuples_render_distinctly`
-//!   crosses every field).
-//! * *a retry attempt has a new attempt number* — `attempt` is a field, so a
-//!   retry that did not change it is a value equal to the one before it.
-//! * *deterministic in the sequential substrate* — the rendering is a pure
-//!   function of the tuple. Nothing here reads a clock, a pid, or a random
-//!   source. This is load-bearing beyond fidelity: `crash_reconstruction`
-//!   builds container names as
-//!   `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` "so
-//!   **deterministic** InvocationIds never collide across incarnations and no
-//!   earlier ownership evidence is overwritten".
-//!
-//! PR4 owns the type and its properties. **PR7 assigns them**:
-//! `decisions.sequential_substrate.runner` — "RunnerRequest carries invocation:
-//! InvocationId from PR4 (assigned by PR7, new per attempt)". No ledger, no
-//! broker and no allocation policy lives here.
+//! Extended notes: `docs/internals/runner/invocation.md`
 
 use std::fmt;
 
@@ -42,43 +10,22 @@ use crate::runner::{AgentId, ProbeTarget};
 use crate::topology::events::{AttemptNumber, GenerationId, SequenceId};
 use crate::topology::registry::TaskKey;
 
-/// The role of an invocation identified by `(key, generation, attempt, …)`.
-///
-/// The packet's first form: "role in {worker, gate(n), review_pass(n),
-/// review_reask(n)}".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AttemptRole {
-    /// The worker process of this attempt.
     Worker,
-    /// Gate `n` of this attempt's gate list.
     Gate(u32),
-    /// Review pass `n`.
     ReviewPass(u32),
-    /// Re-ask `n` of a review pass.
     ReviewReask(u32),
 }
 
-/// The role of an invocation identified by `(sequence, …)`.
-///
-/// The packet's second form: "role in {gate(n), review_pass(n),
-/// review_reask(n)}" — **without** `worker`. A separate type rather than a
-/// runtime check on [`AttemptRole`], because "a sequence has no worker" is then
-/// a compile error at the call site instead of a refusal at run time. INV-20
-/// draws the same line: "every completion is bound to (key, generation,
-/// attempt) or (sequence, candidate)" — a sequence integrates candidates other
-/// processes produced, so there is no worker of a sequence to identify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SequenceRole {
-    /// Gate `n` of this integration transaction.
     Gate(u32),
-    /// Review pass `n`.
     ReviewPass(u32),
-    /// Re-ask `n` of a review pass.
     ReviewReask(u32),
 }
 
 impl AttemptRole {
-    /// The token this role renders as.
     const fn token(self) -> &'static str {
         match self {
             Self::Worker => "worker",
@@ -111,7 +58,6 @@ impl AttemptRole {
 }
 
 impl SequenceRole {
-    /// The token this role renders as.
     const fn token(self) -> &'static str {
         match self {
             Self::Gate(_) => "gate",
@@ -129,9 +75,6 @@ impl SequenceRole {
     }
 
     fn parse(text: &str) -> Option<Self> {
-        // Longest token first: `review_pass` and `review_reask` share no
-        // prefix, but `gate` must not swallow a token that merely starts the
-        // same way if one is ever added.
         for (token, build) in [
             ("review_pass", Self::ReviewPass as fn(u32) -> Self),
             ("review_reask", Self::ReviewReask as fn(u32) -> Self),
@@ -145,77 +88,33 @@ impl SequenceRole {
     }
 }
 
-/// The identity of one Runner process — one of the packet's three forms.
-///
-/// A closed enumeration rather than a string, because the value is a key in
-/// four separate ledgers (R3's slot pairs, R4's invocation registrations, PR6's
-/// container names and intent paths, PR7's completion identity check) and
-/// because every property the packet states about it is a property of the
-/// tuple. An opaque string can hold a value no form describes; this cannot.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InvocationId {
-    /// `(key, generation, attempt, role, ordinal)`.
     Attempt {
         key: TaskKey,
         generation: GenerationId,
         attempt: AttemptNumber,
         role: AttemptRole,
-        /// Which invocation of this role within this attempt, dense from 0. The
-        /// role index says *which* gate; the ordinal says which run of it, so a
-        /// re-dispatch inside one attempt is a new identity rather than a
-        /// reused one.
         ordinal: u32,
     },
-    /// `(sequence, role, ordinal)`.
     Sequence {
         sequence: SequenceId,
         role: SequenceRole,
         ordinal: u32,
     },
-    /// `(probe, target: Agent(name) | Shell, ordinal)` at pre-flight.
     Probe {
         target: ProbeTarget,
-        /// Which pre-flight this is. Probe identities repeat across
-        /// incarnations by construction — the packet says so, and says how it
-        /// is handled: "because probe identities repeat across incarnations,
-        /// every container name and intent path additionally carries the
-        /// coordinator incarnation id".
         ordinal: u32,
     },
 }
 
-/// The generation the legacy sequential engine assigns.
-///
-/// The contract's `invariants_introduced[1]` is "legacy engine assigns
-/// legacy-scoped values". The legacy engine has no generations — it never
-/// re-dispatches a task from a fresh worktree — so every value it assigns sits
-/// in generation 0 and says so through [`InvocationId::legacy_attempt`]. The
-/// scope is real rather than decorative: a legacy run is schema-1..3 and a
-/// generation-bearing run is schema-4, and no run changes schema between
-/// epochs (INV-23), so the two never share a ledger.
 pub const LEGACY_GENERATION: GenerationId = GenerationId(0);
 
-/// The longest value the enumeration can render.
-///
-/// Not a policy number: it is the maximum of [`InvocationId::render`] over the
-/// whole domain, which `the_longest_value_the_domain_can_render_is_the_limit`
-/// computes from `u32::MAX` and the longest role token. Deriving it this way is
-/// what stops the validator refusing a value the domain contains — the failure
-/// mode a hand-picked limit has. The only construction it can therefore refuse
-/// is an over-long agent name in the probe form.
 pub const MAX_LEN: usize = 70;
 
-/// Every character a rendered id may carry.
-///
-/// PR6 puts this value inside a container name and inside the file name
-/// `<R>/containers/<name>.intent` (`decisions.pr_sequence[7].scope`), so a
-/// value carrying a path separator, a space, or a control character is a value
-/// that names a different file than the one the record says. `.` is the field
-/// separator, so no component may contain one.
 const SEPARATOR: char = '.';
 
 impl InvocationId {
-    /// `(key, generation, attempt, role, ordinal)`.
     #[must_use]
     pub const fn attempt(
         key: TaskKey,
@@ -233,8 +132,6 @@ impl InvocationId {
         }
     }
 
-    /// `(key, generation, attempt, role, ordinal)` in the legacy engine's
-    /// generation. See [`LEGACY_GENERATION`].
     #[must_use]
     pub const fn legacy_attempt(
         key: TaskKey,
@@ -245,7 +142,6 @@ impl InvocationId {
         Self::attempt(key, LEGACY_GENERATION, attempt, role, ordinal)
     }
 
-    /// `(sequence, role, ordinal)`.
     #[must_use]
     pub const fn sequence(sequence: SequenceId, role: SequenceRole, ordinal: u32) -> Self {
         Self::Sequence {
@@ -255,19 +151,7 @@ impl InvocationId {
         }
     }
 
-    /// `(probe, target, ordinal)`.
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] when the target names an agent whose id
-    /// carries a character outside `[0-9A-Za-z_-]`, or is long enough to push
-    /// the rendering past [`MAX_LEN`]. Every other form is infallible: its
-    /// fields are integers, and their longest rendering *is* [`MAX_LEN`].
     pub fn probe(target: ProbeTarget, ordinal: u32) -> Result<Self, UpstrokeError> {
-        // The *component*, not only the whole rendering. `.` is inside the
-        // charset the whole value is checked against, so an agent named
-        // `claude.code` would render a value that passes `validate` and yet
-        // splits into four components no form has — writable and unreadable.
         if let ProbeTarget::Agent(agent) = &target {
             let name = agent.as_str();
             if name.is_empty() {
@@ -294,20 +178,6 @@ impl InvocationId {
         Ok(id)
     }
 
-    /// The value as it is recorded: injective over the whole domain.
-    ///
-    /// The grammar, one line per form:
-    ///
-    /// ```text
-    /// k<key>.g<generation>.a<attempt>.<role>.o<ordinal>
-    /// s<sequence>.<role>.o<ordinal>
-    /// p.shell.o<ordinal>   |   p.agent-<id>.o<ordinal>
-    /// ```
-    ///
-    /// The leading component is `k…`, `s…` or `p`, which no other form can
-    /// produce, so the forms are disjoint; within a form the component count is
-    /// fixed and no component may contain the separator, so two distinct tuples
-    /// differ in some component and therefore in the rendering.
     #[must_use]
     pub fn render(&self) -> String {
         match self {
@@ -339,16 +209,6 @@ impl InvocationId {
         }
     }
 
-    /// Rebuild a recorded identity.
-    ///
-    /// The domain is closed on the way back in as well as on the way out: a
-    /// value that is not one of the three forms is refused rather than carried
-    /// as an opaque string, so a record cannot smuggle a fourth shape into a
-    /// ledger keyed by this type.
-    ///
-    /// # Errors
-    ///
-    /// [`UpstrokeError::Refused`] when `value` is not the rendering of any tuple.
     pub fn parse(value: &str) -> Result<Self, UpstrokeError> {
         validate(value)?;
         parse_forms(value).ok_or_else(|| UpstrokeError::Refused {
@@ -362,12 +222,6 @@ impl InvocationId {
         })
     }
 
-    /// The probe target, when this identity is a pre-flight probe.
-    ///
-    /// INV-18 accounts the two targets differently — "every agent CLI
-    /// invocation incl. agent probes acquires its atomic {agent, pool?} pair
-    /// while gates and the shell probe register without slots" — so the target
-    /// is readable from the identity and not only from the request's role.
     #[must_use]
     pub const fn probe_target(&self) -> Option<&ProbeTarget> {
         match self {
@@ -377,7 +231,6 @@ impl InvocationId {
     }
 }
 
-/// Refuse a rendering no funnel could have written.
 fn validate(value: &str) -> Result<(), UpstrokeError> {
     if value.is_empty() {
         return Err(UpstrokeError::Refused {
@@ -410,7 +263,6 @@ fn validate(value: &str) -> Result<(), UpstrokeError> {
     Ok(())
 }
 
-/// The inverse of [`InvocationId::render`], or `None`.
 fn parse_forms(value: &str) -> Option<InvocationId> {
     let parts: Vec<&str> = value.split(SEPARATOR).collect();
     match parts.as_slice() {
@@ -448,10 +300,6 @@ fn parse_forms(value: &str) -> Option<InvocationId> {
     }
 }
 
-/// One `<tag><digits>` component. Rejects a leading `+`, a leading zero on a
-/// multi-digit number, and anything else `u32::from_str` would accept but
-/// `render` would never produce, so `parse ∘ render` is a bijection and not
-/// merely a left inverse.
 fn field(component: &str, tag: &str) -> Option<u32> {
     let digits = component.strip_prefix(tag)?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -487,20 +335,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // the grid, and what bounds it
-    // -----------------------------------------------------------------------
-    //
-    // Every numeric field is a `u32`, so no grid can be exhaustive. What a grid
-    // has to catch is a rendering that *drops* a field, *conflates* two, or
-    // loses a separator. Dropping and conflation are caught by a full Cartesian
-    // product in which every field varies independently — if the rendering is a
-    // function of fewer fields than the tuple has, two grid points collide.
-    // Three values per field is the smallest set that also distinguishes "uses
-    // the value" from "uses whether the value is zero". A lost separator is a
-    // different defect (adjacent fields concatenate), so it gets its own table
-    // of pairs chosen to collide under exactly that mutation.
 
     const KEYS: [u32; 3] = [0, 1, 12];
     const GENERATIONS: [u32; 3] = [0, 2, 13];
@@ -538,7 +372,6 @@ mod tests {
         targets
     }
 
-    /// Every identity the grid describes.
     fn grid() -> Vec<InvocationId> {
         let mut ids = Vec::new();
         for key in KEYS {
@@ -573,9 +406,6 @@ mod tests {
         ids
     }
 
-    /// The grid's size, computed from the grid's *definition* — the product of
-    /// the dimensions — so a renderer that lost a field cannot also lower the
-    /// number it is compared against.
     const fn grid_size() -> usize {
         let attempt_form = KEYS.len() * GENERATIONS.len() * ATTEMPTS.len() * 10 * ORDINALS.len();
         let sequence_form = SEQUENCES.len() * 9 * ORDINALS.len();
@@ -585,7 +415,6 @@ mod tests {
 
     #[test]
     fn the_grid_varies_every_field_independently() {
-        // Fixture hostility as a distinct-value count, per field, not as prose.
         assert_eq!(BTreeSet::from(KEYS).len(), 3);
         assert_eq!(BTreeSet::from(GENERATIONS).len(), 3);
         assert_eq!(BTreeSet::from(ATTEMPTS).len(), 3);
@@ -605,8 +434,6 @@ mod tests {
         assert_eq!(grid_size(), 903);
     }
 
-    /// The packet enumerates nine role/target members across the three forms:
-    /// four attempt roles, three sequence roles (no worker), two probe targets.
     #[test]
     fn the_enumeration_has_exactly_the_nine_members_the_packet_names() {
         let attempt: BTreeSet<&'static str> = [
@@ -652,9 +479,6 @@ mod tests {
         assert_eq!(attempt.len() + sequence.len() + 2, 9, "nine members");
     }
 
-    /// Expected values written by hand from the packet's field order, never
-    /// from `render`. A rendering that reordered, dropped, or re-spelled a
-    /// field fails here even if it stayed injective.
     #[test]
     fn the_three_forms_render_as_the_packet_spells_them() {
         let table: Vec<(InvocationId, &str)> = vec![
@@ -736,9 +560,6 @@ mod tests {
             grid_size(),
             "two distinct identities rendered the same value"
         );
-        // Uniqueness within a run is therefore structural: it does not depend
-        // on a generator not colliding, and no expected value here came from
-        // the constructor.
         let tuples: BTreeSet<&InvocationId> = ids.iter().collect();
         assert_eq!(
             tuples.len(),
@@ -747,9 +568,6 @@ mod tests {
         );
     }
 
-    /// A lost separator concatenates two adjacent fields. Each pair below is
-    /// two distinct tuples whose renderings become equal under exactly that
-    /// mutation, so the pair fails the moment a `.` is dropped.
     #[test]
     fn adjacent_fields_cannot_be_confused_for_one() {
         let pairs: Vec<(InvocationId, InvocationId)> = vec![
@@ -806,8 +624,6 @@ mod tests {
         }
     }
 
-    /// [`MAX_LEN`] is the domain's own maximum, so the validator can never
-    /// refuse a value the enumeration can produce.
     #[test]
     fn the_longest_value_the_domain_can_render_is_the_limit() {
         let longest = InvocationId::attempt(
@@ -817,8 +633,6 @@ mod tests {
             AttemptRole::ReviewReask(u32::MAX),
             u32::MAX,
         );
-        // Written out rather than computed: `k` + 10 digits, `.g` + 10, `.a` +
-        // 10, `.review_reask` + 10, `.o` + 10.
         assert_eq!(
             longest.render(),
             "k4294967295.g4294967295.a4294967295.review_reask4294967295.o4294967295"
@@ -835,9 +649,6 @@ mod tests {
         }
     }
 
-    /// "deterministic in the sequential substrate" — the rendering is a pure
-    /// function of the tuple, so the same identity built twice is the same
-    /// value. A ULID, a pid, or a counter fails this.
     #[test]
     fn the_same_tuple_always_renders_the_same_value() {
         let build = || {
@@ -850,8 +661,6 @@ mod tests {
             )
         };
         let first = build();
-        // Work between the two constructions, so anything reading a clock or a
-        // monotonic nonce has had the chance to move.
         let mut noise = 0u64;
         for i in 0..100_000u64 {
             noise = noise.wrapping_add(i);
@@ -863,7 +672,6 @@ mod tests {
         assert_eq!(first.render(), "k3.g1.a2.gate0.o0");
     }
 
-    /// "a retry attempt has a new attempt number".
     #[test]
     fn a_retry_is_a_new_attempt_number_and_a_new_identity() {
         let attempts: Vec<InvocationId> = (1..=5)
@@ -897,27 +705,24 @@ mod tests {
         }
     }
 
-    /// The domain is closed on the way in. Every value here is one a reader
-    /// might plausibly be handed — including the opaque forms this type used to
-    /// accept.
     #[test]
     fn parse_refuses_what_no_form_can_render() {
         for bad in [
             "",
-            "legacy-t1-a2",               // the old open-ended scope form
-            "01K3Q9V0Z3B8N9RJ4F2A6C7D8E", // a ULID
-            "k1.g1.a1.worker",            // a field short
-            "k1.g1.a1.worker.o1.x2",      // a field long
-            "k1.g1.a1.boss.o1",           // a role outside the enumeration
-            "s1.worker.o1",               // worker is not a sequence role
-            "k1.g1.a1.gate.o1",           // an indexed role without its index
-            "x1.g1.a1.worker.o1",         // an unknown form tag
-            "k1.g1.a1.worker.1",          // an untagged field
-            "k01.g1.a1.worker.o1",        // a leading zero render never writes
+            "legacy-t1-a2",
+            "01K3Q9V0Z3B8N9RJ4F2A6C7D8E",
+            "k1.g1.a1.worker",
+            "k1.g1.a1.worker.o1.x2",
+            "k1.g1.a1.boss.o1",
+            "s1.worker.o1",
+            "k1.g1.a1.gate.o1",
+            "x1.g1.a1.worker.o1",
+            "k1.g1.a1.worker.1",
+            "k01.g1.a1.worker.o1",
             "k+1.g1.a1.worker.o1",
-            "k1.g1.a1.worker.o4294967296", // past u32
-            "p.agent-.o1",                 // an empty agent name
-            "p.agent-a b.o1",              // outside the charset
+            "k1.g1.a1.worker.o4294967296",
+            "p.agent-.o1",
+            "p.agent-a b.o1",
             "p.shell.o1.o2",
             "has/slash",
             "has space",
@@ -934,10 +739,6 @@ mod tests {
         assert!(InvocationId::probe(ProbeTarget::Agent(AgentId::new("claude.code")), 0).is_err());
         assert!(InvocationId::probe(ProbeTarget::Agent(AgentId::new("a/b")), 0).is_err());
         assert!(InvocationId::probe(ProbeTarget::Agent(AgentId::new("")), 0).is_err());
-        // `p.agent-<name>.o<ordinal>` spends `p`, two separators, `agent-`,
-        // `o` and up to ten ordinal digits: 1 + 1 + 6 + 1 + 1 + 10 = 20. So
-        // MAX_LEN leaves exactly 50 characters for the name, and the boundary
-        // is asserted on both sides rather than described.
         let longest = "a".repeat(50);
         assert!(InvocationId::probe(ProbeTarget::Agent(AgentId::new(&longest)), u32::MAX).is_ok());
         assert_eq!(
@@ -951,8 +752,6 @@ mod tests {
         assert!(InvocationId::probe(ProbeTarget::Agent(AgentId::new(&over)), u32::MAX).is_err());
     }
 
-    /// The wire form is the bare rendered string, pinned against payloads
-    /// written here rather than against this type's own output.
     #[test]
     fn the_wire_form_is_the_bare_string() {
         let id = InvocationId::attempt(
@@ -971,8 +770,6 @@ mod tests {
         assert_eq!(read, id);
         let probe: InvocationId = serde_json::from_str("\"p.shell.o0\"").expect("deserialize");
         assert_eq!(probe.probe_target(), Some(&ProbeTarget::Shell));
-        // A value outside the enumeration does not become an InvocationId by
-        // being written into a record.
         assert!(serde_json::from_str::<InvocationId>("\"legacy-t1-a2\"").is_err());
     }
 
