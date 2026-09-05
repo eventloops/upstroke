@@ -343,12 +343,12 @@ fn run_with_timeout_and_limit(
     let stdout_drain = child
         .stdout
         .take()
-        .map(|pipe| Drain::start("stdout", pipe, output_limit))
+        .map(|pipe| Drain::start(Stream::Stdout, pipe, output_limit))
         .transpose();
     let stderr_drain = child
         .stderr
         .take()
-        .map(|pipe| Drain::start("stderr", pipe, output_limit))
+        .map(|pipe| Drain::start(Stream::Stderr, pipe, output_limit))
         .transpose();
     let (stdout_drain, stderr_drain) = match (stdout_drain, stderr_drain) {
         (Ok(stdout_drain), Ok(stderr_drain)) => (stdout_drain, stderr_drain),
@@ -494,7 +494,7 @@ fn run_with_timeout_and_limit(
 /// supervisor asks it for. Both are visible in `proc` and its descendants,
 /// exactly as they were when they were private items of this file.
 mod drain;
-use self::drain::{Drain, DrainError, drain_limit_exceeded};
+use self::drain::{Drain, DrainError, Stream, drain_limit_exceeded};
 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep
