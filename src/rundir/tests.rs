@@ -2406,6 +2406,38 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
     );
 }
 
+/// `RunPaths::events` and `RunPaths::plan_json` return the paths [`EVENT_LOG`]
+/// and [`PLAN`] name (`SWEEP-NAMES-001`).
+///
+/// **That is the whole sentence, and it is deliberately weaker than "the
+/// accessors use the constants".** Restore either accessor to its equal literal
+/// and this test still passes, because the path it returns is still the path
+/// the constant names. No assertion over values can do better: substituting a
+/// constant for a literal of equal value is behaviour-neutral by construction,
+/// and a test that could tell them apart would have to assert over source text,
+/// which a sibling helper satisfies. Pass 3 was right that the previous name
+/// claimed more than the body proves.
+///
+/// **What it does catch is an accessor drift** — an accessor spelling something
+/// other than what its constant names. `RunPaths::events` changed to
+/// `"events.json"` fails this test while
+/// `the_names_on_disk_are_the_names_the_packet_writes` passes, so the two are
+/// not redundant. A change to the *constant* does not fail it here: both sides
+/// of the assertion move together.
+///
+/// The repair this test accompanies is witnessed by a measurement rather than
+/// by an assertion. That measurement is stated once, in the pull request body's
+/// Validation section, and is not restated here.
+#[test]
+fn the_event_log_and_plan_accessors_return_the_paths_their_constants_name() {
+    // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
+    // needs no scratch tree and leaves none.
+    let paths = paths_in(Path::new("names-through-consts"), BOUND_RUN);
+
+    assert_eq!(paths.events(), paths.public.join(EVENT_LOG));
+    assert_eq!(paths.plan_json(), paths.public.join(PLAN));
+}
+
 #[test]
 fn a_committed_private_half_is_never_provable_however_bound_it_is() {
     // The commit-record condition is the last conjunct and the one whose
