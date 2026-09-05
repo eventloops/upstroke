@@ -1,5 +1,5 @@
 ---
-id: PR135-REVIEW3-KILL-HANDOFF-MISHANDLES-PATH-IDENTITY
+id: PR135-REVIEW3-THE-WITHDRAWAL-DID-NOT-WITHDRAW
 severity: P2
 disposition: deferred
 category: correctness
