@@ -42,8 +42,11 @@ emits the line above. The author wired `b` to the task that produces what it nee
 opposite; and a plan in which two tasks genuinely produce the same artifact — a conflict the design
 does not define an order for — passes without a word.
 
-The graph check cannot repair this: a producer the adapter did not record is not in `plan.artifacts`,
-and `Artifact.produced_by` holds one `TaskId`.
+The graph check cannot repair this from the record: a producer the adapter did not record is not in
+`plan.artifacts`, and `Artifact.produced_by` holds one `TaskId`. The declaration itself survives in
+`d2.artifacts_out`, so a scan of `plan.tasks[*].artifacts_out` can see every producer; what it
+cannot see is what the design means a second producer to be. `SWEEP-GRAPH-004` (a task that
+needs what it is recorded as producing) waits on the same decision.
 
 ## What the change that takes this up should do
 
