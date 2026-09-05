@@ -15,7 +15,17 @@
 //! sit on neither side.** A key that is neither consumed, refused nor named is
 //! a key that vanished, and a vanished key is indistinguishable from one that
 //! was never written: `[[gates]]` and `[interaction]` sat there until 2026-09-04
-//! (`RawGate` and `RawInteraction` now refuse what they do not read).
+//! (`RawGate` and `RawInteraction` now refuse what they do not read). **And an
+//! unknown key is never a warning**, in any section: a key typo cannot be told
+//! from a deleted key, and every section here holds at least one control —
+//! `[engine]` warned until 2026-09-05, and `on_task_failur = "continue"` was
+//! a halted run the operator asked to continue, with a footnote.
+//!
+//! **A resume reads `[[gates]]` by what its log records** ([`EngineLimits`]):
+//! with a gate record, today's section is compared with the record and never
+//! refused over (`design/15`); without one, it settles the run's gates and is
+//! read as a fresh run reads it. The `[engine]` ceilings warn on either resume.
+//! Nothing else reads differently on a resume.
 //!
 //! **A parse failure never becomes a default, with one stated exception.**
 //! Every `unwrap_or`, `map_or` and `unwrap_or_else` in this module but one
@@ -118,14 +128,11 @@ pub(super) fn read_runner(
             ),
         )
     })?;
-    // An error, where `[engine]` warns. `[engine]`'s unknown keys are ceilings
-    // and timeouts: a typo leaves a default in place and the run does slightly
-    // less than asked. A typo here — `knid = "container"`, `iamge = "..."` —
-    // leaves the run executing on the **host** while the operator believes gate
-    // code is confined, which is the one thing this section exists to decide.
-    // Same rule as `[interaction]`, `[[gates]]` and `[budgets]`, for the same
-    // reason: silently ignoring a key is silently deleting a control. Every
-    // unknown key is named, as `[engine]` names every one of its own, so one
+    // An error. A typo here — `knid = "container"`, `iamge = "..."` — leaves
+    // the run executing on the **host** while the operator believes gate code
+    // is confined, which is the one thing this section exists to decide. Same
+    // rule as every other section, for the same reason: silently ignoring a
+    // key is silently deleting a control. Every unknown key is named, so one
     // load reports the whole section.
     if !runner.unknown.is_empty() {
         let keys: Vec<&str> = runner.unknown.keys().map(String::as_str).collect();
@@ -309,7 +316,7 @@ pub(super) fn refuse_legacy_container_selection(
     }
     let reading = match limits {
         EngineLimits::Fresh => "this run is being created by the schema-1..3 engine",
-        EngineLimits::SequentialResume => {
+        EngineLimits::SequentialResume | EngineLimits::SequentialResumeRederivingGates => {
             "this run was recorded by the schema-1..3 engine and keeps the boundary it started \
              with"
         }
@@ -410,56 +417,76 @@ pub(super) fn parse_budgets(
 /// collisions that mapping itself creates (`lint fast` and `lint-fast`) are the
 /// log writer's, `SWEEP-CONFIG-PARSE-011`.
 ///
-/// **On a sequential run's resume those two refusals are warnings.** Both
-/// shapes were legal to record before 2026-09-05, and `design/15` is explicit
-/// that gates are taken from the record and not refused over: today's section
-/// is read only to be compared with the recorded gates, so refusing over it
-/// would strand a run for a section that does not govern it. This is the
-/// reading `[engine] max_parallel` already takes through [`EngineLimits`], and
-/// it is applied here to the two shapes and to nothing else — a blank field or
-/// a zero timeout never recorded a run, so those refuse on both readings.
+/// **Which reading, and why the parser cannot choose it alone.** Under
+/// [`EngineLimits::Fresh`] today's section governs the run, and every shape
+/// above refuses. Under [`EngineLimits::SequentialResume`] the run's log
+/// records its gates and `design/15` is explicit that they are taken from the
+/// record, not re-derived, and **not refused over**: today's section is read
+/// only to be compared with them, so nothing here refuses — every shape,
+/// including a zero timeout, a blank field, an entry that is not a table and a
+/// section that is not an array, is a warning naming the recorded gates as
+/// what runs, and the list carries what could be read so the comparison can
+/// still say what moved (an unreadable entry is skipped; an unreadable section
+/// is `Ok(None)`). Under [`EngineLimits::SequentialResumeRederivingGates`] the
+/// log has no gate record, this resume settles the run's gates from today's
+/// file and records them, so the section governs and is read exactly as a
+/// fresh run reads it. Which of the two resumes applies is a fact about the
+/// log, not about the config, which is why `EngineLimits::for_resume` takes
+/// it from `events::recorded_gates` and this function only asks the reading.
+/// An earlier version keyed the downgrade off "a resume" alone and was wrong
+/// both ways: it promised the record would run when a legacy log had none,
+/// and it kept refusing a run that had one.
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Config`] naming the entry by position: `gates` is not an
-/// array; an entry is not a table of `name`, `cmd` and optional `timeout_secs`;
-/// a blank `name` or `cmd`, naming which; `timeout_secs = 0`; and, under
-/// [`EngineLimits::Fresh`] only, a key outside those three or a `name` an
-/// earlier entry has (compared without regard to ASCII case) — under
-/// [`EngineLimits::SequentialResume`] each of those is a warning in `warnings`
-/// naming the recorded gates as what runs, and the entry is kept so the record
-/// can be compared with it. `Ok(None)` is an absent section and
-/// `Ok(Some(vec![]))` an explicitly empty one — the parent's `Config::gates`
-/// says what each means.
+/// Under `Fresh` and `SequentialResumeRederivingGates`, [`UpstrokeError::Config`]
+/// naming the entry by position: `gates` is not an array; an entry is not a
+/// table of `name`, `cmd` and optional `timeout_secs`; a blank `name` or
+/// `cmd`, naming which; a key outside those three; `timeout_secs = 0`; a
+/// `name` an earlier entry has, compared without regard to ASCII case. Under
+/// `SequentialResume`, never: each of those is a warning in `warnings`. On
+/// every reading `Ok(None)` is an absent section and `Ok(Some(vec![]))` an
+/// explicitly empty one — the parent's `Config::gates` says what each means.
 pub(super) fn parse_gates(
     raw: Option<toml::Value>,
     repo_path: &Path,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
 ) -> Result<Option<Vec<GateConfig>>, UpstrokeError> {
+    // The one exhaustive decision: which of the three readings this is.
+    let reading = match limits {
+        EngineLimits::Fresh | EngineLimits::SequentialResumeRederivingGates => {
+            GatesReading::Governs
+        }
+        EngineLimits::SequentialResume => GatesReading::ComparedOnly,
+    };
     let Some(value) = raw else { return Ok(None) };
     let toml::Value::Array(entries) = value else {
-        return Err(config_error(
-            repo_path,
-            format!(
-                "`gates` must be an array of tables — write `[[gates]]` entries (double brackets, \
-                 one per gate), found a {}",
-                value.type_str()
-            ),
-        ));
+        let problem = format!(
+            "`gates` must be an array of tables — write `[[gates]]` entries (double brackets, \
+             one per gate), found a {}",
+            value.type_str()
+        );
+        refuse_or_announce(reading, problem, repo_path, warnings)?;
+        // Compared only, and there is nothing to compare: the record runs.
+        return Ok(None);
     };
     let mut list: Vec<GateConfig> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.into_iter().enumerate() {
         let n = index + 1;
-        let g: RawGate = entry.try_into().map_err(|e| {
-            config_error(
-                repo_path,
-                format!(
+        let g: RawGate = match entry.try_into() {
+            Ok(g) => g,
+            Err(e) => {
+                let problem = format!(
                     "[[gates]] entry {n}: {e} (each entry takes `name`, `cmd`, and an optional \
                      `timeout_secs` integer)"
-                ),
-            )
-        })?;
+                );
+                refuse_or_announce(reading, problem, repo_path, warnings)?;
+                // Compared only, and this entry cannot be built: skipped, and
+                // the comparison says the record has a gate today's file lacks.
+                continue;
+            }
+        };
         let blank: Vec<&str> = [
             ("name", g.name.trim().is_empty()),
             ("cmd", g.cmd.trim().is_empty()),
@@ -468,19 +495,21 @@ pub(super) fn parse_gates(
         .filter_map(|(key, is_blank)| is_blank.then_some(key))
         .collect();
         if !blank.is_empty() {
-            return Err(config_error(
-                repo_path,
+            refuse_or_announce(
+                reading,
                 format!(
                     "[[gates]] entry {n}: `{}` is blank — each entry needs a non-empty `name` \
                      and `cmd`",
                     blank.join("` and `")
                 ),
-            ));
+                repo_path,
+                warnings,
+            )?;
         }
         if !g.unknown.is_empty() {
             let keys: Vec<&str> = g.unknown.keys().map(String::as_str).collect();
             refuse_or_announce(
-                limits,
+                reading,
                 format!(
                     "[[gates]] entry {n} (`{}`) has unknown key `{}` (each entry takes `name`, \
                      `cmd`, and an optional `timeout_secs` integer)",
@@ -497,7 +526,7 @@ pub(super) fn parse_gates(
             .find(|(_, gate)| gate.name.eq_ignore_ascii_case(&g.name))
         {
             refuse_or_announce(
-                limits,
+                reading,
                 format!(
                     "[[gates]] entry {n} repeats the name `{}` of entry {} (`{}`; names are \
                      compared without regard to ASCII case, because a case-insensitive \
@@ -513,21 +542,25 @@ pub(super) fn parse_gates(
             )?;
         }
         if g.timeout_secs == Some(0) {
-            return Err(config_error(
-                repo_path,
+            refuse_or_announce(
+                reading,
                 format!(
                     "[[gates]] entry {n} (`{}`): timeout_secs must be at least 1 — omit it for \
                      the {}s default",
                     g.name,
                     DEFAULT_GATE_TIMEOUT.as_secs()
                 ),
-            ));
+                repo_path,
+                warnings,
+            )?;
         }
         list.push(GateConfig {
             name: g.name,
             cmd: g.cmd,
             // An absent key, not a failed reading: a `timeout_secs` that is
-            // not a whole number was refused by the `try_into` above.
+            // not a whole number was refused (or announced and skipped) above.
+            // Compared only, a zero written today is carried as zero so the
+            // comparison can name it; it never runs, the record does.
             timeout: g
                 .timeout_secs
                 .map_or(DEFAULT_GATE_TIMEOUT, Duration::from_secs),
@@ -536,23 +569,36 @@ pub(super) fn parse_gates(
     Ok(Some(list))
 }
 
-/// A `[[gates]]` shape a run could have been recorded under before it became a
-/// refusal: refused on a run being created now, announced on a sequential run's
-/// resume, where the recorded gates are what executes (`design/15`) and today's
-/// section is read only to be compared with them. See [`parse_gates`].
+/// What today's `[[gates]]` section is *for* on this load — the one question
+/// [`parse_gates`] asks of [`EngineLimits`]. See its doc for which reading
+/// maps to which.
+#[derive(Clone, Copy)]
+enum GatesReading {
+    /// The gates this run executes come from this section: refuse a shape
+    /// the engine cannot act on.
+    Governs,
+    /// The gates this run executes come from its record; this section is
+    /// read only to say what moved. Nothing refuses.
+    ComparedOnly,
+}
+
+/// A `[[gates]]` shape the engine cannot act on: refused where the section
+/// governs the run, announced where it is only compared with the recorded
+/// gates (`design/15`: taken from the record and not refused over). See
+/// [`parse_gates`].
 fn refuse_or_announce(
-    limits: EngineLimits,
+    reading: GatesReading,
     problem: String,
     repo_path: &Path,
     warnings: &mut Vec<String>,
 ) -> Result<(), UpstrokeError> {
-    match limits {
-        EngineLimits::Fresh => Err(config_error(repo_path, problem)),
-        EngineLimits::SequentialResume => {
+    match reading {
+        GatesReading::Governs => Err(config_error(repo_path, problem)),
+        GatesReading::ComparedOnly => {
             warnings.push(format!(
-                "{problem}; in {} this resume runs the gates the run recorded, so today's \
-                 [[gates]] is read only to be compared with them, and a fresh run refuses this \
-                 shape",
+                "{problem}; in {} this resume runs the gates its log recorded, so today's \
+                 [[gates]] is read only to be compared with them — a fresh run, or a resume of \
+                 a log with no gate record, refuses this shape",
                 repo_path.display()
             ));
             Ok(())
@@ -560,9 +606,15 @@ fn refuse_or_announce(
     }
 }
 
+/// Every accepted `[engine]` key, written out, for the same reason as
+/// [`RUNNER_KEYS`]: the refusal names this list, so a key that stops being
+/// read is a key that stops being offered.
+const ENGINE_KEYS: &str = "`shell`, `on_task_failure`, `max_parallel`, `max_merge_repairs`, \
+                           `max_per_agent`, `max_per_pool`";
+
 /// `[engine]` (§17).
 ///
-/// Every key here is now consumed, refused, or named in a warning. Nothing is
+/// Every key here is now consumed or refused. Nothing is
 /// read past: accepting `max_parallel = 4` and then running one attempt at a
 /// time is the failure a config file exists to prevent — the operator believes
 /// they bought four workers, the run costs and takes what one worker costs and
@@ -583,24 +635,30 @@ fn refuse_or_announce(
 /// about a future run, `max_parallel` included, so all four warn and the resume
 /// continues on the ceiling it recorded.
 ///
-/// **Which side each key sits on.** An unknown key **warns** by name: every
-/// key here is a ceiling, a timeout or an interpreter choice, and a typo leaves
-/// the default in place, so the run does slightly less than asked and the
-/// warning says which key bought nothing. An unknown `shell` value **warns**
-/// and takes the platform default, on the same reading — the gate commands
-/// still run, under the shell the platform would have used — and it is the one
-/// value in this module that degrades rather than refuses. `on_task_failure`
-/// **errors**: a misspelling there decides whether a failed task stops the
-/// run. A zero ceiling **errors** on both readings of `limits`: "no ceiling"
-/// and "nothing may run" are two meanings, and a resume must not become a way
+/// **Which side each key sits on.** An unknown key **errors**, every one
+/// named with the accepted set, on every reading. Until 2026-09-05 it warned,
+/// on the reasoning that the keys here are ceilings and timeouts a typo merely
+/// leaves at their defaults — but `on_task_failure` and `shell` sit in the
+/// same table, and `on_task_failur = "continue"` under that reasoning was a
+/// run that halted on its first failed task with a warning beside it: a
+/// deleted control with a footnote. A key typo cannot be told from a deleted
+/// key, so the table refuses, as every other section does; a misspelled key
+/// governs no run, recorded or not, so the resume readings change nothing
+/// here. An unknown `shell` **value** **warns** and takes the platform default
+/// — the gate commands still run, under the shell the platform would have used
+/// — and it is the one value in this module that degrades rather than refuses
+/// (`SWEEP-CONFIG-PARSE-012`). `on_task_failure` **errors** on an unknown
+/// value: a misspelling there decides whether a failed task stops the run. A
+/// zero ceiling **errors** on every reading of `limits`: "no ceiling" and
+/// "nothing may run" are two meanings, and a resume must not become a way
 /// around the check.
 ///
 /// # Errors
 ///
 /// [`UpstrokeError::Config`]: the section is not a table of the six optional
-/// keys; `on_task_failure` is not `halt` or `continue`; any ceiling is zero or
-/// not a whole number; `max_parallel` above [`DEFAULT_MAX_PARALLEL`] on a
-/// fresh run.
+/// keys; a key outside [`ENGINE_KEYS`]; `on_task_failure` is not `halt` or
+/// `continue`; any ceiling is zero or not a whole number; `max_parallel`
+/// above [`DEFAULT_MAX_PARALLEL`] on a fresh run.
 pub(super) fn parse_engine(
     raw: Option<toml::Value>,
     repo_path: &Path,
@@ -627,10 +685,14 @@ pub(super) fn parse_engine(
             ),
         )
     })?;
-    for key in engine.unknown.keys() {
-        warnings.push(format!(
-            "unknown key `{key}` in [engine] in {} (ignored)",
-            repo_path.display()
+    if !engine.unknown.is_empty() {
+        let keys: Vec<&str> = engine.unknown.keys().map(String::as_str).collect();
+        return Err(config_error(
+            repo_path,
+            format!(
+                "unknown key `{}` in [engine] (accepted: {ENGINE_KEYS})",
+                keys.join("`, `")
+            ),
         ));
     }
     // The one degrade-and-warn in the module; the reason is in the doc above.
@@ -697,7 +759,7 @@ pub(super) fn parse_engine(
                 ),
             ));
         }
-        (EngineLimits::SequentialResume, true) => {
+        (EngineLimits::SequentialResume | EngineLimits::SequentialResumeRederivingGates, true) => {
             warnings.push(format!(
                 "[engine] `max_parallel = {configured_parallel}` in {} is parsed but not acted on \
                  by this resume: this run was recorded by an engine that runs one attempt at a \
@@ -952,9 +1014,10 @@ mod tests {
             "a refusal is not also a warning: {warnings:?}"
         );
 
-        // A run recorded under the old rules is resumed through the same file:
-        // the key is named, the entry is kept at the default the typo left it
-        // at, and the recorded gates are named as what runs.
+        // A run whose log records its gates is resumed through the same
+        // file: the section is compared only, so the key is named, the entry
+        // is kept at the default the typo left it at, and the recorded gates
+        // are named as what runs.
         let mut warnings = Vec::new();
         let gates = parse_gates(
             section(body).get("gates").cloned(),
@@ -962,7 +1025,7 @@ mod tests {
             EngineLimits::SequentialResume,
             &mut warnings,
         )
-        .expect("a resume is not refused over a section it does not run")
+        .expect("a resume is not refused over a section it only compares")
         .expect("the section was present");
         assert_eq!(
             gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
@@ -975,6 +1038,22 @@ mod tests {
             }),
             "{warnings:?}"
         );
+
+        // A run whose log has no gate record settles them from this file, so
+        // the file governs and the typo is refused exactly as for a fresh run:
+        // the reviewer's slow gate is not killed at 600 s with a footnote.
+        let mut warnings = Vec::new();
+        let message = refused(
+            parse_gates(
+                section(body).get("gates").cloned(),
+                path(),
+                EngineLimits::SequentialResumeRederivingGates,
+                &mut warnings,
+            ),
+            "timeout_sec on a resume with no gate record",
+        );
+        assert!(message.contains("`timeout_sec`"), "{message}");
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         // The control: the same entry with the key spelt right, and the value
         // reaches the gate under either reading.
@@ -1042,9 +1121,21 @@ mod tests {
         );
         assert!(message.contains("ASCII case"), "says why: {message}");
 
-        // A run recorded under the old rules is resumed through the same file:
-        // both entries are kept, so the record can be compared with them, and
-        // the repeat is announced with the recorded gates named as what runs.
+        // A run whose log records its gates is resumed through the same
+        // file: both entries are kept, so the record can be compared with
+        // them, and the repeat is announced with the recorded gates named as
+        // what runs. A run with no gate record refuses it as a fresh run does.
+        let mut warnings = Vec::new();
+        refused(
+            parse_gates(
+                section(repeated).get("gates").cloned(),
+                path(),
+                EngineLimits::SequentialResumeRederivingGates,
+                &mut warnings,
+            ),
+            "a repeated name on a resume with no gate record",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
         let mut warnings = Vec::new();
         let gates = parse_gates(
             section(repeated).get("gates").cloned(),
@@ -1052,7 +1143,7 @@ mod tests {
             EngineLimits::SequentialResume,
             &mut warnings,
         )
-        .expect("a resume is not refused over a section it does not run")
+        .expect("a resume is not refused over a section it only compares")
         .expect("the section was present");
         assert_eq!(
             gates
@@ -1098,15 +1189,19 @@ mod tests {
 
     #[test]
     fn a_blank_gate_field_is_named() {
-        // A blank field refuses on both readings — no run was ever recorded
-        // with one — and the refusal says which field, where it used to say
-        // only that one of the two was blank.
+        // A blank field refuses wherever the section governs the run, and the
+        // refusal says which field, where it used to say only that one of the
+        // two was blank. Where the section is only compared with a record it
+        // is announced, with the same words, and the entry kept as written.
         for (body, expected) in [
             ("name = \"\"\ncmd = \"cargo test\"\n", "`name` is blank"),
             ("name = \"test\"\ncmd = \" \"\n", "`cmd` is blank"),
             ("name = \"\"\ncmd = \"\"\n", "`name` and `cmd` is blank"),
         ] {
-            for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            for limits in [
+                EngineLimits::Fresh,
+                EngineLimits::SequentialResumeRederivingGates,
+            ] {
                 let mut warnings = Vec::new();
                 let message = refused(
                     parse_gates(
@@ -1124,6 +1219,165 @@ mod tests {
                 );
                 assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
             }
+            let mut warnings = Vec::new();
+            let gates = parse_gates(
+                section(&format!("[[gates]]\n{body}")).get("gates").cloned(),
+                path(),
+                EngineLimits::SequentialResume,
+                &mut warnings,
+            )
+            .expect("compared only: announced, never refused")
+            .expect("the section was present");
+            assert_eq!(gates.len(), 1, "the entry is kept for the comparison");
+            assert!(
+                warnings
+                    .first()
+                    .is_some_and(|w| w.contains(expected) && w.contains("recorded")),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compared_only_gates_section_is_never_refused_over() {
+        // The shapes a fresh run refuses that the tests above do not already
+        // drive under the compare-only reading: a zero timeout (carried as
+        // zero so the comparison can name it), an entry that is not a table
+        // (skipped, since nothing can be built from it), and a section that
+        // is not an array (nothing to compare: `None`). Each is announced
+        // with the recorded gates named as what runs, and none refuses —
+        // `design/15`'s "not refused over", shape by shape. The same three
+        // refuse under the two readings where the section governs.
+        let zero = "[[gates]]\nname = \"test\"\ncmd = \"cargo test\"\ntimeout_secs = 0\n";
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(zero).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("compared only")
+        .expect("present");
+        assert_eq!(
+            gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
+            vec![Duration::ZERO],
+            "carried as written, for the comparison"
+        );
+        assert!(
+            warnings.first().is_some_and(
+                |w| w.contains("timeout_secs must be at least 1") && w.contains("recorded")
+            ),
+            "{warnings:?}"
+        );
+
+        let not_a_table = "gates = [\"cargo test\"]\n";
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(not_a_table).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("compared only")
+        .expect("present");
+        assert!(
+            gates.is_empty(),
+            "the unbuildable entry is skipped: {gates:?}"
+        );
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|w| w.contains("[[gates]] entry 1") && w.contains("recorded")),
+            "{warnings:?}"
+        );
+
+        let not_an_array = "[gates]\ncheck = \"cargo check\"\n";
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(not_an_array).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("compared only");
+        assert!(gates.is_none(), "nothing to compare: {gates:?}");
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|w| w.contains("must be an array") && w.contains("recorded")),
+            "{warnings:?}"
+        );
+
+        // The control: where the section governs, each of the three refuses.
+        for body in [zero, not_a_table, not_an_array] {
+            for limits in [
+                EngineLimits::Fresh,
+                EngineLimits::SequentialResumeRederivingGates,
+            ] {
+                let mut warnings = Vec::new();
+                refused(
+                    parse_gates(
+                        section(body).get("gates").cloned(),
+                        path(),
+                        limits,
+                        &mut warnings,
+                    ),
+                    body,
+                );
+                assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_engine_key_is_refused_and_named_on_every_reading() {
+        // `on_task_failur = "continue"` used to warn and leave `halt` in
+        // place: a deleted control with a footnote. Every unknown key is
+        // named, the accepted set is listed, and no reading softens it — a
+        // misspelled key governs no run, recorded or not.
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeRederivingGates,
+        ] {
+            let mut warnings = Vec::new();
+            let message = refused(
+                parse_engine(
+                    Some(section("on_task_failur = \"continue\"\nmax_paralel = 4\n")),
+                    path(),
+                    limits,
+                    &mut warnings,
+                ),
+                "an unknown [engine] key",
+            );
+            assert!(
+                message.contains("`on_task_failur`"),
+                "{limits:?}: {message}"
+            );
+            assert!(message.contains("`max_paralel`"), "{limits:?}: {message}");
+            assert!(message.contains(ENGINE_KEYS), "{limits:?}: {message}");
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
+        // The control: the key spelt right is consumed, on every reading.
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeRederivingGates,
+        ] {
+            let mut warnings = Vec::new();
+            let settings = parse_engine(
+                Some(section("on_task_failure = \"continue\"\n")),
+                path(),
+                limits,
+                &mut warnings,
+            )
+            .expect("the accepted key loads");
+            assert_eq!(
+                settings.on_task_failure,
+                OnTaskFailure::Continue,
+                "{limits:?}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
         }
     }
 

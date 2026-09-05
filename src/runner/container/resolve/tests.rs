@@ -1587,11 +1587,17 @@ fn legacy_container_selection_refused_before_effects() {
 /// is a compile error here rather than a reading that quietly escapes.
 #[test]
 fn every_engine_limits_reading_refuses_a_container_selection() {
-    let all = [EngineLimits::Fresh, EngineLimits::SequentialResume];
+    let all = [
+        EngineLimits::Fresh,
+        EngineLimits::SequentialResume,
+        EngineLimits::SequentialResumeRederivingGates,
+    ];
     for limits in all {
         match limits {
             // Exhaustive on purpose: a new variant must be classified here.
-            EngineLimits::Fresh | EngineLimits::SequentialResume => {}
+            EngineLimits::Fresh
+            | EngineLimits::SequentialResume
+            | EngineLimits::SequentialResumeRederivingGates => {}
         }
     }
 
@@ -1633,7 +1639,7 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
         assert_eq!(config.runner.kind, RunnerKind::Host);
         assert!(config.runner.from_config);
     }
-    assert_eq!(refused, 2, "both readings were driven");
+    assert_eq!(refused, all.len(), "every reading was driven");
 }
 
 /// ST-16 (i)'s second clause: **no legacy process ever writes a container
