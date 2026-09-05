@@ -36,16 +36,22 @@ impl RunState {
         // * `AwaitingRepair` is moved to `Merged` by its lineage's
         //   `task_merged` (`satisfies`), which asks nothing about the task's
         //   state and would orphan a question open on it.
-        if !matches!(
-            task.state,
-            TaskState::Pending | TaskState::AwaitingMerge | TaskState::Deferred
-        ) {
-            return Err(FoldError::WrongTaskState {
-                kind: KIND,
-                key: question.key.0,
-                state: task.state.name(),
-                expected: "pending, awaiting merge or deferred",
-            });
+        // Exhaustive on purpose, with no wildcard: a `TaskState` added later
+        // is a build error here, and whoever adds it decides which side of
+        // this door it belongs on by naming the event that would move it.
+        match task.state {
+            TaskState::Pending | TaskState::AwaitingMerge | TaskState::Deferred => {}
+            TaskState::Merged
+            | TaskState::Failed
+            | TaskState::AwaitingInput
+            | TaskState::AwaitingRepair => {
+                return Err(FoldError::WrongTaskState {
+                    kind: KIND,
+                    key: question.key.0,
+                    state: task.state.name(),
+                    expected: "pending, awaiting merge or deferred",
+                });
+            }
         }
         // Then an open generation, in any class. This was the door that was
         // missing: a bare question against a task whose generation was in
