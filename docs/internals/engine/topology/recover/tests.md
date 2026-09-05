@@ -1,10 +1,12 @@
 # `src/engine/topology/recover/tests.rs`
 
-Extended notes for [`src/engine/topology/recover/tests.rs`](../../../../../src/engine/topology/recover/tests.rs).
+Repository source for these notes: [`src/engine/topology/recover/tests.rs`](../../../../../src/engine/topology/recover/tests.rs).
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/recover/tests.rs).
+The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. The explanatory prose is preserved below.
+Each backticked part of a section heading is an exact source excerpt. Search for the final
+excerpt within the preceding item when a heading names both an item and a line inside it.
 
 ## Module
 
@@ -331,12 +333,12 @@ the staged evidence is not the evidence a gate would see.
 
 A runner whose worker leaves a change behind, so an attempt can succeed.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `if code == 0`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `if code == 0`
 
 The worker's edit, which is the whole difference between an attempt
 the cheap rungs reject and one that reaches a candidate.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `crate::workspace_manager::fixture::write_file(`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `crate::workspace_manager::fixture::write_file(`
 
 Through the fixture funnel every other test in this file uses:
 `std::fs::write` is on the effect denylist here, and a test that
@@ -455,7 +457,7 @@ byte comparison's failure output is two `run_started` lines rendered as
 `Vec<u8>` and nobody can read which of them grew. The kinds say it in
 one line, and the bytes still catch a difference the kinds cannot see.
 
-## `fn direct_target(&self, refname: &str) -> Result<Option<Str…` › `if self.shape == RefShape::Symbolic {`
+## `fn direct_target(&self, refname: &str) -> Result<Option<String>, UpstrokeError> {` › `if self.shape == RefShape::Symbolic {`
 
 `WorkspaceManager::direct_ref_target` opens with `refuse_symbolic`
 too, and reproducing that is what makes the symbolic case's
@@ -549,7 +551,7 @@ takes [`resume_holding`].
 
 Whether any lock site ran — the R17 half of "no hold was taken".
 
-## `fn first_observation(harness: &Arc<Mutex<HookHarness>>, site: EffectSiteId) -> Option<usi…`
+## `fn first_observation(harness: &Arc<Mutex<HookHarness>>, site: EffectSiteId) -> Option<usize> {`
 
 The index of a site's first observation, for an ordering assertion.
 
@@ -594,7 +596,7 @@ would produce a different path and the census below it would scan the wrong
 tree. Asserted as an equality against the recorded locator's parent rather
 than as "the resume succeeded".
 
-## `fn resume_derives_private_root_from_record_when_default_cha…` › `let canonical =`
+## `fn resume_derives_private_root_from_record_when_default_changed() {` › `let canonical =`
 
 Compared canonical-to-canonical, because `authorized_root` is
 deliberately **lexical**: it refuses a locator whose shape is not
@@ -685,7 +687,7 @@ emptiness is asserted rather than assumed, and the anchor is the census's
 first effect *here*: if the barrier's three sites do not all precede it, the
 resume decided something from a prefix it had not proven.
 
-## `fn resume_establishes_stable_prefix_barrier_before_any_fold…` › `assert_eq!(`
+## `fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {` › `assert_eq!(`
 
 Asserted **before** the resume, because the resume reclaims what it walks:
 afterwards a husk that had preceded this run in the walk is gone and the
@@ -758,7 +760,7 @@ Deriving the record from the settlement is the fix, not attaching a failure
 at each call site: a fixture that has to remember to make its own event
 self-consistent is a fixture that will stop doing so.
 
-## `fn attempt_finished(attempt: u32, settlement: AttemptSettle…` › `if let AttemptSettlement::Retained {`
+## `fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEventBody {` › `if let AttemptSettlement::Retained {`
 
 The settlement's retained session and the record's `session_id` are one
 value in production — both come from `assessed.outcome.session_id` — and
@@ -821,7 +823,7 @@ would satisfy the warning half, and `run_resumed(4).runner` would then
 differ from `run_started(4).runner` — which the fold refuses, but only if
 the record actually reaches it.
 
-## `fn resume_rebuilds_runner_from_record_and_warns_on_config_d…` › `let log = String::from_utf8(fixture.log_bytes()).expect("the log is utf-8");`
+## `fn resume_rebuilds_runner_from_record_and_warns_on_config_drift() {` › `let log = String::from_utf8(fixture.log_bytes()).expect("the log is utf-8");`
 
 The record won: `run_resumed` carries the recorded volume, not today's.
 
@@ -835,7 +837,7 @@ tag table is what makes this constructible at all — the reference is moved
 to a second image the runtime also holds, so the refusal path (an absent id)
 is not what is being exercised.
 
-## `fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent()…`
+## `fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent() {`
 
 An unavailable runtime, a recorded image id the runtime no longer holds, and
 an absent credential volume each refuse **before any spawn**.
@@ -846,17 +848,17 @@ that spawns — so a refusal that produced no `RunnerRebuilt` cannot have
 spawned. Asserted here through a pre-flight that would *panic* if it were
 reached.
 
-## `fn resume_refuses_by_inspection_before_any_spawn_when_runti…` › `struct NeverRuns;`
+## `fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent() {` › `struct NeverRuns;`
 
 A pre-flight that must never run. `certify` is unreachable if the
 inspection refusals really do precede every spawn, and this is what
 turns "unreachable" into a failing test rather than a comment.
 
-## `fn resume_refuses_by_inspection_before_any_spawn_when_runti…` › `type Damage = fn(&FakeRuntime);`
+## `fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent() {` › `type Damage = fn(&FakeRuntime);`
 
 One way to leave a recorded runner un-re-establishable.
 
-## `fn resume_refuses_by_inspection_before_any_spawn_when_runti…` › `runtime.add_image("sha256:absent", None);`
+## `fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent() {` › `runtime.add_image("sha256:absent", None);`
 
 Remove the image itself: moving the tag alone leaves the id
 present, and the id is what the rebuild asks about.
@@ -894,7 +896,7 @@ census's own report has to name the recorded root. A build that censused
 perfectly successful report — so "the container was reclaimed" alone is not
 enough; the root the census scanned is part of the claim.
 
-## `fn resume_of_nondefault_root_run_reclaims_earlier_incarnati…` › `let invocation = crate::runner::InvocationId::probe(`
+## `fn resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorded_root() {` › `let invocation = crate::runner::InvocationId::probe(`
 
 An intent this run's *creator* incarnation left behind, in the recorded
 root. It is dead by construction: the run lock is exclusive, so only one
@@ -923,7 +925,7 @@ Three claims, and the third is what makes the first two mean anything:
 * the husk carrying `committed.json` is byte-identical afterwards. A census
   that deleted whatever it walked over would pass the first two.
 
-## `fn resume_reclaims_a_provable_husk_beside_the_run_and_retai…` › `assert_eq!(`
+## `fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committed_one() {` › `assert_eq!(`
 
 And the run being resumed: its own stale marker repaired by its owner, and
 nothing else. The husk arms are gated on the run lock, which this process
@@ -949,11 +951,11 @@ the failure never reached this run's own directory at all — and recovery step
 (a1) gives this run's stale-marker repair to its owner, which is this
 process. So the repair was collateral damage of a different run's residue.
 
-## `fn resume_completes_past_a_husk_whose_private_half_cannot_b…` › `assert!(stuck.public.exists(), "the public half was removed anyway");`
+## `fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {` › `assert!(stuck.public.exists(), "the public half was removed anyway");`
 
 The husk: retained where it was, with the locator the next census needs.
 
-## `fn resume_completes_past_a_husk_whose_private_half_cannot_b…` › `assert!(`
+## `fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {` › `assert!(`
 
 And this run's own stale marker, which sorts after the failure, was still
 repaired by its owner.
@@ -1108,7 +1110,7 @@ never saw it. So the refusal has to come from the reader, and it does — the
 barrier's checked replay refuses the whole prefix, which is what stops a
 forged identity from authorizing anything.
 
-## `fn forged_run_resumed_with_different_runner_identity_refuse…` › `let harness = harness();`
+## `fn forged_run_resumed_with_different_runner_identity_refused_on_replay() {` › `let harness = harness();`
 
 And a resume over that prefix refuses at the barrier, before anything.
 
@@ -1155,7 +1157,7 @@ whether the proven prefix contains the line".
 The next resume: a fresh harness, nothing armed, and it follows the
 surviving prefix.
 
-## `fn an_append_error_during_recovery_cancels_the_reservation_and_every_running_invocation()…`
+## `fn an_append_error_during_recovery_cancels_the_reservation_and_every_running_invocation() {`
 
 An outcome-unknown append during recovery cancels the provisional
 reservation and every still-running invocation.
@@ -1194,7 +1196,7 @@ different accountings: the shell probe is non-slotted and the agent probe
 takes a slot pair. A build that refused correctly on one could hold a slot
 forever on the other, so both assert the ledgers as well as the refusal.
 
-## `fn resume_refuses_by_preflight_probe_when_shell_or_cli_fail…` › `let programs: Vec<String> = runner`
+## `fn resume_refuses_by_preflight_probe_when_shell_or_cli_fails_before_any_recovery_event() {` › `let programs: Vec<String> = runner`
 
 The shell probe fails first, so the agent CLI is never asked. That is
 the sequence `runner` states — "probes execute through it
@@ -1235,7 +1237,7 @@ delegating wrapper around the fake is not something this module may write.
 
 The program whose container exits non-zero.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `release(`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `release(`
 
 Released on both paths: R26 is "released on complete …, cancel, or
 shutdown" and R19's view is "pruned on complete or cancel".
@@ -1320,11 +1322,11 @@ implementation that called `create_zero_old` again would get an `Err` back
 from Git ("already exists; zero-old refuses"), and a build that swallowed it
 would be green on `result.is_ok()` while having repeated the spend.
 
-## `fn a_resume_adopts_an_integration_ref_already_at_the_record…` › `{`
+## `fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {` › `{`
 
 (1) Already there when the resume arrives.
 
-## `fn a_resume_adopts_an_integration_ref_already_at_the_record…` › `{`
+## `fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {` › `{`
 
 (2) Two resumes of one run: the second adopts what the first created.
 
@@ -1503,13 +1505,13 @@ only route **the topology engine takes** — and this is what makes it a
 checkable claim rather than a convention. Same idiom, and same reason, as
 `events::log::tests::the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`.
 
-## `fn the_barrier_is_the_only_topology_route_from_a_proven_pre…` › `if !relative.starts_with("engine/topology") {`
+## `fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {` › `if !relative.starts_with("engine/topology") {`
 
 Only the topology engine is in scope: the funnel that defines
 `into_parts` and its own tests are not a second route into the
 chain, they are where it lives.
 
-## `fn the_barrier_is_the_only_topology_route_from_a_proven_pre…` › `if test_modules.contains(&path) {`
+## `fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {` › `if test_modules.contains(&path) {`
 
 A file the crate declares as a whole-file test module is test
 code in full and has no production half; counting one would
@@ -1519,7 +1521,7 @@ whole-file test modules are not called `tests.rs`, and one of
 those is `engine/topology/scaffold.rs` — inside this very
 census's `engine/topology` domain. `PR7-R5-ATT-001`.
 
-## `fn the_barrier_is_the_only_topology_route_from_a_proven_pre…` › `let production = crate::effects::production_code(&source);`
+## `fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {` › `let production = crate::effects::production_code(&source);`
 
 The production half only. A test that takes a prefix apart is a
 fixture, not a path a run can take.
@@ -1545,7 +1547,7 @@ own evidence: the guard was cited as proving that
 `StablePrefix::events` did not become a second entry point, and
 that check ran against the truncated domain.
 
-## `fn the_barrier_is_the_only_topology_route_from_a_proven_pre…` › `regions.push((relative.clone(), production.len(), source.len()));`
+## `fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {` › `regions.push((relative.clone(), production.len(), source.len()));`
 
 Calls, not definitions — a definition is not a route.
 
@@ -1564,7 +1566,7 @@ region was 83 lines of 1777 and its zero looked like a pass. The
 four whole-tree censuses each carry this control; this one did
 not, which is why the class survived here.
 
-## `fn the_barrier_is_the_only_topology_route_from_a_proven_pre…` › `for (file, region, whole) in &regions {`
+## `fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {` › `for (file, region, whole) in &regions {`
 
 Every region is a real fraction of its file. A tenth is a generous floor
 and still an order of magnitude above what the truncation left behind.
@@ -1691,13 +1693,13 @@ What is asserted is that the three survive and are the *same* three, not
 replacements: the log still appends to the proven prefix, the fold is the
 one the barrier replayed, and the locks are still held.
 
-## `fn the_recovery_order_hands_the_run_on_rather_than_dropping…` › `let contested = rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID));`
+## `fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {` › `let contested = rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID));`
 
 The run lock is still held, which is the property that lets a loop run
 at all. Measured by asking for it: a second acquisition must be refused
 while the handle is alive.
 
-## `fn the_recovery_order_hands_the_run_on_rather_than_dropping…` › `drop(handle);`
+## `fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {` › `drop(handle);`
 
 And released when the handle dies, in declaration order.
 
@@ -1807,7 +1809,7 @@ Two tests rather than one parameterised over a flag: the two paths append
 different events in different orders, and a grid would assert the union of
 them.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `let plans = crate::engine::assembly::FrozenPlans {`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `let plans = crate::engine::assembly::FrozenPlans {`
 
 **Through the production assembler, not a fixture plan shape.** The
 condition on this extraction was that the scaffold be re-pointed at the
@@ -1815,7 +1817,7 @@ real one or round-tripped against it; a fixture that hand-built an
 `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
 precedent warns about.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `assert_eq!(`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `assert_eq!(`
 
 **The settlement *is* `candidate_prepared`, so there are six events and
 not seven.** This comment required an `attempt_finished` between the pin
@@ -1828,7 +1830,7 @@ answered it: `attempt_finished` "is not also emitted for that attempt".
 Ruled CONFORM 2026-08-27, and the count below is the assertion — a build
 that re-introduced the pair puts a seventh kind back here.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `assert_eq!(`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `assert_eq!(`
 
 -----------------------------------------------------------------------
 **The same clause over the EFFECTS, not only the events.**
@@ -1846,12 +1848,12 @@ after `candidate_prepared`, the candidates ref moved before it, the commit
 object moved to just after capture, the pin created before `commit-tree` —
 were all green. One rule, two production compositions, one witness.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `"Event.Append".to_owned(),`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `"Event.Append".to_owned(),`
 
 task_dispatched and attempt_started: the branch's own prologue,
 which this fixture drives in the same step.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `"Event.Append".to_owned(),`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `"Event.Append".to_owned(),`
 
 **candidate_prepared — one append here, not two.** This list
 carried an `attempt_finished(succeeded)` above it; that event is
@@ -1860,11 +1862,11 @@ not emitted for a candidate-producing attempt
 CONFORM 2026-08-27), and the fold now refuses it. The count is
 part of the ordering claim.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `"Event.Append".to_owned(),`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `"Event.Append".to_owned(),`
 
 task_candidate_created.
 
-## `fn the_driver_carries_an_accepted_attempt_through_the_candi…` › `"Worktree.Remove".to_owned(),`
+## `fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {` › `"Worktree.Remove".to_owned(),`
 
 O31's scrub, which `PR7-PIPELINE-029` moved to immediately after
 `candidate_prepared` — three appends too early — and was green.
@@ -1925,12 +1927,12 @@ it, a driver reading a constant zero would record `1` and be
 indistinguishable from a correct one — which is precisely why the mutation
 survived before this test existed.
 
-## `fn the_driver_settles_an_outage_from_the_folds_deferral_cou…` › `let fixture = Fixture::build(`
+## `fn the_driver_settles_an_outage_from_the_folds_deferral_count() {` › `let fixture = Fixture::build(`
 
 One deferral already in the log, and the resume wakes the task back to
 `Pending` so the driver can dispatch it again.
 
-## `fn the_driver_settles_an_outage_from_the_folds_deferral_cou…` › `let plans = crate::engine::assembly::FrozenPlans {`
+## `fn the_driver_settles_an_outage_from_the_folds_deferral_count() {` › `let plans = crate::engine::assembly::FrozenPlans {`
 
 **Through the production assembler, not a fixture plan shape.** The
 condition on this extraction was that the scaffold be re-pointed at the
@@ -1938,13 +1940,13 @@ real one or round-tripped against it; a fixture that hand-built an
 `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
 precedent warns about.
 
-## `fn the_driver_settles_an_outage_from_the_folds_deferral_cou…` › `assert!(`
+## `fn the_driver_settles_an_outage_from_the_folds_deferral_count() {` › `assert!(`
 
 **An outage spends no allowance.** `next_step` defers precisely so that
 "retrying would burn attempts on a run that never got a verdict" does not
 happen, and `spends_allowance` prices it the same way.
 
-## `fn the_driver_settles_an_outage_from_the_folds_deferral_cou…` › `let settlements: Vec<u32> = TopologyFold::parse_log(&fixture.log_bytes())`
+## `fn the_driver_settles_an_outage_from_the_folds_deferral_count() {` › `let settlements: Vec<u32> = TopologyFold::parse_log(&fixture.log_bytes())`
 
 **The count came from the fold**, not from a tally this process kept.
 One deferral was already durable, so the settlement records two.
@@ -2070,7 +2072,7 @@ suite green. Measured, twice: once as `R3-SEAMS-001` and once when round
 The generation is retained, not closed: only a retained one is retried in
 place, and `settle::retry` refuses any other class by name.
 
-## `fn the_retaining_incarnation_retries_in_place()` › `let starts: Vec<(u32, bool, Option<String>)> = TopologyFold::parse_log(&fixture.log_bytes…`
+## `fn the_retaining_incarnation_retries_in_place()` › `let starts: Vec<(u32, bool, Option<String>)> = TopologyFold::parse_log(&fixture.log_bytes())`
 
 **Two attempts in one generation, the second resuming the first.** A
 driver that opened a fresh generation would append `task_dispatched`
@@ -2151,15 +2153,15 @@ This drives **two** attempts through the real assembler and asserts on the
 second worker's own stdin, because the prompt is the only place the claim is
 observable — a brief the driver holds and does not send is the defect.
 
-## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on…` › `run.step(&seams, &mut hooks)`
+## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {` › `run.step(&seams, &mut hooks)`
 
 Attempt one fails and, with one attempt per rung, escalates onto rung 1.
 
-## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on…` › `run.step(&seams, &mut hooks)`
+## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {` › `run.step(&seams, &mut hooks)`
 
 Attempt two, on the rung above, from a fresh generation.
 
-## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on…` › `let settled: Vec<serde_json::Value> = TopologyFold::parse_log(&fixture.log_bytes())`
+## `fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {` › `let settled: Vec<serde_json::Value> = TopologyFold::parse_log(&fixture.log_bytes())`
 
 **And the feedback is on the durable record, because this engine has no
 other carrier.** The crash-resume witnesses seed a log directly, so they
@@ -2321,11 +2323,11 @@ rather than on the prompt's length — a longer prompt is evidence that
 `a_retried_worker_is_told_what_the_last_attempt_failed_on` could say and is
 not what §11.4 requires.
 
-## `fn a_crash_does_not_erase_what_the_last_attempt_was_told_to…` › `const TAIL: &str = "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   \`
+## `fn a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix() {` › `const TAIL: &str = "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   \`
 
 §11.1's payload: what the gate printed, not the summary of it.
 
-## `fn a_crash_does_not_erase_what_the_last_attempt_was_told_to…` › `let fixture = Fixture::build(`
+## `fn a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix() {` › `let fixture = Fixture::build(`
 
 One tier, `attempts_per = 2`: the retry the log entitles this run to is on
 the **same rung**, which is the half of §11.4 this test is about.
@@ -2354,7 +2356,7 @@ exists at all — `feedback_section` writes its header **only** when it is
 rendering more than one entry for a fresh rung, so that sentence is the
 accumulation itself and not a statement about it.
 
-## `fn an_escalation_after_a_crash_carries_the_accumulated_feed…` › `in_generation(GenerationId(1), dispatched()),`
+## `fn an_escalation_after_a_crash_carries_the_accumulated_feedback() {` › `in_generation(GenerationId(1), dispatched()),`
 
 A closed generation cannot take another attempt, so the
 second failure is in the generation the retry opened —
@@ -2526,7 +2528,7 @@ question a reader would otherwise ask.
 This fixture's Mid rung is `High` and its review axis is `Medium`, so the two
 are distinguishable. A fixture where they matched would assert nothing.
 
-## `fn a_reviewer_runs_at_the_review_effort_not_the_implementer…` › `use crate::engine::topology::scaffold::REVIEW_AGENT;`
+## `fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {` › `use crate::engine::topology::scaffold::REVIEW_AGENT;`
 
 **The reviewer is bound to a different agent than the implementer, and it
 has to be.** The comment here used to say the single pool was "named so
@@ -2547,12 +2549,12 @@ Through the scaffold's own constant rather than a literal: it is the
 agent that fixture's `alternative` binding already names, so this is the
 second agent the run actually probed and not one invented here.
 
-## `fn a_reviewer_runs_at_the_review_effort_not_the_implementer…` › `assert_eq!(`
+## `fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {` › `assert_eq!(`
 
 The implementer's own pool, so the two values in play are distinguishable
 and the assertion below is about which one the reviewer got.
 
-## `fn a_reviewer_runs_at_the_review_effort_not_the_implementer…` › `assert_eq!(`
+## `fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {` › `assert_eq!(`
 
 **And its own agent's pool**, which is the other cell of
 `a_reviewers_profile_is_accounted_for_at_both_callers` whose value the
@@ -2581,13 +2583,13 @@ Recovery's own emitter passes `Some(...)`. `TopologyRun::resumed` passed
 committed, and only the loop's appends lost the answer. Nothing observed it
 because nothing compared them.
 
-## `fn the_loop_inherits_the_committed_digest_recovery_verified…` › `let expected = crate::rundir::run_started_sha256(&fixture.first_line);`
+## `fn the_loop_inherits_the_committed_digest_recovery_verified() {` › `let expected = crate::rundir::run_started_sha256(&fixture.first_line);`
 
 Computed independently from the run's own committed first line, rather
 than read back from the record the handle came through: a comparison of
 the record with itself would pass however the digest was carried.
 
-## `fn the_loop_inherits_the_committed_digest_recovery_verified…` › `let run = crate::engine::topology::run::TopologyRun::resumed(`
+## `fn the_loop_inherits_the_committed_digest_recovery_verified() {` › `let run = crate::engine::topology::run::TopologyRun::resumed(`
 
 **And it survives into the loop's own identity**, which is the hop that
 matters: `establish_stable_prefix` skips its check entirely when the
@@ -2623,12 +2625,12 @@ attempt was never settled, so it settles **interrupted**, and the pin is
 residue that recovery prunes. Not patched to pass — the log this drives is
 one the fold accepts, which the old fixture no longer is.
 
-## `fn a_prepared_pin_without_a_candidate_record_is_orphan_resi…` › `extra: vec![attempt_started(1)],`
+## `fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {` › `extra: vec![attempt_started(1)],`
 
 An attempt that started and never settled: the whole of what a
 crash between the pin and `candidate_prepared` leaves durable.
 
-## `fn a_prepared_pin_without_a_candidate_record_is_orphan_resi…` › `let prepared: Vec<_> = TopologyFold::parse_log(&fixture.log_bytes())`
+## `fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {` › `let prepared: Vec<_> = TopologyFold::parse_log(&fixture.log_bytes())`
 
 **And no `candidate_prepared` was invented.** This is the assertion the
 removed trio inverted: they required exactly one to appear.
@@ -2655,7 +2657,7 @@ for real.
 Returns the commit sha, so a test can assert what became of the object the
 pin named.
 
-## `fn seed_candidate_commit(fixture: &Fixture, generation: u32…` › `write_file(&repo.join("candidate.txt"), b"the worker's edit\n");`
+## `fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {` › `write_file(&repo.join("candidate.txt"), b"the worker's edit\n");`
 
 A change on top of the base, committed without moving the branch: the
 candidate commit is unreferenced except by its pin, which is R23's shape.
@@ -2665,7 +2667,7 @@ candidate commit is unreferenced except by its pin, which is R23's shape.
 subsequent worktree restore deletes it — measured, as a resume that could
 not find its own run.
 
-## `fn seed_candidate_commit(fixture: &Fixture, generation: u32…` › `git(repo, &["rm", "-q", "-f", "--", "candidate.txt"]);`
+## `fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {` › `git(repo, &["rm", "-q", "-f", "--", "candidate.txt"]);`
 
 Unstage and remove just that path, so the index matches the base again
 and the pin is the only thing referencing the commit. Targeted for the
@@ -2708,7 +2710,7 @@ So this asserts the needle's rule over the four shapes that decide it, and
 then over the real file the collision was found in — a unit assertion alone
 would pass against a helper that was never wired into the census.
 
-## `fn a_call_census_needle_is_not_satisfied_by_a_longer_name_e…` › `let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));`
+## `fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {` › `let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));`
 
 And on the file the collision was measured in, through the same region
 the census reads — a unit assertion over literals would pass against a
@@ -2776,11 +2778,11 @@ The fourth is the one worth stating as a class: the needle is built from a
 name **the packet chose**, so it cannot be renamed out of a collision the way
 `into_log_and_fold` was.
 
-## `fn every_packet_named_recovery_action_has_a_production_call…` › `const CLAUSES: &[(&str, crate::effects::census_domain::Call, &str)] = &[`
+## `fn every_packet_named_recovery_action_has_a_production_caller() {` › `const CLAUSES: &[(&str, crate::effects::census_domain::Call, &str)] = &[`
 
 (function, how production calls it, the packet clause it performs).
 
-## `fn every_packet_named_recovery_action_has_a_production_call…` › `let test_modules = crate::effects::census_domain::whole_file_test_modules(&root, &all, 13…`
+## `fn every_packet_named_recovery_action_has_a_production_caller() {` › `let test_modules = crate::effects::census_domain::whole_file_test_modules(&root, &all, 13);`
 
 **The crate's own declarations, not a file-name rule.** This skipped
 by the stem `"tests"`, so it covered only the modules named
@@ -2791,7 +2793,7 @@ and the six it missed — `scaffold`, `premove`, `fake`, `fixture`,
 `scratch_tree`, `readiness` — are the ones most likely to name what
 production names. `PR7-R5-ATT-001`.
 
-## `fn every_packet_named_recovery_action_has_a_production_call…` › `if test_modules.contains(&path) {`
+## `fn every_packet_named_recovery_action_has_a_production_caller() {` › `if test_modules.contains(&path) {`
 
 **An out-of-line test file is test code in full, and
 `production_code` cannot tell.** The `#[cfg(test)]` is on the
@@ -2801,7 +2803,7 @@ this skip a fixture calling a packet-named function satisfies
 the clause on production's behalf, which is precisely the
 class this census exists to close.
 
-## `fn every_packet_named_recovery_action_has_a_production_call…` › `assert!(`
+## `fn every_packet_named_recovery_action_has_a_production_caller() {` › `assert!(`
 
 The skip is in force and it removed something. A zero here would mean the
 control was silently inert — the same failure as an empty region, one
@@ -2810,7 +2812,7 @@ which is why it is that list and not `test_modules.len()`: the derivation
 is what this floor exists to catch, so a floor read off its own output
 would pass on an empty answer.
 
-## `fn every_packet_named_recovery_action_has_a_production_call…` › `let defined: usize = sources`
+## `fn every_packet_named_recovery_action_has_a_production_caller() {` › `let defined: usize = sources`
 
 **The named item exists.** The census never checked, so renaming a
 clause's definition out of the tree left it green — measured, S5

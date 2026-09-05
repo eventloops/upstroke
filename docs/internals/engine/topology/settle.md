@@ -1,10 +1,12 @@
 # `src/engine/topology/settle.rs`
 
-Extended notes for [`src/engine/topology/settle.rs`](../../../../src/engine/topology/settle.rs).
+Repository source for these notes: [`src/engine/topology/settle.rs`](../../../../src/engine/topology/settle.rs).
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/settle.rs).
+The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. The explanatory prose is preserved below.
+Each backticked part of a section heading is an exact source excerpt. Search for the final
+excerpt within the preceding item when a heading names both an item and a line inside it.
 
 ## Module
 

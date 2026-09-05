@@ -1,10 +1,12 @@
 # `src/engine/topology/run.rs`
 
-Extended notes for [`src/engine/topology/run.rs`](../../../../src/engine/topology/run.rs).
+Repository source for these notes: [`src/engine/topology/run.rs`](../../../../src/engine/topology/run.rs).
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/run.rs).
+The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. The explanatory prose is preserved below.
+Each backticked part of a section heading is an exact source excerpt. Search for the final
+excerpt within the preceding item when a heading names both an item and a line inside it.
 
 ## Module
 
@@ -119,7 +121,7 @@ The whole candidate sequence was therefore tested against an emitter no
 production path would use, which is the same hole `RunEmitter` was written
 to close for dispatch and attempt.
 
-## `fn emit(&mut self, body: TopologyEventBody) -> Result<(), U…` › `self.emitter`
+## `fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {` › `self.emitter`
 
 Three disjoint field borrows, and the discharge of obligation (3)
 happens here because this struct is what holds the ledger.
@@ -733,25 +735,25 @@ caller that consumes it. Before the handle existed, the order dropped
 the log, the fold and both locks, and there was nothing for this
 function to take.
 
-## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, cei…` › `committed_first_line_sha256: Some(handle.committed_first_line_sha256.clone()),`
+## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, ceiling: Ceiling) -> Self {` › `committed_first_line_sha256: Some(handle.committed_first_line_sha256.clone()),`
 
 The digest recovery verified, not `None`. A loop that dropped it
 would make its own appends unable to report a creator
 disposition, while recovery's emitter — over the same run —
 could.
 
-## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, cei…` › `let spend = Spend::replay(&handle.events);`
+## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, ceiling: Ceiling) -> Self {` › `let spend = Spend::replay(&handle.events);`
 
 Read before the handle moves into the struct below it.
 
-## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, cei…` › `let brief = Brief::replay(&handle.events);`
+## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, ceiling: Ceiling) -> Self {` › `let brief = Brief::replay(&handle.events);`
 
 **The log's brief, not an empty map.** Same reader, same reason as
 `spend`: §11.4's feedback is on the durable record now, so a resumed
 run tells the next worker what the attempts before the crash failed
 on rather than handing it attempt 1's prompt.
 
-## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, cei…` › `spend,`
+## `pub fn resumed(handle: RunHandle, inputs: FrozenInputs, ceiling: Ceiling) -> Self {` › `spend,`
 
 **The log's spend, not a fresh counter.** `Spend::replay` is
 documented as the reader "a resumed process rebuilds this with",
@@ -1402,7 +1404,7 @@ that: it seeds one deferral in the log before the run, so the settlement
 must record `defers: 2`, and the constant-zero mutation records `1`.
 A prior deferral is what makes the read observable at all.
 
-## `impl TopologyRun` › `fn ladder_policy(&self, key: TaskKey) -> Result<crate::ladder::LadderPolicy, UpstrokeErro…`
+## `impl TopologyRun` › `fn ladder_policy(&self, key: TaskKey) -> Result<crate::ladder::LadderPolicy, UpstrokeError> {`
 
 The frozen ladder's shape, as `next_step` reads it.
 

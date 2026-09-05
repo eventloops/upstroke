@@ -1,10 +1,12 @@
 # `src/engine/topology/settle/tests.rs`
 
-Extended notes for [`src/engine/topology/settle/tests.rs`](../../../../../src/engine/topology/settle/tests.rs).
+Repository source for these notes: [`src/engine/topology/settle/tests.rs`](../../../../../src/engine/topology/settle/tests.rs).
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/settle/tests.rs).
+The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. The explanatory prose is preserved below.
+Each backticked part of a section heading is an exact source excerpt. Search for the final
+excerpt within the preceding item when a heading names both an item and a line inside it.
 
 ## `pub(crate) const ALEPH: TaskKey = TaskKey(0);`
 
@@ -89,13 +91,13 @@ nothing about its review clause. A gate failure never reached a
 reviewer, so the failing variant's list is empty because it is —
 not for want of a fixture.
 
-## `pub(crate) fn finished(key: TaskKey, generation: u32, attempt: u32, next: Next) -> Finish…`
+## `pub(crate) fn finished(key: TaskKey, generation: u32, attempt: u32, next: Next) -> FinishedAttempt {`
 
 A `FinishedAttempt` with every field at a value of its own, so a
 settlement that read one field where it meant another lands somewhere
 this fixture does not hold.
 
-## `pub(crate) fn finished(key: TaskKey, generation: u32, attem…` › `record: record_failing(`
+## `pub(crate) fn finished(key: TaskKey, generation: u32, attempt: u32, next: Next) -> FinishedAttempt {` › `record: record_failing(`
 
 **A failed settlement's record says failed.** This used
 `record(attempt, Some(0.5))`, whose `failure: None` means "the work
@@ -107,7 +109,7 @@ lines above. `check_attempt_finished` refuses it since 2026-08-27.
 
 Dispatch `key` into generation `generation` and start attempt 1.
 
-## `pub(crate) fn settle_into(fold: &mut TopologyFold, finished: &FinishedAttempt) -> Attempt…`
+## `pub(crate) fn settle_into(fold: &mut TopologyFold, finished: &FinishedAttempt) -> AttemptFinished4 {`
 
 Settle `key`'s in-flight attempt through the module under test.
 
@@ -252,11 +254,11 @@ be written.
 `T-FAILED.resume_action`: "rematerialize question from the event …
 never re-decide".
 
-## `fn a_question_is_read_back_from_the_event_and_not_re_decide…` › `let open = fold.open_questions().expect("started");`
+## `fn a_question_is_read_back_from_the_event_and_not_re_decided() {` › `let open = fold.open_questions().expect("started");`
 
 The fold opened exactly that question, under exactly that id.
 
-## `fn a_question_is_read_back_from_the_event_and_not_re_decide…` › `let mut other = started();`
+## `fn a_question_is_read_back_from_the_event_and_not_re_decided() {` › `let mut other = started();`
 
 Every other settlement rematerializes nothing: a reader that
 answered `Some` for a non-parking settlement would write a question
@@ -293,15 +295,15 @@ the value a run actually writes.
 
 `deferred_task_does_not_block_halted_or_budget_exceeded_closure`.
 
-## `fn deferred_task_does_not_block_halted_or_budget_exceeded_c…` › `let mut fold = started();`
+## `fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {` › `let mut fold = started();`
 
 Halted.
 
-## `fn deferred_task_does_not_block_halted_or_budget_exceeded_c…` › `let refused = fold`
+## `fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {` › `let refused = fold`
 
 And the wait it is deferred behind can no longer elapse.
 
-## `fn deferred_task_does_not_block_halted_or_budget_exceeded_c…` › `let mut fold = started();`
+## `fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {` › `let mut fold = started();`
 
 BudgetExceeded.
 
@@ -318,7 +320,7 @@ control that separates "a task failed" from "the run is over".
 
 `halting_drain_settlement_after_budget_exceeded_yields_halted` (ST-17).
 
-## `fn halting_drain_settlement_after_budget_exceeded_yields_ha…` › `apply(&mut fold, &budget_exceeded(Epoch(0), BET));`
+## `fn halting_drain_settlement_after_budget_exceeded_yields_halted() {` › `apply(&mut fold, &budget_exceeded(Epoch(0), BET));`
 
 The ceiling refused BET's next attempt; ALEPH's attempt is still in
 flight and drains.

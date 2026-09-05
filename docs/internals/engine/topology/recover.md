@@ -1,10 +1,15 @@
 # `src/engine/topology/recover.rs`
 
-Extended notes for [`src/engine/topology/recover.rs`](../../../../src/engine/topology/recover.rs).
+Repository source for these notes: [`src/engine/topology/recover.rs`](../../../../src/engine/topology/recover.rs).
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/recover.rs).
+The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. The explanatory prose is preserved below.
+Each backticked part of a section heading is an exact source excerpt. Search for the final
+excerpt within the preceding item when a heading names both an item and a line inside it.
+
+The lock ownership and release protocols remain beside `LocksHeld`, `into_guards`,
+and `RunHandle` in the source, as required by standards sections 10 and 13.
 
 ## Module
 
@@ -306,7 +311,7 @@ and names a directory the run does not own, and a locator of
 `<R>/<run_id>` has no `runs` component at all. Both are the
 `malformed_recorded_locator_refused_before_any_lock` case.
 
-## `fn authorized_root(private_dir: &Path, run_id: &str) -> Res…` › `if private_dir`
+## `fn authorized_root(private_dir: &Path, run_id: &str) -> Result<PathBuf, UpstrokeError> {` › `if private_dir`
 
 No `..`, no `.`, no prefix trickery: every component is checked,
 because the whole value of this refusal is that the two trailing
@@ -423,7 +428,7 @@ Verify both records against the run record (a0) read.
 or unparseable record, or a disagreement in any of the six
 fields.
 
-## `pub fn verify(locks: LocksHeld, repo_key: &RepoKey) -> Resu…` › `if let Some(field) = started.runner.difference(&owner.runner) {`
+## `pub fn verify(locks: LocksHeld, repo_key: &RepoKey) -> Result<Self, UpstrokeError> {` › `if let Some(field) = started.runner.difference(&owner.runner) {`
 
 INV-23: "every later incarnation rebuilds the Runner from
 `run_started(4).runner` — **verified equal to
@@ -1318,13 +1323,13 @@ bytes nobody proved.
 [`UpstrokeError::Refused`] when the proven prefix ends in `run_finished`
 with [`RunOutcome::Complete`] or [`RunOutcome::Halted`].
 
-## `pub fn refuse_if_finished(censused: &ResumeCensused) -> Res…` › `RunOutcome::Parked | RunOutcome::BudgetExceeded => Ok(()),`
+## `pub fn refuse_if_finished(censused: &ResumeCensused) -> Result<(), UpstrokeError> {` › `RunOutcome::Parked | RunOutcome::BudgetExceeded => Ok(()),`
 
 Parked and BudgetExceeded are resumable outcomes: the fold's own
 guard lets `run_resumed` through for exactly these two, which is what
 makes "raise the ceiling and resume" the response to a budget stop.
 
-## `pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<(), Upstr…`
+## `pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<(), UpstrokeError> {`
 
 Step (f)'s checkpoint refusal.
 
@@ -1357,7 +1362,7 @@ convergence, which rebuilt a candidate identity from the pin; with
 reconstruction and no such window, so one refusal is left and this takes no
 `WorkspaceManager` — it is now a predicate over the fold alone.
 
-## `pub fn refuse_unimplemented_terminals(certified: &Preflight…` › `Ok(())`
+## `pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<(), UpstrokeError> {` › `Ok(())`
 
 **A `Promoting` generation whose pin is gone used to be refused here**,
 because E6's convergence rebuilt the candidate identity *from* that pin
@@ -1899,12 +1904,12 @@ act on" is a property of the function the step calls rather than of a
 predicate the step re-derives. Two rules that can disagree is the shape this
 slice has paid for repeatedly.
 
-## `fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenG…` › `let Some(open) = fold.open_no_attempt(key) else {`
+## `fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenGeneration>, UpstrokeError> {` › `let Some(open) = fold.open_no_attempt(key) else {`
 
 The class question is the fold's, through `open_no_attempt`. The
 repair refusal below is recovery's own policy and stays here.
 
-## `fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenG…` › `source: None,`
+## `fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenGeneration>, UpstrokeError> {` › `source: None,`
 
 `None` is not a guess. An ordinary generation has no
 materialization to reproduce, and the repair case returned
@@ -1916,12 +1921,12 @@ third path that could leave it wrong.
 
 Every task key the registry holds.
 
-## `fn in_flight(fold: &TopologyFold) -> Vec<(TaskKey, GenerationId, AttemptNumber, LeaseDisp…`
+## `fn in_flight(fold: &TopologyFold) -> Vec<(TaskKey, GenerationId, AttemptNumber, LeaseDisposition)> {`
 
 Every `(key, generation, attempt)` whose attempt was running when the last
 coordinator died.
 
-## `fn in_flight(fold: &TopologyFold) -> Vec<(TaskKey, Generati…` › `found.push((`
+## `fn in_flight(fold: &TopologyFold) -> Vec<(TaskKey, GenerationId, AttemptNumber, LeaseDisposition)> {` › `found.push((`
 
 `survives: false` — "the generation does *not* survive an
 interruption" (T-ATTEMPT: generation Closed). The disposition

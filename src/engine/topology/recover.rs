@@ -245,6 +245,13 @@ pub mod chain {
         use crate::error::UpstrokeError;
         use crate::rundir::{RunDirHooks, RunLock, WorktreeLock};
 
+        // This witness owns the worktree lease and run lock for recovery's sole writer.
+        // `take` acquires the worktree lease before the run lock. The funnels arbitrate
+        // ownership through atomic claims and OS locks, refusing competing owners or
+        // surviving cleanup holds. If run-lock acquisition fails, the local worktree
+        // guard drops. Later failures and command exit drop both guards; process death
+        // releases the OS locks. Keep `_run` before `_worktree`: declaration-order drop
+        // releases the run lock first, reversing acquisition.
         #[derive(Debug)]
         pub struct LocksHeld {
             root: RootDerived,
@@ -275,6 +282,8 @@ pub mod chain {
 
             #[must_use]
             pub fn into_guards(self) -> (RunLock, WorktreeLock, RootDerived) {
+                // Transfer live guards without unlocking. The recipient keeps both for
+                // the command and must release the run lock before the worktree lease.
                 (self._run, self._worktree, self.root)
             }
         }
@@ -1213,6 +1222,10 @@ pub fn run_resumed(
     ))
 }
 
+// Owns the run's writer state and both live guards through the driver, with no
+// unlock/reacquire gap at the recovery handoff. Dropping the handle on completion
+// or error releases both; `_run` must precede `_worktree` so declaration-order drop
+// releases the run lock before the worktree lease. Process death releases OS holds.
 pub struct RunHandle {
     pub committed_first_line_sha256: String,
     pub log: crate::events::log::EventLog,
