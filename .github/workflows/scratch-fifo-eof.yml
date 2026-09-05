@@ -1,0 +1,13 @@
+name: scratch before-fix witness
+on:
+  push:
+    branches: [scratch/darwin-fifo-eof-experiment]
+jobs:
+  darwin-before-fix:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sw_vers
+      - run: cargo test --lib -- agent::proc::termination::tests 2>&1 | tail -60
+        continue-on-error: true

@@ -2516,7 +2516,6 @@ mod termination {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn wait_readable(fd: libc::c_int, timeout: Duration) -> Readiness {
         let timeout_ms = libc::c_int::try_from(timeout.as_millis())
             .unwrap_or(libc::c_int::MAX)
@@ -2549,7 +2548,8 @@ mod termination {
     }
 
     #[cfg(target_os = "macos")]
-    fn wait_readable(fd: libc::c_int, timeout: Duration) -> Readiness {
+    #[allow(dead_code)]
+    fn wait_readable_select(fd: libc::c_int, timeout: Duration) -> Readiness {
         const BITS_PER_WORD: usize = 32;
         let (Ok(slot), Some(nfds)) = (usize::try_from(fd), fd.checked_add(1)) else {
             return Readiness::Failed(libc::EBADF);
