@@ -7,9 +7,9 @@ rationale, worked examples, and the records of what an earlier shape got wrong. 
 that material is valuable and dense enough to fill a reader's attention — human or agent — before
 they reach the code. Moving it here makes loading it a choice.
 
-Where a module has a notes file, its source carries **no rustdoc and no inline comments**, only a
-single pointer in the module header. The code is expected to read for itself; the notes are the
-backup for the context the code cannot carry. `CODING_STANDARDS.md` §13 is the rule.
+Where a module has a notes file, its source keeps one header pointer and the
+site-required exceptions listed below. Other rustdoc and inline comments move to
+the notes. `CODING_STANDARDS.md` §13 is the rule.
 
 It is **not** a second source of truth. `DESIGN.md` is the living authority for product design and
 `CODING_STANDARDS.md` for implementation; a note here that disagrees with either is a defect in the
@@ -31,17 +31,34 @@ with no note has no file; absence means nothing was moved, not that nothing is k
 
 ## Getting from a note back to the code
 
-Every file opens with a link to the module it describes. Every section is headed by the item it
-belongs to, spelled as it is in the source, so the section heading is the grep string that finds
-the code.
+Every file opens with a visible backlink, using its own module and relative path:
+
+```markdown
+# `src/runner/host.rs`
+
+Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs).
+```
+
+The opening paragraph may follow an H1 and blank lines. The H1 may include a
+description, and ordinary prose may follow the backlink on the same line.
+The generated wording is an example; a `[Source](relative/path.rs)` link also
+satisfies the same contract.
+The recognized link label is plain text or a single code span closed inside its
+brackets. The opening is a paragraph; lists, blockquotes, and code blocks do not
+supply it, even when their source contains link-like text.
+
+The repository-relative link works in a checkout and on GitHub. A separate
+`Source on GitHub` link points to the module's GitHub page for readers on
+upstroke.rs, whose published `/docs` tree does not contain `src/`.
+
+Code fragments in section headings are spelled as in source. Search each
+backticked fragment separately; the enclosing item distinguishes repeated lines.
 
 ## Getting from the code to a note
 
 One marker, in the module header, and nothing else:
 
 ```rust
-//! The host runner: `host-v1`.
-//!
 //! Extended notes: `docs/internals/runner/host.md`
 ```
 
@@ -99,13 +116,19 @@ four Bash gates) and holds the two trees to each other in both directions:
   derives, and that file exists;
 - every notes file mirrors a live module, and that module carries exactly one marker, so a module
   that loses its marker is caught from the notes side;
-- every notes file links back to its module, resolved against the repository root from the notes
-  file's own directory, at any depth;
+- every notes file opens with the Markdown backlink shown above, optionally
+  following an H1 and blank lines, and its relative target resolves to its module;
 - a module carries at most one marker, above its first line of code.
 
 An absent `docs/internals/` is a failure, never "nothing to check": with markers in `src/` it is a
 deleted notes tree, and with none it is a gate measuring nothing. Each check has been broken on
 purpose and watched fail.
 
-What it cannot check is whether a note is still *true*. That is a review duty, and §4's rule that a
-stale comment is a defect applies to a stale note in the same way.
+The gate checks that opening format rather than parsing arbitrary Markdown.
+Hidden links, plain paths, code examples, and images do not satisfy it. Its
+isolated fixtures exercise valid depths and CRLF, malformed backlinks, missing
+files, and misplaced or duplicate markers.
+
+The gate does not check section headings, arbitrary source prose, or whether a
+note remains true. Those are review duties under §13, including its site-required
+exceptions. §4's rule that a stale comment is a defect also applies to notes.

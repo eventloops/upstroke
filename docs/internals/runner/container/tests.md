@@ -1485,8 +1485,8 @@ only. The `(` is part of every needle, which is what keeps
 
 Every denied method `readiness.rs` reaches, and how many times.
 
-Over the blanked source, so the prologue's own prose -- which spells every
-one of these names -- is not counted as a call. `PR4-CENSUS-COMMENT-ORACLE`.
+Over the blanked source, so comments and literals cannot count as calls.
+`PR4-CENSUS-COMMENT-ORACLE`.
 
 ## `fn the_readiness_allowance_names_the_paths_it_is_written_against() {`
 
