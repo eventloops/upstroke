@@ -190,11 +190,10 @@ pub enum FoldError {
     },
 
     #[error(
-        "`{kind}` parks task {key} while its generation {generation} is {class}; a question is \
-         raised against a task with no open generation, because its answer returns the task to \
-         pending and a decline fails it, and neither settles an attempt — a generation left open \
-         under a failed task could never close, and the run could never end. A question that \
-         arises from an attempt is carried by that attempt's settlement."
+        "`{kind}` names task {key} while its generation {generation} is {class}; a question parks \
+         a task at rest and its answer returns one, and a generation still open settles by moving \
+         the task under the question, so the answer would apply to a state the question was not \
+         asked about"
     )]
     GenerationOpen {
         kind: &'static str,

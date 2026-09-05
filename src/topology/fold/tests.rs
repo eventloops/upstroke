@@ -7224,17 +7224,24 @@ fn refused_live_and_on_replay(
 fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
     // **What the pre-repair fold answered for every one of these inputs:
     // accepted.** The bare `question_raised` set the task `AwaitingInput`
-    // and left the generation exactly as it was — and the decline that
+    // and left the generation exactly as it was, and the decline that
     // answered it then set the task `Failed` with generation 0 still open
     // and its predicted lease still held, from which `derived_outcome` read
     // `NotEnding` for the rest of the log. That log is the one in
     // `the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_ends_the_run`,
     // where the same history is written the way the fold can end it.
     //
-    // Every class, not only `InFlight`: `common()` counts any generation
-    // that is not `Closed` as blocking the end of the run, so a decline
-    // wedges the run from each of the four, and a guard that read only the
-    // in-flight class would leave three doors open.
+    // **What this asserts, and what it does not.** It asserts the rule the
+    // door states — a bare question parks a task at rest, and an open
+    // generation in any class is not at rest — and that the refusal is the
+    // same live and on replay. It does not claim a decline is unrecoverable
+    // from every class: `generation_closed` can close `OpenNoAttempt` and
+    // `RetainedIdle` after a decline. What those two classes share with
+    // `InFlight` and `Promoting` is that `attempt_started` asks nothing about
+    // the task's state, so an attempt can start under the open question and
+    // the decline then lands on `InFlight`; the constructed states in
+    // `an_answer_applies_only_to_a_task_still_parked_with_nothing_open` are
+    // what that ordering produces, and show the answer refused there.
     for (class, events) in alpha_open_in_every_class() {
         let (fold, log) = folded(&events);
         let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
@@ -7323,9 +7330,11 @@ fn the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_end
 }
 
 #[test]
-fn a_bare_question_is_refused_on_a_terminal_task() {
-    // **Pre-repair: accepted**, and an answer then returned a merged or a
-    // failed task to `Pending`, where `ready` would dispatch it again.
+fn a_bare_question_is_refused_on_a_task_that_is_not_at_rest() {
+    // **Pre-repair: accepted** against a merged or a failed task, and an
+    // answer then returned it to `Pending`, where `ready` would dispatch it
+    // again. The three states below are the ones another event would move
+    // before the answer arrived; each is named with the event that moves it.
     let base = sha("base");
     let mut merged_log = Vec::new();
     {
@@ -7367,20 +7376,237 @@ fn a_bare_question_is_refused_on_a_terminal_task() {
             failed_log.push(event);
         }
     }
-    for (state, events) in [("merged", merged_log), ("failed", failed_log)] {
+    // `AwaitingInput`: a second question while one is open. The pass-1
+    // review of `15c37e4` reached the wedge through this door — q1 and q2
+    // raised, q1 answered (`Pending`), the task dispatched and its attempt
+    // started, q2 declined onto the in-flight generation.
+    let parked_log = vec![raised("q-first-Ünicode", ALPHA)];
+    // `AwaitingRepair`: its lineage's `task_merged` moves it to `Merged`.
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut repair_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(0),
+            candidate: candidate_of(ALPHA, 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+            lease_effect: RejectionLeaseEffect::CreatesLineage {
+                root: ALPHA,
+                paths: region(ALPHA),
+            },
+        };
+        rejected.repair.entry.deps = Vec::new();
+        rejected.repair.entry.display_deps = Vec::new();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+            ev(TopologyEventBody::MergeRejected {
+                data: Box::new(rejected),
+            }),
+        ] {
+            apply(&mut fold, &event);
+            repair_log.push(event);
+        }
+    }
+    for (state, events) in [
+        ("merged", merged_log),
+        ("failed", failed_log),
+        ("awaiting input", parked_log),
+        ("awaiting repair", repair_log),
+    ] {
         let (fold, log) = folded(&events);
         assert_eq!(fold.task_state(ALPHA).map(TaskState::name), Some(state));
-        let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+        let error = refused_live_and_on_replay(&fold, &log, &raised("q-second-Ünicode", ALPHA));
         assert_eq!(
             error,
             FoldError::WrongTaskState {
                 kind: "question_raised",
                 key: 1,
                 state,
-                expected: "not terminal",
+                expected: "pending, awaiting merge or deferred",
             }
         );
     }
+}
+
+#[test]
+fn a_bare_question_is_refused_on_the_candidate_under_integration() {
+    // **Pre-repair: accepted.** The pass-1 review of `15c37e4` drove it on:
+    // `merge_prepared` and `task_merged` continue the recorded transaction
+    // without asking the task's state, so the task went `Merged` with the
+    // question open, and the answer returned it to `Pending`, where a fresh
+    // generation was dispatched for merged work. `first_eligible` skips a
+    // parked task's candidate at the *start* of a transaction; this is the
+    // same rule for one already open.
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingMerge));
+    let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("a question on the candidate under integration is refused as one: {error}");
+    };
+    assert_eq!(kind, "question_raised");
+    assert!(detail.contains("sequence 0"), "{detail}");
+    // The same task, once the transaction is over and the candidate is back
+    // in the queue, can be parked — this is the shape `select`'s tests use.
+    let mut released = fold.clone();
+    apply(
+        &mut released,
+        &ev(TopologyEventBody::MergeVerificationInterrupted {
+            data: MergeVerificationInterrupted {
+                sequence: SequenceId(0),
+                detail: "  the coordinator died  ".to_owned(),
+            },
+        }),
+    );
+    apply(&mut released, &raised("q-park-Ünicode", ALPHA));
+    assert_eq!(released.task_state(ALPHA), Some(TaskState::AwaitingInput));
+}
+
+#[test]
+fn an_answer_applies_only_to_a_task_still_parked_with_nothing_open() {
+    // The other end of the same rule, and the invariant the raise-time doors
+    // exist to keep: whatever the log did between a question and its
+    // answer, the answer is applied only to a task that is still
+    // `AwaitingInput` with no open generation, because that is the state
+    // `apply_answer`'s two effects are written against.
+    //
+    // **Constructed, not folded.** With the raise-time doors shut no legal
+    // log reaches these states, which is the point; the states are the ones
+    // the pass-1 sequences produced at `15c37e4` — an attempt started under
+    // an open question, and a task merged under one — built by hand the way
+    // the derived-outcome grid builds its shapes.
+    let generation = |class: GenerationClass| GenerationFold {
+        id: GenerationId(0),
+        class,
+        base_sha: sha("base"),
+        lease: GenerationLease::Own,
+        attempts: 1,
+        candidate: None,
+    };
+    let answers = [
+        Answer4::Answered {
+            option_index: 0,
+            binding_override: None,
+        },
+        Answer4::Declined {
+            decline_halts_run: true,
+        },
+        Answer4::Declined {
+            decline_halts_run: false,
+        },
+    ];
+
+    // Parked, and an attempt then started in a generation it holds.
+    for (class, name) in [
+        (GenerationClass::OpenNoAttempt, "open with no attempt"),
+        (
+            GenerationClass::InFlight {
+                attempt: AttemptNumber(1),
+            },
+            "in flight",
+        ),
+        (
+            GenerationClass::RetainedIdle {
+                session: SessionId("sess-ÜNI-0042".to_owned()),
+                incarnation: Epoch(0),
+            },
+            "retained idle",
+        ),
+        (GenerationClass::Promoting, "promoting"),
+    ] {
+        let mut fold = started();
+        apply(&mut fold, &raised("q-park-Ünicode", ALPHA));
+        fold.run
+            .as_mut()
+            .and_then(|run| run.tasks.get_mut(ALPHA.index()))
+            .expect("alpha is registered")
+            .generations
+            .push(generation(class));
+        for answer in &answers {
+            assert_eq!(
+                refuse(&fold, &answered(ALPHA, "q-park-Ünicode", answer.clone())),
+                FoldError::GenerationOpen {
+                    kind: "question_answered",
+                    key: 1,
+                    generation: 0,
+                    class: name,
+                },
+                "an answer under a generation that is {name}"
+            );
+        }
+    }
+
+    // Parked, and the task then moved by something other than its answer.
+    for state in [
+        TaskState::Pending,
+        TaskState::AwaitingMerge,
+        TaskState::AwaitingRepair,
+        TaskState::Deferred,
+        TaskState::Merged,
+        TaskState::Failed,
+    ] {
+        let mut fold = started();
+        apply(&mut fold, &raised("q-park-Ünicode", ALPHA));
+        fold.run
+            .as_mut()
+            .and_then(|run| run.tasks.get_mut(ALPHA.index()))
+            .expect("alpha is registered")
+            .state = state;
+        for answer in &answers {
+            assert_eq!(
+                refuse(&fold, &answered(ALPHA, "q-park-Ünicode", answer.clone())),
+                FoldError::WrongTaskState {
+                    kind: "question_answered",
+                    key: 1,
+                    state: state.name(),
+                    expected: "awaiting input",
+                },
+                "an answer to a task that is {}",
+                state.name()
+            );
+        }
+    }
+
+    // And the state every legal question leaves, answered.
+    let mut fold = started();
+    apply(&mut fold, &raised("q-park-Ünicode", ALPHA));
+    accepts(
+        &fold,
+        &answered(
+            ALPHA,
+            "q-park-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: false,
+            },
+        ),
+    );
 }
 
 #[test]
