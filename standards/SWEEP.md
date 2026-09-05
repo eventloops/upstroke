@@ -55,9 +55,11 @@ Files outside `src/` that the standards govern (today `examples/probe.rs`) close
 The tree has older per-concern families that no pull request of this wave produced, among them
 `src/plan/markdown/` (`cd612c3`, 2026-08-30), `src/engine/topology/`, `src/runner/container/`,
 `src/effects/`, `src/events/log/`, `src/validate/`, `src/status/` and `src/connect/`, and flat
-modules no split has touched. They are not on this queue. They join it, family by family, after
-the wave above or earlier when the owner names one, and the merge-order rule applies within a
-wave, not across the history of the tree.
+modules no split has touched. They join the queue family by family, after the wave above or
+earlier when the owner names one, and the merge-order rule applies within a wave, not across the
+history of the tree. On 2026-09-04 the owner named four of them (amendment 16); each joins as a
+block appended below the wave, numbered on, in the pull request that sweeps its first file.
+`src/validate/` (#69, `1292653`, 2026-08-30) is one of the four.
 
 | # | File | Lines | Family | Merged |
 |---|---|---|---|---|
@@ -105,6 +107,8 @@ wave, not across the history of the tree.
 | 53 | `src/config/read.rs` | 274 | #123 | 2026-09-03 |
 | 54 | `src/config.rs` | 2,875 | #123 | 2026-09-03 |
 | 55 | `examples/probe.rs` | 70 | — | — |
+| 57 | `src/validate/render.rs` | 257 | #69 | 2026-08-30 |
+| 58 | `src/validate.rs` | 838 | #69 | 2026-08-30 |
 
 **Row 12 has had two passes and is not swept.** PR #137 landed correctness repairs in
 `src/rundir/classify.rs` — a first-line re-read that carried the scan's proof onto bytes the scan
