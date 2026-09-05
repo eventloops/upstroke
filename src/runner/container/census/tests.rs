@@ -5162,3 +5162,345 @@ fn a_view_removal_that_never_succeeds_blocks_admission() {
     assert!(!view.exists() && !harness.intent_exists(&name));
     let _ = fs::remove_dir_all(&harness.root);
 }
+
+// These Windows-only integration diagnostics record the real filesystem and
+// toolchain behavior. Their observations do not attribute earlier CI errors.
+// The existing concurrent-census regression remains unchanged.
+#[cfg(windows)]
+fn windows_removal_evidence(value: serde_json::Value) {
+    use std::io::Write as _;
+
+    let line = format!("UPSTROKE_WINDOWS_REMOVAL_DIAGNOSTIC {value}\n");
+    assert!(line.len() <= 16_384, "native evidence exceeded its bound");
+    // A bounded write through the test module's existing effect allowance
+    // keeps evidence visible when libtest captures passing-test print macros.
+    // Hold stdout's lock only for this record, so parallel records stay whole.
+    std::io::stdout()
+        .lock()
+        .write_all(line.as_bytes())
+        .expect("publish bounded native evidence");
+}
+
+#[cfg(windows)]
+fn windows_removal_toolchain() {
+    use crate::agent::proc;
+    use crate::runner::{CommandSpec, host};
+    use std::time::Duration;
+
+    let cargo = PathBuf::from(env!("CARGO"));
+    let rustc = cargo
+        .parent()
+        .expect("Cargo has a toolchain directory")
+        .join("rustc.exe");
+    for (name, program, argument) in [("rustc", rustc, "-Vv"), ("cargo", cargo, "-V")] {
+        let spec = CommandSpec::new(
+            program
+                .to_str()
+                .expect("the image's toolchain path is UTF-8"),
+        )
+        .arg(argument);
+        let output = proc::test_support::run_with_timeout(
+            host::test_support::build_command(&spec),
+            "",
+            Duration::from_secs(30),
+        )
+        .expect("the native toolchain version command starts");
+        assert!(
+            output.stdout.len() + output.stderr.len() <= 8_192,
+            "toolchain version output exceeded its diagnostic bound"
+        );
+        assert_eq!(output.code, Some(0), "{name}: {}", output.stderr);
+        assert!(!output.timed_out && !output.output_limited);
+        windows_removal_evidence(serde_json::json!({
+            "case": "executing-toolchain", "program": program, "argument": argument,
+            "pid": std::process::id(), "arch": std::env::consts::ARCH,
+            "stdout": output.stdout, "stderr": output.stderr,
+        }));
+    }
+}
+
+#[cfg(windows)]
+fn windows_directory_state(handle: &fs::File) -> (bool, bool, u32) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: the File owns a live directory handle for this synchronous
+    // query. The writable repr(C) output has the SDK's FILE_STANDARD_INFO
+    // layout and size and remains live until the call returns.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileStandardInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            u32::try_from(std::mem::size_of_val(&info)).expect("the SDK record fits a DWORD"),
+        )
+    };
+    assert_ne!(
+        result,
+        0,
+        "query directory state: {}",
+        std::io::Error::last_os_error()
+    );
+    (info.DeletePending, info.Directory, info.NumberOfLinks)
+}
+
+#[cfg(windows)]
+fn windows_hold_pending_directory(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let handle = fs::File::options()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open the fixture's directory observation handle");
+    let before = windows_directory_state(&handle);
+    assert!(
+        !before.0 && before.1,
+        "the fixture starts as an ordinary directory"
+    );
+    fs::remove_dir(path).expect("mark the empty fixture directory for removal");
+    let marked = windows_directory_state(&handle);
+    assert!(
+        marked.0 && marked.1,
+        "the kernel must establish a pending directory deletion"
+    );
+    handle
+}
+
+#[cfg(windows)]
+fn windows_path_observation(path: &Path) -> serde_json::Value {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => serde_json::json!({"present": true, "directory": metadata.is_dir()}),
+        Err(error) => serde_json::json!({
+            "error_kind": format!("{:?}", error.kind()), "raw_os_error": error.raw_os_error(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pending_directory_observation_executes_the_real_removal_helper() {
+    use std::time::Instant;
+
+    windows_removal_toolchain();
+    let root =
+        crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "native-pending-removal")
+            .expect("an owned native diagnostic root");
+    let path = root.path().join("view");
+    fs::create_dir(&path).expect("an empty disposable view");
+    let handle = windows_hold_pending_directory(&path);
+    let before = windows_path_observation(&path);
+    let started = Instant::now();
+    let mut attempts = Vec::new();
+    let result = crate::runner::container::racing_removal(&path, || {
+        let outcome = fs::remove_dir_all(&path);
+        attempts.push(serde_json::json!({
+            "elapsed_us": started.elapsed().as_micros(),
+            "raw_os_error": outcome.as_ref().err().and_then(std::io::Error::raw_os_error),
+            "error_kind": outcome.as_ref().err().map(|error| format!("{:?}", error.kind())),
+        }));
+        outcome
+    });
+    let elapsed = started.elapsed();
+    let held = windows_directory_state(&handle);
+    windows_removal_evidence(serde_json::json!({
+        "case": "held-through-all-attempts", "operation": "remove_dir_all",
+        "path": path, "before": before, "result": format!("{result:?}"),
+        "elapsed_us": elapsed.as_micros(), "attempts": attempts,
+        "held_delete_pending": held.0, "held_directory": held.1, "held_links": held.2,
+        "after_attempts": windows_path_observation(&path),
+    }));
+    assert!(
+        held.0 && held.1,
+        "the observation handle stays live through the calls"
+    );
+    if result.is_ok() {
+        assert_eq!(
+            fs::symlink_metadata(&path)
+                .expect_err("success must mean the name is gone")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    drop(handle);
+    assert_eq!(
+        fs::symlink_metadata(&path)
+            .expect_err("the last close removes the name")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(
+        !crate::runner::container::racing_removal(&path, || fs::remove_dir_all(&path))
+            .expect("the already-gone control succeeds")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_census_observes_closer_progress_and_preserves_refused_cleanup_intent() {
+    use crate::runner::container::runtime::{TraceEntry, ViewAction};
+    use crate::runner::container::{GitView, GitViewRequest};
+    use std::sync::mpsc::{self, Sender};
+    use std::time::{Duration, Instant};
+
+    struct SignalDiscard<'a> {
+        inner: &'a dyn GitView,
+        began: Sender<()>,
+        elapsed: Sender<Duration>,
+    }
+    impl GitView for SignalDiscard<'_> {
+        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError> {
+            self.inner.materialize(request)
+        }
+        fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {
+            let started = Instant::now();
+            self.began
+                .send(())
+                .expect("the closer observes entry to the real view discard");
+            let result = self.inner.discard(path);
+            self.elapsed
+                .send(started.elapsed())
+                .expect("the observer receives the duration");
+            result
+        }
+    }
+
+    windows_removal_toolchain();
+    for projected in [false, true] {
+        for handoff in [false, true] {
+            let root = crate::rundir::scratch_tree::acquire(
+                &std::env::temp_dir(),
+                "native-census-removal",
+            )
+            .expect("an owned native census root");
+            let trace = ContainerTrace::recording();
+            // The runtime and both view implementations publish into the same
+            // owned trace so the test can inspect the complete effect order.
+            let runtime = FakeRuntime::new(trace.clone());
+            let disposable = DisposableDirView::new(trace.clone());
+            let role = crate::runner::container::view::RoleGitView::new(trace.clone());
+            let view: &dyn GitView = if projected { &role } else { &disposable };
+            let owner = Owner::new(RUN_A, INC_1, REPO_KEY_A);
+            let name = seed(
+                root.path(),
+                &runtime,
+                &owner,
+                &shell_probe(),
+                Present::Both,
+                Liveness::Running,
+            );
+            let path = view_path(root.path(), &name);
+            let handle = windows_hold_pending_directory(&path);
+            let before = windows_path_observation(&path);
+            let liveness = RecordingLiveness::new();
+            let start = resume(RUN_A, INC_2);
+            std::thread::scope(|scope| {
+                let (began_tx, began_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let (closed_tx, closed_rx) = mpsc::channel();
+                let (elapsed_tx, elapsed_rx) = mpsc::channel();
+                let epoch = Instant::now();
+                // The closer exclusively owns the native handle. Channels
+                // establish discard entry, release permission, and completed
+                // close without sharing mutable fixture state.
+                scope.spawn(move || {
+                    began_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("view discard begins");
+                    if handoff {
+                        std::thread::sleep(Duration::from_millis(10));
+                    } else {
+                        release_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("the refusal was observed");
+                    }
+                    drop(handle);
+                    closed_tx
+                        .send(epoch.elapsed())
+                        .expect("the observer receives completed close");
+                });
+                let signalled = SignalDiscard {
+                    inner: view,
+                    began: began_tx,
+                    elapsed: elapsed_tx,
+                };
+                let first = run_startup_census(
+                    &mut RecordingHooks::new(trace.clone()),
+                    &Census {
+                        private_root: root.path(),
+                        start: &start,
+                        runtime: &runtime,
+                        liveness: &liveness,
+                        view: &signalled,
+                    },
+                );
+                let returned = epoch.elapsed();
+                let intent_retained = name.intent_path(root.path()).is_file();
+                if !handoff {
+                    release_tx
+                        .send(())
+                        .expect("allow the held observation handle to close");
+                }
+                let closed = closed_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the closer finishes");
+                let discard_elapsed = elapsed_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the real discard ran");
+                windows_removal_evidence(serde_json::json!({
+                    "case": "actual-census-view-discard", "projected": projected,
+                    "holder": if handoff { "closes-after-10ms" } else { "held-until-census-return" },
+                    "operation": "remove_dir_all", "path": path, "before": before,
+                    "outcome": first.as_ref().map(|complete| complete.report().reclaimed.len()).map_err(ToString::to_string),
+                    "census_return_us": returned.as_micros(), "close_complete_us": closed.as_micros(),
+                    "discard_elapsed_us": discard_elapsed.as_micros(), "intent_retained": intent_retained,
+                }));
+                if first.is_err() {
+                    assert!(
+                        intent_retained,
+                        "a refused view cleanup must preserve its only intent"
+                    );
+                } else {
+                    assert!(!intent_retained, "a completed census removes the intent");
+                    assert!(trace.entries().iter().any(|entry| matches!(entry,
+                        TraceEntry::View { action: ViewAction::Discarded, path: discarded } if discarded == &path)),
+                        "completed cleanup records the discarded view");
+                }
+                assert_eq!(
+                    fs::symlink_metadata(&path)
+                        .expect_err("completed close removes the view name")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                let next = run_startup_census(
+                    &mut RecordingHooks::new(trace.clone()),
+                    &Census {
+                        private_root: root.path(),
+                        start: &start,
+                        runtime: &runtime,
+                        liveness: &liveness,
+                        view,
+                    },
+                )
+                .expect("cleanup converges after the observed close");
+                assert!(
+                    !name.intent_path(root.path()).exists(),
+                    "no intent is forgotten"
+                );
+                assert!(
+                    runtime.container(name.as_str()).is_none(),
+                    "the container was removed"
+                );
+                assert_eq!(next.report().reclaimed.len(), usize::from(intent_retained));
+            });
+        }
+    }
+}
