@@ -318,7 +318,7 @@ pub(super) fn refuse_legacy_container_selection(
     }
     let reading = match limits {
         EngineLimits::Fresh => "this run is being created by the schema-1..3 engine",
-        EngineLimits::SequentialResume | EngineLimits::SequentialResumeRederivingGates => {
+        EngineLimits::SequentialResumeWithRecordedGates | EngineLimits::SequentialResume => {
             "this run was recorded by the schema-1..3 engine and keeps the boundary it started \
              with"
         }
@@ -394,6 +394,17 @@ pub(super) fn parse_budgets(
     Ok(budgets)
 }
 
+/// The largest `timeout_secs` the run record can carry back exactly.
+///
+/// `run_started` records each gate's timeout as `timeout_ms`, a `u64` written
+/// by `crate::util::duration_millis`, which **saturates** at `u64::MAX`
+/// milliseconds rather than failing. A larger value would load, be recorded
+/// smaller, and be resumed at the recorded value with a drift warning against
+/// a file nobody edited — the opposite of `design/15`'s record-and-resume-
+/// exactly. So the reader refuses what the record cannot hold; the tests pin
+/// this bound to the serialiser's own arithmetic.
+const MAX_GATE_TIMEOUT_SECS: u64 = u64::MAX / 1000;
+
 /// `[[gates]]` parsing with actionable shape errors: a `[gates]` table, a
 /// wrong-typed field, or `timeout_secs = 0` all name what was expected.
 ///
@@ -421,7 +432,7 @@ pub(super) fn parse_budgets(
 ///
 /// **Which reading, and why the parser cannot choose it alone.** Under
 /// [`EngineLimits::Fresh`] today's section governs the run, and every shape
-/// above refuses. Under [`EngineLimits::SequentialResume`] the run's log
+/// above refuses. Under [`EngineLimits::SequentialResumeWithRecordedGates`] the run's log
 /// records its gates and `design/15` is explicit that they are taken from the
 /// record, not re-derived, and **not refused over**: today's section is read
 /// only to be compared with them, so nothing here refuses — every shape,
@@ -429,7 +440,7 @@ pub(super) fn parse_budgets(
 /// section that is not an array, is a warning naming the recorded gates as
 /// what runs, and the list carries what could be read so the comparison can
 /// still say what moved (an unreadable entry is skipped; an unreadable section
-/// is `Ok(None)`). Under [`EngineLimits::SequentialResumeRederivingGates`] the
+/// is `Ok(None)`). Under [`EngineLimits::SequentialResume`] the
 /// log has no gate record, this resume settles the run's gates from today's
 /// file and records them, so the section governs and is read exactly as a
 /// fresh run reads it. Which of the two resumes applies is a fact about the
@@ -437,19 +448,24 @@ pub(super) fn parse_budgets(
 /// it from `events::recorded_gates` and this function only asks the reading.
 /// An earlier version keyed the downgrade off "a resume" alone and was wrong
 /// both ways: it promised the record would run when a legacy log had none,
-/// and it kept refusing a run that had one.
+/// and it kept refusing a run that had one. A later draft put the compare-only
+/// reading on `SequentialResume` itself, which silently changed what a caller
+/// passing that public variant directly had always got; the reading lives on
+/// the variant that names it, and `SequentialResume` governs as it always did.
 ///
 /// # Errors
 ///
-/// Under `Fresh` and `SequentialResumeRederivingGates`, [`UpstrokeError::Config`]
+/// Under `Fresh` and `SequentialResume`, [`UpstrokeError::Config`]
 /// naming the entry by position: `gates` is not an array; an entry is not a
-/// table of `name`, `cmd` and optional `timeout_secs`; a blank `name` or
-/// `cmd`, naming which; a key outside those three; `timeout_secs = 0`; a
-/// `name` an earlier entry has, compared without regard to ASCII case. Under
-/// `SequentialResume`, never: each of those is a warning in `warnings`. On
+/// table; `name` or `cmd` is missing, named beside any unknown key the entry
+/// carries; a blank `name` or `cmd`, naming which; a key outside those three
+/// on an entry that has both; `timeout_secs = 0`, or more than
+/// [`MAX_GATE_TIMEOUT_SECS`]; a `name` an earlier entry has, compared without
+/// regard to ASCII case. Under
+/// `SequentialResumeWithRecordedGates`, never: each of those is a warning in `warnings`. On
 /// every reading `Ok(None)` is an absent section and `Ok(Some(vec![]))` an
 /// explicitly empty one — the parent's `Config::gates` says what each means —
-/// with one exception the warning names: under `SequentialResume` a section
+/// with one exception the warning names: under `SequentialResumeWithRecordedGates` a section
 /// that is not a list is also `Ok(None)`, there being no other shape for "no
 /// list", so the engine derives defaults to compare with the record and the
 /// warning says any reported difference is against those, not the file
@@ -462,10 +478,8 @@ pub(super) fn parse_gates(
 ) -> Result<Option<Vec<GateConfig>>, UpstrokeError> {
     // The one exhaustive decision: which of the three readings this is.
     let reading = match limits {
-        EngineLimits::Fresh | EngineLimits::SequentialResumeRederivingGates => {
-            GatesReading::Governs
-        }
-        EngineLimits::SequentialResume => GatesReading::ComparedOnly,
+        EngineLimits::Fresh | EngineLimits::SequentialResume => GatesReading::Governs,
+        EngineLimits::SequentialResumeWithRecordedGates => GatesReading::ComparedOnly,
     };
     let Some(value) = raw else { return Ok(None) };
     let toml::Value::Array(entries) = value else {
@@ -506,9 +520,40 @@ pub(super) fn parse_gates(
                 continue;
             }
         };
+        let unknown: Vec<&str> = g.unknown.keys().map(String::as_str).collect();
+        // A required key that is absent is named beside any key the entry has
+        // that nothing reads: `nmae = "check"` is a missing `name` and an
+        // unknown `nmae`, and the operator is told both, since the second is
+        // almost always the first misspelt. Serde's own "missing field" would
+        // have named only the first.
+        let (name, cmd) = match (g.name, g.cmd) {
+            (Some(name), Some(cmd)) => (name, cmd),
+            (name, cmd) => {
+                let missing: Vec<&str> = [("name", name.is_none()), ("cmd", cmd.is_none())]
+                    .into_iter()
+                    .filter_map(|(key, absent)| absent.then_some(key))
+                    .collect();
+                let mut problem = format!(
+                    "[[gates]] entry {n} is missing `{}`",
+                    missing.join("` and `")
+                );
+                if !unknown.is_empty() {
+                    problem.push_str(&format!(
+                        " and has unknown key `{}` — a misspelling of what is missing?",
+                        unknown.join("`, `")
+                    ));
+                }
+                problem.push_str(
+                    " (each entry takes `name`, `cmd`, and an optional `timeout_secs` integer)",
+                );
+                refuse_or_announce(reading, problem, repo_path, warnings)?;
+                // Compared only, and this entry cannot be built: skipped.
+                continue;
+            }
+        };
         let blank: Vec<&str> = [
-            ("name", g.name.trim().is_empty()),
-            ("cmd", g.cmd.trim().is_empty()),
+            ("name", name.trim().is_empty()),
+            ("cmd", cmd.trim().is_empty()),
         ]
         .into_iter()
         .filter_map(|(key, is_blank)| is_blank.then_some(key))
@@ -525,15 +570,13 @@ pub(super) fn parse_gates(
                 warnings,
             )?;
         }
-        if !g.unknown.is_empty() {
-            let keys: Vec<&str> = g.unknown.keys().map(String::as_str).collect();
+        if !unknown.is_empty() {
             refuse_or_announce(
                 reading,
                 format!(
-                    "[[gates]] entry {n} (`{}`) has unknown key `{}` (each entry takes `name`, \
-                     `cmd`, and an optional `timeout_secs` integer)",
-                    g.name,
-                    keys.join("`, `")
+                    "[[gates]] entry {n} (`{name}`) has unknown key `{}` (each entry takes \
+                     `name`, `cmd`, and an optional `timeout_secs` integer)",
+                    unknown.join("`, `")
                 ),
                 repo_path,
                 warnings,
@@ -542,17 +585,16 @@ pub(super) fn parse_gates(
         if let Some((earlier, first)) = list
             .iter()
             .enumerate()
-            .find(|(_, gate)| gate.name.eq_ignore_ascii_case(&g.name))
+            .find(|(_, gate)| gate.name.eq_ignore_ascii_case(&name))
         {
             refuse_or_announce(
                 reading,
                 format!(
-                    "[[gates]] entry {n} repeats the name `{}` of entry {} (`{}`; names are \
+                    "[[gates]] entry {n} repeats the name `{name}` of entry {} (`{}`; names are \
                      compared without regard to ASCII case, because a case-insensitive \
                      filesystem keeps one log file for both): a gate's name is what its log \
                      file and its failure report carry, so two gates cannot share one — give \
                      each gate a name of its own",
-                    g.name,
                     earlier + 1,
                     first.name
                 ),
@@ -564,18 +606,31 @@ pub(super) fn parse_gates(
             refuse_or_announce(
                 reading,
                 format!(
-                    "[[gates]] entry {n} (`{}`): timeout_secs must be at least 1 — omit it for \
-                     the {}s default",
-                    g.name,
+                    "[[gates]] entry {n} (`{name}`): timeout_secs must be at least 1 — omit it \
+                     for the {}s default",
                     DEFAULT_GATE_TIMEOUT.as_secs()
                 ),
                 repo_path,
                 warnings,
             )?;
         }
+        if let Some(secs) = g.timeout_secs.filter(|secs| *secs > MAX_GATE_TIMEOUT_SECS) {
+            refuse_or_announce(
+                reading,
+                format!(
+                    "[[gates]] entry {n} (`{name}`): timeout_secs = {secs} is more than the run \
+                     record can hold — at most {MAX_GATE_TIMEOUT_SECS} seconds, because \
+                     `run_started` records a gate's timeout in milliseconds as a 64-bit count and \
+                     a larger value would be recorded saturated and resumed smaller than this file \
+                     says"
+                ),
+                repo_path,
+                warnings,
+            )?;
+        }
         list.push(GateConfig {
-            name: g.name,
-            cmd: g.cmd,
+            name,
+            cmd,
             // An absent key, not a failed reading: a `timeout_secs` that is
             // not a whole number was refused (or announced and skipped) above.
             // Compared only, a zero written today is carried as zero so the
@@ -778,7 +833,10 @@ pub(super) fn parse_engine(
                 ),
             ));
         }
-        (EngineLimits::SequentialResume | EngineLimits::SequentialResumeRederivingGates, true) => {
+        (
+            EngineLimits::SequentialResumeWithRecordedGates | EngineLimits::SequentialResume,
+            true,
+        ) => {
             warnings.push(format!(
                 "[engine] `max_parallel = {configured_parallel}` in {} is parsed but not acted on \
                  by this resume: this run was recorded by an engine that runs one attempt at a \
@@ -1041,7 +1099,7 @@ mod tests {
         let gates = parse_gates(
             section(body).get("gates").cloned(),
             path(),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("a resume is not refused over a section it only compares")
@@ -1066,7 +1124,7 @@ mod tests {
             parse_gates(
                 section(body).get("gates").cloned(),
                 path(),
-                EngineLimits::SequentialResumeRederivingGates,
+                EngineLimits::SequentialResume,
                 &mut warnings,
             ),
             "timeout_sec on a resume with no gate record",
@@ -1149,7 +1207,7 @@ mod tests {
             parse_gates(
                 section(repeated).get("gates").cloned(),
                 path(),
-                EngineLimits::SequentialResumeRederivingGates,
+                EngineLimits::SequentialResume,
                 &mut warnings,
             ),
             "a repeated name on a resume with no gate record",
@@ -1159,7 +1217,7 @@ mod tests {
         let gates = parse_gates(
             section(repeated).get("gates").cloned(),
             path(),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("a resume is not refused over a section it only compares")
@@ -1217,10 +1275,7 @@ mod tests {
             ("name = \"test\"\ncmd = \" \"\n", "`cmd` is blank"),
             ("name = \"\"\ncmd = \"\"\n", "`name` and `cmd` is blank"),
         ] {
-            for limits in [
-                EngineLimits::Fresh,
-                EngineLimits::SequentialResumeRederivingGates,
-            ] {
+            for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
                 let mut warnings = Vec::new();
                 let message = refused(
                     parse_gates(
@@ -1242,7 +1297,7 @@ mod tests {
             let gates = parse_gates(
                 section(&format!("[[gates]]\n{body}")).get("gates").cloned(),
                 path(),
-                EngineLimits::SequentialResume,
+                EngineLimits::SequentialResumeWithRecordedGates,
                 &mut warnings,
             )
             .expect("compared only: announced, never refused")
@@ -1272,7 +1327,7 @@ mod tests {
         let gates = parse_gates(
             section(zero).get("gates").cloned(),
             path(),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("compared only")
@@ -1294,7 +1349,7 @@ mod tests {
         let gates = parse_gates(
             section(not_a_table).get("gates").cloned(),
             path(),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("compared only")
@@ -1315,7 +1370,7 @@ mod tests {
         let gates = parse_gates(
             section(not_an_array).get("gates").cloned(),
             path(),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("compared only");
@@ -1338,10 +1393,7 @@ mod tests {
 
         // The control: where the section governs, each of the three refuses.
         for body in [zero, not_a_table, not_an_array] {
-            for limits in [
-                EngineLimits::Fresh,
-                EngineLimits::SequentialResumeRederivingGates,
-            ] {
+            for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
                 let mut warnings = Vec::new();
                 refused(
                     parse_gates(
@@ -1365,8 +1417,8 @@ mod tests {
         // misspelled key governs no run, recorded or not.
         for limits in [
             EngineLimits::Fresh,
+            EngineLimits::SequentialResumeWithRecordedGates,
             EngineLimits::SequentialResume,
-            EngineLimits::SequentialResumeRederivingGates,
         ] {
             let mut warnings = Vec::new();
             let message = refused(
@@ -1389,8 +1441,8 @@ mod tests {
         // The control: the key spelt right is consumed, on every reading.
         for limits in [
             EngineLimits::Fresh,
+            EngineLimits::SequentialResumeWithRecordedGates,
             EngineLimits::SequentialResume,
-            EngineLimits::SequentialResumeRederivingGates,
         ] {
             let mut warnings = Vec::new();
             let settings = parse_engine(
@@ -1623,5 +1675,161 @@ mod tests {
             .expect("finite positive ceilings load");
         assert_eq!(budgets.run_usd, Some(15.0));
         assert_eq!(budgets.task_usd, Some(4.5));
+    }
+
+    #[test]
+    fn a_missing_gate_key_is_named_beside_the_unknown_key_that_replaced_it() {
+        // `nmae = "check"` used to fail inside serde as "missing field `name`",
+        // which names the field the operator did not write and not the one
+        // they did. Both are named now, on the readings where the section
+        // governs; where it is only compared, the entry cannot be built and
+        // is skipped with the same words.
+        let typo = "[[gates]]\nnmae = \"check\"\ncmd = \"cargo check\"\n";
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            let mut warnings = Vec::new();
+            let message = refused(
+                parse_gates(
+                    section(typo).get("gates").cloned(),
+                    path(),
+                    limits,
+                    &mut warnings,
+                ),
+                "a misspelled required key",
+            );
+            assert!(
+                message.contains("[[gates]] entry 1 is missing `name`"),
+                "{limits:?}: {message}"
+            );
+            assert!(
+                message.contains("has unknown key `nmae`"),
+                "{limits:?}: the misspelling is named: {message}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(typo).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResumeWithRecordedGates,
+            &mut warnings,
+        )
+        .expect("compared only")
+        .expect("present");
+        assert!(
+            gates.is_empty(),
+            "an entry without a name cannot be built: {gates:?}"
+        );
+        assert!(
+            warnings.first().is_some_and(|w| {
+                w.contains("missing `name`") && w.contains("`nmae`") && w.contains("recorded")
+            }),
+            "{warnings:?}"
+        );
+
+        // Missing with nothing misspelt is named alone, so the sentence about
+        // a misspelling is not printed where there is none to point at.
+        let mut warnings = Vec::new();
+        let message = refused(
+            parse_gates(
+                section("[[gates]]\nname = \"check\"\n")
+                    .get("gates")
+                    .cloned(),
+                path(),
+                EngineLimits::Fresh,
+                &mut warnings,
+            ),
+            "a missing cmd",
+        );
+        assert!(message.contains("is missing `cmd`"), "{message}");
+        assert!(!message.contains("unknown key"), "{message}");
+    }
+
+    #[test]
+    fn a_gate_timeout_the_record_cannot_hold_is_refused() {
+        // The bound is the serialiser's own arithmetic, asserted here rather
+        // than restated: `duration_millis::serialize` writes
+        // `u64::try_from(d.as_millis()).unwrap_or(u64::MAX)`, so the largest
+        // whole second it carries exactly is the one whose millisecond count
+        // still converts.
+        assert!(
+            u64::try_from(Duration::from_secs(MAX_GATE_TIMEOUT_SECS).as_millis()).is_ok(),
+            "the bound itself is representable"
+        );
+        assert!(
+            u64::try_from(Duration::from_secs(MAX_GATE_TIMEOUT_SECS + 1).as_millis()).is_err(),
+            "one second more is not"
+        );
+
+        let over = format!(
+            "[[gates]]\nname = \"slow\"\ncmd = \"cargo test\"\ntimeout_secs = {}\n",
+            MAX_GATE_TIMEOUT_SECS + 1
+        );
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            let mut warnings = Vec::new();
+            let message = refused(
+                parse_gates(
+                    section(&over).get("gates").cloned(),
+                    path(),
+                    limits,
+                    &mut warnings,
+                ),
+                "a timeout the record cannot hold",
+            );
+            assert!(
+                message.contains("more than the run record can hold"),
+                "{limits:?}: {message}"
+            );
+            assert!(
+                message.contains(&MAX_GATE_TIMEOUT_SECS.to_string()),
+                "{limits:?}: names the bound: {message}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
+        // Compared only: announced and carried as written, since it never runs.
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(&over).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResumeWithRecordedGates,
+            &mut warnings,
+        )
+        .expect("compared only")
+        .expect("present");
+        assert_eq!(
+            gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
+            vec![Duration::from_secs(MAX_GATE_TIMEOUT_SECS + 1)]
+        );
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|w| w.contains("record can hold") && w.contains("recorded")),
+            "{warnings:?}"
+        );
+
+        // The bound itself loads, on every reading, and reaches the gate.
+        let at = format!(
+            "[[gates]]\nname = \"slow\"\ncmd = \"cargo test\"\ntimeout_secs = {MAX_GATE_TIMEOUT_SECS}\n"
+        );
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
+        ] {
+            let mut warnings = Vec::new();
+            let gates = parse_gates(
+                section(&at).get("gates").cloned(),
+                path(),
+                limits,
+                &mut warnings,
+            )
+            .expect("the bound loads")
+            .expect("present");
+            assert_eq!(
+                gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
+                vec![Duration::from_secs(MAX_GATE_TIMEOUT_SECS)],
+                "{limits:?}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
     }
 }

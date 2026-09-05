@@ -79,8 +79,13 @@ struct RawRunnerMount {
 /// executes (`design/15`: gates are taken from the record and not refused over).
 #[derive(Debug, Deserialize)]
 struct RawGate {
-    name: String,
-    cmd: String,
+    /// Required, and optional at the wire so that a missing one is refused by
+    /// `parse::parse_gates` beside whatever unknown key replaced it — `nmae`
+    /// is named as the likely misspelling rather than lost behind serde's
+    /// "missing field".
+    name: Option<String>,
+    /// As `name`.
+    cmd: Option<String>,
     timeout_secs: Option<u64>,
     /// Everything else, so a typo is named instead of vanishing.
     #[serde(flatten)]
@@ -424,6 +429,17 @@ pub enum EngineLimits {
     /// A run about to be created, or a preview of one (`upstroke validate`).
     /// Today's config is the whole truth: every section governs.
     Fresh,
+    /// A resume of a run a sequential engine recorded, whose log predates the
+    /// gate record (`run_started.gate_cmds` absent and no earlier resume
+    /// established one) — or any caller that passes this variant to a load
+    /// directly. The ceilings warn as above, but today's `[[gates]]`
+    /// **governs**: this resume settles the run's gates from it and records
+    /// them on `run_resumed`, so it is read exactly as a fresh run reads it
+    /// and refuses what a fresh run refuses. That is the gate reading this
+    /// variant has always had; a 2026-09-05 draft gave it the compare-only
+    /// reading below instead, which silently changed what a direct caller
+    /// got, and the reading moved to a variant of its own.
+    SequentialResume,
     /// A resume of a run a sequential engine recorded, whose log records its
     /// gates. The ceilings warn (above). Today's `[[gates]]` is **compared**
     /// with the record and never refused over — `design/15`: gates are taken
@@ -432,14 +448,7 @@ pub enum EngineLimits {
     /// what runs. Chosen only by [`EngineLimits::for_resume`] from the log's
     /// own record; a caller that has not read the log has no business passing
     /// it.
-    SequentialResume,
-    /// A resume of a run a sequential engine recorded, whose log predates the
-    /// gate record (`run_started.gate_cmds` absent and no earlier resume
-    /// established one). The ceilings warn as above, but today's `[[gates]]`
-    /// **governs**: this resume settles the run's gates from it and records
-    /// them on `run_resumed`, so it is read exactly as a fresh run reads it
-    /// and refuses what a fresh run refuses.
-    SequentialResumeRederivingGates,
+    SequentialResumeWithRecordedGates,
 }
 
 impl EngineLimits {
@@ -458,9 +467,9 @@ impl EngineLimits {
         if effective_schema > LAST_SEQUENTIAL_SCHEMA {
             Self::Fresh
         } else if gates_recorded {
-            Self::SequentialResume
+            Self::SequentialResumeWithRecordedGates
         } else {
-            Self::SequentialResumeRederivingGates
+            Self::SequentialResume
         }
     }
 }
@@ -2366,8 +2375,9 @@ pool_fraction = 0.5
     /// run whose log records its gates, today's section is compared and never
     /// refused over — every shape a fresh run refuses there is a warning and
     /// the load succeeds — while the same bytes refuse a run being created
-    /// now, and a resume of a log with **no** gate record, which settles its
-    /// gates from today's file. The engine's own composition (which reading
+    /// now, and a resume of a log with **no** gate record (`SequentialResume`,
+    /// the reading a direct caller has always had), which settles its gates
+    /// from today's file. The engine's own composition (which reading
     /// `resume.rs` chooses, and that the record is what then runs) is
     /// witnessed in `engine::tests`, not here.
     #[test]
@@ -2377,10 +2387,7 @@ pool_fraction = 0.5
             "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\ntimeout_sec = 900\n\
              [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
         );
-        for limits in [
-            EngineLimits::Fresh,
-            EngineLimits::SequentialResumeRederivingGates,
-        ] {
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
             let mut strict_warnings = Vec::new();
             let error = load_limits(
                 Some(&path),
@@ -2405,7 +2412,7 @@ pool_fraction = 0.5
             Some(&path),
             &hermetic(),
             Some(&missing()),
-            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
             &mut warnings,
         )
         .expect("a recorded run stays reachable through the same file");
@@ -2448,15 +2455,16 @@ pool_fraction = 0.5
         for schema in 1..=LAST_SEQUENTIAL_SCHEMA {
             assert_eq!(
                 EngineLimits::for_resume(schema, true),
-                EngineLimits::SequentialResume,
-                "schema {schema} was written by a sequential engine"
+                EngineLimits::SequentialResumeWithRecordedGates,
+                "schema {schema} with a gate record compares today's section with it"
             );
             // The same run with no gate record: its gates are settled from
-            // today's config on this resume, so that section governs.
+            // today's config on this resume, so that section governs — the
+            // reading `SequentialResume` has always given a direct caller.
             assert_eq!(
                 EngineLimits::for_resume(schema, false),
-                EngineLimits::SequentialResumeRederivingGates,
-                "schema {schema} without a gate record re-derives its gates"
+                EngineLimits::SequentialResume,
+                "schema {schema} without a gate record settles its gates from today's file"
             );
         }
         for gates_recorded in [true, false] {
@@ -2525,7 +2533,7 @@ pool_fraction = 0.5
         for limits in [
             EngineLimits::Fresh,
             EngineLimits::SequentialResume,
-            EngineLimits::SequentialResumeRederivingGates,
+            EngineLimits::SequentialResumeWithRecordedGates,
         ] {
             let mut warnings = Vec::new();
             let error = load_limits(
@@ -2978,7 +2986,7 @@ credential_volumes = { claude-code = "creds-cc" }
         for limits in [
             EngineLimits::Fresh,
             EngineLimits::SequentialResume,
-            EngineLimits::SequentialResumeRederivingGates,
+            EngineLimits::SequentialResumeWithRecordedGates,
         ] {
             let container = RunnerSelection {
                 kind: RunnerKind::Container,
@@ -3014,7 +3022,8 @@ credential_volumes = { claude-code = "creds-cc" }
             // refused fresh run from a refused resume.
             let expected = match limits {
                 EngineLimits::Fresh => "is being created by the schema-1..3 engine",
-                EngineLimits::SequentialResume | EngineLimits::SequentialResumeRederivingGates => {
+                EngineLimits::SequentialResume
+                | EngineLimits::SequentialResumeWithRecordedGates => {
                     "keeps the boundary it started with"
                 }
             };

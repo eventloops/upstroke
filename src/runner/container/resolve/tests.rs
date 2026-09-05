@@ -1590,14 +1590,14 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
     let all = [
         EngineLimits::Fresh,
         EngineLimits::SequentialResume,
-        EngineLimits::SequentialResumeRederivingGates,
+        EngineLimits::SequentialResumeWithRecordedGates,
     ];
     for limits in all {
         match limits {
             // Exhaustive on purpose: a new variant must be classified here.
             EngineLimits::Fresh
             | EngineLimits::SequentialResume
-            | EngineLimits::SequentialResumeRederivingGates => {}
+            | EngineLimits::SequentialResumeWithRecordedGates => {}
         }
     }
 
