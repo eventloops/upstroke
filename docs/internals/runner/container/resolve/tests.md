@@ -535,10 +535,10 @@ Every reading of `[engine]`'s limits refuses a container selection.
 
 `EngineLimits` is what distinguishes "a run being created now" from "a
 sequential run's resume", and `expected_failures_refusals[0]` names both. The
-grid is written out with an exhaustive `match` beside it, so a third variant
+grid is written out with an exhaustive `match` beside it, so an additional variant
 is a compile error here rather than a reading that quietly escapes.
 
-## `fn every_engine_limits_reading_refuses_a_container_selectio…` › `EngineLimits::Fresh | EngineLimits::SequentialResume => {}`
+## `fn every_engine_limits_reading_refuses_a_container_selection()` › `EngineLimits::SequentialResumeWithRecordedGates => {}`
 
 Exhaustive on purpose: a new variant must be classified here.
 

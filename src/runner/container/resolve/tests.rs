@@ -1243,10 +1243,16 @@ fn legacy_container_selection_refused_before_effects() {
 
 #[test]
 fn every_engine_limits_reading_refuses_a_container_selection() {
-    let all = [EngineLimits::Fresh, EngineLimits::SequentialResume];
+    let all = [
+        EngineLimits::Fresh,
+        EngineLimits::SequentialResume,
+        EngineLimits::SequentialResumeWithRecordedGates,
+    ];
     for limits in all {
         match limits {
-            EngineLimits::Fresh | EngineLimits::SequentialResume => {}
+            EngineLimits::Fresh
+            | EngineLimits::SequentialResume
+            | EngineLimits::SequentialResumeWithRecordedGates => {}
         }
     }
 
@@ -1286,7 +1292,7 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
         assert_eq!(config.runner.kind, RunnerKind::Host);
         assert!(config.runner.from_config);
     }
-    assert_eq!(refused, 2, "both readings were driven");
+    assert_eq!(refused, all.len(), "every reading was driven");
 }
 
 #[test]
