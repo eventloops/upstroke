@@ -38,7 +38,8 @@
 //! What is left for this module is exactly the packet's own division of
 //! labour: **which** eligible item to take, and **whether the ceiling permits
 //! it**. `CandidateQueue::first_eligible` answers the first of those for an
-//! integration; ascending task key answers it for a dispatch and a retry,
+//! integration through the fold's question-aware reader; ascending task key
+//! answers it for a dispatch and a retry,
 //! which is §14's "lowest plan index first" over the dense registry keys.
 
 use std::collections::BTreeMap;
@@ -50,7 +51,7 @@ use crate::topology::events::{
     AttemptNumber, BudgetExceeded4, CandidateRef, DerivedOutcome, Epoch, GenerationId,
     TopologyEvent, TopologyEventBody,
 };
-use crate::topology::fold::{GenerationClass, TaskState, TopologyFold};
+use crate::topology::fold::{GenerationClass, TopologyFold};
 use crate::topology::registry::TaskKey;
 
 // ---------------------------------------------------------------------------
@@ -528,24 +529,11 @@ pub fn checkpoint(step: Step) -> Result<Admitted, UpstrokeError> {
 
 /// The candidate an eligible integration would take, if one is eligible.
 ///
-/// `integration_admissible` decides *whether* — it is the fold's, it already
-/// folds in "no unresolved transaction" and "run not ending", and it is false
-/// on a poisoned fold. `first_eligible` decides *which*, over the same three
-/// inputs the fold hands it.
+/// The fold supplies both eligibility and identity, including questions on
+/// other members of the candidate's lineage. The selected step owns its
+/// candidate snapshot after this borrowed view ends.
 fn eligible_integration(fold: &TopologyFold) -> Option<CandidateRef> {
-    if !fold.integration_admissible() {
-        return None;
-    }
-    let queue = fold.queue()?;
-    let leases = fold.leases()?;
-    let policy = &fold.started()?.path_policy;
-    queue
-        .first_eligible(
-            |key| fold.task_state(key) == Some(TaskState::AwaitingInput),
-            leases,
-            policy,
-        )
-        .map(|entry| entry.candidate.clone())
+    fold.eligible_integration_candidate().cloned()
 }
 
 /// The lowest-keyed `ready_retry` task, its retained generation, and the

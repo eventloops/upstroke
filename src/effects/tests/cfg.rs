@@ -1297,6 +1297,7 @@ pub(crate) static WHOLE_FILE_TEST_MODULES: LazyLock<Vec<PathBuf>> = LazyLock::ne
         "runner/host/tests.rs",
         "topology/effects/tests.rs",
         "topology/fold/tests.rs",
+        "topology/fold/tests/questions.rs",
         "workspace_manager/fixture.rs",
         "workspace_manager/tests.rs",
     ];

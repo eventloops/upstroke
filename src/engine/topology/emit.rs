@@ -494,11 +494,11 @@ impl EmitError {
 ///   lossless for it, and the whole reason the round-trip exists is that it is
 ///   not always. Checking the original would check a transition the log can
 ///   never reproduce.
-/// * `apply_delta` runs only after the funnel returned `Ok`. The delta is a
-///   [`crate::topology::fold::TopologyDelta`], which nothing outside the fold
-///   can construct, so "the only path into the state runs through
-///   `plan_transition`" is a type property; "and only after the append" is this
-///   function's, and it is the one the protocol below exists to hold.
+/// * `apply_delta` runs once, only after the funnel returned `Ok`, against the
+///   fold that checked the delta with no intervening transition. Private
+///   [`crate::topology::fold::TopologyDelta`] construction guarantees prior
+///   checking; this function's exclusive mutable access and call order preserve
+///   freshness, single application and append-before-apply.
 ///
 /// # Errors
 ///

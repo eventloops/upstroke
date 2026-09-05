@@ -9,7 +9,65 @@ impl RunState {
     pub(super) fn check_question_raised(&self, question: &FrozenQuestion) -> Result<(), FoldError> {
         const KIND: &str = "question_raised";
         self.entry(KIND, question.key)?;
+        let task = self.task(KIND, question.key)?;
+        match task.state {
+            TaskState::Merged | TaskState::Failed => {
+                return Err(FoldError::WrongTaskState {
+                    kind: KIND,
+                    key: question.key.0,
+                    state: task.state.name(),
+                    expected: "nonterminal",
+                });
+            }
+            TaskState::Pending
+            | TaskState::Deferred
+            | TaskState::AwaitingInput
+            | TaskState::AwaitingMerge
+            | TaskState::AwaitingRepair => {}
+        }
+        self.check_question_can_park_lineage(KIND, question.key)?;
         self.check_new_question(KIND, question, question.key)
+    }
+
+    /// A question cannot suspend an unresolved process or an already
+    /// authorized publication. Standalone admission questions use this check;
+    /// a settlement's embedded question accounts for its own closing work.
+    pub(super) fn check_question_can_park_lineage(
+        &self,
+        kind: &'static str,
+        key: TaskKey,
+    ) -> Result<(), FoldError> {
+        let root = self.lineage_root(key);
+        if let Some(transaction) = &self.transaction {
+            if self.lineage_root(transaction.candidate.key) == root {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: format!(
+                        "lineage {root} has unresolved integration sequence {}; settle it before \
+                         parking its tasks",
+                        transaction.sequence.0
+                    ),
+                });
+            }
+        }
+        for entry in self.registry.entries() {
+            if self.lineage_root(entry.key) != root {
+                continue;
+            }
+            if let Some(generation) = self.tasks.get(entry.key.index()).and_then(TaskFold::open) {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: format!(
+                        "lineage {root} has task {} generation {} still {}; settle it before \
+                         parking its tasks",
+                        entry.key,
+                        generation.id.0,
+                        generation.class.name()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn check_question_answered(
@@ -60,6 +118,30 @@ impl RunState {
                     open.question.key, answered.key
                 ),
             });
+        }
+        match &answered.answer {
+            Answer4::Answered { .. } => {}
+            Answer4::Declined { .. } => {
+                if let Some(transaction) = &self.transaction {
+                    if self.lineage_root(transaction.candidate.key)
+                        == self.lineage_root(answered.key)
+                    {
+                        match &transaction.class {
+                            TransactionClass::VerificationStarted { .. } => {}
+                            TransactionClass::Prepared { .. } => {
+                                return Err(FoldError::InconsistentRecord {
+                                    kind: KIND,
+                                    detail: format!(
+                                        "integration sequence {} already authorizes publication; \
+                                         complete it before declining its lineage",
+                                        transaction.sequence.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         if let Answer4::Answered {
             option_index,

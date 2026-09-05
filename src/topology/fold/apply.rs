@@ -1,5 +1,19 @@
 //! The application half of INV-02: what a checked transition does to the
 //! state, and nothing that decides whether it may.
+//!
+//! Application is a deterministic function of the prior state, event and
+//! checked derivation. It reads no clock, environment or randomness and performs
+//! no I/O. Live/replay equality requires the caller to check each event against
+//! the current state, append it once and apply its delta once before checking
+//! the next event. Purity and [`RunState`]'s `PartialEq` support testing that
+//! protocol; they do not enforce single application or reject a stale delta.
+//! [`super::Derived`] carries facts checked before application, including a
+//! question's origin before [`RunState::apply_answer`] removes the question.
+//!
+//! Clones retain event data in fold state, which outlives the borrowed event.
+//! Registry entries, lease regions, queued candidates and generation records
+//! each own the data they retain. Rejection borrows the recorded candidate
+//! region while updating the disjoint lease table.
 
 use super::*;
 
@@ -10,12 +24,12 @@ use super::*;
 impl RunState {
     /// Apply a transition the check accepted.
     ///
-    /// Total by construction: every lookup here was proved to succeed by the
-    /// check that produced the delta, and each one is written so that a miss
-    /// leaves the state alone rather than panicking. Nothing in this function
-    /// decides anything — a decision made here would be a decision the live
-    /// path and the replay path could reach differently, which is the one thing
-    /// INV-02 forbids.
+    /// Checking establishes the lookup preconditions for immediate application
+    /// to that same state. A lookup miss is not generally inert: candidate
+    /// creation still enqueues, verification start advances its sequence,
+    /// verification unavailability takes the transaction, and dispatch grants
+    /// its lease before the corresponding lookup. Callers must preserve the
+    /// check/append/apply protocol instead of relying on these fallbacks.
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
@@ -75,7 +89,16 @@ impl RunState {
                 self.open_question(&data.question, QuestionOrigin::Admission, None);
                 self.set_state(data.question.key, TaskState::AwaitingInput);
             }
-            TopologyEventBody::QuestionAnswered { data } => self.apply_answer(data, derived),
+            TopologyEventBody::QuestionAnswered { data } => match derived {
+                Derived::Answer(QuestionOrigin::VerificationPark | QuestionOrigin::Admission) => {
+                    self.apply_answer(data);
+                }
+                // Exhaustive over `Derived`, so a new variant is a compile error
+                // here rather than a silent no-op: the check pairs every
+                // `question_answered` with `Derived::Answer`, and these two
+                // cannot be its delta, so they change nothing.
+                Derived::None | Derived::Registry(_) => {}
+            },
             TopologyEventBody::BudgetExceeded { data } => {
                 if !self.budget_stop_is_current() {
                     self.budget_stop = Some(data.stop());
@@ -105,10 +128,10 @@ impl RunState {
 
     pub(super) fn wake_backoff(&mut self) {
         self.queue.wake_deferred();
-        for task in &mut self.tasks {
-            if task.state == TaskState::Deferred {
-                task.state = TaskState::Pending;
-            }
+        // Move the keys out before deriving visible states. An open question
+        // keeps a task parked but cannot preserve an already elapsed wait.
+        for key in std::mem::take(&mut self.deferred_tasks) {
+            self.refresh_task_state(key);
         }
     }
 
@@ -386,16 +409,28 @@ impl RunState {
             return;
         };
         let candidate = transaction.candidate;
-        if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
-            entry.sequence = None;
-            if let UnavailableOutcome::Deferred { defers } = &unavailable.outcome {
-                entry.verification_deferred = true;
-                entry.defers = *defers;
+        // Exhaustive over the outcome, so a new `UnavailableOutcome` variant is
+        // a compile error here rather than a silent no-op: two separate
+        // `if let`s over a closed two-variant enum is a wildcard by another
+        // spelling, which §5 forbids over a domain a new variant should force a
+        // decision at. Behaviour is unchanged — both outcomes drop the open
+        // sequence from the queue entry, only a defer sets the backoff, and only
+        // a park raises a question and moves the task to awaiting input.
+        match &unavailable.outcome {
+            UnavailableOutcome::Deferred { defers } => {
+                if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
+                    entry.sequence = None;
+                    entry.verification_deferred = true;
+                    entry.defers = *defers;
+                }
             }
-        }
-        if let UnavailableOutcome::Parked { question } = &unavailable.outcome {
-            self.open_question(question, QuestionOrigin::VerificationPark, None);
-            self.set_state(candidate.key, TaskState::AwaitingInput);
+            UnavailableOutcome::Parked { question } => {
+                if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
+                    entry.sequence = None;
+                }
+                self.open_question(question, QuestionOrigin::VerificationPark, None);
+                self.set_state(candidate.key, TaskState::AwaitingInput);
+            }
         }
     }
 
@@ -412,8 +447,17 @@ impl RunState {
     }
 
     pub(super) fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
-        if prepared.disposition == PreparedDisposition::Fast {
-            self.next_sequence = self.next_sequence.saturating_add(1);
+        // Exhaustive over the disposition, so a new self-opening
+        // `PreparedDisposition` is a compile error here rather than one that
+        // silently skips the increment: a fast publication opens and closes its
+        // own transaction and consumes a sequence, while a stale-clean or
+        // already-present one was opened by its `merge_verification_started`,
+        // which already advanced `next_sequence`.
+        match prepared.disposition {
+            PreparedDisposition::Fast => {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+            PreparedDisposition::StaleClean | PreparedDisposition::AlreadyPresent => {}
         }
         self.transaction = Some(Transaction {
             sequence: prepared.sequence,
@@ -426,8 +470,16 @@ impl RunState {
     }
 
     pub(super) fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
-        if matches!(rejected.disposition, RejectionDisposition::Conflict { .. }) {
-            self.next_sequence = self.next_sequence.saturating_add(1);
+        // Exhaustive over the disposition, same reason as `apply_merge_prepared`:
+        // a conflict is decided at the cherry-pick and opens and closes its own
+        // transaction, consuming a sequence, while a code rejection was opened
+        // by its `merge_verification_started`, which already advanced
+        // `next_sequence`.
+        match rejected.disposition {
+            RejectionDisposition::Conflict { .. } => {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+            RejectionDisposition::CodeRejected { .. } => {}
         }
         self.transaction = None;
         let candidate = &rejected.candidate;
@@ -445,9 +497,9 @@ impl RunState {
                             .find(|generation| generation.id == candidate.generation)
                     })
                     .and_then(|generation| generation.candidate.as_ref())
-                    .map(|prepared| prepared.paths.clone());
+                    .map(|prepared| &prepared.paths);
                 if let Some(held) = held {
-                    self.leases.widen_lineage(*root, &held);
+                    self.leases.widen_lineage(*root, held);
                 }
                 self.leases.widen_lineage(*root, paths);
                 self.leases.release(LeaseOwner::Candidate {
@@ -485,7 +537,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, derived: &Derived) {
+    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4) {
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -494,15 +546,10 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                let state = match derived {
-                    Derived::Answer(QuestionOrigin::VerificationPark) => TaskState::AwaitingMerge,
-                    _ => TaskState::Pending,
-                };
-                self.set_state(answered.key, state);
+                self.refresh_task_state(answered.key);
             }
             Answer4::Declined { decline_halts_run } => {
-                self.set_state(answered.key, TaskState::Failed);
-                self.release_holdings_of(answered.key);
+                self.fail_lineage(answered.key);
                 if *decline_halts_run {
                     self.record_halt(answered.key);
                 }
@@ -510,24 +557,97 @@ impl RunState {
         }
     }
 
-    /// A declined question consumes the task's queue position and releases what
-    /// it held: its candidate lease, or the lineage lease when the task belongs
-    /// to a lineage — a declined lineage fails as a whole.
+    /// Derive the visible state after answering or waking a task. Question
+    /// origin does not capture a queued candidate, later wake or other answer.
+    fn refresh_task_state(&mut self, key: TaskKey) {
+        let Some(task) = self.tasks.get(key.index()) else {
+            return;
+        };
+        if task.state.is_terminal() {
+            return;
+        }
+        let state = if self.open_question_for(key).is_some() {
+            TaskState::AwaitingInput
+        } else if self.queue.holds_task(key)
+            || self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.candidate.key == key)
+        {
+            TaskState::AwaitingMerge
+        } else if self
+            .registry
+            .entries()
+            .iter()
+            .any(|entry| entry.lineage.is_some_and(|lineage| lineage.parent == key))
+        {
+            TaskState::AwaitingRepair
+        } else if self.deferred_tasks.contains(&key) {
+            TaskState::Deferred
+        } else {
+            TaskState::Pending
+        };
+        self.set_state(key, state);
+    }
+
+    /// Decline terminates all unpublished work in the lineage. Already merged
+    /// work stays merged; a human answer cannot undo a recorded publication.
+    fn fail_lineage(&mut self, key: TaskKey) {
+        let root = self.lineage_root(key);
+        let cancels_verification = self.transaction.as_ref().is_some_and(|transaction| {
+            self.lineage_root(transaction.candidate.key) == root
+                && match &transaction.class {
+                    TransactionClass::VerificationStarted { .. } => true,
+                    // The answer check refuses decline before append in this
+                    // class. Its already authorized publication must survive.
+                    TransactionClass::Prepared { .. } => false,
+                }
+        });
+        if cancels_verification {
+            self.release_transaction();
+        }
+        // Owned keys let each member's resources be consumed without retaining
+        // a registry borrow across those mutations.
+        let members: Vec<TaskKey> = self
+            .registry
+            .entries()
+            .iter()
+            .filter(|entry| entry.key == root || entry.lineage.is_some_and(|l| l.root == root))
+            .map(|entry| entry.key)
+            .collect();
+        for member in members {
+            self.close_generation(member);
+            self.release_holdings_of(member);
+            self.deferred_tasks.remove(&member);
+            if self
+                .tasks
+                .get(member.index())
+                .is_some_and(|task| task.state != TaskState::Merged)
+            {
+                self.set_state(member, TaskState::Failed);
+            }
+        }
+        let registry = &self.registry;
+        self.questions.retain(|_, open| {
+            open.question.key != root
+                && !registry
+                    .get(open.question.key)
+                    .and_then(|entry| entry.lineage)
+                    .is_some_and(|lineage| lineage.root == root)
+        });
+    }
+
+    /// Remove this member's queued candidates and candidate/lineage holdings.
+    /// The caller closes its generation and visits every affected member.
     pub(super) fn release_holdings_of(&mut self, key: TaskKey) {
-        let generations: Vec<GenerationId> = self
-            .tasks
-            .get(key.index())
-            .map(|task| {
-                task.generations
-                    .iter()
-                    .map(|generation| generation.id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        for generation in generations {
-            self.queue.remove(key, generation);
-            self.leases
-                .release(LeaseOwner::Candidate { key, generation });
+        if let Some(task) = self.tasks.get(key.index()) {
+            for generation in &task.generations {
+                self.queue.remove(key, generation.id);
+                self.leases.release(LeaseOwner::Candidate {
+                    key,
+                    generation: generation.id,
+                });
+            }
         }
         let root = self
             .registry
@@ -565,6 +685,19 @@ impl RunState {
     }
 
     pub(super) fn set_state(&mut self, key: TaskKey, state: TaskState) {
+        match state {
+            TaskState::Deferred => {
+                self.deferred_tasks.insert(key);
+            }
+            TaskState::AwaitingInput => {}
+            TaskState::Pending
+            | TaskState::AwaitingMerge
+            | TaskState::AwaitingRepair
+            | TaskState::Merged
+            | TaskState::Failed => {
+                self.deferred_tasks.remove(&key);
+            }
+        }
         if let Some(task) = self.tasks.get_mut(key.index()) {
             task.state = state;
         }
@@ -581,6 +714,8 @@ impl RunState {
         }
     }
 
+    /// `None` means this key has no task or no open generation. Checked callers
+    /// establish which generation they need before application mutates it.
     pub(super) fn open_generation_mut(&mut self, key: TaskKey) -> Option<&mut GenerationFold> {
         self.tasks.get_mut(key.index())?.open_mut()
     }
@@ -591,9 +726,17 @@ impl RunState {
             return;
         };
         let id = generation.id;
-        let own = generation.lease == GenerationLease::Own;
+        // Exhaustive over the lease, so a new `GenerationLease` is a compile
+        // error here rather than one that silently keeps its region held: an
+        // own generation holds its predicted region and releases it when it
+        // closes, and an inherited-lineage generation took none of its own and
+        // releases nothing.
+        let releases_own_region = match generation.lease {
+            GenerationLease::Own => true,
+            GenerationLease::InheritedLineage { .. } => false,
+        };
         generation.class = GenerationClass::Closed;
-        if own {
+        if releases_own_region {
             self.leases.release(LeaseOwner::Generation {
                 key,
                 generation: id,

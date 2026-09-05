@@ -83,9 +83,11 @@ impl RunState {
     }
 
     pub(super) fn task_is_awaiting_input(&self, key: TaskKey) -> bool {
-        self.tasks
-            .get(key.index())
-            .is_some_and(|task| task.state == TaskState::AwaitingInput)
+        self.lineage_has_question(key)
+            || self
+                .tasks
+                .get(key.index())
+                .is_some_and(|task| task.state == TaskState::AwaitingInput)
     }
 
     /// The open transaction this event must belong to (refusals[6]).
@@ -312,6 +314,15 @@ impl RunState {
 
         let candidate_record = self.prepared_candidate(KIND, &prepared.candidate())?;
         let inconsistent = |detail: String| FoldError::InconsistentRecord { kind: KIND, detail };
+
+        // A sibling attempt can settle with an embedded question after this
+        // verification started. Recheck before authorizing the ref move.
+        if self.lineage_has_question(prepared.key) {
+            return Err(inconsistent(format!(
+                "task {} belongs to a lineage with an unanswered question",
+                prepared.key
+            )));
+        }
 
         match prepared.disposition {
             PreparedDisposition::Fast => {

@@ -59,7 +59,7 @@ impl RunState {
                     .get(dep.index())
                     .is_some_and(|dep| dep.state == TaskState::Merged)
             })
-            && self.open_question_for(key).is_none()
+            && !self.lineage_has_question(key)
             && !self.queue.holds_task(key)
             && self
                 .transaction
@@ -110,7 +110,7 @@ impl RunState {
         });
         task.state == TaskState::Pending
             && retained
-            && self.open_question_for(key).is_none()
+            && !self.lineage_has_question(key)
             && self
                 .transaction
                 .as_ref()
@@ -134,23 +134,24 @@ impl RunState {
     /// statement: a selector that admitted an integration while the count was
     /// at `max_parallel` would open the entitlement that is already held.
     pub(super) fn integration_admissible(&self) -> bool {
-        self.transaction.is_none()
-            && self.pipeline_reservable()
-            && !self.run_is_ending()
-            && self
-                .queue
-                .first_eligible(
-                    |key| self.task_is_awaiting_input(key),
-                    &self.leases,
-                    &self.started.path_policy,
-                )
-                .is_some()
+        self.eligible_integration_candidate().is_some()
+    }
+
+    pub(super) fn eligible_integration_candidate(&self) -> Option<&CandidateRef> {
+        if self.transaction.is_some() || !self.pipeline_reservable() || self.run_is_ending() {
+            return None;
+        }
+        self.queue
+            .first_eligible(
+                |key| self.task_is_awaiting_input(key),
+                &self.leases,
+                &self.started.path_policy,
+            )
+            .map(|entry| &entry.candidate)
     }
 
     pub(super) fn backoff_pending(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| task.state == TaskState::Deferred)
+        !self.deferred_tasks.is_empty()
             || self
                 .queue
                 .entries()

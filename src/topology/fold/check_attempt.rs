@@ -22,6 +22,19 @@ impl RunState {
 
     // --- task_spawned ------------------------------------------------------
 
+    pub(super) fn check_task_spawned(&self, spawn: &FrozenSpawn) -> Result<(), FoldError> {
+        const KIND: &str = "task_spawned";
+        self.check_spawn(spawn, KIND)?;
+        if spawn.admission.question().is_some() {
+            // check_spawn has established the lineage. Unlike merge_rejected,
+            // a standalone birth settles no transaction before its question.
+            if let Some(lineage) = spawn.entry.lineage {
+                self.check_question_can_park_lineage(KIND, lineage.root)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn check_spawn(
         &self,
         spawn: &FrozenSpawn,
@@ -67,6 +80,23 @@ impl RunState {
                  {}",
                 lineage.root, lineage.parent, spawn.key
             )));
+        }
+        self.entry(kind, lineage.root)?;
+        self.entry(kind, lineage.parent)?;
+        if self.lineage_root(lineage.parent) != lineage.root {
+            return Err(malformed(format!(
+                "parent {} belongs to lineage {}, not recorded root {}",
+                lineage.parent,
+                self.lineage_root(lineage.parent),
+                lineage.root
+            )));
+        }
+        for ancestor in [lineage.root, lineage.parent] {
+            if self.task(kind, ancestor)?.state == TaskState::Failed {
+                return Err(malformed(format!(
+                    "ancestor {ancestor} has failed; a new repair cannot revive declined work"
+                )));
+            }
         }
         // The allow-list is the run's, not the registering event's: an entry
         // that widened it would admit an agent pre-flight never probed.
@@ -211,6 +241,20 @@ impl RunState {
                 expected: "pending",
             });
         }
+        if self.lineage_has_question(dispatched.key)
+            || self.queue.holds_task(dispatched.key)
+            || self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.candidate.key == dispatched.key)
+        {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: "dispatch requires no outstanding lineage question or candidate for this \
+                         task"
+                    .to_owned(),
+            });
+        }
         if let Some(open) = task.open() {
             return Err(FoldError::NotTheOpenGeneration {
                 kind: KIND,
@@ -339,6 +383,16 @@ impl RunState {
         let task = self.task(KIND, started.key)?;
         let generation = self.open_generation(KIND, task, started.key, started.generation)?;
 
+        if self.lineage_has_question(started.key) {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "task {} belongs to a lineage with an unanswered question",
+                    started.key
+                ),
+            });
+        }
+
         // ST-06: a retry names the generation it is retrying, and a fresh
         // attempt names one nothing has run in yet.
         match (&generation.class, &started.resume_session) {
@@ -395,13 +449,24 @@ impl RunState {
         }
 
         // ST-06: attempts are dense from 1 within a generation.
-        if started.attempt.0 != generation.attempts + 1 {
+        let next_attempt =
+            generation
+                .attempts
+                .checked_add(1)
+                .ok_or_else(|| FoldError::InconsistentRecord {
+                    kind: KIND,
+                    detail: format!(
+                        "task {} generation {} has exhausted its attempt numbers",
+                        started.key, started.generation.0
+                    ),
+                })?;
+        if started.attempt.0 != next_attempt {
             return Err(FoldError::WrongAttempt {
                 kind: KIND,
                 key: started.key.0,
                 generation: started.generation.0,
                 attempt: started.attempt.0,
-                expected: (generation.attempts + 1).to_string(),
+                expected: next_attempt.to_string(),
             });
         }
 

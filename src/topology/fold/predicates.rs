@@ -183,6 +183,17 @@ impl TopologyFold {
                 .is_some_and(RunState::integration_admissible)
     }
 
+    /// The same eligible candidate that makes integration admissible. The
+    /// engine uses this borrowed result so its choice includes lineage questions.
+    pub(crate) fn eligible_integration_candidate(&self) -> Option<&CandidateRef> {
+        if self.poisoned {
+            return None;
+        }
+        self.run
+            .as_ref()
+            .and_then(RunState::eligible_integration_candidate)
+    }
+
     /// Whether this run has already ended in the sense that forbids further
     /// work: `halted_at` is set, or a `budget_stop` of **this** epoch is.
     ///
@@ -200,8 +211,8 @@ impl TopologyFold {
     }
 
     /// Whether anything is waiting on a wait: a task in
-    /// [`TaskState::Deferred`], or a queue entry whose verification was
-    /// deferred by an outage.
+    /// [`TaskState::Deferred`], a task whose execution backoff is hidden by
+    /// an open question, or a queue entry whose verification was deferred.
     ///
     /// This is the *pending work* half of the backoff branch and not the
     /// branch itself — [`Self::run_is_ending`] is the other half, and

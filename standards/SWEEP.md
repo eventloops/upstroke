@@ -128,6 +128,48 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
+**Row 29 (`src/topology/fold/apply.rs`) remains open pending review of PR #152's
+complete repair.** All six legacy frontier verdicts were `CHANGES_REQUIRED`.
+The canonical PR ledger preserves each finding and the failed repair sequences.
+The owner expanded the repair scope to include the required checks and callers;
+the prior claim that those files were beyond this PR's reach is superseded.
+
+The application dispatches are exhaustive over `UnavailableOutcome`,
+`Derived`/`QuestionOrigin`, `PreparedDisposition`, `RejectionDisposition` and
+`GenerationLease`. This forces a decision at each application site when an enum
+grows. The old outage witness overstated the effect: the transaction was consumed
+and the queue sequence cleared, while the new outcome's effect would be omitted.
+The checker already had its own exhaustive match. Neither whole-event inertness
+nor automatic checker acceptance was established by that witness.
+
+The repair derives answer state from current questions, queue/transaction
+ownership, repair children and execution backoff. It preserves hidden waits until
+wake or resume consumes them. Decline terminates the whole unmerged lineage,
+cancels matching unprepared verification and preserves unrelated work; a prepared
+publication refuses decline until completion. Bare questions cannot enter active
+lineage work or park terminal tasks. The engine selector uses the fold's eligible
+candidate, including lineage questions. DESIGN §26 records these behavior changes.
+Checked-log regressions cover the interactions and compare live state with replay
+of serialized records. Current checkpoint runtime still refuses human answers;
+these fold effects do not implement process cancellation.
+
+The rejected `parked_from` repairs remain historical failed approaches. Their
+merged-state, multiple-question, hidden-wake and overlapping-episode witnesses do
+not prove that every possible snapshot representation is unsound. This repair
+adds no public question field or `non_exhaustive` attribute. The old
+`SWEEP-FOLD-APPLY-DESIGN-AUTHORITY` claim was rejected because DESIGN.md already
+mapped the retired protocol to §26. `SWEEP-FOLD-APPLY-ORIGIN-SUPERSEDED` depended on
+the withdrawn snapshot premise and is withdrawn too.
+
+Rejection now borrows the candidate region while updating the disjoint lease
+table. Remaining application clones retain owned event or historical state in
+independent fold records. The module performs no I/O and its optional generation
+lookup documents absence. Determinism and equality support replay checks;
+private delta construction establishes prior checking, not freshness or single
+use. The public delta API still requires the documented check/append/apply-once
+protocol. The cloned/stale-delta witness remains valid and is not claimed fixed
+by the documentation correction.
+
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and
 "Merged" is when that split landed; neither says which pull request first created the file at
