@@ -21,16 +21,17 @@ pub(super) struct Section {
     /// Byte range of the section body in the original text: from the end of
     /// the heading block to the start of the next `##`/`###` heading.
     pub(super) content: Range<usize>,
-    /// Annotation written inline on the heading line itself.
-    pub(super) inline_annotation: Option<String>,
+    /// Every upstroke annotation written inline on the heading line itself,
+    /// in order; the sink takes the first and warns for the rest.
+    pub(super) inline_annotations: Vec<String>,
 }
 
 /// Heading state while scanning: accumulated title text, the heading block
-/// span, and any inline annotation found on the heading line.
+/// span, and the inline annotations found on the heading line.
 struct HeadingScan {
     title: String,
     span: Range<usize>,
-    annotation: Option<String>,
+    annotations: Vec<String>,
 }
 
 pub(super) fn split_sections(raw: &str) -> Vec<Section> {
@@ -53,7 +54,7 @@ pub(super) fn split_sections(raw: &str) -> Vec<Section> {
                 in_heading = Some(HeadingScan {
                     title: String::new(),
                     span: range,
-                    annotation: None,
+                    annotations: Vec::new(),
                 });
             }
             Event::End(TagEnd::Heading(HeadingLevel::H2 | HeadingLevel::H3)) => {
@@ -71,7 +72,7 @@ pub(super) fn split_sections(raw: &str) -> Vec<Section> {
                     sections.push(Section {
                         title,
                         content: scan.span.end..raw.len(),
-                        inline_annotation: scan.annotation,
+                        inline_annotations: scan.annotations,
                     });
                 }
             }
@@ -84,9 +85,7 @@ pub(super) fn split_sections(raw: &str) -> Vec<Section> {
                 if let Some(scan) = in_heading.as_mut() {
                     for comment in comments_in(&t) {
                         if let Some(body) = upstroke_body(comment.inner) {
-                            if scan.annotation.is_none() {
-                                scan.annotation = Some(body.to_owned());
-                            }
+                            scan.annotations.push(body.to_owned());
                         }
                     }
                 }

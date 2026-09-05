@@ -11,8 +11,11 @@
 //! indentation) is never emitted, and indentation a tab straddles comes back
 //! as a zero-width `Text` event between two `Html` events of the same block.
 //! Inline HTML arrives as one `InlineHtml` event per construct, however many
-//! lines it spans, and an inline `<!--` with no `-->` is not HTML at all but
-//! text. [`HtmlAccumulator`] joins the lines of one block, keeps the source
+//! lines it spans — and that one event is the raw source, so inside a
+//! blockquote its continuation lines still carry the quote's `>` markers
+//! (measured: `<!-- upstroke: id=a\n>min=frontier -->`), which the grammar
+//! below strips as container syntax. An inline `<!--` with no `-->` is not
+//! HTML at all but text. [`HtmlAccumulator`] joins the lines of one block, keeps the source
 //! range of every piece, and maps a comment found in the joined text back to
 //! the source through those pieces, so the span it reports is the comment's
 //! own bytes whatever the block's line endings or container. It never joins
@@ -34,11 +37,16 @@
 //! | `kind=wat` | unknown kind; heuristics | the title-keyword heuristic |
 //! | `tier=wat` | unknown tier; no suggestion | routing's own choice |
 //! | `min=wat` | unknown min tier; **no floor** | routing's own choice, below what the author required |
-//! | `kind=fix kind=docs` | repeated; the last applies | the last value, parseable or not |
+//! | `kind=fix kind=docs` | repeated; the last applies | the last value, parseable or not; the earlier one is not parsed |
 //!
-//! Every warning lands in `Parsed::warnings`, which `upstroke validate` prints
-//! under `warnings:` and a run copies into its report as `warning:` lines.
-//! Nothing here errors: `DESIGN.md` §9 has unknown attributes warn and never
+//! A value's warning is about the value that applies: `min=wat min=frontier`
+//! warns that `min` is repeated and binds `frontier`, and never says no floor
+//! binds. When the plan parses, every warning lands in `Parsed::warnings`,
+//! which `upstroke validate` prints under `warnings:` and a run copies into
+//! its report as `warning:` lines; a plan the adapter refuses outright (no
+//! tasks found) reports the refusal alone, and the warnings gathered before
+//! it are dropped with the parse — recorded as SWEEP-ANNOTATION-017 against
+//! the parent. Nothing here errors: `DESIGN.md` §9 has unknown attributes warn and never
 //! error, and this module takes the same posture for values it cannot parse.
 //! For `min=` that posture removes a binding floor on a typo, which no later
 //! stage restores; whether that should refuse instead is the owner's call and
@@ -53,7 +61,7 @@ use pulldown_cmark::{Event, Tag, TagEnd};
 
 use crate::ir::{TaskKind, Tier};
 
-const OPEN: &str = "<!--";
+pub(super) const OPEN: &str = "<!--";
 const CLOSE: &str = "-->";
 const MARKER: &str = "upstroke:";
 
@@ -363,21 +371,92 @@ pub(super) struct Annotation {
     pub(super) paths: Vec<String>,
 }
 
+/// The attribute names the grammar knows, one table for parsing and naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Id,
+    Kind,
+    Depends,
+    Tier,
+    Min,
+    Needs,
+    Out,
+    Paths,
+}
+
+impl Key {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "id" => Self::Id,
+            "kind" => Self::Kind,
+            "depends" => Self::Depends,
+            "tier" => Self::Tier,
+            "min" => Self::Min,
+            "needs" => Self::Needs,
+            "out" => Self::Out,
+            "paths" => Self::Paths,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Kind => "kind",
+            Self::Depends => "depends",
+            Self::Tier => "tier",
+            Self::Min => "min",
+            Self::Needs => "needs",
+            Self::Out => "out",
+            Self::Paths => "paths",
+        }
+    }
+}
+
 /// Whitespace-separated `key=value` tokens. The module doc's table is the
-/// contract; each refusal below says what the task gets instead.
+/// contract; each refusal below says what the task gets instead. Tokens are
+/// gathered first and the last value of each attribute is parsed afterwards,
+/// so a warning about a value is always about the value that applies.
 fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annotation {
+    // The last value of each attribute, in first-seen order.
+    let mut values: Vec<(Key, &str)> = Vec::new();
+    for line in body.lines() {
+        // An inline comment spanning lines inside a blockquote carries the
+        // quote's `>` markers at the start of its continuation lines
+        // (measured, module doc); they are container syntax, not attributes.
+        // Only the line's leading run is shed: no name in `Key` begins with
+        // `>`, so a line never legitimately starts with one, and a value
+        // that contains or begins with `>` sits after its `key=` and is kept.
+        let line = line.trim_start_matches(['>', ' ', '\t']);
+        for token in line.split_whitespace() {
+            let Some((name, value)) = token.split_once('=') else {
+                warnings.push(format!(
+                    "malformed annotation attribute `{token}` in {ctx} (expected key=value); ignored"
+                ));
+                continue;
+            };
+            let Some(key) = Key::parse(name) else {
+                warnings.push(format!(
+                    "unknown annotation attribute `{name}` in {ctx}; ignored"
+                ));
+                continue;
+            };
+            match values.iter_mut().find(|(seen, _)| *seen == key) {
+                Some(slot) => {
+                    warnings.push(format!(
+                        "annotation attribute `{}` repeated in {ctx}; the last one applies",
+                        key.name()
+                    ));
+                    slot.1 = value;
+                }
+                None => values.push((key, value)),
+            }
+        }
+    }
     let mut ann = Annotation::default();
-    let mut seen: Vec<&str> = Vec::new();
-    for token in body.split_whitespace() {
-        let Some((key, value)) = token.split_once('=') else {
-            warnings.push(format!(
-                "malformed annotation attribute `{token}` in {ctx} (expected key=value); ignored"
-            ));
-            continue;
-        };
-        let mut known = true;
+    for (key, value) in values {
         match key {
-            "id" => {
+            Key::Id => {
                 ann.id = non_empty(value);
                 if ann.id.is_none() {
                     warnings.push(format!(
@@ -385,7 +464,7 @@ fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annota
                     ));
                 }
             }
-            "kind" => {
+            Key::Kind => {
                 ann.kind = TaskKind::parse(value);
                 if ann.kind.is_none() {
                     warnings.push(format!(
@@ -393,8 +472,8 @@ fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annota
                     ));
                 }
             }
-            "depends" => ann.depends = Some(csv(value)),
-            "tier" => {
+            Key::Depends => ann.depends = Some(csv(value)),
+            Key::Tier => {
                 ann.tier = Tier::parse(value);
                 if ann.tier.is_none() {
                     warnings.push(format!(
@@ -402,7 +481,7 @@ fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annota
                     ));
                 }
             }
-            "min" => {
+            Key::Min => {
                 ann.min = Tier::parse(value);
                 if ann.min.is_none() {
                     warnings.push(format!(
@@ -411,24 +490,9 @@ fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annota
                     ));
                 }
             }
-            "needs" => ann.needs = csv(value),
-            "out" => ann.out = csv(value),
-            "paths" => ann.paths = csv(value),
-            _ => {
-                known = false;
-                warnings.push(format!(
-                    "unknown annotation attribute `{key}` in {ctx}; ignored"
-                ));
-            }
-        }
-        if known {
-            if seen.contains(&key) {
-                warnings.push(format!(
-                    "annotation attribute `{key}` repeated in {ctx}; the last one applies"
-                ));
-            } else {
-                seen.push(key);
-            }
+            Key::Needs => ann.needs = csv(value),
+            Key::Out => ann.out = csv(value),
+            Key::Paths => ann.paths = csv(value),
         }
     }
     ann
@@ -776,6 +840,136 @@ mod tests {
             1
         );
         assert_eq!(warnings_mentioning(&parsed, "unknown kind `wat`").len(), 1);
+    }
+
+    #[test]
+    fn a_later_valid_value_leaves_no_false_consequence_warning() {
+        // Pass 1 finding 3: the warning about a value is about the value
+        // that applies, so a later duplicate that parses leaves no warning
+        // saying the floor, kind, tier or id is missing.
+        let parsed = parse(
+            "## Fix bug\n<!-- upstroke: min=wat min=frontier id= id=actual kind=wat kind=fix tier=wat tier=mid -->\n",
+        );
+        let t = task(&parsed, 0);
+        assert_eq!(t.min_tier, Some(Tier::Frontier));
+        assert_eq!(t.id, TaskId::from("actual"));
+        assert_eq!(t.kind, TaskKind::Fix);
+        assert_eq!(t.suggested_tier, Some(Tier::Mid));
+        for false_claim in [
+            "no floor binds",
+            "unknown min tier",
+            "empty id",
+            "unknown kind",
+            "unknown tier",
+        ] {
+            assert!(
+                warnings_mentioning(&parsed, false_claim).is_empty(),
+                "`{false_claim}` is not true of what the task got: {:?}",
+                parsed.warnings
+            );
+        }
+        assert_eq!(
+            warnings_mentioning(&parsed, "repeated").len(),
+            4,
+            "{:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn an_inline_annotation_spanning_quoted_lines_keeps_its_floor() {
+        // Pass 1 finding 2: one `InlineHtml` event carrying the blockquote's
+        // `>` on its continuation line, with and without the space, nested
+        // in a list item, and at top level of the quote.
+        for raw in [
+            "## Fix bug\n> Context <!-- upstroke: id=a\n>min=frontier --> more.\n",
+            "## Fix bug\n> Context <!-- upstroke: id=a\n> min=frontier --> more.\n",
+            "## Fix bug\n- > Context <!-- upstroke: id=a\n  > min=frontier --> more.\n",
+            "## Fix bug\n- Context <!-- upstroke: id=a\n  min=frontier --> more.\n",
+        ] {
+            let parsed = parse(raw);
+            let t = task(&parsed, 0);
+            assert_eq!(t.id, TaskId::from("a"), "{raw:?}");
+            assert_eq!(
+                t.min_tier,
+                Some(Tier::Frontier),
+                "{raw:?}: {:?}",
+                parsed.warnings
+            );
+            assert!(parsed.warnings.is_empty(), "{raw:?}: {:?}", parsed.warnings);
+            assert!(!t.body.contains("upstroke"), "{raw:?}: {}", t.body);
+            assert!(t.body.contains("more."), "{raw:?}: {}", t.body);
+        }
+    }
+
+    #[test]
+    fn a_value_that_begins_with_a_quote_marker_is_kept() {
+        // Only a line's leading `>` run is container syntax; after `key=`
+        // the character is the author's, on the first line and on a quoted
+        // continuation line alike.
+        let raw =
+            "## T\n> Context <!-- upstroke: id=a paths=>a/**,>b/**\n> out=>c needs=>d --> more.\n";
+        let parsed = parse(raw);
+        let t = task(&parsed, 0);
+        assert_eq!(t.id, TaskId::from("a"));
+        assert_eq!(t.path_hints, [">a/**", ">b/**"]);
+        let out: Vec<String> = t.artifacts_out.iter().map(ToString::to_string).collect();
+        let needs: Vec<String> = t.artifacts_in.iter().map(ToString::to_string).collect();
+        assert_eq!(out, [">c"]);
+        assert_eq!(needs, [">d"]);
+        assert!(
+            warnings_mentioning(&parsed, "unknown annotation attribute").is_empty(),
+            "warnings: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn two_inline_heading_annotations_warn_and_the_first_wins() {
+        // Pass 1 finding 4: both comments sit on the heading line, so the
+        // second reaches the sink through `split_sections`, not the body walk.
+        let parsed = parse(
+            "## Task <!-- upstroke: id=first --><!-- upstroke: id=second kind=fix -->\nBody.\n",
+        );
+        let t = task(&parsed, 0);
+        assert_eq!(t.id, TaskId::from("first"));
+        assert_eq!(t.kind, TaskKind::Implement);
+        assert_eq!(
+            warnings_mentioning(&parsed, "multiple upstroke annotations in section `Task`").len(),
+            1,
+            "warnings: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn a_checklist_item_keeps_the_text_an_unterminated_annotation_swallowed() {
+        // Pass 1 finding 1: the checklist body is built from text events,
+        // which an HTML block never produces, so the swallowed prose has to
+        // be put back for the warning's promise to hold.
+        let parsed =
+            parse("- [ ] Deploy\n  <!-- upstroke: id=deploy\n  Do not deploy before backup.\n");
+        let t = task(&parsed, 0);
+        assert!(
+            t.body.contains("Do not deploy before backup."),
+            "the safety instruction reaches the agent: {:?}",
+            t.body
+        );
+        assert!(
+            t.body.contains("<!-- upstroke: id=deploy"),
+            "as written: {:?}",
+            t.body
+        );
+        assert_eq!(
+            warnings_mentioning(
+                &parsed,
+                "unterminated upstroke annotation in checklist item"
+            )
+            .len(),
+            1,
+            "warnings: {:?}",
+            parsed.warnings
+        );
     }
 
     #[test]
