@@ -348,7 +348,8 @@ mod tests {
     use super::*;
     use crate::events::{
         AttemptRecord, AttemptStarted, AttemptTransition, LadderEscalated, LadderRetry,
-        RunFinished, RunOutcome, TaskCommitted, TaskDeferred, TaskFailed,
+        ReviewPassOutcome, ReviewRecord, RunFinished, RunOutcome, RunResumed, TaskCommitted,
+        TaskDeferred, TaskFailed, TaskParked,
     };
     use crate::ir::{Answer, Question, QuestionId, QuestionKind, TaskId};
     use crate::ladder::{FailureKind, FailureOrigin};
@@ -470,7 +471,7 @@ mod tests {
             }),
         ];
         let rendered: Vec<String> = lines.iter().map(describe).collect();
-        assert!(rendered[0].starts_with("14:03:07  "), "{:?}", rendered[0]);
+        assert!(rendered[0].starts_with("14:03:07Z  "), "{:?}", rendered[0]);
         assert!(rendered[0].contains("t1: attempt 1 on small"));
         assert!(rendered[1].contains("committed 0123456789"));
         assert!(rendered[2].contains("run finished"));
@@ -731,5 +732,498 @@ mod tests {
             "no escape codes reach the terminal"
         );
         assert!(line.contains("q-1 answered via answer-file"), "{line}");
+    }
+
+    /// One settled record, varying only what a test is about.
+    fn record(failure: Option<events::FailureRecord>, reviews: Vec<ReviewRecord>) -> AttemptRecord {
+        AttemptRecord {
+            attempt: 1,
+            tier: "small".to_owned(),
+            model: "model".to_owned(),
+            pool: None,
+            resumed: false,
+            duration: Duration::from_secs(1),
+            cost_usd: None,
+            reviews,
+            session_id: None,
+            usage: None,
+            failure,
+        }
+    }
+
+    fn gate_failure(reason: &str) -> events::FailureRecord {
+        events::FailureRecord {
+            kind: FailureKind::GateFailed,
+            origin: FailureOrigin::Worker,
+            reason: reason.to_owned(),
+            detail: None,
+        }
+    }
+
+    fn review(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {
+        ReviewRecord {
+            pass: pass.to_owned(),
+            agent: "codex".to_owned(),
+            model: "gpt-5".to_owned(),
+            adapter: None,
+            preflight_cli_version: None,
+            effort: None,
+            pool: None,
+            cost_usd: None,
+            outcome,
+        }
+    }
+
+    fn finished(
+        record: AttemptRecord,
+        parking: Option<events::AttemptParking>,
+        transition: Option<AttemptTransition>,
+    ) -> Event {
+        event(EventBody::AttemptFinished {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            profile: "implement".to_owned(),
+            data: Box::new(record),
+            parking: parking.map(Box::new),
+            transition: transition.map(Box::new),
+            prepared_commit: None,
+        })
+    }
+
+    fn parking(id: &str) -> events::AttemptParking {
+        events::AttemptParking {
+            question: Question {
+                id: QuestionId::from(id),
+                kind: QuestionKind::Unblock,
+                affected_tasks: vec![TaskId::from("t1")],
+                context: "every rung failed".to_owned(),
+                options: Vec::new(),
+            },
+            refund_attempt: false,
+        }
+    }
+
+    fn answered(answer: Answer, decline_halts_run: Option<bool>) -> Event {
+        event(EventBody::QuestionAnswered {
+            data: events::QuestionAnswered {
+                question: QuestionId::from("q-1"),
+                answer,
+                decline_halts_run,
+                via: "terminal".to_owned(),
+            },
+        })
+    }
+
+    /// The pre-repair line for every answer was "q-1 answered via terminal":
+    /// a decline, which fails the affected task and may halt the run, and a
+    /// question no channel could deliver both read as an answer.
+    #[test]
+    fn a_decline_is_described_as_a_decline_with_the_halt_policy_frozen_with_it() {
+        let halting = describe(&answered(Answer::Declined, Some(true)));
+        assert!(
+            halting.contains("q-1 declined via terminal; its task fails; the run halts"),
+            "{halting}"
+        );
+        assert!(!halting.contains("answered"), "{halting}");
+
+        let continuing = describe(&answered(Answer::Declined, Some(false)));
+        assert!(
+            continuing.contains("q-1 declined via terminal; its task fails; the run continues"),
+            "{continuing}"
+        );
+
+        let legacy = describe(&answered(Answer::Declined, None));
+        assert!(
+            legacy.contains("its task fails and the halt policy was not recorded"),
+            "{legacy}"
+        );
+
+        let nobody = describe(&answered(Answer::Unanswered, None));
+        assert!(
+            nobody.contains("q-1 went unanswered via terminal: no channel reached a person"),
+            "{nobody}"
+        );
+        assert!(!nobody.contains("q-1 answered"), "{nobody}");
+
+        let answer = describe(&answered(
+            Answer::Answered {
+                text: "go on".to_owned(),
+            },
+            None,
+        ));
+        assert!(answer.contains("q-1 answered via terminal"), "{answer}");
+    }
+
+    #[test]
+    fn a_finished_run_names_its_outcome_in_words_and_the_task_it_halted_at() {
+        let finished = |outcome, halted_at: Option<&str>| {
+            describe(&event(EventBody::RunFinished {
+                data: RunFinished {
+                    outcome,
+                    halted_at: halted_at.map(str::to_owned),
+                    committed: 1,
+                    parked: 0,
+                },
+            }))
+        };
+        let halted = finished(RunOutcome::Halted, Some("t2"));
+        assert!(
+            halted.contains("run finished: halted at `t2` (1 committed, 0 parked)"),
+            "{halted}"
+        );
+        let budget = finished(RunOutcome::BudgetExceeded, None);
+        assert!(
+            budget.contains("run finished: stopped at its budget (1 committed, 0 parked)"),
+            "{budget}"
+        );
+        let complete = finished(RunOutcome::Complete, None);
+        assert!(
+            complete.contains("run finished: complete (1 committed, 0 parked)"),
+            "{complete}"
+        );
+        assert!(
+            !complete.contains("Complete"),
+            "a derived Debug spelling is not a contract: {complete}"
+        );
+        // The parser admits both inconsistent shapes; each is shown as what
+        // the record says rather than folded into a halt or a silence.
+        let unnamed = finished(RunOutcome::Halted, None);
+        assert!(
+            unnamed.contains(
+                "run finished: halted at a task the record does not name (1 committed, 0 parked)"
+            ),
+            "{unnamed}"
+        );
+        let odd = finished(RunOutcome::Complete, Some("t2"));
+        assert!(
+            odd.contains(
+                "run finished: complete (`t2` recorded as halted_at on a run that did not halt) \
+                 (1 committed, 0 parked)"
+            ),
+            "{odd}"
+        );
+        assert!(!odd.contains("complete at"), "{odd}");
+    }
+
+    /// The record production writes for a rejected review carries both the
+    /// pass's `Failed` outcome and a `ReviewFailed` failure whose reason is
+    /// `review failed: …` (`engine::attempt::evaluate_review`); an unavailable
+    /// reviewer carries `Unavailable` and a `ReviewUnavailable` failure. The
+    /// line names the pass and the model beside the reason on that shape — the
+    /// one a run produces — and not only on a record with the outcome alone.
+    #[test]
+    fn a_real_review_rejection_names_the_pass_and_the_model_beside_its_reason() {
+        let rejected = describe(&finished(
+            record(
+                Some(events::FailureRecord {
+                    kind: FailureKind::ReviewFailed,
+                    origin: FailureOrigin::Reviewer,
+                    reason: "review failed: no tests were added".to_owned(),
+                    detail: None,
+                }),
+                vec![
+                    review("review", ReviewPassOutcome::Passed),
+                    review("second-opinion", ReviewPassOutcome::Failed),
+                ],
+            ),
+            None,
+            Some(AttemptTransition::Retry(LadderRetry {
+                resume: false,
+                tier: "small".to_owned(),
+                summary: "review failed: no tests were added".to_owned(),
+                detail: None,
+            })),
+        ));
+        assert!(
+            rejected.contains(
+                "t1: attempt 1 failed — review failed: no tests were added; review \
+                 `second-opinion` (gpt-5) rejected it; retrying on small"
+            ),
+            "{rejected}"
+        );
+        let unavailable = describe(&finished(
+            record(
+                Some(events::FailureRecord {
+                    kind: FailureKind::ReviewUnavailable,
+                    origin: FailureOrigin::Reviewer,
+                    reason: "reviewer unavailable: rate limited".to_owned(),
+                    detail: None,
+                }),
+                vec![review("review", ReviewPassOutcome::Unavailable)],
+            ),
+            None,
+            None,
+        ));
+        assert!(
+            unavailable.contains(
+                "t1: attempt 1 failed — reviewer unavailable: rate limited; review `review` \
+                 (gpt-5) reached no verdict"
+            ),
+            "{unavailable}"
+        );
+        // A gate failure has no review to name, and says nothing about one.
+        let gates = describe(&finished(
+            record(Some(gate_failure("gate `test` failed: exit 1")), Vec::new()),
+            None,
+            None,
+        ));
+        assert!(
+            gates.contains("t1: attempt 1 failed — gate `test` failed: exit 1"),
+            "{gates}"
+        );
+        assert!(!gates.contains("review"), "{gates}");
+    }
+
+    #[test]
+    fn a_deferral_wait_says_how_long_and_which_round() {
+        let line = describe(&event(EventBody::DeferWaitElapsed {
+            data: events::DeferWaitElapsed {
+                waited: Duration::from_secs(90),
+                round: 3,
+            },
+        }));
+        assert!(
+            line.contains("waited 90s for a pool to come back (round 3)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_failure_says_whether_the_run_halts_in_both_wire_shapes() {
+        for (halts_run, expected) in [(true, "; the run halts"), (false, "; the run continues")] {
+            let failed = TaskFailed {
+                kind: FailureKind::GateFailed,
+                reason: "gates exhausted".to_owned(),
+                halts_run,
+            };
+            let standalone = describe(&event(EventBody::TaskFailed {
+                task: "t1".to_owned(),
+                data: failed.clone(),
+            }));
+            assert!(
+                standalone.contains(&format!(
+                    "t1: failed — gates exhausted; task failed (GateFailed){expected}"
+                )),
+                "{standalone}"
+            );
+            let atomic = describe(&finished(
+                record(Some(gate_failure("the attempt failed")), Vec::new()),
+                None,
+                Some(AttemptTransition::Fail(failed)),
+            ));
+            assert!(
+                atomic.contains(&format!(
+                    "t1: attempt 1 failed — the attempt failed; task failed (GateFailed){expected}"
+                )),
+                "{atomic}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_that_discarded_edits_says_how_many() {
+        let resumed = |discarded: &[&str]| {
+            describe(&event(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "0123456789abcdef".to_owned(),
+                    interrupted_attempts: 1,
+                    discarded: discarded.iter().map(|path| (*path).to_owned()).collect(),
+                    gates: None,
+                    effort_policy: None,
+                    reviews: None,
+                    chains: None,
+                    normalized_plan_digest: None,
+                },
+            }))
+        };
+        let discarding = resumed(&["src/a.rs", "src/b.rs"]);
+        assert!(
+            discarding.contains(
+                "resumed at 0123456789 (1 interrupted attempt(s)); 2 uncommitted path(s) discarded"
+            ),
+            "{discarding}"
+        );
+        let clean = resumed(&[]);
+        assert!(
+            clean.contains("resumed at 0123456789 (1 interrupted attempt(s))"),
+            "{clean}"
+        );
+        assert!(!clean.contains("discarded"), "{clean}");
+    }
+
+    /// "Passed" follows `AttemptRecord::is_successful`, not `failure.is_none()`:
+    /// the grid below is every combination of the two facts that predicate
+    /// reads, and the line says "passed" exactly where the predicate says so.
+    /// The pre-repair code answered "passed" for a record with no failure and
+    /// a review that rejected it.
+    #[test]
+    fn an_attempt_is_described_as_passed_only_where_the_record_is_successful() {
+        let failures = [None, Some(gate_failure("gate `test` failed: exit 1"))];
+        let review_sets = [
+            Vec::new(),
+            vec![review("review", ReviewPassOutcome::Passed)],
+            vec![
+                review("review", ReviewPassOutcome::Passed),
+                review("second-opinion", ReviewPassOutcome::Failed),
+            ],
+            vec![review("review", ReviewPassOutcome::Unavailable)],
+        ];
+        for failure in &failures {
+            for reviews in &review_sets {
+                let record = record(failure.clone(), reviews.clone());
+                let successful = record.is_successful();
+                let line = describe(&finished(record, None, None));
+                assert_eq!(line.contains("t1: attempt 1 passed"), successful, "{line}");
+            }
+        }
+
+        let rejected = describe(&finished(
+            record(
+                None,
+                vec![
+                    review("review", ReviewPassOutcome::Passed),
+                    review("second-opinion", ReviewPassOutcome::Failed),
+                ],
+            ),
+            None,
+            None,
+        ));
+        assert!(
+            rejected.contains(
+                "t1: attempt 1 was not approved — review `second-opinion` (gpt-5) rejected it"
+            ),
+            "{rejected}"
+        );
+        let unavailable = describe(&finished(
+            record(None, vec![review("review", ReviewPassOutcome::Unavailable)]),
+            None,
+            None,
+        ));
+        assert!(
+            unavailable.contains(
+                "t1: attempt 1 was not approved — review `review` (gpt-5) reached no verdict"
+            ),
+            "{unavailable}"
+        );
+    }
+
+    /// The transition and the parking are two halves of one settlement, and
+    /// the line renders each on its own. The pre-repair code rendered a parked
+    /// attempt's transition only when it was an escalation, so a parking
+    /// beside a `Fail` — a shape no writer produces today — dropped the task's
+    /// failure from the line.
+    #[test]
+    fn a_parked_attempt_renders_every_transition_recorded_beside_the_parking() {
+        let parked_failure = describe(&finished(
+            record(Some(gate_failure("the attempt failed")), Vec::new()),
+            Some(parking("q-1")),
+            Some(AttemptTransition::Fail(TaskFailed {
+                kind: FailureKind::GateFailed,
+                reason: "the attempt failed".to_owned(),
+                halts_run: true,
+            })),
+        ));
+        assert!(
+            parked_failure.contains(
+                "t1: attempt 1 failed — the attempt failed; task failed (GateFailed); the run \
+                 halts; parked on question q-1"
+            ),
+            "{parked_failure}"
+        );
+
+        // A parking with no failure and no transition says what the record
+        // says, rather than inventing a "policy refusal" for it.
+        let parked_pass = describe(&finished(
+            record(None, Vec::new()),
+            Some(parking("q-1")),
+            None,
+        ));
+        assert!(
+            parked_pass.contains("t1: attempt 1 passed; parked on question q-1"),
+            "{parked_pass}"
+        );
+    }
+
+    /// Every field on a line is on-disk data, and a failure reason quotes an
+    /// agent's stderr. The pre-repair line carried the reason verbatim, so a
+    /// newline in it split one event across lines of `--follow` and an escape
+    /// sequence in it reached the terminal.
+    #[test]
+    fn describe_is_one_line_with_no_control_character_whatever_the_log_carries() {
+        let reason =
+            "agent error (exit Some(1)): first line\n\u{1b}[31msecond line\u{1b}[0m\r\n\tthird";
+        let line = describe(&finished(
+            record(Some(gate_failure(reason)), Vec::new()),
+            None,
+            None,
+        ));
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(
+            line.contains("first line \\u{1b}[31msecond line\\u{1b}[0m   third"),
+            "the control characters are shown, not passed through: {line:?}"
+        );
+
+        // Not only the reason: the guarantee is on the assembled line, so a
+        // field the arm did not think of is covered too.
+        let parked = describe(&event(EventBody::TaskParked {
+            task: "t1".to_owned(),
+            data: TaskParked {
+                question: "q-1\u{1b}[2J\nq-2".to_owned(),
+                refund_attempt: false,
+            },
+        }));
+        assert_eq!(parked.lines().count(), 1, "{parked:?}");
+        assert!(!parked.contains('\u{1b}'), "{parked:?}");
+        assert!(parked.contains("parked on q-1\\u{1b}[2J q-2"), "{parked:?}");
+
+        // And a line with nothing to change is the line as assembled.
+        let plain = describe(&finished(record(None, Vec::new()), None, None));
+        assert_eq!(plain, "14:03:07Z  t1: attempt 1 passed");
+    }
+
+    /// The slice is taken only from a timestamp in RFC 3339 shape, checked
+    /// character by character: nineteen bytes that happen to end in something
+    /// clock-like are not a time, and a persisted value the engine did not
+    /// write is shown whole rather than dressed as one. `Event.ts` is an
+    /// unconstrained `String` and parsing validates nothing about it.
+    #[test]
+    fn a_timestamp_the_engine_did_not_write_is_printed_whole_rather_than_sliced() {
+        let with = |ts: &str| Event {
+            ts: ts.to_owned(),
+            body: EventBody::TaskParked {
+                task: "t1".to_owned(),
+                data: TaskParked {
+                    question: "q-1".to_owned(),
+                    refund_attempt: false,
+                },
+            },
+        };
+        for whole in [
+            "sometime",
+            "xxxxxxxxxxx14:03:07Z",
+            "2026-08-09 14:03:07Z",
+            "2026/08/09T14:03:07Z",
+            "2026-08-09T14.03.07Z",
+            "2026-08-09T1a:03:07Z",
+            "2026-08-09T14:03:0",
+        ] {
+            let line = describe(&with(whole));
+            assert_eq!(line, format!("{whole}  t1: parked on q-1"), "{whole}");
+        }
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07+02:00")),
+            "14:03:07+02:00  t1: parked on q-1"
+        );
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07.250Z")),
+            "14:03:07.250Z  t1: parked on q-1"
+        );
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07")),
+            "14:03:07  t1: parked on q-1",
+            "a zone-less shape is still a clock, with nothing to append"
+        );
     }
 }
