@@ -24,9 +24,9 @@
 //! no wildcard arm, so a variant this module does not know is a build error
 //! rather than an event that renders as nothing.
 //!
-//! The `--follow` line format is documented here and nowhere else: neither
-//! `design/18` (the CLI surface) nor `README.md` spells it, so this module doc
-//! is its record.
+//! The line is product surface and its contract is `DESIGN.md` §18 (the CLI
+//! surface), which this module implements; a change to what a line says is a
+//! change to that section in the same pull request (CODING_STANDARDS.md §13).
 //!
 //! # Why the effect denials are restored here
 //!
