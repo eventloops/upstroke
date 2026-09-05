@@ -2488,7 +2488,7 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         assert!(
             failures.iter().any(|failure| matches!(
                 failure,
-                BijectionFailure::UnwitnessedFastSequence { site: named, sequence, executed: false }
+                BijectionFailure::UnwitnessedFastSequence { site: named, sequence, observed: false }
                     if named == site && sequence == "fast/seq-2"
             )),
             "{site} said nothing about a fast sequence the suite ran: {failures:#?}"
@@ -2562,16 +2562,18 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         );
     }
 
-    // (f) A site that ran inside an exercised fast sequence the record
-    // does not name. Two facts, both from the inputs: the record says nothing
-    // about `fast/seq-2`, and the harness saw the site run in it. The report
-    // carries both in one failure, so a reader learns the execution now
-    // rather than a round later by adding the sequence to the record and
-    // reading `ExecutedInFastSequence` then. Until `ffe26ca` the `else`
-    // placement reported the gap with `executed` unknowable; between
-    // `ffe26ca` and `c2b6b6c` the execution was reported as a failure of its
-    // own, which asserted that these sites never run in a fast sequence — a
-    // rule `DESIGN.md` does not contain (pass 3 on `c2b6b6c`, finding 1).
+    // (f) A site whose hook the harness recorded inside an exercised fast
+    // sequence the record does not name. Two observations, both from the
+    // inputs: the record says nothing about `fast/seq-2`, and the harness
+    // recorded the site's hook in it. The report carries both in one failure,
+    // so a reader learns of the observation now rather than a round later by
+    // adding the sequence to the record and reading `ExecutedInFastSequence`
+    // then. Until `ffe26ca` the `else` placement reported the gap with the
+    // observation withheld; between `ffe26ca` and `c2b6b6c` the observation
+    // was reported as a failure of its own asserting a rule `DESIGN.md` did
+    // not then contain (pass 3 on `c2b6b6c`); at `4fb81b3` the field was
+    // called `executed`, which claims more than a harness that sees only its
+    // own hook can know (pass 4 on `4fb81b3`).
     let mut ran_unnamed = self_test_harness(host);
     ran_unnamed.begin_fast_sequence("fast/seq-2");
     drive(&mut ran_unnamed, cherry, host);
@@ -2580,11 +2582,11 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
     assert!(
         failures.iter().any(|failure| matches!(
             failure,
-            BijectionFailure::UnwitnessedFastSequence { site: named, sequence, executed: true }
+            BijectionFailure::UnwitnessedFastSequence { site: named, sequence, observed: true }
                 if *named == cherry && sequence == "fast/seq-2"
         )),
-        "a cherry-pick inside an unnamed fast sequence was reported as a gap with the \
-             execution unstated: {failures:#?}"
+        "a cherry-pick hook inside an unnamed fast sequence was reported as a gap with the \
+             observation withheld: {failures:#?}"
     );
     // And no contradiction is reported, because the record made no claim
     // about `fast/seq-2` to contradict.

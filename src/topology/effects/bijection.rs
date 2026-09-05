@@ -165,20 +165,23 @@ pub enum BijectionFailure {
 
     #[error(
         "`{site}`'s no-execution record says nothing about the exercised fast sequence \
-         `{sequence}`, {}",
-        if *executed { "in which the site executed" } else { "in which the site did not execute" }
+         `{sequence}`, in which the harness {}",
+        if *observed { "observed the site's hook" } else { "observed no hook of the site" }
     )]
     UnwitnessedFastSequence {
         /// The site.
         site: EffectSiteId,
         /// The sequence it says nothing about.
         sequence: String,
-        /// Whether the harness saw the site execute inside that sequence.
-        /// A fact the report carries beside the gap, so a reader sees at once
-        /// which of the two the record would contradict if it named the
-        /// sequence; it asserts nothing about whether the execution is
+        /// Whether the harness recorded a hook of this site inside that
+        /// sequence. An observation, not an execution: the harness knows only
+        /// what called [`HookHarness::hook`], so `false` says no funnel of the
+        /// site reported itself during the sequence, and cannot say the site
+        /// did not run through a path that omits its hook. Carried beside the
+        /// gap so a reader sees at once what the record would contradict if it
+        /// named the sequence; it asserts nothing about whether an execution is
         /// allowed.
-        executed: bool,
+        observed: bool,
     },
 
     #[error("`{site}`'s no-execution record names `{sequence}`, which the harness never exercised")]
@@ -394,23 +397,23 @@ pub fn check_bijection(
         // made the entire branch unreachable and `check_bijection` reported
         // nothing: a completeness oracle that derives *whether* a requirement
         // exists from the very entries it is checking cannot report a missing
-        // one. `completeness_rule` is explicit that "any missing link fails",
-        // and ST-07 requires the record itself — "the fast-path no-execution
-        // record shows that no staging, cherry-pick, or prepared-pin site
-        // executed for any fast sequence". The `check_evidence` call at the end
-        // of the block is what reports the record's absence, and it is now
-        // reached whether or not the record is there.
+        // one. `DESIGN.md` §26's bijection contract requires the record
+        // itself — the three sites the fast path skips carry a no-execution
+        // entry naming every exercised fast sequence — and any missing
+        // link fails. The `check_evidence` call at the end of the block is
+        // what reports the record's absence, and it is now reached whether
+        // or not the record is there.
         //
         // Exactly one record, not at least one: `check_evidence` finds the
         // entry at the key `(site, NoExecution, None)` and the duplicate sweep
         // above refuses a second at the same key, so the two together admit one
         // and only one.
         if site.skipped_on_fast_path() {
-            // "The fast-path no-execution record shows that no staging,
-            // cherry-pick, or prepared-pin site executed for any fast
-            // sequence" — so there has to *be* a fast sequence, the record has
-            // to hold within every one the suite exercised, and it may not
-            // name one that never happened. Without all three an empty harness
+            // `DESIGN.md` §26: the no-execution record names every fast
+            // sequence the suite exercised and the harness observed no hook of
+            // the site in any of them — so there has to *be* a fast sequence,
+            // the record has to hold within every one the suite exercised, and
+            // it may not name one that never happened.
             // substantiates the claim, which is the same false report as an
             // empty coverage table.
             if harness.fast_sequences().is_empty() {
@@ -426,21 +429,24 @@ pub fn check_bijection(
                 .flatten()
                 .map(String::as_str)
                 .collect();
-            // Two facts about each exercised sequence, both read from the
-            // inputs: whether the record names it, and whether the harness saw
-            // the site run in it. A named sequence the site ran in is a
-            // contradiction between the record and the observation, and is
-            // `ExecutedInFastSequence`. An unnamed sequence is a gap in the
-            // record whatever happened in it, and is `UnwitnessedFastSequence`
-            // — carrying whether the site ran, so a reader sees at once what
-            // the record would contradict if it named the sequence, instead of
-            // learning it a round later by naming it. Neither says whether the
-            // execution was allowed; nothing in `DESIGN.md` does, and this
-            // checker reports what it was handed.
+            // Two observations about each exercised sequence, both read from
+            // the inputs: whether the record names it, and whether the harness
+            // recorded a hook of the site inside it. A named sequence with a
+            // recorded hook is a contradiction between the record and the
+            // observation, and is `ExecutedInFastSequence`. An unnamed
+            // sequence is a gap in the record whatever happened in it, and is
+            // `UnwitnessedFastSequence` — carrying whether a hook was
+            // observed, so a reader sees at once what the record would
+            // contradict if it named the sequence, instead of learning it a
+            // round later by naming it. The harness witnesses only what called
+            // its hook (`DESIGN.md` §26, the bijection contract): an absence
+            // of observation is not evidence of non-execution, which is why
+            // the record's own names are the claim and the observations are
+            // what the claim is held to.
             for sequence in harness.fast_sequences() {
-                let executed = sequence.ran(site);
+                let observed = sequence.ran(site);
                 if claimed.contains(&sequence.name()) {
-                    if executed {
+                    if observed {
                         failures.push(BijectionFailure::ExecutedInFastSequence {
                             site,
                             sequence: sequence.name().to_owned(),
@@ -450,7 +456,7 @@ pub fn check_bijection(
                     failures.push(BijectionFailure::UnwitnessedFastSequence {
                         site,
                         sequence: sequence.name().to_owned(),
-                        executed,
+                        observed,
                     });
                 }
             }
