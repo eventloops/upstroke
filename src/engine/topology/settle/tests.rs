@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -15,6 +14,7 @@ use crate::ir::{
 use crate::ladder::Next;
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::review::{PassBinding, ReviewPlan};
+use crate::rundir::scratch_tree::{self, ScratchTree};
 use crate::rundir::{self, RunPaths};
 use crate::runner::host::{HostEnvironment, HostRunner, KeyCase};
 use crate::runner::{CommandSpec, Runner, gate_request};
@@ -1533,83 +1533,45 @@ fn only_a_retained_generation_is_retried_in_place() {
 // on disk*. An early `return` would unwind and prove something weaker.
 // =======================================================================
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
-
-/// How many names [`scratch_in`] tries before giving up. A temp directory
-/// carries one leftover per `(process id, label)` for every harness that
-/// died holding that id, so reaching this is a directory that needs
-/// emptying, and the panic says which.
-const SCRATCH_LEFTOVER_BOUND: u32 = 64;
-
-/// The name of this process's `nth` scratch directory for `label`.
-fn scratch_name(label: &str, nth: u32) -> String {
-    format!("upstroke-pr7h-{label}-{}-{nth}", std::process::id())
-}
-
-/// A scratch directory, created through the run-directory funnel because
-/// this module may not name `std::fs`.
+/// A scratch tree for one kill test: [`scratch_tree::acquire`]'s exclusive,
+/// ULID-named root, reclaimed when the guard drops.
 ///
-/// The name carries the process id, and a process id is unique only among
-/// **live** processes. Nothing here removes a scratch directory — the kill
-/// tests' claim is what a coordinator that runs no cleanup leaves on disk
-/// — so a harness handed a dead harness's id finds that harness's
-/// directory, and the funnel's `create_dir_all` accepts it. The kill child
-/// then opens the log the dead harness's child left, appends a second run
-/// to it, and `replay` refuses the second `RunStarted` with
-/// `AlreadyStarted`: both kill tests fail together, at their
-/// `the log replays` expectations, with every earlier assertion passing.
-/// Windows hands a freed id out again within hours, and the `test
-/// (winguest)` image's temp directory carries one such pair per harness
-/// that ever ran on it, so that is what the pair of reds on that leg was.
-/// [`scratch_in`] passes an existing name over: no live process shares
-/// this id, so an existing name is always a leftover, never a neighbour.
-fn scratch(label: &str) -> PathBuf {
-    scratch_in(&std::env::temp_dir(), label)
+/// Through the run directory's own test allocator because this module may
+/// not name `std::fs`, and through *that* allocator because of what the
+/// fixture it replaces did. It named the root by `std::process::id()` and a
+/// counter, created it with `create_dir_all`, and never removed it. A
+/// process id is unique only among live processes; Windows reissues one
+/// within hours, and the `test (winguest)` image carried one leftover pair
+/// per harness that had ever run on it. A harness that drew a leftover's id
+/// was handed the dead harness's directory, its kill child appended a
+/// second run to the log the dead child had left, and `replay` refused the
+/// second `RunStarted`: both kill tests red together, at their `the log
+/// replays` expectations, with every earlier assertion passing.
+///
+/// An exclusive `create_dir` on a name no other process can compute leaves
+/// that collision no interleaving, which a check before the create could
+/// not say. And the guard reclaims the tree on return and on unwind: the
+/// **child** still dies without cleanup, which is the claim the kill tests
+/// make, and the **parent** removes what it left once the assertions have
+/// read it.
+fn scratch(label: &str) -> ScratchTree {
+    scratch_tree::acquire(&std::env::temp_dir(), &format!("pr7h-{label}")).expect("a scratch tree")
 }
 
-/// [`scratch`] under `root`, which is what lets its witness plant leftovers
-/// in a root of its own.
-fn scratch_in(root: &Path, label: &str) -> PathBuf {
-    for _ in 0..SCRATCH_LEFTOVER_BOUND {
-        let nth = SCRATCH.fetch_add(1, Ordering::Relaxed);
-        let dir = root.join(scratch_name(label, nth));
-        if dir.exists() {
-            continue;
-        }
-        rundir::create_public_dir(&dir, &mut rundir::NoHooks).expect("a scratch directory");
-        return dir;
-    }
-    panic!(
-        "{SCRATCH_LEFTOVER_BOUND} scratch names for `{label}` under {} already exist for process {}",
-        root.display(),
-        std::process::id()
-    );
-}
-
-/// [`scratch_in`] never hands a test a directory a dead process left: a
-/// name that already exists under this process's id is passed over, not
-/// reused. Without the `exists` check the fixture returns the first planted
-/// name, on every platform.
+/// The fixture hands back the guard, and the guard reclaims: nothing is at
+/// the tree's path once it drops. The kill tests hold it through their
+/// assertions, so their residue is read and then removed.
 #[test]
-fn a_scratch_directory_is_never_a_leftover() {
-    let root = scratch("leftover-root");
-    // The names this process would choose next, planted as leftovers. Eight,
-    // because each of the two kill tests may advance the counter once between
-    // the read and the call.
-    let next = SCRATCH.load(Ordering::Relaxed);
-    let planted: Vec<PathBuf> = (next..next + 8)
-        .map(|nth| root.join(scratch_name("leftover", nth)))
-        .collect();
-    for dir in &planted {
-        rundir::create_public_dir(dir, &mut rundir::NoHooks).expect("a leftover");
-    }
-    let fresh = scratch_in(&root, "leftover");
+fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {
+    let tree = scratch("reclaimed");
+    let path = tree.path().to_path_buf();
+    assert!(path.is_dir(), "the tree was created: {}", path.display());
+    drop(tree);
     assert!(
-        !planted.contains(&fresh),
-        "the fixture reused a leftover: {}",
-        fresh.display()
+        !path.exists(),
+        "the tree was not reclaimed: {}",
+        path.display()
     );
-    assert!(fresh.starts_with(&root));
 }
 
 /// A [`RunDirHooks`] that records into the shared harness **and** answers
@@ -1798,8 +1760,9 @@ fn committed(dir: &Path) -> Vec<TopologyEvent> {
 /// `kill_after_failed_settlement_rematerializes_question`.
 #[test]
 fn kill_after_failed_settlement_rematerializes_question() {
-    let dir = scratch("question");
-    let output = spawn_kill_child(&dir, "question");
+    let tree = scratch("question");
+    let dir = tree.path();
+    let output = spawn_kill_child(dir, "question");
 
     let payload = dir
         .join("public")
@@ -1812,7 +1775,7 @@ fn kill_after_failed_settlement_rematerializes_question() {
         output.stderr
     );
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(
@@ -1838,10 +1801,11 @@ fn kill_after_failed_settlement_rematerializes_question() {
 /// `retained_generation_not_continued_after_kill`.
 #[test]
 fn retained_generation_not_continued_after_kill() {
-    let dir = scratch("retained");
-    spawn_kill_child(&dir, "retained");
+    let tree = scratch("retained");
+    let dir = tree.path();
+    spawn_kill_child(dir, "retained");
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(
