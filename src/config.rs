@@ -70,16 +70,21 @@ struct RawRunnerMount {
     read_only: Option<bool>,
 }
 
-/// One `[[gates]]` entry as written. An unknown key is an **error**, as in
-/// `[runner]`: the entry has three keys, the one that is optional decides when
-/// a running gate is killed and reported failed, and a typo there is a timeout
-/// the operator asked for and did not get — see `parse::parse_gates`.
+/// One `[[gates]]` entry as written. An unknown key is collected rather than
+/// dropped, and `parse::parse_gates` decides what it means: an **error** on a
+/// fresh run, as in `[runner]` — the entry has three keys, the one that is
+/// optional decides when a running gate is killed and reported failed, and a
+/// typo there is a timeout the operator asked for and did not get — and a
+/// **warning** on a sequential run's resume, where the recorded gates are what
+/// executes (`design/15`: gates are taken from the record and not refused over).
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawGate {
     name: String,
     cmd: String,
     timeout_secs: Option<u64>,
+    /// Everything else, so a typo is named instead of vanishing.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,9 +397,12 @@ pub const DEFAULT_MAX_MERGE_REPAIRS: u32 = 2;
 /// this one. See [`EngineLimits`].
 pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 
-/// Which reading of the `[engine]` ceilings a load is performing.
+/// Which reading of the `[engine]` ceilings a load is performing — and, since
+/// 2026-09-05, of the two `[[gates]]` shapes a run could have been recorded
+/// under before they became refusals (an unknown key in an entry, a repeated
+/// name).
 ///
-/// The same four keys mean two different things depending on what is about to
+/// The same keys mean two different things depending on what is about to
 /// happen, and the difference is not cosmetic — it is the difference between a
 /// refusal and a warning.
 ///
@@ -687,9 +695,12 @@ pub fn load(
 
 /// [`load`] for a caller that is not creating a run.
 ///
-/// Only `[engine]`'s ceilings read `limits`, and only to decide whether a value
-/// this engine cannot honour refuses or warns — see [`EngineLimits`]. Every
-/// other key means the same thing either way.
+/// Only `[engine]`'s ceilings and two `[[gates]]` shapes read `limits`, and
+/// only to decide whether refusing or warning is the answer: a ceiling this
+/// engine cannot honour, and a `[[gates]]` entry with an unknown key or a
+/// repeated name, which a run could have been recorded under before those
+/// became refusals — see [`EngineLimits`]. Every other key means the same
+/// thing either way.
 pub fn load_limits(
     repo_config: Option<&Path>,
     discover_in: &Path,
@@ -1013,7 +1024,7 @@ pub fn load_captured_with(
         });
     }
 
-    let gates = parse_gates(raw.gates, &repo_path)?;
+    let gates = parse_gates(raw.gates, &repo_path, limits, warnings)?;
     let runner = parse_runner(raw.runner, &repo_path, limits)?;
     let engine = parse_engine(raw.engine, &repo_path, limits, warnings)?;
     let interaction = parse_interaction(raw.interaction, &repo_path)?;
@@ -2327,6 +2338,70 @@ pool_fraction = 0.5
             .expect_err("a zero limit must error on a resume too");
             assert!(error.to_string().contains(key), "names the key: {error}");
         }
+    }
+
+    /// The `[[gates]]` twin of the ceiling rule above, witnessed at the level
+    /// the property lives at: a *load*. `design/15`: "gates are taken from the
+    /// record, not re-derived — and not refused over", so a shape a run could
+    /// have been recorded under before it became a refusal (a repeated name,
+    /// an unknown key in an entry) warns on a sequential run's resume and the
+    /// load succeeds, where the same bytes refuse a run being created now.
+    #[test]
+    fn a_sequential_resume_announces_gate_shapes_a_fresh_run_refuses() {
+        let path = scratch(
+            "resumegates.toml",
+            "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\ntimeout_sec = 900\n\
+             [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
+        );
+        let mut fresh_warnings = Vec::new();
+        let error = load_limits(
+            Some(&path),
+            &hermetic(),
+            Some(&missing()),
+            EngineLimits::Fresh,
+            &mut fresh_warnings,
+        )
+        .expect_err("a run being created now refuses this file");
+        assert!(
+            error.to_string().contains("[[gates]] entry 1"),
+            "the first refusal is the unknown key, in entry order: {error}"
+        );
+
+        let mut warnings = Vec::new();
+        let cfg = load_limits(
+            Some(&path),
+            &hermetic(),
+            Some(&missing()),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("a recorded run stays reachable through the same file");
+        let gates = cfg.gates.expect("the section was present");
+        assert_eq!(
+            gates
+                .iter()
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["check", "Check"],
+            "both entries are kept, so the record can be compared with them"
+        );
+        assert_eq!(
+            gates.first().map(|gate| gate.timeout),
+            Some(DEFAULT_GATE_TIMEOUT),
+            "the misspelled timeout bought nothing"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`timeout_sec`") && w.contains("recorded")),
+            "the unknown key is named and the recorded gates are named as what runs: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("entry 2 repeats the name `Check`") && w.contains("recorded")),
+            "the repeated name is named the same way: {warnings:?}"
+        );
     }
 
     #[test]

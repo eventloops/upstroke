@@ -17,23 +17,25 @@
 //! was never written: `[[gates]]` and `[interaction]` sat there until 2026-09-04
 //! (`RawGate` and `RawInteraction` now refuse what they do not read).
 //!
-//! **A parse failure never becomes a default.** Every `unwrap_or`, `map_or` and
-//! `unwrap_or_else` in this module folds an *absent* key into the default the
-//! design gives it; none folds a key that was written and could not be read,
-//! because every reading goes through `try_into` first and that refuses. The
-//! one value that degrades rather than refuses is `[engine] shell`, and it
-//! warns by name — see [`parse_engine`].
+//! **A parse failure never becomes a default, with one stated exception.**
+//! Every `unwrap_or`, `map_or` and `unwrap_or_else` in this module but one
+//! folds an *absent* key into the default the design gives it; a key that was
+//! written and could not be read is refused by the section's `try_into` before
+//! any fold is reached. The one exception is `[engine] shell`, whose
+//! `unwrap_or_else` folds a written value the parser did not recognise into the
+//! platform default, and warns by name — see [`parse_engine`].
 //!
 //! Nothing here reads a path, starts a process, or writes anything: every input
 //! arrives as an already-parsed `toml::Value`, and the reading of the bytes it
 //! came from belongs to `super::read`.
 //!
 //! **What a refusal carries.** Every error is [`UpstrokeError::Config`] with
-//! the file's path and a message that names the section, the key and, where
-//! there is one, the value written (`[[gates]] entry 2`, `[engine] \`max_parallel = 4\``,
-//! `[runner] \`kind = "vm"\``). That is enough to find the line by eye; a byte
-//! offset is not carried, because `toml::Value` has already dropped the span
-//! by the time a section reaches here.
+//! the file's path and a message that names the section and the key, and the
+//! value written when the value is what is wrong (`[engine] \`max_parallel = 4\``,
+//! `[runner] \`kind = "vm"\``, `[[gates]] entry 2 (\`test\`)`); an unknown key is
+//! named without its value, since the key is the mistake. That is enough to
+//! find the line by eye; a byte offset is not carried, because `toml::Value`
+//! has already dropped the span by the time a section reaches here.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -386,29 +388,54 @@ pub(super) fn parse_budgets(
 /// `[[gates]]` parsing with actionable shape errors: a `[gates]` table, a
 /// wrong-typed field, or `timeout_secs = 0` all name what was expected.
 ///
-/// **Every key is an error when wrong, and an unknown key is an error.** An
-/// entry has three keys and the only optional one, `timeout_secs`, decides when
-/// a running gate is killed and reported as failed: `timeout_sec = 3600` on a
-/// gate that needs an hour is a gate that fails at the 600 s default, and the
-/// ladder then spends attempts repairing code that passes. That is a control
-/// deleted by a typo, which is the module's rule for an error, not a warning.
+/// **Every key is an error when wrong, and an unknown key is an error on a
+/// fresh run.** An entry has three keys and the only optional one,
+/// `timeout_secs`, decides when a running gate is killed and reported as
+/// failed: `timeout_sec = 3600` on a gate that needs an hour is a gate that
+/// fails at the 600 s default, and the ladder then spends attempts repairing
+/// code that passes. That is a control deleted by a typo, which is the module's
+/// rule for an error, not a warning.
 ///
-/// **Two entries may not share a `name`.** The name is what a gate's log file
-/// is written under (`<task>-<attempt>-<name>.log`, in `gates::run_all`) and
-/// what its failure report carries, so a second gate with the first's name
-/// replaces the first's log in the same attempt and reports a failure the
-/// operator cannot attribute. Names are compared as written.
+/// **Two entries may not share a `name`, on a fresh run.** The name is what a
+/// gate's log file is written under (`<task>-<attempt>-<name>.log`, in
+/// `gates::run_all`) and what its failure report carries, so a second gate with
+/// the first's name replaces the first's log in the same attempt and reports a
+/// failure the operator cannot attribute. Names are compared **without regard
+/// to ASCII case**: two of the three CI platforms keep their logs on a
+/// case-insensitive filesystem (NTFS, APFS as shipped), where `check` and
+/// `Check` are one file, and a config must not behave differently per platform.
+/// ASCII case and no more, because `util::filename_component` maps every
+/// non-ASCII character to `-` before the name reaches the filesystem, so ASCII
+/// case is the only folding the filesystem can apply to what is written; the
+/// collisions that mapping itself creates (`lint fast` and `lint-fast`) are the
+/// log writer's, `SWEEP-CONFIG-PARSE-011`.
+///
+/// **On a sequential run's resume those two refusals are warnings.** Both
+/// shapes were legal to record before 2026-09-05, and `design/15` is explicit
+/// that gates are taken from the record and not refused over: today's section
+/// is read only to be compared with the recorded gates, so refusing over it
+/// would strand a run for a section that does not govern it. This is the
+/// reading `[engine] max_parallel` already takes through [`EngineLimits`], and
+/// it is applied here to the two shapes and to nothing else — a blank field or
+/// a zero timeout never recorded a run, so those refuse on both readings.
 ///
 /// # Errors
 ///
 /// [`UpstrokeError::Config`] naming the entry by position: `gates` is not an
 /// array; an entry is not a table of `name`, `cmd` and optional `timeout_secs`;
-/// a blank `name` or `cmd`; `timeout_secs = 0`; a `name` an earlier entry has.
-/// `Ok(None)` is an absent section and `Ok(Some(vec![]))` an explicitly empty
-/// one — the parent's `Config::gates` says what each means.
+/// a blank `name` or `cmd`, naming which; `timeout_secs = 0`; and, under
+/// [`EngineLimits::Fresh`] only, a key outside those three or a `name` an
+/// earlier entry has (compared without regard to ASCII case) — under
+/// [`EngineLimits::SequentialResume`] each of those is a warning in `warnings`
+/// naming the recorded gates as what runs, and the entry is kept so the record
+/// can be compared with it. `Ok(None)` is an absent section and
+/// `Ok(Some(vec![]))` an explicitly empty one — the parent's `Config::gates`
+/// says what each means.
 pub(super) fn parse_gates(
     raw: Option<toml::Value>,
     repo_path: &Path,
+    limits: EngineLimits,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<Vec<GateConfig>>, UpstrokeError> {
     let Some(value) = raw else { return Ok(None) };
     let toml::Value::Array(entries) = value else {
@@ -433,23 +460,57 @@ pub(super) fn parse_gates(
                 ),
             )
         })?;
-        if g.name.trim().is_empty() || g.cmd.trim().is_empty() {
-            return Err(config_error(
-                repo_path,
-                format!("[[gates]] entry {n} needs a non-empty `name` and `cmd`"),
-            ));
-        }
-        if let Some(earlier) = list.iter().position(|gate| gate.name == g.name) {
+        let blank: Vec<&str> = [
+            ("name", g.name.trim().is_empty()),
+            ("cmd", g.cmd.trim().is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(key, is_blank)| is_blank.then_some(key))
+        .collect();
+        if !blank.is_empty() {
             return Err(config_error(
                 repo_path,
                 format!(
-                    "[[gates]] entry {n} repeats the name `{}` of entry {}: a gate's name is \
-                     what its log file and its failure report carry, so two gates cannot share \
-                     one — give each gate a name of its own",
-                    g.name,
-                    earlier + 1
+                    "[[gates]] entry {n}: `{}` is blank — each entry needs a non-empty `name` \
+                     and `cmd`",
+                    blank.join("` and `")
                 ),
             ));
+        }
+        if !g.unknown.is_empty() {
+            let keys: Vec<&str> = g.unknown.keys().map(String::as_str).collect();
+            refuse_or_announce(
+                limits,
+                format!(
+                    "[[gates]] entry {n} (`{}`) has unknown key `{}` (each entry takes `name`, \
+                     `cmd`, and an optional `timeout_secs` integer)",
+                    g.name,
+                    keys.join("`, `")
+                ),
+                repo_path,
+                warnings,
+            )?;
+        }
+        if let Some((earlier, first)) = list
+            .iter()
+            .enumerate()
+            .find(|(_, gate)| gate.name.eq_ignore_ascii_case(&g.name))
+        {
+            refuse_or_announce(
+                limits,
+                format!(
+                    "[[gates]] entry {n} repeats the name `{}` of entry {} (`{}`; names are \
+                     compared without regard to ASCII case, because a case-insensitive \
+                     filesystem keeps one log file for both): a gate's name is what its log \
+                     file and its failure report carry, so two gates cannot share one — give \
+                     each gate a name of its own",
+                    g.name,
+                    earlier + 1,
+                    first.name
+                ),
+                repo_path,
+                warnings,
+            )?;
         }
         if g.timeout_secs == Some(0) {
             return Err(config_error(
@@ -473,6 +534,30 @@ pub(super) fn parse_gates(
         });
     }
     Ok(Some(list))
+}
+
+/// A `[[gates]]` shape a run could have been recorded under before it became a
+/// refusal: refused on a run being created now, announced on a sequential run's
+/// resume, where the recorded gates are what executes (`design/15`) and today's
+/// section is read only to be compared with them. See [`parse_gates`].
+fn refuse_or_announce(
+    limits: EngineLimits,
+    problem: String,
+    repo_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), UpstrokeError> {
+    match limits {
+        EngineLimits::Fresh => Err(config_error(repo_path, problem)),
+        EngineLimits::SequentialResume => {
+            warnings.push(format!(
+                "{problem}; in {} this resume runs the gates the run recorded, so today's \
+                 [[gates]] is read only to be compared with them, and a fresh run refuses this \
+                 shape",
+                repo_path.display()
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// `[engine]` (§17).
@@ -839,19 +924,21 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_gate_key_is_refused_and_named() {
+    fn an_unknown_gate_key_is_refused_on_a_fresh_run_and_announced_on_a_resume() {
         // `timeout_sec = 3600` on a gate that needs an hour used to be a gate
         // killed at the 600 s default, with nothing said.
+        let body = "[[gates]]\nname = \"test\"\ncmd = \"cargo test\"\ntimeout_sec = 3600\n";
+        let mut warnings = Vec::new();
         let message = refused(
             parse_gates(
-                section("[[gates]]\nname = \"test\"\ncmd = \"cargo test\"\ntimeout_sec = 3600\n")
-                    .get("gates")
-                    .cloned(),
+                section(body).get("gates").cloned(),
                 path(),
+                EngineLimits::Fresh,
+                &mut warnings,
             ),
             "timeout_sec",
         );
-        assert!(message.contains("[[gates]] entry 1"), "{message}");
+        assert!(message.contains("[[gates]] entry 1 (`test`)"), "{message}");
         assert!(
             message.contains("`timeout_sec`"),
             "the message must name the key: {message}"
@@ -860,13 +947,45 @@ mod tests {
             message.contains("`timeout_secs`"),
             "the message must name what is accepted: {message}"
         );
+        assert!(
+            warnings.is_empty(),
+            "a refusal is not also a warning: {warnings:?}"
+        );
+
+        // A run recorded under the old rules is resumed through the same file:
+        // the key is named, the entry is kept at the default the typo left it
+        // at, and the recorded gates are named as what runs.
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(body).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("a resume is not refused over a section it does not run")
+        .expect("the section was present");
+        assert_eq!(
+            gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
+            vec![DEFAULT_GATE_TIMEOUT]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings.first().is_some_and(|warning| {
+                warning.contains("`timeout_sec`") && warning.contains("recorded")
+            }),
+            "{warnings:?}"
+        );
+
         // The control: the same entry with the key spelt right, and the value
-        // reaches the gate.
+        // reaches the gate under either reading.
+        let mut warnings = Vec::new();
         let gates = parse_gates(
             section("[[gates]]\nname = \"test\"\ncmd = \"cargo test\"\ntimeout_secs = 3600\n")
                 .get("gates")
                 .cloned(),
             path(),
+            EngineLimits::Fresh,
+            &mut warnings,
         )
         .expect("the accepted keys load")
         .expect("the section was present");
@@ -874,20 +993,21 @@ mod tests {
             gates.iter().map(|gate| gate.timeout).collect::<Vec<_>>(),
             vec![Duration::from_secs(3600)]
         );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
-    fn two_gates_with_one_name_are_refused_and_both_entries_are_named() {
+    fn two_gates_with_one_name_are_refused_on_a_fresh_run_and_announced_on_a_resume() {
+        let repeated = "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\n\
+                        [[gates]]\nname = \"test\"\ncmd = \"cargo test\"\n\
+                        [[gates]]\nname = \"check\"\ncmd = \"cargo clippy\"\n";
+        let mut warnings = Vec::new();
         let message = refused(
             parse_gates(
-                section(
-                    "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\n\
-                     [[gates]]\nname = \"test\"\ncmd = \"cargo test\"\n\
-                     [[gates]]\nname = \"check\"\ncmd = \"cargo clippy\"\n",
-                )
-                .get("gates")
-                .cloned(),
+                section(repeated).get("gates").cloned(),
                 path(),
+                EngineLimits::Fresh,
+                &mut warnings,
             ),
             "a repeated name",
         );
@@ -897,17 +1017,72 @@ mod tests {
             message.contains("of entry 1"),
             "names the earlier entry: {message}"
         );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Two names that differ only in ASCII case are one log file on NTFS
+        // and on APFS as shipped, so they are one name here on every platform.
+        let mut warnings = Vec::new();
+        let message = refused(
+            parse_gates(
+                section(
+                    "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\n\
+                     [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
+                )
+                .get("gates")
+                .cloned(),
+                path(),
+                EngineLimits::Fresh,
+                &mut warnings,
+            ),
+            "a name repeated in another case",
+        );
+        assert!(
+            message.contains("entry 2 repeats the name `Check` of entry 1 (`check`"),
+            "{message}"
+        );
+        assert!(message.contains("ASCII case"), "says why: {message}");
+
+        // A run recorded under the old rules is resumed through the same file:
+        // both entries are kept, so the record can be compared with them, and
+        // the repeat is announced with the recorded gates named as what runs.
+        let mut warnings = Vec::new();
+        let gates = parse_gates(
+            section(repeated).get("gates").cloned(),
+            path(),
+            EngineLimits::SequentialResume,
+            &mut warnings,
+        )
+        .expect("a resume is not refused over a section it does not run")
+        .expect("the section was present");
+        assert_eq!(
+            gates
+                .iter()
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["check", "test", "check"]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings.first().is_some_and(|warning| {
+                warning.contains("entry 3 repeats the name `check`") && warning.contains("recorded")
+            }),
+            "{warnings:?}"
+        );
+
         // The control: the same three commands under three names, kept in file
-        // order. Two names that differ only in case are two names.
+        // order, with nothing announced.
+        let mut warnings = Vec::new();
         let gates = parse_gates(
             section(
                 "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\n\
                  [[gates]]\nname = \"test\"\ncmd = \"cargo test\"\n\
-                 [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
+                 [[gates]]\nname = \"clippy\"\ncmd = \"cargo clippy\"\n",
             )
             .get("gates")
             .cloned(),
             path(),
+            EngineLimits::Fresh,
+            &mut warnings,
         )
         .expect("distinct names load")
         .expect("the section was present");
@@ -916,8 +1091,40 @@ mod tests {
                 .iter()
                 .map(|gate| gate.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["check", "test", "Check"]
+            vec!["check", "test", "clippy"]
         );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_blank_gate_field_is_named() {
+        // A blank field refuses on both readings — no run was ever recorded
+        // with one — and the refusal says which field, where it used to say
+        // only that one of the two was blank.
+        for (body, expected) in [
+            ("name = \"\"\ncmd = \"cargo test\"\n", "`name` is blank"),
+            ("name = \"test\"\ncmd = \" \"\n", "`cmd` is blank"),
+            ("name = \"\"\ncmd = \"\"\n", "`name` and `cmd` is blank"),
+        ] {
+            for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+                let mut warnings = Vec::new();
+                let message = refused(
+                    parse_gates(
+                        section(&format!("[[gates]]\n{body}")).get("gates").cloned(),
+                        path(),
+                        limits,
+                        &mut warnings,
+                    ),
+                    expected,
+                );
+                assert!(message.contains(expected), "{limits:?}: {message}");
+                assert!(
+                    message.contains("[[gates]] entry 1"),
+                    "{limits:?}: {message}"
+                );
+                assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+            }
+        }
     }
 
     #[test]
