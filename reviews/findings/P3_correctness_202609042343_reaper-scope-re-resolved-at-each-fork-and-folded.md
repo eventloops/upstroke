@@ -33,8 +33,27 @@ none at `425ad55`).
 ## What the change that takes this up should do
 
 Resolve once. Either store the scope with its program already resolved — a `ReaperContainerScope`
-whose `program` is the absolute path `resolve_reaper_program` returned — so the fork-time render
-can fail only on the interior-NUL check arm time already passed, or store the rendered `CString`s
-and build the pointer array per fork. Then `container_scope_for_a_new_reaper` has nothing to fold,
-and `set_container_reclaim_scope`'s module doc in `ambient.rs`, which now says the `PATH` read
-happens when the scope is armed and again as each reaper starts, says it happens once.
+whose `program` is the path `resolve_reaper_program` returned, which is a `PATH` entry joined to the
+name and is relative when that entry was (measured; `find_program` does not canonicalise) — so the
+fork-time render can fail only on the interior-NUL check arm time already passed, or store the
+rendered `CString`s and build the pointer array per fork. Then `container_scope_for_a_new_reaper`
+has nothing to fold, and the module doc in `ambient.rs`, which now says the `PATH` read happens when
+the scope is armed and again as each reaper starts, says it happens once. A relative stored path
+still depends on the working directory at fork time; resolving to an absolute path at arm time
+closes that too, and is the better of the two.
+
+## Measured
+
+At `7150ea9`, with an uncommitted probe inside `termination`'s test module (private functions), run
+alone under `--exact`, tree restored afterwards. A directory holding an executable stub named
+`upstroke-probe-010-docker` was prepended to `PATH`; a scope was built over that bare name;
+`set_container_reclaim_scope(Some(&scope))` returned `Ok`; `container_scope_for_a_new_reaper()`
+returned `Some`; the stub file was removed; `container_scope_for_a_new_reaper()` returned `None`.
+
+```
+PROBE010 armed-render-some=true after-removal-render-some=false
+```
+
+The sequence above fires as written: arming succeeded and the next reaper would have been forked
+with no container scope and no diagnostic. The full probe is quoted in PR #147's comment of
+2026-09-05 00:28Z.
