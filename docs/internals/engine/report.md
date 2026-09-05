@@ -205,12 +205,12 @@ Whether an engine is driving this run right now.
 
 Whether this run stopped without ever recording that it finished.
 
-## `pub(super) fn build_report(header: ReportHeader<'_>, plan: …` › `.chain((0..plan.tasks.len()).filter(|i| !state.order.contains(i)))`
+## `pub(super) fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunReport {` › `.chain((0..plan.tasks.len()).filter(|i| !state.order.contains(i)))`
 
 Tasks that never started append in plan order, so the report reads
 as the run happened and still accounts for everything.
 
-## `pub(super) fn build_report(header: ReportHeader<'_>, plan: …` › `let pool_drain = capacity::drain_of(state.progress.iter().flat_map(|p| p.records.iter()))`
+## `pub(super) fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunReport {` › `let pool_drain = capacity::drain_of(state.progress.iter().flat_map(|p| p.records.iter()))`
 
 §13's second currency: what each subscription drained, folded from the
 same attempt records the dollar column comes from — so the two halves of
@@ -226,13 +226,13 @@ moment that question is answered — so if `Blocked` were folded in from the
 log, every resume would have to un-fold it. Deriving it fresh from whatever
 the log says is true right now means there is nothing to undo.
 
-## `fn settle(plan: &Plan, states: &[TaskState], running: bool)…` › `loop {`
+## `fn settle(plan: &Plan, states: &[TaskState], running: bool) -> Vec<TaskState> {` › `loop {`
 
 Blocking propagates: a dependent of a blocked task is blocked too.
 Repeat until stable rather than assuming plan order carries it — a plan
 may list a dependent before the task it waits on.
 
-## `fn settle(plan: &Plan, states: &[TaskState], running: bool)…` › `if !running {`
+## `fn settle(plan: &Plan, states: &[TaskState], running: bool) -> Vec<TaskState> {` › `if !running {`
 
 Whatever is still Pending was never reached: the run halted. A run that
 is still going has not halted — those tasks are queued, or one of them
@@ -254,11 +254,11 @@ blocked by it. Deciding this from `Done`-ness alone made `Queued`
 unreachable for every task with a dependency, so the entire first half of a
 live run read as a graph of failures.
 
-## `fn blocks_dependents(state: &TaskState, running: bool) -> b…` › `TaskState::Pending | TaskState::Deferred => !running,`
+## `fn blocks_dependents(state: &TaskState, running: bool) -> bool {` › `TaskState::Pending | TaskState::Deferred => !running,`
 
 Still on the way. Only an ended run turns that into "never".
 
-## `fn blocks_dependents(state: &TaskState, running: bool) -> b…` › `TaskState::AwaitingInput(_)`
+## `fn blocks_dependents(state: &TaskState, running: bool) -> bool {` › `TaskState::AwaitingInput(_)`
 
 Terminal even mid-run, which is what keeps the propagation working
 while the engine is still going: a parked dependency really does
@@ -410,7 +410,7 @@ and is said rather than left as a blank column that looks like
 Every attempt on this pool ran on a route that reports no
 spend (§13) — saying "$0.0000" would read as free.
 
-## `pub fn render_ledger(&self) -> String` › `"  stopped by [budgets] {} = ${:.4} before {} (§13)",`
+## `pub fn render_ledger(&self) -> String` › ``"  stopped by [budgets] {} = ${:.4} before `{}` (§13)",``
 
 The ledger annotates; `render` owns the outcome line and the
 resume advice. Printing both put two near-identical

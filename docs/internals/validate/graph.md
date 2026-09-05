@@ -24,13 +24,13 @@ extending here, and this line is what stops it. That is also what keeps this
 file out of `effects/allowlist.toml`: an allowance is what that file records,
 and this module takes none.
 
-## `pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), Upstroke…`
+## `pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {`
 
 Duplicate ids, unknown `depends` targets, then cycles — all collected so a
 broken plan reports everything in one run. On a clean graph, artifact
 wiring that contradicts the dependency order is surfaced as warnings.
 
-## `pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<S…` › `if problems.is_empty() {`
+## `pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {` › `if problems.is_empty() {`
 
 Cycle detection only makes sense on a graph whose edges all resolve.
 
@@ -40,7 +40,7 @@ A task that `needs` an artifact should depend — directly or transitively —
 on its producer, or execution order cannot guarantee the artifact exists.
 The plan is frozen (§5), so this warns rather than inventing edges.
 
-## `fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<St…` › `let Some(producer) = producer else { continue };`
+## `fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {` › `let Some(producer) = producer else { continue };`
 
 Unknown producers already warned during parsing.
 

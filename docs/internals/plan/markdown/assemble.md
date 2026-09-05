@@ -25,7 +25,7 @@ nothing but the adapter itself.
 Reserve explicit ids first so derived slugs never collide with them.
 Explicit duplicates are left intact for validation to report.
 
-## `pub(super) fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Ar…`
+## `pub(super) fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Artifact> {`
 
 Artifacts come from `out=` annotations; a bare plan with a Design task
 defaults to a conventions brief produced by the first one (§9).

@@ -57,6 +57,8 @@ pub(super) fn resume_harness_inner_on(
     };
     let events_path = public.join("events.jsonl");
 
+    // This unlocked header read only selects the inputs for read-only refusal.
+    // Resume adopts the authoritative log only after both leases are held below.
     let mut header_warnings = Vec::new();
     let header_events = events::read_all(&events_path, &mut header_warnings)?;
     let header = events::started_of(&header_events, &events_path)?.clone();
@@ -84,8 +86,17 @@ pub(super) fn resume_harness_inner_on(
 
     let workspace = Workspace::open(&opts.repo_root)?;
     let worktree_git_dir = workspace.worktree_git_dir()?;
+    // Acquire the physical worktree before the per-run lease, as a fresh run
+    // does. Success grants this conductor ownership of the shared Git state;
+    // a competing holder is refused before replay or branch mutation. Keep
+    // both guards for the whole resume and release them in reverse order on
+    // return or unwinding. The OS releases primary holds if the process dies;
+    // the lock implementation also refuses while prior agents are cleaning up.
     let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
 
+    // Claim the run before acting on its log, so two resumes cannot race into
+    // the same branch. The lock is in the known public directory; the private
+    // directory comes from the authoritative run_started read under this hold.
     let _lock = RunLock::acquire(&public)?;
     let _cleanup_scope = _lock.enter_cleanup_scope();
 

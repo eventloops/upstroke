@@ -198,12 +198,12 @@ releases — identity only, nothing cryptographic. CR bytes are skipped so a
 plan checked out with CRLF hashes the same as the LF original (git's
 autocrlf would otherwise make the same plan look changed across machines).
 
-## `fn a_verdict_without_needs_human_is_a_judgement_not_an_esca…` › `let verdict: Verdict =`
+## `fn a_verdict_without_needs_human_is_a_judgement_not_an_escalation() {` › `let verdict: Verdict =`
 
 Silence must mean "I judged it". A verdict written before the field
 existed, or by a model that ignored it, must not park the task.
 
-## `fn answers_round_trip_and_keep_declined_apart_from_unanswer…` › `for answer in [`
+## `fn answers_round_trip_and_keep_declined_apart_from_unanswered() {` › `for answer in [`
 
 The distinction decides whether a task Fails or parks (§12), so it
 has to survive serialization.

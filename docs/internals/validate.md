@@ -141,11 +141,11 @@ today's table, not a property: §13 says the catalog ships ahead of support
 (Aider models are catalogued in v0.2 before its adapter lands), and the
 moment it does, this is what stops a preview from promising them.
 
-## `pub fn run(opts: &ValidateOptions) -> Result<Report, Upstro…` › `gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);`
+## `pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {` › `gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);`
 
 Zero-spend preview of the §14 gate pre-flight: warn, never refuse.
 
-## `pub fn run(opts: &ValidateOptions) -> Result<Report, Upstro…` › `let reviews = review::plan_for(`
+## `pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {` › `let reviews = review::plan_for(`
 
 Who would judge the work (§11.2–§11.3), against the adapters this binary
 ships. A run asks the same question of the adapters its own harness
@@ -205,7 +205,7 @@ nothing moved, so anything outside the comparison is free to move.
 The plan, the repo config, the pools file, and the three worktree
 files the gate derivation consults are the whole set.
 
-## `fn an_analysis_is_parsed_out_of_the_captured_plan_not_a_sec…` › `let root = scratch_root("capturedplan");`
+## `fn an_analysis_is_parsed_out_of_the_captured_plan_not_a_second_read_of_it() {` › `let root = scratch_root("capturedplan");`
 
 The plan is an input like any other, and it was the one an earlier
 capture left out. Same interleaving as the config's: capture, let the
@@ -229,31 +229,31 @@ when this fires for real.
 
 And it passes what this build really does ship.
 
-## `fn the_preview_shows_who_reviews_without_promising_a_binary…` › `let root = env::temp_dir().join(format!("upstroke-validate-review-{}", std::process::id()…`
+## `fn the_preview_shows_who_reviews_without_promising_a_binary_it_cannot_probe() {` › `let root = env::temp_dir().join(format!("upstroke-validate-review-{}", std::process::id()));`
 
 §18: `validate` and `--dry-run` execute nothing, so they cannot check
 that a named reviewer is installed. Saying "would be, if installed"
 is the difference between a plan and a promise.
 
-## `fn the_preview_shows_who_reviews_without_promising_a_binary…` › `let rotate = rendered`
+## `fn the_preview_shows_who_reviews_without_promising_a_binary_it_cannot_probe() {` › `let rotate = rendered`
 
 The per-task decision belongs in the row that explains what this
 task's paths bought it — and only on the task whose paths matched.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_r…` › `assert!(`
+## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
 
 D2's seam is echoed even though nothing acts on it.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_r…` › `assert!(`
+## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
 
 §13's conservatism, visible: an unmeasured pool reads as unknown, and
 the block says that is not the same as full.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_r…` › `assert!(`
+## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
 
 A source the estimate did not read must not pass as accounted for.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_r…` › `assert!(rendered.contains("never probes"), "rendered:\n{rendered}");`
+## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(rendered.contains("never probes"), "rendered:\n{rendered}");`
 
 §18: this command executes nothing, and says which side of that line
 it is on rather than letting a preview read as a promise.

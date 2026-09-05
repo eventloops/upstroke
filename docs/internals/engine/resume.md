@@ -2,8 +2,9 @@
 
 Extended notes for [`src/engine/resume.rs`](../../../src/engine/resume.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
+The code is the authority for what it does. This file preserves the migrated prose;
+the concurrency protocol also remains at its source sites under standards §10 and §13.
+Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
 
 ## `#![allow(clippy::disallowed_methods)]`
@@ -132,7 +133,7 @@ AwaitingInput with no legal way to answer it again.
 Resolve the recorded private root before touching the worktree so a
 killed engine's durable snapshot registrations are reclaimed first.
 
-## `let recorded_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone…`
+## `let recorded_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());`
 
 §15's check, before anything is discarded: if HEAD moved, refusing has
 to leave the operator's tree exactly as they left it.

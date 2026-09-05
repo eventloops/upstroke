@@ -218,7 +218,7 @@ This task's §11.3 second opinion, where its paths asked for one.
 
 The run-level plan's answer for the task at `index`.
 
-## `pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Vec<ReviewP…`
+## `pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Vec<ReviewPass> {`
 
 The ordered passes for one task, given the binding the implementer is
 actually running on.
@@ -414,7 +414,7 @@ implementer's descriptor does not would make that comparison always
 false — silently retiring the check that stops a model reviewing its own
 work. The comparison is about identity; effort is not identity.
 
-## `pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> WorkerProfile…`
+## `pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> WorkerProfile {`
 
 A read-only profile bound to the same rung the reviewer is configured for.
 
@@ -487,18 +487,18 @@ hung process just spends again for the same result.
 answered — it just never answered in a shape that means anything — so
 this is a genuine no-pass, not an outage.
 
-## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, …` › `prompt.push_str(cx.lens.preamble());`
+## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {` › `prompt.push_str(cx.lens.preamble());`
 
 What distinguishes this pass from the others, if anything (§11.5). It
 leads, because it frames everything below it.
 
-## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, …` › `if !cx.decisions.is_empty() {`
+## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {` › `if !cx.decisions.is_empty() {`
 
 Above the fence, and framed as instruction rather than data: unlike
 everything below, this came from the operator, and a criterion that
 reads "the policy the operator chose" is unjudgeable without it.
 
-## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, …` › `for (name, content) in cx.artifacts {`
+## `fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {` › `for (name, content) in cx.artifacts {`
 
 Everything below is agent-authored: the artifacts were written by an
 earlier task's agent and the diff by the very agent under review. It is
@@ -558,7 +558,7 @@ Any adapter contact is a test failure. Used to prove evidence-size
 refusal happens before permission materialization, command build, or
 model spend.
 
-## `fn build(&self, _run: &TaskRun) -> Result<crate::runner::Co…` › `let (marker, delay_ms) = if invocation == 0 {`
+## `fn build(&self, _run: &TaskRun) -> Result<crate::runner::CommandSpec, UpstrokeError> {` › `let (marker, delay_ms) = if invocation == 0 {`
 
 0.4 and 0.75 of `verdict_reask_uses_the_remaining_pass_deadline`'s
 3s budget. The ratios are what the test is about and they are
@@ -566,7 +566,7 @@ unchanged; only the absolute scale moved, and it moved because
 0.4 of *one* second left 599ms for a process spawn. See that
 test for the measurement.
 
-## `fn a_mangled_final_verdict_never_falls_back_to_an_earlier_p…` › `for botched in [`
+## `fn a_mangled_final_verdict_never_falls_back_to_an_earlier_pass() {` › `for botched in [`
 
 The reviewer echoes the requested shape, then fails the change but
 botches the JSON. Falling back to the echo would commit a rejected
@@ -581,7 +581,7 @@ The old bare-JSON fallback turned this exact reply into pass=true.
 §12's escalation channel. Absent means "I judged it"; a sloppy
 non-boolean must not park a task either.
 
-## `fn the_prompt_teaches_needs_human_without_offering_it_as_an…` › `assert!(`
+## `fn the_prompt_teaches_needs_human_without_offering_it_as_an_escape_hatch() {` › `assert!(`
 
 The schema must still be unparseable, or a model echoing it would
 produce an authoritative-looking verdict (step-6 finding 4).
@@ -623,7 +623,7 @@ review two role members — "{worker, gate(n), **review_pass(n)**,
 carries `review_reask(n)`, not a second run of `review_pass(n)`. The
 expected values are written from that sentence.
 
-## `fn the_one_format_reask_is_its_own_invocation_not_a_second_…` › `timeout: Duration::from_secs(30),`
+## `fn the_one_format_reask_is_its_own_invocation_not_a_second_run_of_the_first() {` › `timeout: Duration::from_secs(30),`
 
 Generous, so the pass really performs both invocations rather
 than running out of clock the way the deadline test wants it to.
@@ -653,7 +653,7 @@ this test at the 3s scale, exactly as it did at 1s.
 A markdown file whose content is itself a fenced block — the exact
 shape that used to break out of the reviewer's ```diff fence.
 
-## `fn quoted_fences_in_the_diff_cannot_close_the_block()` › `assert!(prompt.contains("diff"), "fence escalated: {prompt}");`
+## `fn quoted_fences_in_the_diff_cannot_close_the_block()` › `````assert!(prompt.contains("````diff"), "fence escalated: {prompt}");`````
 
 The fence around the diff must be longer than any run inside it.
 
@@ -667,7 +667,7 @@ The fence around the diff must be longer than any run inside it.
 
 Primary at frontier, a reachable OpenAI alternative, one task.
 
-## `fn a_task_reviewed_by_its_own_author_rebinds_to_another_fam…` › `let plan = plan_with(None);`
+## `fn a_task_reviewed_by_its_own_author_rebinds_to_another_family() {` › `let plan = plan_with(None);`
 
 The step-6 carried item: at the frontier rung both binders resolve
 identically, so without this the reviewer IS the implementer.
@@ -677,7 +677,7 @@ identically, so without this the reviewer IS the implementer.
 sonnet-written code judged by opus is a genuine second look. Rebinding
 it would spend cross-vendor capacity on most of a run for nothing.
 
-## `fn without_an_alternative_the_primary_stands_even_when_it_w…` › `let mut plan = plan_with(None);`
+## `fn without_an_alternative_the_primary_stands_even_when_it_wrote_the_code() {` › `let mut plan = plan_with(None);`
 
 Single-vendor install: `plan_for` has already warned about this. The
 review still happens — refusing would make upstroke unusable without a
@@ -689,7 +689,7 @@ The trap: rebinding the primary here would resolve BOTH passes to
 copilot/gpt-5.3-codex, and opus-written code would lose its Anthropic review
 entirely — strictly worse than the self-review being avoided.
 
-## `fn the_probe_set_separates_required_agents_from_the_optiona…` › `let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));`
+## `fn the_probe_set_separates_required_agents_from_the_optional_one() {` › `let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));`
 
 The alternative is opportunistic, so its probe may fail without
 taking the run down; everything else is load-bearing.
@@ -715,27 +715,27 @@ the one file they all shared.
 
 A one-task plan whose paths can match an override.
 
-## `fn a_second_opinion_that_cannot_resolve_refuses_and_says_wh…` › `let cfg = scratch_config(`
+## `fn a_second_opinion_that_cannot_resolve_refuses_and_says_what_to_do() {` › `let cfg = scratch_config(`
 
 Step-6 finding #10's posture. The operator asked for two families;
 silently giving them one is the failure that finding exists to stop.
 
-## `fn a_single_vendor_build_warns_that_a_task_will_review_itse…` › `let cfg = scratch_config(`
+## `fn a_single_vendor_build_warns_that_a_task_will_review_itself() {` › `let cfg = scratch_config(`
 
 The visible half of the step-6 carried item: the run continues, but
 it says the check is weaker than it looks.
 
-## `fn a_single_vendor_build_warns_that_a_task_will_review_itse…` › `let mut quiet = Vec::new();`
+## `fn a_single_vendor_build_warns_that_a_task_will_review_itself() {` › `let mut quiet = Vec::new();`
 
 With the second vendor present there is nothing to warn about.
 
-## `fn a_task_that_never_runs_at_the_review_tier_is_not_warned_…` › `let cfg = scratch_config(`
+## `fn a_task_that_never_runs_at_the_review_tier_is_not_warned_about() {` › `let cfg = scratch_config(`
 
 Only a chain that can actually reach the reviewer's own binding is a
 self-review risk; warning about the rest is noise that trains people
 to ignore the warning that matters.
 
-## `fn review_disabled_and_a_second_opinion_asked_for_is_a_cont…` › `let cfg = scratch_config(`
+## `fn review_disabled_and_a_second_opinion_asked_for_is_a_contradiction() {` › `let cfg = scratch_config(`
 
 One key says judge nothing, the other says judge twice. Picking a
 winner silently would be the engine deciding how much verification

@@ -231,7 +231,7 @@ a doc comment, above the construction it was looking for — and reported one
 production construction where there are two. Same class as §4's
 self-referential greps, and the third time this slice has paid for it.
 
-## `pub(crate) fn attempt_record(attempt: u32, facts: AttemptFa…` › `detail: match facts.feedback {`
+## `pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRecord {` › `detail: match facts.feedback {`
 
 §11.4's feedback, onto the durable record — **for the caller
 that has nowhere else to put it**. It was dropped here entirely:

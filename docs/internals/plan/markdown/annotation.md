@@ -37,7 +37,7 @@ buffer offsets map linearly back to absolute spans.
 
 Complete comments in the buffer, as (absolute span, inner text).
 
-## `pub(super) fn take_comments(&mut self) -> Vec<(Range<usize>…` › `match self.buffer.rfind("<!--") {`
+## `pub(super) fn take_comments(&mut self) -> Vec<(Range<usize>, String)> {` › `match self.buffer.rfind("<!--") {`
 
 Keep a trailing partial comment buffered for the next event.
 

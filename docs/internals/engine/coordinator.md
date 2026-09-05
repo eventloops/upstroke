@@ -2,8 +2,9 @@
 
 Extended notes for [`src/engine/coordinator.rs`](../../../src/engine/coordinator.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
+The code is the authority for what it does. This file preserves the migrated prose;
+the concurrency protocol also remains at its source sites under standards §10 and §13.
+Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
 
 ## `#![allow(clippy::disallowed_methods)]`
@@ -199,7 +200,7 @@ inspection.
 
 Drain, settle, and report.
 
-## `pub(super) fn drain_and_report(&mut self) -> Result<RunRepo…` › `let partial = self.finish();`
+## `pub(super) fn drain_and_report(&mut self) -> Result<RunReport, UpstrokeError> {` › `let partial = self.finish();`
 
 The log already holds everything that happened, including the
 attempt this died inside — that is what `resume` reads. The
@@ -286,12 +287,12 @@ this loop is what guarantees that.
 
 Returns whether the task ended deferred.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let analysis = self.analysis;`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let analysis = self.analysis;`
 
 Copied out of `self` so they carry the run's lifetime rather than
 this method's `&mut self` borrow.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if let Some(exceeded) = self.budget_breach(index) {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if let Some(exceeded) = self.budget_breach(index) {`
 
 §13's ceiling, checked before EVERY spawn rather than once per
 task. The placement is the whole point: an escalation onto a
@@ -301,7 +302,7 @@ the one that dodged the budget. It never influences *what* binds
 — capacity-driven routing is v0.2 (§13) — only whether the next
 attempt happens at all.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `self.emit(EventBody::BudgetExceeded { data: exceeded })?;`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `self.emit(EventBody::BudgetExceeded { data: exceeded })?;`
 
 The ceiling is recorded first, and nothing below may take it
 back. It is what `outcome()` reads to return `BudgetExceeded`
@@ -310,7 +311,7 @@ job gating on it, and what `resume --budget` needs to find in
 order to have a stop to get past. Tidying up afterwards is a
 courtesy; the record is the run's account of itself.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if let Err(error) = workspace.discard_uncommitted() {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if let Err(error) = workspace.discard_uncommitted() {`
 
 The tree may still hold a rejected attempt's edits, kept by
 the ladder below for a resumed retry that is now never going
@@ -327,13 +328,13 @@ sibling discard on the error path below is `let _ =` for the
 same reason; this one warns, because here there is a report
 left to carry the warning.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let profile = super::assembly::implementer_profile(`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let profile = super::assembly::implementer_profile(`
 
 Attribution only (§13 read-only): which subscription pays for
 this attempt. Resolved here because it needs the run's config,
 and passed in.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let rung_number = u32::try_from(rung_index).unwrap_or(u32::MAX);`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let rung_number = u32::try_from(rung_index).unwrap_or(u32::MAX);`
 
 Recorded *before* the agent is spawned, so a process that dies
 mid-attempt leaves an `attempt_started` with no
@@ -341,48 +342,48 @@ mid-attempt leaves an `attempt_started` with no
 later replay an attempt was interrupted (§19's crash row) — the
 engine cannot write a record of its own death afterwards.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let result = {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let result = {`
 
 Scoped so every borrow the attempt takes on `self` is released
 before the ladder updates this task's progress below.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `feedback: self.state.progress[index].feedback.clone(),`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `feedback: self.state.progress[index].feedback.clone(),`
 
 Owned: the ladder appends to this task's feedback the
 moment the attempt returns, and one clone per attempt
 costs less than threading that borrow through.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `task_index: u32::try_from(index).unwrap_or(u32::MAX),`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `task_index: u32::try_from(index).unwrap_or(u32::MAX),`
 
 The legacy engine's own scope for an invocation
 identity: this task's position in the plan. See
 `AttemptCx::invocation`.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `decisions: self.state.progress[index]`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `decisions: self.state.progress[index]`
 
 The same entries the worker prompt quotes as operator
 instruction, routed to the judge as well (§12).
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `match run_attempt(&attempt_cx, workspace, resume.clone()) {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `match run_attempt(&attempt_cx, workspace, resume.clone()) {`
 
 Any error between the agent editing files and the verdict
 leaves the tree dirty; the run cannot continue but must not
 hand the user a half-staged workspace either (§14).
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let next = result.failure.as_ref().map(|failure| {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let next = result.failure.as_ref().map(|failure| {`
 
 Decide the ladder transition before writing the settlement, then
 carry both in one event. A failure record without its decision is
 not a safe crash prefix: replay would otherwise buy another
 attempt on the old rung or lose an outage refund.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `refund_attempt: kind == QuestionKind::Clarify || failure.is_outage(),`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `refund_attempt: kind == QuestionKind::Clarify || failure.is_outage(),`
 
 An outage or clarification never received a code
 verdict, so its allowance is returned even when
 the outage ceiling sends it to a human.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `let prepared_commit = if result.failure.is_none() {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `let prepared_commit = if result.failure.is_none() {`
 
 A passing attempt is turned into an immutable commit object and
 pinned before its settlement becomes durable. The event, HEAD
@@ -390,7 +391,7 @@ CAS, and pin deletion can therefore be recovered at every crash
 prefix without re-running paid work or trusting the mutable
 index.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `feedback: super::classify::FeedbackCarrier::LadderEvent,`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `feedback: super::classify::FeedbackCarrier::LadderEvent,`
 
 The legacy wire's own carrier. `ladder_retry` and
 `ladder_escalated` are appended with `summary` and
@@ -399,7 +400,7 @@ is rebuilt by replaying them, so a copy on the record
 would be the same kilobytes twice — once in the log
 and once in every `report.json`.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if let Err(cleanup) = self.workspace.discard_uncommitted() {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if let Err(cleanup) = self.workspace.discard_uncommitted() {`
 
 A write/flush/sync error cannot prove whether the newline-
 committed event reached disk. Deliberately retain a prepared
@@ -408,20 +409,20 @@ or publishes it if the complete settlement is readable.
 Deleting it here would turn an ambiguous sync error into a
 schema-3 settlement whose exact object is no longer durable.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if let Err(cleanup) = self.workspace.discard_uncommitted() {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if let Err(cleanup) = self.workspace.discard_uncommitted() {`
 
 The durable settlement is authoritative and already carries
 the complete question. A crash or write failure here cannot
 expose an orphan projection; resume rematerializes the
 question from the event before accepting an answer.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `self.workspace.discard_uncommitted()?;`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `self.workspace.discard_uncommitted()?;`
 
 Scrub gate side-effects (build artifacts, lockfile churn) so
 they cannot leak into the next task's captured diff; the
 commit recorded exactly the verified staged set.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if failure.kind != FailureKind::Interrupted`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if failure.kind != FailureKind::Interrupted`
 
 §13 source 1: a rate-limit signal is ground truth about a pool,
 and the only thing in v0.1 that can call one empty rather than
@@ -430,7 +431,7 @@ because they are facts with different lifetimes — the deferral is
 about this task's next move, this is about a subscription, and a
 later run's estimator reads it back out of the log.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `self.exhausted_pools.remove(&profile.pool);`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `self.exhausted_pools.remove(&profile.pool);`
 
 This attempt reached a model and got an answer, whatever the
 verdict on its code, so any pool it drew on is serving again.
@@ -439,7 +440,7 @@ own view so the two cannot disagree about when a pool
 recovered — without it, the *next* outage on the same pool
 would go unrecorded because the set still held it.
 
-## `fn step_task(&mut self, index: usize) -> Result<bool, Upstr…` › `if !matches!(next, Next::RetrySameRung { resume: true }) {`
+## `fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {` › `if !matches!(next, Next::RetrySameRung { resume: true }) {`
 
 §14: the tree survives only for a resumed retry, where the
 *cumulative* diff is what gets re-gated. Every other branch
@@ -575,20 +576,20 @@ operator asked to be consulted first.
 Attempts whose route reported no spend at all (§13), so the figures this
 run quotes are floors rather than totals.
 
-## `fn build_question(&self, index: usize, kind: QuestionKind, …` › `affected_tasks: vec![task.id.clone()],`
+## `fn build_question(&self, index: usize, kind: QuestionKind, context: String) -> Question {` › `affected_tasks: vec![task.id.clone()],`
 
 v0.1 parks only the task that raised it. Dependents are held by
 the graph, not by the question, so they stay eligible the moment
 an answer arrives.
 
-## `fn materialize_question(&mut self, question: &Question) -> …` › `interaction::write_question(`
+## `fn materialize_question(&mut self, question: &Question) -> Result<(), UpstrokeError> {` › `interaction::write_question(`
 
 Materialize before notifying: a recipient must always be able to open
 the payload it was told about. The caller decides whether the
 authoritative event belongs before (atomic settlement parking) or
 after (ordinary question flow) this projection.
 
-## `fn materialize_question(&mut self, question: &Question) -> …` › `if let Err(error) = notifier.ask(question) {`
+## `fn materialize_question(&mut self, question: &Question) -> Result<(), UpstrokeError> {` › `if let Err(error) = notifier.ask(question) {`
 
 A notifier that cannot deliver must not take the run with it: the
 question is already on disk either way (§12).
@@ -646,7 +647,7 @@ This runs only at a hard block, and each question is asked at most
 once: an `Unanswered` result marks it unreachable rather than looping
 back to a channel that already said nobody is there.
 
-## `fn resolve_one_question(&mut self) -> Result<bool, Upstroke…` › `self.sweep_answers()?;`
+## `fn resolve_one_question(&mut self) -> Result<bool, UpstrokeError> {` › `self.sweep_answers()?;`
 
 The channel may have been waiting on the very file the sweep reads,
 so sweep before applying what it returned — and then still apply it.
@@ -656,7 +657,7 @@ typed reply is absorbed, and if it answered a different one — an
 operator working through a backlog of parked tasks — this reply
 still lands instead of being discarded along with it.
 
-## `fn resolve_one_question(&mut self) -> Result<bool, Upstroke…` › `self.unanswerable.push(question.id);`
+## `fn resolve_one_question(&mut self) -> Result<bool, UpstrokeError> {` › `self.unanswerable.push(question.id);`
 
 §12 CI mode: the task stays parked and the run's exit status
 reports it. Not a failure — nobody rejected anything.

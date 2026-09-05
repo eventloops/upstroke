@@ -164,7 +164,7 @@ A misspelling here decides whether a failed task stops the run, so it
 errors rather than warning: silently halting a run the user asked to
 continue (or the reverse) is not a recoverable surprise.
 
-## `let limit = |key: &str, configured: Option<u32>, default: u32| -> Result<u32, UpstrokeErr…`
+## `let limit = |key: &str, configured: Option<u32>, default: u32| -> Result<u32, UpstrokeError> {`
 
 Zero has two readings — "no ceiling" and "nothing may run" — and which one
 happened must never be a surprise. The rule `attempts_per` and every

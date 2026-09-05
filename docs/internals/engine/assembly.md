@@ -301,18 +301,18 @@ substitution and not a behaviour change.
 `run::tests::the_frozen_pool_table_is_read_through_one_seam` holds the
 count at one. `reviews/FINDINGS.md` §19, claim (4).
 
-## `fn inputs(&self, request: &InputsRequest<'_>) -> Result<Rev…` › `artifacts: super::attempt::load_artifacts(`
+## `fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError> {` › `artifacts: super::attempt::load_artifacts(`
 
 Through the one production resolver, which reads the same two
 artifact lists the worker's prompt wired to real files.
 
-## `fn inputs(&self, request: &InputsRequest<'_>) -> Result<Rev…` › `stem: crate::util::filename_component(entry.display_id.as_str()),`
+## `fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError> {` › `stem: crate::util::filename_component(entry.display_id.as_str()),`
 
 **Through the sanitiser, exactly as the legacy engine does it.**
 See `Self::plan`'s stem for why this is a guard and not a
 convenience.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `self.pool_for(&request.binding.agent),`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `self.pool_for(&request.binding.agent),`
 
 Through the seam, which is what makes it *the* production
 resolution rather than one of three. This read
@@ -320,13 +320,13 @@ resolution rather than one of three. This read
 `Self::pool_for`'s body, character for character -- while that
 method's own doc said the plan builder read it.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `let gate_cmds: Vec<String> = self.gates.iter().map(|gate| gate.cmd.clone()).collect();`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `let gate_cmds: Vec<String> = self.gates.iter().map(|gate| gate.cmd.clone()).collect();`
 
 The cmdlines, not the specs: this is what the worker's prompt quotes
 as the bar it has to clear, and it is the same list the gate plans
 below turn into commands.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `stem: &crate::util::filename_component(entry.display_id.as_str()),`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `stem: &crate::util::filename_component(entry.display_id.as_str()),`
 
 **A task id is plan-authored input, and this becomes a filename.**
 
@@ -353,25 +353,25 @@ class in its most consequential form — the copy dropped a
 **guard** — and §4's "all paths through `std::path`" honoured
 mechanically while the value entering the path was untrusted.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `retry: brief.as_ref(),`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `retry: brief.as_ref(),`
 
 §11.4's brief, when there is one. A first dispatch has no
 feedback and passes `None`; a retry passes what the attempts
 before it failed on.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `let gates = self`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `let gates = self`
 
 Through `ShellGate::command`, the one production place a gate's
 cmdline becomes a spec.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `let reviewers = if let Some(bindings) = entry.reviews.bindings() {`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `let reviewers = if let Some(bindings) = entry.reviews.bindings() {`
 
 Through `FrozenReviews::bindings`, which is where `enabled` gates the
 plan — the same reader `FrozenReviews::obliged_lenses` projects, so
 the passes this dispatches and the passes the fold requires of the
 record are one answer rather than two.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `profile: {`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `profile: {`
 
 **The reviewer's effort, from §10's own review axis.** This
 said exactly that and then passed `request.binding.effort` —
@@ -382,7 +382,7 @@ it answers the question a reader would otherwise ask.
 `ResolvedEffortPolicy::review` is the axis, frozen on the
 entry beside the implementation efforts.
 
-## `fn plan(&self, request: &PlanRequest<'_>) -> Result<Attempt…` › `let mut profile = pass.profile(entry.ladder.effort.review);`
+## `fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {` › `let mut profile = pass.profile(entry.ladder.effort.review);`
 
 **A reviewer's pool is looked up from its own agent, not
 inherited from the implementer.** `coordinator.rs` states

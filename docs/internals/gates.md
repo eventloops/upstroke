@@ -168,15 +168,15 @@ cannot judge these without re-implementing the shell.
 §14 pre-flight: every gate command resolves. Hard error for path-resolving
 shells; PowerShell cmdlets downgrade to a warning.
 
-## `pub fn preview_resolution(gates: &[ShellGate], workspace_root: &Path, warnings: &mut Vec<…`
+## `pub fn preview_resolution(gates: &[ShellGate], workspace_root: &Path, warnings: &mut Vec<String>) {`
 
 `validate`/dry-run variant: same checks, warnings only, never refuses.
 
-## `fn resolution(gate: &ShellGate, workspace_root: &Path) -> R…` › `if cmd`
+## `fn resolution(gate: &ShellGate, workspace_root: &Path) -> Result<Resolution, UpstrokeError> {` › `if cmd`
 
 Shell syntax pre-flight cannot judge: quoting, operators, env prefixes.
 
-## `fn resolution(gate: &ShellGate, workspace_root: &Path) -> R…` › `probe_extensions(&workspace_root.join(candidate))`
+## `fn resolution(gate: &ShellGate, workspace_root: &Path) -> Result<Resolution, UpstrokeError> {` › `probe_extensions(&workspace_root.join(candidate))`
 
 Relative to the workspace, where the gate actually runs.
 
@@ -186,7 +186,7 @@ Derived default gates when `[[gates]]` is absent (§17: a fresh repo runs
 with zero config): recognized project markers map to the obvious
 compile+test commands. Unknown project shapes derive no gates.
 
-## `pub fn derive(root: &Path, shell: ShellKind) -> Vec<ShellGa…` › `if !script.contains("no test specified") {`
+## `pub fn derive(root: &Path, shell: ShellKind) -> Vec<ShellGate> {` › `if !script.contains("no test specified") {`
 
 npm init's placeholder always exits 1 — deriving it would
 make every zero-config run fail.
@@ -233,19 +233,19 @@ The expected rows are `cmd /C`, `sh -c`, `bash -c` and PowerShell's
 `-NoProfile -NonInteractive -Command` — the documented non-interactive
 invocation of each — with the command line as the last argument.
 
-## `fn every_shell_spells_its_invocation_the_way_the_record_say…` › `assert_eq!(expected.len(), 5);`
+## `fn every_shell_spells_its_invocation_the_way_the_record_says() {` › `assert_eq!(expected.len(), 5);`
 
 Every variant, and no more: a sixth shell has to be spelled here
 before it can be gated with.
 
-## `fn every_shell_spells_its_invocation_the_way_the_record_say…` › `let built = shell.command(LINE);`
+## `fn every_shell_spells_its_invocation_the_way_the_record_says() {` › `let built = shell.command(LINE);`
 
 The `Command` the runner builds from it says the same thing. On
 Windows `cmd`'s tail goes through `raw_arg`, which is why this
 is asserted through the runner's own translation rather than
 re-derived here.
 
-## `fn every_shell_spells_its_invocation_the_way_the_record_say…` › `let programs: std::collections::BTreeSet<String> =`
+## `fn every_shell_spells_its_invocation_the_way_the_record_says() {` › `let programs: std::collections::BTreeSet<String> =`
 
 Fixture hostility as a count: five shells, four distinct programs
 (PowerShell and pwsh are two programs with one flag set), and three
@@ -298,12 +298,12 @@ evidence authorizes nothing.
 Twelve supervised shapes — three exit codes crossed with both flags —
 plus the un-run process, which is not a verdict at all.
 
-## `fn a_shell_gate_maps_every_supervision_result_the_way_the_c…` › `const GRID: &[(Option<i32>, bool, bool, bool, &str)] = &[`
+## `fn a_shell_gate_maps_every_supervision_result_the_way_the_contract_says() {` › `const GRID: &[(Option<i32>, bool, bool, bool, &str)] = &[`
 
 (code, `timed_out`, `output_limited`, expected pass?, what the log
 must name).
 
-## `fn a_shell_gate_maps_every_supervision_result_the_way_the_c…` › `let seen = runner.seen();`
+## `fn a_shell_gate_maps_every_supervision_result_the_way_the_contract_says() {` › `let seen = runner.seen();`
 
 The request really is the one production sends for this role.
 
@@ -324,7 +324,7 @@ Both layers, because the propagation is the claim and it has two steps:
 short-circuit and the evidence file — hands it out rather than turning it
 into `Ok(Some(GateFailure))`.
 
-## `fn a_gate_whose_process_never_ran_returns_the_error_and_syn…` › `let runner = ScriptedRunner::new(Scripted::SpawnFailure);`
+## `fn a_gate_whose_process_never_ran_returns_the_error_and_synthesizes_nothing() {` › `let runner = ScriptedRunner::new(Scripted::SpawnFailure);`
 
 And through `run_all`, where the settlement would be synthesized. Two
 gates, so a short-circuit that returned `Ok(None)` after skipping
@@ -335,19 +335,19 @@ them both would still be caught by the count below.
 `git config` with a quoted value round-trips only if the shell
 preserved the quote grouping.
 
-## `fn resolution_enforces_simple_commands_and_skips_shelly_one…` › `for complex in [`
+## `fn resolution_enforces_simple_commands_and_skips_shelly_ones() {` › `for complex in [`
 
 Shell-complex commands are the shell's business, not pre-flight's.
 
-## `fn resolution_enforces_simple_commands_and_skips_shelly_one…` › `resolve_programs(&[gate("echo hello", 30)], &root, &mut warnings).expect("builtin ok");`
+## `fn resolution_enforces_simple_commands_and_skips_shelly_ones() {` › `resolve_programs(&[gate("echo hello", 30)], &root, &mut warnings).expect("builtin ok");`
 
 Builtins are legal starters.
 
-## `fn resolution_enforces_simple_commands_and_skips_shelly_one…` › `let script_rel = if cfg!(windows) {`
+## `fn resolution_enforces_simple_commands_and_skips_shelly_ones() {` › `let script_rel = if cfg!(windows) {`
 
 Workspace-relative scripts resolve against the workspace root.
 
-## `fn resolution_enforces_simple_commands_and_skips_shelly_one…` › `let ps = ShellGate {`
+## `fn resolution_enforces_simple_commands_and_skips_shelly_ones() {` › `let ps = ShellGate {`
 
 PowerShell cmdlets downgrade to a warning.
 

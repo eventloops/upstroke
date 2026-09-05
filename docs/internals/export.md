@@ -31,7 +31,7 @@ adding an internal field must not silently add a public JSON key.
 Load and validate one stable run snapshot. No config, source plan, adapter,
 or report is consulted.
 
-## `pub fn load(repo_root: &Path, wanted: &str) -> Result<Loade…` › `let projected = (|| {`
+## `pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, UpstrokeError> {` › `let projected = (|| {`
 
 Always perform the closing stability check before returning a projection
 error. Otherwise a racing resume could make a transient moving view look
@@ -55,6 +55,6 @@ retaining every timestamp an authentic Upstroke writer can produce.
 `:60` is not accepted blindly on a leap-year date, and even a
 historical leap second is outside the writer's supported subset.
 
-## `fn both_formats_preserve_start_order_reviews_and_frozen_fea…` › `fs::write(`
+## `fn both_formats_preserve_start_order_reviews_and_frozen_features() {` › `fs::write(`
 
 These current inputs are traps: the exporter must never consult them.

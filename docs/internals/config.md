@@ -562,7 +562,7 @@ rejects an unknown effort with a 400 *after* the turn has started
 (measured 2026-08-11), so a typo costs a whole attempt instead of a
 config error. Same posture as the pinned-model check above.
 
-## `const RUNNER_KEYS: &str = "kind, image, credential_volumes, mounts";`
+## ``const RUNNER_KEYS: &str = "`kind`, `image`, `credential_volumes`, `mounts`";``
 
 Every accepted `[runner]` key, written out.
 
@@ -587,7 +587,7 @@ container selection without going through a door this engine keeps locked.
 The section readers
 ---------------------------------------------------------------------------
 
-## `fn repo_config_location(repo_config: Option<&Path>, discover_in: &Path) -> (PathBuf, bool…`
+## `fn repo_config_location(repo_config: Option<&Path>, discover_in: &Path) -> (PathBuf, bool) {`
 
 Where a load looks for the repo config, and whether an absent file there is
 an error.
@@ -699,13 +699,13 @@ Empty discovery root so tests never pick up a real upstroke.toml.
 `review` is a routing role, not a task kind: parsed, echoed, and
 never warned about (DESIGN §17 configures it in its own example).
 
-## `fn an_override_may_ask_for_a_second_opinion_without_raising…` › `let path = scratch(`
+## `fn an_override_may_ask_for_a_second_opinion_without_raising_the_floor() {` › `let path = scratch(`
 
 Requiring `start_at` would force a no-op `start_at = "small"` on
 anyone who wants a cross-family reviewer on paths whose difficulty
 is already routed correctly.
 
-## `fn an_override_may_ask_for_a_second_opinion_without_raising…` › `assert_eq!(`
+## `fn an_override_may_ask_for_a_second_opinion_without_raising_the_floor() {` › `assert_eq!(`
 
 With no floor to apply, routing is untouched.
 
@@ -734,32 +734,32 @@ present — the original behavior remains intact.
 
 Reviewers judge at the review tier, which defaults to frontier.
 
-## `fn a_misspelled_effort_is_a_config_error_not_a_burned_attem…` › `let path = scratch(`
+## `fn a_misspelled_effort_is_a_config_error_not_a_burned_attempt() {` › `let path = scratch(`
 
 The provider rejects an unknown effort with a 400 after the turn has
 started (measured), so a typo would otherwise cost an attempt and
 report as an agent failure. Same posture as the pinned-model check.
 
-## `fn every_pool_key_parses_into_the_shape_the_estimator_reads…` › `assert_eq!(max.profile.as_deref(), Some("personal"));`
+## `fn every_pool_key_parses_into_the_shape_the_estimator_reads() {` › `assert_eq!(max.profile.as_deref(), Some("personal"));`
 
 D2's seam: two Claude Max pools differing only in `profile` parse and
 stay distinct. Nothing acts on the field in v0.1 — this is the shape
 being right ahead of the behaviour, deliberately.
 
-## `fn pool_mistakes_error_where_they_would_change_the_estimate…` › `let err = load_pools(`
+## `fn pool_mistakes_error_where_they_would_change_the_estimate_and_warn_where_they_degrade_it() {` › `let err = load_pools(`
 
 `kind` decides which estimator rule runs.
 
-## `fn pool_mistakes_error_where_they_would_change_the_estimate…` › `let err = load_pools(`
+## `fn pool_mistakes_error_where_they_would_change_the_estimate_and_warn_where_they_degrade_it() {` › `let err = load_pools(`
 
 Dropping `signals` by typo would discard §13's ground truth while the
 file still claims to have it.
 
-## `fn pool_mistakes_error_where_they_would_change_the_estimate…` › `for bad in ["safety_margin = 1.5", "reserve = -0.2"] {`
+## `fn pool_mistakes_error_where_they_would_change_the_estimate_and_warn_where_they_degrade_it() {` › `for bad in ["safety_margin = 1.5", "reserve = -0.2"] {`
 
 A "150% margin" has no degraded reading, only a wrong one.
 
-## `fn pool_mistakes_error_where_they_would_change_the_estimate…` › `warnings.clear();`
+## `fn pool_mistakes_error_where_they_would_change_the_estimate_and_warn_where_they_degrade_it() {` › `warnings.clear();`
 
 §17's own example ships `agent = "aider"`, which has no adapter in
 v0.1. Erroring would brick anyone who copied the documented file.
@@ -776,7 +776,7 @@ Wrong field type inside an entry.
 
 [engine] with a wrong type.
 
-## `fn wait_on_block_is_configurable_and_zero_means_do_not_wait…` › `let path = scratch("nowait.toml", "[interaction]\nwait_on_block_secs = 0\n");`
+## `fn wait_on_block_is_configurable_and_zero_means_do_not_wait() {` › `let path = scratch("nowait.toml", "[interaction]\nwait_on_block_secs = 0\n");`
 
 Zero is a real setting, not "unset" — it is how an operator says a
 detached run should end parked rather than hold the workspace.
@@ -820,7 +820,7 @@ alphabetical already, so nothing noticed.
 reading the design reaches for first. Accepting it silently would let
 them believe a pool was capped while nothing capped it.
 
-## `fn an_explicit_pools_path_that_does_not_exist_is_a_typo_not…` › `let absent = env::temp_dir()`
+## `fn an_explicit_pools_path_that_does_not_exist_is_a_typo_not_an_empty_machine() {` › `let absent = env::temp_dir()`
 
 Same rule `--config` has had: a path someone typed and that is not
 there is a mistake, and answering it with "no pools connected — run
@@ -850,7 +850,7 @@ workspace, or a run directory exists.
 One is not merely tolerated — it is the engine's actual behaviour, so
 writing it down deliberately must not warn.
 
-## `fn a_sequential_resume_warns_about_an_impossible_ceiling_ra…` › `let path = scratch("resumeparallel.toml", "[engine]\nmax_parallel = 3\n");`
+## `fn a_sequential_resume_warns_about_an_impossible_ceiling_rather_than_refusing_it() {` › `let path = scratch("resumeparallel.toml", "[engine]\nmax_parallel = 3\n");`
 
 The refusal above protects a promise about to be made. A run that
 already exists has made its promise, and it was a sequential one —
@@ -859,17 +859,17 @@ whose one fault is that someone edited a file it re-reads on the way
 back in. So the same value that stops a fresh run lets a resume
 through, says so by name, and leaves the recorded ceiling in place.
 
-## `fn a_sequential_resume_warns_about_an_impossible_ceiling_ra…` › `let mut fresh_warnings = Vec::new();`
+## `fn a_sequential_resume_warns_about_an_impossible_ceiling_rather_than_refusing_it() {` › `let mut fresh_warnings = Vec::new();`
 
 The same file, one line earlier in its life, still refuses.
 
-## `fn a_sequential_resume_warns_about_an_impossible_ceiling_ra…` › `for key in [`
+## `fn a_sequential_resume_warns_about_an_impossible_ceiling_rather_than_refusing_it() {` › `for key in [`
 
 What the resume softens is that one ceiling, not validation. A limit
 with no meaning at all is refused for a resume exactly as for a fresh
 run — otherwise "legacy" would become a way around every check.
 
-## `fn the_engine_limit_reading_follows_the_schema_the_run_reco…` › `for schema in 1..=LAST_SEQUENTIAL_SCHEMA {`
+## `fn the_engine_limit_reading_follows_the_schema_the_run_recorded() {` › `for schema in 1..=LAST_SEQUENTIAL_SCHEMA {`
 
 Sequential forever, by the topology design: a run recorded at schema
 1, 2 or 3 never becomes a parallel one, so its resume reads the
@@ -890,13 +890,13 @@ alone is a rule the next key added here quietly escapes.
 A value of the wrong shape is a mistake about the same setting, and
 must not fall through to the default the way an omitted key does.
 
-## `fn an_unknown_engine_key_warns_by_name_instead_of_vanishing…` › `let path = scratch(`
+## `fn an_unknown_engine_key_warns_by_name_instead_of_vanishing() {` › `let path = scratch(`
 
 `[engine]` used to drop every key it did not know, so a misspelled
 ceiling was indistinguishable from no ceiling at all. The typo below
 is the realistic one, and the operator has to be able to see it.
 
-## `fn an_unknown_engine_key_warns_by_name_instead_of_vanishing…` › `assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);`
+## `fn an_unknown_engine_key_warns_by_name_instead_of_vanishing() {` › `assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);`
 
 The typo bought nothing, which is exactly what the warning says.
 
@@ -913,13 +913,13 @@ ignored one.
 Written at their defaults they change nothing, so there is nothing to
 announce — the warning tracks the *value*, not the presence of a key.
 
-## `fn the_new_engine_limits_sit_beside_the_keys_that_already_w…` › `let path = scratch(`
+## `fn the_new_engine_limits_sit_beside_the_keys_that_already_worked() {` › `let path = scratch(`
 
 The section grew four keys; the two it already had must still be
 consumed from the same table, and the shell warning must still be the
 soft one while `on_task_failure` stays hard.
 
-## `fn a_load_validates_the_captured_bytes_and_not_a_second_rea…` › `let refusing = "[engine]\nmax_parallel = 3\n";`
+## `fn a_load_validates_the_captured_bytes_and_not_a_second_read_of_the_file() {` › `let refusing = "[engine]\nmax_parallel = 3\n";`
 
 The capture/read/restore race, driven by hand at the only speed a
 test can drive it. `refusing` is a config this engine must not run;
@@ -937,25 +937,25 @@ observations agree.
 What closes it is not a better comparison, it is having one read. The
 capture *is* the parser's input, so the answer below is A's.
 
-## `fn a_load_validates_the_captured_bytes_and_not_a_second_rea…` › `fs::write(&path, refusing).expect("A restored");`
+## `fn a_load_validates_the_captured_bytes_and_not_a_second_read_of_the_file() {` › `fs::write(&path, refusing).expect("A restored");`
 
 And back to A. The confirmation an engine performs here agrees with
 the capture — which is the trap, not the proof: agreement is only
 worth something because the thing it agrees with is what was parsed.
 
-## `fn a_load_validates_the_captured_bytes_and_not_a_second_rea…` › `let path = scratch("abaaccepted.toml", accepted);`
+## `fn a_load_validates_the_captured_bytes_and_not_a_second_read_of_the_file() {` › `let path = scratch("abaaccepted.toml", accepted);`
 
 The same claim the other way round, so this cannot pass by refusing
 everything: a captured config that is fine stays fine while the file
 is briefly one that would be refused. A run must inherit neither a
 refusal nor an acceptance from bytes it never held.
 
-## `fn a_capture_covers_the_pools_file_as_well_as_the_repo_conf…` › `let repo = scratch("capturedpools-config.toml", "[engine]\nshell = \"bash\"\n");`
+## `fn a_capture_covers_the_pools_file_as_well_as_the_repo_config() {` › `let repo = scratch("capturedpools-config.toml", "[engine]\nshell = \"bash\"\n");`
 
 Two files feed a load, and a capture that covered one of them would
 leave the other free to move unobserved between a check and its use.
 
-## `fn a_capture_covers_the_pools_file_as_well_as_the_repo_conf…` › `fs::write(`
+## `fn a_capture_covers_the_pools_file_as_well_as_the_repo_config() {` › `fs::write(`
 
 A pool named only by the transient file must not reach the config.
 
@@ -1038,7 +1038,7 @@ known to fit rather than assumed to.
 Second field held constant: the runtime, which holds exactly what the
 TOML names, so every assertion is about the value that crossed the seam.
 
-## `fn a_container_section_parses_into_the_selection_resolution…` › `let empty = FakeRuntime::new(ContainerTrace::off());`
+## `fn a_container_section_parses_into_the_selection_resolution_consumes() {` › `let empty = FakeRuntime::new(ContainerTrace::off());`
 
 The control: the same TOML against a runtime that holds nothing is
 refused, so the success above is about what the runtime had.
@@ -1054,11 +1054,11 @@ pins that the refusal is a property of `refuse_legacy_container_selection`
 alone, so deleting it from `parse_runner` is a distinct, separately
 witnessed kill.
 
-## `fn the_legacy_refusal_is_about_the_kind_and_about_nothing_e…` › `assert_eq!(`
+## `fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {` › `assert_eq!(`
 
 The two selections differ in the kind and in nothing else.
 
-## `fn the_legacy_refusal_is_about_the_kind_and_about_nothing_e…` › `let expected = match limits {`
+## `fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {` › `let expected = match limits {`
 
 The message says which reading it is, so an operator can tell a
 refused fresh run from a refused resume.

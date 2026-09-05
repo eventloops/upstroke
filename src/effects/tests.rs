@@ -4678,6 +4678,11 @@ fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
 }
 
 #[test]
+fn the_production_code_region_excludes_typed_test_functions() {
+    oracles::typed_test_functions_are_removed_and_later_code_is_kept();
+}
+
+#[test]
 fn a_configured_attribute_in_prose_removes_nothing() {
     oracles::a_configured_attribute_in_prose_is_inert();
 }

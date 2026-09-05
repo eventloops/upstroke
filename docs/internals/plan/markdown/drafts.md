@@ -22,24 +22,24 @@ The confluence of the DAG: [`super::sections`], [`super::annotation`] and
 [`super::hints`] all feed it, and [`super::assemble`] consumes what it
 produces.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, w…` › `let mut annotation_spans: Vec<Range<usize>> = Vec::new();`
+## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut annotation_spans: Vec<Range<usize>> = Vec::new();`
 
 Spans of upstroke annotation comments (slice-relative), removed from body.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, w…` › `let mut armed = false;`
+## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut armed = false;`
 
 An `Acceptance:` paragraph or heading arms the next list.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, w…` › `let mut item_slots: Vec<usize> = Vec::new();`
+## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut item_slots: Vec<usize> = Vec::new();`
 
 Slots in `draft.acceptance`, one per open item, so a criterion with a
 nested sub-list keeps both its own text and the children, in order.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, w…` › `if let Event::Html(t) | Event::InlineHtml(t) = &event {`
+## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `if let Event::Html(t) | Event::InlineHtml(t) = &event {`
 
 HTML accumulates across events; everything else flushes it first.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, w…` › `Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,`
+## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,`
 
 Blocks that end an acceptance run; HTML comments and headings
 deliberately do not, so an invisible annotation between the
@@ -52,6 +52,6 @@ Fallback when a plan has no `##`/`###` sections: top-level checklist items
 plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
 would false-positive. Nested content joins the body.
 
-## `pub(super) fn checklist_drafts(raw: &str, warnings: &mut Ve…` › `Event::SoftBreak | Event::HardBreak => {`
+## `pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {` › `Event::SoftBreak | Event::HardBreak => {`
 
 A wrapped title must not run its words together.

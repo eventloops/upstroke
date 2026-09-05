@@ -72,6 +72,13 @@ pub(super) fn validate_inputs(
 }
 
 impl Validated {
+    // The caller holds the worktree lease throughout confirmation and execution.
+    // The unlocked capture only decided whether this command could start.
+    // Capture and validate again under the lease, then adopt that new analysis
+    // only when its bytes and limits agree with the previous capture. A changed
+    // capture becomes the next comparison input, never executable state. Three
+    // failed confirmations refuse instead of holding the lease indefinitely;
+    // the caller's guards release it on that error or on unwinding.
     pub(super) fn confirm_under_lease(
         self,
         opts: &RunOptions,

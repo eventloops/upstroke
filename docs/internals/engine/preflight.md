@@ -2,8 +2,9 @@
 
 Extended notes for [`src/engine/preflight.rs`](../../../src/engine/preflight.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
+The code is the authority for what it does. This file preserves the migrated prose;
+the concurrency protocol also remains at its source sites under standards §10 and §13.
+Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
 
 ## `pub(super) struct Preflight {`
@@ -190,7 +191,7 @@ registry: the harness is what can actually spawn something, and
 asking the wrong one would let a preview's answer stand in for a
 capability the run does not have.
 
-## `events::validate_review_identity(&review_plan, analysis.plan.tasks.len(), &opts.plan_path…`
+## `events::validate_review_identity(&review_plan, analysis.plan.tasks.len(), &opts.plan_path)?;`
 
 A legacy record is not trustworthy merely because its missing marker
 fields can be filled. Validate the complete inherited identity before
@@ -260,7 +261,7 @@ a validated key must not be a way around the validation: `--budget 0` and
 behaviours behind one mistyped number, where the config key refuses all
 three at load.
 
-## `pub(super) fn repo_relative(repo_root: &std::path::Path, path: &std::path::Path) -> Strin…`
+## `pub(super) fn repo_relative(repo_root: &std::path::Path, path: &std::path::Path) -> String {`
 
 A path as the run record should carry it: relative to the repo root where
 possible, so the record survives the repository being moved or cloned
@@ -281,7 +282,7 @@ continue with the snapshot, matching gates and effort.
 
 The effective gates, in full, as they stood at this moment.
 
-## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<Strin…`
+## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<String> {`
 
 What today's config would gate with, against what the run recorded — `None`
 when they agree.
@@ -297,18 +298,18 @@ legal in `[[gates]]`, so `find`-by-name silently answers for the wrong entry
 — reporting an edit nobody made, or finding every name present and claiming
 a reorder when a gate was added.
 
-## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &…` › `let mut unmatched: Vec<&GateSummary> = now.iter().collect();`
+## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<String> {` › `let mut unmatched: Vec<&GateSummary> = now.iter().collect();`
 
 Whole-gate multiset difference: what the record has that today lacks, and
 the reverse. Anything appearing in both cancels, however many times.
 
-## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &…` › `return Some(`
+## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<String> {` › `return Some(`
 
 Same gates, listed in a different order. Worth a line — the record is
 what runs, and the order it runs in decides which failure a task sees
 first — but not the same claim as a changed command.
 
-## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &…` › `let once = |gates: &[&GateSummary], name: &str| {`
+## `pub(super) fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<String> {` › `let once = |gates: &[&GateSummary], name: &str| {`
 
 A name in exactly one dropped and one added gate is one gate edited, not
 one removed and an unrelated one added. Only when it is unambiguous:

@@ -155,12 +155,12 @@ vendor answered and check which of them was asked at all.
 
 The last scripted entry repeats forever.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `return Ok(shell_spec(&format!("echo {REVIEW_MARKER}")));`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `return Ok(shell_spec(&format!("echo {REVIEW_MARKER}")));`
 
 No `current_dir`: the runner puts the process in
 `RunnerRequest.workspace`, which is `run.workspace`.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `let _ = fs::write(`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `let _ = fs::write(`
 
 Half-finished edits first, then die without
 unwinding — no destructors, no flush of anything the
@@ -169,7 +169,7 @@ this a faithful stand-in for a kill rather than a
 tidy shutdown, and it happens at a deterministic
 point instead of racing a signal.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `return Ok(CommandSpec::new(`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `return Ok(CommandSpec::new(`
 
 Return before editing anything: this attempt never gets to
 run, so it must not leave the workspace looking as though it
@@ -180,15 +180,15 @@ did.
 Delegate to the real generator so the engine's permission wiring is
 exercised, not stubbed out.
 
-## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, Ups…` › `let index = self`
+## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {` › `let index = self`
 
 `build` already consumed this invocation's slot.
 
-## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, Ups…` › `Effect::EditFile`
+## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {` › `Effect::EditFile`
 
 `Exit` never reaches here — `build` ends the process.
 
-## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, Ups…` › `| Effect::SpawnError`
+## `fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {` › `| Effect::SpawnError`
 
 `SpawnError` never reaches here either: the runner fails to
 spawn it, so nothing is parsed.
@@ -311,12 +311,12 @@ Held constant with the sibling above: the same fault, at the same append, in
 the same fixture. What varies is what is examined — the caller's return
 value there, the run directory here.
 
-## `fn a_returned_legacy_append_error_still_leaves_the_partial_…` › `let runs = opts.repo_root.join(".upstroke").join("runs");`
+## `fn a_returned_legacy_append_error_still_leaves_the_partial_report() {` › `let runs = opts.repo_root.join(".upstroke").join("runs");`
 
 The run directory the failed run created, found by its own log rather
 than by a run id the caller never received.
 
-## `fn a_returned_legacy_append_error_still_leaves_the_partial_…` › `let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");`
+## `fn a_returned_legacy_append_error_still_leaves_the_partial_report() {` › `let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");`
 
 The premise: the fault fired *inside* `drain()`, not during startup.
 `run_started` and the capacity snapshot are appends 1 and 2 and both must
@@ -332,7 +332,7 @@ error-return arm leaves a torn prefix rather than a complete line.
 Per task: implementer 0.01 + reviewer 0.05 (§11.2 reviews every
 attempt), so both spends are accounted for.
 
-## `fn an_oversized_review_diff_is_settled_once_before_the_task…` › `let paths = paths_of(&repo, &report.run_id);`
+## `fn an_oversized_review_diff_is_settled_once_before_the_task_parks() {` › `let paths = paths_of(&repo, &report.run_id);`
 
 Rewind to the exact atomic settlement, then add dirty residue to
 model death before ordinary post-attempt cleanup. Replay must retain
@@ -374,14 +374,14 @@ override.
 
 Same task, no override — the implicit anti-self-review path.
 
-## `fn a_second_opinion_runs_a_second_family_and_leaves_the_pri…` › `let repo = temp_engine_repo("secondopinion");`
+## `fn a_second_opinion_runs_a_second_family_and_leaves_the_primary_alone() {` › `let repo = temp_engine_repo("secondopinion");`
 
 §11.3: both verdicts must pass. And the primary must NOT rebind here
 even though it matches the implementer — rebinding would resolve both
 passes to copilot/gpt-5.3-codex and drop the Anthropic review entirely, which
 is worse than the self-review the rebind exists to prevent.
 
-## `fn a_second_opinion_runs_a_second_family_and_leaves_the_pri…` › `assert_eq!(t1.review_cost_usd, Some(0.10), "0.05 per pass");`
+## `fn a_second_opinion_runs_a_second_family_and_leaves_the_primary_alone() {` › `assert_eq!(t1.review_cost_usd, Some(0.10), "0.05 per pass");`
 
 Both reviewers' spend lands in the review column, not the worker's.
 
@@ -396,12 +396,12 @@ Passes short-circuit like gates do (§11.1): once one has said no, a
 second opinion on the same diff changes nothing and costs a frontier
 invocation to learn it.
 
-## `fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_…` › `let repo = temp_engine_repo("selfreview");`
+## `fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_it() {` › `let repo = temp_engine_repo("selfreview");`
 
 The item carried since step 6: both binders resolve `frontier`
 identically, so without the rebind the reviewer IS the implementer.
 
-## `fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_…` › `let source = cross_vendor(`
+## `fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_it() {` › `let source = cross_vendor(`
 
 The claude adapter's review script says FAIL and the copilot one says
 PASS, so a committed task proves which of them was actually asked.
@@ -413,33 +413,33 @@ genuine second look, so nothing rebinds. Triggering on family
 similarity instead of exact identity would send most of a run
 cross-vendor for no verification gain.
 
-## `fn a_configured_second_opinion_with_no_second_family_refuse…` › `let repo = temp_engine_repo("nosecondfamily");`
+## `fn a_configured_second_opinion_with_no_second_family_refuses_before_spending() {` › `let repo = temp_engine_repo("nosecondfamily");`
 
 Step-6 finding #10's posture: the operator asked for two model
 families on their blast-radius paths. Quietly giving them one is the
 failure that finding exists to prevent, so this refuses instead.
 
-## `fn without_a_second_vendor_self_review_warns_rather_than_re…` › `let repo = temp_engine_repo("selfreviewwarn");`
+## `fn without_a_second_vendor_self_review_warns_rather_than_refusing() {` › `let repo = temp_engine_repo("selfreviewwarn");`
 
 The implicit rebind is upstroke's own idea, not the operator's, so a
 single-vendor machine loses the upgrade rather than the run — but it
 is told, because a verification property that quietly is not there is
 exactly what step 6 objected to.
 
-## `fn an_unprobeable_cross_family_reviewer_downgrades_instead_…` › `let repo = temp_engine_repo("brokencopilot");`
+## `fn an_unprobeable_cross_family_reviewer_downgrades_instead_of_halting() {` › `let repo = temp_engine_repo("brokencopilot");`
 
 Installed but broken is different from absent, and the two probe
 classes have to agree about which is which: the opportunistic
 reviewer only warns.
 
-## `fn an_unprobeable_cross_family_reviewer_downgrades_instead_…` › `assert!(`
+## `fn an_unprobeable_cross_family_reviewer_downgrades_instead_of_halting() {` › `assert!(`
 
 And it names the tasks. Resolution cannot reach this warning — a
 shipped binary always has the Copilot adapter, so the only way the
 rebind really goes missing is a probe failure, and a warning that
 never fires for a real user is not a warning.
 
-## `fn the_same_broken_reviewer_is_fatal_when_the_config_asked_…` › `let repo = temp_engine_repo("brokenrequired");`
+## `fn the_same_broken_reviewer_is_fatal_when_the_config_asked_for_it() {` › `let repo = temp_engine_repo("brokenrequired");`
 
 Same machine, same breakage — but now a `second_opinion` names it, so
 it is load-bearing rather than opportunistic.
@@ -465,13 +465,13 @@ nothing — so t1 exhausts its chain and parks, still unbuilt.
 Second process: copilot has appeared since. The record still rules,
 so the retry is judged by the model the run started with.
 
-## `fn resume_restores_the_recorded_worker_binding_before_prefl…` › `let resumed = resume_answering(&repo, &run_id, Effect::EditFile);`
+## `fn resume_restores_the_recorded_worker_binding_before_preflight() {` › `let resumed = resume_answering(&repo, &run_id, Effect::EditFile);`
 
 `resume_answering` exposes only the Claude fake. If pre-flight probes
 today's Copilot pin before restoring the record, this refuses before
 the behavioral assertions below can run.
 
-## `fn max_parallel_above_one_refuses_before_the_run_touches_th…` › `let repo = temp_engine_repo("maxparallelrefusal");`
+## `fn max_parallel_above_one_refuses_before_the_run_touches_the_workspace() {` › `let repo = temp_engine_repo("maxparallelrefusal");`
 
 The config refusal is only worth having if it lands before the run has
 done anything an operator must undo. Pre-flight loads the config ahead of
@@ -510,7 +510,7 @@ two do:
 
 (a) Uncontended: the refusal must not have created the lease file.
 
-## `fn a_refused_ceiling_beats_the_lease_rather_than_racing_it()` › `let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease"…`
+## `fn a_refused_ceiling_beats_the_lease_rather_than_racing_it()` › `let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease");`
 
 (b) Contended: the config error must still be the one that comes back.
 
@@ -527,7 +527,7 @@ fresh runs and resumes alike, so this refusal is genuinely about *when*.
 The fixture run created both lock files. Remove them, so that a file
 found afterwards is evidence about this resume rather than history.
 
-## `fn a_refused_ceiling_beats_both_locks_on_resume()` › `let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease"…`
+## `fn a_refused_ceiling_beats_both_locks_on_resume()` › `let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease");`
 
 And with the lease already held, so that an acquisition-first order
 could only ever answer with contention.
@@ -541,7 +541,7 @@ verbatim by every reading, it loads without refusing, and its value is
 visible on the `Analysis` — so "which bytes produced this analysis" has a
 direct answer rather than an inferred one.
 
-## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_…` › `let repo = temp_engine_repo("confirmunderlease");`
+## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_bytes_were_validated_from() {` › `let repo = temp_engine_repo("confirmunderlease");`
 
 The pre-lock check answers "may this start", from files the worktree did
 not yet belong to this run. Adopting *that* analysis afterwards would
@@ -549,28 +549,28 @@ execute an answer about bytes that no longer exist, so what the lease
 holder adopts is an analysis it captured and validated itself — on the
 condition that the two captures agree about what it was reading.
 
-## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_…` › `fs::write(&config, config_with_repairs(5)).expect("the config before the lease");`
+## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_bytes_were_validated_from() {` › `fs::write(&config, config_with_repairs(5)).expect("the config before the lease");`
 
 (a) A change that is still there at the lease is adopted, not papered
     over with the pre-lock reading. Nothing here is refused: the point is
     that a stale-adopting implementation returns 5 and a re-validating
     one returns 7, and only one of those is the config the run will hold.
 
-## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_…` › `fs::write(&config, config_with_repairs(5)).expect("the config before the lease");`
+## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_bytes_were_validated_from() {` › `fs::write(&config, config_with_repairs(5)).expect("the config before the lease");`
 
 (b) And if the change is one this engine must refuse, it refuses — under
     the lease rather than never. A run whose config was checked in an
     earlier life and replaced since is a run executing something nothing
     ever validated, which is the whole defect.
 
-## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_…` › `fs::write(&config, config_with_repairs(5)).expect("A");`
+## `fn the_analysis_adopted_under_the_lease_is_the_one_its_own_bytes_were_validated_from() {` › `fs::write(&config, config_with_repairs(5)).expect("A");`
 
 (c) The A-to-B-to-A interleaving, end to end. The excursion is invisible
     to both captures — which is precisely why the analysis may not come
     from a read taken beside them. It comes from the capture itself, so
     what is adopted is A whether or not B ever existed.
 
-## `fn the_gate_derivation_is_taken_under_the_lease_not_carried…` › `let repo = temp_engine_repo("gatesunderlease");`
+## `fn the_gate_derivation_is_taken_under_the_lease_not_carried_over_it() {` › `let repo = temp_engine_repo("gatesunderlease");`
 
 The one input `analyze` still reads from the filesystem rather than out
 of the capture: `gates::derive` is handed a directory. So the derivation
@@ -579,7 +579,7 @@ analysis cannot be the pre-lock one, and the files it looks at have to be
 in the captured set so that a change to them is a change this confirmation
 notices.
 
-## `fn the_gate_derivation_is_taken_under_the_lease_not_carried…` › `fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("a rust repo now");`
+## `fn the_gate_derivation_is_taken_under_the_lease_not_carried_over_it() {` › `fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("a rust repo now");`
 
 The repo becomes a Rust repo between the check and the lease.
 
@@ -588,7 +588,7 @@ The repo becomes a Rust repo between the check and the lease.
 What two runs of one fixture can never share: their run id, and the two
 absolute paths their identity is built out of.
 
-## `fn volatile_strings(repo: &Path, run_id: &str) -> Vec<Strin…` › `for path in [private_root_for(repo), repo.to_path_buf()] {`
+## `fn volatile_strings(repo: &Path, run_id: &str) -> Vec<String> {` › `for path in [private_root_for(repo), repo.to_path_buf()] {`
 
 Longest first, so a path that contains another is replaced whole.
 
@@ -606,7 +606,7 @@ names and the 26-character ULIDs are unshareable.
 One JSON value with everything two runs of one fixture legitimately differ
 by replaced by a token, in place.
 
-## `fn canonicalize_json(value: &mut serde_json::Value, volatil…` › `if matches!(key.as_str(), "ts" | "duration_ms" | "duration") {`
+## `fn canonicalize_json(value: &mut serde_json::Value, volatile: &[String]) {` › `if matches!(key.as_str(), "ts" | "duration_ms" | "duration") {`
 
 Wall-clock, not meaning. Everything else — cost, usage,
 effort, tier, model, reviewer, session, rung — is compared.
@@ -684,7 +684,7 @@ comparable across two repositories whose commits can never share a sha.
 Run one legacy fixture twice — once with the four ceilings in today's
 config, once without — and hand back what each resume did.
 
-## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_l…` › `for (fixture, tag) in [`
+## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {` › `for (fixture, tag) in [`
 
 The keys are new; the run is not. A resume that reads all four — the one
 a fresh run refuses among them — must continue exactly as it would have
@@ -703,62 +703,62 @@ on exactly the reinterpretation it exists to rule out. Three comparisons
 together close that: every event body, the report and its task records,
 and the tree the run actually committed.
 
-## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_l…` › `let mut open = 0i32;`
+## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {` › `let mut open = 0i32;`
 
 Sequential all the way through, stated as a property of the log
 rather than of the outcome: one attempt open at a time is what
 `max_parallel = 2` would have changed if anything acted on it.
 
-## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_l…` › `EventBody::AttemptFinished { .. } | EventBody::AttemptInterrupted { .. } => {`
+## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {` › `EventBody::AttemptFinished { .. } | EventBody::AttemptInterrupted { .. } => {`
 
 Both settlements close one: a crashed attempt's recovery
 record is as much an end as a finished one.
 
-## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_l…` › `for key in [`
+## `fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {` › `for key in [`
 
 Every one of the four is named, and only where it was written.
 
-## `fn a_log_written_before_step_9_still_gets_reviewed_on_resum…` › `let repo = temp_engine_repo("oldlogresume");`
+## `fn a_log_written_before_step_9_still_gets_reviewed_on_resume() {` › `let repo = temp_engine_repo("oldlogresume");`
 
 `RunStarted.reviews` is #[serde(default)] so a step-8 log still
 parses — but the default is an EMPTY plan, which every later reader
 cannot tell apart from `review = { enabled = false }`.
 
-## `fn a_log_written_before_step_9_still_gets_reviewed_on_resum…` › `let paths = paths_of(&repo, &first.run_id);`
+## `fn a_log_written_before_step_9_still_gets_reviewed_on_resume() {` › `let paths = paths_of(&repo, &first.run_id);`
 
 Rewrite run_started as a pre-step-9 process would have written it.
 
-## `fn a_log_written_before_step_9_still_gets_reviewed_on_resum…` › `let later = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);`
+## `fn a_log_written_before_step_9_still_gets_reviewed_on_resume() {` › `let later = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);`
 
 A reviewer that rejects everything: if review still runs, nothing can
 commit. If the absent field read as "review disabled", it commits —
 verification gone without a word, which is step-6 finding #10.
 
-## `fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rej…` › `let repo = temp_engine_repo("outagerecord");`
+## `fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rejection() {` › `let repo = temp_engine_repo("outagerecord");`
 
 Step-6 finding #8's distinction, carried into the ledger: a judge
 that never ran said nothing about the code, and recording it as a
 plain "did not pass" puts a rejection against a model that never read
 the diff.
 
-## `fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rej…` › `assert!(committed(&report, "t1"), "{report:?}");`
+## `fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rejection() {` › `assert!(committed(&report, "t1"), "{report:?}");`
 
 And the ladder treated it as an outage: deferred, then committed.
 
-## `fn a_total_missing_an_unreported_reviewer_is_marked_rather_…` › `let repo = temp_engine_repo("partialcost");`
+## `fn a_total_missing_an_unreported_reviewer_is_marked_rather_than_implied() {` › `let repo = temp_engine_repo("partialcost");`
 
 The Copilot route bills nothing back (§13), so a two-pass review
 shows one reviewer's spend. Presenting that as the total is exactly
 what `render_ledger` says is worse than no ledger at all.
 
-## `fn every_model_that_judged_a_task_is_listed_beside_the_cost…` › `let repo = temp_engine_repo("reviewtrail");`
+## `fn every_model_that_judged_a_task_is_listed_beside_the_cost_of_all_of_them() {` › `let repo = temp_engine_repo("reviewtrail");`
 
 An escalated task can be judged on one rung by one model and on the
 next by another. `review_cost_usd` sums every attempt, so a list
 scoped to the final attempt would read as though it explained a total
 it does not cover.
 
-## `fn every_model_that_judged_a_task_is_listed_beside_the_cost…` › `let source = cross_vendor(`
+## `fn every_model_that_judged_a_task_is_listed_beside_the_cost_of_all_of_them() {` › `let source = cross_vendor(`
 
 Mid fails review, escalates to frontier, which passes. The frontier
 rung is self-review, so its pass rebinds to the other family.
@@ -790,21 +790,21 @@ Present input: content is inlined.
 
 ---- step 7: the ladder in the engine ---------------------------------
 
-## `fn a_gate_failure_recovers_on_the_same_rung_via_session_res…` › `let repo = temp_engine_repo("resume");`
+## `fn a_gate_failure_recovers_on_the_same_rung_via_session_resume() {` › `let repo = temp_engine_repo("resume");`
 
 §21 definition-of-done (b). The gate demands a file only the second
 attempt writes, so recovery is real rather than scripted around.
 
-## `fn a_gate_failure_recovers_on_the_same_rung_via_session_res…` › `let files = git_in(&repo, &["show", "--name-only", "--format=", "HEAD"]);`
+## `fn a_gate_failure_recovers_on_the_same_rung_via_session_resume() {` › `let files = git_in(&repo, &["show", "--name-only", "--format=", "HEAD"]);`
 
 §14: a resumed retry keeps the tree, so the commit carries BOTH
 attempts' work rather than only the last one's.
 
-## `fn exhausting_a_rung_escalates_with_a_fresh_session_and_the…` › `let repo = temp_engine_repo("escalate");`
+## `fn exhausting_a_rung_escalates_with_a_fresh_session_and_the_history() {` › `let repo = temp_engine_repo("escalate");`
 
 §21 definition-of-done (c).
 
-## `fn exhausting_a_rung_escalates_with_a_fresh_session_and_the…` › `assert_eq!(runs[0].model, "claude-haiku-4-5");`
+## `fn exhausting_a_rung_escalates_with_a_fresh_session_and_the_history() {` › `assert_eq!(runs[0].model, "claude-haiku-4-5");`
 
 The adapter's own record, not just the report echoing what the
 engine intended: the second attempt really was dispatched to the
@@ -902,13 +902,13 @@ So the claim is exact: **strip `,"detail":null` and the bytes are the pre-change
 bytes.** Not "similar", and not asserted by rebuilding the expected value from the
 observed one — the strip must fire, and what is left must match key for key.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `const PRE_CHANGE_FAILURE: &str = concat!(`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `const PRE_CHANGE_FAILURE: &str = concat!(`
 
 The exact bytes `610106b` wrote for this scenario's failed attempt. Captured by
 building a worktree at that commit and running the same gate; not derived from
 anything this build produces.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `let bytes =`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `let bytes =`
 
 **The log's own bytes, sliced out of the line.** Not
 `serde_json::to_string(failure)`: a `Value` round-trip sorts keys, so
@@ -916,30 +916,30 @@ the field order the comparison is about would be the map's rather than
 the struct's, and the pre-change fixture's `,"detail":null` suffix
 would never appear where it actually appears.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `assert_eq!(`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `assert_eq!(`
 
 **Byte for byte against the captured fixture.** Not a key-set check and not a
 `starts_with`: every byte of `kind`, `origin` and `reason` must be what
 `610106b` wrote, so a changed reason — a different gate name, a reworded
 prefix, an extra suffix — fails here instead of passing a prefix predicate.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `let object = failure.as_object().expect("the failure is an object");`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `let object = failure.as_object().expect("the failure is an object");`
 
 The point of the whole finding: the tail is not on the record. Asserted as an
 **explicit null and not merely a falsy read** — `failure["detail"].is_null()`
 answers true for an absent key too, so it could not tell "the field is here
 and empty" from "the field is gone", which are different wires.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `if event`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `if event`
 
 And it is still delivered — by the carrier that owns it here.
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `let report: serde_json::Value = serde_json::from_str(`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `let report: serde_json::Value = serde_json::from_str(`
 
 `report.json` is the other reader of these records, and the reason
 `LadderRetry` holds the text instead: it "should not grow one per attempt".
 
-## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_atte…` › `let runs = source.adapter.runs();`
+## `fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {` › `let runs = source.adapter.runs();`
 
 The retry was still told. Delivery is the whole reason the field exists on the
 other engine, and removing it here must not cost the legacy one anything.
@@ -999,7 +999,7 @@ wrong string satisfies a presence check exactly as well as the right one.
 One failure's `detail` as the wire carries it, through the production
 builder rather than around it.
 
-## `fn durable_detail(failure: &crate::ladder::AttemptFailure) …` › `feedback: super::classify::FeedbackCarrier::AttemptRecord,`
+## `fn durable_detail(failure: &crate::ladder::AttemptFailure) -> Option<String> {` › `feedback: super::classify::FeedbackCarrier::AttemptRecord,`
 
 The schema-4 carrier, because that is the path under test: this
 helper exists to assert the field is written at all.
@@ -1028,24 +1028,24 @@ attempt", and losing the timeout's transcript-tail feedback.
 
 A genuine question on a completed run still parks the task.
 
-## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_caus…` › `let repo = temp_engine_repo("haltpark");`
+## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {` › `let repo = temp_engine_repo("haltpark");`
 
 t1 parks on a question, t2 fails terminally under the default halt
 policy. Asking about t1 afterwards spends the operator's attention
 on an answer no attempt can consume, and a decline would relabel
 `halted_at` with t1 — sending triage at the wrong task.
 
-## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_caus…` › `let source = source(`
+## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {` › `let source = source(`
 
 t1 asks and parks; t2 changes nothing and parks on chain exhaustion.
 
-## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_caus…` › `let answers = ScriptedAnswers::new(vec![`
+## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {` › `let answers = ScriptedAnswers::new(vec![`
 
 Declining t1 fails it, which halts the run under the default policy.
 The second answer must never be consumed: t2's question cannot be
 asked once nothing can act on the reply.
 
-## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_caus…` › `assert!(`
+## `fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {` › `assert!(`
 
 The distinguishing assertion. Unguarded, t2's question would be
 asked, answered, and flipped back to Pending — where `next_ready`
@@ -1083,7 +1083,7 @@ a lossy projection — it drops `feedback`, `resume_next`, `session`, and
 the rung a task is standing on, which are exactly the fields a resume
 depends on being right.
 
-## `fn assert_live_equals_replay(repo: &Path, live: &RunState, …` › `let strip = |report: &RunReport| {`
+## `fn assert_live_equals_replay(repo: &Path, live: &RunState, report: &RunReport) {` › `let strip = |report: &RunReport| {`
 
 Warnings are the one field deliberately excluded. They are
 diagnostics of the *process* — what this invocation noticed about a
@@ -1092,42 +1092,42 @@ run, so a later reader legitimately has different ones. Anything
 that genuinely belongs to the run is an event instead (a discarded
 tree, for instance, rides on `run_resumed`).
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `let scenarios = vec![`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `let scenarios = vec![`
 
 One scenario per branch the engine can take, so the equality is
 exercised against commits, retries, escalations, deferrals, parks,
 answers, and a halt — not just the happy path.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `Scenario::new(`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `Scenario::new(`
 
 §11.3: two review passes per attempt, so `AttemptRecord.reviews`
 carries more than one entry through serialize → deserialize. The
 list replaced a scalar pair in step 9; this is what proves the
 new shape survives the wire.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `Scenario::new(`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `Scenario::new(`
 
 And the same with the second reviewer rejecting, so a `false`
 verdict on a non-final pass replays too.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `Scenario::new(`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `Scenario::new(`
 
 The anti-self-review rebind: the acceptance pass runs on a model
 no chain rung names, so the record has to carry the binding
 rather than let a replay re-derive it.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `Scenario::new(`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `Scenario::new(`
 
 Step 10's two new branches. `budget_exceeded` folds into a
 run-level field and `capacity_snapshot` folds into nothing —
 opposite shapes, and both have to come back the same on replay.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `Scenario::new(`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `Scenario::new(`
 
 And the ApproveSpend park, whose fold depends on the escalation
 having landed *before* the park — the ordering D3 turns on.
 
-## `fn live_state_equals_replayed_state_across_every_ladder_pat…` › `if cross_vendor_scenario {`
+## `fn live_state_equals_replayed_state_across_every_ladder_path() {` › `if cross_vendor_scenario {`
 
 A cross-vendor scenario that quietly resolved to one pass would
 still replay identically and prove nothing about the shape this
@@ -1199,22 +1199,22 @@ The one the dependency-free pair could not catch: `t2` is waiting on
 a task that is working, which is what `Queued` means. Reading that as
 `Blocked` tells the operator a dependency failed when it is running.
 
-## `fn a_truncated_run_resumes_without_spending_the_interrupted…` › `let repo = temp_engine_repo("resumetrunc");`
+## `fn a_truncated_run_resumes_without_spending_the_interrupted_attempt() {` › `let repo = temp_engine_repo("resumetrunc");`
 
 Decision 3, end to end: the attempt shows up in the ledger, the
 rung's allowance does not, and the task completes on the retry.
 
-## `fn a_truncated_run_resumes_without_spending_the_interrupted…` › `Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),`
+## `fn a_truncated_run_resumes_without_spending_the_interrupted_attempt() {` › `Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),`
 
 One attempt on one rung: if the interrupted attempt had been
 counted, the task could never commit.
 
-## `fn a_truncated_run_resumes_without_spending_the_interrupted…` › `let text = fs::read_to_string(paths.events()).expect("log");`
+## `fn a_truncated_run_resumes_without_spending_the_interrupted_attempt() {` › `let text = fs::read_to_string(paths.events()).expect("log");`
 
 Rewind the record to mid-attempt and put the tree back the way a
 dead agent would have left it.
 
-## `fn a_truncated_run_resumes_without_spending_the_interrupted…` › `assert!(`
+## `fn a_truncated_run_resumes_without_spending_the_interrupted_attempt() {` › `assert!(`
 
 The residue is gone and the branch is linear.
 
@@ -1385,7 +1385,7 @@ than concluding the gate is broken when it never ran.
 
 The report describes the gates that ran, not the ones on disk.
 
-## `fn the_report_labels_gates_from_the_record_not_todays_confi…` › `let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");`
+## `fn the_report_labels_gates_from_the_record_not_todays_config() {` › `let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");`
 
 `gates` came from the record but `gates_from_config` did not, so the
 run's own report and a later `status` disagreed about the same list:
@@ -1393,16 +1393,16 @@ run's own report and a later `status` disagreed about the same list:
 the record. The doc above `from_state` promises those two cannot
 drift, and this is the one field that still let them.
 
-## `fn the_report_labels_gates_from_the_record_not_todays_confi…` › `fs::write(repo.join("upstroke.toml"), PARKED_RUN_CONFIG).expect("edit config");`
+## `fn the_report_labels_gates_from_the_record_not_todays_config() {` › `fs::write(repo.join("upstroke.toml"), PARKED_RUN_CONFIG).expect("edit config");`
 
 `[[gates]]` deleted, so today's flag would be false and today's
 derivation empty — the temp repo has no project marker.
 
-## `fn the_report_labels_gates_from_the_record_not_todays_confi…` › `let replayed = replay_of(&repo, &run_id).report();`
+## `fn the_report_labels_gates_from_the_record_not_todays_config() {` › `let replayed = replay_of(&repo, &run_id).report();`
 
 The other half of the same promise: a reader replaying the log agrees.
 
-## `fn a_resume_whose_gates_did_not_move_says_nothing_about_the…` › `let (repo, run_id) = parked_run_with_gate("gateunmoved", "git --version");`
+## `fn a_resume_whose_gates_did_not_move_says_nothing_about_them() {` › `let (repo, run_id) = parked_run_with_gate("gateunmoved", "git --version");`
 
 The success path, with a non-empty gate list — the direction a false
 positive would break. Every other gate test edits the config, so
@@ -1432,7 +1432,7 @@ entries and neither changed.
 
 An unambiguous single-name edit still reads as one edit.
 
-## `fn a_gate_difference_is_described_without_inventing_edits()` › `let renamed = gates_differ(only_check, &[gate("verify", "cargo test")]).expect("a differe…`
+## `fn a_gate_difference_is_described_without_inventing_edits()` › `let renamed = gates_differ(only_check, &[gate("verify", "cargo test")]).expect("a difference");`
 
 A rename is two facts, and saying so beats guessing which gate the
 operator meant to rename into which.
@@ -1448,7 +1448,7 @@ and is not a program at all under cmd.
 Same gates, different order: a difference worth a line, but not the
 same claim as a changed command.
 
-## `fn a_log_that_predates_the_gate_record_rederives_and_says_w…` › `let (repo, run_id) = parked_run_with_gate("oldgatelog", "git --version");`
+## `fn a_log_that_predates_the_gate_record_rederives_and_says_what_it_can() {` › `let (repo, run_id) = parked_run_with_gate("oldgatelog", "git --version");`
 
 A v0.1 log recorded gate names and nothing else. Refusing would
 strand every run written before the record over a field it could
@@ -1456,12 +1456,12 @@ never have carried, so resume re-derives — and uses the one thing
 such a log *does* have. A moved name is proof the standard changed,
 not a suspicion, and the warning says which.
 
-## `fn a_log_that_predates_the_gate_record_rederives_and_says_w…` › `fs::write(`
+## `fn a_log_that_predates_the_gate_record_rederives_and_says_what_it_can() {` › `fs::write(`
 
 Re-derivation must be a real re-derivation, or this test would pass
 against a resume that ignored today's config entirely.
 
-## `fn the_resume_that_rederives_an_old_logs_gates_records_them…` › `let (repo, run_id) = parked_run_with_gate("oldgateestablish", "git --version");`
+## `fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {` › `let (repo, run_id) = parked_run_with_gate("oldgateestablish", "git --version");`
 
 Without this, the pre-record population never gains a record: every
 resume re-derives, so a gate weakened between two of them is adopted
@@ -1473,23 +1473,23 @@ Behavioural, and it takes two resumes to show: the first establishes
 and the second must still commit. It can only do that by running the
 gate the first resume wrote down.
 
-## `fn the_resume_that_rederives_an_old_logs_gates_records_them…` › `let first = resume_answering(&repo, &run_id, Effect::NoEdit);`
+## `fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {` › `let first = resume_answering(&repo, &run_id, Effect::NoEdit);`
 
 First resume: nothing to rebuild from, so it re-derives and says so.
 `Effect::NoEdit` leaves the task parked, so there is a second resume
 to make.
 
-## `fn the_resume_that_rederives_an_old_logs_gates_records_them…` › `let paths = paths_of(&repo, &run_id);`
+## `fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {` › `let paths = paths_of(&repo, &run_id);`
 
 It wrote down what it settled on.
 
-## `fn the_resume_that_rederives_an_old_logs_gates_records_them…` › `fs::write(`
+## `fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {` › `fs::write(`
 
 Now weaken the gate, exactly as an implementer editing the workspace
 would. Under the old behaviour the second resume re-derived and
 adopted this.
 
-## `fn the_resume_that_rederives_an_old_logs_gates_records_them…` › `assert!(`
+## `fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {` › `assert!(`
 
 And it is an ordinary record-bearing resume now: it warns about the
 difference rather than about the log's age.
@@ -1505,18 +1505,18 @@ harmless case is not read on the harmful one.
 
 ---- step 8: status and the ledger -------------------------------------
 
-## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_…` › `rendered.contains("per-pool drain: no pool is connected"),`
+## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_log() {` › `rendered.contains("per-pool drain: no pool is connected"),`
 
 No pools file in these tests, so no attempt names a pool — and
 the ledger says exactly that rather than showing a blank column
 that reads as "nothing was spent".
 
-## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_…` › `assert!(`
+## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_log() {` › `assert!(`
 
 The ledger totals are the run's, derived from the log rather than
 carried over from the process that wrote it.
 
-## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_…` › `let paths = paths_of(&repo, &report.run_id);`
+## `fn status_reports_a_live_run_and_the_ledger_reads_from_the_log() {` › `let paths = paths_of(&repo, &report.run_id);`
 
 Holding the lock on a run that has already recorded its finish does
 not make it live again. It says a process has claimed the run —
@@ -1525,20 +1525,20 @@ leaves the outcome above alone. A live run is covered by
 `a_live_run_reads_as_running_rather_than_halted`, which truncates the
 log so that the run genuinely has somewhere left to go.
 
-## `fn transcripts_live_outside_the_workspace_and_survive_a_rol…` › `let repo = temp_engine_repo("private");`
+## `fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {` › `let repo = temp_engine_repo("private");`
 
 The §15 split, and the reason the private root cannot be inside the
 repo: §14's rollback is `git clean -fd`, which would delete it.
 
-## `fn transcripts_live_outside_the_workspace_and_survive_a_rol…` › `let adapters = source(`
+## `fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {` › `let adapters = source(`
 
 The first attempt fails, so a rollback happens before the second.
 
-## `fn transcripts_live_outside_the_workspace_and_survive_a_rol…` › `assert!(paths.events().starts_with(&repo));`
+## `fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {` › `assert!(paths.events().starts_with(&repo));`
 
 The ops surface stays where §15 documents it.
 
-## `fn transcripts_live_outside_the_workspace_and_survive_a_rol…` › `let in_repo = repo.join(".upstroke").join("runs").join(&report.run_id);`
+## `fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {` › `let in_repo = repo.join(".upstroke").join("runs").join(&report.run_id);`
 
 And nothing agent-authored is reachable from the repo.
 
@@ -1589,34 +1589,34 @@ and to spend the attempt a second time.
 
 The commit is on the branch; the log stops just short of it.
 
-## `fn recovered_prepared_commit_precedes_unrelated_answer_defe…` › `let question_id = QuestionId::from("q-before-success");`
+## `fn recovered_prepared_commit_precedes_unrelated_answer_defect_repair() {` › `let question_id = QuestionId::from("q-before-success");`
 
 Model an earlier answered question whose DesignDefect append was
 interrupted. It is unrelated to the later successful settlement,
 but resume still owes the repair after closing that settlement.
 
-## `fn resume_refuses_an_arbitrary_tree_with_the_same_parent_an…` › `let repo = temp_engine_repo("adoptforeign");`
+## `fn resume_refuses_an_arbitrary_tree_with_the_same_parent_and_subject() {` › `let repo = temp_engine_repo("adoptforeign");`
 
 Exact object identity, not a plausible subject, is the authority.
 
-## `fn resume_writes_where_the_run_recorded_not_where_defaults_…` › `let repo = temp_engine_repo("privatedir");`
+## `fn resume_writes_where_the_run_recorded_not_where_defaults_point() {` › `let repo = temp_engine_repo("privatedir");`
 
 Which private root a run used is a fact about that run. Recomputing
 it from today's environment — another HOME, a service account, the
 no-home fallback — would scatter the rest of its transcripts
 somewhere `status` never looks.
 
-## `fn resume_writes_where_the_run_recorded_not_where_defaults_…` › `truncate_log_before(&recorded, "attempt_finished");`
+## `fn resume_writes_where_the_run_recorded_not_where_defaults_point() {` › `truncate_log_before(&recorded, "attempt_finished");`
 
 Stop before the successful settlement, so this is a genuinely
 interrupted attempt rather than a settled prepared commit whose pin
 a real process would still retain.
 
-## `fn resume_writes_where_the_run_recorded_not_where_defaults_…` › `let mut resume = resume_options(&repo, &run_id);`
+## `fn resume_writes_where_the_run_recorded_not_where_defaults_point() {` › `let mut resume = resume_options(&repo, &run_id);`
 
 No override, so the resume has to read the location off the record.
 
-## `fn resume_makes_a_stale_question_payload_agree_with_the_log…` › `let repo = temp_engine_repo("stalepayload");`
+## `fn resume_makes_a_stale_question_payload_agree_with_the_log() {` › `let repo = temp_engine_repo("stalepayload");`
 
 The engine emits `question_answered` and then rewrites the payload
 beside it. A crash in between leaves a file that still reads as
@@ -1624,12 +1624,12 @@ open — and `upstroke answer` will accept a second answer against it,
 one no engine can ever ingest, because the log has already closed
 the question.
 
-## `fn resume_makes_a_stale_question_payload_agree_with_the_log…` › `let retry = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);`
+## `fn resume_makes_a_stale_question_payload_agree_with_the_log() {` › `let retry = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);`
 
 The retry fails the same way, so the run ends parked on a *second*
 question with the first one answered in the log.
 
-## `fn resume_makes_a_stale_question_payload_agree_with_the_log…` › `let questions = rundir::public_dir(&repo, &run_id).join("questions");`
+## `fn resume_makes_a_stale_question_payload_agree_with_the_log() {` › `let questions = rundir::public_dir(&repo, &run_id).join("questions");`
 
 Rewind the payload to what a crash mid-ingest leaves.
 
@@ -1653,18 +1653,18 @@ An operator working a backlog: they answer some other parked question
 out of band, reply to this one at the prompt, and then walk away — so a
 dropped answer never gets a second chance.
 
-## `fn a_typed_answer_survives_another_question_being_answered_…` › `let repo = temp_engine_repo("backlog");`
+## `fn a_typed_answer_survives_another_question_being_answered_at_the_same_time() {` › `let repo = temp_engine_repo("backlog");`
 
 Both channels can produce an answer on one scheduler turn. The sweep
 must not swallow the reply the operator typed: it closed a different
 question, and discarding this one throws away words a person sat and
 wrote — words nothing will ask for again.
 
-## `fn a_typed_answer_survives_another_question_being_answered_…` › `let source = source(`
+## `fn a_typed_answer_survives_another_question_being_answered_at_the_same_time() {` › `let source = source(`
 
 Both tasks fail into a question, then both succeed once released.
 
-## `fn an_answer_file_that_changes_nothing_does_not_spin_the_sc…` › `let repo = temp_engine_repo("nullanswer");`
+## `fn an_answer_file_that_changes_nothing_does_not_spin_the_scheduler() {` › `let repo = temp_engine_repo("nullanswer");`
 
 `sweep_answers` reports whether anything *changed*, and the drain
 loop trusts that to mean it made progress. A file the sweep reads
@@ -1678,7 +1678,7 @@ A regression here hangs this test rather than failing it.
 Holds a run's lock and lets go after a set number of sleeps — an engine
 that finishes while a follower is waiting on it.
 
-## `fn following_waits_out_a_silent_live_run_and_stops_once_it_…` › `let repo = temp_engine_repo("followlive");`
+## `fn following_waits_out_a_silent_live_run_and_stops_once_it_dies() {` › `let repo = temp_engine_repo("followlive");`
 
 A whole attempt — the agent's thinking, its tool calls, the gates,
 the review — folds into one `attempt_finished`, so a healthy run
@@ -1686,11 +1686,11 @@ says nothing for minutes at a time. The idle budget exists to
 release a terminal attached to a dead engine; spending it on a live
 one drops the operator's view mid-run.
 
-## `fn following_waits_out_a_silent_live_run_and_stops_once_it_…` › `let text = fs::read_to_string(paths.events()).expect("log");`
+## `fn following_waits_out_a_silent_live_run_and_stops_once_it_dies() {` › `let text = fs::read_to_string(paths.events()).expect("log");`
 
 Drop the ending, so `follow` idles rather than stopping at it.
 
-## `fn following_waits_out_a_silent_live_run_and_stops_once_it_…` › `crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");`
+## `fn following_waits_out_a_silent_live_run_and_stops_once_it_dies() {` › `crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");`
 
 A budget of one idle poll: without the liveness check this returns
 after two sleeps, whatever the run is doing.
@@ -1705,54 +1705,54 @@ A pools file beside the repo — never `~/.upstroke`, which is the
 operator's, and never inside the workspace, where §14's `git clean -fd`
 would delete it.
 
-## `fn a_run_budget_stops_the_run_exactly_once_and_survives_rep…` › `let repo = temp_engine_repo("budgetstop");`
+## `fn a_run_budget_stops_the_run_exactly_once_and_survives_replay() {` › `let repo = temp_engine_repo("budgetstop");`
 
 The one-fold property, on the branch step 10 added: the stop is an
 event, `RunState::apply` is what turns it into state, and a replay of
 the log lands on the same state the live run held.
 
-## `fn a_run_budget_stops_the_run_exactly_once_and_survives_rep…` › `assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");`
+## `fn a_run_budget_stops_the_run_exactly_once_and_survives_replay() {` › `assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");`
 
 Each task costs 0.06 (0.01 implementer + 0.05 review), so the ceiling
 is crossed after the first and the second task is refused before it
 spawns anything.
 
-## `fn a_run_budget_stops_the_run_exactly_once_and_survives_rep…` › `let events = events_of(&repo, &report.run_id);`
+## `fn a_run_budget_stops_the_run_exactly_once_and_survives_replay() {` › `let events = events_of(&repo, &report.run_id);`
 
 Exactly once: the scheduler stops scheduling on the first stop, so a
 second would describe a spawn that never happened.
 
-## `fn a_run_budget_stops_the_run_exactly_once_and_survives_rep…` › `assert!(matches!(task(&report, "t2").status, TaskRunStatus::Skipped));`
+## `fn a_run_budget_stops_the_run_exactly_once_and_survives_replay() {` › `assert!(matches!(task(&report, "t2").status, TaskRunStatus::Skipped));`
 
 Nothing after t1 ran, and the untouched tasks settle as skipped.
 
-## `fn a_task_budget_also_ends_the_run_and_says_which_ceiling_i…` › `let source = source(`
+## `fn a_task_budget_also_ends_the_run_and_says_which_ceiling_it_was() {` › `let source = source(`
 
 Fails on the first rung, so a second attempt is asked for — and
 refused, because this task has already spent past its own ceiling.
 
-## `fn resuming_with_a_higher_ceiling_continues_the_run_the_bud…` › `let repo = temp_engine_repo("budgetresume");`
+## `fn resuming_with_a_higher_ceiling_continues_the_run_the_budget_stopped() {` › `let repo = temp_engine_repo("budgetresume");`
 
 D4's whole point: a budget stop is recoverable in one command,
 because budgets are re-derived at resume rather than inherited.
 
-## `fn a_frontier_escalation_over_the_threshold_parks_for_appro…` › `let repo = temp_engine_repo("approvespend");`
+## `fn a_frontier_escalation_over_the_threshold_parks_for_approval_then_runs_it() {` › `let repo = temp_engine_repo("approvespend");`
 
 D3, end to end. The engine escalates FIRST and then asks, so an
 approved task un-parks already standing on the frontier rung with a
 fresh allowance — and `answer_question` needs no ApproveSpend arm.
 
-## `fn a_frontier_escalation_over_the_threshold_parks_for_appro…` › `let tiers: Vec<&str> = task(&report, "t1")`
+## `fn a_frontier_escalation_over_the_threshold_parks_for_approval_then_runs_it() {` › `let tiers: Vec<&str> = task(&report, "t1")`
 
 The approved attempt really ran on the frontier rung with the
 allowance the escalation reset — not a re-run of the mid rung.
 
-## `fn a_declined_spend_approval_fails_the_task_through_the_hal…` › `assert_eq!(report.outcome(), RunOutcome::Halted, "{report:?}");`
+## `fn a_declined_spend_approval_fails_the_task_through_the_halt_policy() {` › `assert_eq!(report.outcome(), RunOutcome::Halted, "{report:?}");`
 
 Through `ingest_answer`'s existing Declined path — the one place that
 owns the halt policy, with no ApproveSpend special case beside it.
 
-## `fn a_chain_that_starts_at_frontier_never_asks_to_approve_sp…` › `let repo = temp_engine_repo("frontierstart");`
+## `fn a_chain_that_starts_at_frontier_never_asks_to_approve_spend() {` › `let repo = temp_engine_repo("frontierstart");`
 
 §12's target is silent escalation. A task the operator deliberately
 routed to frontier in config was not escalated onto it silently, and
@@ -1768,17 +1768,17 @@ dollar column comes from.
 And §14's pre-flight snapshot is on the record — folding to nothing,
 which `assert_live_equals_replay` elsewhere is what proves.
 
-## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_ret…` › `let repo = temp_engine_repo("poolexhausted");`
+## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_retires_the_signal() {` › `let repo = temp_engine_repo("poolexhausted");`
 
 §13 source 1 made real: the signal is ground truth, and the estimator
 that reads it back must never let a self-metered figure talk it up.
 
-## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_ret…` › `let signal_at = events`
+## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_retires_the_signal() {` › `let signal_at = events`
 
 A fold that stops at the signal reads the pool as exhausted, at the
 top confidence rank — the signal is ground truth about that moment.
 
-## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_ret…` › `let settled = capacity::estimate(&cfg.pools, &capacity::observe(&events));`
+## `fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_retires_the_signal() {` › `let settled = capacity::estimate(&cfg.pools, &capacity::observe(&events));`
 
 But the whole log has the pool serving an attempt afterwards, so the
 signal is retired rather than standing forever. Reporting `exhausted`
@@ -1796,7 +1796,7 @@ fired at all.
 
 And refused at pre-flight, before a branch or a run directory exists.
 
-## `fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_inst…` › `let repo = temp_engine_repo("approvalfeedback");`
+## `fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_instruction() {` › `let repo = temp_engine_repo("approvalfeedback");`
 
 Every other question's answer is guidance for the next attempt. An
 ApproveSpend answer is a yes/no about money whose meaning was already
@@ -1805,7 +1805,7 @@ consumed by the un-park, and `feedback_section` frames feedback as
 assumptions" — which is not a thing to tell a coding agent about a
 billing decision.
 
-## `fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_inst…` › `assert!(`
+## `fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_instruction() {` › `assert!(`
 
 An Unblock answer still does, because there it really is guidance.
 
@@ -1835,7 +1835,7 @@ The retry happened — the answer still un-parks the task.
 
 And nothing reached the judge as an operator decision either.
 
-## `fn one_outage_records_one_signal_however_many_deferrals_it_…` › `let source = source(`
+## `fn one_outage_records_one_signal_however_many_deferrals_it_causes() {` › `let source = source(`
 
 Down for three attempts, then back.
 
@@ -1912,7 +1912,7 @@ ladder looks like when one rung reports and another does not.
 
 And a route that does report keeps its figure.
 
-## `fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_r…` › `let text = r#"{`
+## `fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_report() {` › `let text = r#"{`
 
 `report.json` is a projection for whoever reads the run afterwards,
 and `TaskRunStatus` is `pub` and `Deserialize` because that reader
@@ -1925,7 +1925,7 @@ the entire report unreadable.
 against 0.0.1, and that break is published and cannot be taken back.
 This is so the next variant is not another one.
 
-## `fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_r…` › `assert!(`
+## `fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_report() {` › `assert!(`
 
 And everything the reader *can* understand still arrives intact.
 
@@ -1948,7 +1948,7 @@ path. One reordering away, that file reads `t1: running now — attempt
 process that wrote it. So the invariant is stated where it is relied
 upon.
 
-## `fn a_budget_stop_keeps_its_outcome_while_a_resume_holds_the…` › `let repo = temp_engine_repo("resumewindow");`
+## `fn a_budget_stop_keeps_its_outcome_while_a_resume_holds_the_lock() {` › `let repo = temp_engine_repo("resumewindow");`
 
 `resume` takes the run's lock and then does a dozen git subprocesses
 — branch checks, a switch, a discard — before it writes
@@ -2039,7 +2039,7 @@ in the order the contract asks for it:
 4. **Authoritative Git never crosses the boundary** (DESIGN.md:612): the
    run made commits, and not one recorded request is a `git` process.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `let expected_ids = vec![`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `let expected_ids = vec![`
 
 (1) and (2): the exact identities of the run, in order, written from the
 plan's shape and the packet's grammar rather than read back from the
@@ -2047,14 +2047,14 @@ engine. Two tasks at plan positions 0 and 1, one attempt each, generation
 0 because the legacy engine has none, and inside each attempt the worker,
 then gate 0 and gate 1, then review pass 0.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `use crate::runner::ExecutionRole;`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `use crate::runner::ExecutionRole;`
 
 The roles, and what each buys. R3, via `ExecutionRole::is_slotted`: a
 worker and a review take an {agent, pool} pair; a gate does not, because
 a gate is repository-controlled code and runs no agent CLI — which is
 also why it is handed no agent.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `let worker_stdin = &seen`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `let worker_stdin = &seen`
 
 The prompt still reaches the child the way the adapter says it should.
 `stdin_payload` is delivery policy and the spec is what carries those
@@ -2062,20 +2062,20 @@ bytes, so the two routed agent processes must be carrying them: a worker
 gets the materialized task prompt, a reviewer gets the verdict prompt,
 and a gate — which is a shell command, not an agent — gets nothing.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `let shell_probes = |seen: &[RoutedProcess]| {`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `let shell_probes = |seen: &[RoutedProcess]| {`
 
 (3) The clause, and the control that makes it a measurement. The run has
 a recorded shell and ran four gate commands through it, and still never
 asked that shell to `exit 0` through the Runner — `gates::shell_available`
 is a PATH check and stays one.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `assert!(`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `assert!(`
 
 (4) Authoritative Git never crosses the boundary. The run committed both
 tasks — every one of those commits was git work — and not one process
 the runner was asked to execute is git.
 
-## `fn the_legacy_engine_routes_every_process_through_the_runne…` › `let worker = seen`
+## `fn the_legacy_engine_routes_every_process_through_the_runner() {` › `let worker = seen`
 
 The workspace is the runner's to set, and it set a different one for the
 worker than for the gates and the review: an attempt edits the repo,
@@ -2090,7 +2090,7 @@ CI: `RUNNER~1` for `runneradmin`). Comparing the directories rather than
 the strings is also what makes the `!` case below mean anything — an
 inequality between two spellings holds for free.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production()…`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {`
 
 Every identity a *retried* attempt with two review passes and a re-ask
 assigns, recorded from production rather than constructed by the test.
@@ -2112,42 +2112,42 @@ review passes from two families, and a first verdict the reviewer botches.
 The expected list is written from the packet's grammar and this run's
 shape.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `vec![Effect::NoEdit, Effect::EditFile],`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `vec![Effect::NoEdit, Effect::EditFile],`
 
 The first attempt reports success and edits nothing, which fails
 outcome sanity before any gate runs; the second does the work.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `vec![ReviewBehavior::Unparseable, ReviewBehavior::Pass],`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `vec![ReviewBehavior::Unparseable, ReviewBehavior::Pass],`
 
 The primary reviewer's first verdict is prose, so the pass spends
 its one format-only re-ask and then answers.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `"k0.g0.a1.worker.o0",`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `"k0.g0.a1.worker.o0",`
 
 Attempt 1: the worker alone — nothing downstream of a lying
 agent runs.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `"k0.g0.a2.worker.o0",`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `"k0.g0.a2.worker.o0",`
 
 Attempt 2 carries a *new attempt number* through every process
 it starts, not only through the worker.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `"k0.g0.a2.review_pass0.o0",`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `"k0.g0.a2.review_pass0.o0",`
 
 Pass 0's verdict, and the one re-ask it is allowed — two
 processes, two identities, and the second is not a second run of
 the first.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `"k0.g0.a2.review_pass1.o0",`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `"k0.g0.a2.review_pass1.o0",`
 
 Pass 1 is the other family's, and it is pass *one*.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `use std::collections::BTreeSet;`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `use std::collections::BTreeSet;`
 
 Hostility as counts, so the list above cannot be satisfied by a run that
 exercised fewer of the varying fields than it claims.
 
-## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_ev…` › `assert_eq!(`
+## `fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {` › `assert_eq!(`
 
 `reviews_run` counts *invocations*, so the primary's two are the
 verdict and its re-ask — the same two the identity list names.
@@ -2172,7 +2172,7 @@ of a run that had recorded a failure first: the call returns `Err`, the
 error is the runner's own spawn diagnostic, and the log carries
 `attempt_started` with **no** settlement after it.
 
-## `fn a_worker_that_cannot_be_spawned_returns_an_error_and_set…` › `let run_id = rundir::latest_run(&repo).expect("the run created its directory");`
+## `fn a_worker_that_cannot_be_spawned_returns_an_error_and_settles_nothing() {` › `let run_id = rundir::latest_run(&repo).expect("the run created its directory");`
 
 Nothing was settled: one attempt started, no attempt finished, no task
 failed, and the ladder bought no second attempt.
@@ -2201,7 +2201,7 @@ A `pub`/`pub(crate)` widening is invisible to every in-crate test — each
 caller compiles either way — so this reads the facade's own text. The
 expected sets are transcribed from the packet, not derived from the file.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `let raw = include_str!("mod.rs");`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `let raw = include_str!("mod.rs");`
 
 **The blanked region, not the raw file.** This read `include_str!` and
 counted prose: the doc comment on `pub(crate) mod topology;` explains
@@ -2210,15 +2210,15 @@ in the file — so the census failed on its own explanation.
 `PR4-CENSUS-COMMENT-ORACLE`, and the same trick would have let any of the
 six widenings be smuggled past by writing it in a comment.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `let public_fns: BTreeSet<&str> = source`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `let public_fns: BTreeSet<&str> = source`
 
 Every `pub fn` at the facade's top level.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `for widening in [`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `for widening in [`
 
 And nothing else is exported by any other route.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"pub mod ",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"pub mod ",`
 
 **`pub mod ` was missing from this list, and it is the route the
 schema-4 surface actually took.** `pub mod topology;` stood here for
@@ -2231,32 +2231,32 @@ this build's own recovery refuses — the frontier review of
 `75da796`, finding 1. A census that forbids five widenings and not
 the sixth is the shape of every fail-open needle this slice found.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `let mut reexported: BTreeSet<&str> = BTreeSet::new();`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `let mut reexported: BTreeSet<&str> = BTreeSet::new();`
 
 The re-exports, flattened. `pub use` is the other way a name reaches the
 public path, and the packet enumerates these too.
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"RunOptions",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"RunOptions",`
 
 options
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"RunReport",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"RunReport",`
 
 report
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"AdapterSource",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"AdapterSource",`
 
 crate::agent
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"AttemptRecord",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"AttemptRecord",`
 
 crate::events
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `"AttemptFailure",`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `"AttemptFailure",`
 
 crate::ladder
 
-## `fn the_engine_facade_exposes_exactly_the_items_the_packet_e…` › `for private in ["fn run_harness_on(", "fn resume_harness_on("] {`
+## `fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {` › `for private in ["fn run_harness_on(", "fn resume_harness_on("] {`
 
 The boundary-taking helpers exist and are *not* public: this test would
 pass just as well if they had been deleted, which is not what it is for.
@@ -2300,12 +2300,12 @@ The *class* is what is asserted: the table is crossed against the facade's
 own `pub fn` list, so this cannot be satisfied by covering the two the
 review named.
 
-## `fn every_public_write_coordinator_entry_point_establishes_c…` › `let mut driven: Vec<&str> = entry_points.iter().map(|(name, _)| *name).collect();`
+## `fn every_public_write_coordinator_entry_point_establishes_containment() {` › `let mut driven: Vec<&str> = entry_points.iter().map(|(name, _)| *name).collect();`
 
 The class, not the instance: every public entry point of the facade is
 in this table, and every row of the table is one of them.
 
-## `fn every_public_write_coordinator_entry_point_establishes_c…` › `assert!(`
+## `fn every_public_write_coordinator_entry_point_establishes_containment() {` › `assert!(`
 
 Windows has the other half of the same fact: the coordinator process
 really is a member of an ambient job now. (Process-wide and latching,
@@ -2362,7 +2362,7 @@ returns one has established containment.
 The same ordering, for the other coordinator. A resume is a write command:
 `startup_census` enumerates them "(run, resume)".
 
-## `fn a_facade_resume_refuses_before_any_effect_when_containme…` › `let looked_in = repo.display().to_string();`
+## `fn a_facade_resume_refuses_before_any_effect_when_containment_fails() {` › `let looked_in = repo.display().to_string();`
 
 The resume's own refusal names the run directory it looked in; the
 containment refusal cannot, because it happens before the coordinator

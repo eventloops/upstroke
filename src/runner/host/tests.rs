@@ -6855,30 +6855,45 @@ fn production_reaches_a_spawn_through_one_host_runner_per_run() {
         "the census and its expectation cover different files"
     );
 
-    let mut counted: Vec<(&str, usize)> = Vec::new();
-    let mut stripped = 0_usize;
-    for (name, source) in sources {
-        let production = crate::effects::production_region(source);
-        let kept: Vec<&str> = production
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        stripped += production.lines().count() - kept.len();
-        counted.push((name, kept.join("\n").matches("HostRunner::new(").count()));
-    }
-    assert!(
-        stripped > 100,
-        "the comment strip removed {stripped} lines, so this census is reading prose"
-    );
-    // The control: the pattern matches when it is present, so a zero means
-    // absence rather than a broken search.
-    assert_eq!(
-        "let r = HostRunner::new();"
+    // STRIP-CONTROL goes through the same whole-file blanker and counter as
+    // production. Its only production construction follows a test-only item,
+    // so truncating at the first #[cfg(test)] also fails this control.
+    const CONTROL: &str = r##"
+// STRIP-CONTROL: HostRunner::new();
+/* HostRunner::new(); /* HostRunner::new(); */ */
+const TEXT: &str = "HostRunner::new();";
+const RAW: &str = r#"HostRunner::new();"#;
+const BYTES: &[u8] = b"HostRunner::new();";
+const RAW_BYTES: &[u8] = br#"HostRunner::new();"#;
+const QUOTE: char = '"';
+#[cfg(test)]
+pub(super) fn excluded_control() -> Result<((), ()), ()> {
+    let runner = HostRunner::new();
+    Ok(((), ()))
+}
+fn production_control() { let runner = HostRunner::new(); }
+"##;
+    let count_constructions = |source: &str| {
+        crate::effects::production_code(source)
             .matches("HostRunner::new(")
-            .count(),
+            .count()
+    };
+    assert_eq!(
+        count_constructions(CONTROL),
         1,
-        "the census pattern matches nothing at all"
+        "the control must count only the production construction"
     );
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for (name, source) in sources {
+        let count = count_constructions(source);
+        let with_control = format!("{source}\n{CONTROL}");
+        assert_eq!(
+            count_constructions(&with_control),
+            count + 1,
+            "{name}: the census must ignore prose and test items and count an appended production construction"
+        );
+        counted.push((name, count));
+    }
     assert_eq!(
         counted,
         SITES.to_vec(),
@@ -6888,7 +6903,7 @@ fn production_reaches_a_spawn_through_one_host_runner_per_run() {
     );
     // And the two are the run and the resume facade, each of which then
     // borrows that one runner for pre-flight and every attempt.
-    let engine = crate::effects::production_region(include_str!("../../engine/mod.rs"));
+    let engine = crate::effects::production_code(include_str!("../../engine/mod.rs"));
     for facade in ["fn run_harness(", "fn resume_harness("] {
         let after = engine
             .split_once(facade)

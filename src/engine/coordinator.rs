@@ -64,6 +64,11 @@ pub(super) fn run_harness_inner_on(
     let validated = validate_inputs(opts, config::EngineLimits::Fresh)?;
     let workspace = Workspace::open(&opts.repo_root)?;
     let worktree_git_dir = workspace.worktree_git_dir()?;
+    // Own the physical worktree before capturing the analysis this run adopts.
+    // The successful lease acquisition arbitrates between conductors; a loser
+    // returns before preflight or Git mutation. Acquire this outer lease before
+    // the per-run lease below and keep both guards until the run finishes, so
+    // error returns and unwinding release them in reverse order.
     let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
     let analysis = validated.confirm_under_lease(opts, config::EngineLimits::Fresh)?;
     let Preflight {
@@ -95,6 +100,9 @@ pub(super) fn run_harness_inner_on(
     let branch = format!("upstroke/run-{run_id}");
     let paths = opts.paths(&run_id);
     paths.create()?;
+    // Claim this run before publishing its first event. Keep the guard for the
+    // whole run; process death releases the primary OS hold, while the lock
+    // implementation prevents takeover while prior agents are cleaning up.
     let _lock = RunLock::acquire(&paths.public)?;
     let _cleanup_scope = _lock.enter_cleanup_scope();
 
