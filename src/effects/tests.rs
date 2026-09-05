@@ -1,7 +1,7 @@
 //! Extended notes: `docs/internals/effects/tests.md`
 
 // Allowlist placement: the funnel section of `effects/allowlist.toml`, which
-// carries this module's review clause. `effect_site_inventory.mechanism` (2).
+
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -3389,6 +3389,11 @@ fn the_file_level_lint_reader_answers_what_rustc_does() {
 #[test]
 fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
     oracles::the_configured_item_is_removed_and_the_rest_kept();
+}
+
+#[test]
+fn the_production_code_region_excludes_typed_test_functions() {
+    oracles::typed_test_functions_are_removed_and_later_code_is_kept();
 }
 
 #[test]

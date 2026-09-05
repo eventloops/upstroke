@@ -327,10 +327,17 @@ pub fn production_code(source: &str) -> String {
 }
 
 fn configured_item_end(bytes: &[u8], start: usize) -> usize {
+    let return_start = configured_function_return_start(bytes, start);
     let mut depth = 0usize;
     let mut index = start;
-    while index < bytes.len() {
-        match bytes[index] {
+    while let Some(&byte) = bytes.get(index) {
+        if depth == 0
+            && return_start.is_some_and(|at| index >= at)
+            && starts_named_function_item(bytes, index)
+        {
+            return start;
+        }
+        match byte {
             b'{' if depth == 0 => {
                 let Some(close) = matching(bytes, index, b'{', b'}') else {
                     return start;
@@ -348,12 +355,89 @@ fn configured_item_end(bytes: &[u8], start: usize) -> usize {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' if depth == 0 => return index,
             b')' | b']' | b'}' => depth -= 1,
-            b';' | b',' if depth == 0 => return index + 1,
+            b';' if depth == 0 => return index + 1,
+            b',' if depth == 0 && return_start.is_none_or(|at| index < at) => return index + 1,
             _ => {}
         }
         index += 1;
     }
     start
+}
+
+fn starts_named_function_item(bytes: &[u8], at: usize) -> bool {
+    if at
+        .checked_sub(1)
+        .and_then(|before| bytes.get(before))
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'#'))
+    {
+        return false;
+    }
+    let Some(rest) = bytes.get(at..).and_then(|rest| rest.strip_prefix(b"fn")) else {
+        return false;
+    };
+    rest.first().is_some_and(u8::is_ascii_whitespace)
+        && rest
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+}
+
+fn configured_function_return_start(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let rest = bytes.get(cursor..)?;
+        let length = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        let word = rest.get(..length)?;
+        cursor += length;
+        match word {
+            b"fn" => break,
+            b"pub" => {
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&b'(') {
+                    let close = matching(bytes, cursor, b'(', b')')?;
+                    cursor = close + 1;
+                }
+            }
+            b"async" | b"const" | b"unsafe" | b"extern" => {}
+            _ => return None,
+        }
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let name_start = cursor;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        cursor += 1;
+    }
+    if cursor == name_start {
+        return None;
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'(') {
+        return None;
+    }
+    let close = matching(bytes, cursor, b'(', b')')?;
+    cursor = close + 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    bytes
+        .get(cursor..)
+        .is_some_and(|rest| rest.starts_with(b"->"))
+        .then_some(cursor + 2)
 }
 
 #[must_use]

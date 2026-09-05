@@ -2669,10 +2669,9 @@ and how many times in each file.
 
 ## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `assert_eq!(`
 
-The control: the pattern matches when it is present, so a zero means
-absence rather than a broken search.
+The injected control contains comments, literals, a typed test function and one later production construction. It must add exactly one count alone and when appended to each of the six source files.
 
-## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `let engine = crate::effects::production_region(include_str!("../../engine/mod.rs"));`
+## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `let engine = crate::effects::production_code(include_str!("../../engine/mod.rs"));`
 
 And the two are the run and the resume facade, each of which then
 borrows that one runner for pre-flight and every attempt.
@@ -2873,3 +2872,60 @@ The row's own premise, both halves.
 ## `fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {` › `let reachable = HostRunner::new()`
 
 The oracle: the same directory, named as a location, does run.
+
+## `#![allow(`
+
+Allowlist placement: the funnel section of `effects/allowlist.toml`, which
+carries this module's review clause. `effect_site_inventory.mechanism` (2).
+
+## `struct HeldFork {`
+
+This guard owns one forked child's lifetime. Its socket releases the child
+after observation; shutdown also releases it on failure. The child closes
+the parent's socket endpoint before announcing readiness and exits after
+release or its read timeout. Drop waits for that exact pid, never a group.
+
+## `let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };`
+
+SAFETY: pid is this guard's unreaped child and status is writable.
+WNOHANG observes whether it exited without waiting for release.
+
+## `let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };`
+
+SAFETY: pid is our unreaped direct child; status is a live,
+writable c_int. The socket's read timeout bounds the child.
+
+## `unsafe {`
+
+SAFETY: only the parent returns into Rust after fork. The child
+uses only close/write/read/_exit, all async-signal-safe, with live
+inherited fds and one-byte stack buffers. It never allocates,
+unwinds, drops Rust owners, or touches inherited locks. Closing
+parent_fd removes its copy of the release endpoint. The separate
+child endpoint stays live until _exit closes all inherited fds.
+
+## `let polled = unsafe { libc::poll(&mut ready, 1, 1000) };`
+
+SAFETY: ready is one initialized pollfd and remains live for this
+call; its descriptor is borrowed from reader. The wait is bounded.
+
+## `assert_eq!(`
+
+SAFETY: name is a live NUL-terminated path in our private scratch
+directory, and 0600 grants access only to this test's user.
+
+## `let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };`
+
+SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
+integer size, and shrinking an empty pipe needs no extra privilege.
+
+## `const CONTROL: &str = r##"`
+
+STRIP-CONTROL goes through the same whole-file blanker and counter as
+production. Its only production construction follows a test-only item,
+so truncating at the first #[cfg(test)] also fails this control.
+
+## `let engine = crate::effects::production_code(include_str!("../../engine/mod.rs"));`
+
+And the two are the run and the resume facade, each of which then
+borrows that one runner for pre-flight and every attempt.

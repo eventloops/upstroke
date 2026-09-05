@@ -407,8 +407,9 @@ line it came from.
 The item's extent is found by delimiter matching over the blanked text — a
 brace body ends at its matching `}` (and takes a trailing `;` with it, for
 `use a::{b, c};`), anything else ends at the first `;` or `,` outside a
-nested delimiter, and a closing delimiter that would leave the enclosing
-block ends it too. Angle brackets are deliberately not matched: a
+nested delimiter, except that a recognized function return type keeps its
+commas until the function body or semicolon. A closing delimiter that would
+leave the enclosing block ends the item too. Angle brackets are not matched: a
 `#[cfg(test)] field: BTreeMap<K, V>,` ends at the comma inside the generics
 and leaves `V>,` behind. That is the safe direction — a region that is too
 **large** can only make a census match more, never less.
@@ -1758,3 +1759,23 @@ Whether an attribute entry names `lint`, qualified either way.
 of the whole-file test-module population -- reaches the one census outside
 this module that floors a count on it. Test-only either way: the module is
 compiled only under `cfg(test)`.
+
+## `if depth == 0`
+
+A named function cannot be part of the preceding return type. If a
+malformed test signature has no body, keep the following item visible
+instead of taking its brace as the missing test body's boundary.
+
+## `fn configured_function_return_start(bytes: &[u8], start: usize) -> Option<usize> {`
+
+Recognize the return arrow of a named function item without type parameters.
+A field's function-pointer type is not an item. Unknown prefixes, generic
+parameter lists and incomplete signatures keep the conservative comma rule.
+The input is already blanked, including any extern ABI string.
+
+## `#[must_use]`
+
+Every `allow`/`expect` of a governed lint in `source`, with where it sits.
+
+Attributes are found in the blanked text and read out of the original, so a
+fixture quoted in a doc comment is invisible and a real attribute is not.
