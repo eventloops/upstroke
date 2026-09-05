@@ -4928,8 +4928,7 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
 #[cfg(unix)]
 #[test]
 fn tree_bytes_detects_a_file_replaced_by_a_link_to_equal_contents() {
-    let scratch =
-        acquire(&std::env::temp_dir(), "tree-bytes-file-link").expect("scratch tree");
+    let scratch = acquire(&std::env::temp_dir(), "tree-bytes-file-link").expect("scratch tree");
     let root = scratch.path().join("observed");
     fs::create_dir(&root).expect("observed directory");
     let file = root.join("file");
