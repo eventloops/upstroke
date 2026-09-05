@@ -131,22 +131,43 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
-**Row 29 (`src/topology/fold/apply.rs`) has had a pass and is not swept.** The pass landed a §5
-fix — `apply_verification_unavailable` dispatched a closed two-variant `UnavailableOutcome` through
-two separate `if let`s, so a third variant would compile to a silent no-op; it is now an exhaustive
-`match` — and stated the file's replay purity and ownership model, both re-derived by reading. `apply`
-was found sound: a pure function of `(state, event, derived)` with no clock, environment, randomness
-or I/O; its transitions total over the closed event vocabulary; every lookup a no-op on a miss. The
-row stays open for the reason #146 (`effects/bijection.rs`), #139 and #143 (`rundir`) stay open: the
-contracts this file states the effect of — INV-02, ST-06, `transaction_fault_matrix[T-ATTEMPT]`, the
-`refusals` inventory, the retired `decisions/2026-08-12-merge-queue-execution-topology.md` record —
-occur nowhere in `DESIGN.md` or `design/`, the family's normative source being a packet in the
-private lab repository. Listing the file would assert a conformance whose contract half is
-unanchored, and `#108`'s design authority is with the owner as one decision beside those three. The
-row is `SWEEP-FOLD-APPLY-DESIGN-AUTHORITY`. A liveness defect found during the pass — a fold-legal
-`question_raised` then `Declined` sequence that leaves a task `Failed` with an open generation and
-wedges the run so it can never end — is a behaviour change to the check layer
-(`src/topology/fold/check_end.rs`, row 32) and was routed to its own stream, not carried here.
+**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass and is not swept.** The pass and
+its repairs landed two §5 fixes: `apply_verification_unavailable` dispatched a closed two-variant
+`UnavailableOutcome` through two separate `if let`s, and `apply_answer` returned every answered
+question through `_ => TaskState::Pending`, a catch-all over `Derived` that swallowed
+`Answer(Admission)`. Both are now exhaustive matches — `apply_answer` takes the resolved
+`QuestionOrigin` and matches its two variants — and the module doc states the file's replay purity
+and ownership model, re-derived by reading. `apply` was otherwise found sound: a pure function of
+`(state, event, derived)` with no clock, environment, randomness or I/O; transitions total over the
+closed 24-variant vocabulary; every lookup a no-op on a miss; §7 clean.
+
+The row is held pending one owner ruling. Each item below is labelled by its stage, so the group is
+not read as handled:
+
+- **The wedge — FIXED, in #153.** A fold-legal `question_raised` then `Declined { decline_halts_run }`
+  on an *in-flight* task left it `Failed` with an open generation and wedged the run so
+  `derived_outcome` could never end it. Found during this pass, ruled a check-layer behaviour change,
+  and fixed in `src/topology/fold/check_end.rs` (row 32) on its own stream, not here.
+- **`apply_answer` returns any bare-question task to `Pending` — OPEN, and *not* closed by #153's
+  fix.** #153 refuses `question_raised` on an *open generation* or a *terminal* task; `AwaitingRepair`,
+  `AwaitingMerge` and `Deferred` are non-terminal with no open generation, and `check_question_raised`
+  admits them **on purpose** — `src/engine/topology/select/tests.rs`'s
+  `selection_takes_the_first_eligible_candidate_and_not_the_head` parks a *queued* candidate's task
+  with exactly that event. So an answer on such a task returns it to `Pending`, and the fold's
+  accepted-log set then holds a re-dispatch of the original that `ready` never selects. Recorded as
+  `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`.
+- **The design question — ESCALATED and UNANSWERED.** *Is a bare `question_raised` on a non-`Pending`
+  task valid input the fold must handle, or invalid input it must refuse?* A question about the
+  accepted domain of the replay spec; the two fixes it admits — the check refuses the event, or
+  `apply_answer` records the parked-from state and restores it — are a design choice for the owner. It
+  joins the `#108` topology design escalation.
+- **The design-authority claim — WITHDRAWN on evidence.** An earlier draft held this row open because
+  the contracts `apply.rs` states the effect of (INV-02, ST-06, `transaction_fault_matrix[T-ATTEMPT]`,
+  the retired `decisions/2026-08-12` record) name no `DESIGN.md` section. That was wrong: `DESIGN.md`'s
+  row for `decisions/2026-08-12` maps it to §26, whose first paragraph carries that decision's verdict
+  and durable protocol **verbatim**, summarised in §7, §14 and §15. Absence of a private label name is
+  not evidence that its substance is absent. The finding is deleted; the hold is the design question
+  above, not a contract-authority gap.
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and

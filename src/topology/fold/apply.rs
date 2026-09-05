@@ -3,21 +3,23 @@
 //!
 //! **A pure function of `(state, event, derived)`.** Nothing here reads a
 //! clock, the environment, or randomness, and nothing performs I/O; the only
-//! values it computes rather than copies are `epoch + 1` on a resume and the
-//! `next_sequence` increments, each a function of prior durable state alone. So
-//! a live fold and a replay of the bytes it appended reach the same
-//! [`RunState`], which is the equality INV-02 turns into a property of the type
-//! ([`super::TopologyFold`]'s `PartialEq`). The one value a transition needs
-//! that is not in its own body — a question's origin, gone from `questions` the
-//! instant [`RunState::apply_answer`] removes it — rides on [`super::Derived`],
-//! decided by the check and therefore identical on replay.
+//! values it computes rather than copies are `epoch + 1` on a resume, the
+//! `next_sequence` increments, and a task's per-rung attempt count, each a
+//! function of prior durable state alone. So a live fold and a replay of the
+//! bytes it appended reach the same [`RunState`], which is the equality INV-02
+//! turns into a property of the type: [`RunState`] derives `PartialEq`, and two
+//! of them are how a live fold and a replay are proved identical. The one value
+//! a transition needs that is not in its own body — a question's origin, gone
+//! from `questions` the instant [`RunState::apply_answer`] removes it — is
+//! carried by [`super::Derived`], decided by the check and therefore identical
+//! on replay.
 //!
 //! **The state owns snapshots of what the log records.** Every `.clone()` in
-//! this module copies a value out of the borrowed event body into durable fold
-//! state: a `TaskEntry` into the registry, a region into the lease table, a
-//! session, base or candidate identity into a generation or queue entry. That
-//! is the owned-snapshot semantics §6 blesses, never a borrow-checker
-//! workaround — the fold outlives every event it folded.
+//! this module copies a value into durable fold state: a `TaskEntry` into the
+//! registry, a region into the lease table or the queue, a session, base or
+//! candidate identity into a generation. That is the owned-snapshot semantics
+//! §6 blesses, never a borrow-checker workaround — the fold outlives every
+//! event it folded.
 
 use super::*;
 
@@ -93,7 +95,16 @@ impl RunState {
                 self.open_question(&data.question, QuestionOrigin::Admission, None);
                 self.set_state(data.question.key, TaskState::AwaitingInput);
             }
-            TopologyEventBody::QuestionAnswered { data } => self.apply_answer(data, derived),
+            TopologyEventBody::QuestionAnswered { data } => {
+                // The check pairs every `question_answered` with the resolved
+                // origin on `Derived::Answer`, and `apply` is only reached
+                // through a delta the check produced, so a derived that is not
+                // an answer is not this event's and — like every lookup miss
+                // here — changes nothing.
+                if let Derived::Answer(origin) = derived {
+                    self.apply_answer(data, *origin);
+                }
+            }
             TopologyEventBody::BudgetExceeded { data } => {
                 if !self.budget_stop_is_current() {
                     self.budget_stop = Some(data.stop());
@@ -515,7 +526,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, derived: &Derived) {
+    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, origin: QuestionOrigin) {
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -524,9 +535,19 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                let state = match derived {
-                    Derived::Answer(QuestionOrigin::VerificationPark) => TaskState::AwaitingMerge,
-                    _ => TaskState::Pending,
+                // Exhaustive over the origin, so a new `QuestionOrigin` is a
+                // compile error here rather than a silent fall-through to
+                // pending: a verification park re-enters the queue at awaiting
+                // merge, and every other origin — a spawn admission, a parked
+                // settlement, a bare `question_raised` — returns the task to
+                // pending. That a bare `question_raised` also carries
+                // `Admission`, so one raised on a task already in
+                // awaiting-repair, awaiting-merge or deferred returns it to
+                // pending as well, is an open design question escalated with the
+                // `#108` topology design, not this arm's to decide.
+                let state = match origin {
+                    QuestionOrigin::VerificationPark => TaskState::AwaitingMerge,
+                    QuestionOrigin::Admission => TaskState::Pending,
                 };
                 self.set_state(answered.key, state);
             }
