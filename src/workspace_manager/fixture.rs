@@ -60,7 +60,7 @@
 //!   rendering are not the machine's.
 //! - **the settings this module states**, as `-c` on the command line: the
 //!   hooks path, the fsmonitor, the attributes and excludes files, and
-//!   signing, each at [`ABSENT`] or `false`.
+//!   signing, each at the platform's null device or `false`.
 //!
 //! **So the claim is a construction rather than a list**: a Git command here
 //! runs under Git's own built-in defaults, plus the repository's config, plus
@@ -195,34 +195,12 @@ pub(crate) fn note_removal_attempt(attempt: u32) {
     });
 }
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
+pub(crate) static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
 /// A scratch directory unique to this process *and* to this call, because
 /// the suite runs tests in parallel and two fixtures sharing a directory
 /// would each measure the other's Git repository.
-///
-/// **This is master's, restored.** Four frontier passes read this file, and
-/// three of them faulted the machinery that replaced it. The `rundir::
-/// scratch_tree` token §8 names removes the pre-clean below — a `remove_dir_all`
-/// on a predictable tag-and-pid name, before anything is acquired — but a token
-/// cannot be minted from a path, so a *fixture adopted from another process's
-/// tree* can hold no token, and every shape tried for that gap either deleted a
-/// tree the fixture could not prove it owned or leaked one per kill test. The
-/// §8 finding is back in `reviews/FINDINGS.md` with the three attempts written
-/// out; closing it needs an ownership handoff somebody can authenticate, which
-/// is a design question rather than a repair to this file.
-///
-/// `tag` is still validated as one path component by the manager's own
-/// [`safe_component`], which no finding has touched: a tag carrying a separator
-/// would put the tree somewhere [`Fixture::drop`] does not remove it from.
-///
-/// # Panics
-///
-/// If `tag` is not a safe component, or if the directory cannot be made.
 pub(crate) fn scratch(tag: &str) -> PathBuf {
-    if let Err(why) = safe_component(tag) {
-        panic!("the fixture's scratch tag `{tag}` is not one path component: {why}");
-    }
     let ordinal = SCRATCH.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
         "upstroke-wm-{tag}-{}-{ordinal}",
@@ -352,6 +330,13 @@ fn git_command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
         .env("GIT_COMMITTER_DATE", COMMITTER_DATE)
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
+        // As `WorkspaceManager::command` does, and for the same reason. With
+        // `git replace B C` installed, `rev-list --max-parents=0 main` answers
+        // the replacement's root, not the repository's (measured, git 2.43.0),
+        // so `adopt`'s `seed` would name a commit `side` was never based on.
+        // `replace -l` still lists replacements under this variable, so the
+        // suite that installs one and asserts on it is unaffected (measured).
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .arg("-C")
         .arg(dir);
     for key in ["core.hooksPath", "core.attributesFile", "core.excludesFile"] {
@@ -499,7 +484,7 @@ impl Fixture {
         Self::with_object_format(tag, ObjectFormat::Sha1)
     }
 
-    /// A repository of the given object format, under [`scratch_parent`].
+    /// A repository of the given object format, under [`scratch`].
     pub(crate) fn with_object_format(tag: &str, object_format: ObjectFormat) -> Self {
         Self::at(scratch(tag), object_format)
     }
@@ -570,17 +555,11 @@ impl Fixture {
 
     /// Re-open a fixture a **previous process** built.
     ///
-    /// **The adopted tree is reclaimed exactly as master reclaims it**, and
-    /// that is a deliberate limit rather than an oversight. A token cannot be
-    /// minted from a path, so this process cannot take ownership of a tree its
-    /// child created. The shape that tried — the parent minting the tree and
-    /// handing the child an environment variable naming it — was an
-    /// unauthenticated protocol that reinitialised any repository the variable
-    /// pointed at, and it is withdrawn. Leaving the tree behind instead would
-    /// add a leak master does not have, on a box that has twice run out of
-    /// inodes to exactly this class. So this arm keeps master's best-effort
-    /// removal; the §8 deviation it carries is a deferred row, and closing it
-    /// needs an ownership handoff somebody can authenticate.
+    /// **Reclaimed exactly as master reclaims it, untokened**, and that is
+    /// §8's open finding rather than a claim: a token cannot be minted from a
+    /// path, so a fixture adopted from another process's tree can hold none,
+    /// and every shape tried for that gap under five frontier passes either
+    /// deleted a tree it could not prove it owned or leaked one per kill test.
     ///
     /// A kill child dies by `std::process::abort()`, so its `Drop` never
     /// runs and its scratch tree survives it. The parent then has to speak
@@ -1056,19 +1035,6 @@ mod tests {
         write_file(Path::new(&marker), b"ran\n");
     }
 
-    #[test]
-    fn a_scratch_tag_that_is_not_one_path_component_is_refused() {
-        let refused = std::panic::catch_unwind(|| scratch("has/separator"));
-        let error = refused.expect_err("a tag with a separator must be refused");
-        let message = error
-            .downcast_ref::<String>()
-            .map_or_else(String::new, Clone::clone);
-        assert!(
-            message.contains("is not one path component"),
-            "the refusal must name the tag and the objection: {message}"
-        );
-    }
-
     /// `init.templateDir` and `GIT_TEMPLATE_DIR` put hooks in `.git/hooks` at
     /// `git init`, and an ambient `core.hooksPath` points every command at a
     /// directory of them. Both run under the fixture's own `checkout` and
@@ -1452,8 +1418,10 @@ mod tests {
     /// A display conversion is for diagnostics (§8), so the bytes are the
     /// path's own on Unix, and elsewhere a path that is not Unicode is refused
     /// rather than replaced: a Git config file there is UTF-8, and a
-    /// replacement character is a different path. A newline is refused too,
-    /// because Git config has no representation for one inside a value.
+    /// replacement character is a different path. A newline and a tab are
+    /// escaped, `\\n` and `\\t`, which Git config reads back as the bytes
+    /// (measured, git 2.43.0): an earlier version refused a newline on the
+    /// claim that Git could not represent one, and that claim was false.
     fn config_path_bytes(path: &Path) -> Vec<u8> {
         #[cfg(unix)]
         let bytes = {
@@ -1468,18 +1436,18 @@ mod tests {
                 path.display()
             ),
         };
-        assert!(
-            !bytes.contains(&b'\n'),
-            "the fixture cannot write {} into a Git config file: a value cannot carry a newline",
-            path.display()
-        );
         let mut quoted = Vec::with_capacity(bytes.len() + 2);
         quoted.push(b'"');
         for byte in bytes {
-            if byte == b'\\' || byte == b'"' {
-                quoted.push(b'\\');
+            match byte {
+                b'\\' | b'"' => {
+                    quoted.push(b'\\');
+                    quoted.push(byte);
+                }
+                b'\n' => quoted.extend_from_slice(b"\\n"),
+                b'\t' => quoted.extend_from_slice(b"\\t"),
+                other => quoted.push(other),
             }
-            quoted.push(byte);
         }
         quoted.push(b'"');
         quoted
@@ -1488,6 +1456,13 @@ mod tests {
     /// `trim()` ate a trailing space from a path Git answered with, which is a
     /// different path. Unix only: Windows strips a trailing space from a
     /// directory name itself, so the case cannot be built there.
+    ///
+    /// **What this proves and what it does not.** It proves the terminator
+    /// strip. It does not prove exact path handling: `git` decodes its answer
+    /// as UTF-8 and refuses anything else, so under a temporary directory
+    /// whose own name is not UTF-8 this test -- and every other fixture test --
+    /// panics before Git is reached. That is the module-wide `String` class,
+    /// master's shape, and it is an open finding rather than a claim here.
     #[cfg(unix)]
     #[test]
     fn git_strips_the_line_terminator_and_not_a_trailing_space() {
@@ -1516,7 +1491,7 @@ mod tests {
     #[test]
     fn the_abort_oracle_separates_an_abort_from_an_ordinary_failure() {
         let aborted = run_kill_child(ABORT_PROBE, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
-        let exited = run_kill_child(EXITING_CHILD, &[]);
+        let exited = run_kill_child(EXITING_CHILD, &[(ABORT_PROBE_ARM, OsStr::new("1"))]);
 
         // Premises first, so a probe that stopped working is loud rather than
         // vacuous.
@@ -1590,6 +1565,23 @@ mod tests {
         }
     }
 
+    /// Both probes are inert unless armed, so a run that includes ignored
+    /// tests cannot be ended by them.
+    ///
+    /// `process::exit(1)` ends the whole libtest binary, destructors of every
+    /// other running test included; unarmed, the exit probe returns instead,
+    /// exactly as the abort probe beside it always did.
+    #[test]
+    fn the_probes_are_inert_unless_armed() {
+        for probe in [ABORT_PROBE, EXITING_CHILD] {
+            let unarmed = run_kill_child(probe, &[]);
+            assert!(
+                unarmed.success(),
+                "`{probe}` ran unarmed and did not simply return: {unarmed:?}"
+            );
+        }
+    }
+
     /// The abort half of [`the_abort_oracle_separates_an_abort_from_an_ordinary_failure`],
     /// and the probe [`died_by_abort`] measures against on Windows.
     ///
@@ -1609,6 +1601,13 @@ mod tests {
     #[test]
     #[ignore = "spawned by `the_abort_oracle_separates_an_abort_from_an_ordinary_failure`"]
     fn exiting_child() {
+        // Armed like the abort probe: unarmed it returns, so a run that
+        // includes ignored tests does not end the whole binary with exit 1 --
+        // which `process::exit` does, destructors of every other running test
+        // included.
+        if std::env::var_os(ABORT_PROBE_ARM).is_none() {
+            return;
+        }
         std::process::exit(1);
     }
 
@@ -1662,7 +1661,10 @@ mod tests {
     #[test]
     fn a_config_path_survives_gits_comment_and_trimming_rules() {
         let fixture = Fixture::new("config-quoting");
-        let awkward = fixture.root.join("a#b;c ");
+        // `#` and `;` open comments, the trailing space is trimmed, and the
+        // newline used to be refused on the claim that Git could not
+        // represent one; Git escapes it and reads it back.
+        let awkward = fixture.root.join("a#b;c\nd ");
         create_dir(&awkward);
 
         let mut written = b"[core]\n\thooksPath = ".to_vec();
@@ -1686,6 +1688,37 @@ mod tests {
             PathBuf::from(read_back),
             awkward,
             "Git read a different path out of the config than the one written in"
+        );
+    }
+
+    /// `adopt` reads the repository's own root commit, not a replacement's.
+    ///
+    /// With `git replace B C` installed, `rev-list --max-parents=0 main` answers
+    /// the replacement's root (measured, git 2.43.0), so an adopted `seed` would
+    /// name a commit `side` was never based on. The fixture's commands run with
+    /// `GIT_NO_REPLACE_OBJECTS=1`, as the manager's do, and this test installs a
+    /// replacement through the same commands -- `replace` writes the ref under
+    /// that variable and `replace -l` lists it -- then adopts.
+    #[test]
+    fn adopt_reads_the_real_root_commit_through_a_replacement() {
+        let fixture = Fixture::new("adopt-replaced");
+        let tree = git(&fixture.base, &["rev-parse", "HEAD^{tree}"]);
+        let other_root = git(&fixture.base, &["commit-tree", &tree, "-m", "R"]);
+        let replacement = git(
+            &fixture.base,
+            &["commit-tree", &tree, "-p", &other_root, "-m", "C"],
+        );
+        git(&fixture.base, &["replace", &fixture.head, &replacement]);
+        assert_eq!(
+            git(&fixture.base, &["replace", "-l"]),
+            fixture.head,
+            "the replacement must be installed, or this proves nothing"
+        );
+
+        let adopted = Fixture::adopt(fixture.root.clone());
+        assert_eq!(
+            adopted.seed, fixture.seed,
+            "the adopted seed followed the replacement to a root `side` was never based on"
         );
     }
 
