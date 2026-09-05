@@ -1,7 +1,7 @@
 //! Extended notes: `docs/internals/runner/host/tests.md`
 
 // Allowlist placement: the funnel section of `effects/allowlist.toml`, which
-// carries this module's review clause. `effect_site_inventory.mechanism` (2).
+
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -3971,10 +3971,6 @@ mod inherited_writer {
         }
     }
 
-    // This guard owns one forked child's lifetime. Its socket releases the child
-    // after observation; shutdown also releases it on failure. The child closes
-    // the parent's socket endpoint before announcing readiness and exits after
-    // release or its read timeout. Drop waits for that exact pid, never a group.
     struct HeldFork {
         pid: libc::pid_t,
         release: UnixStream,
@@ -3984,7 +3980,7 @@ mod inherited_writer {
         fn assert_alive(&self) {
             let mut status = 0;
             // SAFETY: pid is this guard's unreaped child and status is writable.
-            // WNOHANG observes whether it exited without waiting for release.
+
             let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             assert_eq!(
                 waited, 0,
@@ -3999,7 +3995,7 @@ mod inherited_writer {
             let mut status = 0;
             let waited = loop {
                 // SAFETY: pid is our unreaped direct child; status is a live,
-                // writable c_int. The socket's read timeout bounds the child.
+
                 let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
                 if result < 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
@@ -4028,11 +4024,7 @@ mod inherited_writer {
         let pid = std::thread::spawn(move || {
             let child_fd = child_socket.as_raw_fd();
             // SAFETY: only the parent returns into Rust after fork. The child
-            // uses only close/write/read/_exit, all async-signal-safe, with live
-            // inherited fds and one-byte stack buffers. It never allocates,
-            // unwinds, drops Rust owners, or touches inherited locks. Closing
-            // parent_fd removes its copy of the release endpoint. The separate
-            // child endpoint stays live until _exit closes all inherited fds.
+
             unsafe {
                 let pid = libc::fork();
                 if pid == 0 {
@@ -4074,7 +4066,7 @@ mod inherited_writer {
                 revents: 0,
             };
             // SAFETY: ready is one initialized pollfd and remains live for this
-            // call; its descriptor is borrowed from reader. The wait is bounded.
+
             let polled = unsafe { libc::poll(&mut ready, 1, 1000) };
             if polled < 0
                 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
@@ -4153,7 +4145,7 @@ mod inherited_writer {
         let name =
             std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("a NUL-free FIFO path");
         // SAFETY: name is a live NUL-terminated path in our private scratch
-        // directory, and 0600 grants access only to this test's user.
+
         assert_eq!(
             unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
             0,
@@ -4165,7 +4157,7 @@ mod inherited_writer {
             .open(&fifo)
             .expect("open the FIFO reader before the shim writer");
         // SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
-        // integer size, and shrinking an empty pipe needs no extra privilege.
+
         let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
         assert_eq!(capacity, 4096, "bound the pipe so the script cannot fit");
         let marker = format!("{} ' $name `printf literal`", "x".repeat(16 * 1024));
@@ -5327,37 +5319,42 @@ fn production_reaches_a_spawn_through_one_host_runner_per_run() {
         "the census and its expectation cover different files"
     );
 
-    let planted = sources.len();
-    let mut counted: Vec<(&str, usize)> = Vec::new();
-    let mut stripped = 0_usize;
-    for (name, source) in sources {
-        let production = format!(
-            "{}\n// STRIP-CONTROL: a comment this strip must remove",
-            crate::effects::production_region(source)
-        );
-        let kept: Vec<&str> = production
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        stripped += production.lines().count() - kept.len();
-        assert!(
-            !kept.iter().any(|line| line.contains("STRIP-CONTROL")),
-            "{name}: the planted control survived the strip"
-        );
-        counted.push((name, kept.join("\n").matches("HostRunner::new(").count()));
-    }
-    assert!(
-        stripped >= planted,
-        "the comment strip removed {stripped} lines across {planted} files, fewer than the one \
-         control line planted in each, so this census is reading prose"
-    );
-    assert_eq!(
-        "let r = HostRunner::new();"
+    const CONTROL: &str = r##"
+// STRIP-CONTROL: HostRunner::new();
+/* HostRunner::new(); /* HostRunner::new(); */ */
+const TEXT: &str = "HostRunner::new();";
+const RAW: &str = r#"HostRunner::new();"#;
+const BYTES: &[u8] = b"HostRunner::new();";
+const RAW_BYTES: &[u8] = br#"HostRunner::new();"#;
+const QUOTE: char = '"';
+#[cfg(test)]
+pub(super) fn excluded_control() -> Result<((), ()), ()> {
+    let runner = HostRunner::new();
+    Ok(((), ()))
+}
+fn production_control() { let runner = HostRunner::new(); }
+"##;
+    let count_constructions = |source: &str| {
+        crate::effects::production_code(source)
             .matches("HostRunner::new(")
-            .count(),
+            .count()
+    };
+    assert_eq!(
+        count_constructions(CONTROL),
         1,
-        "the census pattern matches nothing at all"
+        "the control must count only the production construction"
     );
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for (name, source) in sources {
+        let count = count_constructions(source);
+        let with_control = format!("{source}\n{CONTROL}");
+        assert_eq!(
+            count_constructions(&with_control),
+            count + 1,
+            "{name}: the census must ignore prose and test items and count an appended production construction"
+        );
+        counted.push((name, count));
+    }
     assert_eq!(
         counted,
         SITES.to_vec(),
@@ -5365,7 +5362,8 @@ fn production_reaches_a_spawn_through_one_host_runner_per_run() {
          The memo behind `program_searches` is per runner, so a runner per attempt is a \
          resolution per attempt and DESIGN.md:612 is open again"
     );
-    let engine = crate::effects::production_region(include_str!("../../engine/mod.rs"));
+
+    let engine = crate::effects::production_code(include_str!("../../engine/mod.rs"));
     for facade in ["fn run_harness(", "fn resume_harness("] {
         let after = engine
             .split_once(facade)

@@ -1052,6 +1052,62 @@ pub(super) mod oracles {
         assert!(!region.contains("mod tests;"), "{region:?}");
     }
 
+    pub(in crate::effects::tests) fn typed_test_functions_are_removed_and_later_code_is_kept() {
+        for prefix in [
+            "",
+            "pub ",
+            "pub(super) ",
+            "pub(in crate::effects) ",
+            "pub(crate) async unsafe ",
+            "extern \"C\" ",
+        ] {
+            let source = format!(
+                "#[cfg(test)]\n{prefix}fn excluded() -> Result<(RunReport, RunState), UpstrokeError> {{\n\
+                 let hidden = HostRunner::new();\nOk((report, state))\n}}\n\
+                 fn production() {{ let visible = HostRunner::new(); }}\n"
+            );
+            let region = production_code(&source);
+            assert!(
+                !region.contains("hidden"),
+                "typed test function survived its cfg removal: {prefix:?}: {region:?}"
+            );
+            assert!(region.contains("fn production()"), "{prefix:?}: {region:?}");
+            assert!(region.contains("let visible"), "{prefix:?}: {region:?}");
+            assert_eq!(region.matches("HostRunner::new(").count(), 1, "{region:?}");
+            assert_eq!(region.len(), source.len());
+            assert_eq!(region.lines().count(), source.lines().count());
+        }
+
+        for field in [
+            "callback: fn() -> Result<A, B>,",
+            "generic: BTreeMap<K, V>,",
+            "callback: unsafe extern \"C\" fn() -> Result<A, B>,",
+        ] {
+            let source =
+                format!("struct S {{ #[cfg(test)] {field} kept: u8, }}\nfn production() {{}}\n");
+            let region = production_code(&source);
+            assert!(region.contains("kept: u8"), "{field}: {region:?}");
+            assert!(region.contains("fn production()"), "{field}: {region:?}");
+        }
+
+        for source in [
+            "#[cfg(test)]\nfn broken() -> Result<A, B>\nfn production() { let visible = HostRunner::new(); }\n",
+            "#[cfg(test)] fn broken() -> Result<A, B> { fn production() {}\n",
+            "#[cfg(test)] fn broken() -> Result<A, B>\n",
+            "#[cfg(test)] pub(super fn broken() -> Result<A, B> { fn production() {}\n",
+        ] {
+            let region = production_code(source);
+            assert!(
+                region.contains("fn broken()"),
+                "an incomplete test item swallowed later source: {region:?}"
+            );
+            assert_eq!(
+                region.contains("fn production()"),
+                source.contains("fn production()")
+            );
+        }
+    }
+
     pub(in crate::effects::tests) fn a_configured_attribute_in_prose_is_inert() {
         for prose in [
             "/* a fixture in prose: #[cfg(test)] opens a test module */\nfn kept() {}\n",

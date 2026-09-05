@@ -1996,3 +1996,8 @@ the body that holds them are in `contract_mappings::mappings` with the
 T-CONTAINER transcription above. They are resolved by the same
 `defining_test_sites` census and belong beside it; the name below is the
 harness and delegates.
+
+## `#![allow(`
+
+Allowlist placement: the funnel section of `effects/allowlist.toml`, which
+carries this module's review clause. `effect_site_inventory.mechanism` (2).

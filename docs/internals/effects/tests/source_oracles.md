@@ -1307,3 +1307,18 @@ Counted in code, not asserted from prose.
 
 And the shared prohibition region has exactly one definition, which is
 the whole point of having removed the third `production_region`.
+
+## `pub(in crate::effects::tests) fn typed_test_functions_are_removed_and_later_code_is_kept() {`
+
+Typed test wrappers must disappear without hiding later production.
+A return-type comma is not a field separator; a function-pointer field's
+comma still is. Incomplete items retain their bodies for the census.
+
+## `pub(in crate::effects::tests) fn a_configured_attribute_in_prose_is_inert() {`
+
+A `#[cfg(test)]` that is prose neither cuts nor is removed.
+
+The two attacks the `//`-only strip this replaced could not see, both
+measured against the barrier census: with either one planted as line 1 of a
+production file, a second `TopologyFold::parse_log` route in the same file
+became invisible and the census passed.
