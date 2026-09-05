@@ -6,6 +6,9 @@ The code is the authority for what it does; this file is the whole of its prose,
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
 
+Command and argument descriptions also remain in explicit Clap attributes in the source:
+they generate the installed CLI's short and long help. The notes preserve the longer prose.
+
 ## `#![allow(`
 
 upstroke — headless orchestration engine for AI coding agents.

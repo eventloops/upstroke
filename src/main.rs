@@ -43,61 +43,104 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Discover installed agent CLIs and write ~/.upstroke/pools.toml")]
     Connect {
+        #[arg(
+            help = "Replace an existing pools file that differs from what this would write. Without it, connect prints the difference and refuses"
+        )]
         #[arg(long)]
         force: bool,
+        #[arg(help = "Pools file path (default: ~/.upstroke/pools.toml)")]
         #[arg(long)]
         pools: Option<PathBuf>,
     },
+    #[command(
+        about = "Show every pool: remaining estimate, resets, and what each strategy would do"
+    )]
     Capacity {
+        #[arg(help = "Repo config path (default: ./upstroke.toml, optional)")]
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(help = "Pools file path (default: ~/.upstroke/pools.toml)")]
         #[arg(long)]
         pools: Option<PathBuf>,
     },
+    #[command(about = "Parse a plan, resolve routing, and print the task table (no execution)")]
     Validate {
+        #[arg(help = "Path to the plan file (annotated or bare markdown)")]
         plan: PathBuf,
+        #[arg(help = "Write plan.normalized.json (the IR) to the current directory")]
         #[arg(long)]
         emit_json: bool,
+        #[arg(help = "Repo config path (default: ./upstroke.toml, optional)")]
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    #[command(about = "Execute a plan sequentially: run branch, agent per task, commit per task")]
     Run {
+        #[arg(help = "Path to the plan file (annotated or bare markdown)")]
         plan: PathBuf,
+        #[arg(
+            help = "Everything except agents: parse, route, and print the preview at zero spend"
+        )]
         #[arg(long)]
         dry_run: bool,
+        #[arg(help = "Repo config path (default: ./upstroke.toml, optional)")]
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(
+            help = "Override [interaction] mode; `never` is the CI setting — questions park their tasks and the run reports them instead of waiting"
+        )]
         #[arg(long, value_enum)]
         interaction: Option<Interaction>,
+        #[arg(
+            help = "Ceiling on api-equivalent dollars, overriding [budgets] run_usd. The run stops (exit 3) before the attempt that would cross it"
+        )]
         #[arg(long)]
         budget: Option<f64>,
     },
+    #[command(about = "Continue a run that was interrupted, parked, or stopped at its budget")]
     Resume {
+        #[arg(help = "Run id, or any unambiguous prefix of one")]
         run_id: String,
+        #[arg(help = "Repo config path (default: the one the run recorded)")]
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long, value_enum)]
         interaction: Option<Interaction>,
+        #[arg(
+            help = "Raise the ceiling and continue. Budgets are re-derived at resume rather than inherited from the stopped run"
+        )]
         #[arg(long)]
         budget: Option<f64>,
     },
+    #[command(about = "Show a run: what happened, what it cost, and what it is waiting for")]
     Status {
+        #[arg(help = "Run id or prefix; omit for the most recent run")]
         run_id: Option<String>,
+        #[arg(help = "Stream events as they are appended, ending when the run finishes")]
         #[arg(long)]
         follow: bool,
     },
+    #[command(about = "Export one settled run's local routing decisions to stdout")]
     ExportDecisions {
+        #[arg(help = "Run id, or any unambiguous prefix of one")]
         run_id: String,
+        #[arg(help = "Output encoding (default: jsonl)")]
         #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
         format: ExportFormat,
     },
+    #[command(about = "Answer a question a run is parked on (§12)")]
     Answer {
+        #[arg(help = "Question id, or any unambiguous prefix of one")]
         question_id: String,
+        #[arg(help = "Pick one of the question's numbered options")]
         #[arg(long, conflicts_with_all = ["text", "decline"])]
         option: Option<usize>,
+        #[arg(help = "Answer in your own words")]
         #[arg(long, conflicts_with = "decline")]
         text: Option<String>,
+        #[arg(help = "Give up on the task; its dependents will be blocked")]
         #[arg(long)]
         decline: bool,
     },
@@ -380,6 +423,148 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn cli_help_lists_every_command_description() {
+        let descriptions = [
+            (
+                "connect",
+                "Discover installed agent CLIs and write ~/.upstroke/pools.toml",
+            ),
+            (
+                "capacity",
+                "Show every pool: remaining estimate, resets, and what each strategy would do",
+            ),
+            (
+                "validate",
+                "Parse a plan, resolve routing, and print the task table (no execution)",
+            ),
+            (
+                "run",
+                "Execute a plan sequentially: run branch, agent per task, commit per task",
+            ),
+            (
+                "resume",
+                "Continue a run that was interrupted, parked, or stopped at its budget",
+            ),
+            (
+                "status",
+                "Show a run: what happened, what it cost, and what it is waiting for",
+            ),
+            (
+                "export-decisions",
+                "Export one settled run's local routing decisions to stdout",
+            ),
+            ("answer", "Answer a question a run is parked on (§12)"),
+        ];
+        for flag in ["-h", "--help"] {
+            let root = rendered_cli_help(&["upstroke", flag]);
+            for (name, description) in descriptions {
+                assert!(
+                    root.contains(&format!("{name} {description}")),
+                    "root {flag} must describe {name}: {root}"
+                );
+                let help = rendered_cli_help(&["upstroke", name, flag]);
+                assert!(
+                    help.contains(description),
+                    "{name} {flag} must retain its description: {help}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_help_preserves_argument_meanings() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "connect",
+                &[
+                    "Replace an existing pools file that differs from what this would write. Without it, connect prints the difference and refuses",
+                    "Pools file path (default: ~/.upstroke/pools.toml)",
+                ],
+            ),
+            (
+                "capacity",
+                &[
+                    "Repo config path (default: ./upstroke.toml, optional)",
+                    "Pools file path (default: ~/.upstroke/pools.toml)",
+                ],
+            ),
+            (
+                "validate",
+                &[
+                    "Path to the plan file (annotated or bare markdown)",
+                    "Write plan.normalized.json (the IR) to the current directory",
+                    "Repo config path (default: ./upstroke.toml, optional)",
+                ],
+            ),
+            (
+                "run",
+                &[
+                    "Path to the plan file (annotated or bare markdown)",
+                    "Everything except agents: parse, route, and print the preview at zero spend",
+                    "Repo config path (default: ./upstroke.toml, optional)",
+                    "Override [interaction] mode; `never` is the CI setting — questions park their tasks and the run reports them instead of waiting",
+                    "Ceiling on api-equivalent dollars, overriding [budgets] run_usd. The run stops (exit 3) before the attempt that would cross it",
+                ],
+            ),
+            (
+                "resume",
+                &[
+                    "Run id, or any unambiguous prefix of one",
+                    "Repo config path (default: the one the run recorded)",
+                    "Raise the ceiling and continue. Budgets are re-derived at resume rather than inherited from the stopped run",
+                ],
+            ),
+            (
+                "status",
+                &[
+                    "Run id or prefix; omit for the most recent run",
+                    "Stream events as they are appended, ending when the run finishes",
+                ],
+            ),
+            (
+                "export-decisions",
+                &[
+                    "Run id, or any unambiguous prefix of one",
+                    "Output encoding (default: jsonl)",
+                ],
+            ),
+            (
+                "answer",
+                &[
+                    "Question id, or any unambiguous prefix of one",
+                    "Pick one of the question's numbered options",
+                    "Answer in your own words",
+                    "Give up on the task; its dependents will be blocked",
+                ],
+            ),
+        ];
+        for (name, meanings) in cases {
+            for flag in ["-h", "--help"] {
+                let help = rendered_cli_help(&["upstroke", name, flag]);
+                for meaning in *meanings {
+                    assert!(
+                        help.contains(meaning),
+                        "{name} {flag} must explain {meaning:?}: {help}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn rendered_cli_help(argv: &[&str]) -> String {
+        let error = Cli::command()
+            .try_get_matches_from(argv)
+            .expect_err("help returns a display request instead of parsed arguments");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert_eq!(error.exit_code(), 0, "help is a successful CLI request");
+        error
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     const DISPATCH: &[(&str, &[&str], CommandClass)] = &[
         ("connect", &["upstroke", "connect"], CommandClass::ReadOnly),
