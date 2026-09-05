@@ -5005,12 +5005,14 @@ fn tree_bytes_detects_a_directory_replaced_by_a_link_to_equal_contents() {
 /// `remove_worktree` **refuses** it, with a diagnostic naming this admin
 /// directory and nothing else, and the residue blocks every removal through
 /// this funnel in the repository, not only this slot's. That is pinned as what
-/// the funnel does today. No shipped path reaches it: `remove_worktree`'s
-/// callers are the schema-4 topology, which this build's recovery refuses to
-/// resume (`src/engine/mod.rs`), and `reclaim_intents` has no non-test
-/// caller; `upstroke resume` reclaims gate/review snapshot worktrees through
-/// `Workspace::reclaim_gate_workspaces`, which never decodes a registration's
-/// `gitdir`, and `DESIGN.md` §15's reclaim sentence is about those worktrees.
+/// the public `WorkspaceManager` library API does today. The shipped CLI's
+/// `upstroke resume` uses the separate `Workspace::reclaim_gate_workspaces`
+/// path, which never decodes a registration's `gitdir`; this test does not
+/// reproduce a refusal in that path. `DESIGN.md` §15's reclaim sentence is
+/// about those gate/review worktrees. The engine's task-slot callers are in
+/// its crate-private schema-4 topology, and `reclaim_intents` has no non-test
+/// caller within this repository, but external library callers can use the
+/// public manager directly.
 /// The design is silent about a task registration this funnel cannot bind;
 /// `RESIDUE-UNBINDABLE-TASK-REGISTRATION-HAS-NO-DESIGN-SENTENCE` records that
 /// gap and the measurements a sentence needs. On disk this state is

@@ -8,10 +8,10 @@ reviewed_sha: ac00723e980cb9549aae76ae0fea24797bd25d7d
 location: design/15_design_event_log_resume_run_layout.md:32
 provenance: pre_existing
 first_bad: RESIDUE-EMPTY-GITDIR-REGISTRATION-BLOCKS-EVERY-REMOVAL
-guard: the change that gives the schema-4 topology a shipped entry point (`src/engine/mod.rs` says a schema-4 run is reachable only from a `#[cfg(test)]` writer today), or the sweep of `src/workspace_manager.rs` (queue row 11), whichever comes first; `an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup` pins the behaviour a sentence has to describe
+guard: the next task-registration recovery policy change or the WorkspaceManager sweep must decide and document the unbindable-registration policy; this is already a public library API; `an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup` records its current behaviour, while PR145 owns the separate P2 sampler/classifier defect
 ---
 
-## What is missing
+## Failure sequence
 
 `DESIGN.md` §15's reclaim sentence -- "Exact gate/review worktrees likewise record and sync a
 private intent before `git worktree add`; resume reclaims every such registration before it
@@ -21,13 +21,19 @@ intent-named checkout and never decodes a registration's `gitdir`. The v0.2 work
 task, staging and snapshot slots (`src/workspace_manager.rs`) are a different funnel with a
 different reclaim -- `remove_worktree` binds a registration only through its `gitdir` bytes and
 refuses on one it cannot bind -- and no sentence in `design/` says what that funnel does with a
-registration it cannot bind. That funnel has no shipped caller today: its callers are the
-schema-4 topology, which this build's recovery refuses to resume, and `reclaim_intents` has no
-non-test caller. So this is a gap in the design for behaviour that is in the tree and not in the
-product, which is why it is P3 and docs-contract: the sentence is owed when the behaviour ships,
-and the facts it needs are measured now so they are not re-derived then.
+registration it cannot bind. That task-registration policy remains unspecified in the design.
+`src/lib.rs` publicly exports `workspace_manager`, including `WorkspaceManager::derive` and
+`remove_worktree`, so external library consumers can use this API today. The engine's task-slot
+callers are in its crate-private schema-4 topology, and `reclaim_intents` has no non-test caller
+within this repository. Those facts do not make the library API unshipped.
 
-## The behaviour a sentence has to describe, measured (git 2.43.0 on the build box)
+This P3 records the missing design policy. It does not establish a violation of section 15's
+gate/review sentence or reproduce a shipped CLI resume failure. It also does not replace the
+separate P2 sampler/classifier defect, `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`, assigned
+to PR145. The old finding's CLI/design claim was rejected against its actual subject and caller,
+not because the task-slot refusal or the sampler failure disappeared.
+
+## Historical Git 2.43.0 observations on the build box
 
 `git worktree add --detach` under strace writes, in order: `mkdir .git/worktrees/<name>`; open+write
 `locked` (`initializing\n`); `mkdir <checkout>`; open+write `gitdir`; open+write
@@ -47,17 +53,21 @@ list`, so `record_for` answers `None`, `classify_object_residue` answers `Object
 reason the site's `recovery_proven` sampling half (`SamplingRecord.recovered`) is falsified when
 the sampler's kill lands in that window (`forced removal converges: Git { message: "worktree
 registration … has an empty gitdir" }`, about 1/50 under load by the handing session's measurement).
-`remove_worktree` refuses before mutation, for the slot and for every other slot through this
-funnel, with a diagnostic naming the admin directory; the test named in `guard` pins all of it
-with a whole-tree byte comparison around each refusal.
+`remove_worktree` refuses for the slot and for an unrelated populated slot through this API,
+with a diagnostic naming the admin directory. The test named in `guard` constructs the residue
+deterministically and compares four trees around each refusal: both checkouts, the whole Git
+worktrees store and the intents. Entries record directories, file bytes and link targets. This
+test does not reproduce the sampler's rate or establish that all other repository state is
+unchanged.
 
 ## Why the sentence cannot simply promise reclaim
 
 `.git/worktrees/` is per repository, not per run or per execution root; a registration whose
 `gitdir` names nothing cannot be attributed to this run -- it may be a sibling run's add in flight
 in the same repository or a human's killed `git worktree add` -- and the admin directory's name
-proves nothing (`revalidate_removal` says why; the collision-suffixed name is the measured form).
-So no sound implementation deletes such a registration. What an implementation could do is
+does not identify its owner (`revalidate_removal` says why; the collision-suffixed name is the
+measured form). Those fields alone do not authorize this run to delete the registration. One
+possible policy is to
 converge the removal of this run's own checkout past it, which is attributable by path; a skip of
 exactly that shape was built on PR #151 and withdrawn because, on disk, the kill residue and an
 add in flight are identical (`locked` present in both), and the manager's Git children are
@@ -70,12 +80,12 @@ without it.
 
 ## What the change that takes this up should do
 
-Write the sentence for this funnel, in §15 beside the gate/review one or in the v0.2 section that
-owns the workspace manager: a registration reclaim cannot bind through its `gitdir` bytes is
-never deleted by name; one with no `gitdir` is skipped and left to prune; one with a `gitdir` it
-cannot decode halts reclaim through this funnel before mutation, and the residue an add killed
-before writing `gitdir` leaves is one such. If the product wants that residue converged rather
-than halted, the sentence has to state the liveness argument, and the mechanism -- the manager's
-Git children under the ownership protocol -- lands with it; then the withdrawn skip (`88c41a3`
-on PR #151's branch) is the funnel change and the classifier learns to see the state so the
-site's sampling evidence is over what the funnel meets. Never gate on `locked` alone.
+Decide and document the policy for this public task-registration API in the design section that
+owns the workspace manager. Describe the current distinction between an absent `gitdir`, which
+is skipped and left to prune, and a present file the manager cannot decode, which refuses
+removal. If the policy keeps that refusal, specify its scope and recovery conditions. If it
+instead promises convergence, the implementation needs both deletion authority and evidence
+that its writers have stopped, with deterministic tests for those conditions. The withdrawn
+skip at `88c41a3` is historical evidence, not a prescribed implementation. Keep the classifier
+and sampling contract consistent with the adopted behavior. `locked` alone is not a liveness
+proof.
