@@ -1,13 +1,8 @@
-//! The derived outcome (INV-15) and the structural predicates it and the
-//! selection accessors are both answered from.
+//! Extended notes: `docs/internals/topology/fold/outcome.md`
 
 use super::*;
 
 impl RunState {
-    // -----------------------------------------------------------------------
-    // derived_outcome
-    // -----------------------------------------------------------------------
-
     pub(super) fn derived_outcome(&self) -> DerivedOutcome {
         if !self.common() {
             return DerivedOutcome::NotEnding;
@@ -30,7 +25,6 @@ impl RunState {
         DerivedOutcome::FoldError
     }
 
-    /// No generation is open and no integration transaction is unresolved.
     pub(super) fn common(&self) -> bool {
         self.tasks.iter().all(|task| {
             task.open()
@@ -38,8 +32,6 @@ impl RunState {
         }) && self.transaction.is_none()
     }
 
-    /// Some task could be dispatched, retried, or integrated from this state
-    /// alone. Budget, capacity and runner availability are not consulted.
     pub(super) fn structurally_admissible(&self) -> bool {
         (0..self.tasks.len())
             .map(|index| TaskKey(u32::try_from(index).unwrap_or(u32::MAX)))
@@ -70,12 +62,6 @@ impl RunState {
             && !self.run_is_ending()
     }
 
-    /// A repair dispatch is never lease-blocked; an ordinary one is blocked by
-    /// any overlapping active lease of another owner.
-    ///
-    /// The predicted region is not in the log until the dispatch that takes it,
-    /// so the check the *fold* can make is over the run's own leases: a task
-    /// with a repo-wide prediction is admissible exactly when nothing is held.
     pub(super) fn dispatch_lease_check(&self, key: TaskKey, entry: &TaskEntry) -> bool {
         if entry.lineage.is_some() {
             return true;
@@ -124,15 +110,6 @@ impl RunState {
             < usize::try_from(self.started.limits.max_parallel).unwrap_or(usize::MAX)
     }
 
-    /// `permits.provisional_reservations` gives integration selection the
-    /// `{pipeline, merge}` pair, and `deadlock_freedom` takes a reservation
-    /// "only when the derived count permits" — so the entitlement is a clause
-    /// of admissibility here for the same reason it is one in [`Self::ready`]
-    /// and [`Self::ready_retry`], and not a check the caller is trusted to
-    /// remember. `permits.pipeline` counts an unresolved integration
-    /// transaction among the held, which is the other half of the same
-    /// statement: a selector that admitted an integration while the count was
-    /// at `max_parallel` would open the entitlement that is already held.
     pub(super) fn integration_admissible(&self) -> bool {
         self.transaction.is_none()
             && self.pipeline_reservable()
@@ -171,21 +148,8 @@ impl RunState {
             && !self.leases.any_candidate_or_lineage()
     }
 
-    /// Every task that can never run because a failure sits in its transitive
-    /// dependency closure.
     pub(super) fn blocked_tasks(&self) -> BTreeSet<usize> {
         let mut blocked = BTreeSet::new();
-        // To a fixed point, not in one pass. A *repair*'s dependencies refer
-        // only backwards, but an original's keys are assigned in plan order
-        // (`keys_by_display_id`) and plan order is not topological order, so
-        // an ordinary plan can have a task depend on a later key. One forward
-        // pass would then decide that task before it had decided what the task
-        // waits on, and a failure two hops away would go unseen — which is the
-        // difference between "directly failed dependency" and the transitive
-        // closure the packet asks for.
-        //
-        // Each round adds at least one member or stops, and membership only
-        // grows, so this runs at most `tasks.len()` rounds.
         loop {
             let mut grew = false;
             for (index, task) in self.tasks.iter().enumerate() {
