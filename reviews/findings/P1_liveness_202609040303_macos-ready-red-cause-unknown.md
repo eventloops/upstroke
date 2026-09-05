@@ -8,7 +8,7 @@ reviewed_sha: 0bff83dfa632b80a0373202613f37cce222410f9
 location: src/agent/proc.rs:2461
 provenance: undetermined
 first_bad: W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT is the other macOS fingerprint of the same period, not this one; first sighting of this one 2026-09-03 on master
-guard: deferred: the cause is not established and a bigger budget did not help at the exact head, so the next change is a diagnostic, not a budget: on a…
+guard: deferred: PR #172 repaired the wait's blindness to the helper's end on Darwin (`a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`) and made the helper report the setup step that refused and its errno (`a_reaper_refused_its_cleanup_lease_says_which_lease_and_why`); the cause of the helper's own exit is still not established, so the row stays open until a recurrence with the report in place names the step and that step is repaired, or the fingerprint stays absent across the macOS legs of enough runs to say so
 ---
 
 ## Failure sequence
@@ -53,3 +53,56 @@ changing #156's head or restarting its CI. This is a PR-specific acceptance
 of the existing runtime risk, not a severity downgrade, a claim of a fix, or
 a general waiver for other PRs. The canonical P1 remains open with its
 historical metadata and repair requirements unchanged.
+
+### What PR #172 established, 2026-09-05
+
+**The shape of every recorded occurrence is explained; the helper's own exit is not.** Two facts
+were established, one by measurement on the macOS runner CI uses and one by reading the tree.
+
+**Why a bigger budget could not help, and why every failure read as a timeout.** The helper
+channel on Darwin is a FIFO (`create_cloexec_pipe`, because Darwin has no `pipe2` and a FIFO gives
+an atomic close-on-exec open), and the parent's READY wait was `poll(2)`. `poll` on a Darwin FIFO
+reports data and never the last writer's close: XNU routes a FIFO's `EVFILT_READ` knote through
+the generic vnode filter, whose readable test is the queued byte count (`fifo_charcount`), and the
+writer's `fifo_close` wakes the read socket's selinfo, not the vnode's knotes. So a helper that
+ended before READY was invisible to the wait, which ran to its budget — two seconds on master, ten
+at PR #125's head — and then reported the exit status of a child that had been dead the whole time.
+Measured on macOS 26.5.2 / xnu-12377.121.10 (run 33989444028 and 33989492728 on branch
+`scratch/darwin-fifo-eof-experiment`, `exp/fifo_eof.c`): with the channel built exactly as the
+crate builds it and a forked child that closes its end and exits, `poll` returned 0 after the full
+3 s; `select` on the same FIFO returned readable at once and `read` then returned 0; `poll` on a
+`pipe(2)` returned `POLLIN|POLLHUP` at once; one byte written by the child woke `poll` on the FIFO
+at once. Linux passed all five at once. The same fact was visible in CI before the experiment:
+`a_helper_that_never_acknowledged_reports_what_ending_it_answered`, whose two helpers exit before
+READY, completed about 4 s after its neighbours on the macOS leg of run 33987067020 and about 6 ms
+after them on the Linux leg. PR #172 makes the Darwin wait a `select` (`wait_readable`), so the wait
+now ends when the helper ends; `a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`
+fails on the tree before it on macOS and passes after.
+
+**What the helper's exit means, and what still has to be learned.** Every recorded occurrence with
+the PR #134 diagnostic in place — #154 at `d7e0c5d`, #156 at `20f0665`, #171 at `dea50f9` —
+collected the reaper "having already exited with status 1". Status 1 is reached only through the
+reaper's own `_exit(1)` sites before READY: installing its signal dispositions, `setpgid(0, 0)`,
+opening a cleanup lease, or taking the shared `flock` on one. Which of the four, and with what
+errno, nothing recorded so far can say. PR #172 makes the helper write a report naming the step,
+the lease and the errno on the acknowledgement pipe before it ends, and the parent's message carries
+it ("the reaper reported that taking the shared lock on the cleanup lease <path> failed: <errno>");
+the report is data, which `poll` and `select` both see, so the next occurrence names the step
+whatever the wait primitive. Until such an occurrence is read, the cause of the exit is not
+established, and this row stays open. Two things the reading so far rules out or narrows: the
+reported waits (2.0005–2.008 s against a 2 s budget) are the wait ending at its budget, not the
+child taking that long, since a child still running when the parent gave up would have been
+collected "killed by signal 9"; and within one test process the launch barrier serialises reaper
+spawns against agent spawns, so a sibling fork holding the pipe's write end is not what kept the
+wait from ending — the wait could not see the end at all.
+
+**A candidate the code shows, not yet observed.** `rundir::cleanup::is_held` probes the cleanup
+lease with `flock(LOCK_EX | LOCK_NB)` and releases it; a reaper whose `LOCK_SH | LOCK_NB` lands
+inside that window is refused and exits 1 through the fourth site. Within the test process the
+in-process claim check answers before the probe for a run this process holds, and the two
+consecutive failures on #156 (3.3 s apart, two tests, two lease files) do not fit one probe. It is
+recorded here as the one exit-1 path with a known writer of the conflicting lock, for the reader of
+the next report.
+
+**Occurrences recorded above stand as written.** This section adds what the wait was doing; it
+changes nothing about when the failures happened or what they reported.
