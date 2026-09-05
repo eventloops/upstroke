@@ -245,6 +245,7 @@ fn wrappers() -> Wrappers {
 #[test]
 fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
+    const NOTES: &str = "docs/internals/agent/proc/test_support/readiness.md";
     const LINT: &str = "clippy::disallowed_methods";
     const SITES: usize = 6;
     const DECISION: &str = "standards/02_standards_automated_baseline.md";
@@ -304,8 +305,9 @@ fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     let shouted = phrase.to_uppercase();
     let allowlist_text =
         fs::read_to_string(repo_root().join(ALLOWLIST_TOML)).expect("the allowlist");
+    let notes = fs::read_to_string(repo_root().join(NOTES)).expect("the readiness notes");
     for (record, text, needle) in [
-        (READINESS, source.as_str(), phrase.as_str()),
+        (NOTES, notes.as_str(), phrase.as_str()),
         (ALLOWLIST_TOML, allowlist_text.as_str(), shouted.as_str()),
     ] {
         for spelling in [text.to_owned(), text.replace('\n', "\r\n")] {
