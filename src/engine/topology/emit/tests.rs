@@ -299,8 +299,9 @@ impl Drop for OwnedTree {
 ///
 /// [`acquire`] mints it with a non-recursive, exclusive `fs::create_dir` under
 /// a name carrying a fresh ULID, so the call succeeds only if nothing was
-/// there. **Nothing beneath the root predates the token**, which is what makes
-/// a recursive reclaim of it safe without any claim about its contents.
+/// there at acquisition. The token pins that directory's identity. Access
+/// through this fixture and reclaim check the current pathname against it;
+/// replacement after a check remains outside that observation.
 ///
 /// The helper this replaces built `temp_dir()/upstroke-emit-<tag>-<pid>-<n>`
 /// and created the run directories over whatever it found. `temp_dir()` is
@@ -331,6 +332,12 @@ impl Deref for Scratch {
     type Target = RunPaths;
 
     fn deref(&self) -> &RunPaths {
+        self.inner
+            .token
+            .as_ref()
+            .expect("a live fixture owns its token")
+            .checked_path()
+            .expect("the acquired tree is current before using its run paths");
         &self.inner.paths
     }
 }
@@ -387,7 +394,7 @@ impl Scratch {
                 parked: ParkedSlot::default(),
             }),
         };
-        let created = scratch.inner.paths.create_hooked(hooks);
+        let created = scratch.create_hooked(hooks);
         (scratch, created)
     }
 

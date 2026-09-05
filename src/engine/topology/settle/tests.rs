@@ -1540,16 +1540,9 @@ type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;
 
 /// How many names [`scratch_with`] draws before it gives up.
 ///
-/// Two live harnesses draw one name when they draw in one millisecond with
-/// seeds that coincide, which `crate::ulid`'s construction allows: a seed is
-/// `now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, so pids 100 and 101 at
-/// nonces 32768 and 0 seed identically, and in general the nonces must
-/// agree modulo 2^15 and their XOR shifted right by fifteen must equal the
-/// pids' XOR (`(100, 65536)` and `(102, 0)` is the next pair), which needs
-/// a nonce of at least 2^15 in one of the two. Each draw advances this process's nonce, so
-/// a second draw meets the same partner only if the partner drew again in
-/// the same millisecond at the matching nonce; three draws is two such
-/// coincidences deep, and past it the refusal names every root it met.
+/// Each occupied name is preserved and the fixture asks for another. The
+/// bound prevents an exhausted or deliberately preoccupied namespace from
+/// keeping a test alive indefinitely; it does not promise eventual success.
 const SCRATCH_DRAWS: u32 = 3;
 
 /// A scratch tree for one kill test: [`scratch_tree::acquire`]'s exclusive,
@@ -1567,17 +1560,14 @@ const SCRATCH_DRAWS: u32 = 3;
 /// second `RunStarted`: both kill tests red together, at their `the log
 /// replays` expectations, with every earlier assertion passing.
 ///
-/// What the allocator guarantees, and what it does not. The root is created
-/// with one exclusive `create_dir`, so a leftover is never **reused** and a
-/// neighbour's tree is never **adopted**: a name that is already there is
-/// refused. The name is a tag and a ULID, and the ULID is not unpredictable
-/// and not unique across processes: it is a millisecond timestamp and
-/// eighty bits from a `splitmix64` stream seeded by that timestamp, the pid
-/// and a per-process nonce, so two harnesses can draw one name in one
-/// millisecond for seed-equal pid-and-nonce pairs ([`SCRATCH_DRAWS`] gives
-/// the arithmetic), a dead harness's name can recur after a clock rollback
-/// with the same pid and nonce, and a launcher that computes the names of a
-/// future window arranges a refusal at will. [`scratch_with`] draws again
+/// The root is created with one exclusive `create_dir`: a name occupied at
+/// acquisition is refused. The guard retains the original directory handle;
+/// the parent checks its identity before launching the child and reading the
+/// residue, and reclaim checks independently before removal. A replacement
+/// after one of those observations remains a check-to-use interval.
+/// The name is a tag and a deterministic ULID. A dead harness's name can
+/// recur if the clock, pid and nonce repeat, and knowledge of those inputs
+/// permits computing names ahead of allocation. [`scratch_with`] draws again
 /// on `Occupied`, up to [`SCRATCH_DRAWS`] times, and never on
 /// `Undecidable`, which is not a collision.
 ///
@@ -1926,8 +1916,13 @@ fn committed(dir: &Path) -> Vec<TopologyEvent> {
 #[test]
 fn kill_after_failed_settlement_rematerializes_question() {
     let tree = scratch("question");
-    let dir = tree.path();
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
     let output = spawn_kill_child(dir, "question");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
     let payload = dir
         .join("public")
@@ -1969,8 +1964,13 @@ fn kill_after_failed_settlement_rematerializes_question() {
 #[test]
 fn retained_generation_not_continued_after_kill() {
     let tree = scratch("retained");
-    let dir = tree.path();
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
     spawn_kill_child(dir, "retained");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
     let events = committed(dir);
     let last = events.last().expect("the log has lines");
