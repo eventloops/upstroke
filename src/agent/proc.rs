@@ -1960,22 +1960,6 @@ mod termination {
             );
         }
 
-        if unsafe { libc::setpgid(pid, pid) } != 0 {
-            let error = last_errno();
-            if error != libc::EACCES && error != libc::EPERM {
-                for fd in [command[0], command[1], ack[0], ack[1]] {
-                    close_fd(fd);
-                }
-                unsafe {
-                    let _ = libc::kill(pid, libc::SIGKILL);
-                    let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
-                return Err(format!(
-                    "isolating Unix cleanup reaper: {}",
-                    std::io::Error::from_raw_os_error(error)
-                ));
-            }
-        }
         close_fd(ack[1]);
         let reaper = Reaper {
             command_fd: command[1],

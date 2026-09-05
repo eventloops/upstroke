@@ -6,9 +6,9 @@ category: liveness
 pr: 125
 reviewed_sha: 0bff83dfa632b80a0373202613f37cce222410f9
 location: src/agent/proc.rs:2461
-provenance: undetermined
-first_bad: W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT is the other macOS fingerprint of the same period, not this one; first sighting of this one 2026-09-03 on master
-guard: deferred: PR #172 repaired the wait's blindness to the helper's end on Darwin (`a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`) and made the helper report the setup step that refused and its errno (`a_reaper_refused_its_cleanup_lease_says_which_lease_and_why`); the cause of the helper's own exit is still not established, so the row stays open until a recurrence with the report in place names the step and that step is repaired, or the fingerprint stays absent across the macOS legs of enough runs to say so
+provenance: pre_existing
+first_bad: W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT is the other macOS fingerprint of the same period, not this one; first sighting of this one 2026-09-03 on master; the parent-side `setpgid(pid, pid)` that races the reaper's own predates the first sighting
+guard: deferred: PR #172 established both halves of the cause and repaired both (the Darwin READY wait could not see the helper end, `a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`; the parent's `setpgid(pid, pid)` raced the reaper's `setpgid(0, 0)` into `EPERM` on Darwin, removed, with the reaper now reporting the step that refused, `a_reaper_refused_its_cleanup_lease_says_which_lease_and_why`); the row stays open only for confirmation, and closes when the macOS leg has shown no READY failure across the pull requests that merge after #172 for a week, or sooner if the owner reads the evidence as sufficient; a READY failure after #172 carries the step and errno and is a new row, not this one
 ---
 
 ## Failure sequence
@@ -79,30 +79,49 @@ after them on the Linux leg. PR #172 makes the Darwin wait a `select` (`wait_rea
 now ends when the helper ends; `a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`
 fails on the tree before it on macOS and passes after.
 
-**What the helper's exit means, and what still has to be learned.** Every recorded occurrence with
-the PR #134 diagnostic in place (#154 at `d7e0c5d`, #156 at `20f0665`, #171 at `dea50f9`)
-collected the reaper "having already exited with status 1". Status 1 is reached only through the
+**Why the helper exits: the parent's `setpgid` raced the reaper's own.** Every recorded occurrence
+with the PR #134 diagnostic in place (#154 at `d7e0c5d`, #156 at `20f0665`, #171 at `dea50f9`)
+collected the reaper "having already exited with status 1", which is reached only through the
 reaper's own `_exit(1)` sites before READY: installing its signal dispositions, `setpgid(0, 0)`,
-opening a cleanup lease, or taking the shared `flock` on one. Which of the four, and with what
-errno, nothing recorded so far can say. PR #172 makes the helper write a report naming the step,
-the lease and the errno on the acknowledgement pipe before it ends, and the parent's message carries
-it ("the reaper reported that taking the shared lock on the cleanup lease <path> failed: <errno>");
-the report is data, which `poll` and `select` both see, so the next occurrence names the step
-whatever the wait primitive. Until such an occurrence is read, the cause of the exit is not
-established, and this row stays open. Two things the reading so far rules out or narrows: the
-reported waits (2.0005–2.008 s against a 2 s budget) are the wait ending at its budget, not the
-child taking that long, since a child still running when the parent gave up would have been
+opening a cleanup lease, or taking the shared `flock` on one. PR #172 made the helper write a report
+naming the step, the lease and the errno on the acknowledgement pipe before it ends, and the first
+run carrying that report (CI run 33992302665 at `a9f11da`, the second run of the same head,
+`engine::tests::second_reviewer_spawn_failure_settles_worker_and_first_review_evidence`) read:
+
+    Unix cleanup reaper did not initialize; waited 24.333µs of 2s; descriptor ceiling 10240; the
+    reaper reported that moving into its own process group failed: Operation not permitted (os
+    error 1); ending it: SIGKILL was delivered, and the wait collected it, having already exited
+    with status 1
+
+So the step is `setpgid(0, 0)` and the errno is `EPERM`, and the wait ended in 24 µs rather than
+two seconds, which is the first half of the repair at work. The second half: until #172 the parent
+called `setpgid(pid, pid)` on the reaper right after the fork, "to close the parent's race with the
+child-side setpgid; either call may win". On Darwin the two calls racing on the same new group make
+the child's fail with `EPERM`. Measured on the macOS runner CI uses (macOS 26.6.2, run 33992718199
+on branch `scratch/darwin-fifo-eof-experiment`, `exp/setpgid_race.c`): with the parent's call the
+child's `setpgid(0, 0)` returned `EPERM` in 1 to 4 of every 20,000 forks across nine tallies, and in
+none of 120,000 forks without it; Linux returned none in 60,000 with the parent's call. The rate,
+roughly one in ten thousand forks, fits a suite that forks a reaper per agent launch and reds a
+handful of launches a day across all branches. The parent's call is removed in #172: `begin` returns
+only after READY, and the child writes READY only after its own `setpgid` succeeded, so the reaper is
+in its own group before any agent exists in either shape, and the child's call stays checked and
+reported.
+
+What the recorded occurrences before #172 cannot say is which of the four sites they took; the
+status-1 signature is shared. The one site with a measured Darwin failure mode is this one, and the
+one recorded occurrence that could name its step named it. Two things the reading rules out or
+narrows: the reported waits (2.0005–2.008 s against a 2 s budget) were the wait ending at its budget,
+not the child taking that long, since a child still running when the parent gave up would have been
 collected "killed by signal 9"; and within one test process the launch barrier serialises reaper
 spawns against agent spawns, so a sibling fork holding the pipe's write end is not what kept the
 wait from ending. The wait could not see the end at all.
 
-**A candidate the code shows, not yet observed.** `rundir::cleanup::is_held` probes the cleanup
-lease with `flock(LOCK_EX | LOCK_NB)` and releases it; a reaper whose `LOCK_SH | LOCK_NB` lands
-inside that window is refused and exits 1 through the fourth site. Within the test process the
-in-process claim check answers before the probe for a run this process holds, and the two
-consecutive failures on #156 (3.3 s apart, two tests, two lease files) do not fit one probe. It is
-recorded here as the one exit-1 path with a known writer of the conflicting lock, for the reader of
-the next report.
+**A candidate the code shows, not observed.** `rundir::cleanup::is_held` probes the cleanup lease
+with `flock(LOCK_EX | LOCK_NB)` and releases it; a reaper whose `LOCK_SH | LOCK_NB` lands inside
+that window is refused and exits 1 through the fourth site. Within the test process the in-process
+claim check answers before the probe for a run this process holds, so nothing in the suite drives
+it; a `status` from another process against a live run could. It is recorded for the reader of a
+report that names the lease.
 
-**Occurrences recorded above stand as written.** This section adds what the wait was doing; it
-changes nothing about when the failures happened or what they reported.
+**Occurrences recorded above stand as written.** This section adds what the wait was doing and what
+the reaper was refused; it changes nothing about when the failures happened or what they reported.

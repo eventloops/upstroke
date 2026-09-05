@@ -846,15 +846,34 @@ A separate process group is the crucial boundary: an
 uncatchable kill of Upstroke's foreground job must not also kill
 the process that owns its final agent cleanup.
 
+**The child's call is the only one.** Until PR #172 the parent also
+called `setpgid(pid, pid)` right after the fork, "to close the parent's
+race with the child-side setpgid; either call may win". On Darwin the
+two calls racing on the same new group make the child's fail with
+`EPERM` about once in five to twenty thousand forks. Measured on the
+macOS runner CI uses (macOS 26.6.2, run 33992718199 on branch
+`scratch/darwin-fifo-eof-experiment`, `exp/setpgid_race.c`): with the
+parent's call, the child's `setpgid(0, 0)` returned `EPERM` in 1 to 4 of
+every 20,000 forks across nine tallies, and never in 120,000 forks
+without it; Linux returned no `EPERM` in 60,000 with the parent's call.
+The first READY failure carrying the setup report (CI run 33992302665
+on PR #172, `engine::tests::second_reviewer_spawn_failure_settles_worker_and_first_review_evidence`)
+named exactly this step: "the reaper reported that moving into its own
+process group failed: Operation not permitted (os error 1)", after a wait
+of 24 µs. The parent's call bought nothing the handshake does not
+already give: `begin` returns only after READY, and the child writes
+READY only after its `setpgid` succeeded, so the reaper is in its own
+group before any agent exists in either shape. In the window between the
+fork and the child's call the reaper is still in the parent's group, and
+a kill of that group then takes the reaper with it; no agent exists yet
+to be left behind, and the launch fails at the READY wait. The
+child-side call remains checked, and its failure is reported by step
+and errno.
+
 ## `fn spawn_reaper() -> Result<Reaper, String>` › `let mut delay_left = ready_delay_ms;`
 
 Test subprocesses can hold READY back past the parent's deadline
 so the late-reaper path is driven deterministically.
-
-## `fn spawn_reaper() -> Result<Reaper, String>` › `if unsafe { libc::setpgid(pid, pid) } != 0 {`
-
-Close the parent's race with the child-side setpgid. Either call may
-win; both establish the same private group before any agent exists.
 
 ## `fn spawn_reaper() -> Result<Reaper, String>` › `let how = describe_ready_wait("reaper", wait, &cleanup_paths);`
 
