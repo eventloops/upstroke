@@ -1,6 +1,6 @@
 ---
 id: PR149-ULID-SEED-COLLIDES-ACROSS-CONCURRENT-PROCESSES
-severity: P2
+severity: P3
 disposition: deferred
 category: correctness
 pr: 149
@@ -29,24 +29,37 @@ identically. In general the seeds are equal when the nonces agree modulo 2^15 an
 shifted right by fifteen equals the pids' XOR — `nonce_a ≡ nonce_b (mod 2^15)` and
 `pid_a ^ pid_b == (nonce_a ^ nonce_b) >> 15` — which needs one of the two at a nonce of at least
 2^15 (the nonce is the per-process count of ULIDs minted so far) and both drawing in the same
-millisecond. `(100, 65536)` against `(102, 0)` is the next pair; a search over pid 100 against pids
-90 to 120 at nonces below 70,000 finds exactly those two, and a mirror of the construction confirms
-them. One full run of the lib test harness mints 6,017 ULIDs and ends at nonce 6,016, which is why
+millisecond. `(100, 65536)` against `(102, 0)` and `(100, 32769)` against `(101, 1)` are further
+examples, not an enumeration; a mirror of the construction confirms them. One full run of the lib test harness mints 6,017 ULIDs and ends at nonce 6,016, which is why
 the settle tests were the symptom and not the population: the harness alone cannot get there. The eighty random bits are then
 identical, the timestamp is identical, and the ULID is identical.
 
 The production call sites at `323beb0`:
 
 - `src/engine/coordinator.rs:121`, `let run_id = ulid::ulid();` — §15's canonical run identity.
-  Two runs sharing it share a run directory and an event log.
 - `src/engine/topology/seams.rs:330` and `:334` — `IncarnationId`.
 - `src/interaction.rs:101` — `QuestionId`.
-- `src/agent/codex.rs:486`, `src/agent/proc.rs:4572`, `src/agent/proc.rs:5133`.
+- `src/agent/codex.rs:486`, `src/workspace.rs:1402`, `:1445`, `:1483`, and
+  `src/workspace_manager.rs:3471`.
+
+Each checked against its file's `#[cfg(test)]` boundary; `src/agent/proc.rs:4572` and `:5133`,
+listed at first, are inside `mod tests` and are not production.
+
+**What currently prevents the harm, and that it is incidental.** Two conductors cannot both be
+minting a run id for one worktree: `coordinator.rs` takes `WorktreeLock::acquire_in` before
+`let run_id = ulid::ulid()`, and run directories are repo-scoped, so an identical run id minted by
+a process on another repository names a different directory. No shared run directory or event log
+follows from the collision as the code stands; that protection is the lock's and the layout's, not
+the id's, and a caller that minted before locking, or a consumer that keyed on the id alone
+(`IncarnationId`, `QuestionId`, the staging names), would not have it. The finding is that the
+module does not meet its own stated requirement by construction; the impact is what a consumer
+makes of it.
 
 The realistic shape is not two fresh runs racing. It is a long-lived conductor that has minted
 tens of thousands of question and incarnation ids — nonce past 2^15 — and a second process
-minting a fresh run id at a low nonce, in the same millisecond, with pids in the XOR relation the
-nonces dictate. On a box running a dozen concurrent sessions, pids differ in the low bits all the
+minting at a low nonce, in the same millisecond, with pids in the XOR relation the nonces dictate;
+two harnesses cannot supply it, since one harness ends at nonce 6,016 and counters do not combine
+across processes. On a box running a dozen concurrent sessions, pids differ in the low bits all the
 time; a single-session workflow never has two processes minting ULIDs in one millisecond with
 adjacent pids, which is why this survived until 2026-09-05. Whoever fixes it should test against
 that population, not a single process.

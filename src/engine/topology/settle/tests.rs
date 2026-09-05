@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -1622,6 +1622,10 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 /// Whether [`refuse_once_then_acquire`] has refused yet.
 static REFUSED_ONCE: AtomicBool = AtomicBool::new(false);
+/// How many times [`always_occupied`] has been asked.
+static OCCUPIED_CALLS: AtomicU32 = AtomicU32::new(0);
+/// How many times [`undecidable`] has been asked.
+static UNDECIDABLE_CALLS: AtomicU32 = AtomicU32::new(0);
 
 /// An acquisition that answers `Occupied` to its first call and is the real
 /// allocator after that.
@@ -1638,15 +1642,19 @@ fn refuse_once_then_acquire(
     }
 }
 
-/// An acquisition that answers `Occupied` to every call.
+/// An acquisition that answers `Occupied` to every call, each time with a
+/// root of its own, so a report that names every refused root can be told
+/// from one that names the last root three times.
 fn always_occupied(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    let call = OCCUPIED_CALLS.fetch_add(1, Ordering::SeqCst);
     Err(ScratchAcquireRefusal::Occupied {
-        root: parent.join(tag),
+        root: parent.join(format!("{tag}-refused-{call}")),
     })
 }
 
-/// An acquisition whose answer is not a collision.
+/// An acquisition whose answer is not a collision, counting its calls.
 fn undecidable(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    UNDECIDABLE_CALLS.fetch_add(1, Ordering::SeqCst);
     Err(ScratchAcquireRefusal::Undecidable {
         root: parent.join(tag),
         source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -1669,32 +1677,47 @@ fn an_occupied_draw_is_drawn_again() {
     );
 }
 
-/// The draws are bounded, and the refusal past the bound names every root
-/// it met — so a collision that is not a coincidence reads as what it is.
+/// The draws are bounded — exactly [`SCRATCH_DRAWS`] acquisitions, counted
+/// at the double — and the refusal past the bound names each distinct root
+/// it met, so a collision that is not a coincidence reads as what it is.
 #[test]
 fn the_draws_are_bounded_and_every_refused_root_is_named() {
+    OCCUPIED_CALLS.store(0, Ordering::SeqCst);
     let outcome = std::panic::catch_unwind(|| scratch_with(always_occupied, "bounded"));
     let message = panic_message(&outcome.expect_err("every draw was refused"));
+    assert_eq!(
+        OCCUPIED_CALLS.load(Ordering::SeqCst),
+        SCRATCH_DRAWS,
+        "the double was not asked exactly {SCRATCH_DRAWS} times"
+    );
     assert!(
         message.contains("3 draws refused as occupied"),
         "the bound is not reported: {message}"
     );
-    assert_eq!(
-        message.matches("pr7h-bounded").count(),
-        3,
-        "not every refused root is named: {message}"
-    );
+    for call in 0..SCRATCH_DRAWS {
+        assert!(
+            message.contains(&format!("pr7h-bounded-refused-{call}")),
+            "refused root {call} is not named: {message}"
+        );
+    }
 }
 
-/// `Undecidable` is not a collision and is not drawn again.
+/// `Undecidable` is not a collision and is not drawn again: the double is
+/// asked exactly once.
 #[test]
 fn an_undecidable_refusal_is_not_drawn_again() {
+    UNDECIDABLE_CALLS.store(0, Ordering::SeqCst);
     let outcome = std::panic::catch_unwind(|| scratch_with(undecidable, "undecidable"));
     let message = panic_message(&outcome.expect_err("the refusal is raised"));
+    assert_eq!(
+        UNDECIDABLE_CALLS.load(Ordering::SeqCst),
+        1,
+        "an undecidable answer was asked again"
+    );
     assert!(message.contains("Undecidable"), "{message}");
     assert!(
         !message.contains("draws refused"),
-        "an undecidable answer was drawn again: {message}"
+        "an undecidable answer was reported as occupied: {message}"
     );
 }
 
@@ -1910,8 +1933,10 @@ fn kill_after_failed_settlement_rematerializes_question() {
         .join("public")
         .join("questions")
         .join(format!("{}.json", question_for(ALEPH).id.as_str()));
+    // Absence proved, not assumed: `Path::exists` answers `false` to a stat
+    // the filesystem refused as well as to `NotFound`.
     assert!(
-        !payload.exists(),
+        scratch_tree::proves_absent(&payload),
         "the child wrote the question file it was killed before writing: {}{}",
         output.stdout,
         output.stderr

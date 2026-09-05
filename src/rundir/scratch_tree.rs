@@ -236,7 +236,8 @@ fn report_to_stderr(message: &str) -> io::Result<()> {
 /// collide on a tag-and-pid name, and colliding on a path somebody else is
 /// using is precisely what made the old pre-clean destructive. The ULID is
 /// distinct against this process's own draws and, by its millisecond,
-/// against every earlier run's; it is **not unpredictable**, and not unique
+/// against earlier runs' unless the clock revisits their millisecond with
+/// the same pid and nonce; it is **not unpredictable**, and not unique
 /// across processes: `crate::ulid` is arithmetic over the clock, the pid
 /// and a per-process nonce, so two processes can draw one value in one
 /// millisecond for seed-equal pid-and-nonce pairs, and anything that knows
