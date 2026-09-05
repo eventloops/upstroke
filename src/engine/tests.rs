@@ -7564,6 +7564,64 @@ fn resume_makes_a_stale_question_payload_agree_with_the_log() {
 }
 
 #[test]
+fn a_private_run_collision_refuses_before_early_error_cleanup() {
+    let root =
+        rundir::scratch_tree::acquire(&std::env::temp_dir(), "coordinator-private-collision")
+            .expect("owned regression fixture");
+    let repo = root.path().join("second-repo");
+    fs::create_dir(&repo).expect("create the second repository");
+    git_in(&repo, &["init", "-q", "-b", "main"]);
+    git_in(&repo, &["config", "user.email", "test@upstroke.local"]);
+    git_in(&repo, &["config", "user.name", "upstroke tests"]);
+    seed(
+        &repo,
+        "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
+        Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+    );
+    // If the coordinator mistakenly adopts the occupied private root, this
+    // branch conflict sends it through the destructive early-error arm.
+    git_in(&repo, &["branch", "upstroke"]);
+
+    const RUN_ID: &str = "01M191Y2PSVX78RNEP31D23K02";
+    let private_root = root.path().join("shared-home");
+    let first =
+        rundir::RunPaths::with_private_root(&root.path().join("first-repo"), RUN_ID, &private_root);
+    first
+        .create_fresh()
+        .expect("the first run reserves its private half");
+    let transcript = first.transcripts().join("t1-1.json");
+    fs::write(&transcript, b"first run evidence").expect("first run transcript");
+    let mut opts = options(&repo);
+    opts.private_root = Some(private_root);
+    let source = fake(Effect::EditFile);
+    let harness = Harness::new(&source);
+    let contained = crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)
+        .expect("the test coordinator is contained");
+    let error = coordinator::run_harness_inner_with_id(
+        &opts,
+        &harness,
+        &crate::runner::host::HostRunner::new(),
+        &contained,
+        || RUN_ID.to_owned(),
+    )
+    .expect_err("the second run refuses the occupied private half");
+    assert_eq!(
+        fs::read(&transcript).expect("early-error cleanup did not delete the first run"),
+        b"first run evidence"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("reserve fresh private run directory"),
+        "the allocation boundary must refuse before branch creation: {error}"
+    );
+    assert!(
+        rundir::scratch_tree::proves_absent(&opts.paths(RUN_ID).public),
+        "the refused coordinator leaves no public run directory"
+    );
+}
+
+#[test]
 fn a_run_that_never_started_leaves_no_directory_behind() {
     // Nothing is on the record until the first event lands. A failure in
     // that window would otherwise leave a run directory with no
