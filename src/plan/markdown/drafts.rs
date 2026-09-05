@@ -37,11 +37,20 @@ impl Draft {
 }
 
 pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {
-    let slice = &raw[section.content.clone()];
     let ctx = format!("section `{}`", section.title);
     let mut draft = Draft {
         title: section.title.clone(),
         ..Draft::default()
+    };
+    // The range came from `split_sections`' own walk of `raw`, so it lies on
+    // event boundaries of this text; answering its absence beats a panic on a
+    // plan file.
+    let Some(slice) = raw.get(section.content.clone()) else {
+        warnings.push(format!(
+            "internal error: the body range {:?} of {ctx} is not within the plan text; the body is left empty",
+            section.content
+        ));
+        return draft;
     };
     let mut sink = AnnotationSink::default();
     if let Some(inline) = &section.inline_annotation {
@@ -63,15 +72,11 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     let mut item_slots: Vec<usize> = Vec::new();
 
     for (event, range) in Parser::new_ext(slice, md_options()).into_offset_iter() {
-        // HTML accumulates across events; everything else flushes it first.
-        if let Event::Html(t) | Event::InlineHtml(t) = &event {
-            html.push(t, &range);
-        } else {
-            for (span, inner) in html.take_comments() {
-                if let Some(body) = upstroke_body(&inner) {
-                    sink.accept(body, &ctx, warnings);
-                    annotation_spans.push(span);
-                }
+        // The accumulator sees every event and hands a comment back once the
+        // HTML block or inline construct holding it is complete.
+        for comment in html.observe(&event, &range) {
+            if let Some(span) = sink.take(&comment, &ctx, warnings) {
+                annotation_spans.push(span);
             }
         }
 
@@ -120,8 +125,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 item_slots.pop();
             }
             Event::Text(t) => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push_str(&t);
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
@@ -132,8 +137,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 collect_text_hints(&t, &mut draft.hints);
             }
             Event::Code(t) => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push_str(&t);
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
@@ -144,8 +149,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 collect_code_hint(&t, &mut draft.hints);
             }
             Event::SoftBreak | Event::HardBreak => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push(' ');
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push(' ');
                 }
                 if in_para {
                     para_text.push(' ');
@@ -157,9 +162,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
             _ => {}
         }
     }
-    for (span, inner) in html.take_comments() {
-        if let Some(body) = upstroke_body(&inner) {
-            sink.accept(body, &ctx, warnings);
+    for comment in html.finish() {
+        if let Some(span) = sink.take(&comment, &ctx, warnings) {
             annotation_spans.push(span);
         }
     }
@@ -172,8 +176,30 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
         .collect();
     draft.ann = sink.annotation;
     annotation_spans.sort_by_key(|s| s.start);
-    draft.body = strip_spans(slice, &annotation_spans).trim().to_owned();
+    // The spans are the comments' own source bytes, mapped by the accumulator
+    // through the ranges the parser reported, so a refusal here is a defect in
+    // that mapping and not in the plan; the body is kept whole and says so.
+    draft.body = match strip_spans(slice, &annotation_spans) {
+        Some(body) => body.trim().to_owned(),
+        None => {
+            warnings.push(format!(
+                "internal error: the annotation spans {annotation_spans:?} of {ctx} do not lie on \
+                 its text; the body keeps its annotation comments"
+            ));
+            slice.trim().to_owned()
+        }
+    };
     draft
+}
+
+/// The criterion the innermost open acceptance item is collecting into. The
+/// slots are indices pushed when the item opened, each beside the criterion
+/// it names, so the lookup cannot miss; answering absence keeps it total.
+fn open_criterion<'a>(
+    item_slots: &[usize],
+    acceptance: &'a mut [String],
+) -> Option<&'a mut String> {
+    acceptance.get_mut(*item_slots.last()?)
 }
 
 /// Fallback when a plan has no `##`/`###` sections: top-level checklist items
@@ -190,16 +216,23 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
     let mut html = HtmlAccumulator::default();
 
     for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
-        if let Event::Html(t) | Event::InlineHtml(t) = &event {
-            html.push(t, &range);
-        } else if let Some((_, sink)) = current.as_mut() {
-            for (_, inner) in html.take_comments() {
-                if let Some(body) = upstroke_body(&inner) {
-                    sink.accept(body, "checklist item", warnings);
+        for comment in html.observe(&event, &range) {
+            match current.as_mut() {
+                // The body is built from the text events, so the span the
+                // sink returns has nothing to cut here.
+                Some((_, sink)) => {
+                    sink.take(&comment, "checklist item", warnings);
+                }
+                // Top-level HTML before, between or after the items belongs
+                // to no task; an annotation there would bind to nothing.
+                None => {
+                    if upstroke_body(&comment.inner).is_some() {
+                        warnings.push(
+                            "upstroke annotation outside any checklist item; ignored".to_owned(),
+                        );
+                    }
                 }
             }
-        } else {
-            let _ = html.take_comments();
         }
 
         match event {
@@ -257,6 +290,13 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                 }
             }
             _ => {}
+        }
+    }
+    // Every block is closed by the parser; the contract is that nothing fed
+    // to the accumulator goes unreported.
+    for comment in html.finish() {
+        if upstroke_body(&comment.inner).is_some() {
+            warnings.push("upstroke annotation outside any checklist item; ignored".to_owned());
         }
     }
     drafts
