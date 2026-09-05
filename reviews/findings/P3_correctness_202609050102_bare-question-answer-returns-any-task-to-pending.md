@@ -1,9 +1,9 @@
 ---
-id: PR152-FOLD-ANSWER-RETURNS-TO-PENDING
+id: PR153-FOLD-ANSWER-RETURNS-TO-PENDING
 severity: P3
 disposition: deferred
 category: correctness
-pr: 152
+pr: 153
 reviewed_sha: 807b6057bcfa5c6772b3969edd82881c47232277
 location: src/topology/fold/apply.rs:499
 provenance: pre_existing
@@ -42,7 +42,7 @@ ends the backoff early.
 
 No run wedges and no lease leaks: the repair's `task_merged` satisfies the original and moves it
 to `Merged`, and `structurally_admissible` never selects the original because `ready` is
-lease-blocked. That is why this is P3 and not the P1/P2 shape #152 fixed, where the answer's
+lease-blocked. That is why this is P3 and not the P1/P2 shape #153 fixed, where the answer's
 return state was applied to a task holding an open generation.
 
 ## What the change that takes this up should do
