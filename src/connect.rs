@@ -593,6 +593,44 @@ mod tests {
     }
 
     #[test]
+    fn operator_keys_with_toml_escapes_survive_a_force_and_read_back_unchanged() {
+        // §13 calls `profile` a config-directory path, and on Windows a path
+        // holds backslashes. The parent parses the operator's spelling and the
+        // renderer writes the value back; written raw, `\U` and `\.` are TOML
+        // escapes, so `--force` produced a file `config::load` refused with a
+        // parse error and the next `connect` read no keys from — the loss the
+        // carrying exists to prevent, on the path that recommends `--force`.
+        let path = scratch("escapes");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
+                    profile = 'C:\\Users\\me\\.claude-work'\nendpoint = \"http://host/#frag \\\"q\\\"\"\n";
+        fs::write(&path, mine).expect("hand-written file");
+
+        let forced = connect(&path, true);
+        assert_eq!(forced.outcome, Wrote::Written);
+        let mut warnings = Vec::new();
+        let hermetic = path.parent().expect("parent").to_path_buf();
+        let cfg = crate::config::load(None, &hermetic, Some(&path), &mut warnings)
+            .expect("the file --force wrote parses");
+        let pool = cfg.pools.first().expect("one pool");
+        assert_eq!(pool.profile.as_deref(), Some(r"C:\Users\me\.claude-work"));
+        assert_eq!(pool.endpoint.as_deref(), Some(r#"http://host/#frag "q""#));
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        // The written spelling reads back into the same keys, so a second
+        // connect carries them again and finds nothing to rewrite — which is
+        // the round trip the two comparisons in `run_with` depend on.
+        let again = connect(&path, false);
+        assert_eq!(again.outcome, Wrote::Unchanged, "{}", again.content);
+        assert!(
+            again
+                .content
+                .contains("profile = \"C:\\\\Users\\\\me\\\\.claude-work\""),
+            "{}",
+            again.content
+        );
+    }
+
+    #[test]
     fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {
         // The header names the write date, so a byte comparison would call
         // every second run a conflict — and the only way past a conflict is

@@ -14,4 +14,6 @@ upstroke export-decisions <run-id> [--format jsonl|csv] # landed 2026-08-12: loc
 
 The export reads only the named, non-live run's event log and `plan.normalized.json`: it makes no HTTP request, branch switch, lock acquisition, or write. JSONL is the default; CSV has the same logical rows, with nested review passes and path hints represented as quoted JSON cells. See §25 for schema 2, legacy unknowns, and the measured/derived boundary.
 
+`connect` prints one line per agent — its auth state and the pool it got, marked when the pool's `kind` is a default rather than something detected, or the reason it was skipped — then any warnings, then `wrote <path>`, `unchanged: <path>`, or the refusal with the file it would have written and what `--force` keeps. §17 says what that file holds and when it is rewritten.
+
 `--dry-run` executes everything except agents: parse, route, and print task → kind → chain (with source of each decision: config/annotation/override) → gates → pool + strategy effect, at zero spend. It exists from day one; it is both the config-iteration loop and the sales demo.

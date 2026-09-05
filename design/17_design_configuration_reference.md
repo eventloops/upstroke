@@ -26,6 +26,43 @@ agent = "aider"
 endpoint = "http://homeserver:11434/v1"
 ```
 
+**What `connect` writes.** The file above is an operator's. The one `upstroke connect` writes is a
+persisted format with two readers — `config`, for every `run`, `validate` and `capacity` that loads
+pools, and `connect` itself on its next run — and it has this shape:
+
+- One `[pools.<name>]` table per agent whose CLI probed and answered discovery, in registry order,
+  **named after the agent** (`claude-code`, `copilot`, `codex`) rather than after a plan: discovery
+  does not establish a tier, and the pool is the operator's to rename. An agent that is not usable
+  on the machine gets a comment saying so and no table.
+- The keys: `kind` and `agent` always; `window = "5h"` and `weekly = true` for a
+  `subscription-window` pool; `sources = ["signals", "self"]`, the two sources v0.1 reads, never
+  `local-logs` or `provider-endpoint`; `safety_margin = 0.15` and `reserve = 0.20`, §13's defaults.
+  Then the operator's own keys, written only when the existing file held them under the same pool
+  name: `profile`, `monthly_allowance` as a number (`"auto"` is the reader's default and is not
+  written) and `endpoint`. `connect` invents none of the three.
+- Comments carry what discovery found: a header naming the version, the write time (RFC 3339, UTC)
+  and where the model roster came from; per agent, the auth state — one of *signed in*, *NOT signed
+  in* and *could not be determined*, never the second for the third — each discovery note on its
+  own line, and a sentence saying the `kind` is a default where the CLI could not say.
+- Every value is written as a TOML basic string or number that parses back to the identical value,
+  and every comment payload is written one line per line with control characters replaced, so a
+  note can neither end its comment nor fail the parse. **A file `connect` writes always parses**,
+  whatever a CLI printed into a note or an operator wrote into a carried key.
+
+**When it is rewritten.** Two comparisons against the file already there, because two questions
+are asked. *May* it be replaced: only if the settings — every line, comments and blank lines
+removed — are the same, or `--force` is given; otherwise `connect` refuses, prints the file it
+would have written, and exits non-zero. *Should* it be rewritten: if anything but the write-time
+line differs, comments included, so a login between two runs updates the auth comment while an
+unchanged machine leaves the file, and the date on it, alone. `--force` carries `profile`,
+`monthly_allowance` and `endpoint` over from the pools of the same name in the existing file and
+replaces everything else; a file that does not parse carries nothing.
+
+**Not decided here:** whether the keys above and the default pool name are frozen across versions.
+Today the reader warns on an unknown key and refuses an unknown value, no key or name has been
+renamed, and nothing migrates one; a renamed default pool name would stop the carrying by name.
+That rule is owed and is the owner's to state.
+
 Repo-level `upstroke.toml` — overrides only; everything below has a derived default:
 
 ```toml
