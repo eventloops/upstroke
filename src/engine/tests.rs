@@ -6160,6 +6160,106 @@ fn resume_runs_the_gates_the_run_recorded_not_todays() {
 }
 
 #[test]
+fn a_resume_with_a_gate_record_is_not_refused_over_todays_gates_section() {
+    // `design/15`: gates are taken from the record, not re-derived — and not
+    // refused over. Today's file has changed since the run started, and
+    // changed into shapes a fresh run refuses: a zero timeout, a second
+    // entry repeating the first's name, and a key no entry has. The record
+    // decides what runs, so the resume goes through, says what it saw, and
+    // runs the recorded gate — which is the only way `t1` can commit.
+    //
+    // This is the composition the config-level tests cannot see: which
+    // reading `resume.rs` chooses from the log, and that the record is what
+    // then executes. Pass 2 on PR #150 showed a parser-only downgrade wrong
+    // in both directions; this test and its twin below are the two
+    // directions.
+    let (repo, run_id) = parked_run_with_gate("gate_record_lenient", "git --version");
+    fs::write(
+        repo.join("upstroke.toml"),
+        format!(
+            "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"check\"\ncmd = \"git --version\"\n\
+             timeout_secs = 0\ntimeout_sec = 3600\n\
+             [[gates]]\nname = \"Check\"\ncmd = \"git frobnicate-not-a-command\"\n"
+        ),
+    )
+    .expect("edit config");
+
+    let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+    assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+    assert!(
+        committed(&resumed, "t1"),
+        "the recorded gate ran, not today's zero-timeout or failing one: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.gates,
+        ["check"],
+        "the report describes the recorded gate"
+    );
+    for shape in [
+        "timeout_secs must be at least 1",
+        "has unknown key `timeout_sec`",
+        "repeats the name `Check` of entry 1",
+    ] {
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains(shape) && w.contains("recorded")),
+            "each shape is announced, with the record named as what runs (`{shape}`): {:?}",
+            resumed.warnings
+        );
+    }
+}
+
+#[test]
+fn a_resume_with_no_gate_record_refuses_the_gate_shapes_a_fresh_run_refuses() {
+    // The other direction. A log from before the gate record has nothing to
+    // substitute: this resume settles the run's gates from today's file, so
+    // today's file governs, and `timeout_sec = 3600` is a gate that would
+    // really run at the 600 s default — the harm a warning cannot prevent.
+    // So the resume refuses, before any effect, naming the key.
+    let (repo, run_id) = parked_run_with_gate("gate_record_absent", "git --version");
+    let paths = paths_of(&repo, &run_id);
+    strip_event_data_field(&paths, "run_started", "gate_cmds");
+    let before = fs::read_to_string(paths.events()).expect("the log before");
+    assert!(
+        events::recorded_gates(&events_of(&repo, &run_id)).is_none(),
+        "the fixture must have no gate record left"
+    );
+    fs::write(
+        repo.join("upstroke.toml"),
+        format!(
+            "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"check\"\ncmd = \"git --version\"\n\
+             timeout_sec = 3600\n"
+        ),
+    )
+    .expect("edit config");
+
+    let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+    let error = resume_with(&resume_options(&repo, &run_id), &source)
+        .expect_err("a resume whose gates come from this file refuses it");
+    let message = error.to_string();
+    assert!(
+        message.contains("[[gates]] entry 1") && message.contains("`timeout_sec`"),
+        "names the entry and the key: {message}"
+    );
+    // Refused before any effect: the log is byte-identical to what it was.
+    let after = fs::read_to_string(paths.events()).expect("the log after");
+    assert_eq!(after, before, "a refusal before the lock appends nothing");
+
+    // And with the key spelt right the same log resumes and, having no
+    // record, settles today's gate and runs it.
+    fs::write(repo.join("upstroke.toml"), gate_config("git --version")).expect("edit config");
+    let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+    assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+    assert!(committed(&resumed, "t1"), "{resumed:?}");
+    assert!(
+        events::recorded_gates(&events_of(&repo, &run_id)).is_some(),
+        "the resume recorded the gates it settled on"
+    );
+}
+
+#[test]
 fn the_report_labels_gates_from_the_record_not_todays_config() {
     // `gates` came from the record but `gates_from_config` did not, so the
     // run's own report and a later `status` disagreed about the same list:
