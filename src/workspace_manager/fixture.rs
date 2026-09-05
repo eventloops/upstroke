@@ -1663,9 +1663,11 @@ mod tests {
         let fixture = Fixture::new("config-quoting");
         // `#` and `;` open comments, the trailing space is trimmed, and the
         // newline used to be refused on the claim that Git could not
-        // represent one; Git escapes it and reads it back.
+        // represent one; Git escapes it and reads it back. The path is never
+        // created: this witnesses the config text, not the filesystem, and
+        // NTFS refuses a directory name holding a newline (os error 123 on
+        // the Windows guest, measured), which is nothing about Git config.
         let awkward = fixture.root.join("a#b;c\nd ");
-        create_dir(&awkward);
 
         let mut written = b"[core]\n\thooksPath = ".to_vec();
         written.extend_from_slice(&config_path_bytes(&awkward));
