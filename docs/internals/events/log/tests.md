@@ -2,9 +2,9 @@
 
 Extended notes for [`src/events/log/tests.rs`](../../../../src/events/log/tests.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -177,19 +177,19 @@ The table is written from the frozen enum's own doc comments and from
 `effect_site_inventory.identity`, not from `EventLog`'s `match` arms — a
 classification derived from the code under test cannot disagree with it.
 
-## `fn every_event_site_is_classified_and_the_funnel_accepts_ex…` › `let classified: BTreeSet<EventSite> = SITE_ROLES.iter().map(|(site, _)| *site).collect();`
+## `fn every_event_site_is_classified_and_the_funnel_accepts_exactly_its_own() {` › `let classified: BTreeSet<EventSite> = SITE_ROLES.iter().map(|(site, _)| *site).collect();`
 
 The list is derived from the type, so a site added later is uncovered
 loudly rather than silently.
 
-## `fn every_event_site_is_classified_and_the_funnel_accepts_ex…` › `let lines = append_site_lines();`
+## `fn every_event_site_is_classified_and_the_funnel_accepts_exactly_its_own() {` › `let lines = append_site_lines();`
 
 Appending: one handle per scope, every site tried against both. The
 schema-4 cell hands each site a line of *its own* kind, so an accepting
 site is exercised rather than refused for the line's sake — the three
 append sites are three separately droppable behaviours, not one.
 
-## `fn every_event_site_is_classified_and_the_funnel_accepts_ex…` › `let line = lines`
+## `fn every_event_site_is_classified_and_the_funnel_accepts_exactly_its_own() {` › `let line = lines`
 
 A site with no line of its own is one this funnel must refuse, so any
 line will do for it; `defer_wait_elapsed` is the one it gets.
@@ -199,18 +199,18 @@ line will do for it; `defer_wait_elapsed` is the one it gets.
 Nothing was written by either refusal: a scope refusal happens before the
 append is entered.
 
-## `const INFORMATIONAL_KINDS: &[&str] = &["capacity_snapshot", "pool_exhausted", "design_def…`
+## `const INFORMATIONAL_KINDS: &[&str] = &["capacity_snapshot", "pool_exhausted", "design_defect"];`
 
 The lenient class, transcribed from `src/topology/events.rs`'s own frozen
 statement of it — "the lenient class is exactly these three by name" — and
 not computed from the predicate the funnel uses.
 
-## `fn an_events_append_site_is_decided_by_the_frozen_transacti…` › `let expected: &[(&str, EventSite)] = &[`
+## `fn an_events_append_site_is_decided_by_the_frozen_transaction_class() {` › `let expected: &[(&str, EventSite)] = &[`
 
 `run_started` is `AppendFirst` ("the commitment boundary"); the three
 lenient kinds are `AppendInformational`; everything else is `Append`.
 
-## `fn an_events_append_site_is_decided_by_the_frozen_transacti…` › `let classified: Vec<(&str, EventSite)> = append_site_lines()`
+## `fn an_events_append_site_is_decided_by_the_frozen_transaction_class() {` › `let classified: Vec<(&str, EventSite)> = append_site_lines()`
 
 And the two sites the table names that a `defer_wait_elapsed` is not: a
 `run_started` really does classify as the commitment boundary and a
@@ -238,46 +238,46 @@ together could be satisfied by a correlated field.
 The first two bytes of a three-byte character: invalid UTF-8 on its own,
 and dropped before the committed bytes are validated.
 
-## `fn the_grid_varies_shape_and_tail_length_and_tail_content_i…` › `let grid = open_grid();`
+## `fn the_grid_varies_shape_and_tail_length_and_tail_content_independently() {` › `let grid = open_grid();`
 
 Hostility as counts, not as prose: `PR4-CONF-004`/`-006` are in the
 ledger because a grid whose axes moved together was satisfied by a
 correlated field.
 
-## `fn the_legacy_open_is_byte_identical_to_the_pre_move_writer…` › `assert_eq!(`
+## `fn the_legacy_open_is_byte_identical_to_the_pre_move_writer() {` › `assert_eq!(`
 
 Warnings are compared with the path's directory removed, because the
 two writers were pointed at two directories on purpose — a comparison
 that shared one file could not tell "wrote the same bytes" from "wrote
 nothing twice".
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `let bodies: Vec<EventBody> = vec![`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `let bodies: Vec<EventBody> = vec![`
 
 Four bodies, so a comparison cannot pass by writing one constant twice —
 and one of them is **lossy over the wire**, which is what makes the
 returned event a claim and not a copy of the input (`PR5-CORRECTNESS-015`).
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `let before = crate::util::rfc3339_utc_now();`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `let before = crate::util::rfc3339_utc_now();`
 
 Bracketing clock reads, so the `ts` the writers stamp can be checked
 for being a *time* rather than merely for being equal to itself. The
 format is fixed-width RFC 3339 UTC, so lexical order is chronological.
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `if matches!(body, EventBody::AttemptFinished { .. }) {`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `if matches!(body, EventBody::AttemptFinished { .. }) {`
 
 The returned body is the one the wire carries, not the one that
 was handed in. `PR5-CORRECTNESS-015`: returning the constructed
 event leaves the coordinator holding a duration a replay of its
 own log can never restore.
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `assert_eq!(`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `assert_eq!(`
 
 The timestamps are the two writers' own `Event::now`, so the bytes are
 compared with the `ts` field of every line normalized and nothing
 else touched. A mutation to the separator, the ordering, the newline
 or the payload still shows.
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `for (writer, path) in [("moved", &moved), ("oracle", &premove)] {`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `for (writer, path) in [("moved", &moved), ("oracle", &premove)] {`
 
 Normalising `ts` is what lets the bytes be compared at all, and it is
 also a hole: it says nothing about the value. `PR5-CORRECTNESS-006` /
@@ -285,7 +285,7 @@ also a hole: it says nothing about the value. `PR5-CORRECTNESS-006` /
 which this grid folded away. So the field is checked separately, on
 both writers, against clock reads taken either side of the appends.
 
-## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writ…` › `let committed_before = committed_lines(seed.as_ref());`
+## `fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {` › `let committed_before = committed_lines(seed.as_ref());`
 
 Both files gained exactly one newline-terminated line per body beyond
 the committed prefix they started with.
@@ -309,22 +309,22 @@ returns, the moved writer returns the same variant, with the same path
 named. A control asserts the oracle really did fail, because a grid whose
 cells all succeeded would compare two `Ok`s and pass.
 
-## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writ…` › `type Case = (&'static str, fn(&Path) -> PathBuf);`
+## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writer_did() {` › `type Case = (&'static str, fn(&Path) -> PathBuf);`
 
 (name, how to build a path that cannot be opened for append).
 
-## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writ…` › `unexercisable.push(*name);`
+## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writer_did() {` › `unexercisable.push(*name);`
 
 A machine that can open this anyway (a `root` that ignores the
 read-only bit) cannot host this cell. Recorded, never silent.
 
-## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writ…` › `assert!(`
+## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writer_did() {` › `assert!(`
 
 The variant is `Io`, and it is asserted positively as well as
 relatively: a mutation applied to *both* sides would keep the
 discriminants equal.
 
-## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writ…` › `assert_eq!(`
+## `fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writer_did() {` › `assert_eq!(`
 
 And the same path is named, with the two directories folded away —
 they are different on purpose, so a comparison cannot pass by naming
@@ -356,12 +356,12 @@ Both legacy entry points, because they are two functions:
 pre-round-tripped bytes and stamp nothing, so they are not in this class —
 `the_topology_append_carries_the_callers_own_bytes` is what holds them.
 
-## `fn the_legacy_append_stamps_the_clocks_answer_at_every_entr…` › `assert_ne!(`
+## `fn the_legacy_append_stamps_the_clocks_answer_at_every_entry_point() {` › `assert_ne!(`
 
 The epoch is not merely "an old time": it is the value a clock that
 cannot be read yields, and this machine's clock can be read.
 
-## `fn the_legacy_append_stamps_the_clocks_answer_at_every_entr…` › `let written = appended_timestamps(&path, 0);`
+## `fn the_legacy_append_stamps_the_clocks_answer_at_every_entry_point() {` › `let written = appended_timestamps(&path, 0);`
 
 And the same value reached the file, which is what `status` renders and
 `export` copies.
@@ -383,7 +383,7 @@ cannot carry, so "returned" and "constructed" are different observations.
 Replace every `"ts":"…"` value with a constant. Deliberately narrow: only the
 one field the two writers cannot agree on.
 
-## `fn the_legacy_open_performs_none_of_the_syncs_the_pre_move_…` › `assert!(`
+## `fn the_legacy_open_performs_none_of_the_syncs_the_pre_move_open_did_not() {` › `assert!(`
 
 `EventSite::LegacyOpenLog.sub_effects()` is `&[]` in the frozen inventory.
 A legacy open that acquired `SyncPrefix` would be a new way for a
@@ -431,12 +431,12 @@ kill is `abort`, so no in-process test can observe its aftermath at all.
 What separates them is what was already durable *at the moment the funnel
 asked*, so that is what is read.
 
-## `fn the_synced_consults_are_offered_after_the_data_is_durabl…` › `witness.at_consult.clear();`
+## `fn the_synced_consults_are_offered_after_the_data_is_durable() {` › `witness.at_consult.clear();`
 
 The open's own barrier is not this append's trace: both are cleared so
 every step read below was performed by the append.
 
-## `fn the_synced_consults_are_offered_after_the_data_is_durabl…` › `let written = witness`
+## `fn the_synced_consults_are_offered_after_the_data_is_durable() {` › `let written = witness`
 
 And the earlier coordinates are on their own side of it, so the assertion
 above is about this point rather than about the end of the append.
@@ -458,7 +458,7 @@ real one.
 returns `ENOSPC`. Linux only, and named rather than skipped elsewhere — this
 is the one place in the lane where the primitive itself fails.
 
-## `fn a_real_write_failure_is_attempted_once_poisons_the_handl…` › `let mut log =`
+## `fn a_real_write_failure_is_attempted_once_poisons_the_handle_and_is_not_retried() {` › `let mut log =`
 
 The **legacy** open, which takes no barrier: `fsync` on a character
 device is `EINVAL`, so `Event.OpenLog`'s prefix sync cannot be performed
@@ -485,20 +485,20 @@ points, never a length. So syncing the *pre*-normalized length and
 truncating afterwards satisfied both: one had no truncation to get wrong,
 the other never read the number that would have been wrong.
 
-## `fn open_truncates_the_torn_tail_before_it_syncs_and_syncs_t…` › `let expected: Vec<DurableStep> = vec![`
+## `fn open_truncates_the_torn_tail_before_it_syncs_and_syncs_the_shortened_length() {` › `let expected: Vec<DurableStep> = vec![`
 
 One expectation for every platform (`PR5-CONF-013`). This used to fork on
 `cfg!(unix)` because there was no directory fsync on Windows; `scope`'s
 "file **and directory** after a truncation" carries no platform
 exception, and `util::fsync_dir` now performs it on both.
 
-## `fn open_syncs_the_surviving_prefix_and_the_ledger_agrees_wi…` › `let mut warnings = Vec::new();`
+## `fn open_syncs_the_surviving_prefix_and_the_ledger_agrees_with_the_filesystem() {` › `let mut warnings = Vec::new();`
 
 A line written by an earlier handle and never synced — the case
 `proof_tests[9]` names explicitly. `WrittenFull`'s error-return leaves
 exactly that shape: the full newline-terminated line, no flush, no sync.
 
-## `fn open_fsyncs_the_directory_when_it_creates_the_log_and_af…` › `let expected_directory_syncs = 1;`
+## `fn open_fsyncs_the_directory_when_it_creates_the_log_and_after_a_truncation() {` › `let expected_directory_syncs = 1;`
 
 One expectation for every platform (`PR5-CONF-013`). This used to be
 `if cfg!(unix) { 1 } else { 0 }`, because `File::open` on a directory needs
@@ -507,25 +507,25 @@ the reason `util::fsync_dir` calls `CreateFileW` there instead. `scope`'s
 "directory fsync" and "file **and directory** after a truncation" carry no
 platform exception, so neither does this.
 
-## `fn open_fsyncs_the_directory_when_it_creates_the_log_and_af…` › `let untouched = log_path("dir-fsync-untouched");`
+## `fn open_fsyncs_the_directory_when_it_creates_the_log_and_after_a_truncation() {` › `let untouched = log_path("dir-fsync-untouched");`
 
 An untouched existing log syncs the file and nothing else: the directory
 entry did not move.
 
-## `fn an_injected_sync_failure_at_open_names_syncprefix_and_ha…` › `let mut failing = FailAt::error(SubEffectPoint::SyncPrefix);`
+## `fn an_injected_sync_failure_at_open_names_syncprefix_and_hands_out_no_handle() {` › `let mut failing = FailAt::error(SubEffectPoint::SyncPrefix);`
 
 The barrier reports the same failure as its own step.
 
-## `fn every_open_point_is_offered_in_every_mode_the_frozen_inv…` › `let points = EventSite::OpenLog.sub_effects();`
+## `fn every_open_point_is_offered_in_every_mode_the_frozen_inventory_declares() {` › `let points = EventSite::OpenLog.sub_effects();`
 
 Derived from the type, not from a list: `sub_effects()` x `modes()`.
 
-## `fn every_open_point_is_offered_in_every_mode_the_frozen_inv…` › `let mut offered = Vec::new();`
+## `fn every_open_point_is_offered_in_every_mode_the_frozen_inventory_declares() {` › `let mut offered = Vec::new();`
 
 `Create` needs an absent log; `TruncateTornTail` needs a torn one. One
 open cannot be both, so both are run and the offers are unioned.
 
-## `fn every_open_point_is_offered_in_every_mode_the_frozen_inv…` › `8,`
+## `fn every_open_point_is_offered_in_every_mode_the_frozen_inventory_declares() {` › `8,`
 
 Create x 2 modes + SyncPrefix x 2 (first open), TruncateTornTail x 2 +
 SyncPrefix x 2 (second open).
@@ -547,18 +547,18 @@ leaves. Written from the packet's own words, not from the funnel's code.
 * (e-s) `Synced` — "sync_data returned an error after the data reached the
   disk" → the complete line.
 
-## `fn every_error_return_case_leaves_its_tabled_shape_names_it…` › `assert_eq!(`
+## `fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_the_handle() {` › `assert_eq!(`
 
 Two distinct durable shapes across the three cases: a grid that produced
 one shape three times would be satisfied by the wrong thing.
 
-## `fn every_error_return_case_leaves_its_tabled_shape_names_it…` › `let mut sites: Vec<(EventSite, Option<TopologyLine>)> = append_site_lines()`
+## `fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_the_handle() {` › `let mut sites: Vec<(EventSite, Option<TopologyLine>)> = append_site_lines()`
 
 Every append site of the group, not the one that was looked at: the
 contract names `AppendFirst`, `Append` and `AppendInformational`
 separately, and the legacy site is a fourth behaviour again.
 
-## `fn every_error_return_case_leaves_its_tabled_shape_names_it…` › `let path = log_path(&format!("err-{case}-{index}"));`
+## `fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_the_handle() {` › `let path = log_path(&format!("err-{case}-{index}"));`
 
 **The scratch name carries no point and no site**
 (`PR5-EVENTS-045`). It used to be `err-<point>-<site>`, and
@@ -568,7 +568,7 @@ separately, and the legacy site is a fourth behaviour again.
 reported a `Synced` injection as `Written` passed this grid.
 Verified by running it under exactly that mutation.
 
-## `fn every_error_return_case_leaves_its_tabled_shape_names_it…` › `let quoted = |point: &SubEffectPoint| format!("{}", point.name());`
+## `fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_the_handle() {` › ``let quoted = |point: &SubEffectPoint| format!("`{}`", point.name());``
 
 On the **message**, not on `to_string()`: the rendering adds the
 path, and a path is not something the funnel decided to say.
@@ -579,7 +579,7 @@ apart, and they are the two the packet most needs kept apart —
 one is a torn tail the next open truncates, the other a complete
 unsynced prefix the barrier makes durable.
 
-## `fn every_error_return_case_leaves_its_tabled_shape_names_it…` › `for attempt in 1..=3 {`
+## `fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_the_handle() {` › `for attempt in 1..=3 {`
 
 **Every** later append through this handle fails, naming the
 poisoning coordinate — the first, the second and the third
@@ -620,36 +620,36 @@ constant: the point, at `Written`, so the point half cannot be what fails.
 A legacy handle cannot build this shape at all (`check_scope` admits only
 `LegacyAppend`), which is why it took a schema-4 fixture.
 
-## `fn a_handle_poisoned_at_one_site_names_that_site_when_refus…` › `for (poison_at, poison_line) in &lines {`
+## `fn a_handle_poisoned_at_one_site_names_that_site_when_refused_at_another() {` › `for (poison_at, poison_line) in &lines {`
 
 Every ordered pair of distinct sites, so no single pairing can be the one
 that happens to agree.
 
-## `fn a_value_the_wire_cannot_carry_does_not_enter_the_append_…` › `let path = log_path("unserializable");`
+## `fn a_value_the_wire_cannot_carry_does_not_enter_the_append_and_does_not_poison() {` › `let path = log_path("unserializable");`
 
 `emit`'s contract is "a FoldError aborts before any write", and the
 packet's poisoning rule is about an `Err` "after the append **was
 entered**". A handle poisoned by a value that never reached the file
 would refuse the next, perfectly good, event.
 
-## `fn a_value_the_wire_cannot_carry_does_not_enter_the_append_…` › `assert!(`
+## `fn a_value_the_wire_cannot_carry_does_not_enter_the_append_and_does_not_poison() {` › `assert!(`
 
 `serde_json` writes a non-finite float as `null` rather than refusing, so
 the guard that catches it is the round-trip — which is precisely the step
 `emit` names ("serialize -> round-trip -> plan_transition -> append").
 
-## `fn every_append_point_is_offered_in_every_mode_the_frozen_i…` › `for (site, line) in append_site_lines() {`
+## `fn every_append_point_is_offered_in_every_mode_the_frozen_inventory_declares() {` › `for (site, line) in append_site_lines() {`
 
 All three sites declare the same points, and all three are driven. A
 suppression keyed on one site — `if site == EventSite::Append` around the
 consults — is the `PR4-CONF-002` defect, and it passes a grid that drives
 only the site somebody happened to look at.
 
-## `fn every_append_point_is_offered_in_every_mode_the_frozen_i…` › `5,`
+## `fn every_append_point_is_offered_in_every_mode_the_frozen_inventory_declares() {` › `5,`
 
 Written x 2, WrittenFull x 1 (error-return only), Synced x 2.
 
-## `fn the_written_kill_shape_moves_where_a_kill_lands_and_not_…` › `let mut bytes = Vec::new();`
+## `fn the_written_kill_shape_moves_where_a_kill_lands_and_not_what_is_durable() {` › `let mut bytes = Vec::new();`
 
 The observer that asks for the torn coordinate must not change the file a
 successful append leaves, or every ST-07 kill measurement would be taken
@@ -713,7 +713,7 @@ declare `Kill`. A point added to the inventory later is uncovered loudly.
 
 Run the helper for one case and hand back what the killed process left.
 
-## `fn kill_at(case: &str, point: SubEffectPoint, path: &Path) …` › `let helper = format!(`
+## `fn kill_at(case: &str, point: SubEffectPoint, path: &Path) -> Vec<u8> {` › `let helper = format!(`
 
 The harness names a test by its module path without the crate, so the
 filter is derived rather than written out: a module that moves takes
@@ -737,7 +737,7 @@ append in these cases and no handle to append through.
 Reached only if the kill did not fire, which the parent detects as a
 successful exit.
 
-## `fn every_kill_point_the_inventory_declares_has_a_case_and_n…` › `let declared = declared_kill_points();`
+## `fn every_kill_point_the_inventory_declares_has_a_case_and_no_case_is_invented() {` › `let declared = declared_kill_points();`
 
 Derived from the types: `EventSite::ALL` x `sub_effects()` x `modes()`.
 
@@ -752,15 +752,15 @@ truncated **before the append handle was taken**"; and for `SyncPrefix`,
 effect is performed, the command refuses resumably, and **the next open
 repeats the barrier**".
 
-## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_ta…` › `let created = log_path("kill-create");`
+## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_tables() {` › `let created = log_path("kill-create");`
 
 `Create` — the log was absent, so nothing seeds it.
 
-## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_ta…` › `let truncated = log_path("kill-truncate-torn-tail");`
+## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_tables() {` › `let truncated = log_path("kill-truncate-torn-tail");`
 
 `TruncateTornTail` — the truncation is already durable at the point.
 
-## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_ta…` › `let unsynced = log_path("kill-sync-prefix");`
+## `fn a_kill_at_each_open_point_leaves_the_shape_the_packet_tables() {` › `let unsynced = log_path("kill-sync-prefix");`
 
 `SyncPrefix` — consulted before the sync, so the bytes are untouched and
 the next open is what makes them durable.
@@ -771,11 +771,11 @@ the next open is what makes them durable.
 the synced line `Synced` tables, each executed by a real abort, and each
 followed by what the next open makes of it.
 
-## `fn a_kill_at_each_append_point_leaves_the_shape_the_packet_…` › `let mut warnings = Vec::new();`
+## `fn a_kill_at_each_append_point_leaves_the_shape_the_packet_tables() {` › `let mut warnings = Vec::new();`
 
 What the next open makes of it — the other half of the tabled entry.
 
-## `fn a_kill_at_each_append_point_leaves_the_shape_the_packet_…` › `assert_eq!(durable.len(), 3);`
+## `fn a_kill_at_each_append_point_leaves_the_shape_the_packet_tables() {` › `assert_eq!(durable.len(), 3);`
 
 Two shapes across three coordinates: the complete-unsynced line a kill at
 `Written` leaves and the synced line a kill at `Synced` leaves are the
@@ -787,29 +787,29 @@ same bytes, which is why `WrittenFull` declares no kill mode at all.
 The stable-prefix barrier
 ---------------------------------------------------------------------------
 
-## `fn a_fresh_log_establishes_the_barrier_trivially_and_hands_…` › `let path = log_path("barrier-fresh");`
+## `fn a_fresh_log_establishes_the_barrier_trivially_and_hands_out_a_handle() {` › `let path = log_path("barrier-fresh");`
 
 "a fresh run's Event.OpenLog at P5 creates an empty log, so the barrier is
 trivially established (no prefix)".
 
-## `fn the_barrier_syncs_before_it_rereads_and_proves_before_it…` › `assert_eq!(witness.ledger.len(), 2);`
+## `fn the_barrier_syncs_before_it_rereads_and_proves_before_it_replays() {` › `assert_eq!(witness.ledger.len(), 2);`
 
 The sync happened inside `OpenLog`, i.e. before `ProvePrefixStable` began.
 The file's barrier and the directory's, on every platform (`PR5-CONF-013`).
 
-## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_an…` › `let committed = b"{\"ts\":\"2026-08-20T09:41:02Z\",\"event\":\"defer_wait_elapsed\",\"dat…`
+## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_and_hands_out_no_handle() {` › `let committed = b"{\"ts\":\"2026-08-20T09:41:02Z\",\"event\":\"defer_wait_elapsed\",\"data\":{\"waited_ms\":1500,\"round\":1}}\n";`
 
 Three independent ways a reread can be unstable: a byte moved, the length
 moved, and the boundary moved. `stable_prefix_barrier` step (4) names all
 three, so each is a cell rather than one test that happens to trip.
 
-## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_an…` › `let cases: &[(&str, Vec<u8>, &str)] = &[`
+## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_and_hands_out_no_handle() {` › `let cases: &[(&str, Vec<u8>, &str)] = &[`
 
 Three cells, three *different clauses* of step (4). The order the proof
 checks them in is what makes that possible: byte-equality implies the
 other two, so it is checked last.
 
-## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_an…` › `let details: BTreeSet<String> = cases`
+## `fn an_unstable_reread_refuses_naming_prove_prefix_stable_and_hands_out_no_handle() {` › `let details: BTreeSet<String> = cases`
 
 Each cell produced a *distinct* detail, so a proof that had collapsed the
 three clauses into one would fail here rather than pass three times.
@@ -843,13 +843,13 @@ is not the refuser, and the refusal can only come from `replay` having
 been handed the events. A barrier that replayed an empty slice would
 succeed here.
 
-## `fn a_first_line_digest_that_disagrees_with_the_commit_recor…` › `let expected = {`
+## `fn a_first_line_digest_that_disagrees_with_the_commit_record_refuses() {` › `let expected = {`
 
 Computed here from the line's own bytes rather than by calling the
 function again: an oracle that called the function under test would move
 with it.
 
-## `fn a_first_line_digest_that_disagrees_with_the_commit_recor…` › `let empty = log_path("first-line-digest-empty");`
+## `fn a_first_line_digest_that_disagrees_with_the_commit_record_refuses() {` › `let empty = log_path("first-line-digest-empty");`
 
 An empty log with a commit record that names a first line is the other
 half of the same clause.
@@ -914,16 +914,16 @@ line is not an event: the newline is the commit marker)", and
 before taking the append handle … only then does recovery follow the fault
 row of the surviving prefix (before-append …)".
 
-## `fn torn_tail_truncated_on_open_and_recovery_matches_before_…` › `let killed = kill_at("written-torn", SubEffectPoint::Written, &path);`
+## `fn torn_tail_truncated_on_open_and_recovery_matches_before_append_row() {` › `let killed = kill_at("written-torn", SubEffectPoint::Written, &path);`
 
 A real process death inside the write, in the torn half of `Written`'s
 kill entry.
 
-## `fn torn_tail_truncated_on_open_and_recovery_matches_before_…` › `let mut warnings = Vec::new();`
+## `fn torn_tail_truncated_on_open_and_recovery_matches_before_append_row() {` › `let mut warnings = Vec::new();`
 
 The open normalizes it, before it takes the append handle.
 
-## `fn torn_tail_truncated_on_open_and_recovery_matches_before_…` › `assert_ne!(before_events, after_append_events(&before_events));`
+## `fn torn_tail_truncated_on_open_and_recovery_matches_before_append_row() {` › `assert_ne!(before_events, after_append_events(&before_events));`
 
 And the two rows really differ, so the assertion above is a choice.
 
@@ -957,16 +957,16 @@ Two crashes, which is what makes the claim more than a restatement of the
 previous test: the first leaves the line unsynced, the barrier syncs it, and
 the second crash — a torn write on top of it — does not take it away.
 
-## `fn unsynced_line_made_durable_by_barrier_survives_later_pow…` › `let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);`
+## `fn unsynced_line_made_durable_by_barrier_survives_later_power_loss() {` › `let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);`
 
 Crash one: the complete-unsynced shape.
 
-## `fn unsynced_line_made_durable_by_barrier_survives_later_pow…` › `let mut witness = Witness::default().recording_durability();`
+## `fn unsynced_line_made_durable_by_barrier_survives_later_power_loss() {` › `let mut witness = Witness::default().recording_durability();`
 
 The barrier's step (2): the whole surviving prefix — including that
 line — is successfully synced by the reopening process.
 
-## `fn unsynced_line_made_durable_by_barrier_survives_later_pow…` › `let torn = kill_at("written-torn", SubEffectPoint::Written, &path);`
+## `fn unsynced_line_made_durable_by_barrier_survives_later_power_loss() {` › `let torn = kill_at("written-torn", SubEffectPoint::Written, &path);`
 
 Crash two, on top of the now-durable prefix: a torn write that the next
 open truncates away.
@@ -984,13 +984,13 @@ way to model a power loss that drops an unsynced write is to truncate the
 file directly. It happens **before** any open, so no process ever saw the
 line, let alone acted on it.
 
-## `fn unsynced_line_lost_before_barrier_converges_to_before_ap…` › `fs::OpenOptions::new()`
+## `fn unsynced_line_lost_before_barrier_converges_to_before_append_order() {` › `fs::OpenOptions::new()`
 
 The loss: the unsynced tail is gone, and no process has opened the log
 since the crash — so nothing has been authorized by that line, which is
 the premise the convergence rests on.
 
-## `fn unsynced_line_lost_before_barrier_converges_to_before_ap…` › `let (kept_path, _, kept_before) = seeded_prefix("unsynced-kept");`
+## `fn unsynced_line_lost_before_barrier_converges_to_before_append_order() {` › `let (kept_path, _, kept_before) = seeded_prefix("unsynced-kept");`
 
 The control. The identical fixture, with the loss removed, converges to
 the *other* row — so the assertion above is about the loss and not about
@@ -1051,7 +1051,7 @@ rather than tripped over: comments are stripped first, and the strip is
 asserted to have removed something, because this file's own prose names every
 primitive it counts.
 
-## `fn the_event_log_is_written_in_exactly_one_module()` › `const PRIMITIVES: &[&str] = &["write_all(", "sync_data(", "set_len(", "OpenOptions::new()…`
+## `fn the_event_log_is_written_in_exactly_one_module()` › `const PRIMITIVES: &[&str] = &["write_all(", "sync_data(", "set_len(", "OpenOptions::new()"];`
 
 `sync_all(` is deliberately absent (`PR5-CONF-012`): the log's *file*
 barrier is now `util::fsync_file`, the one call in the funnel modules that
@@ -1117,7 +1117,7 @@ a control is not a control, which is what this paragraph used to be.
   non-whitespace bytes scanned catches the case where every region is empty
   and the file count alone still passes.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `const FOLD_MENTIONS: &[&str] = &[`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `const FOLD_MENTIONS: &[&str] = &[`
 
 The control: every production region that **names** the fold at all.
 
@@ -1137,23 +1137,23 @@ read the same on Windows, where the walk produces `\`.
 Sorted, asserted sorted, and asserted duplicate-free: an entry appended in
 the wrong place, or twice by two merges, fails here rather than passing.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/engine/topology/candidate.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/engine/topology/candidate.rs",`
 
 PR7's candidate pipeline. Holds a fold, builds none from bytes.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/engine/topology/create.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/engine/topology/create.rs",`
 
 PR7's schema-4 creator. It holds a fold across P5b and P6 because
 `emit` puts `plan_transition` before the commit record and
 `apply_delta` after the append.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/engine/topology/emit.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/engine/topology/emit.rs",`
 
 PR7's emit path. It holds a fold and appends to a log and builds
 neither from bytes — it obtains one from `establish_stable_prefix` —
 so it names the type without adding to `callers` below.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/engine/topology/recover.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/engine/topology/recover.rs",`
 
 This funnel: `establish_stable_prefix` is the one place a log becomes
 a fold.
@@ -1161,18 +1161,18 @@ PR7's selection and settlement halves. Both read a fold; neither
 builds one from bytes.
 PR7's recovery order. Reads a fold; builds none from bytes.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/engine/topology/run.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/engine/topology/run.rs",`
 
 PR7's driver. Holds the fold `RunHandle` handed it and reads it to
 select; builds none from bytes, because the one it holds is the one
 the barrier proved and a second derivation would be a rule that can
 disagree with the first.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/topology/census.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/topology/census.rs",`
 
 ST-14's bounded reachability census over fold states.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `"src/topology/fold.rs",`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `"src/topology/fold.rs",`
 
 The fold itself: the root holds the state types, the
 `plan_transition`/`apply_delta` pair and the child declarations, and the
@@ -1180,7 +1180,7 @@ children listed below carry an `impl TopologyFold` block of their own.
 Every other child names the type in prose only, if at all, and prose is
 blanked — so it does not appear here.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `let test_modules: BTreeSet<PathBuf> =`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `let test_modules: BTreeSet<PathBuf> =`
 
 Whole files the crate declares under `#[cfg(test)]` are test code with no
 production half at all, and treating them as production would count a
@@ -1195,12 +1195,12 @@ and — as a *third*, different rule — in `recover::tests`, which keyed on
 the file name and so covered only the whole-file test modules named
 `tests.rs`, not the rest of them. `PR7-R5-ATT-001`.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `let production = crate::effects::production_code(&source);`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `let production = crate::effects::production_code(&source);`
 
 The whole file, comments and string literals blanked and every
 `#[cfg(test)]` item removed — not a truncation at the first one.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `assert!(`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `assert!(`
 
 Per file, because the aggregate floor below cannot see one region
 collapsing: it stands at 750,000 against an actual over 900,000, so a
@@ -1214,13 +1214,13 @@ removes the forged lines and adds a probe of the same size, and
 measured a zero-byte delta. `effects::char_literal_end` and
 `configured_item_end`'s give-up direction are what close that.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `assert!(`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `assert!(`
 
 And the regions were not empty. A file count alone passes with every
 region collapsed to nothing, which is precisely what a `#[cfg(test)]` in a
 comment used to do to one.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `let funnel_code =`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `let funnel_code =`
 
 And that one place is inside the barrier, not merely inside this file.
 
@@ -1230,7 +1230,7 @@ of file, which also covered `read_all`, `read_bytes`, `parse_bytes` and
 *below* the barrier and this check would still count one. Measured: it
 did, and the census stayed green.
 
-## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_…` › `for below in ["pub fn read_all(", "impl LogTail {"] {`
+## `fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {` › `for below in ["pub fn read_all(", "impl LogTail {"] {`
 
 The bound is real: the readers below the barrier are outside it.
 
@@ -1310,7 +1310,7 @@ this project uses and is not `target/`.
 
 Type-check `body` against this crate and return rustc's diagnostics.
 
-## `fn typecheck(dir: &Path, name: &str, body: &str) -> (bool, …` › `fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).expect("the fixture");`
+## `fn typecheck(dir: &Path, name: &str, body: &str) -> (bool, String) {` › `fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).expect("the fixture");`
 
 Doctests without a `fn main` are wrapped in one, so the fixtures are
 written that way and this wraps them the same.
@@ -1353,12 +1353,12 @@ guard available for it is a timestamp comparison, and a test binary that is
 legitimately newer than an unchanged rlib is the *ordinary* case, so the
 guard would be a flake rather than a check. The gate is unaffected.
 
-## `fn every_declared_build_refusal_fails_for_the_reason_it_dec…` › `let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"…`
+## `fn every_declared_build_refusal_fails_for_the_reason_it_declares() {` › `let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))`
 
 The harness compiles at one edition; a crate that moved would be checked
 under rules it is not built with.
 
-## `fn every_declared_build_refusal_fails_for_the_reason_it_dec…` › `let (control_ok, control_stderr) = typecheck(`
+## `fn every_declared_build_refusal_fails_for_the_reason_it_declares() {` › `let (control_ok, control_stderr) = typecheck(`
 
 The control, and it earns its keep twice.
 
@@ -1392,7 +1392,7 @@ What is left here is what a behavioural test cannot see: that the branch
 emits **nothing**, over the whole branch rather than over the paths a
 fixture happens to drive.
 
-## `fn the_legacy_engine_reports_and_stops_on_a_returned_append…` › `let squeezed: String = code.chars().filter(|c| !c.is_whitespace()).collect();`
+## `fn the_legacy_engine_reports_and_stops_on_a_returned_append_error() {` › `let squeezed: String = code.chars().filter(|c| !c.is_whitespace()).collect();`
 
 Whitespace out before counting a call, because rustfmt decides where a
 method chain breaks and a census that a reformat can silently zero is a

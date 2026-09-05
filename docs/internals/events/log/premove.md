@@ -2,9 +2,9 @@
 
 Extended notes for [`src/events/log/premove.rs`](../../../../src/events/log/premove.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -63,7 +63,7 @@ never finished being written, and no reader could ever have parsed
 them — and it keeps "damage anywhere but the end means corruption" a
 statement the reader can still trust.
 
-## `pub fn open(path: &Path, warnings: &mut Vec<String>) -> Res…` › `match std::fs::read(path) {`
+## `pub fn open(path: &Path, warnings: &mut Vec<String>) -> Result<Self, UpstrokeError> {` › `match std::fs::read(path) {`
 
 Truncate before taking the append handle, through a handle of its
 own. On Windows an append-only handle is opened with

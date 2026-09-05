@@ -2,9 +2,9 @@
 
 Extended notes for [`src/events/mod.rs`](../../../src/events/mod.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -966,17 +966,17 @@ Parking discards the attempt's working tree. Its model
 session therefore describes edits that no longer exist
 and must not survive as a candidate for a later retry.
 
-## `fn apply_ladder_escalated(&mut self, task: &str, attempt: u…` › `progress.session = None;`
+## `fn apply_ladder_escalated(&mut self, task: &str, attempt: u32, data: &LadderEscalated) {` › `progress.session = None;`
 
 §11.4: a different model cannot inherit another's conversation; the
 accumulated feedback carries the history.
 
-## `fn apply_task_deferred(&mut self, task: &str, data: &TaskDe…` › `progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);`
+## `fn apply_task_deferred(&mut self, task: &str, data: &TaskDeferred) {` › `progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);`
 
 No attempt was spent on the work itself (§19), and the discarded tree
 makes every session that described it invalid.
 
-## `fn apply_task_failed(&mut self, task: &str, data: &TaskFail…` › `self.halted_at.get_or_insert_with(|| task.to_owned());`
+## `fn apply_task_failed(&mut self, task: &str, data: &TaskFailed) {` › `self.halted_at.get_or_insert_with(|| task.to_owned());`
 
 First failure wins: `halted_at` is what the report and CLI name
 as the cause.
@@ -1127,7 +1127,7 @@ The resolved worker bindings this run is bound to, wherever they first
 become available. Schema-2 runs carry them in `run_started`; a schema-1 run
 gains them on the first schema-2 `run_resumed` event.
 
-## `pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, Upstrok…`
+## `pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, UpstrokeError> {`
 
 The `run_started` a log opens with — how a run describes itself.
 
@@ -1180,26 +1180,26 @@ An event with no task omits the field rather than nulling it.
 Readability in the log, and it survives serde's internally-tagged
 buffering, which the default Duration shape does not reliably do.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_event…` › `let torn = format!("{good}\n{also_good}\n{{\"ts\":\"2026-01-0");`
+## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let torn = format!("{good}\n{also_good}\n{{\"ts\":\"2026-01-0");`
 
 A kill mid-write: the last line stops partway through.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_event…` › `let mut invalid_utf8_tail = format!("{good}\n").into_bytes();`
+## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let mut invalid_utf8_tail = format!("{good}\n").into_bytes();`
 
 `serde_json` may write Unicode from a recorded reason or path. A kill
 can split that code point, but bytes after the commit newline are no
 less recoverable merely because they are not yet valid UTF-8.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_event…` › `let corrupt = format!("{good}\nnot json at all\n{also_good}\n");`
+## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let corrupt = format!("{good}\nnot json at all\n{also_good}\n");`
 
 Damage anywhere else means the file was rewritten, not interrupted.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_event…` › `let mut invalid: serde_json::Value =`
+## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let mut invalid: serde_json::Value =`
 
 Being last is not enough to make an event recoverable. This record is
 complete JSON and newline-terminated, but its domain value is invalid.
 
-## `fn appending_after_a_torn_line_discards_it_rather_than_spli…` › `let mut warnings = Vec::new();`
+## `fn appending_after_a_torn_line_discards_it_rather_than_splicing() {` › `let mut warnings = Vec::new();`
 
 Splicing would have lost both the fragment and the new event;
 newline-terminating the fragment would have left an unparseable
@@ -1217,23 +1217,23 @@ none" must stay distinguishable — the same rule `reviews` follows for
 logs that predate step 9, and the difference between re-deriving with
 a warning and running a run with verification switched off.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_a…` › `let EventBody::RunStarted { data } = started() else {`
+## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `let EventBody::RunStarted { data } = started() else {`
 
 Resume rebuilds its gates from this record and executes them, so a
 field that does not round-trip is a gate that runs differently the
 second time. `shell` in particular: the same `cmd` is an always-pass
 builtin under one and not a program at all under another.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_a…` › `assert_eq!(json["data"]["gate_cmds"][0]["timeout_ms"], 600_000);`
+## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `assert_eq!(json["data"]["gate_cmds"][0]["timeout_ms"], 600_000);`
 
 Readable in the raw log, like every other duration in it.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_a…` › `let recorded = read_back.gate_cmds.expect("gates");`
+## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `let recorded = read_back.gate_cmds.expect("gates");`
 
 And the shell spells the same way in the log as in `upstroke.toml`, so
 an operator comparing the two is comparing like with like.
 
-## `fn an_interrupted_attempt_is_recorded_but_does_not_spend_th…` › `let events = vec![`
+## `fn an_interrupted_attempt_is_recorded_but_does_not_spend_the_rung() {` › `let events = vec![`
 
 Decision 3, and the property a killed run depends on: the attempt
 shows up in the ledger, the allowance does not.

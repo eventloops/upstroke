@@ -2,9 +2,9 @@
 
 Extended notes for [`src/topology/events.rs`](../../../src/topology/events.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -554,7 +554,7 @@ What came back.
 
 Present exactly when the question was asking for a binding.
 
-## `pub enum Answer4` › `Declined { decline_halts_run: bool },`
+## `pub enum Answer4` › `Declined {`
 
 The human said no. Whether that halts the run is the run's policy as it
 stood when the decline became durable — recorded, not re-derived, so a
@@ -664,7 +664,7 @@ What a dispatch does to the run's leases.
 An ordinary dispatch takes a predicted lease over the region the plan's
 hints imply.
 
-## `pub enum LeaseGrant` › `InheritedLineage { root: TaskKey },`
+## `pub enum LeaseGrant` › `InheritedLineage {`
 
 A repair executes inside the lineage lease its root already holds, and
 takes nothing of its own.
@@ -1064,7 +1064,7 @@ Whether this is a passing terminal record.
 
 Why an integration could not be judged.
 
-## `pub enum UnavailableCause` › `HumanRequired { verdict: String },`
+## `pub enum UnavailableCause` › `HumanRequired {`
 
 A reviewer found something only a person may decide. Always parks.
 
@@ -1156,7 +1156,7 @@ The candidate's own attempt record. Only a fast publication may cite
 it, because only a fast publication publishes the object that record
 judged.
 
-## `pub enum VerificationSource` › `Verification { sequence: SequenceId },`
+## `pub enum VerificationSource` › `Verification {`
 
 A verification run in this transaction.
 
@@ -1273,7 +1273,7 @@ Why a candidate was not published.
 The cherry-pick conflicted. The conflicting region is what the repair
 inherits and what widens the lineage lease.
 
-## `pub enum RejectionDisposition` › `CodeRejected { verification: VerificationRecord },`
+## `pub enum RejectionDisposition` › `CodeRejected {`
 
 The proposal was verified and judged unacceptable.
 
@@ -1314,7 +1314,7 @@ Which lease a publication releases.
 
 An ordinary candidate's actual lease.
 
-## `pub enum MergeLeaseRelease` › `Lineage { root: TaskKey },`
+## `pub enum MergeLeaseRelease` › `Lineage {`
 
 The lineage lease, released when the publication settles its root.
 
@@ -1348,7 +1348,7 @@ question it parked behind halts anything.
 
 A terminal task failure whose recorded policy halts the run.
 
-## `pub enum HaltCarrier` › `DeclinedQuestion { key: TaskKey, question: QuestionId },`
+## `pub enum HaltCarrier` › `DeclinedQuestion {`
 
 A declined question whose recorded policy halts the run.
 
@@ -1506,7 +1506,7 @@ Asserting the serialized tag, not merely that serialize and
 deserialize agree: a renamed variant round-trips perfectly and
 silently stops matching every log already written.
 
-## `fn the_envelope_is_a_timestamp_a_tag_and_a_payload_and_noth…` › `for body in every_kind() {`
+## `fn the_envelope_is_a_timestamp_a_tag_and_a_payload_and_nothing_else() {` › `for body in every_kind() {`
 
 Schema 4 hoists no routing field beside the tag. Identity lives in
 the payload once, so an envelope that contradicts its own record is
@@ -1518,7 +1518,7 @@ not a refusal — it cannot be written.
 Unknown fields (deny_unknown_fields on transactions only)
 ------------------------------------------------------------------
 
-## `mod tests` › `fn object_paths(value: &serde_json::Value, at: Vec<String>, found: &mut Vec<Vec<String>>)…`
+## `mod tests` › `fn object_paths(value: &serde_json::Value, at: Vec<String>, found: &mut Vec<Vec<String>>) {`
 
 Every object path in `value`, deepest last, as a list of steps.
 
@@ -1566,7 +1566,7 @@ paths.
 
 `merge_rejected` embeds the same registry entry under `repair`.
 
-## `fn an_unknown_field_is_refused_at_every_object_boundary_of_…` › `let mut visited = 0_usize;`
+## `fn an_unknown_field_is_refused_at_every_object_boundary_of_every_transaction() {` › `let mut visited = 0_usize;`
 
 `refusals[24]`: unknown fields in topology transaction payloads are
 refused, and only informational events are lenient. Recursively —
@@ -1578,19 +1578,19 @@ The paths are enumerated from the canonical payloads rather than
 sampled, so a nested structure nobody remembered is covered by
 construction and a new one is covered the day it is added.
 
-## `fn an_unknown_field_is_refused_at_every_object_boundary_of_…` › `assert_eq!(`
+## `fn an_unknown_field_is_refused_at_every_object_boundary_of_every_transaction() {` › `assert_eq!(`
 
 Pinned rather than bounded: the failure this whole test exists to
 prevent is a sweep that quietly stops covering something, and a
 shrinking corpus is exactly as invisible as a shrinking grid. A
 legitimate new nested object raises this number and says so.
 
-## `fn an_unknown_field_is_refused_at_every_object_boundary_of_…` › `assert_eq!(`
+## `fn an_unknown_field_is_refused_at_every_object_boundary_of_every_transaction() {` › `assert_eq!(`
 
 Both classes are non-empty, so neither assertion above is vacuously
 satisfied by a decoder that refuses or accepts everything.
 
-## `fn a_record_reused_from_the_legacy_schemas_is_read_strictly…` › `let finished = AttemptFinished4 {`
+## `fn a_record_reused_from_the_legacy_schemas_is_read_strictly_inside_a_transaction() {` › `let finished = AttemptFinished4 {`
 
 The reconciliation the design forces. `refusals[24]` refuses an
 unknown field in a *topology transaction payload* and grants no
@@ -1601,12 +1601,12 @@ schema-4 field, not to `AttemptRecord`.
 
 This replaces the assertion A1 shipped, which required the opposite.
 
-## `fn a_record_reused_from_the_legacy_schemas_is_read_strictly…` › `let mut legacy = serde_json::to_value(attempt_record()).expect("serialize");`
+## `fn a_record_reused_from_the_legacy_schemas_is_read_strictly_inside_a_transaction() {` › `let mut legacy = serde_json::to_value(attempt_record()).expect("serialize");`
 
 And the same bytes still read exactly as they always did through the
 legacy type itself: the schema-1..3 decoder is untouched.
 
-## `fn a_known_null_survives_the_strict_door_and_an_unknown_nul…` › `let mut record = serde_json::to_value(attempt_record()).expect("serialize");`
+## `fn a_known_null_survives_the_strict_door_and_an_unknown_null_does_not() {` › `let mut record = serde_json::to_value(attempt_record()).expect("serialize");`
 
 The strict door decides "unknown" by asking the record which keys it
 claims back. That is exact only while every embedded record
@@ -1616,11 +1616,11 @@ and this is where that precondition is checked rather than assumed.
 record; supplied as an explicit null they are known, absent-valued
 fields and must pass.
 
-## `fn a_known_null_survives_the_strict_door_and_an_unknown_nul…` › `value["data"]["record"]`
+## `fn a_known_null_survives_the_strict_door_and_an_unknown_null_does_not() {` › `value["data"]["record"]`
 
 A null under a key the record does not claim is still unknown.
 
-## `fn every_required_payload_field_is_refused_when_it_is_absen…` › `let mut deletions = 0_usize;`
+## `fn every_required_payload_field_is_refused_when_it_is_absent() {` › `let mut deletions = 0_usize;`
 
 A field made `#[serde(default)]` on input accepts a truncated durable
 record and round-trips unchanged, so no round trip can see it.
@@ -1632,7 +1632,7 @@ A key whose value is `null` is excluded: for an `Option` field the
 absent key and the null key are the same durable answer, and the
 distinction the design draws is between a value and no record at all.
 
-## `fn every_required_payload_field_is_refused_when_it_is_absen…` › `assert_eq!(`
+## `fn every_required_payload_field_is_refused_when_it_is_absent() {` › `assert_eq!(`
 
 Pinned rather than bounded, for the same reason the injection sweep
 is: a sweep that quietly stops covering a field is exactly as
@@ -1652,36 +1652,36 @@ One way to move exactly one identity field of a runner record.
 
 One way to move exactly one field of a rung binding, and its name.
 
-## `fn a_runner_record_differs_in_the_field_that_moved_and_no_o…` › `let cases: Vec<(RunnerField, MoveRunner)> = vec![`
+## `fn a_runner_record_differs_in_the_field_that_moved_and_no_other() {` › `let cases: Vec<(RunnerField, MoveRunner)> = vec![`
 
 Crossed over every field the design names, each moved on its own
 against a base whose fields are already distinct from one another.
 A comparison that read one field and reported the rest would satisfy
 any single example.
 
-## `fn a_runner_record_differs_in_the_field_that_moved_and_no_o…` › `assert_eq!(other.difference(&base), Some(field));`
+## `fn a_runner_record_differs_in_the_field_that_moved_and_no_other() {` › `assert_eq!(other.difference(&base), Some(field));`
 
 Symmetric: which side is the record and which the incarnation
 does not change what moved.
 
-## `fn the_first_difference_reported_is_the_most_structural_one…` › `let base = container_runner();`
+## `fn the_first_difference_reported_is_the_most_structural_one() {` › `let base = container_runner();`
 
 A record that changed kind has not merely moved its image, and
 telling an operator to check their tag when the run changed
 confinement boundary sends them to the wrong place.
 
-## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list…` › `let forwards = container_runner();`
+## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list() {` › `let forwards = container_runner();`
 
 Two incarnations that enumerated the same volumes in different
 orders established the same runner. A list here would refuse a
 resume for the order a directory listing came back in.
 
-## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list…` › `for changed in [`
+## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list() {` › `for changed in [`
 
 But the contents are compared exactly: an added agent, a removed
 one, and a renamed volume for the same agent are all differences.
 
-## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list…` › `let mut empty = container_runner();`
+## `fn a_credential_volume_set_is_a_set_and_not_an_ordered_list() {` › `let mut empty = container_runner();`
 
 An empty record and no record at all are different answers.
 
@@ -1695,7 +1695,7 @@ asked the mapping under test what it thought would move with it. A
 mapping that sent `host-v1` to `Container` would then refuse every host
 run while the grid derived the same wrong expectation and passed.
 
-## `fn each_runner_contract_belongs_to_the_kind_the_packet_give…` › `assert_eq!(RunnerContract::HostV1.kind(), RunnerKind::Host);`
+## `fn each_runner_contract_belongs_to_the_kind_the_packet_gives_it() {` › `assert_eq!(RunnerContract::HostV1.kind(), RunnerKind::Host);`
 
 `decisions.sequential_substrate.runner`: `host-v1` is the host
 contract and `container-v1` is the container one. Pinned against
@@ -1711,23 +1711,23 @@ grid whose only valid image has no digest never asks what a complete
 record with one does, so a rule that rejected every reported digest
 would pass it.
 
-## `fn runner_completeness_is_decided_over_every_kind_and_field…` › `let expected = if frozen_kind_of(contract) != kind {`
+## `fn runner_completeness_is_decided_over_every_kind_and_field_combination() {` › `let expected = if frozen_kind_of(contract) != kind {`
 
 The rule, restated from the design rather than read
 off the implementation.
 
-## `fn runner_completeness_is_decided_over_every_kind_and_field…` › `assert!(complete > 0 && complete < cells);`
+## `fn runner_completeness_is_decided_over_every_kind_and_field_combination() {` › `assert!(complete > 0 && complete < cells);`
 
 Non-vacuous in both directions, and specifically: a valid container
 record *with* a reported digest is among the accepted cells.
 
-## `fn a_missing_digest_is_a_complete_record_but_not_an_equal_o…` › `let mut without = container_runner();`
+## `fn a_missing_digest_is_a_complete_record_but_not_an_equal_one() {` › `let mut without = container_runner();`
 
 The digest is the manifest digest *when reported*, so a runtime that
 reports none still produces a re-establishable record. It is
 compared all the same: a record that gained or lost one changed.
 
-## `fn two_independently_built_identical_runners_are_the_same_r…` › `let pairs: Vec<(&str, RunnerPolicy, RunnerPolicy)> = vec![`
+## `fn two_independently_built_identical_runners_are_the_same_runner() {` › `let pairs: Vec<(&str, RunnerPolicy, RunnerPolicy)> = vec![`
 
 A2 refuses a resume on any `Some(field)`, so a comparator that
 reported a difference between a record and its own twin would refuse
@@ -1747,14 +1747,14 @@ packet's when-reported rule, and a shape a resume must accept twice.
 A container whose agents need no credentials. An empty map is a record;
 `None` is the absence of one, and the two are different answers.
 
-## `fn an_image_id_is_compared_byte_for_byte_in_both_directions…` › `let base_id = "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";`
+## `fn an_image_id_is_compared_byte_for_byte_in_both_directions() {` › `let base_id = "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";`
 
 INV-23 requires the re-established image id to equal the recorded one
 exactly. A mover that swaps the whole value proves only that the
 field is read at all; these change one thing each, and the ASCII-case
 pair is the one a normalizing comparison survives.
 
-## `fn a_credential_volume_name_is_compared_byte_for_byte_at_a_…` › `let base = "upstroke-creds-Zeta";`
+## `fn a_credential_volume_name_is_compared_byte_for_byte_at_a_fixed_key() {` › `let base = "upstroke-creds-Zeta";`
 
 INV-23 again, on the other side of the map. Every mover below keeps
 the keys, the cardinality and the pairing identical and changes one
@@ -1778,7 +1778,7 @@ declarations of the same facts in production, and a mutation that moves
 all three together is invisible to any test that compares them with each
 other. This is the fourth copy, and the only one that is not production.
 
-## `fn the_vocabulary_and_its_transaction_class_match_a_test_ow…` › `assert_eq!(`
+## `fn the_vocabulary_and_its_transaction_class_match_a_test_owned_frozen_table() {` › `assert_eq!(`
 
 Counting 21 and 3 is satisfied by swapping one member of each class,
 which is exactly the mutation that would make `run_finished` lenient
@@ -1791,7 +1791,7 @@ counted.
 The writer and the reader, composed
 ------------------------------------------------------------------
 
-## `fn the_run_started_this_module_writes_is_the_header_the_pro…` › `use crate::topology::schema::{`
+## `fn the_run_started_this_module_writes_is_the_header_the_probe_reads() {` › `use crate::topology::schema::{`
 
 The two halves of the seam, in one test, over bytes. Separate
 fixtures for the producer and the decoder let this module's writer
@@ -1799,12 +1799,12 @@ vocabulary and `schema::probe_header` drift apart while both stay
 green — and the first line of the log is exactly where that costs a
 reader the ability to choose a fold at all.
 
-## `fn the_run_started_this_module_writes_is_the_header_the_pro…` › `let torn = &bytes[..bytes.len() - 1];`
+## `fn the_run_started_this_module_writes_is_the_header_the_probe_reads() {` › `let torn = &bytes[..bytes.len() - 1];`
 
 Without the commit marker the very same bytes are not a header, so
 the composition is not accidentally reading past the line.
 
-## `fn the_run_header_records_each_resource_identity_in_its_own…` › `let plan = sample_plan();`
+## `fn the_run_header_records_each_resource_identity_in_its_own_slot() {` › `let plan = sample_plan();`
 
 `transaction_fault_matrix[0].durable_state` for a committed run:
 `run_started` records the integration ref, the base sha, the
@@ -1813,7 +1813,7 @@ the runner. Recovery compares each against the resource it is about
 to mutate, so two of them sharing a slot is two resources it can no
 longer tell apart.
 
-## `fn the_run_header_records_each_resource_identity_in_its_own…` › `let independent = [`
+## `fn the_run_header_records_each_resource_identity_in_its_own_slot() {` › `let independent = [`
 
 And the four the design does not derive from one another share no
 text at all: a fixture whose execution root contained its private
@@ -1839,14 +1839,14 @@ failed nothing.
 And through the event, so the carrier the vocabulary builds carries
 the key the payload names rather than the fixture's usual one.
 
-## `fn a_budget_stop_is_scoped_to_the_exact_epoch_that_hit_the_…` › `for epoch in [0, 1, 2, 3, 4, 7, 8, 15, 16, 255, 256, u32::MAX] {`
+## `fn a_budget_stop_is_scoped_to_the_exact_epoch_that_hit_the_ceiling() {` › `for epoch in [0, 1, 2, 3, 4, 7, 8, 15, 16, 255, 256, u32::MAX] {`
 
 Checking one epoch exactly and one other for inequality is satisfied
 by any projection that is injective on the pair tested — masking the
 low bits keeps `Epoch(2)` exact and `Epoch(3)` different. So every
 epoch is asserted exactly, across the bits a mask would drop.
 
-## `fn a_budget_stop_is_scoped_to_the_exact_epoch_that_hit_the_…` › `let event = BudgetExceeded4 {`
+## `fn a_budget_stop_is_scoped_to_the_exact_epoch_that_hit_the_ceiling() {` › `let event = BudgetExceeded4 {`
 
 The high-bit case said plainly: a mask to the low two bits sends
 epoch 4 to 0, and a stop attributed to epoch 0 is a stop a resume
@@ -1865,7 +1865,7 @@ future vocabulary as this one.
 merge_prepared relations that live inside one event (INV-09)
 ------------------------------------------------------------------
 
-## `fn the_commit_corpus_shares_no_run_a_comparison_could_key_o…` › `let corpus = [`
+## `fn the_commit_corpus_shares_no_run_a_comparison_could_key_on() {` › `let corpus = [`
 
 Every relation in the merge queue is an equality over a full sha,
 and the fixtures are what decide whether a *partial* comparison
@@ -1880,13 +1880,13 @@ everything but one interior byte with SHA_CANDIDATE, and is checked
 against it directly in `a_fast_publication_publishes_the_commit_that
 _was_judged`.
 
-## `fn merge_prepared_self_consistency_over_the_crossed_disposi…` › `let proposals = [`
+## `fn merge_prepared_self_consistency_over_the_crossed_disposition_grid() {` › `let proposals = [`
 
 Three proposals: the candidate's commit, the expected head, and a
 third sha belonging to neither. Sampling two of them would let a
 check compare against the wrong one and still pass.
 
-## `fn merge_prepared_self_consistency_over_the_crossed_disposi…` › `let candidates = [`
+## `fn merge_prepared_self_consistency_over_the_crossed_disposition_grid() {` › `let candidates = [`
 
 And three candidate commits, crossed independently of the proposal.
 INV-09's relation is `proposed_sha == the candidate's recorded
@@ -1896,7 +1896,7 @@ How distinct the three are is asserted in
 `the_commit_corpus_shares_no_run_a_comparison_could_key_on`, not
 claimed here.
 
-## `fn merge_prepared_self_consistency_over_the_crossed_disposi…` › `let cited_candidate =`
+## `fn merge_prepared_self_consistency_over_the_crossed_disposition_grid() {` › `let cited_candidate =`
 
 The rule as the design states it, restated here.
 
@@ -1917,11 +1917,11 @@ operator ever sees — would publish an object nobody judged.
 
 Symmetrically, with the candidate moved instead of the proposal.
 
-## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_…` › `let mut rebased = candidate_prepared();`
+## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_used() {` › `let mut rebased = candidate_prepared();`
 
 And the other direction: moving the base, not the parent.
 
-## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_…` › `let base = SHA_BASE;`
+## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_used() {` › `let base = SHA_BASE;`
 
 Full equality, not a prefix, a suffix or a length. Every pair below
 is unequal while agreeing everywhere a partial comparison would
@@ -1929,7 +1929,7 @@ look — and a commit parented somewhere other than its worktree base
 fast-forwards the integration ref onto history nobody judged, so the
 cheap comparison is the expensive bug.
 
-## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_…` › `let mut other = candidate_prepared();`
+## `fn a_candidate_commit_is_parented_on_the_base_its_worktree_used() {` › `let mut other = candidate_prepared();`
 
 And symmetrically, with the base moved instead of the parent.
 
@@ -1939,7 +1939,7 @@ And symmetrically, with the base moved instead of the parent.
 Halting
 ------------------------------------------------------------------
 
-## `fn exactly_two_carriers_can_halt_a_run_and_only_when_their_…` › `let halting = [`
+## `fn exactly_two_carriers_can_halt_a_run_and_only_when_their_policy_says_so() {` › `let halting = [`
 
 Every settlement and every answer, crossed against the carriers the
 design names. The near-misses are the point: an outage that parked,
@@ -1947,7 +1947,7 @@ a deferral, an interruption, a run-ending closure, and a terminal
 failure the run's policy does not halt on all look like the end of
 something and none of them ends the run.
 
-## `fn exactly_two_carriers_can_halt_a_run_and_only_when_their_…` › `for body in every_kind() {`
+## `fn exactly_two_carriers_can_halt_a_run_and_only_when_their_policy_says_so() {` › `for body in every_kind() {`
 
 And none of the ordinary vocabulary carries a halt either.
 
@@ -1957,7 +1957,7 @@ And none of the ordinary vocabulary carries a halt either.
 Answers and binding overrides
 ------------------------------------------------------------------
 
-## `fn an_answer_and_its_override_must_name_the_same_question_t…` › `let outer_keys = [3_u32, 4, 12];`
+## `fn an_answer_and_its_override_must_name_the_same_question_task_and_option() {` › `let outer_keys = [3_u32, 4, 12];`
 
 2^3 over the three identity fields, crossed against values chosen so
 that no cheaper relation than equality satisfies the grid: the
@@ -1967,12 +1967,12 @@ a prefix and a length, and the unequal options are 2/10 rather than
 2/1. A check that compared parity, a low bit, or a first character
 would otherwise pass every cell.
 
-## `fn an_answer_and_its_override_must_name_the_same_question_t…` › `for answer in [`
+## `fn an_answer_and_its_override_must_name_the_same_question_task_and_option() {` › `for answer in [`
 
 An answer without an override, and a decline, have nothing to
 disagree with.
 
-## `fn a_question_is_complete_only_when_it_can_actually_be_answ…` › `let mut one_option = complete;`
+## `fn a_question_is_complete_only_when_it_can_actually_be_answered() {` › `let mut one_option = complete;`
 
 A single option is enough; the bar is answerable, not plural.
 
@@ -1982,7 +1982,7 @@ A single option is enough; the bar is answerable, not plural.
 Verification outages
 ------------------------------------------------------------------
 
-## `fn every_infrastructure_kind_is_distinguishable_on_the_wire…` › `let kinds = [`
+## `fn every_infrastructure_kind_is_distinguishable_on_the_wire() {` › `let kinds = [`
 
 Including the open-ended one: an outage nobody enumerated must still
 be recordable as itself rather than collapsing into a neighbour.
@@ -1993,7 +1993,7 @@ be recordable as itself rather than collapsing into a neighbour.
 Generation closure
 ------------------------------------------------------------------
 
-## `fn every_close_reason_is_distinguishable_including_each_run…` › `let tags = [`
+## `fn every_close_reason_is_distinguishable_including_each_run_ending_outcome() {` › `let tags = [`
 
 The exact tags, not merely six distinct strings: a renamed reason
 round-trips and stays distinct while no longer matching a log
@@ -2005,133 +2005,133 @@ already written, and the run-ending reason must name its outcome.
 Routing, restored as a function
 ------------------------------------------------------------------
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `let expected_keys: Vec<Option<u32>> = vec![`
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `let expected_keys: Vec<Option<u32>> = vec![`
 
 The legacy envelope hoisted these; schema 4 derives them. Stated as
 a table over the whole vocabulary so a kind that quietly answers
 `None` is visible rather than convenient.
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 run_started
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 run_resumed
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(9),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(9),` (trailing)
 
 task_spawned
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(5),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(5),` (trailing)
 
 task_dispatched
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(5),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(5),` (trailing)
 
 attempt_started
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(5),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(5),` (trailing)
 
 attempt_finished
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(7),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(7),` (trailing)
 
 attempt_interrupted
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 generation_closed
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 defer_wait_elapsed
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(2),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(2),` (trailing)
 
 candidate_prepared
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(2),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(2),` (trailing)
 
 task_candidate_created
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(2),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(2),` (trailing)
 
 merge_verification_started
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 merge_verification_unavailable
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 merge_verification_interrupted
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(2),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(2),` (trailing)
 
 merge_prepared
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(2),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(2),` (trailing)
 
 merge_rejected
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 task_merged
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(3),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(3),` (trailing)
 
 question_raised
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(3),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(3),` (trailing)
 
 question_answered
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(4),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(4),` (trailing)
 
 budget_exceeded
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 run_finished
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 capacity_snapshot
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 pool_exhausted
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `None,` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `None,` (trailing)
 
 design_defect
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 merge_verification_started
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 merge_verification_unavailable
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 merge_verification_interrupted
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 merge_prepared
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(8),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(8),` (trailing)
 
 merge_rejected
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `Some(6),` (trailing)
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `Some(6),` (trailing)
 
 task_merged
 
-## `fn the_task_and_sequence_are_recoverable_from_every_event_t…` › `assert_ne!(expected_keys[2], expected_keys[3]);`
+## `fn the_task_and_sequence_are_recoverable_from_every_event_that_has_one() {` › `assert_ne!(expected_keys[2], expected_keys[3]);`
 
 A key that differs from the one the surrounding fixture uses, so an
 accessor reading the wrong field of the right event is caught.
@@ -2142,15 +2142,15 @@ accessor reading the wrong field of the right event is caught.
 Bindings
 ------------------------------------------------------------------
 
-## `fn a_binding_is_compared_against_both_authorities_field_by_…` › `let movers: Vec<NamedBindingMove> = vec![`
+## `fn a_binding_is_compared_against_both_authorities_field_by_field() {` › `let movers: Vec<NamedBindingMove> = vec![`
 
 Each field moved on its own.
 
-## `fn a_binding_is_compared_against_both_authorities_field_by_…` › `assert!(!frozen.matches_frozen(&rung, Effort::Low));`
+## `fn a_binding_is_compared_against_both_authorities_field_by_field() {` › `assert!(!frozen.matches_frozen(&rung, Effort::Low));`
 
 And the effort argument itself is part of the comparison.
 
-## `fn a_binding_is_compared_against_both_authorities_field_by_…` › `for pinned in [true, false] {`
+## `fn a_binding_is_compared_against_both_authorities_field_by_field() {` › `for pinned in [true, false] {`
 
 The pin is crossed rather than sampled. A frozen rung the plan
 pinned and one the run resolved are two different authorities even
@@ -2158,12 +2158,12 @@ when tier, agent and model agree, so a binding recorded against one
 must not match the other — in *both* directions, which one fixture at
 `pinned: true` cannot show.
 
-## `fn a_binding_is_compared_against_both_authorities_field_by_…` › `let binding = BindingOverride {`
+## `fn a_binding_is_compared_against_both_authorities_field_by_field() {` › `let binding = BindingOverride {`
 
 The override comparison ignores tier and nothing else: the option
 list an override chooses from is agents, not tiers.
 
-## `fn a_binding_is_compared_against_both_authorities_field_by_…` › `for pinned in [true, false] {`
+## `fn a_binding_is_compared_against_both_authorities_field_by_field() {` › `for pinned in [true, false] {`
 
 The pin is ignored for the same reason the tier is, and for both of
 its values: `BindingOverride` records neither, so comparing either
@@ -2175,7 +2175,7 @@ would refuse a validated one-off binding rather than check it.
 The run record
 ------------------------------------------------------------------
 
-## `fn a_topology_run_record_projects_to_the_registry_derivatio…` › `let plan = sample_plan();`
+## `fn a_topology_run_record_projects_to_the_registry_derivation_intact() {` › `let plan = sample_plan();`
 
 The registry is the oracle: it refuses a run record that does not
 describe the same run as the plan, and it refuses one that is
@@ -2183,12 +2183,12 @@ incomplete. A projection that dropped or defaulted a field it needs
 is therefore not a field comparison away from being caught — it
 fails to build a registry at all, or builds a different one.
 
-## `fn a_topology_run_record_projects_to_the_registry_derivatio…` › `let mut elsewhere = run_started(&plan);`
+## `fn a_topology_run_record_projects_to_the_registry_derivation_intact() {` › `let mut elsewhere = run_started(&plan);`
 
 And the derivation actually read the projected values: the digest
 moves when the record does.
 
-## `fn a_topology_run_record_leaves_nothing_the_registry_would_…` › `let plan = sample_plan();`
+## `fn a_topology_run_record_leaves_nothing_the_registry_would_call_incomplete() {` › `let plan = sample_plan();`
 
 Schema 4 has no ancestors, so the fields schemas 1–3 made optional
 for the sake of older logs are required here — and the projection
@@ -2235,71 +2235,71 @@ shape, and their keys are already pinned by the schema-1..3 suite that
 reads them. What is written out by hand here is exactly what schema 4
 froze, which is exactly what this slice owns.
 
-## `fn every_event_decodes_from_its_independently_written_paylo…` › `for (body, canonical) in every_kind().iter().zip(canonical_events()) {`
+## `fn every_event_decodes_from_its_independently_written_payload() {` › `for (body, canonical) in every_kind().iter().zip(canonical_events()) {`
 
 The other direction, and the one a replay actually performs: bytes a
 conforming writer produced, read by this decoder. A rename that
 moved encoder and decoder together passes the round trip and fails
 here.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `let paths = PathSet::Prefixes {`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `let paths = PathSet::Prefixes {`
 
 `bounded_census.event_payload_classes`: every nested payload class,
 including the variants no fixture in `every_kind` instantiates.
 Sampling one arm of an enum leaves the other free to be renamed.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(&RunnerKind::Host, serde_json::json!("host"));`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(&RunnerKind::Host, serde_json::json!("host"));`
 
 Runner identity (INV-23): the kebab-case contract spellings are
 durable identity, and `host-v1` is the arm no event fixture uses.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Spawn admission: all three arms.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Lease grants: both, including the repair arm nothing else builds.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Settlement transitions: every arm, including `retry`, whose tag no
 other test reads off the wire.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Attempt settlement and lease disposition: the frozen vocabulary.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(&Materialization::Clean, serde_json::json!("clean"));`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(&Materialization::Clean, serde_json::json!("clean"));`
 
 Every repair materialization, including the three no fixture uses.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Generation closure.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Candidate and rejection lease effects: both arms of each.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Verification bases, sources, verdicts, and both rejection forms.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Outages: every enumerated kind and the open-ended one.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Merge lease release: both arms.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 Answers: both arms, and the override whose authoritative slot is a
 key rather than a task label.
 
-## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fie…` › `pinned(`
+## `fn every_nested_variant_is_pinned_to_its_frozen_tag_and_fields() {` › `pinned(`
 
 The run's frozen ceilings, and the region vocabulary.
 

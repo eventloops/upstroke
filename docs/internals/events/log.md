@@ -2,9 +2,9 @@
 
 Extended notes for [`src/events/log.rs`](../../../src/events/log.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -483,7 +483,7 @@ non-durable and refuses the write command resumably".
 
 "and its directory after a truncation changed the length".
 
-## `impl EventLog` › `pub fn append(&mut self, site: EventSite, body: EventBody) -> Result<Event, UpstrokeError…`
+## `impl EventLog` › `pub fn append(&mut self, site: EventSite, body: EventBody) -> Result<Event, UpstrokeError> {`
 
 Append one schema-1..3 event and get it back **as it will be read back**.
 
@@ -922,13 +922,13 @@ the boundary goes first, then the length, then the bytes.
 (5). Exactly those bytes. `reread` is moved into the result afterwards, so
 there is no third read to accidentally take.
 
-## `pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeEr…`
+## `pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeError> {`
 
 ---------------------------------------------------------------------------
 Readers
 ---------------------------------------------------------------------------
 
-## `pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeEr…`
+## `pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeError> {`
 
 Read a whole log.
 
@@ -961,7 +961,7 @@ A parsed whole-log snapshot. The only recoverable parse condition is typed
 separately from the events so callers never have to infer its meaning from
 human-readable warning text.
 
-## `pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Res…` › `let committed_end = bytes`
+## `pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, UpstrokeError> {` › `let committed_end = bytes`
 
 EventLog::append writes the newline after the JSON bytes. EventLog::open
 likewise discards everything after the last newline before resuming, so
@@ -990,7 +990,7 @@ Every complete line written since the last poll.
 [`UpstrokeError::Io`] if the log cannot be read; [`UpstrokeError::EventLog`]
 for a rewritten log.
 
-## `pub fn poll(&mut self, warnings: &mut Vec<String>) -> Resul…` › `if length < self.offset {`
+## `pub fn poll(&mut self, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeError> {` › `if length < self.offset {`
 
 Truncated or replaced underneath us: start over rather than
 read from an offset that now means something else.

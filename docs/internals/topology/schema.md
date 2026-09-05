@@ -2,9 +2,9 @@
 
 Extended notes for [`src/topology/schema.rs`](../../../src/topology/schema.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The source defines behavior; these notes hold the module's contracts and rationale.
+Each code span in a section heading is an exact source fragment. Search it as a fixed string
+in the linked module, using the enclosing item to distinguish repeated lines.
 
 ## Module
 
@@ -178,13 +178,13 @@ reason the *fold* is entitled to state precisely, having read the file.
 envelope, [`SchemaRefusal::RunStartedNotFirst`] when it is some other
 event, and [`SchemaRefusal::HeaderWithoutSchema`] when it records no schema.
 
-## `pub fn probe_header(bytes: &[u8]) -> Result<LogHeader, Sche…` › `let end = bytes`
+## `pub fn probe_header(bytes: &[u8]) -> Result<LogHeader, SchemaRefusal> {` › `let end = bytes`
 
 The newline is the commit marker (see `crate::events::parse_bytes`): a
 syntactically complete first line without one was never committed, so
 there is no header to read even though the bytes look like one.
 
-## `pub fn select_for_schema(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefu…`
+## `pub fn select_for_schema(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefusal> {`
 
 Which reader a log written in `schema` gets from a binary whose ceiling is
 `ceiling`.
@@ -199,14 +199,14 @@ the post-activation ceiling be exercised without moving production's.
 not activated for, and [`SchemaRefusal::NewerThanReadable`] for anything
 above the topology schema.
 
-## `pub fn select_for_schema(schema: u32, ceiling: u32) -> Resu…` › `if schema == TOPOLOGY_SCHEMA {`
+## `pub fn select_for_schema(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefusal> {` › `if schema == TOPOLOGY_SCHEMA {`
 
 Two refusals, because they are two different situations for the
 person reading them: one is fixed by upgrading upstroke, the other by
 upgrading upstroke *and* knowing that this log will never be a legacy
 run no matter what reads it.
 
-## `pub fn select_reader_with(bytes: &[u8], ceiling: u32) -> Result<ReaderSelection, SchemaRe…`
+## `pub fn select_reader_with(bytes: &[u8], ceiling: u32) -> Result<ReaderSelection, SchemaRefusal> {`
 
 Probe `bytes` and choose a reader against an explicit `ceiling`.
 
@@ -291,7 +291,7 @@ and for "above the ceiling", and says nothing about a binary claiming
 to read schema 9, so a test asserting one would freeze an answer the
 frozen design does not give.
 
-## `mod tests` › `fn expected_selection(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefusal…`
+## `mod tests` › `fn expected_selection(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefusal> {`
 
 The reader-selection rule as the design states it, restated here and
 never read off the implementation.
@@ -306,17 +306,17 @@ looked past line 1 would find this and be believed.
 
 -- constants ---------------------------------------------------------
 
-## `fn max_readable_is_the_activation_switch_and_production_is_…` › `assert_eq!(`
+## `fn max_readable_is_the_activation_switch_and_production_is_inactive() {` › `assert_eq!(`
 
 The ceiling is not a number this crate writes down twice: it is the
 activation, evaluated. A mutation that hard-codes either side of the
 switch is what these four assertions exist to catch.
 
-## `fn max_readable_is_the_activation_switch_and_production_is_…` › `assert_eq!(MAX_READABLE_SCHEMA, 3);`
+## `fn max_readable_is_the_activation_switch_and_production_is_inactive() {` › `assert_eq!(MAX_READABLE_SCHEMA, 3);`
 
 The slice's stated invariant, said in the plainest possible way.
 
-## `fn fresh_writer_schema_maps_each_selector_to_a_different_mo…` › `assert!(fresh_writer_schema(WriterSelector::Production) <= MAX_READABLE_SCHEMA);`
+## `fn fresh_writer_schema_maps_each_selector_to_a_different_model() {` › `assert!(fresh_writer_schema(WriterSelector::Production) <= MAX_READABLE_SCHEMA);`
 
 Production never writes something production cannot read back.
 
@@ -324,7 +324,7 @@ Production never writes something production cannot read back.
 
 -- reader selection --------------------------------------------------
 
-## `fn reader_selection_is_a_relation_over_every_ceiling_and_sc…` › `for ceiling in [LATEST_LEGACY_SCHEMA, TOPOLOGY_SCHEMA] {`
+## `fn reader_selection_is_a_relation_over_every_ceiling_and_schema() {` › `for ceiling in [LATEST_LEGACY_SCHEMA, TOPOLOGY_SCHEMA] {`
 
 Crossed grid, not samples: a lookup table keyed on a handful of
 pairs satisfies any finite set of examples, so the expectation here
@@ -336,7 +336,7 @@ topology refusal is a different refusal from the generic one.
 
 -- header probe ------------------------------------------------------
 
-## `fn a_first_line_is_a_header_only_once_its_newline_commits_i…` › `let line = header_line(RUN_STARTED, Some(2));`
+## `fn a_first_line_is_a_header_only_once_its_newline_commits_it() {` › `let line = header_line(RUN_STARTED, Some(2));`
 
 The two inputs differ in exactly one byte. Anything that reads the
 header from an uncommitted line passes the first assertion, so the
@@ -352,7 +352,7 @@ would accept a log whose real header had been prefixed away.
 
 And the converse: damage after line 1 is not the probe's business.
 
-## `fn a_committed_first_line_that_is_not_an_event_is_a_rewritt…` › `assert!(matches!(`
+## `fn a_committed_first_line_that_is_not_an_event_is_a_rewritten_log() {` › `assert!(matches!(`
 
 Invalid UTF-8 inside the committed first line, not after it.
 
@@ -360,7 +360,7 @@ Invalid UTF-8 inside the committed first line, not after it.
 
 -- refusal messages --------------------------------------------------
 
-## `fn the_topology_refusal_is_a_different_message_from_the_gen…` › `let topology = SchemaRefusal::TopologyLogUnreadable {`
+## `fn the_topology_refusal_is_a_different_message_from_the_generic_newer_one() {` › `let topology = SchemaRefusal::TopologyLogUnreadable {`
 
 The ceiling here is deliberately not production's, so a message that
 renders a hard-coded 3 rather than the ceiling it was given fails.
@@ -386,7 +386,7 @@ topology is refused, and it is refused from every rung.
 The relations over the whole wire domain, not a sample of it
 ==================================================================
 
-## `fn reader_selection_holds_across_every_partition_and_intege…` › `let mut cells = 0_u32;`
+## `fn reader_selection_holds_across_every_partition_and_integer_boundary() {` › `let mut cells = 0_u32;`
 
 The grid above stops at 6, which is a range a `schema <= 6` cap
 satisfies exactly and a `(schema as u8) > (ceiling as u8)`
@@ -394,29 +394,29 @@ narrowing never contradicts. This one crosses the partitions the
 relation distinguishes against the boundaries of every integer
 width the value could be narrowed to, including the top of u32.
 
-## `fn reader_selection_holds_across_every_partition_and_intege…` › `assert_eq!(`
+## `fn reader_selection_holds_across_every_partition_and_integer_boundary() {` › `assert_eq!(`
 
 Named singly as well, so the intent survives a change to the lists.
 
-## `fn no_upgrade_reaches_any_destination_at_or_above_the_topol…` › `let froms: [u32; 9] = [0, 1, 2, 3, 4, 5, 255, 256, u32::MAX];`
+## `fn no_upgrade_reaches_any_destination_at_or_above_the_topology_schema() {` › `let froms: [u32; 9] = [0, 1, 2, 3, 4, 5, 255, 256, u32::MAX];`
 
 The destination rule is unbounded above. A grid that stops at 6 is
 satisfied by `(TOPOLOGY_SCHEMA..=6).contains(&to)` and by an
 `as u8` narrowing of the same comparison; both are wrong for a log
 recording an upgrade into a schema nobody has written yet.
 
-## `fn the_production_wrapper_refuses_every_future_schema_its_i…` › `for schema in HOSTILE_SCHEMAS {`
+## `fn the_production_wrapper_refuses_every_future_schema_its_inner_selector_refuses() {` › `for schema in HOSTILE_SCHEMAS {`
 
 `select_reader` is what production calls, and a wrapper that
 short-circuits before delegating passes every test of the function
 it is supposed to be a composition of. Asserted as an identity over
 committed bytes rather than as a sample of outcomes.
 
-## `fn the_production_wrapper_refuses_every_future_schema_its_i…` › `assert_eq!(`
+## `fn the_production_wrapper_refuses_every_future_schema_its_inner_selector_refuses() {` › `assert_eq!(`
 
 The two cases the wrapper is most tempting to special-case.
 
-## `fn a_future_schema_survives_the_probe_at_its_recorded_width…` › `for schema in [5_u32, 6, 7, 9, 255, 256, 257, 259, 65_536, u32::MAX] {`
+## `fn a_future_schema_survives_the_probe_at_its_recorded_width() {` › `for schema in [5_u32, 6, 7, 9, 255, 256, 257, 259, 65_536, u32::MAX] {`
 
 The probe's own integer type is a place the value can be lost: a
 `u8` field cannot represent 256, and a header that cannot be
@@ -431,7 +431,7 @@ decoder's, not the caller's.
 The commit marker
 ==================================================================
 
-## `fn the_line_feed_is_the_only_byte_that_commits_a_first_line…` › `let line = header_line(RUN_STARTED, Some(2));`
+## `fn the_line_feed_is_the_only_byte_that_commits_a_first_line() {` › `let line = header_line(RUN_STARTED, Some(2));`
 
 The existing pair proves LF-present against no-suffix, which any
 "stop at the first line-ending byte" rule also satisfies. Crossing
@@ -439,23 +439,23 @@ the same header over all 256 one-byte suffixes is what separates
 "the newline commits" from "some terminator commits": a CR-only
 suffix is a torn write on Windows and must record nothing.
 
-## `fn the_line_feed_is_the_only_byte_that_commits_a_first_line…` › `let mut crlf = line.clone().into_bytes();`
+## `fn the_line_feed_is_the_only_byte_that_commits_a_first_line() {` › `let mut crlf = line.clone().into_bytes();`
 
 CRLF is committed, because it contains the newline: the CR is
 trailing whitespace inside the committed line, not a terminator.
 
-## `fn commitment_depends_on_the_newline_and_on_nothing_the_hea…` › `for schema in [`
+## `fn commitment_depends_on_the_newline_and_on_nothing_the_header_says() {` › `for schema in [`
 
 The torn-write rule is exercised at one schema only, which a
 schema-dependent exception at the 3/4 boundary survives. The same
 bytes, differing in the commit marker alone, at every schema class.
 
-## `fn commitment_depends_on_the_newline_and_on_nothing_the_hea…` › `assert_eq!(`
+## `fn commitment_depends_on_the_newline_and_on_nothing_the_header_says() {` › `assert_eq!(`
 
 And through the composite entry point, where a torn line must
 outrank whatever its bytes claim about the schema.
 
-## `fn a_committed_header_outranks_every_kind_of_damage_after_i…` › `let head = committed(RUN_STARTED, Some(5));`
+## `fn a_committed_header_outranks_every_kind_of_damage_after_it() {` › `let head = committed(RUN_STARTED, Some(5));`
 
 The converse of the torn-first-line rule, at the composite entry
 point: line 1 is committed and above the ceiling, so the refusal is
@@ -463,7 +463,7 @@ fixed before anything later is looked at. A selector that inspected
 the tail would report "nothing committed" for a log whose first line
 records exactly what is wrong with it.
 
-## `fn a_committed_header_outranks_every_kind_of_damage_after_i…` › `for schema in [1_u32, 5, 9, u32::MAX] {`
+## `fn a_committed_header_outranks_every_kind_of_damage_after_it() {` › `for schema in [1_u32, 5, 9, u32::MAX] {`
 
 And the mirror: an uncommitted first line stays uncommitted however
 newsworthy its bytes are.
@@ -494,7 +494,7 @@ The one case a suffix is allowed not to change: an accepted header
 ignores everything after it. Stated so the assertions above cannot
 be satisfied by refusing every multi-line log.
 
-## `fn a_schema_read_out_of_invalid_committed_bytes_is_not_a_he…` › `let damaged: [&[u8]; 4] = [`
+## `fn a_schema_read_out_of_invalid_committed_bytes_is_not_a_header() {` › `let damaged: [&[u8]; 4] = [`
 
 A committed first line that will not parse is a rewritten log,
 whatever recognizable text it contains. Scanning it for a `schema`
@@ -526,13 +526,13 @@ Near misses, not an unrelated tag: a case-normalizing or trimming
 comparison accepts a header no writer of this project ever wrote,
 and `found` is what tells the operator which one they have.
 
-## `fn a_non_run_started_first_line_refuses_whatever_schema_it_…` › `for schema in [`
+## `fn a_non_run_started_first_line_refuses_whatever_schema_it_carries() {` › `for schema in [`
 
 The existing case correlates the wrong tag with an absent schema, so
 a guard that refused only schema-less non-headers passes it. The tag
 is decided before the schema is read, at every schema class.
 
-## `fn a_first_line_that_is_not_an_event_envelope_is_unreadable…` › `let not_envelopes: [&[u8]; 9] = [`
+## `fn a_first_line_that_is_not_an_event_envelope_is_unreadable_rather_than_wrong_tagged() {` › `let not_envelopes: [&[u8]; 9] = [`
 
 `refusals` distinguishes a log that begins with the wrong event from
 a committed line that is not a valid event at all, and they carry
@@ -546,14 +546,14 @@ rewritten log as a header with an empty tag.
 Refusal messages: the numbers keep their roles
 ==================================================================
 
-## `fn the_newer_schema_diagnostics_bind_each_number_to_its_rol…` › `for (schema, ceiling) in [(9_u32, 7_u32), (5, 3), (4, 2), (256, 255), (u32::MAX, 0)] {`
+## `fn the_newer_schema_diagnostics_bind_each_number_to_its_role() {` › `for (schema, ceiling) in [(9_u32, 7_u32), (5, 3), (4, 2), (256, 255), (u32::MAX, 0)] {`
 
 Asserting that both numerals appear proves nothing about which is
 which, and a diagnostic that swaps them tells the operator their
 binary reads a schema newer than the log — the opposite of why it
 refused, and an instruction to do nothing.
 
-## `fn the_no_upgrade_refusal_never_advises_the_upgrade_it_refu…` › `for (from, to) in [(3_u32, TOPOLOGY_SCHEMA), (1, 4), (2, 9), (0, u32::MAX)] {`
+## `fn the_no_upgrade_refusal_never_advises_the_upgrade_it_refuses() {` › `for (from, to) in [(3_u32, TOPOLOGY_SCHEMA), (1, 4), (2, 9), (0, u32::MAX)] {`
 
 The packet does not freeze this sentence and this test does not
 pretend it does. What it does fix is the one thing the remediation
@@ -567,7 +567,7 @@ produces is a schema-3 log reinterpreted as a topology one.
 Activation
 ==================================================================
 
-## `fn the_activation_constant_is_asserted_outside_the_test_con…` › `const { assert!(matches!(TOPOLOGY_ACTIVATION, TopologyActivation::Inactive)) };`
+## `fn the_activation_constant_is_asserted_outside_the_test_configuration() {` › `const { assert!(matches!(TOPOLOGY_ACTIVATION, TopologyActivation::Inactive)) };`
 
 The four `const _` assertions beside `MAX_READABLE_SCHEMA` are the
 load-bearing ones: they are evaluated in the ordinary build, so an
