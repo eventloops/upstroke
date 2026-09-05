@@ -39,4 +39,7 @@ The comparison is the parent's, and the fix changes what "differs" means for the
 Compare values, not text: parse both texts as `toml::Table` (the parent already parses the existing
 file for `operator_keys`) and compare the tables. Comment-only differences fall out of the parse;
 an existing file that does not parse is a conflict, which is what it is. `strip_comment` and its
-quote tracking can then go.
+string tracking can then go — since PR #168's pass 1 it understands basic-string escapes and
+literal strings, because the renderer now writes escaped keys and a `\"` read as a closing quote
+made two headers differing after a `#` compare equal, the false-equality half of this class; that
+half is closed, the spelling-sensitivity half above is not.
