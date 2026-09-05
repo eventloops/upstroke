@@ -29,7 +29,8 @@ exclude = [
     ".upstroke/",
     ".testagent/",
     "acceptance/",
-    "docs/",
+    "docs/index.html",
+    "docs/CNAME",
     "scripts/",
 ]
 
