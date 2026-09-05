@@ -2,9 +2,14 @@
 
 Extended notes for [`src/util.rs`](../../src/util.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. This file preserves the migrated prose. Each section
+names the source item and, where needed, the line its comment described. Each code snippet in a
+heading is a literal source lookup string.
+
+The source retains the allowlist-placement marker above its governed lint allowance. In
+`windows_fsync_dir`, it also retains the read/write/delete sharing protocol and the three
+`SAFETY:` comments for opening, flushing and closing the directory handle. Lint reason strings
+stay in their attributes.
 
 ## Module
 
@@ -369,7 +374,7 @@ same code path with a mask that is *not* enough and show which half refuses.
 
 [`fsync_dir`]'s Windows body, over any access mask.
 
-## `fn windows_fsync_dir(dir: &Path, access: u32) -> std::io::R…` › `let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();`
+## `fn windows_fsync_dir(dir: &Path, access: u32) -> std::io::Result<()> {` › `let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();`
 
 `CreateFileW` takes a NUL-terminated UTF-16 string, and an interior NUL
 would silently truncate the path — so it is refused rather than trimmed.

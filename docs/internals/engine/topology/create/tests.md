@@ -84,7 +84,7 @@ The append funnel, armed and recording — including
 `written_kill_shape`, without which `WrittenShape::Torn` is unreachable
 and no torn first line can be produced at all.
 
-## `impl EventHooks for ArmedEvents` › `fn point(&mut self, site: EventSite, point: SubEffectPoint, mode: InjectionMode) -> Injec…`
+## `impl EventHooks for ArmedEvents` › `fn point(&mut self, site: EventSite, point: SubEffectPoint, mode: InjectionMode) -> Injection {`
 
 Straight to the shared harness: `EventSite`'s points are the ones
 `HookHarness::arm` accepts, so the injection *and* the coverage
@@ -92,7 +92,7 @@ record come from the same place. Only the two phases of a `RunDir`
 or `Lock` site need the module-local table, because `arm` takes no
 phase.
 
-## `fn point(&mut self, site: EventSite, point: SubEffectPoint,…` › `harness`
+## `fn point(&mut self, site: EventSite, point: SubEffectPoint, mode: InjectionMode) -> Injection {` › `harness`
 
 Armed in the shared harness at the moment it becomes due, so
 the injection and the coverage record still come from one
@@ -325,11 +325,11 @@ marker's digest (P1), `owner.json.runner` (P3b), the probes' boundary
 against the witness rather than against each other, so a stamp that took
 the *caller's* value would agree with itself and fail here.
 
-## `fn run_started_records_runner_policy_resolved_before_worktr…` › `driver.runner = container_policy();`
+## `fn run_started_records_runner_policy_resolved_before_worktree_lock() {` › `driver.runner = container_policy();`
 
 What the caller claims, and what pre-flight actually resolved, differ.
 
-## `fn run_started_records_runner_policy_resolved_before_worktr…` › `hooks.faults().arm_phase(`
+## `fn run_started_records_runner_policy_resolved_before_worktree_lock() {` › `hooks.faults().arm_phase(`
 
 The marker is read before P7 removes it, so the run is stopped at P6.
 
@@ -361,11 +361,11 @@ permanently: the only production `read_dir` over a runs root is
 is reachable only through the marker inside the public husk. The second
 half of this test is that assertion.
 
-## `fn creator_error_at_p3a_retains_both_halves_and_reports_the…` › `(`
+## `fn creator_error_at_p3a_retains_both_halves_and_reports_them() {` › `(`
 
 The staging file never landed: an empty private half, and P3a.
 
-## `fn creator_error_at_p3a_retains_both_halves_and_reports_the…` › `(`
+## `fn creator_error_at_p3a_retains_both_halves_and_reports_them() {` › `(`
 
 The **same site**, failing after its primitive — which is what a
 failing fsync inside `stage_json` leaves, because it creates the
@@ -374,7 +374,7 @@ so the prefix the operator is given has to be P3a (staged): a private
 half holding a staging file is retained and is **not** content-free,
 and the two are separate names for exactly that reason.
 
-## `fn creator_error_at_p3a_retains_both_halves_and_reports_the…` › `let husk = fixture.husk();`
+## `fn creator_error_at_p3a_retains_both_halves_and_reports_them() {` › `let husk = fixture.husk();`
 
 And the census reaches the same answer, which is the convergence
 property: a kill here and an error here leave one shape.
@@ -414,7 +414,7 @@ And the shell probe goes first: a machine whose shell does not run
 A `PublishCommitRecord` error whose rename **never landed**: the stat
 says absent, so both halves go.
 
-## `fn commit_record_rename_error_with_record_absent_removes_bo…` › `hooks.faults().arm_phase(`
+## `fn commit_record_rename_error_with_record_absent_removes_both_halves() {` › `hooks.faults().arm_phase(`
 
 `Before`: the funnel returns `Err` without performing the rename.
 
@@ -428,7 +428,7 @@ This is the error-return mode's whole point — the funnel returns `Err`
 by a stat rather than by the error, which is the identical value on both
 sides of the rename.
 
-## `fn creator_error_after_commit_record_present_removes_nothing_and_reports_possibly_committ…`
+## `fn creator_error_after_commit_record_present_removes_nothing_and_reports_possibly_committed() {`
 
 The same crossing, reported: a retained, possibly committed husk that the
 census classifies identically and the deferred prune is the only path to.
@@ -477,20 +477,20 @@ leaves the byte-for-byte shape a partial `remove_dir_all` leaves. The claim
 under test is what the **next census** does with that shape, and the census
 reads the disk, not the history.
 
-## `fn a_failed_private_half_removal_keeps_the_public_half_that…` › `hooks`
+## `fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {` › `hooks`
 
 P5: past the owner record, so the proof holds and the creator is
 entitled to remove both halves, and before the deletion boundary, so
 it is required to.
 
-## `fn a_failed_private_half_removal_keeps_the_public_half_that…` › `let Disposition::PrivateHalfRemovalFailed {`
+## `fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {` › `let Disposition::PrivateHalfRemovalFailed {`
 
 The report says what happened, not a condition nobody observed. The
 owner record is present on the surviving-half window — the proof that
 minted the spent token read it — so `OwnerRecordMissing` was a false
 statement about the tree and not merely an imprecise one.
 
-## `fn a_failed_private_half_removal_keeps_the_public_half_that…` › `assert!(`
+## `fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {` › `assert!(`
 
 The three questions, and the point of there being three. A failed
 removal completed nothing, so `removed_anything` is `false` — the same
@@ -500,12 +500,12 @@ the error. Answering `removed_anything` `true` here made this arm
 indistinguishable from `PublicHalfRemoved`, whose public half is gone
 and whose private half never existed.
 
-## `fn a_failed_private_half_removal_keeps_the_public_half_that…` › `if plant_partial {`
+## `fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {` › `if plant_partial {`
 
 The third window: every child gone, the directory not. Planted here
 rather than injected, for the reason the doc comment gives.
 
-## `fn a_failed_private_half_removal_keeps_the_public_half_that…` › `assert_eq!(`
+## `fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {` › `assert_eq!(`
 
 And all three shapes are ones a later pass finishes: the first two by
 reclaiming, the third by retaining and reporting for the deferred
@@ -524,19 +524,19 @@ survives carrying a marker whose target is absent, and the next census
 reclaims it public-only. Nothing is orphaned in either — the public half
 needs no proof and no locator.
 
-## `fn a_failed_public_half_removal_is_best_effort_and_converge…` › `assert!(`
+## `fn a_failed_public_half_removal_is_best_effort_and_converges() {` › `assert!(`
 
 Best-effort: the operator is given the error that stopped the run,
 not the one the cleanup hit on the way out.
 
-## `fn a_failed_public_half_removal_is_best_effort_and_converge…` › `let enumerated = crate::rundir::run_dir_names(&fixture.repo);`
+## `fn a_failed_public_half_removal_is_best_effort_and_converges() {` › `let enumerated = crate::rundir::run_dir_names(&fixture.repo);`
 
 `run_dir_names`, not `list_runs`: the survivor is a husk, and
 `list_runs` answers only for committed runs. `run_dir_names` is the
 enumeration the census walks, so it is the one that says whether the
 next census can still see this directory.
 
-## `fn a_failed_public_half_removal_is_best_effort_and_converge…` › `assert_eq!(`
+## `fn a_failed_public_half_removal_is_best_effort_and_converges() {` › `assert_eq!(`
 
 The survivor needs no proof and no locator: its marker names a
 private half that is no longer there.
@@ -569,7 +569,7 @@ run can be created at such a path in the first place, so there is no
 shape and is neither portable nor available: `set_permissions` is on the
 effect denylist, in tests too.
 
-## `fn a_commit_record_stat_that_cannot_answer_retains_both_hal…` › `assert!(`
+## `fn a_commit_record_stat_that_cannot_answer_retains_both_halves_and_releases_the_lock() {` › `assert!(`
 
 The fixture's own precondition, asserted rather than assumed: an interior
 NUL is rejected by `std` before either platform reaches the filesystem —
@@ -613,12 +613,12 @@ ledgers apart: an empty one balances too. This is the discriminating half —
 the pair the request holds carries an unsettled registration, so a check
 reading any other would report the run clean and this assertion would fail.
 
-## `fn a_leaked_probe_registration_is_reported_by_the_append_er…` › `let probes = RecordingProbes::new(&host_digest());`
+## `fn a_leaked_probe_registration_is_reported_by_the_append_error() {` › `let probes = RecordingProbes::new(&host_digest());`
 
 A probe that uses what it is handed, because P4 now refuses one that does
 not: the leak this test needs is seeded by the owner of the pair below.
 
-## `fn a_leaked_probe_registration_is_reported_by_the_append_er…` › `driver.leak_into_the_pair(AGENT);`
+## `fn a_leaked_probe_registration_is_reported_by_the_append_error() {` › `driver.leak_into_the_pair(AGENT);`
 
 Seeded by the owner of the pair, because a probe can no longer leak:
 what it is handed settles what it registers. The property under test is
@@ -658,7 +658,7 @@ that wrapper's own locks; it never built a `Request` and never called
 `create_run`, so it proved the wrapper and not the accounting. This drives
 `create_run` to the forced first-append error.
 
-## `fn the_append_error_balance_reads_the_ledger_the_probes_use…` › `let source = OneSource::default();`
+## `fn the_append_error_balance_reads_the_ledger_the_probes_used() {` › `let source = OneSource::default();`
 
 **The production probes, not a recording double.** A double that registers
 nothing leaves an empty ledger, and a balance check over an empty ledger is
@@ -666,14 +666,14 @@ true for the wrong reason — which the premise assertion below refuses. This
 is `RunnerProbes` over a runner that answers, so P4's registrations are
 real and the balance is earned.
 
-## `fn the_append_error_balance_reads_the_ledger_the_probes_use…` › `let probes = RunnerProbes {`
+## `fn the_append_error_balance_reads_the_ledger_the_probes_used() {` › `let probes = RunnerProbes {`
 
 No pair and no runner are built here: the `Request` grants the one pair,
 owns the run's Runner, and builds each probe's boundary from the two — so
 the witness reads `driver.ledger` below and `RunnerProbes` has nothing of
 its own to read instead.
 
-## `fn the_append_error_balance_reads_the_ledger_the_probes_use…` › `let executed = driver.execution.requests().len();`
+## `fn the_append_error_balance_reads_the_ledger_the_probes_used() {` › `let executed = driver.execution.requests().len();`
 
 The premise: P4 ran, and **every process it ran** is accounted in the
 granted pair. A count greater than zero is not enough — the shell probe
@@ -681,7 +681,7 @@ alone satisfies it, so a run whose *agent* probe was bound to some other
 pair would pass. The claim is therefore the equality: the run's Runner
 executed exactly the processes the pair settled.
 
-## `fn the_append_error_balance_reads_the_ledger_the_probes_use…` › `let text = format!("{}", refused.error);`
+## `fn the_append_error_balance_reads_the_ledger_the_probes_used() {` › `let text = format!("{}", refused.error);`
 
 And that is what the refusal says. A balanced run adds **nothing** — only an
 unbalanced one appends "(and this process still holds a registered
@@ -689,7 +689,7 @@ invocation…)" — so the assertion is the absence of that clause, which is
 only meaningful because the premise above proved the ledger was populated
 and did balance. An empty ledger would satisfy this line and fail that one.
 
-## `fn append_first_error_after_partial_write_reopens_truncates_and_reports_not_committed_wit…`
+## `fn append_first_error_after_partial_write_reopens_truncates_and_reports_not_committed_without_deletion()`
 
 A partial write: the reopen truncates the torn first line, the proven
 prefix has no committed line, and nothing is deleted.
@@ -710,7 +710,7 @@ nothing is ever deleted.
 The barrier's own sync fails: the outcome is **undetermined**, the step
 is named, and nothing is deleted.
 
-## `fn append_first_error_with_failed_prefix_sync_reports_undet…` › `hooks.faults().arm_point_after(`
+## `fn append_first_error_with_failed_prefix_sync_reports_undetermined_and_never_deletes() {` › `hooks.faults().arm_point_after(`
 
 Skip P5's own open, which consults the same coordinate.
 
@@ -753,7 +753,7 @@ creates and adopts, and could not prove that any resume ever calls it, with
 what arguments, or at what point in the order. The resume-side test proves
 all three, so this one keeps the claim it can actually make.
 
-## `fn p7_error_leaves_run_started_durable_with_no_integration_…` › `hooks.faults().arm_phase(`
+## `fn p7_error_leaves_run_started_durable_with_no_integration_ref() {` › `hooks.faults().arm_phase(`
 
 Stop at P6: `run_started` is durable, the marker is present, and no
 ref exists — exactly what a kill between P6 and P8 leaves.
@@ -779,7 +779,7 @@ Deleting the caller fails it in one direction; deleting the promise fails it
 in the other; and the pair can only be made green together, which is the
 property that was actually wanted both times it was got wrong.
 
-## `fn the_p8_report_promises_exactly_the_resume_action_the_res…` › `let from = resume`
+## `fn the_p8_report_promises_exactly_the_resume_action_the_resume_performs() {` › `let from = resume`
 
 Read out of the recovery **driver's own body**, not out of the module.
 "The module defines a function that would create the ref" is exactly the
@@ -787,7 +787,7 @@ state this tree was in when the sentence was wrong the second time: the
 step existed as a body and the order never called it. So the window is
 `run_recovery_order`'s, and it ends at the next item.
 
-## `fn the_p8_report_promises_exactly_the_resume_action_the_res…` › `assert_eq!(`
+## `fn the_p8_report_promises_exactly_the_resume_action_the_resume_performs() {` › `assert_eq!(`
 
 And the step, wherever it is called from, may not carry a second copy of
 "if present == base continue": it has to be P8's own body.
@@ -797,7 +797,7 @@ And the step, wherever it is called from, may not carry a second copy of
 A committed run whose marker is still there is **listed** by the readers
 and repaired by the resume's step (a).
 
-## `fn committed_run_with_stale_marker_listed_and_repaired_by_r…` › `hooks.faults().disarm();`
+## `fn committed_run_with_stale_marker_listed_and_repaired_by_resume() {` › `hooks.faults().disarm();`
 
 The repair: recovery step (a) removes the stale marker through the
 same funnel P7 uses, and the run is unchanged otherwise.
@@ -813,15 +813,15 @@ because the creator publishes `committed.json` **before** it appends: the
 no-record half of this shape is a husk some other writer left, and the
 census has to classify it either way.
 
-## `fn torn_first_line_without_commit_record_reclaimed_and_with…` › `let fixture = Fixture::new("torn-norecord");`
+## `fn torn_first_line_without_commit_record_reclaimed_and_with_commit_record_retained() {` › `let fixture = Fixture::new("torn-norecord");`
 
 (1) No commit record: provable, and reclaimed.
 
-## `fn torn_first_line_without_commit_record_reclaimed_and_with…` › `let fixture = Fixture::new("torn-record");`
+## `fn torn_first_line_without_commit_record_reclaimed_and_with_commit_record_retained() {` › `let fixture = Fixture::new("torn-record");`
 
 (2) With one: retained, possibly committed, and no token exists.
 
-## `fn torn_first_line_without_commit_record_reclaimed_and_with…` › `let fixture = Fixture::new("torn-kill");`
+## `fn torn_first_line_without_commit_record_reclaimed_and_with_commit_record_retained() {` › `let fixture = Fixture::new("torn-kill");`
 
 (3) And the same shape left by a real process death inside the
 append, rather than by an error return: `WrittenShape::Torn` is
@@ -991,12 +991,12 @@ file "spans runs; never removed by a run": once it exists, the refusal
 has left a durable artifact behind, and "before any lock or **other
 effect**" is false.
 
-## `fn image_absent_refused_before_any_lock_no_lock_file_create…` › `let refused = write_command_start(&fixture, &selection, &git_dir, &Inventory::reachable())`
+## `fn image_absent_refused_before_any_lock_no_lock_file_created() {` › `let refused = write_command_start(&fixture, &selection, &git_dir, &Inventory::reachable())`
 
 The write command's start, in order: the read-only checks, then the
 lock. A refusal in the first statement never reaches the second.
 
-## `fn image_absent_refused_before_any_lock_no_lock_file_create…` › `let present =`
+## `fn image_absent_refused_before_any_lock_no_lock_file_created() {` › `let present =`
 
 The control half. Without it this test passes against a
 `write_command_start` that never takes a lock at all.
@@ -1088,12 +1088,12 @@ other boundary is caught rather than agreeing with itself. The other
 half of the claim — that P4 refuses when the two disagree — is the
 second block.
 
-## `fn probe_intent_carries_runner_policy_digest_matching_owner…` › `let fixture = Fixture::new("intent-digest-refusal");`
+## `fn probe_intent_carries_runner_policy_digest_matching_owner_record() {` › `let fixture = Fixture::new("intent-digest-refusal");`
 
 And P4 refuses before the first probe when the probes' boundary is
 not the one P1 and P3b published.
 
-## `fn kill_during_containerized_probe_before_run_started_reclaims_container_and_husk_and_rep…`
+## `fn kill_during_containerized_probe_before_run_started_reclaims_container_and_husk_and_reports_boundary()`
 
 A kill during a containerized probe, before `run_started`: the next
 census reclaims the container **and** the husk, and reports the
@@ -1180,7 +1180,7 @@ The seam has a test double everywhere else in this file, which is what makes
 the *ordering* observable; this is the other half — that the implementation
 production passes is the two existing functions and not a third one.
 
-## `fn the_production_probes_run_both_halves_through_the_runs_r…` › `let refusal = probes`
+## `fn the_production_probes_run_both_halves_through_the_runs_runner() {` › `let refusal = probes`
 
 An agent this machine has no adapter for refuses rather than being
 silently skipped: a run whose pre-flight certified nothing would still
@@ -1226,7 +1226,7 @@ which the caller's pair shows as an empty ledger rather than as a balance
 read off the wrong locks. That distinction is the whole of what the
 structural change buys, and it is asserted below rather than argued.
 
-## `fn an_agent_probe_registers_only_into_the_pair_its_caller_b…` › `let other_ledger = Mutex::new(InvocationLedger::new());`
+## `fn an_agent_probe_registers_only_into_the_pair_its_caller_bound() {` › `let other_ledger = Mutex::new(InvocationLedger::new());`
 
 The pair nobody is handed.
 
@@ -1316,12 +1316,12 @@ Both halves are driven, because a check that only watched the shell probe
 would pass a run whose *agent* probe was the substituted one. Both leave the
 run removed rather than published: an uncertified pre-flight has no run.
 
-## `fn a_probe_that_substitutes_its_own_authority_is_refused_at…` › `assert_eq!(`
+## `fn a_probe_that_substitutes_its_own_authority_is_refused_at_p4() {` › `assert_eq!(`
 
 The substituted authority really did run a process, so the refusal is
 about *where* it ran and not about a probe that did nothing.
 
-## `fn a_probe_that_substitutes_its_own_authority_is_refused_at…` › `let fixture = Fixture::new("substituted-second-agent");`
+## `fn a_probe_that_substitutes_its_own_authority_is_refused_at_p4() {` › `let fixture = Fixture::new("substituted-second-agent");`
 
 **And the check is per agent, not per run.** The first agent's probe uses
 the capability, so a check hoisted out of P4's loop would see the grant
@@ -1360,11 +1360,11 @@ deleting the R4 conjunct changed nothing anybody could see.
 Each half is driven on its own, so a balance that answered on one of them
 fails here rather than passing on the other's evidence.
 
-## `fn the_granted_pairs_balance_answers_for_the_ledger_and_the…` › `let id = PreflightIdentities::agent(AGENT, 0).expect("a probe identity");`
+## `fn the_granted_pairs_balance_answers_for_the_ledger_and_the_slots() {` › `let id = PreflightIdentities::agent(AGENT, 0).expect("a probe identity");`
 
 The R3 half: a registration that never settled.
 
-## `fn the_granted_pairs_balance_answers_for_the_ledger_and_the…` › `slots`
+## `fn the_granted_pairs_balance_answers_for_the_ledger_and_the_slots() {` › `slots`
 
 The R4 half: a pair taken and not given back. The ledger is clean
 throughout, so only the slot conjunct can answer.

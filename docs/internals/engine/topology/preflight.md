@@ -174,12 +174,12 @@ named in the refusal, which is what a caller needs it for.
 not answer. Every invocation registered before the refusal is cancelled
 and every slot pair released, so the ledgers balance on both paths.
 
-## `fn certify(&self, policy: &RunnerPolicy) -> Result<(), Upst…` › `let shell_id = PreflightIdentities::shell(0)?;`
+## `fn certify(&self, policy: &RunnerPolicy) -> Result<(), UpstrokeError> {` › `let shell_id = PreflightIdentities::shell(0)?;`
 
 (1) The shell. Non-slotted, and `is_slotted` is what makes that true
 rather than an argument here.
 
-## `fn certify(&self, policy: &RunnerPolicy) -> Result<(), Upst…` › `let mut caps = Vec::with_capacity(self.agents.len());`
+## `fn certify(&self, policy: &RunnerPolicy) -> Result<(), UpstrokeError> {` › `let mut caps = Vec::with_capacity(self.agents.len());`
 
 (2) One probe per recorded agent, sequentially, in recorded order.
 
@@ -234,20 +234,20 @@ process either never started or did not produce an outcome this run may
 act on, and `R3`'s two lifecycle rows are "released on cancel" and
 "released on complete or cancel" precisely so the two are told apart.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `let Some(slots) = self.slots else {`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `let Some(slots) = self.slots else {`
 
 The non-slotted boundary cannot account a slotted invocation, and
 running it anyway would put an agent probe through a path that
 takes no pair — the process would execute with `permits.
 agent_pool_slots` never consulted.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `agent: match request.agent.as_ref() {`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `agent: match request.agent.as_ref() {`
 
 The agent whose per-agent slot this is. A slotted invocation
 without an agent binding cannot be accounted, and refusing is
 the assertion rather than inventing a name for it.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `pool: None,`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `pool: None,`
 
 The pool is the routing layer's and arrives with PR11's
 broker; a per-agent pair with no pool is the sequential

@@ -296,7 +296,7 @@ error to report over the one that stopped the run".
 
 Which effect refused, and therefore what is left on disk.
 
-## `pub enum RunDirOutcome` › `detail: String,`
+## `pub enum RunDirOutcome` › `detail: String`
 
 The error, as the operator sees it.
 
@@ -609,14 +609,14 @@ and "the proof this census computed" the same object.
 
 Classify one directory and decide, read-only.
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `let lock_held = rundir::is_running(&public);`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `let lock_held = rundir::is_running(&public);`
 
 `is_running` is the read-only probe: on Unix `F_GETLK` asks who holds the
 lock without taking it, and an absent lock file means the run never
 started. "A Husk whose `run.lock` is **free or absent** is handled by
 shape and proof."
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `let own = own_run == Some(run_id);`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `let own = own_run == Some(run_id);`
 
 The own-run exception, stated twice by the packet: recovery step (a1)'s
 census covers "this run's own stale marker, **which the owner removes
@@ -624,13 +624,13 @@ here**", and the stale-marker sentence's "otherwise its live owner
 removes it in recovery step (a)" is the same removal from the other
 side. It licenses the marker repair and nothing else.
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `locator: None,`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `locator: None,`
 
 A committed run's private half is bound by
 `run_started.private_dir`, which recovery step (a) verifies. A
 marker on it is stale residue, not a binding to report.
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `if lock_held {`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `if lock_held {`
 
 Every husk arm is gated on the lock alone. A husk whose lock is held is
 skipped whoever holds it, this process included: under the worktree lock
@@ -638,12 +638,12 @@ no live creator can exist in this worktree, so a held lock on a husk is
 either another repository's process or this resume's own run with a
 damaged log — and neither is a directory a census may delete.
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `let report = rundir::husk_report(`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `let report = rundir::husk_report(`
 
 The one classifier. `status` drives the same call on the same directory
 and gets the same locator and the same reason.
 
-## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: O…` › `HuskDisposition::Unstarted(Reclaimable::BothHalves) => {`
+## `fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scanned {` › `HuskDisposition::Unstarted(Reclaimable::BothHalves) => {`
 
 `husk_report` is read-only and drops its token unspent, so the proof
 is recomputed here to mint one. A second answer that is not `Proven`
@@ -661,7 +661,7 @@ directory's residue cannot end the command that censused it. The retain arm
 keeps a second guarantee it had before: it reaches no funnel at all, which is
 now visible in the signature as well as in the body.
 
-## `fn apply(hooks: &mut dyn RunDirHooks, public: &Path, plan: …` › `if let Err(error) = rundir::remove_private_husk(proof, hooks) {`
+## `fn apply(hooks: &mut dyn RunDirHooks, public: &Path, plan: Planned) -> RunDirOutcome {` › `if let Err(error) = rundir::remove_private_husk(proof, hooks) {`
 
 The order is load-bearing: "the census reclaims the private half
 through the proof-token funnel, **then** the public directory with
@@ -676,7 +676,7 @@ with the directory and that marker is the private half's only
 locator. The creator states the identical rule at its own
 `RunDir.RemovePrivateHusk`; this is the census's half of it.
 
-## `fn apply(hooks: &mut dyn RunDirHooks, public: &Path, plan: …` › `Planned::Retain(reason) => RunDirOutcome::Retained(reason),`
+## `fn apply(hooks: &mut dyn RunDirHooks, public: &Path, plan: Planned) -> RunDirOutcome {` › `Planned::Retain(reason) => RunDirOutcome::Retained(reason),`
 
 Arm (iii). No effect, by construction rather than by discipline:
 there is no funnel call on this path at all.

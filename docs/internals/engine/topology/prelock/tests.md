@@ -74,7 +74,7 @@ Every runtime interaction was a read.
 The four container inspections happen in `run_creation`'s order, and the
 first failure ends it.
 
-## `fn the_container_inspections_run_in_order_and_the_first_fai…` › `let unreachable = Inventory::default();`
+## `fn the_container_inspections_run_in_order_and_the_first_failure_ends_them() {` › `let unreachable = Inventory::default();`
 
 An unreachable runtime never reaches the image question.
 
@@ -92,7 +92,7 @@ silently proceeding as though the inspection had passed.
 A private root that is not there refuses read-only, before anything
 else is asked.
 
-## `fn a_private_root_that_is_not_a_real_directory_refuses_befo…` › `let absent = root.path().join("absent");`
+## `fn a_private_root_that_is_not_a_real_directory_refuses_before_any_inspection() {` › `let absent = root.path().join("absent");`
 
 The root the check is given is a child that was never created; the
 guard still owns the scratch tree that child was named under.
@@ -114,18 +114,18 @@ another doing the same and leave the process with a no-op hook for good
 — every later panic anywhere in the suite losing its message and
 backtrace. The few lines this prints cost less than that.
 
-## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_u…` › `create_private_dir(&path.join("nested"), &mut NoHooks).expect("a child of the root");`
+## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_unwind() {` › `create_private_dir(&path.join("nested"), &mut NoHooks).expect("a child of the root");`
 
 A tree rather than a bare directory: the guard reclaims what a
 test left under its root as well as the root itself.
 
-## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_u…` › `let recorded = Mutex::new(None);`
+## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_unwind() {` › `let recorded = Mutex::new(None);`
 
 The path is recorded from inside the closure rather than re-derived
 here: re-deriving it would copy `Scratch::new`'s naming rule, and a
 witness that agrees with a rule it restates proves nothing about it.
 
-## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_u…` › `assert!(!path.is_dir(), "a deliberate failure, mid-test");`
+## `fn a_scratch_root_is_reclaimed_on_every_exit_including_an_unwind() {` › `assert!(!path.is_dir(), "a deliberate failure, mid-test");`
 
 The shape of a real failure: an assertion about the run that does
 not hold, raised with the guard still in scope.
@@ -198,13 +198,13 @@ which a bare exit-code assertion would read as success. Requiring the
 zero exit **and** `ok. 1 passed` separates the three outcomes: aborted,
 selected-and-passed, and selected-nothing-at-all.
 
-## `fn a_failed_reclamation_during_an_unwind_does_not_abort_the…` › `env: Vec::new(),`
+## `fn a_failed_reclamation_during_an_unwind_does_not_abort_the_process() {` › `env: Vec::new(),`
 
 Nothing to pass: the child derives its own scratch root from
 the temp directory and its own pid, so the two processes
 cannot collide and there is no state to hand over.
 
-## `fn a_failed_reclamation_during_an_unwind_does_not_abort_the…` › `assert_eq!(`
+## `fn a_failed_reclamation_during_an_unwind_does_not_abort_the_process() {` › `assert_eq!(`
 
 `stderr` rather than the whole `ProcessOutput`: the child's stdout
 carries its backtrace, and a failure report that buries the one line

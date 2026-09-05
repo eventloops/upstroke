@@ -140,7 +140,7 @@ prefix sync — and it was the family this method did not reach, because
 [`crate::events::log::HarnessEventHooks`] answered no durability
 question at all until PR7 taught it to.
 
-## `impl HarnessTopologyHooks` › `pub fn with_written_kill_shape(mut self, shape: crate::events::log::WrittenShape) -> Self…`
+## `impl HarnessTopologyHooks` › `pub fn with_written_kill_shape(mut self, shape: crate::events::log::WrittenShape) -> Self {`
 
 Ask the Event funnel to leave the **torn** durable shape at a kill
 armed on `Written`, rather than the complete-unsynced one.

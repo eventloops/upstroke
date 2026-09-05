@@ -190,7 +190,7 @@ establishes the barrier before acting.
 
 Which step of the barrier refused.
 
-## `pub enum AppendOutcome` › `detail: String,`
+## `pub enum AppendOutcome` › `detail: String`
 
 What that step found.
 

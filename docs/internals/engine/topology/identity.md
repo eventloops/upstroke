@@ -322,7 +322,7 @@ Reserve for `key`.
 
 [`UpstrokeError::Refused`] when one is already held.
 
-## `impl Reservations` › `pub fn convert(&mut self, key: TaskKey, kind: ReservationKind) -> Result<(), UpstrokeErro…`
+## `impl Reservations` › `pub fn convert(&mut self, key: TaskKey, kind: ReservationKind) -> Result<(), UpstrokeError> {`
 
 Convert the reservation at its append.
 
@@ -333,7 +333,7 @@ reservation is another task's or another kind. A conversion that
 silently accepted a mismatch is how an entitlement gets counted against
 the wrong generation.
 
-## `impl Reservations` › `pub fn cancel(&mut self, key: TaskKey, kind: ReservationKind) -> Result<(), UpstrokeError…`
+## `impl Reservations` › `pub fn cancel(&mut self, key: TaskKey, kind: ReservationKind) -> Result<(), UpstrokeError> {`
 
 Cancel it: a pre-append failure, run end, shutdown, or a poisoned fold.
 
@@ -459,13 +459,13 @@ rather than pairwise on a sample, because the failure this guards is a
 role whose ordinal was forgotten and which therefore collides with its
 own neighbour.
 
-## `fn every_invocation_of_an_attempt_is_distinct_and_a_retry_r…` › `assert_ne!(first.gate(0, 0), first.gate(0, 1));`
+## `fn every_invocation_of_an_attempt_is_distinct_and_a_retry_reuses_none_of_them() {` › `assert_ne!(first.gate(0, 0), first.gate(0, 1));`
 
 The ordinal is load-bearing: a gate re-dispatched inside one attempt
 is a new identity, so a completion from the first run cannot apply
 to the second.
 
-## `fn every_invocation_of_an_attempt_is_distinct_and_a_retry_r…` › `assert_ne!(first.gate(0, 1), first.gate(1, 0));`
+## `fn every_invocation_of_an_attempt_is_distinct_and_a_retry_reuses_none_of_them() {` › `assert_ne!(first.gate(0, 1), first.gate(1, 0));`
 
 And the gate number is load-bearing separately from the ordinal.
 
@@ -552,7 +552,7 @@ The append-error protocol cancels what it holds without naming it.
 Registered once, settled once; a duplicate settlement is counted, not
 refused.
 
-## `fn the_invocation_ledger_refuses_aliasing_and_counts_duplic…` › `ledger`
+## `fn the_invocation_ledger_refuses_aliasing_and_counts_duplicate_settlements() {` › `ledger`
 
 "duplicate complete/cancel ignored and counted" — INV-20 asks for a
 discard with a warning, not a refusal.

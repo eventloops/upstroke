@@ -120,12 +120,12 @@ from its own output, and fails this one.
 A second call reserves a nonce of its own, and `NONCE` only ever
 increases, so this holds however many threads drew from it in between.
 
-## `fn reserving_a_nonce_yields_the_previous_value_and_wraps_at…` › `let counter = AtomicU64::new(41);`
+## `fn reserving_a_nonce_yields_the_previous_value_and_wraps_at_the_top() {` › `let counter = AtomicU64::new(41);`
 
 The reservation `ulid` makes, on a counter belonging to this test, so
 the process-wide `NONCE` other tests draw from is left alone.
 
-## `fn reserving_a_nonce_yields_the_previous_value_and_wraps_at…` › `let at_top = AtomicU64::new(u64::MAX);`
+## `fn reserving_a_nonce_yields_the_previous_value_and_wraps_at_the_top() {` › `let at_top = AtomicU64::new(u64::MAX);`
 
 At the top of the range it wraps rather than trapping, so a process
 that draws more than `u64::MAX` ids keeps issuing them. The nonce is

@@ -157,7 +157,7 @@ the runtime (there is no implicit pull), or an absent credential volume.
 [`UpstrokeError::Io`] when the root cannot be canonicalized for any other
 reason.
 
-## `pub fn check(inputs: &PreLock<'_>) -> Result<PreLockChecked…` › `let run_id = inputs.ids.run_id();`
+## `pub fn check(inputs: &PreLock<'_>) -> Result<PreLockChecked, UpstrokeError> {` › `let run_id = inputs.ids.run_id();`
 
 Last, and only once every refusal above has passed: `run_creation` puts
 id generation after resolution and annotates it "(no effect)".
@@ -173,7 +173,7 @@ to canonicalize it would be the residue this phase is defined not to leave.
 side — it canonicalizes `<R>/runs` and joins the basename — so the locator
 this produces and the expectation the census computes are the same value.
 
-## `fn authorized_private_root(configured: &Path) -> Result<Pat…` › `let canonical = std::fs::canonicalize(configured).map_err(|source| UpstrokeError::Io {`
+## `fn authorized_private_root(configured: &Path) -> Result<PathBuf, UpstrokeError> {` › `let canonical = std::fs::canonicalize(configured).map_err(|source| UpstrokeError::Io {`
 
 `symlink_metadata` first, then canonicalize: a private root reached
 through a link is legitimate (`/tmp` on macOS, a mounted home), and the

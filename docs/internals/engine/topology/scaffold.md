@@ -174,7 +174,7 @@ So the arming is local and the **recording is not**: every call reaches
 
 Answer `injection` the next time `site` reaches `phase`.
 
-## `fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -…` › `self.timeline.push(site, phase);`
+## `fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {` › `self.timeline.push(site, phase);`
 
 Recorded first and unconditionally: an armed site is still a site the
 suite executed, and a bundle that skipped the harness when it had an
@@ -288,12 +288,12 @@ The kinds the log on disk holds right now.
 
 Everything it was asked to run, in order.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `let durable_at_spawn = self.durable_now();`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `let durable_at_spawn = self.durable_now();`
 
 Read before the request is recorded, so what it captures is the log
 as it stood when the process was asked for.
 
-## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOut…` › `stdout: if code == 0 {`
+## `fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {` › `stdout: if code == 0 {`
 
 A refused process says something, the way a real one does: §11.1
 makes the tail the feedback a retry is given, and a fixture whose
@@ -363,7 +363,7 @@ An agent whose CLI reports it is rate-limited: `evaluate_outcome` maps
 that to `FailureKind::RateLimited`, which `is_outage` recognises and
 `next_step` defers rather than blames on the implementer.
 
-## `fn build(&self, run: &crate::agent::TaskRun) -> Result<Comm…` › `let spec = CommandSpec::new(self.id)`
+## `fn build(&self, run: &crate::agent::TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `let spec = CommandSpec::new(self.id)`
 
 A real spec, carrying the prompt, so a test that reads the recorded
 command sees what was actually asked for.
@@ -501,11 +501,11 @@ A clause about a *second* occurrence — O24's retry runs in a generation
 whose dispatch already drove both of its sites — is asserted from a mark
 taken before the step, so the positions compared are the step's own.
 
-## `impl Run` › `pub(super) fn order_after(&self, mark: usize, site: EffectSiteId, phase: HookPhase) -> us…`
+## `impl Run` › `pub(super) fn order_after(&self, mark: usize, site: EffectSiteId, phase: HookPhase) -> usize {`
 
 The first position at or after `mark` at which `(site, phase)` ran.
 
-## `impl Run` › `pub(super) fn count_after(&self, mark: usize, site: EffectSiteId, phase: HookPhase) -> us…`
+## `impl Run` › `pub(super) fn count_after(&self, mark: usize, site: EffectSiteId, phase: HookPhase) -> usize {`
 
 How many times `(site, phase)` ran at or after `mark`.
 
@@ -599,7 +599,7 @@ Two reviewers rather than one, because
 snapshot per reviewer, never reused across roles or attempts", and a
 single reviewer cannot distinguish a fresh snapshot from a reused one.
 
-## `pub(super) fn attempt_plan(&self, key: TaskKey, attempt: u3…` › `gates: vec![{`
+## `pub(super) fn attempt_plan(&self, key: TaskKey, attempt: u32) -> AttemptPlan {` › `gates: vec![{`
 
 Through the production assembler, not invented here. A fixture
 that built its own `(command, timeout)` pair would be a second
@@ -607,7 +607,7 @@ derivation of the one thing `ShellGate::command` exists to be —
 the `frozen_binding` precedent, where a fixture repeating a
 production composition kept a fifth copy of it alive.
 
-## `pub(super) fn attempt_plan(&self, key: TaskKey, attempt: u3…` › `reviewers: vec![`
+## `pub(super) fn attempt_plan(&self, key: TaskKey, attempt: u32) -> AttemptPlan {` › `reviewers: vec![`
 
 Identity and policy, no command: the shared review machinery
 builds one per invocation, because a re-ask's prompt is not the
@@ -632,7 +632,7 @@ only the *state*, so the event is emitted through the same fold-checked
 emitter every other event uses and is refused if it is not a transition
 the fold allows.
 
-## `pub(super) fn retain(&mut self, key: TaskKey, generation: G…` › `failure: Some(crate::events::FailureRecord {`
+## `pub(super) fn retain(&mut self, key: TaskKey, generation: GenerationId, attempt: u32) {` › `failure: Some(crate::events::FailureRecord {`
 
 **A retained attempt did not succeed.**
 `settle::settle_failed` is the only producer of a

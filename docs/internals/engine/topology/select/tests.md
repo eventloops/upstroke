@@ -12,12 +12,12 @@ as it is in the source, so the heading is the grep string that finds the code.
 Fixtures the settlement lane does not need
 -----------------------------------------------------------------------
 
-## `fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) -> CandidateRe…`
+## `fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) -> CandidateRef {`
 
 Take `key` all the way to a queued candidate: dispatch, attempt,
 success, prepare, create.
 
-## `fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, g…` › `let candidate = candidate_of(key, generation);`
+## `fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) -> CandidateRef {` › `let candidate = candidate_of(key, generation);`
 
 **No `attempt_finished` between the pin and `candidate_prepared`.**
 `candidate_prepared` is the sole successful settlement for a
@@ -59,16 +59,16 @@ assertion is about the branch that *lost*: in the first, a retry and a
 dispatch were both live and the integration still won; in the second, a
 dispatch was live and the retry still won.
 
-## `fn an_eligible_integration_precedes_a_retry_precedes_a_disp…` › `let mut fold = started();`
+## `fn an_eligible_integration_precedes_a_retry_precedes_a_dispatch() {` › `let mut fold = started();`
 
 Without the candidate, the retry wins over the dispatch.
 
-## `fn an_eligible_integration_precedes_a_retry_precedes_a_disp…` › `attempt: AttemptNumber(2),`
+## `fn an_eligible_integration_precedes_a_retry_precedes_a_dispatch() {` › `attempt: AttemptNumber(2),`
 
 The retry runs the *next* attempt of the generation that
 retained the session, not a first attempt of a new one.
 
-## `fn an_eligible_integration_precedes_a_retry_precedes_a_disp…` › `let fold = started();`
+## `fn an_eligible_integration_precedes_a_retry_precedes_a_dispatch() {` › `let fold = started();`
 
 Without either, the dispatch. Lowest key first.
 
@@ -82,7 +82,7 @@ refused for a fresh run, so one held entitlement is a full pipeline. An
 and `attempt_started` leaves holding it, and recovery does not close it
 — so this is the state the resumed loop's first `select` sees.
 
-## `fn nothing_is_selected_at_width_one_while_the_single_entitl…` › `assert_eq!(`
+## `fn nothing_is_selected_at_width_one_while_the_single_entitlement_is_held() {` › `assert_eq!(`
 
 **The entitlement's holder is the one thing still selectable**, and
 that is `T-DISPATCH`'s "continue attempt (no spend repeats)": this
@@ -91,7 +91,7 @@ job is to start one in it. What the held entitlement forbids is a
 *second* claim on it — the queued integration above is no longer
 selected, which is what this test is measuring.
 
-## `fn nothing_is_selected_at_width_one_while_the_single_entitl…` › `let mut wider = started_at_width(2);`
+## `fn nothing_is_selected_at_width_one_while_the_single_entitlement_is_held() {` › `let mut wider = started_at_width(2);`
 
 One slot wider, the identical state selects the integration: what
 this asserts is the count, not something else about the fixture.
@@ -108,7 +108,7 @@ The candidate the queue chooses, not the head of the queue.
 than blocking behind it, and this is the selector inheriting that
 rather than re-deriving it.
 
-## `fn selection_takes_the_first_eligible_candidate_and_not_the…` › `apply(`
+## `fn selection_takes_the_first_eligible_candidate_and_not_the_head() {` › `apply(`
 
 Park ALEPH's task: its candidate keeps its place and loses its turn.
 
@@ -225,29 +225,29 @@ A budget breach with structurally admissible work appends
 `budget_exceeded` **before any spawn**; integration and run end are
 refused **before any start append**.
 
-## `fn a_breach_appends_budget_exceeded_and_integration_and_run…` › `let fold = started();`
+## `fn a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused() {` › `let fold = started();`
 
 (1) A breach with work to do. `select` is a pure function — it
 performs no effect and appends nothing — so "before any spawn" is
 structural, and what the loop is handed is the event itself.
 
-## `fn a_breach_appends_budget_exceeded_and_integration_and_run…` › `assert_eq!(`
+## `fn a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused() {` › `assert_eq!(`
 
 It is not a start, so the checkpoint admits it, and the fold takes
 it — after which the run is ending.
 
-## `fn a_breach_appends_budget_exceeded_and_integration_and_run…` › `let mut fold = started();`
+## `fn a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused() {` › `let mut fold = started();`
 
 (2) An eligible integration is refused before the
 `merge_verification_started` that would start one.
 
-## `fn a_breach_appends_budget_exceeded_and_integration_and_run…` › `let mut spend = Spend::new();`
+## `fn a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused() {` › `let mut spend = Spend::new();`
 
 The ceiling is checked *inside* the integration branch and before
 it, so a breach with an eligible integration records the stop rather
 than the refusal.
 
-## `fn a_breach_appends_budget_exceeded_and_integration_and_run…` › `let fold = all_failed();`
+## `fn a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused() {` › `let fold = all_failed();`
 
 (3) Run-end closure is refused before `run_finished`.
 
@@ -273,12 +273,12 @@ The `match` below has **no wildcard arm**, so adding a variant to `Step`
 stops this file compiling until someone says which side it falls on.
 That is the part a count in a doc comment cannot do.
 
-## `fn every_step_variant_is_admitted_or_refused_and_the_split_…` › `let mut names = Vec::new();`
+## `fn every_step_variant_is_admitted_or_refused_and_the_split_is_five_three() {` › `let mut names = Vec::new();`
 
 Exhaustive by construction: no `_` arm, so a ninth variant is a
 compile error here rather than a silently untested branch.
 
-## `fn every_step_variant_is_admitted_or_refused_and_the_split_…` › `let mut distinct = names.clone();`
+## `fn every_step_variant_is_admitted_or_refused_and_the_split_is_five_three() {` › `let mut distinct = names.clone();`
 
 On a COPY: `names` must stay in the list's order, because it is
 zipped with it below. Sorting it in place paired every step with
@@ -302,11 +302,11 @@ later branch to fall through to and a `BudgetExceeded` to produce from
 it. The assertion is therefore on `key`: only the retry's own check
 names the retained task.
 
-## `fn the_retry_branch_checks_the_ceiling_and_names_the_retain…` › `let ceiling = Ceiling {`
+## `fn the_retry_branch_checks_the_ceiling_and_names_the_retained_task() {` › `let ceiling = Ceiling {`
 
 `BET` is over its own ceiling; `ALEPH` has spent nothing.
 
-## `fn the_retry_branch_checks_the_ceiling_and_names_the_retain…` › `assert_eq!(`
+## `fn the_retry_branch_checks_the_ceiling_and_names_the_retained_task() {` › `assert_eq!(`
 
 Under the ceiling, the same state runs the retry.
 
@@ -326,7 +326,7 @@ green**.
 A run with runnable work must not sleep on a wait that belongs to a task
 which is not the one it could be running.
 
-## `fn a_ready_dispatch_precedes_the_backoff_when_both_are_live…` › `assert!(`
+## `fn a_ready_dispatch_precedes_the_backoff_when_both_are_live() {` › `assert!(`
 
 Both premises, because "not Backoff" is satisfied by a fold where the
 backoff was never pending in the first place.
@@ -341,7 +341,7 @@ swapped every one of them still passes. A deferred task is waiting on a
 wait that will elapse on its own; a question waits on a person. Serving
 the person first would park a run that was about to make progress.
 
-## `fn the_backoff_branch_precedes_the_hard_block_when_both_are…` › `apply(&mut fold, &resume_event());`
+## `fn the_backoff_branch_precedes_the_hard_block_when_both_are_live() {` › `apply(&mut fold, &resume_event());`
 
 With the wait elapsed and the woken task run out, the question is
 what is left — the other half of the same order.
@@ -358,7 +358,7 @@ and was paid for. Charging the task ceiling would refuse the merge of
 work already bought, and refuse it permanently: the candidate can never
 integrate and the task can never unspend.
 
-## `fn an_integration_is_charged_to_the_run_and_never_to_the_ca…` › `assert_eq!(`
+## `fn an_integration_is_charged_to_the_run_and_never_to_the_candidates_task() {` › `assert_eq!(`
 
 The same ceiling still refuses that task's next *attempt*, which is
 what it is a ceiling on.
@@ -368,15 +368,15 @@ what it is a ceiling on.
 The backoff branch, and the guard that keeps it out from under a halt
 or a budget stop.
 
-## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_…` › `let mut woken = fold.clone();`
+## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_ending() {` › `let mut woken = fold.clone();`
 
 Waking it returns the task to an ordinary dispatch.
 
-## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_…` › `let mut halted = started();`
+## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_ending() {` › `let mut halted = started();`
 
 A halt: the branch is not offered, and the closure is.
 
-## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_…` › `let mut stopped = started();`
+## `fn the_backoff_branch_is_entered_only_while_the_run_is_not_ending() {` › `let mut stopped = started();`
 
 A budget stop in this epoch: likewise.
 
@@ -558,7 +558,7 @@ closed against a halt by the same code that closes them against a
 breach. The proof is in the sibling test's doc: delete the guard and it
 reports exactly `Dispatch (continuing)` and `HardBlock`.
 
-## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_t…` › `fn settle_bet(fold: &mut TopologyFold, halts: bool) {`
+## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn settle_bet(fold: &mut TopologyFold, halts: bool) {`
 
 `BET` fails, and `halts` decides whether it asks the run to stop.
 
@@ -569,17 +569,17 @@ settled, and a halt needs a task left to settle. The control fold is
 the same fold with `halts_run = false`, so the comparison isolates
 the flag rather than the shape.
 
-## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_t…` › `fn continuation(halts: bool) -> TopologyFold {`
+## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn continuation(halts: bool) -> TopologyFold {`
 
 The continuation arm: `TopologyFold::open_no_attempt` is a statement
 accessor, so nothing below the guard refuses on its behalf.
 
-## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_t…` › `fn hard_block(halts: bool) -> TopologyFold {`
+## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn hard_block(halts: bool) -> TopologyFold {`
 
 The hard block: `TopologyFold::questions_open` is the same shape one
 accessor over.
 
-## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_t…` › `assert!(`
+## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `assert!(`
 
 The premise: this ends the run the **other** way. A fixture that
 also carried a current budget stop would pass with the halted
@@ -589,7 +589,7 @@ disjunct deleted, which is the mutation this test exists for.
 
 The hard-block branch: open questions and nothing else runnable.
 
-## `fn open_questions_reach_the_hard_block_branch_before_closur…` › `assert_eq!(`
+## `fn open_questions_reach_the_hard_block_branch_before_closure() {` › `assert_eq!(`
 
 Left to itself the fold would already end this run Parked, which is
 exactly why the branch order matters.

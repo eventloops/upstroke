@@ -2,9 +2,12 @@
 
 Extended notes for [`src/workspace.rs`](../../src/workspace.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. This file preserves the migrated prose. Each section
+names the source item and, where needed, the line its comment described. Each code snippet in a
+heading is a literal source lookup string.
+
+The source retains the `LEGACY-EFFECT` allowlist-placement marker above its governed lint
+allowance. Lint reason strings stay in their attributes.
 
 ## Module
 
@@ -107,7 +110,7 @@ Repository prerequisites whose absence would make the captured tree
 incomplete or its attribute policy unverifiable. Run this before any
 worker is dispatched on both fresh and resumed runs.
 
-## `fn refuse_sparse_checkout(&self) -> Result<(), UpstrokeErro…` › `let index = self.git_output_with_private_hooks(&["ls-files", "-t", "-z"])?;`
+## `fn refuse_sparse_checkout(&self) -> Result<(), UpstrokeError> {` › `let index = self.git_output_with_private_hooks(&["ls-files", "-t", "-z"])?;`
 
 `-t` reports the skip-worktree tag as an uppercase `S` even when an
 entry is also marked assume-unchanged. (`-v` would lowercase that
@@ -134,7 +137,7 @@ The full sha of a commit's first parent — `None` at a root commit.
 How `resume` tells a commit sitting directly on its own record apart
 from history that arrived some other way.
 
-## `pub fn parent_sha(&self, sha: &str) -> Result<Option<String…` › `return Ok(None);`
+## `pub fn parent_sha(&self, sha: &str) -> Result<Option<String>, UpstrokeError> {` › `return Ok(None);`
 
 A root commit has no parent. That is an answer, not a failure.
 
@@ -184,7 +187,7 @@ downstream check that reads it.
 
 Backward-compatible diff-only capture for existing callers.
 
-## `fn worktree_filter_problem(&self, operation: &str) -> Resul…` › `let paths = self.git_output_with_private_hooks(&[`
+## `fn worktree_filter_problem(&self, operation: &str) -> Result<Option<String>, UpstrokeError> {` › `let paths = self.git_output_with_private_hooks(&[`
 
 Commands that inspect or update worktree entries (`add`, `status`,
 `switch`, `commit`) can run clean/process filters before a later
@@ -207,7 +210,7 @@ Inspect live nested-worktree state, then bind every semantic input check
 to one captured tree rather than to an index that may have moved since
 its diff was produced.
 
-## `fn tree_input_problem(&self, tree_oid: &str) -> Result<Opti…` › `let entries = self.git_output(&["ls-tree", "-r", "-z", "--full-tree", tree_oid])?;`
+## `fn tree_input_problem(&self, tree_oid: &str) -> Result<Option<String>, UpstrokeError> {` › `let entries = self.git_output(&["ls-tree", "-r", "-z", "--full-tree", tree_oid])?;`
 
 A captured .gitattributes can attach a filter to an otherwise
 unchanged file, so changed names are insufficient. `ls-tree`
@@ -226,7 +229,7 @@ Kept for existing callers; new callers that need more than one snapshot
 should retain `capture_candidate()` and use
 `gate_snapshot_for_candidate()`.
 
-## `impl Workspace` › `pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, UpstrokeErr…`
+## `impl Workspace` › `pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, UpstrokeError> {`
 
 Materialize a clean detached worktree for one exact tree object ID.
 Gates run here, never in the worker's workspace, so ignored files,
@@ -347,12 +350,12 @@ source path -diff replaces all changed bytes with the tiny sentence
 Preserve the independent post-stage guard for a caller opening an
 index prepared outside Workspace::capture_candidate.
 
-## `fn filter_on_unchanged_tracked_path_is_refused_before_mater…` › `fs::write(`
+## `fn filter_on_unchanged_tracked_path_is_refused_before_materialization() {` › `fs::write(`
 
 Only the attributes file changes. The filter target itself is absent
 from `diff --cached --name-only` but is still a gate input.
 
-## `fn capture_candidate_refuses_filter_before_candidate_helper…` › `run_git(&repo, &["add", "-A"]);`
+## `fn capture_candidate_refuses_filter_before_candidate_helper_executes() {` › `run_git(&repo, &["add", "-A"]);`
 
 Control: the exact raw command that capture used to run executes the
 fixture, proving marker absence above is suppression rather than a

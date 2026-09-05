@@ -394,12 +394,12 @@ an admitting branch, which is where `loop` puts it: a run with no
 admissible work never asks the ceiling anything, because there is no spawn
 for it to refuse and `budget_exceeded` is a record *of a refusal*.
 
-## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend…` › `return Step::Closure(fold.derived_outcome());`
+## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {` › `return Step::Closure(fold.derived_outcome());`
 
 No `run_started`: nothing has been recorded, so nothing is
 selectable and nothing has ended.
 
-## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend…` › `if fold.run_is_ending() {`
+## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {` › `if fold.run_is_ending() {`
 
 **An ending run offers no work, whatever else is live.**
 
@@ -425,7 +425,7 @@ the ceiling, and offered again — a run that never terminates. With
 `halted_at` set the same path returned `Dispatch { continuing: true }`: a
 halted run spawning a worker.
 
-## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend…` › `return match ceiling.run_breach(spend) {`
+## `pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {` › `return match ceiling.run_breach(spend) {`
 
 The **run** ceiling, and not the task's. `BudgetExceeded4::key` is
 "the task whose next attempt was refused. Not a failed task:
@@ -473,12 +473,12 @@ folds in "no unresolved transaction" and "run not ending", and it is false
 on a poisoned fold. `first_eligible` decides *which*, over the same three
 inputs the fold hands it.
 
-## `fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, AttemptNumber…`
+## `fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, AttemptNumber)> {`
 
 The lowest-keyed `ready_retry` task, its retained generation, and the
 attempt number the retry starts.
 
-## `fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKe…` › `let task = fold.task(key)?;`
+## `fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, AttemptNumber)> {` › `let task = fold.task(key)?;`
 
 Only a `RetainedIdle` generation is ever `ready_retry`; asking the
 class here is not a second predicate but the way this function gets
@@ -488,7 +488,7 @@ the number without inventing it.
 
 The lowest-keyed `ready` task and the generation its dispatch opens.
 
-## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, Gen…` › `if let Some(generation) = fold.open_no_attempt(key) {`
+## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {` › `if let Some(generation) = fold.open_no_attempt(key) {`
 
 **A continuation first, and it cannot compete with a fresh dispatch.**
 `T-DISPATCH`'s `authoritative_state` is "generation open
@@ -504,7 +504,7 @@ and a continuation is not a *new* dispatch. Reported as a candidate
 erratum rather than chosen here: at a wider pipeline the two can
 coexist and the packet will have to say which wins.
 
-## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, Gen…` › `let task = fold.task(key)?;`
+## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {` › `let task = fold.task(key)?;`
 
 refusals[10]: generations are dense per task, so the next one is the
 count of the ones recorded.
