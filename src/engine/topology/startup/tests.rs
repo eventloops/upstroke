@@ -1099,28 +1099,10 @@ fn scan_plans_a_retention_for_a_listing_that_did_not_answer_and_a_reclaim_for_a_
     assert!(!exists(&husk.public()), "and the bare husk is gone");
 }
 
-/// **The census-level witness for a listing that cannot be read is not here,
-/// and this is where that bites.**
-///
-/// The sequence exists and was measured: with a public directory carrying
-/// `--wx`, the classifier's `open` is refused and answers `Husk` for a
-/// committed run, `is_running` still opens `run.lock` by name and answers
-/// free, the proof finds no marker, and `unbound_shape` is handed a listing it
-/// cannot read. Driving the real `scan` and `apply` across that failure, with
-/// `unbound_shape`'s listing arm reverted to `unwrap_or_default()`, produced
-/// `the census planned ReclaimPublicOnly(Bare) on a listing it could not read
-/// and the outcome was ReclaimedPublicOnly(Bare); the committed log is GONE`.
-///
-/// It cannot be committed here. The fixture needs `fs::set_permissions`, which
-/// `clippy.toml` denies, and this module may carry no module-level allow of a
-/// governed lint — the rule this file's own header states, and the same reason
-/// [`locator_through_reparse_point_retained`] cannot plant its link. An
-/// allowlist row for this file would be a change to the effect governance, not
-/// a repair, so the shape is named here instead of quietly missing. What
-/// guards the fold in the tree is `rundir::tests::
-/// a_committed_run_the_census_could_not_read_is_not_reclaimed` at the fold
-/// itself, and [`every_retain_reason_kind_deletes_nothing`] for the census's
-/// reason-agnostic retain arm.
+/// The selective-permission composition witness lives in `rundir::tests` as
+/// `census_retains_a_committed_log_when_only_its_log_and_public_listing_are_unreadable`.
+/// That module already permits permission fixtures. It drives the real census
+/// with an unreadable committed log, a free run lock, and an unreadable listing.
 ///
 /// Every retention reason, driven through the census's retain arm.
 ///
@@ -1856,8 +1838,8 @@ fn a_public_removal_that_refuses_after_the_private_half_went_says_so() {
 /// the one writer of an arbitrary path this module can reach; a permission bit
 /// is not, because `std::fs::set_permissions` is on the effect denylist. A file
 /// gives `ENOTDIR` on Unix and `ERROR_DIRECTORY` on Windows, and neither is
-/// `NotFound` — which is the one error this function is allowed to read as an
-/// emptiness.
+/// `NotFound`. The separate missing-root witness checks the only empty answer:
+/// both directory-open and metadata probes must report that root absent.
 #[test]
 fn an_unreadable_runs_directory_refuses_rather_than_censusing_nothing() {
     let fixture = Fixture::new("unreadable-runs");
@@ -1868,8 +1850,8 @@ fn an_unreadable_runs_directory_refuses_rather_than_censusing_nothing() {
     assert!(runs.is_file(), "the runs root must be a file for this test");
 
     assert!(
-        rundir::run_dir_names(&fixture.repo).is_empty(),
-        "the swallow this test is about did not happen"
+        rundir::run_dir_names(&fixture.repo).is_err(),
+        "the enumeration itself preserves the failure"
     );
     let error = census_run_dirs(&mut rundir::NoHooks, &fixture.inputs(), None)
         .expect_err("an unreadable runs directory is not an empty one");

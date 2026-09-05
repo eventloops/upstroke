@@ -1126,8 +1126,8 @@ use steps::{
 /// What the creator left on disk, and what it tells the operator.
 ///
 /// The trichotomy T-RUNSTART's `resume_action` names, plus the append-error
-/// protocol's three answers. Every variant that does not say "removed" deletes
-/// nothing.
+/// protocol's three answers. Removal failures describe attempted cleanup and
+/// distinguish known completed halves from an unobserved partial result.
 #[derive(Debug)]
 pub enum Disposition {
     /// `RunDir.CreatePublicDir` itself failed: no run directory came to exist.
@@ -1138,6 +1138,15 @@ pub enum Disposition {
     /// through the proof-token funnel, then the public directory with the marker
     /// last.
     BothHalvesRemoved { private: PathBuf },
+    /// Public cleanup did not report success. It may have removed some or all
+    /// entries before failing, so this is not proof that the public half is gone.
+    PublicHalfRemovalFailed {
+        public: PathBuf,
+        /// The private half was successfully reclaimed when this is `Some`.
+        /// `None` means no private half was bound by the ownership proof.
+        private_removed: Option<PathBuf>,
+        detail: String,
+    },
     /// The ownership proof held and `RunDir.RemovePrivateHusk` returned an
     /// error, so **the public half was deliberately left where it is**.
     ///
@@ -1190,27 +1199,22 @@ pub enum Disposition {
 }
 
 impl Disposition {
-    /// Whether a reclaim this creator drove **completed**: the private half went
-    /// through the proof-token funnel, or nothing private was bound and the
-    /// public half alone was reclaimed.
+    /// Whether at least one half is known to have been completely removed.
     ///
-    /// **Alethic**, and [`Self::PrivateHalfRemovalFailed`] answers `false` for
-    /// that reason. It used to answer `true`, which gave it the identical pair
-    /// of answers to [`Self::PublicHalfRemoved`] — `(true, false)` — for the
-    /// opposite tree: on that arm the public half is gone and nothing private
-    /// ever existed, on this one the public half is **deliberately still on
-    /// disk** and the private half is in a state nobody observed. A caller
-    /// reading both concluded "the public half went", which is exactly wrong.
-    ///
-    /// Mixing an epistemic reading into one of two sibling predicates is what
-    /// made the arms indistinguishable, so both siblings are alethic and
-    /// [`Self::may_have_removed_the_private_half`] carries what this arm
-    /// actually knows.
+    /// A failed private removal establishes no completed removal, and leaves
+    /// the public half untouched. A failed public removal answers `true` only
+    /// when private removal already succeeded. The public removal's error does
+    /// not establish whether any public contents remain.
     #[must_use]
     pub const fn removed_anything(&self) -> bool {
         matches!(
             self,
-            Self::PublicHalfRemoved(_) | Self::BothHalvesRemoved { .. }
+            Self::PublicHalfRemoved(_)
+                | Self::BothHalvesRemoved { .. }
+                | Self::PublicHalfRemovalFailed {
+                    private_removed: Some(_),
+                    ..
+                }
         )
     }
 
@@ -1221,7 +1225,14 @@ impl Disposition {
     /// is gone.
     #[must_use]
     pub const fn removed_the_private_half(&self) -> bool {
-        matches!(self, Self::BothHalvesRemoved { .. })
+        matches!(
+            self,
+            Self::BothHalvesRemoved { .. }
+                | Self::PublicHalfRemovalFailed {
+                    private_removed: Some(_),
+                    ..
+                }
+        )
     }
 
     /// Whether the private half **may** have been removed, in whole or in part.
@@ -1238,7 +1249,12 @@ impl Disposition {
     pub const fn may_have_removed_the_private_half(&self) -> bool {
         matches!(
             self,
-            Self::BothHalvesRemoved { .. } | Self::PrivateHalfRemovalFailed { .. }
+            Self::BothHalvesRemoved { .. }
+                | Self::PrivateHalfRemovalFailed { .. }
+                | Self::PublicHalfRemovalFailed {
+                    private_removed: Some(_),
+                    ..
+                }
         )
     }
 
@@ -1248,11 +1264,11 @@ impl Disposition {
         match self {
             Self::NothingCreated => "no run directory was created".to_owned(),
             Self::PublicHalfRemoved(shape) => format!(
-                "the public run directory was reclaimed ({}); no private half existed by ordering",
+                "the public run directory was reclaimed ({}); no private half was bound",
                 match shape {
                     UnboundShape::Bare => "bare",
                     UnboundShape::StagedMarkerOnly => "only a staged marker",
-                    UnboundShape::TargetAbsent => "its recorded private half was never created",
+                    UnboundShape::TargetAbsent => "its recorded private target was absent",
                 }
             ),
             Self::BothHalvesRemoved { private } => format!(
@@ -1261,6 +1277,21 @@ impl Disposition {
                  funnel, then the public directory with the marker last",
                 private.display()
             ),
+            Self::PublicHalfRemovalFailed {
+                public,
+                private_removed,
+                detail,
+            } => {
+                let private = match private_removed {
+                    Some(path) => format!("the private half at {} was reclaimed", path.display()),
+                    None => "the proof found no bound private half".to_owned(),
+                };
+                format!(
+                    "cleanup of the public run directory at {} failed ({detail}); its removal \
+                     did not report completion and may be partial; {private}",
+                    public.display()
+                )
+            }
             Self::PrivateHalfRemovalFailed {
                 private,
                 public,
@@ -1400,6 +1431,8 @@ fn stat_after_error(aborted: &mut Aborted, hooks: &mut dyn TopologyHooks) -> Dis
     if aborted.reached == Prefix::Nothing {
         return Disposition::NothingCreated;
     }
+    // The returned disposition owns its path evidence independently of Aborted,
+    // which the caller retains to report the creation step that failed.
     let private = aborted.paths.private.clone();
     let public = aborted.paths.public.clone();
 
@@ -1471,16 +1504,24 @@ fn stat_after_error(aborted: &mut Aborted, hooks: &mut dyn TopologyHooks) -> Dis
                     detail: error.to_string(),
                 };
             }
-            // Best-effort, as today: a public removal that failed leaves a husk
-            // whose marker names an absent target, which the next census
-            // reclaims public-only, and it is not a second error to report over
-            // the one that stopped the run.
-            let _ = remove_public_husk(&public, hooks.rundir());
-            Disposition::BothHalvesRemoved { private: target }
+            match remove_public_husk(&public, hooks.rundir()) {
+                Ok(()) => Disposition::BothHalvesRemoved { private: target },
+                Err(error) => Disposition::PublicHalfRemovalFailed {
+                    public,
+                    private_removed: Some(target),
+                    detail: error.to_string(),
+                },
+            }
         }
         PrivateHalfOwnership::NothingBound(shape) => {
-            let _ = remove_public_husk(&public, hooks.rundir());
-            Disposition::PublicHalfRemoved(shape)
+            match remove_public_husk(&public, hooks.rundir()) {
+                Ok(()) => Disposition::PublicHalfRemoved(shape),
+                Err(error) => Disposition::PublicHalfRemovalFailed {
+                    public,
+                    private_removed: None,
+                    detail: error.to_string(),
+                },
+            }
         }
         // **P3a, and every other unprovable shape: nothing is removed.** Not
         // the private half, which is unprovable, and not the public half

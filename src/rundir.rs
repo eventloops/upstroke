@@ -1048,7 +1048,7 @@ pub use ownership::{PrivateHalfProof, prove_private_half_ownership};
 mod discovery;
 pub use discovery::{
     FoundQuestion, HuskDisposition, HuskReport, Reclaimable, find_question, husk_report,
-    latest_run, list_husks, list_runs, resolve_run_id, run_dir_names,
+    latest_run, list_husks, list_runs, resolve_run_id, run_dir_names, run_ids,
 };
 
 /// The lock beside one run's ops surface.
@@ -1120,6 +1120,8 @@ impl WorktreeLock {
     ) -> Result<Self, UpstrokeError> {
         let path = worktree_lock_file(worktree_git_dir);
         let claim = claim_key(worktree_git_dir).join("upstroke-worktree.lock");
+        // The process-wide claim set owns its lookup key; the returned guard
+        // retains the same key to release that claim after closing the file.
         if !claims().insert(claim.clone()) {
             return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
         }
@@ -1133,7 +1135,8 @@ impl WorktreeLock {
                     .write(true)
                     .read(true)
                     .open(&path)
-                    .map_err(|source| UpstrokeError::Io {
+                    .map_err(|source| UpstrokeError::Filesystem {
+                        operation: "open worktree lease",
                         path: path.clone(),
                         source,
                     })
@@ -1146,7 +1149,8 @@ impl WorktreeLock {
                 || match imp::take(&file) {
                     Holder::Nobody => Ok(()),
                     Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
-                    Holder::Unknown(source) => Err(UpstrokeError::Io {
+                    Holder::Unknown(source) => Err(UpstrokeError::Filesystem {
+                        operation: "acquire worktree lease",
                         path: path.clone(),
                         source,
                     }),
@@ -1167,9 +1171,22 @@ impl WorktreeLock {
                 // a reaper still settling its groups is precisely the one that
                 // died before its log committed. Scanning the readers' view
                 // would leave R28 held and unobserved for exactly that run.
-                if let Some(cleaning) = run_dir_names(repo_root)
-                    .into_iter()
-                    .map(|run_id| public_dir(repo_root, &run_id))
+                // And the enumeration itself is fail-closed: a runs directory
+                // this process could not list is not a runs directory with no
+                // run still cleaning. `run_dir_names` used to answer an empty
+                // vector for that failure, so the probe below never ran and the
+                // lease was granted over a reaper that was still active — the
+                // overlapping ownership R28 exists to refuse (PR #139 pass 5).
+                let names = match run_dir_names(repo_root) {
+                    Ok(names) => names,
+                    Err(error) => {
+                        release_claim_after_file(Some(file), &claim, || {});
+                        return Err(error);
+                    }
+                };
+                if let Some(cleaning) = names
+                    .iter()
+                    .map(|name| runs_root(repo_root).join(name))
                     .find(|public| observe_cleanup_hold(public, hooks))
                 {
                     release_claim_after_file(Some(file), &claim, || {});

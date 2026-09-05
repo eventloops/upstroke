@@ -484,18 +484,17 @@ pub(super) fn canonical_public_or_refusal(
 /// because the only place that variant is constructed is a successful equality,
 /// and the caller's `match` is exhaustive over the other two.
 ///
-/// **Two spellings are established and no third.** The two sides derive the
-/// path differently and both are legitimate:
-/// `prelock::authorized_private_root` canonicalizes the **root** — the run
-/// directory does not exist during the pre-lock checks, so there is nothing
-/// else it could canonicalize — and joins `runs/<id>`, while this side
-/// canonicalizes `<R>/runs` when it can. The raw spelling is checked first and
-/// needs no I/O at all, which is what keeps the legitimate `TargetAbsent`
-/// answer reachable at P1, when the marker is published and `<R>/runs` may not
-/// exist yet.
+/// The proof checks three locator forms using path equality:
+///
+/// - Raw `<R>/runs/<id>`, which needs no I/O and permits `TargetAbsent` at P1.
+/// - The canonical root joined with `runs/<id>`. This is what
+///   `prelock::authorized_private_root` records, including when the configured
+///   root reaches its real path through a link and `runs` does not yet exist.
+/// - Canonical `<R>/runs` joined with `<id>`, which also resolves a link at
+///   `runs` itself.
 enum LocatorIdentity {
     /// The recorded locator is this run's child of the authorized runs
-    /// directory, in one of the two spellings that name it.
+    /// directory, in one of the three spellings that name it.
     Established,
     /// It is some other path, and this is the one it should have been.
     Refused { expected: PathBuf },

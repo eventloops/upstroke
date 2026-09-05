@@ -125,8 +125,14 @@ fn runs_list_chronologically_and_resolve_by_prefix() {
     for id in ["01AAA", "01BBB", "01BCC"] {
         commit_run(&repo, id);
     }
-    assert_eq!(list_runs(&repo), ["01AAA", "01BBB", "01BCC"]);
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BCC"));
+    assert_eq!(
+        list_runs(&repo).expect("run directories list"),
+        ["01AAA", "01BBB", "01BCC"]
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BCC")
+    );
 
     assert_eq!(resolve_run_id(&repo, "01AAA").expect("exact"), "01AAA");
     assert_eq!(resolve_run_id(&repo, "01A").expect("prefix"), "01AAA");
@@ -1659,8 +1665,16 @@ fn every_reader_returns_committed_directories_only() {
     fs::create_dir_all(&questions).expect("questions");
     fs::write(questions.join("q-REAL.json"), "{}").expect("question");
 
-    assert_eq!(list_runs(&repo), ["01BBBRUN"], "list_runs");
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BBBRUN"), "latest_run");
+    assert_eq!(
+        list_runs(&repo).expect("run directories list"),
+        ["01BBBRUN"],
+        "list_runs"
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BBBRUN"),
+        "latest_run"
+    );
     assert_eq!(
         resolve_run_id(&repo, "01BBBRUN").expect("the committed run resolves"),
         "01BBBRUN"
@@ -1683,10 +1697,10 @@ fn every_reader_returns_committed_directories_only() {
 
     // And the husks are still there: a reader observes, it never reclaims.
     assert_eq!(
-        list_husks(&repo),
+        list_husks(&repo).expect("run directories list"),
         ["01AAAHUSK", "01ZZZHUSK", "01ZZZMALFORMED"]
     );
-    assert_eq!(run_dir_names(&repo).len(), 4);
+    assert_eq!(run_dir_names(&repo).expect("run directories list").len(), 4);
 }
 
 #[test]
@@ -1709,9 +1723,12 @@ fn a_committed_run_is_never_excluded_because_of_a_marker() {
     );
     fs::create_dir_all(runs_root(&repo).join("01ZZZHUSK")).expect("newer husk");
 
-    assert_eq!(list_runs(&repo), ["01AAAMARKED", "01BBBSTAGED"]);
     assert_eq!(
-        latest_run(&repo).as_deref(),
+        list_runs(&repo).expect("run directories list"),
+        ["01AAAMARKED", "01BBBSTAGED"]
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
         Some("01BBBSTAGED"),
         "a committed-but-marked run is the latest run, and a husk newer \
              than it does not become one"
@@ -1731,9 +1748,13 @@ fn latest_run_skips_a_husk_that_would_otherwise_shadow_it() {
     // longer listed". Asserted from the shadowing direction, because that
     // is the operator-visible symptom.
     let repo = repo_with_a_committed_run_between_two_husks("shadow");
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BBBRUN"));
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BBBRUN")
+    );
     assert!(
         run_dir_names(&repo)
+            .expect("run directories list")
             .last()
             .is_some_and(|last| last == "01ZZZHUSK"),
         "the husk really is the newest directory, so the skip is doing work"
@@ -3264,24 +3285,23 @@ fn a_lossy_public_path_does_not_satisfy_the_owner_record() {
     }
 }
 
-/// A directory whose name is not valid UTF-8 is **skipped**, not enumerated as
-/// a mangled twin of its neighbour.
+/// The enumeration returns every name exactly, and the run-id view skips a
+/// name that is not valid UTF-8 rather than mangling it.
 ///
 /// `run_dir_names` mapped each entry through `to_string_lossy()` and
-/// `engine::topology::startup::scan` rebuilds a path from the result, so a
+/// `engine::topology::startup::scan` rebuilt a path from the result, so a
 /// directory named `x` + `0xff` was enumerated as `x` + `U+FFFD`: the census
 /// inspected a directory that does not exist while the real one was never
 /// inspected, and where both names existed the valid one was scanned twice and
-/// the other not at all. The filter is UTF-8 validity and nothing more —
-/// `x` + `U+FFFD` is a perfectly good return value here and is not a run id —
-/// so what this asserts is the property the census actually needs: every name
-/// the enumeration returns opens the entry it was read from. A run id is a
-/// ULID, so nothing this engine created is ever skipped.
+/// the other not at all. Now the enumeration is exact — every name it returns
+/// opens the entry it was read from — and `run_ids` is the UTF-8 restriction:
+/// `x` + `U+FFFD` *is* a run-id candidate (it is not a ULID either; callers
+/// filter as they always did) and the raw name is not.
 ///
 /// Linux only, for the reason given above.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_run_directory_name_that_is_not_utf8_is_skipped_rather_than_mangled() {
+fn a_run_directory_name_that_is_not_utf8_is_enumerated_exactly_and_skipped_as_a_run_id() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let root = scratch("nonutf8-enumeration");
@@ -3293,10 +3313,11 @@ fn a_run_directory_name_that_is_not_utf8_is_skipped_rather_than_mangled() {
     fs::create_dir(runs.join("x\u{FFFD}")).expect("its lossy twin");
     fs::create_dir(runs.join("01REALRUN00000000000000000")).expect("an ordinary run directory");
 
-    let names = run_dir_names(&repo);
+    let names = run_dir_names(&repo).expect("the runs directory lists");
+    assert_eq!(names.len(), 3, "every directory, exactly once: {names:?}");
     assert!(
         names.iter().all(|name| runs.join(name).is_dir()),
-        "every name the enumeration returns must name the directory it came from: {names:?}"
+        "every name the enumeration returns must open the entry it came from: {names:?}"
     );
     let mut distinct = names.clone();
     distinct.sort_unstable();
@@ -3306,14 +3327,537 @@ fn a_run_directory_name_that_is_not_utf8_is_skipped_rather_than_mangled() {
         names.len(),
         "two directories collapsed to one name: {names:?}"
     );
+
+    let ids = run_ids(&repo).expect("the run-id view lists");
     assert_eq!(
-        names,
+        ids,
         vec![
             "01REALRUN00000000000000000".to_owned(),
             "x\u{FFFD}".to_owned()
         ],
-        "the raw-named directory is skipped, and its valid twin is returned once"
+        "the raw-named directory is not a run id and is skipped; its valid twin is returned once"
     );
+}
+
+/// A runs directory that cannot be listed is **not** a runs directory with no
+/// run still cleaning: the worktree lease refuses rather than assumes.
+///
+/// Pass 5 of this pull request's review wrote the harm chain down. A killed
+/// conductor's Unix reaper deliberately retains the old run's cleanup lease;
+/// the next coordinator takes the primary worktree lease and then probes every
+/// run directory for that hold — through `run_dir_names`, which answered an
+/// empty vector when the directory could not be listed. So the probe never
+/// ran, and the lease was granted over a reaper that was still active: the
+/// overlapping engine ownership R28 exists to refuse. This is the class this
+/// pull request closes, surviving in the one caller whose empty answer decides
+/// ownership.
+///
+/// Unix only, precondition asserted: the runs directory is made unsearchable so
+/// its listing fails, and a process privileged enough to ignore that fails here
+/// rather than passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_runs_directory_that_cannot_be_listed_refuses_the_worktree_lease() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "unlistable-runs-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(&runs).expect("the runs root");
+    let permissions = RestoreFixturePermissions::set(&runs, 0o000);
+    assert_eq!(
+        fs::read_dir(&runs)
+            .expect_err("fixture permissions must prevent enumeration")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    let outcome = WorktreeLock::acquire_in(&repo, &git_dir);
+    drop(permissions);
+
+    match outcome {
+        Err(UpstrokeError::Filesystem {
+            operation,
+            path,
+            source,
+        }) => {
+            assert_eq!(operation, "enumerate directory");
+            assert_eq!(path, runs);
+            assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+        }
+        Err(other) => panic!("refused for the wrong reason: {other}"),
+        Ok(_lock) => {
+            panic!(
+                "the lease was granted over a runs directory nobody could list — R28 was never probed"
+            )
+        }
+    }
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect("the refused acquisition released its file and process claim"),
+    );
+}
+
+#[test]
+fn an_absent_runs_root_allows_the_first_worktree_lease_and_empty_readers() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "first-worktree-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    assert_eq!(
+        fs::symlink_metadata(runs_root(&repo))
+            .expect_err("no runs root")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(
+        run_dir_names(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert!(
+        list_runs(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert!(
+        list_husks(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert_eq!(latest_run(&repo).expect("actual absence is empty"), None);
+    let first = WorktreeLock::acquire_in(&repo, &git_dir).expect("first acquisition succeeds");
+    drop(first);
+    drop(WorktreeLock::acquire_in(&repo, &git_dir).expect("a later acquisition succeeds"));
+}
+
+#[test]
+fn a_partial_run_directory_iterator_never_returns_a_partial_answer() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "partial-run-listing")
+        .expect("a unique scratch tree");
+    let candidate = root.path().join("01OBSERVED");
+    fs::create_dir(&candidate).expect("the first directory can be inspected");
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+        let entries = [
+            Ok((OsString::from("01OBSERVED"), candidate.clone())),
+            Err(io::Error::new(
+                kind,
+                "the next directory entry could not be read",
+            )),
+        ];
+        let error = discovery::collect_run_directories(root.path(), entries)
+            .expect_err("a completed prefix is not a completed enumeration");
+        match error {
+            UpstrokeError::Filesystem {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "enumerate run directories in");
+                assert_eq!(path, root.path());
+                assert_eq!(source.kind(), kind);
+            }
+            other => panic!("the enumeration error lost its context: {other}"),
+        }
+    }
+    let disappeared = root.path().join("02DISAPPEARED");
+    let error = discovery::collect_run_directories(
+        root.path(),
+        [
+            Ok((OsString::from("01OBSERVED"), candidate)),
+            Ok((OsString::from("02DISAPPEARED"), disappeared.clone())),
+        ],
+    )
+    .expect_err("an entry that disappeared is not a completed enumeration");
+    match error {
+        UpstrokeError::Filesystem {
+            operation,
+            path,
+            source,
+        } => {
+            assert_eq!(operation, "inspect run directory entry");
+            assert_eq!(path, disappeared);
+            assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        }
+        other => panic!("the metadata error lost its context: {other}"),
+    }
+}
+
+#[test]
+fn unreadable_run_enumeration_is_reported_by_every_reader() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "reader-enumeration-error")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    fs::write(&runs, b"a file cannot be enumerated").expect("the unreadable runs root");
+    let errors = [
+        run_dir_names(&repo).expect_err("exact-name enumeration fails"),
+        list_runs(&repo).expect_err("committed-run enumeration fails"),
+        list_husks(&repo).expect_err("husk enumeration fails"),
+        latest_run(&repo).expect_err("latest-run lookup fails"),
+        resolve_run_id(&repo, "01").expect_err("run-id resolution fails"),
+        find_question(&repo, "q").expect_err("question lookup fails"),
+        crate::status::load(&repo, None)
+            .err()
+            .expect("latest status fails"),
+        crate::status::load(&repo, Some("01"))
+            .err()
+            .expect("named status fails"),
+    ];
+    for error in errors {
+        match error {
+            UpstrokeError::Filesystem {
+                operation, path, ..
+            } => {
+                assert_eq!(operation, "enumerate directory");
+                assert_eq!(path, runs);
+            }
+            other => panic!("a reader converted an enumeration failure: {other}"),
+        }
+    }
+}
+
+#[test]
+fn capacity_reports_an_unreadable_runs_root_as_a_warning() {
+    struct NoAdapters;
+    impl crate::agent::AdapterSource for NoAdapters {
+        fn get(&self, _id: &str) -> Option<&dyn crate::agent::AgentAdapter> {
+            panic!("the empty pool fixture must not request an agent adapter");
+        }
+    }
+
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "capacity-discovery-error")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    fs::write(&runs, b"not a directory").expect("unreadable runs root");
+    let config_path = tree.path().join("config.toml");
+    let pools_path = tree.path().join("pools.toml");
+    fs::write(&config_path, "").expect("empty explicit configuration");
+    fs::write(&pools_path, "").expect("empty explicit pools");
+    let options = crate::capacity::CapacityOptions {
+        config_path: Some(config_path),
+        pools_path: Some(pools_path),
+        repo_root: repo,
+    };
+    let report =
+        crate::capacity::report(&options, &NoAdapters).expect("capacity can report signals only");
+    assert!(report.run_id.is_none());
+    assert!(report.pools.is_empty());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not discover runs")
+                && warning.contains(&runs.display().to_string())),
+        "the failed observation is reported: {:?}",
+        report.warnings
+    );
+    fs::remove_file(&runs).expect("restore actual absence");
+    let report = crate::capacity::report(&options, &NoAdapters).expect("capacity without runs");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("could not discover runs"))
+    );
+}
+
+#[test]
+fn question_directory_enumeration_failure_is_reported() {
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "question-directory-error")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let public = commit_run(&repo, "01QUESTIONS");
+    let questions = public.join("questions");
+    fs::write(&questions, b"not a directory").expect("unreadable questions directory");
+    match find_question(&repo, "Q").expect_err("question enumeration must fail") {
+        UpstrokeError::Filesystem {
+            operation, path, ..
+        } => {
+            assert_eq!(operation, "enumerate directory");
+            assert_eq!(path, questions);
+        }
+        other => panic!("the question enumeration error lost its context: {other}"),
+    }
+    fs::remove_file(&questions).expect("restore actual absence");
+    assert!(matches!(
+        find_question(&repo, "Q"),
+        Err(UpstrokeError::Refused { .. })
+    ));
+    fs::create_dir(&questions).expect("a real questions directory");
+    fs::write(questions.join("QREAL.json"), b"{}").expect("a question entry");
+    assert_eq!(
+        find_question(&repo, "Q")
+            .expect("the real question")
+            .question_id,
+        "QREAL"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_question_name_does_not_become_a_lossy_identifier() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "question-exact-name")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let public = commit_run(&repo, "01QUESTIONS");
+    let questions = public.join("questions");
+    fs::create_dir(&questions).expect("a questions directory");
+    let raw = questions.join(OsStr::from_bytes(b"Q\xff.json"));
+    fs::write(&raw, b"{}").expect("an entry that cannot be a UTF-8 question identifier");
+    assert!(raw.file_name().expect("raw filename").to_str().is_none());
+    fs::write(questions.join("QREAL.json"), b"{}").expect("the valid question entry");
+    let found = find_question(&repo, "Q").expect("only the exact UTF-8 identifier matches");
+    assert_eq!(found.question_id, "QREAL");
+    assert!(
+        found
+            .public
+            .join("questions")
+            .join(format!("{}.json", found.question_id))
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_directory_link_is_an_error_for_enumeration_and_worktree_ownership() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "dangling-run-listing")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let runs = runs_root(&repo);
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    std::os::unix::fs::symlink(root.path().join("absent"), &runs).expect("dangling runs-root link");
+    assert!(
+        run_dir_names(&repo).is_err(),
+        "an existing link is not absence"
+    );
+    assert!(WorktreeLock::acquire_in(&repo, &git_dir).is_err());
+    fs::remove_file(&runs).expect("remove the fixture link");
+    fs::create_dir(&runs).expect("a real runs directory");
+    let entry = runs.join("01DANGLING");
+    std::os::unix::fs::symlink(root.path().join("absent"), &entry).expect("dangling entry link");
+    assert!(
+        run_dir_names(&repo).is_err(),
+        "entry metadata failure is not a file"
+    );
+    assert!(WorktreeLock::acquire_in(&repo, &git_dir).is_err());
+    fs::remove_file(&entry).expect("remove the fixture entry");
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect("both refusal paths released the primary lease and process claim"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cleanup_lease_renamed_to_a_non_utf8_directory_still_refuses_worktree_ownership() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "nonutf8-cleanup-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let original = public_dir(&repo, "01LIVE");
+    fs::create_dir_all(&original).expect("the original public directory");
+    let mut reaper = readiness::Producer::adopt(
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "rundir::tests::cleanup_hold_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_TEST_CLEANUP_DIR", &original)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the surviving cleanup holder"),
+    );
+    reaper
+        .await_line("held", Duration::from_secs(30))
+        .or_fail("the reaper never acquired its cleanup lease");
+    let renamed = runs_root(&repo).join(OsStr::from_bytes(b"x\xff"));
+    fs::rename(&original, &renamed).expect("rename the held directory without releasing its lease");
+    let twin = public_dir(&repo, "x\u{fffd}");
+    fs::create_dir(&twin).expect("the distinct UTF-8 neighbor");
+    assert!(renamed.file_name().expect("a filename").to_str().is_none());
+    assert!(
+        observe_cleanup_hold(&renamed, &mut NoHooks),
+        "the original lease is still held"
+    );
+    assert!(
+        !observe_cleanup_hold(&twin, &mut NoHooks),
+        "the UTF-8 neighbor has no lease"
+    );
+    let error = WorktreeLock::acquire_in(&repo, &git_dir)
+        .expect_err("the exact-name lease prevents overlapping ownership");
+    assert!(
+        error.to_string().contains("still cleaning agent processes"),
+        "{error}"
+    );
+    assert!(
+        observe_cleanup_hold(&renamed, &mut NoHooks),
+        "refusal returned while the lease was held"
+    );
+    drop(reaper);
+    assert!(!observe_cleanup_hold(&renamed, &mut NoHooks));
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir).expect("the released lease permits acquisition"),
+    );
+}
+
+/// Restore fixture permissions before the scratch tree is reclaimed, including
+/// when a witness fails. A disappeared name can be the mutation's failure.
+#[cfg(unix)]
+struct RestoreFixturePermissions {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl RestoreFixturePermissions {
+    fn set(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = fs::metadata(path)
+            .expect("read original fixture permissions")
+            .permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .expect("set fixture permissions");
+        Self {
+            path: path.to_path_buf(),
+            permissions,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreFixturePermissions {
+    fn drop(&mut self) {
+        if let Err(error) = fs::set_permissions(&self.path, self.permissions.clone()) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return;
+            }
+            if std::thread::panicking() {
+                eprintln!(
+                    "could not restore fixture permissions at {}: {error}",
+                    self.path.display()
+                );
+            } else {
+                panic!(
+                    "could not restore fixture permissions at {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Selective permission failures leave run.lock observable, so the actual
+/// census reaches ownership proof. A deletion hook restores listing access
+/// only if a broken scan requests deletion, exposing loss of the committed log.
+#[cfg(unix)]
+#[test]
+fn census_retains_a_committed_log_when_only_its_log_and_public_listing_are_unreadable() {
+    use crate::engine::topology::startup::{CensusInputs, RunDirOutcome, census_run_dirs};
+    use crate::runner::container::runtime::ContainerTrace;
+    use crate::runner::container::{DisposableDirView, FakeOwnerLiveness, FakeRuntime};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct RestoreBeforeDeletion<'a> {
+        public: &'a Path,
+        deletions: usize,
+    }
+    impl RunDirHooks for RestoreBeforeDeletion<'_> {
+        fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if phase == HookPhase::Before
+                && matches!(site, EffectSiteId::RunDir(RunDirSite::RemovePublicHusk))
+            {
+                self.deletions += 1;
+                fs::set_permissions(self.public, fs::Permissions::from_mode(0o700))
+                    .expect("restore listing before a mistaken deletion");
+            }
+            Injection::Proceed
+        }
+    }
+
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "census-permission-composition")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let run_id = "01COMMITTED";
+    let public = commit_run(&repo, run_id);
+    let log = public.join(EVENT_LOG);
+    let bytes = fs::read(&log).expect("the committed log bytes");
+    fs::write(lock_file(&public), b"").expect("a free observable run lock");
+    assert_eq!(classify_run_dir(&public), RunDirClass::Committed);
+    let worktree = WorktreeLock::acquire_in(&repo, &git_dir).expect("the census owns the worktree");
+    let log_permissions = RestoreFixturePermissions::set(&log, 0o000);
+    let public_permissions = RestoreFixturePermissions::set(&public, 0o300);
+    assert_eq!(
+        fs::read(&log).expect_err("log read must be denied").kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::read_dir(&public)
+            .expect_err("listing must be denied")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        !is_running(&public),
+        "the run lock remains observable and free"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Husk,
+        "the classifier reaches the proof route"
+    );
+    let runtime = FakeRuntime::new(ContainerTrace::off());
+    let liveness = FakeOwnerLiveness::new();
+    let view = DisposableDirView::new(ContainerTrace::off());
+    let repo_key = RepoKey::v1(&git_dir);
+    let authorized_root = root.path().join("private");
+    let inputs = CensusInputs {
+        repo_root: &repo,
+        repo_key: &repo_key,
+        authorized_root: &authorized_root,
+        incarnation: "01TESTINCARNATION",
+        runtime: &runtime,
+        liveness: &liveness,
+        view: &view,
+    };
+    let mut hooks = RestoreBeforeDeletion {
+        public: &public,
+        deletions: 0,
+    };
+    let result = census_run_dirs(&mut hooks, &inputs, None);
+    drop(public_permissions);
+    drop(log_permissions);
+    let report = result.expect("the runs root itself remains enumerable");
+    let entry = report
+        .of(run_id)
+        .expect("the real census inspected this run");
+    assert_eq!(fs::read(&log).expect("the committed log survives"), bytes);
+    match &entry.outcome {
+        RunDirOutcome::Retained(reason) => assert_eq!(reason.kind(), "listing-unreadable"),
+        other => panic!("the real census failed to retain unobserved state: {other:?}"),
+    }
+    assert_eq!(hooks.deletions, 0, "retention performs no deletion effect");
+    assert!(
+        runtime.calls().is_empty(),
+        "run-directory census performs no container effects"
+    );
+    drop(worktree);
 }
 
 /// A private target the census cannot ask about is not a target that is
@@ -4180,7 +4724,7 @@ fn a_surviving_reaper_hold_refuses_the_next_coordinator_until_released() {
     fs::create_dir_all(&husk).expect("husk");
     assert_eq!(classify_run_dir(&husk), RunDirClass::Husk);
     assert!(
-        list_runs(&repo).is_empty(),
+        list_runs(&repo).expect("run directories list").is_empty(),
         "the reader does not return it, which is the point"
     );
 
