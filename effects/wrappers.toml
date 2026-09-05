@@ -694,9 +694,10 @@ effect_free = [
 # `effects/allowlist.toml` row.
 #
 # `crate_path` is EMPTY for all three, because each is a private `mod`. The
-# schema says so at `src/effects/tests.rs:327` -- "the path a denied entry would
-# name this module by, or empty when the module is not reachable from outside
-# its parent (a private `mod`, or the binary crate root)" -- and
+# `ModuleClassification`'s `crate_path` contract in
+# `docs/internals/effects/tests.md` says the path is empty when the module is
+# not reachable from outside its parent, including a private `mod` or the
+# binary crate root, and
 # `src/engine/{coordinator,resume,attempt,preflight}.rs` are the tree's
 # convention. An earlier revision of this note recorded
 # `upstroke::runner::host::probe` and argued the value was harmless because the
