@@ -3,7 +3,7 @@ id: SWEEP-GRAPH-009
 severity: P3
 disposition: deferred
 category: correctness
-pr: 166
+pr: 167
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/plan/markdown/assemble.rs:134
 provenance: pre_existing
@@ -36,7 +36,7 @@ recorded producer and warns:
 task `b` needs artifact `contract` produced by `d1` but does not depend on it (directly or transitively)
 ```
 
-Measured through the adapter at the reviewed SHA (PR 166, Validation, `PROBE`): the parsed plan
+Measured through the adapter at the reviewed SHA (PR 167, Validation, `PROBE`): the parsed plan
 carries one artifact, `contract` produced by `d1`; the adapter emits no warning; the graph check
 emits the line above. The author wired `b` to the task that produces what it needs and is told the
 opposite; and a plan in which two tasks genuinely produce the same artifact — a conflict the design
