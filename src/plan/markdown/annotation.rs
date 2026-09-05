@@ -1,30 +1,13 @@
-//! The `<!-- upstroke: ... -->` grammar, and the machinery that finds it.
-//!
-//! Two halves. The first extracts comments from pulldown-cmark HTML events —
-//! annotations are read from the event stream, never regexed out of raw text,
-//! and because the parser emits one event per line inside an HTML block a
-//! multi-line comment is only whole once consecutive events are joined. The
-//! second parses the `key=value` attributes of an upstroke comment into an
-//! [`Annotation`]. Unknown keys and unparseable values warn and never error.
-//!
-//! A source of the DAG, not a sink: nothing here reads a section, a draft or a
-//! hint.
+//! Extended notes: `docs/internals/plan/markdown/annotation.md`
 
 use std::ops::Range;
 
 use crate::ir::{TaskKind, Tier};
 
-/// The body of a `<!-- upstroke: ... -->` comment, or `None` for ordinary
-/// author comments.
 pub(super) fn upstroke_body(inner: &str) -> Option<&str> {
     inner.trim().strip_prefix("upstroke:")
 }
 
-/// Accumulates consecutive HTML events before scanning for annotations:
-/// pulldown-cmark emits one event per line inside an HTML block, so a
-/// multi-line `<!-- upstroke: ... -->` comment is only complete once its
-/// neighbours are joined. Consecutive events are contiguous in the source, so
-/// buffer offsets map linearly back to absolute spans.
 #[derive(Default)]
 pub(super) struct HtmlAccumulator {
     buffer: String,
@@ -39,7 +22,6 @@ impl HtmlAccumulator {
         self.buffer.push_str(text);
     }
 
-    /// Complete comments in the buffer, as (absolute span, inner text).
     pub(super) fn take_comments(&mut self) -> Vec<(Range<usize>, String)> {
         if self.buffer.is_empty() {
             return Vec::new();
@@ -53,7 +35,6 @@ impl HtmlAccumulator {
                 )
             })
             .collect();
-        // Keep a trailing partial comment buffered for the next event.
         match self.buffer.rfind("<!--") {
             Some(open) if !self.buffer[open..].contains("-->") => {
                 self.start += open;
@@ -67,7 +48,6 @@ impl HtmlAccumulator {
     }
 }
 
-/// First-wins annotation intake shared by the section and checklist paths.
 #[derive(Default)]
 pub(super) struct AnnotationSink {
     pub(super) annotation: Option<Annotation>,
@@ -85,16 +65,10 @@ impl AnnotationSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Annotation grammar
-// ---------------------------------------------------------------------------
-
 #[derive(Default, Clone)]
 pub(super) struct Annotation {
     pub(super) id: Option<String>,
     pub(super) kind: Option<TaskKind>,
-    /// `Some(vec![])` means `depends=` — explicitly no dependencies, breaking
-    /// the document-order default chain. `None` means the attribute is absent.
     pub(super) depends: Option<Vec<String>>,
     pub(super) tier: Option<Tier>,
     pub(super) min: Option<Tier>,
@@ -155,7 +129,6 @@ fn non_empty(value: &str) -> Option<String> {
 }
 
 pub(super) struct HtmlComment<'a> {
-    /// Span within the HTML event text, including the delimiters.
     span: Range<usize>,
     pub(super) inner: &'a str,
 }
