@@ -219,6 +219,32 @@ impl RunState {
                 detail: format!("generation {} is still {}", open.id.0, open.class.name()),
             });
         }
+        // **A task whose candidate is queued is not dispatched again.** Its
+        // work is `AwaitingMerge` until integration or repair (`DESIGN.md`
+        // §14), and `ready` already carries `!queue.holds_task(key)`; this door
+        // asks the same question, because the state alone does not. A bare
+        // question answered on a queued task returns it to `Pending` while the
+        // candidate keeps its place (the return state is
+        // `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`), and the pass-2 review of
+        // `784449e` dispatched a second generation through that gap, merged
+        // the queued candidate under it, and interrupted the attempt back to
+        // `Pending` — merged work run again. The queue position, not the
+        // state, is what says the task has work awaiting integration.
+        if let Some(queued) = self
+            .queue
+            .entries()
+            .iter()
+            .find(|entry| entry.key() == dispatched.key)
+        {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "task {} holds a queued candidate, generation {}, and is dispatched again \
+                     only once that candidate is integrated or rejected",
+                    dispatched.key.0, queued.candidate.generation.0
+                ),
+            });
+        }
         // refusals[10]: generations are dense per task.
         if usize::try_from(dispatched.generation.0).unwrap_or(usize::MAX) != task.generations.len()
         {

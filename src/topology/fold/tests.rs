@@ -7497,11 +7497,15 @@ fn an_answer_applies_only_to_a_task_still_parked_with_nothing_open() {
     // `AwaitingInput` with no open generation, because that is the state
     // `apply_answer`'s two effects are written against.
     //
-    // **Constructed, not folded.** With the raise-time doors shut no legal
-    // log reaches these states, which is the point; the states are the ones
-    // the pass-1 sequences produced at `15c37e4` — an attempt started under
-    // an open question, and a task merged under one — built by hand the way
-    // the derived-outcome grid builds its shapes.
+    // **Constructed, not folded, and therefore live-only.** With the
+    // raise-time doors shut no legal log reaches these states, which is the
+    // point; the states are the ones the pass-1 sequences produced at
+    // `15c37e4` — an attempt started under an open question, and a task
+    // merged under one — built by hand the way the derived-outcome grid
+    // builds its shapes. A state no log reaches cannot be replayed, so this
+    // test asserts the live refusal alone; the replay half of the invariant
+    // is carried by the three log-driven tests above through
+    // `refused_live_and_on_replay`.
     let generation = |class: GenerationClass| GenerationFold {
         id: GenerationId(0),
         class,
@@ -7607,6 +7611,75 @@ fn an_answer_applies_only_to_a_task_still_parked_with_nothing_open() {
             },
         ),
     );
+}
+
+#[test]
+fn a_task_whose_candidate_is_queued_is_not_dispatched_again() {
+    // **Pre-repair: accepted.** The pass-2 review of `784449e` drove it: a
+    // bare question on a queued task, answered, returned the task to
+    // `Pending` with its candidate still queued (the return state is
+    // `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`); `check_dispatched` asked the
+    // state and the open generation and nothing about the queue, so a second
+    // generation was dispatched, the queued candidate merged under it, and
+    // `attempt_interrupted` returned the merged task to `Pending`, from which
+    // a third generation ran the merged work again. `ready` has always
+    // carried `!queue.holds_task(key)`; this is the door asking the same
+    // question, live and on replay.
+    let base = sha("base");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            raised("q-park-Ünicode", ALPHA),
+            answered(
+                ALPHA,
+                "q-park-Ünicode",
+                Answer4::Answered {
+                    option_index: 0,
+                    binding_override: None,
+                },
+            ),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+    // The state the answer leaves — and the queue position it does not touch.
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::Pending));
+    assert!(fold.queue().is_some_and(|queue| queue.holds_task(ALPHA)));
+    assert!(
+        !fold.ready(ALPHA),
+        "`ready` has always refused a queued task"
+    );
+    let error = refused_live_and_on_replay(&fold, &log, &dispatch(ALPHA, 1, &base));
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("a dispatch of a queued task is refused as one: {error}");
+    };
+    assert_eq!(kind, "task_dispatched");
+    assert!(detail.contains("generation 0"), "{detail}");
+
+    // The candidate keeps its place and integrates; the task ends `Merged`
+    // and, being terminal, is refused a dispatch on that ground instead.
+    let mut integrated = fold.clone();
+    apply(
+        &mut integrated,
+        &fast_publication(ALPHA, 0, 0, &base, vec![ALPHA]),
+    );
+    apply(&mut integrated, &merged(ALPHA, 0, 0, vec![ALPHA]));
+    assert_eq!(integrated.task_state(ALPHA), Some(TaskState::Merged));
+    assert!(matches!(
+        refuse(&integrated, &dispatch(ALPHA, 1, &base)),
+        FoldError::WrongTaskState {
+            state: "merged",
+            ..
+        }
+    ));
 }
 
 #[test]
