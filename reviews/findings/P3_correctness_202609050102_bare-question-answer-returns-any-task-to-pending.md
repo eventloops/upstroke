@@ -8,7 +8,7 @@ reviewed_sha: 807b6057bcfa5c6772b3969edd82881c47232277
 location: src/topology/fold/apply.rs:499
 provenance: pre_existing
 first_bad:
-guard: the `src/topology/fold/apply.rs` sweep (queue row 29), or a follow-on that records in `OpenQuestion` the state a bare question parked its task from
+guard: `src/topology/fold/apply.rs`, queue row 29 of `standards/SWEEP.md`; whoever takes that row inherits this, and the remedy is `OpenQuestion` recording the state a bare question parked its task from
 ---
 
 ## Failure sequence
@@ -44,6 +44,17 @@ No run wedges and no lease leaks: the repair's `task_merged` satisfies the origi
 to `Merged`, and `structurally_admissible` never selects the original because `ready` is
 lease-blocked. That is why this is P3 and not the P1/P2 shape #153 fixed, where the answer's
 return state was applied to a task holding an open generation.
+
+## What #153 closes, and what it does not
+
+#153 refuses a bare `question_raised` against a task with an open generation and against a
+terminal task. **It does not refuse the sequence above**: `AwaitingRepair`, `AwaitingMerge` and
+`Deferred` are non-terminal states with no open generation, and the refusal admits them on
+purpose — `engine/topology/select/tests.rs` parks a queued candidate's task with exactly this
+event. So this row is a second consequence of the same unguarded input, and it is live after
+#153, not closed by it. It fires only from a bare `question_raised`, which no schema-4 emitter
+constructs today; the other three paths that open a question return their task to the state
+they took it from.
 
 ## What the change that takes this up should do
 
