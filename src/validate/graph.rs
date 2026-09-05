@@ -1,18 +1,5 @@
-//! The plan's dependency graph, as `analyze` checks it: duplicate ids, unknown
-//! `depends` targets, cycles, and the artifact wiring that only warns.
-//!
-//! Split out of `super` unchanged — every function here is the one that stood
-//! beside `analyze_captured`, moved rather than rewritten, and `check_graph` is
-//! still the single entry point it calls.
-//!
-//! **The denial is restored rather than inherited.** `super` carries
-//! `#![allow(clippy::disallowed_methods)]` because `write_normalized_json`
-//! writes the normalized plan with `fs::write`, and a module-level allow reaches
-//! every child of the module it sits in. Nothing here writes anything — these
-//! are pure functions over a parsed [`Plan`] — so that allowance has no business
-//! extending here, and this line is what stops it. That is also what keeps this
-//! file out of `effects/allowlist.toml`: an allowance is what that file records,
-//! and this module takes none.
+//! Extended notes: `docs/internals/validate/graph.md`
+
 #![deny(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
@@ -20,9 +7,6 @@ use std::collections::BTreeMap;
 use crate::error::{UpstrokeError, ValidationErrors};
 use crate::ir::{Plan, Task, TaskId};
 
-/// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
-/// broken plan reports everything in one run. On a clean graph, artifact
-/// wiring that contradicts the dependency order is surfaced as warnings.
 pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {
     let mut problems = Vec::new();
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
@@ -41,7 +25,6 @@ pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(),
             }
         }
     }
-    // Cycle detection only makes sense on a graph whose edges all resolve.
     if problems.is_empty() {
         if let Some(cycle) = find_cycle(plan) {
             problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
@@ -54,9 +37,6 @@ pub(super) fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(),
     Ok(())
 }
 
-/// A task that `needs` an artifact should depend — directly or transitively —
-/// on its producer, or execution order cannot guarantee the artifact exists.
-/// The plan is frozen (§5), so this warns rather than inventing edges.
 fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
     let index = index_by_id(plan);
     for task in &plan.tasks {
@@ -66,7 +46,6 @@ fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
                 .iter()
                 .find(|a| a.id == *needed)
                 .and_then(|a| a.produced_by.as_ref());
-            // Unknown producers already warned during parsing.
             let Some(producer) = producer else { continue };
             if *producer != task.id && !depends_transitively(&index, &task.id, producer) {
                 warnings.push(format!(
@@ -79,7 +58,6 @@ fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
     }
 }
 
-/// Id → task, built once per pass and shared by the graph checks.
 fn index_by_id(plan: &Plan) -> BTreeMap<&str, &Task> {
     plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect()
 }

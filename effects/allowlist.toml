@@ -919,8 +919,9 @@ lib.rs/main.rs". `src/lib.rs` is deliberately NOT in this file, so a crate-level
 allow there fails the scan."""
 shrinks_when = "the CLI reports through a sink the engine owns rather than through the print macros."
 # `disallowed_types` is the union-over-platforms case this file's header
-# predicts: `src/main.rs:1085` is a `#[cfg(windows)]` test that builds a
-# `std::process::Command`, invisible to a Unix clippy run and caught by
+# predicts: `src/main.rs`'s Windows-only test
+# `a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not`
+# builds a `std::process::Command`, invisible to a Unix clippy run and caught by
 # `cargo clippy --target x86_64-pc-windows-msvc`.
 
 [[legacy]]

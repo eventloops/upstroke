@@ -81,10 +81,13 @@ looks likely to return, say so in the body's row rather than relying on the file
 - **A pull request body still carries its own ledger table**, with the canonical nine-column
   header, listing every finding of that pull request. The body groups by pull request; this
   directory does not.
-- **`reviews/FINDINGS.md` stays exactly as it is**, as the same ledger up to 2026-09-04. Its
+- **`reviews/FINDINGS.md` keeps its resolved history**, as the same ledger up to 2026-09-04. Its
   sections keep their numbers, because source comments and design sections cite them by number
   (`reviews/FINDINGS.md` §4, §19, §20 and others, in 25 places across 16 files). Nothing is
-  migrated and nothing is renumbered. It is closed to new sections; new findings come here.
+  renumbered, and its dated narrative and audit sections are left as their authors wrote them. What
+  did move is its open rows: every one is a file here now, under the same `id`, so this directory
+  is the whole queue and that file is the history behind it. It is closed to new sections; new
+  findings come here.
 - **The review-preservation rule still applies.** `MAINTAINING.md` lets a push confined to the
   ledger keep its frontier review; that exemption names this directory as well, so recording a
   finding, or deleting a resolved one, does not cost a pass.

@@ -1,31 +1,12 @@
-//! Markdown plan adapter (DESIGN.md §9).
-//!
-//! `##`/`###` sections become tasks (heading → title, prose → body). A plan
-//! with no such sections falls back to top-level checklist items or numbered
-//! plan-mode steps. The `<!-- upstroke: ... -->` annotation grammar overrides
-//! the heuristics;
-//! annotations are read from pulldown-cmark HTML events, never regexed out of
-//! raw text. Unknown annotation attributes warn and never error.
-//!
-//! # The concerns are private children; this module is their facade
-//!
-//! `sections` finds the heading boundaries, `annotation` extracts and parses
-//! the upstroke comments, `hints` harvests path mentions, `drafts` turns
-//! either intake shape into one draft per task-to-be, and `assemble` resolves
-//! ids, kinds, dependencies and artifacts into the IR. The dependency
-//! direction is one-way and acyclic: `annotation`, `hints` and `sections` feed
-//! `drafts`; `drafts` and `hints` feed `assemble`; every child feeds this
-//! module and none of them is reachable from outside it.
-//!
-//! The one thing that flows the other way is `md_options`, the single
-//! `pulldown_cmark::Options` value every child parses with — it stays here so
-//! that the three parse sites cannot drift apart.
+//! Extended notes: `docs/internals/plan/markdown.md`
 
 mod annotation;
 mod assemble;
 mod drafts;
 mod hints;
 mod sections;
+
+use std::borrow::Cow;
 
 use pulldown_cmark::Options;
 
@@ -55,7 +36,7 @@ impl PlanAdapter for MarkdownPlanAdapter {
 
     fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, UpstrokeError> {
         let mut warnings = Vec::new();
-        let sections = split_sections(raw);
+        let sections = split_sections(raw, &mut warnings);
         let drafts: Vec<Draft> = if sections.is_empty() {
             checklist_drafts(raw, &mut warnings)
         } else {
@@ -69,7 +50,8 @@ impl PlanAdapter for MarkdownPlanAdapter {
                 message: "no tasks found: expected `##`/`###` sections, a top-level checklist, \
                           or numbered steps"
                     .to_owned(),
-            });
+            }
+            .with_warnings(warnings));
         }
         let mut tasks = assemble(drafts);
         let artifacts = collect_artifacts(&mut tasks, &mut warnings);
@@ -93,7 +75,27 @@ fn md_options() -> Options {
     options
 }
 
-/// `1. step` / `1) step` — Claude Code plan mode often writes numbered steps.
+fn parser_source(raw: &str) -> Cow<'_, str> {
+    let has_lone_cr = raw.ends_with('\r')
+        || raw
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, [b'\r', next] if *next != b'\n'));
+    if !has_lone_cr {
+        return Cow::Borrowed(raw);
+    }
+    let mut normalized = String::with_capacity(raw.len());
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() != Some(&'\n') {
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    Cow::Owned(normalized)
+}
+
 fn is_ordered_item(line: &str) -> bool {
     let digits = line.chars().take_while(char::is_ascii_digit).count();
     let rest = &line[digits..];
@@ -176,13 +178,11 @@ mod tests {
             ]
         );
 
-        // Document-order dependencies: task N depends on task N-1.
         assert!(tasks[0].depends_on.is_empty());
         for pair in tasks.windows(2) {
             assert_eq!(pair[1].depends_on, [pair[0].id.clone()]);
         }
 
-        // Bare plan with a Design task gets the default conventions brief.
         assert_eq!(parsed.plan.artifacts.len(), 1);
         assert_eq!(
             parsed.plan.artifacts[0].id,
@@ -205,13 +205,71 @@ mod tests {
     }
 
     #[test]
+    fn a_no_tasks_refusal_keeps_the_orphan_annotation_warning() {
+        let error = MarkdownPlanAdapter
+            .parse_with_warnings("# Plan\n<!-- upstroke: id=orphan -->\n\n- plain bullet\n")
+            .expect_err("plain bullets do not become tasks");
+        let rendered = error.to_string();
+        assert!(rendered.contains("no tasks found"), "{rendered}");
+        assert!(
+            rendered.contains("outside any checklist item"),
+            "{rendered}"
+        );
+        assert!(matches!(error, UpstrokeError::WithWarnings(_)));
+    }
+
+    #[test]
+    fn an_unclosed_heading_annotation_warns_without_rewriting_the_title() {
+        let parsed = parse("## Title <!-- upstroke: id=a\nkind=fix -->\nBody.\n");
+        let task = &parsed.plan.tasks[0];
+        assert_eq!(task.title, "Title <!-- upstroke: id=a");
+        assert_eq!(task.kind, TaskKind::Implement);
+        assert!(task.body.contains("kind=fix -->"));
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert!(parsed.warnings[0].contains("unterminated upstroke annotation in heading"));
+        assert!(parsed.warnings[0].contains("title is unchanged"));
+    }
+
+    #[test]
+    fn code_escaped_and_author_comment_examples_in_headings_are_not_annotations() {
+        for raw in [
+            "## Title `<!-- upstroke: id=a`\nBody.\n",
+            "## Title \\<!-- upstroke: id=a\nBody.\n",
+            "## Title &lt;!-- upstroke: id=a\nBody.\n",
+            "## Title <!-- note <!-- upstroke: id=a\nBody.\n",
+            "## Title <!-- note -->\nBody.\n",
+        ] {
+            let parsed = parse(raw);
+            assert!(parsed.warnings.is_empty(), "{raw:?}: {:?}", parsed.warnings);
+        }
+    }
+
+    #[test]
+    fn lone_cr_parser_normalization_preserves_offsets_bodies_and_the_original_input_hash() {
+        for raw in ["plain\ntext", "plain\r\ntext", "", "é\r\n"] {
+            assert!(matches!(parser_source(raw), Cow::Borrowed(_)), "{raw:?}");
+        }
+        let raw = "é\rβ\r\nγ\r";
+        let normalized = parser_source(raw);
+        assert_eq!(normalized, "é\nβ\r\nγ\n");
+        assert_eq!(normalized.len(), raw.len());
+
+        let raw = "## First\r<!-- upstroke: id=a -->\ré\rβ\r\r## Second\rBody.\r";
+        let parsed = parse(raw);
+        assert_eq!(parsed.plan.tasks.len(), 2);
+        assert_eq!(parsed.plan.tasks[0].body, "é\rβ");
+        assert_eq!(parsed.plan.tasks[1].body, "Body.");
+        assert_eq!(parsed.plan.source.hash, content_hash(raw.as_bytes()));
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    }
+
+    #[test]
     fn malformed_attribute_and_bad_values_warn() {
         let parsed = parse("## Task one\n<!-- upstroke: standalone tier=galactic kind=wat -->\n");
         let joined = parsed.warnings.join("\n");
         assert!(joined.contains("malformed annotation attribute `standalone`"));
         assert!(joined.contains("unknown tier `galactic`"));
         assert!(joined.contains("unknown kind `wat`"));
-        // Bad values fall back rather than erroring.
         assert_eq!(parsed.plan.tasks[0].suggested_tier, None);
     }
 
@@ -347,7 +405,6 @@ mod tests {
         assert_eq!(tasks[0].acceptance, ["Field list agreed"]);
         assert_eq!(tasks[1].title, "Next task");
 
-        // Deeper heading form inside a section arms too.
         let parsed = parse("## Task\n\n#### Done when\n- it works\n");
         assert_eq!(parsed.plan.tasks[0].acceptance, ["it works"]);
     }

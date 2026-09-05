@@ -41,8 +41,9 @@
 //! the way Git reads it (its gitfile grammar, its linked-worktree reader, its
 //! trace-polluted streams, with a bound on every read of a
 //! repository-controlled file), which is the parent's work and not a child
-//! classifier's: `reviews/FINDINGS.md` §51 carries a row per case for the
-//! sweep of `src/workspace_manager.rs`, the queue's last row of this family.
+//! classifier's: `reviews/findings/` carries a file per case for the sweep of
+//! `src/workspace_manager.rs`, the queue's last row of this family, and
+//! `reviews/FINDINGS.md` §51 is where they were derived.
 
 // **This child states its own lint level and inherits nothing.** A Rust lint
 // level is scoped by the module tree rather than by the file, so an out-of-line
@@ -473,10 +474,10 @@ enum AddState {
 /// What it reads is the parent's `record_for` and `git_dir_of`, so it is only
 /// as trustworthy as those are: `record_for` answers `None` for a `worktree
 /// list` that failed, and `git_dir_of` accepts any target text after
-/// `gitdir:`. Both are rows for the parent's sweep in `reviews/FINDINGS.md`
-/// §51; this function's own contribution is that the after phase and the
-/// residue element are two arms of one reading rather than two hand-written
-/// complements.
+/// `gitdir:`. Both are open findings for the parent's sweep in
+/// `reviews/findings/`; this function's own contribution is that the after
+/// phase and the residue element are two arms of one reading rather than two
+/// hand-written complements.
 fn add_state(repository: &Path, worktree: &Path) -> Result<AddState, UpstrokeError> {
     let Some(record) = record_for(repository, worktree)? else {
         return Ok(AddState::Unregistered);
