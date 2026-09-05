@@ -430,7 +430,9 @@ fn acquire_named(parent: &Path, name: &str) -> Result<ScratchTree, ScratchAcquir
 /// [`ScratchReclaimFailure`] for a refused identity check, removal error or
 /// unproved root absence. A remover's `NotFound` can name a child and is not
 /// itself proof that the root is absent.
-pub(crate) fn remove_scratch_tree(token: ScratchTreeOwnership) -> Result<(), ScratchReclaimFailure> {
+pub(crate) fn remove_scratch_tree(
+    token: ScratchTreeOwnership,
+) -> Result<(), ScratchReclaimFailure> {
     remove_scratch_tree_with(token, remove_tree)
 }
 
