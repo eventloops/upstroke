@@ -1,0 +1,628 @@
+# `src/engine/topology/dispatch.rs`
+
+Extended notes for [`src/engine/topology/dispatch.rs`](../../../../src/engine/topology/dispatch.rs).
+
+The code is the authority for what it does; this file is the whole of its prose, moved out of
+the source verbatim. Each section is headed by the line of code the comment sat above, spelled
+as it is in the source, so the heading is the grep string that finds the code.
+
+## Module
+
+Dispatch: `task_dispatched` → intent → add, and the reuse gate over it.
+
+Two ordering clauses live here and they point in opposite directions, which
+is the whole reason they are one module.
+
+**O21 — `task_dispatched` before worktree intent and add.** The event is
+written *first*, before anything on disk exists.
+[`crate::topology::events::TaskDispatched`] says why in its own doc: "a
+worktree created before the event that records it is a directory nothing in
+the log accounts for; an event written before a worktree that then fails to
+appear is a generation the next process closes". So a fresh dispatch is
+`task_dispatched` → `Worktree.WriteIntent` → `Worktree.Add`, and nothing
+observes the worktree in between.
+
+**O22 — `Worktree.Verify` before any reuse.** `Verify` guards **reuse**, not
+creation. `decisions.workspace_candidates.generation` names its three
+occasions exactly — "a worktree is reused across a process boundary or after
+an interrupted Git command (OpenNoAttempt recreate-or-verify, repair
+materialization, retry verification) **only after** Worktree.Verify" — and
+all three are recovery, never the first create. **Two** of them are this
+module's — [`verify_or_recreate`] and, through it,
+[`resume_open_no_attempt`]. The third, the retry verification, is
+[`super::settle::retry`]'s, because a retained worktree that fails is
+*closed* rather than recreated (INV-06) and the closure lives with the
+reservation it has to cancel. Putting `Verify` in front of
+a fresh add would make
+`residue_carrying_worktree_fails_verify_and_is_recreated` inexpressible:
+there would be no state in which a worktree exists, carries residue, and is
+then recreated, because the verify would have run before it existed.
+
+### What is not here
+
+The attempt is [`super::attempt`]'s. Selection, the ceiling and
+`budget_exceeded` are `select.rs`'s. The append-error protocol is
+`emit.rs`'s, which is why this module takes an [`EventEmitter`] rather than
+an [`crate::events::log::EventLog`].
+
+## `pub trait EventEmitter {`
+
+---------------------------------------------------------------------------
+The emit seam
+---------------------------------------------------------------------------
+
+## `pub trait EventEmitter {`
+
+Where a durable schema-4 event goes.
+
+`coordinator_integration.emit` is "build event → serialize → round-trip →
+plan_transition → append the exact bytes through the Event funnel", plus the
+append-error protocol when that append fails. All of it is **`emit.rs`'s**
+(O17), which is a different module of this slice: `dispatch.rs` and
+`attempt.rs` decide *what* is appended and *when* relative to the effects
+around it, and nothing here may decide *how*.
+
+So the ordering modules take this and never an
+[`crate::events::log::EventLog`]. A module that held the log would hold the
+append-error protocol with it — no fold mutation, no retry, no report from
+memory, no cleanup, then the stable-prefix barrier — and there would be two
+implementations of it, which is the duplication class this crate has already
+paid for three times.
+
+## `pub trait EventEmitter` › `fn emit(`
+
+Emit one durable event, or fail.
+
+**The hooks are a parameter, which is how every other funnel in this
+tree takes them.** `WorkspaceManager::write_intent`, `add_worktree`,
+`verify_worktree`, `remove_worktree`, `candidate_stage`,
+`repair_materialize` and `EventLog::append_topology_hooked` all take
+`hooks` per call rather than at construction, and an append is an
+effect like any of them. Taking them at construction would also
+conflict with the caller, which holds the same bundle for its own
+effects and cannot lend it for an emitter's whole lifetime.
+
+**What this does not do is force one bundle.** A caller may hand over a
+different one, exactly as it may for any Git funnel, and the tree
+already contains an instance: `scaffold::FoldedEmitter` keeps its own
+`EventHooks`, because that one wraps the harness in a timeline recorder
+the shared bundle's `events` family does not have. So appends made
+through the scaffold are observable in the ordering timeline and appends
+made through `emit::emit` are not — two observation surfaces for one
+kind of event, decided by which emitter ran. That is a real divergence,
+it is recorded in `reviews/FINDINGS.md`, and it is why this parameter is
+not by itself a guarantee of anything: it makes the bundle the caller's
+choice, and `every_family_of_the_harness_bundle_records_into_the_same_harness`
+is the assertion that the choice was the right one.
+
+### Errors
+
+Whatever the emitter's append protocol returns, as an
+[`super::emit::EmitFailure`] rather than an [`UpstrokeError`]. A caller
+here never interprets it: an emit that failed means the fold is poisoned
+and the coordinator is ending, and the effect that would have followed
+this event must not run.
+
+**It is not an `UpstrokeError` because obligation (3) may be
+outstanding.** An entered append that fails leaves in-flight
+invocations to cancel, and the ledger belongs to the driver, not to an
+ordering module. The failure carries the obligation until it reaches
+something that can discharge it; converting to `UpstrokeError` early
+would drop it silently, which is the "remembered, not enforced" failure
+this seam exists to make impossible.
+
+## `pub enum DispatchKind {`
+
+---------------------------------------------------------------------------
+What a dispatch is
+---------------------------------------------------------------------------
+
+## `pub enum DispatchKind {`
+
+Which of the two dispatches this is, and what each carries that the other
+does not.
+
+`decisions.admission_and_leases.leases.lifecycle`: "ordinary
+`task_dispatched` creates the predicted lease (PR7) … a repair
+`task_dispatched` records `InheritedLineage(root)`". The two are a sum
+rather than a struct with two `Option`s because the fold refuses every
+crossed combination — a predicted lease on a lineage member and an inherited
+lease on an ordinary task are both `FoldError::MalformedEntry` — and a sum
+makes the crossing unrepresentable instead of refused one layer later.
+
+## `pub enum DispatchKind` › `Ordinary {`
+
+An ordinary task, taking a predicted lease over the region its plan
+hints imply.
+
+## `pub enum DispatchKind` › `paths: PathSet`
+
+The predicted region.
+
+## `pub enum DispatchKind` › `Repair {`
+
+A repair, executing inside its lineage's lease and materializing the
+candidate that was rejected.
+
+## `pub enum DispatchKind` › `root: TaskKey,`
+
+The lineage root whose lease this generation executes inside.
+
+## `pub enum DispatchKind` › `source: CandidateRef`
+
+The protected candidate the worktree is materialized from.
+
+## `impl DispatchKind` › `fn grant(&self) -> LeaseGrant {`
+
+The grant `task_dispatched` records.
+
+## `impl DispatchKind` › `fn source_candidate(&self) -> Option<CandidateRef> {`
+
+The candidate `task_dispatched` records, for a repair.
+
+## `impl DispatchKind` › `fn closing_disposition(&self) -> LeaseDisposition {`
+
+What a settlement of this generation records about the lease.
+
+Read off [`crate::topology::leases::GenerationLease::expected`]'s rule
+rather than restated: a repair never changes a lineage lease, so every
+one of its closures is `LineageHeld`, and an ordinary generation that
+closes releases the region it held.
+
+## `fn closing_disposition(&self) -> LeaseDisposition` › `self.lease().expected(false)`
+
+**`GenerationLease::expected` is the whole of this rule**, and this
+used to restate it: `Ordinary -> PredictedReleased`,
+`Repair -> LineageHeld` is exactly what it computes from `Own` and
+`InheritedLineage` when the generation does not survive. A second
+match is a second authority for a value `check_lease_disposition`
+refuses any other answer to, and the two would drift the moment the
+vocabulary grew a third lease.
+
+## `impl DispatchKind` › `const fn lease(&self) -> crate::topology::leases::GenerationLease {`
+
+The lease relationship this dispatch establishes.
+
+## `pub struct Dispatched {`
+
+One dispatched generation: exactly `T-DISPATCH`'s `durable_state`.
+
+"generation, base, worktree path, lease relationship, source candidate for
+repairs" — and every field here is one of those five. The worktree path is
+carried as the [`Slot`] it was derived from rather than as a bare
+[`PathBuf`], so a later reclaim re-derives the path from the execution root
+and the slot name instead of trusting a string a record could carry out of
+the root. `worktree` is the path the add returned, kept for assertions and
+for the `worktree_path` the event recorded.
+
+## `pub struct Dispatched` › `pub key: TaskKey,`
+
+The task.
+
+## `pub struct Dispatched` › `pub generation: GenerationId,`
+
+Its generation.
+
+## `pub struct Dispatched` › `pub base: CommitSha,`
+
+The commit the worktree was created at.
+
+## `pub struct Dispatched` › `pub slot: Slot,`
+
+The slot the worktree occupies.
+
+## `pub struct Dispatched` › `pub worktree: PathBuf,`
+
+The checkout, at the path `Worktree.Add` returned for it — the slot
+target the funnel validated and handed to Git, not a reading of where
+Git put it.
+
+## `pub struct Dispatched` › `pub kind: DispatchKind,`
+
+The lease relationship, and for a repair the candidate to materialize.
+
+## `impl Dispatched` › `pub fn quiescence(&self) -> Quiescence {`
+
+The quiescence a reuse of this worktree is checked against.
+
+[`Quiescence::AtBase`] and not [`Quiescence::HoldsTree`]: this generation
+has no attempt and therefore no cumulative tree — `HoldsTree` is
+`RetainedIdle`'s, and `settle.rs` owns that.
+
+## `impl Dispatched` › `pub fn open_generation(&self) -> OpenGeneration {`
+
+The narrower value the rebuild family takes.
+
+One conversion, at the two call sites that hold a `Dispatched`, so the
+rebuild path has a single parameter type and recovery does not need to
+build a dispatch it cannot prove.
+
+## `impl Dispatched` › `pub fn closing_disposition(&self) -> LeaseDisposition {`
+
+What a settlement that **closes** this generation records about the
+lease.
+
+One reading of `GenerationLease::expected(false)` for both terminals
+this slice appends — `generation_closed{RunEnding}` here and
+`attempt_interrupted` in [`super::attempt`] — because the fold checks
+both against the same rule and two call sites deciding it separately is
+two chances to record `PredictedReleased` for a lineage member.
+
+## `impl Dispatched` › `pub const fn source(&self) -> Option<&CandidateRef> {`
+
+The candidate a repair materializes from.
+
+## `pub struct OpenGeneration {`
+
+What **rebuilding** an open generation needs, which is less than a dispatch.
+
+[`Dispatched`] additionally carries the checkout path and the lease grant,
+and no path below [`resume_open_no_attempt`] reads either: the rebuild
+family asks the manager for `slot`, `base`, and — for a repair — the source
+candidate, and nothing else.
+
+**The narrowing is not tidiness, it is what lets recovery step (g) exist
+without inventing a field.** A `Dispatched` reconstructed from the fold
+would have to carry a `LeaseGrant`, whose predicted region the fold does not
+hand back; a region invented at that call site is a field that lies about a
+lease, and reaching into `src/topology/`'s lease table for the real one is
+an edit to a frozen layer for a value the operation never reads. Asking for
+what is used removes the question.
+
+## `pub struct OpenGeneration` › `pub key: TaskKey,`
+
+The task.
+
+## `pub struct OpenGeneration` › `pub generation: GenerationId,`
+
+Its generation.
+
+## `pub struct OpenGeneration` › `pub base: CommitSha,`
+
+The commit the worktree was created at, and is recreated at.
+
+## `pub struct OpenGeneration` › `pub slot: Slot,`
+
+The slot the worktree occupies.
+
+## `pub struct OpenGeneration` › `pub source: Option<CandidateRef>,`
+
+For a repair, the protected candidate the worktree is materialized
+from. `None` for an ordinary generation.
+
+## `impl OpenGeneration` › `pub fn quiescence(&self) -> Quiescence {`
+
+The quiescence a reuse of this worktree is checked against.
+
+[`Quiescence::AtBase`] and not [`Quiescence::HoldsTree`]: this
+generation has no attempt and therefore no cumulative tree.
+`HoldsTree` is `RetainedIdle`'s, and `settle.rs` owns that.
+
+## `pub fn task_slot(key: TaskKey, generation: GenerationId) -> Slot {`
+
+The slot one generation of one task occupies.
+
+`decisions.workspace_candidates.manager`: "detached linked worktrees with
+durable synced intents (`tasks/k<key>-g<gen>`, `merge/s<seq>`)". Derived
+here rather than at each call site so no two callers can disagree about
+which worktree a generation owns.
+
+## `pub fn dispatch(`
+
+---------------------------------------------------------------------------
+O21 — the fresh dispatch
+---------------------------------------------------------------------------
+
+## `pub fn dispatch(`
+
+**O21.** Append `task_dispatched`, then write the intent, then add the
+worktree — and for a repair, materialize its source into it.
+
+The provisional reservation is *not* taken here. `permits.
+provisional_reservations` puts it at "a selection decision", which is
+`select.rs`'s, and has it "converted at the append" — so the conversion is
+the caller's statement that this append happened, made with the same
+`(key, kind)` it reserved under. Doing it inside would let a dispatch
+convert a reservation nothing took.
+
+There is **no `Worktree.Verify` in this function**, and that is O22 rather
+than an omission: `Verify` guards reuse. See the module docs.
+
+### Errors
+
+[`UpstrokeError::Refused`] when a repair's source candidate is not an object
+this repository has — `T-DISPATCH`'s `refusal_condition`, and it is checked
+*before* the append so the refusal costs no durable state. The containment
+refusals of [`WorkspaceManager`] (a worktree path outside the execution root
+or on a reparse point) are the other half of that condition and are raised by
+the funnels themselves. Otherwise: whatever the emitter or a Git funnel
+returns.
+
+## `manager.revalidate()?;`
+
+Before the append, because a refusal after it would leave an open
+generation whose worktree can never be built. `T-DISPATCH` lists "source
+candidate object missing" beside the containment refusals, so both are
+here and both are ahead of the event.
+
+The containment half needs this call to be true of it at all.
+`execution_root` says "every create/reclaim/delete revalidates", and
+`write_intent` and `add_worktree` each do — but that is *after* this
+function has appended, so without the line below the sentence above
+would be a claim about the two effects rather than about the dispatch.
+The three conditions are filesystem facts about the world and not about
+this request: a foreign worktree created inside the execution root, a
+reparse point planted on the chain, or a managed base that stopped being
+a real directory can each start being true between `run_started` and
+this call. It costs one read-only `git worktree list`; what it buys is
+that the `OpenNoAttempt` generation this event opens is never one whose
+worktree the very next line refuses to build — which is exactly what
+hoisting `refuse_absent_source` above the append avoids for the other
+half of the same `refusal_condition`.
+
+## `emitter.emit(`
+
+(1) The event. First, and by itself.
+
+## `worktree_path: worktree.to_string_lossy().into_owned(),`
+
+The string a later process compares and re-derives. A platform
+path type here would make a log written on one operating system a
+question on another — `TaskDispatched::worktree_path` says so.
+
+## `let mut dispatched = Dispatched {`
+
+(2) The intent, synced. (3) The add, which refuses without it.
+
+## `dispatched.worktree = create_worktree(manager, hooks, &dispatched.open_generation())?;`
+
+The add's own answer replaces the derivation, and what that buys is
+narrow enough to be worth stating exactly. Until this line the field and
+the event's `worktree_path` were one local under two names, so a test
+comparing them compared a value to itself and could only fail on a lossy
+conversion. Now the event's string is the pre-append derivation — O21
+puts the append first, so it can be nothing else — and the field is what
+`Worktree.Add` returned, which is the target the funnel validated and
+handed to `git worktree add`.
+
+So their agreement says the durable event names the directory the add was
+told to create. It is **not** an observation of where Git put the
+checkout: `WorkspaceManager::add_worktree` answers with `slot_target`,
+which is the same `slot_path` rule the string above came from, and
+nothing reads the location back. A second, independent provenance would
+have to come from `git worktree list`; it is owed, not claimed here.
+
+## `if dispatched.source().is_some() {`
+
+(4) A repair's materialization, which `ObjectSite::RepairMaterialize`
+itself places `Adjacent::After(DurableEvent::TaskDispatched)`.
+
+## `pub struct DispatchRequest {`
+
+What a caller asks [`dispatch`] for.
+
+A struct rather than four parameters because three of them are identities
+that must agree with one another and with the reservation the caller
+converts; a positional call that transposed key and generation would type-
+check under two newtypes over `u32` if either lost its wrapper.
+
+## `pub struct DispatchRequest` › `pub key: TaskKey,`
+
+The task being dispatched.
+
+## `pub struct DispatchRequest` › `pub generation: GenerationId,`
+
+The generation this opens. Dense per task: the fold refuses any other.
+
+## `pub struct DispatchRequest` › `pub base: CommitSha,`
+
+The commit the worktree is created at.
+
+## `pub struct DispatchRequest` › `pub kind: DispatchKind,`
+
+Ordinary or repair.
+
+## `fn create_worktree(`
+
+Intent then add, which is the only order [`WorkspaceManager::add_worktree`]
+permits.
+
+`Refusal::AddWithoutIntent` enforces it at the add site, so this order is
+checked rather than merely intended — an add whose intent is not already
+durable creates a worktree `reclaim_intents` can never find.
+
+The path returned is the funnel's answer rather than a derivation made
+beside it, so a caller that records the checkout's path has one source for
+it. That source is [`WorkspaceManager::add_worktree`], whose answer is the
+validated slot target it gave `git worktree add` — where the checkout was
+*asked* to go. Nothing here reads back where Git put it.
+
+## `fn refuse_absent_source(`
+
+Refuse a repair whose protected source is not in this repository.
+
+Two conditions, because the packet's "source candidate object missing" can
+arrive either way and only one of them is about the object: the authoritative
+ref `refs/upstroke/runs/<id>/candidates/<key>/<gen>` is what keeps the commit
+reachable (R11, "never pruned while the run can resume"), so a ref that is
+gone or that names a different commit is the same failure as an object that
+was never written, and both would leave `git cherry-pick` to fail with a
+message about a revision rather than about a lost candidate.
+
+## `pub enum Reuse {`
+
+---------------------------------------------------------------------------
+O22 — reuse, and only reuse, is gated by Verify
+---------------------------------------------------------------------------
+
+## `pub enum Reuse {`
+
+What [`verify_or_recreate`] did.
+
+## `pub enum Reuse` › `Verified,`
+
+The recorded worktree passed `Worktree.Verify` and is reused as it
+stands.
+
+## `pub enum Reuse` › `Recreated {`
+
+It did not, and was removed with force and rebuilt. Carries the failure
+so a caller — and a test — can say *why* it was not reusable, rather
+than only that it was not.
+
+## `pub enum Reuse` › `failure: VerifyFailure`
+
+What `Worktree.Verify` refused it for.
+
+## `impl Reuse` › `pub const fn reused(&self) -> bool {`
+
+Whether the worktree that came back is the one that was there.
+
+## `pub fn verify_or_recreate(`
+
+**O22.** `Worktree.Verify` the recorded worktree, or remove it with force
+and recreate it (intent then add).
+
+`T-DISPATCH`'s `resume_action`, word for word: "verify the worktree at the
+recorded base with Worktree.Verify (linked worktree at the recorded path,
+HEAD == base, index unlocked, no cherry-pick/merge/sequencer state) or remove
+it with force and recreate it (intent then add)". Every one of those four
+conditions is [`WorkspaceManager::verify_worktree`]'s, not restated here —
+a second copy of a predicate is a second thing to keep in step, and this one
+is `VerifyFailure`'s whole vocabulary.
+
+### The quiescence is the caller's, not this function's
+
+`Quiescence` has two forms and the packet gives both in one breath: "HEAD
+equals the recorded base (**or, for RetainedIdle, the worktree holds the
+retained cumulative tree**)". Which one applies is a property of the
+generation's *class*, which lives in the fold — so it is a parameter here
+rather than something derived from [`Dispatched`], which knows only that a
+generation was opened. [`Dispatched::quiescence`] is the `OpenNoAttempt`
+answer and is what [`resume_open_no_attempt`] passes.
+
+[`Quiescence::HoldsTree`] does **not** belong to this function, and that is
+not a matter of taste: it is `RetainedIdle`'s form of the check, and a
+retained generation is closed rather than recreated (INV-06). No retained
+worktree reaches this module at all — [`super::settle::retry`] performs the
+retained `Worktree.Verify` through its own `WorktreeVerify` seam and writes
+the closure itself — so nothing here has one to hand the recreate branch.
+
+### The intent is re-written rather than removed and re-written
+
+The reclaim order elsewhere is *worktree then intent*, because an intent that
+outlives its worktree is reclaimed harmlessly while a worktree that outlives
+its intent is a leak nothing can find. That reasoning applies here too, so
+the sequence is: force-remove the worktree, re-write the (idempotent) intent,
+add. At no instant does a worktree exist without a durable intent naming it.
+
+### Errors
+
+The containment refusals, or a Git or I/O error. A worktree that merely fails
+its quiescence check is `Ok(Reuse::Recreated { .. })` — that is a decision,
+not a failure.
+
+## `pub fn verify_reuse(`
+
+**O22's observation, with no branch on it.** `Worktree.Verify` the recorded
+worktree and report what it saw.
+
+`decisions.workspace_candidates.generation` gives the failure two different
+recoveries, and which one applies is a property of the generation's class,
+not of the observation: "failing verification an OpenNoAttempt or repair
+worktree is removed with force and recreated, and a **RetainedIdle
+generation is closed** with `generation_closed{WorktreeMissing}`". INV-06
+states the same thing as a prohibition — a retained generation "is never
+recreated" — because what its worktree holds is a cumulative tree that no
+base can be re-cut into, so a forced removal there destroys work
+irrecoverably rather than costing a rebuild.
+
+So the observation is one function and the recovery is the caller's.
+[`verify_or_recreate`] is the rebuilding half and is for the two classes
+that may be rebuilt. The retained class's recovery is
+[`super::settle::retry`]'s and there is exactly one of it — it reaches
+`Worktree.Verify` through its own `WorktreeVerify` seam rather than through
+this function, so a retained worktree never arrives here to be handed the
+recreate branch.
+
+That leaves this function with one caller today, and it stays a separate
+function rather than being folded back into [`verify_or_recreate`] because
+what it separates is the *branch*, not the caller: the observation and the
+destructive recovery are named apart, so a future retained-class reader in
+this module has something to take that has no `remove_worktree` beyond it.
+
+### Errors
+
+The containment refusals, or a Git error. A worktree that merely fails its
+quiescence check is `Ok(Err(VerifyFailure))` — that is an observation, not a
+failure.
+
+## `pub fn materialize_repair(`
+
+Re-run a repair's recorded materialization in a verified or fresh worktree.
+
+`Object.RepairMaterialize` is `git cherry-pick --no-commit`, whose merge
+objects are referenced by the worktree index (R9). It is idempotent only in
+the sense that re-running it *in a worktree at the recorded base* reproduces
+the same index — which is exactly why `T-DISPATCH` says "re-run the recorded
+materialization in a **verified or fresh** worktree" and why a caller reaches
+this through [`resume_open_no_attempt`] rather than directly.
+
+### Errors
+
+[`UpstrokeError::Refused`] for an ordinary dispatch, which has no
+materialization to reproduce and whose caller has therefore lost track of
+which kind it holds. Otherwise the containment refusals or a Git error.
+
+## `pub fn resume_open_no_attempt(`
+
+The whole of `T-DISPATCH`'s resume action for a live process, in order.
+
+Verify-or-recreate first, then — for a repair — the materialization, because
+the materialization is what has to land in a worktree that is already known
+good. A repair whose materialization *completed* before the kill leaves
+`CHERRY_PICK_HEAD` in its git dir, which `Worktree.Verify` reads as
+administrative residue and refuses, so such a worktree is recreated and
+re-materialized rather than reused. That is convergent and deliberate: the
+alternative is a verify that tries to decide whether a half-applied index is
+the same half-applied index, which is not a question a read-only observation
+can answer.
+
+### Errors
+
+As [`verify_or_recreate`] and [`materialize_repair`].
+
+## `pub fn close_at_run_end(`
+
+---------------------------------------------------------------------------
+Run end
+---------------------------------------------------------------------------
+
+## `pub fn close_at_run_end(`
+
+Close an `OpenNoAttempt` generation at run end and scrub its worktree.
+
+`decisions.workspace_candidates.generation`: "a generation with no attempt
+started is recreated at its recorded base during a live run and **closed at
+run end**", and `cleanup`: "RetainedIdle and OpenNoAttempt worktrees are
+resumably_open during a live run and closed at run end".
+
+The event precedes the scrub, and that is `cleanup`'s own rule — "task
+worktree scrubbed only after `task_candidate_created` is durable **or the
+generation is Closed**". A scrub before the close would remove a worktree the
+log still says is resumably open, which is the state a resume would then try
+to verify.
+
+### Errors
+
+Whatever the emitter returns, or a Git or I/O error from the scrub. The scrub
+runs only if the append succeeded, for the reason above.
+
+## `pub(super) fn scrub(`
+
+Forced removal of a worktree and then its intent.
+
+`cleanup`: "every worktree, staging, and snapshot removal is forced … so Git
+administrative residue left by an interrupted command … never blocks
+reclaim". Worktree first, then intent, so that the durable record naming the
+worktree outlives the worktree rather than the other way round.

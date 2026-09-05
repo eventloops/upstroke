@@ -1,17 +1,7 @@
-//! `upstroke status` — the run, folded out of its own log (DESIGN.md §15).
-//!
-//! Status is a pure read: it opens no branch, spawns no agent, and takes no
-//! lock. Everything it shows is derived by replaying `events.jsonl` through
-//! the same [`RunState::apply`](crate::events::RunState::apply) the engine
-//! writes through, so a running engine and a watching operator are looking at
-//! one computation rather than two that ought to agree.
-//!
-//! The plan comes from the run's own `plan.normalized.json` rather than from
-//! the plan file on disk: §5 freezes a plan at run start, and status should
-//! describe the run that happened even if the source plan has since moved on.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/status.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::path::{Path, PathBuf};
@@ -24,37 +14,21 @@ use crate::interaction::Sleeper;
 use crate::ir::Plan;
 use crate::rundir::{self, RunPaths};
 
-/// The view and the per-event lines, which reach nothing and so restore the
-/// effect denials this module allows.
 mod render;
 
-/// One run, as read back from disk.
 pub struct RunStatus {
     pub run_id: String,
     pub paths: RunPaths,
     pub started: RunStarted,
     pub state: RunState,
     pub plan: Plan,
-    /// Whether an engine is driving this run *and* the run has not recorded
-    /// that it finished — the two halves of "still going", which the lock
-    /// alone does not answer.
     pub running: bool,
-    /// Whether anything holds the run's lock, finished or not.
-    ///
-    /// Kept beside `running` rather than folded into it because a process
-    /// claiming a run that already ended is real and worth saying: `resume`
-    /// takes the lock and holds it across a dozen git subprocesses before it
-    /// writes `run_resumed`. During that window the run has an owner and an
-    /// outcome at the same time, and an operator asking `status` deserves
-    /// both.
     pub held: bool,
-    /// Attempts that were in flight when a previous process stopped.
     pub interrupted: u32,
     pub warnings: Vec<String>,
 }
 
 impl RunStatus {
-    /// The same projection a run writes to `report.json`.
     pub fn report(&self) -> RunReport {
         RunReport::from_state(
             &self.started,
@@ -66,19 +40,11 @@ impl RunStatus {
         )
     }
 
-    /// Whether this run stopped without recording that it had finished — the
-    /// signature of a kill, a power loss, or an aborting error.
     pub fn interrupted_run(&self) -> bool {
         !self.running && self.state.finished.is_none()
     }
 }
 
-/// What `status` says about a husk id, or `None` if `wanted` names no husk.
-///
-/// Read-only end to end, and it never resolves a husk into a run: the answer
-/// is the refusal, carrying which of the three kinds of husk this is, its
-/// reason and its private locator. The authorized private root is the default
-/// one, which is the root a read-only command is configured with.
 fn husk_answer(repo_root: &Path, wanted: &str) -> Option<UpstrokeError> {
     let husk_id = rundir::list_husks(repo_root)
         .into_iter()
@@ -102,16 +68,10 @@ fn husk_answer(repo_root: &Path, wanted: &str) -> Option<UpstrokeError> {
     })
 }
 
-/// Load a run: the newest one, or any unambiguous id prefix.
 pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, UpstrokeError> {
     let run_id = match run_id {
         Some(wanted) => match rundir::resolve_run_id(repo_root, wanted) {
             Ok(resolved) => resolved,
-            // `startup_census`: "status is read-only: it ignores husks and,
-            // asked explicitly for a husk id, reports an unstarted husk that
-            // the next write command reclaims, a retained husk with its reason
-            // and locator, or a possibly committed run whose public log has no
-            // valid committed first line".
             Err(error) => return Err(husk_answer(repo_root, wanted).unwrap_or(error)),
         },
         None => rundir::latest_run(repo_root).ok_or_else(|| UpstrokeError::Refused {
@@ -184,24 +144,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
 
     let task_ids = plan.tasks.iter().map(|task| task.id.to_string()).collect();
     let mut replayed = events::replay(events, task_ids, &events_path)?;
-    // Two questions, not one. The lock says whether a process has claimed this
-    // run; the log says whether the run still has anywhere to go. `running`
-    // needs both, for the same reason `interrupted_run` below does: `resume`
-    // claims the lock before it writes anything, so a budget-stopped run has an
-    // owner for as long as that resume takes to get going. Reading the lock
-    // alone made those seconds render as `run in progress`, dropping the stop
-    // reason, the parked list, and the `resume --budget` line the operator is
-    // there to find.
     let running = held && replayed.state.finished.is_none();
-    // Settled in memory only: status is a pure read and must not write to a
-    // run it is merely looking at. A resume records the same settlement as
-    // events instead.
-    //
-    // And only for a run nothing is driving. An attempt in flight under a live
-    // engine has not been interrupted — it is working — so settling it here
-    // would report a running attempt as a failure and the whole run as halted.
-    // `status` is the only window into a run that holds its own terminal, so
-    // that reading is worse than no reading at all.
     let interrupted = if running {
         0
     } else {
@@ -221,31 +164,17 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
     })
 }
 
-/// The whole view: what happened, what it cost, and what it is waiting for.
-///
-/// The view itself is the private `render` child's; this is the public
-/// surface it is reached through.
 pub fn render(status: &RunStatus) -> String {
     render::render(status)
 }
 
-/// One human line per event, for `--follow`.
-///
-/// Delegates to the private `render` child, beside the view it belongs with:
-/// both turn a fold of the log into text and neither touches anything.
 pub fn describe(event: &Event) -> String {
     render::describe(event)
 }
 
-/// Stream a run's events, from the beginning and then as they arrive.
-///
-/// Starting from the beginning is deliberate: `--follow` on a run already in
-/// progress should show how it got here, not drop the reader into the middle
-/// of a story. Reads only whole lines, so a follower attached to a live engine
-/// never sees half an event. Returns once the run records that it is done —
-/// or, once nothing is driving the run any more, after `max_idle_polls` with
-/// nothing new, so a follower attached to a run whose engine has died gives up
-/// instead of waiting forever.
+// The conductor owns the run lock before appending RunResumed. A historical
+// RunFinished is terminal for this follower only once the lock is free; while
+// held, keep polling for the new epoch and do not spend the dead-engine budget.
 pub fn follow(
     status: &RunStatus,
     sleeper: &dyn Sleeper,
@@ -260,19 +189,6 @@ pub fn follow(
     loop {
         let events = tail.poll(&mut warnings)?;
         if events.is_empty() {
-            // The idle budget is not a timeout on silence. A whole attempt —
-            // the agent's thinking, its tool calls, the gates, the review —
-            // folds into a single `attempt_finished`, so a healthy run says
-            // nothing for minutes at a time; giving up on one would drop the
-            // live view mid-run. The budget exists only to release a terminal
-            // attached to an engine that has died, so it starts counting when
-            // the run's lock does not.
-            //
-            // One syscall per poll, asked plainly. This used to need a cheaper
-            // variant of its own, because the check waited out a contention
-            // grace every time the answer was yes — which on a healthy run is
-            // every poll. The lock now answers exactly, so there is no cheaper
-            // question to ask.
             let running = rundir::is_running(&status.paths.public);
             if terminal && !running {
                 return Ok(());
@@ -297,21 +213,17 @@ pub fn follow(
                 _ => {}
             }
         }
-        // A resume owns the lock before it can append RunResumed. A follower
-        // that sees the previous epoch's RunFinished in that window must wait
-        // for the marker rather than treating historical terminal state as the
-        // current process's result.
         if terminal && !rundir::is_running(&status.paths.public) {
             return Ok(());
         }
     }
 }
 
-/// Pair event bytes with a stable liveness observation. A dead snapshot is
-/// trusted only after an identical second read and a second dead probe; this
-/// prevents status from reading `attempt_started`, observing the conductor
-/// release its lock after writing the settlement, and then inventing an
-/// interrupted attempt from the stale prefix.
+// The conductor appends settlement before releasing its run lock; status only
+// observes. Changed lock probes force a retry. A dead observation also needs an
+// identical second event read and another free-lock probe, or settlement followed
+// by release could pair a stale attempt_started prefix with a free lock and invent
+// interruption. Retries are bounded, and refusal leaves the run untouched.
 fn stable_event_bytes_with(
     path: &Path,
     mut read: impl FnMut() -> Result<Vec<u8>, UpstrokeError>,
@@ -360,9 +272,6 @@ mod tests {
         }
     }
 
-    /// `load` composes `resolve_run_id`'s refusal with `rundir::husk_report`,
-    /// and a composition nobody drives is the shape `PR4-CONF-008` was: both
-    /// halves were tested and their join was not. So this asks `status` itself.
     #[test]
     fn status_asked_for_a_husk_id_names_which_husk_it_is() {
         let root = std::env::temp_dir().join(format!(
@@ -375,8 +284,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("scratch");
-        // A real repository, because the husk answer takes this repository's
-        // key over its canonical common git dir.
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -667,8 +574,6 @@ mod tests {
         assert!(ledger.contains("$0.0100"), "implementer's own spend");
         assert!(ledger.contains("$0.0500"), "reviewer's, kept apart");
         assert!(ledger.contains("$0.0600"), "and the total");
-        // §13's second currency, beside the dollars and derived from the same
-        // attempt records.
         assert!(ledger.contains("per-pool drain:"), "{ledger}");
         assert!(
             ledger.contains("claude-max: 1 attempt(s), $0.0100"),
@@ -714,8 +619,6 @@ mod tests {
 
     #[test]
     fn answers_and_defects_render_without_quoting_the_operator() {
-        // The operator's words are an instruction to the agent, not something
-        // status needs to echo into a terminal it does not control.
         let line = describe(&event(EventBody::QuestionAnswered {
             data: events::QuestionAnswered {
                 question: QuestionId::from("q-1"),
