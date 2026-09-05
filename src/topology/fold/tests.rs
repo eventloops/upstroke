@@ -7017,6 +7017,151 @@ fn an_answered_bare_question_returns_its_task_to_the_state_it_was_parked_from() 
 }
 
 #[test]
+fn an_answer_does_not_restore_a_task_that_merged_while_its_question_was_open() {
+    // `parked_from` is only safe while the task is still parked. If a
+    // `task_merged` moves the task to `Merged` between the question and its
+    // answer, restoring the recorded `AwaitingMerge` would un-merge it and make
+    // `derived_outcome` a `FoldError`. `apply_answer` restores only while the
+    // task is still `AwaitingInput`.
+    let base = sha("base");
+    let mut fold = started();
+    merge_task(&mut fold, ALPHA, 0, 0);
+    apply(&mut fold, &dispatch(MID, 0, &base));
+    let start = attempt_started(&fold, MID, 0, 1, 0);
+    apply(&mut fold, &start);
+    apply(&mut fold, &candidate_prepared(MID, 0, &base));
+    apply(&mut fold, &candidate_created(MID, 0));
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingMerge));
+
+    // Open MID's integration transaction while its candidate is still eligible,
+    // then park MID with a bare question: parked_from = AwaitingMerge.
+    apply(&mut fold, &fast_publication(MID, 0, 1, &base, vec![MID]));
+    apply(&mut fold, &raised("q-merge-Ünicode", MID));
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingInput));
+
+    // The merge completes while the question is open: MID -> Merged.
+    apply(&mut fold, &merged(MID, 0, 1, vec![MID]));
+    assert_eq!(fold.task_state(MID), Some(TaskState::Merged));
+
+    // The answer must NOT restore the stale AwaitingMerge.
+    apply(
+        &mut fold,
+        &answered(
+            MID,
+            "q-merge-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
+            },
+        ),
+    );
+    assert_eq!(
+        fold.task_state(MID),
+        Some(TaskState::Merged),
+        "an answer must not un-merge a task that merged while its question was open"
+    );
+    assert_ne!(fold.derived_outcome(), DerivedOutcome::FoldError);
+}
+
+#[test]
+fn a_declined_repair_fails_the_whole_lineage_on_either_halt_arm() {
+    // `design/26`: "Declining fails the lineage." A repair `TaskKey(3)` descends
+    // from MID; declining it must fail MID too, or MID sits `AwaitingRepair` with
+    // nothing runnable and `derived_outcome` becomes a `FoldError` — the run
+    // cannot end. This is unconditional on `decline_halts_run`: both arms fail
+    // the lineage, and with the halt set the wedge would otherwise be hidden.
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+
+    let lineage_up_to_decline = || {
+        let mut fold = started();
+        merge_task(&mut fold, ALPHA, 0, 0);
+        merge_task(&mut fold, ZETA, 0, 1);
+        apply(&mut fold, &dispatch(MID, 0, &base));
+        let start = attempt_started(&fold, MID, 0, 1, 0);
+        apply(&mut fold, &start);
+        apply(&mut fold, &candidate_prepared(MID, 0, &base));
+        apply(&mut fold, &candidate_created(MID, 0));
+        apply(
+            &mut fold,
+            &verification_started(MID, 0, 2, &head, &proposal),
+        );
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(2),
+            candidate: candidate_of(MID, 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: repair_spawn(TaskKey(3), MID, MID),
+            lease_effect: RejectionLeaseEffect::CreatesLineage {
+                root: MID,
+                paths: region(MID),
+            },
+        };
+        rejected.repair.entry.deps = vec![ALPHA];
+        rejected.repair.entry.display_deps = vec![TaskId::from("alpha")];
+        apply(
+            &mut fold,
+            &ev(TopologyEventBody::MergeRejected {
+                data: Box::new(rejected),
+            }),
+        );
+        // MID is AwaitingRepair; its repair TaskKey(3) is Pending. Park it.
+        apply(&mut fold, &raised("q-repair-Ünicode", TaskKey(3)));
+        assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingRepair));
+        fold
+    };
+
+    // The wedge arm: decline_halts_run = false. The lineage fails and the run
+    // can now end, where before MID sat AwaitingRepair with no way out.
+    let mut ended = lineage_up_to_decline();
+    apply(
+        &mut ended,
+        &answered(
+            TaskKey(3),
+            "q-repair-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: false,
+            },
+        ),
+    );
+    assert_eq!(
+        ended.task_state(MID),
+        Some(TaskState::Failed),
+        "a decline fails the lineage root, not only the repair"
+    );
+    assert_eq!(ended.task_state(TaskKey(3)), Some(TaskState::Failed));
+    assert_ne!(
+        ended.derived_outcome(),
+        DerivedOutcome::FoldError,
+        "with the lineage failed the run is no longer wedged"
+    );
+
+    // The halt arm: the lineage still fails; the halt only decides that the run
+    // also stops. Asserting MID is Failed here is what catches a fix made
+    // conditional on the flag, since the halt would otherwise mask the wedge.
+    let mut halted = lineage_up_to_decline();
+    apply(
+        &mut halted,
+        &answered(
+            TaskKey(3),
+            "q-repair-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: true,
+            },
+        ),
+    );
+    assert_eq!(
+        halted.task_state(MID),
+        Some(TaskState::Failed),
+        "the lineage failure is unconditional on decline_halts_run"
+    );
+    assert_eq!(halted.halted_at(), Some(TaskKey(3)));
+}
+
+#[test]
 fn an_answer_names_an_open_question_of_that_task_and_an_option_it_offered() {
     // refusals[13]. A1's half — the override must name the same question,
     // task and option as the answer carrying it — is wired in; this adds

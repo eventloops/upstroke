@@ -557,7 +557,19 @@ pub enum QuestionOrigin {
 }
 
 /// An open question and what raised it.
+///
+/// `#[non_exhaustive]`: this is a `pub` state type a caller *reads* (through
+/// [`TopologyFold::open_questions`]) and never constructs — there is no public
+/// constructor — so a future field, like the `parked_from` this pull request
+/// added, must not break a downstream literal or exhaustive pattern. This is the
+/// opposite decision from #150's on an enum, and for the same principle: there,
+/// a `#[non_exhaustive]` enum would let a downstream wildcard swallow a new
+/// variant silently, so the compile break is *wanted*; here, a struct field
+/// addition can only break downstream construction, so the attribute prevents
+/// the break this pull request would otherwise cause. Both put the breakage
+/// where a human decides, not where a wildcard hides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpenQuestion {
     pub question: FrozenQuestion,
     pub origin: QuestionOrigin,

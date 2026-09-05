@@ -36,12 +36,14 @@ impl RunState {
     /// Total by construction: every lookup here was proved to succeed by the
     /// check that produced the delta, so no lookup misses on a path this fold
     /// takes. The safety is that the miss is unreachable, not that each miss is
-    /// inert — most lookups leave the state alone on a miss, but two do not:
+    /// inert — most lookups leave the state alone on a miss, but three do not:
     /// `apply_candidate_created` falls back to the conservative
-    /// `PathSet::RepoWide` and still enqueues, and `apply_verification_started`
-    /// advances `next_sequence` before its queue lookup. Nothing in this
-    /// function decides anything — a decision made here would be one the live
-    /// path and the replay path could reach differently, which INV-02 forbids.
+    /// `PathSet::RepoWide` and still enqueues, `apply_verification_started`
+    /// advances `next_sequence` before its queue lookup, and `open_question`'s
+    /// task lookup defaults to `Pending` and inserts the question regardless.
+    /// Nothing in this function decides anything — a decision made here would be
+    /// one the live path and the replay path could reach differently, which
+    /// INV-02 forbids.
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
@@ -101,16 +103,14 @@ impl RunState {
                 self.open_question(&data.question, QuestionOrigin::Admission, None);
                 self.set_state(data.question.key, TaskState::AwaitingInput);
             }
-            TopologyEventBody::QuestionAnswered { data } => {
-                // The check pairs every `question_answered` with the resolved
-                // origin on `Derived::Answer`, and `apply` is only reached
-                // through a delta the check produced, so a derived that is not
-                // an answer is not this event's and — like every lookup miss
-                // here — changes nothing.
-                if let Derived::Answer(origin) = derived {
-                    self.apply_answer(data, *origin);
-                }
-            }
+            TopologyEventBody::QuestionAnswered { data } => match derived {
+                Derived::Answer(origin) => self.apply_answer(data, *origin),
+                // Exhaustive over `Derived`, so a new variant is a compile error
+                // here rather than a silent no-op: the check pairs every
+                // `question_answered` with `Derived::Answer`, and these two
+                // cannot be its delta, so they change nothing.
+                Derived::None | Derived::Registry(_) => {}
+            },
             TopologyEventBody::BudgetExceeded { data } => {
                 if !self.budget_stop_is_current() {
                     self.budget_stop = Some(data.stop());
@@ -552,9 +552,20 @@ impl RunState {
     pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, origin: QuestionOrigin) {
         let parked_from = self
             .questions
-            .get(&answered.question)
+            .remove(&answered.question)
             .map(|open| open.parked_from);
-        self.questions.remove(&answered.question);
+        // `origin` is superseded by `parked_from` for the answer-return, and the
+        // `VerificationPark => AwaitingMerge` cross-check that read it was
+        // withdrawn under pass-3 review: a bare question can park a task before a
+        // verification park raises its own on the same task, so a
+        // `VerificationPark` question's parked-from state can be `AwaitingInput`,
+        // not `AwaitingMerge` — the assertion was reachable from a checked log
+        // and would panic every replay of it. `origin` is kept threaded only
+        // because removing it reaches `Derived::Answer` in `start.rs` (row 38)
+        // and `check_end.rs`'s return (row 32, merged from #153) — a second
+        // branch in files this sweep must not open; the removal is
+        // `SWEEP-FOLD-APPLY-ORIGIN-SUPERSEDED`.
+        let _ = origin;
         match &answered.answer {
             Answer4::Answered {
                 binding_override, ..
@@ -562,40 +573,59 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                // An answered question returns the task to the state it was
-                // parked from. `check_question_answered` refuses the answer
-                // unless the task is still `AwaitingInput` with nothing open —
-                // whatever the log did between the question and its answer — so
-                // this returns it to exactly where it was, for whatever admitted
-                // state that was: a spawn admission or a parked settlement parks
-                // a `Pending` task, a verification park an `AwaitingMerge` one, a
-                // bare `question_raised` a task in any admitted state. Returning
-                // to a fixed `Pending` was right only for the first and coincided
-                // for the rest by which states another door happens to admit;
-                // this is right by construction.
+                // Return the task to the state it was parked from — but only
+                // while it is *still* parked. `check_end.rs` at this head does
+                // not guarantee the task did not move between the question and
+                // its answer: nothing refuses a `task_merged` or a failing
+                // settlement on a task whose question is open, so restoring the
+                // recorded `parked_from` unconditionally would un-merge a
+                // `Merged` task and make `derived_outcome` a `FoldError`. **The
+                // invariant this restoration requires is that the task is still
+                // `AwaitingInput`.** When it is not, the move stands and the
+                // answer only closes the question. Guarding here rather than
+                // trusting a door in another file makes it correct whatever the
+                // check admits.
                 if let Some(state) = parked_from {
-                    // The wire-carried `origin` and `parked_from` agree on one
-                    // point that is an invariant, not a coincidence: a
-                    // verification park is only ever raised on an awaiting-merge
-                    // task. Asserting the direction that holds keeps `origin` a
-                    // check on the fold rather than a discarded parameter now
-                    // that `parked_from` decides the return. (An `Admission`
-                    // origin spans a spawn admission, a parked settlement and a
-                    // bare question — `Pending`, `AwaitingMerge` or `Deferred` —
-                    // so it constrains nothing.) `origin` is otherwise
-                    // superseded; removing it reaches `check_end.rs` (row 32,
-                    // open in #153) and `start.rs` (row 38), so it is left here
-                    // and recorded against those rows.
-                    debug_assert!(
-                        origin != QuestionOrigin::VerificationPark
-                            || state == TaskState::AwaitingMerge,
-                        "a verification-park question parks an awaiting-merge task, not {state:?}"
-                    );
-                    self.set_state(answered.key, state);
+                    if self
+                        .tasks
+                        .get(answered.key.index())
+                        .is_some_and(|task| task.state == TaskState::AwaitingInput)
+                    {
+                        self.set_state(answered.key, state);
+                    }
                 }
             }
             Answer4::Declined { decline_halts_run } => {
-                self.set_state(answered.key, TaskState::Failed);
+                // **A decline fails the whole lineage, not just the answered
+                // task** — `design/26`, "Declining fails the lineage.", and
+                // `release_holdings_of`'s own doc, "a declined lineage fails as a
+                // whole". A repair and every task back to its root fail together,
+                // because the original awaits a repair this decline abandons:
+                // failing the repair alone leaves the root `AwaitingRepair` with
+                // no queue, question, generation or runnable repair, so
+                // `derived_outcome` has no answer for it (`FoldError`) and refuses
+                // every `run_finished`. **Unconditional on `decline_halts_run`** —
+                // that flag decides only whether the run also halts, and setting
+                // it would otherwise hide this wedge behind the halt.
+                let root = self
+                    .registry
+                    .get(answered.key)
+                    .and_then(|entry| entry.lineage)
+                    .map_or(answered.key, |lineage| lineage.root);
+                let members: Vec<TaskKey> = std::iter::once(root)
+                    .chain(
+                        self.registry
+                            .entries()
+                            .iter()
+                            .filter(|entry| {
+                                entry.lineage.is_some_and(|lineage| lineage.root == root)
+                            })
+                            .map(|entry| entry.key),
+                    )
+                    .collect();
+                for member in members {
+                    self.set_state(member, TaskState::Failed);
+                }
                 self.release_holdings_of(answered.key);
                 if *decline_halts_run {
                     self.record_halt(answered.key);
