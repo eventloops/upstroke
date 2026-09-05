@@ -417,15 +417,19 @@ phases and carries passing evidence; and each residue class has a recovery-prove
 synthetic records construct, recover and classify every element the class lists, and whose
 sampling record is non-zero, classifies every sample, and accounts for exactly `n` samples. An
 entry for a site outside the inventory, a duplicate key, and an entry the format would refuse
-are each reported. Legacy-scoped sites are inventoried and carry no requirement.
+are each reported. Legacy-scoped sites carry no site-coverage requirement. The entry audit and
+the empty-fast-sequence check below apply independently of the inventory. With an empty inventory,
+every supplied entry is reported as outside it; even with no entries, a begun fast sequence with
+no hook observation is reported.
 
 **The fast-path no-execution record.** Item 4 above fixes that an integration whose base is still
 the head publishes the exact candidate: no staging worktree is added, nothing is cherry-picked, and
 no prepared pin is taken. The three sites those effects belong to therefore carry a fifth kind of
 entry, the no-execution record, naming every fast sequence the suite exercised. A sequence is
 exercised only by what the harness observed inside it: the harness records a hook of some site
-between the sequence's begin and end, and that is the only marker, because only a funnel can set
-it. The check holds the record to the harness: it fails when the suite began no fast sequence at
+while recording that sequence. This observation is the marker. The check includes a sequence
+that is still open and does not establish that the sequence ended or an integration completed.
+The check holds the record to the harness: it fails when the suite began no fast sequence at
 all (an empty harness is not evidence), when a begun sequence had no hook observed inside it (a
 trace the harness saw nothing in is not an exercised fast integration, whatever the records say of
 it), when the record names a sequence the harness never began, when the record says nothing about

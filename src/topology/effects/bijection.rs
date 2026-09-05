@@ -43,9 +43,10 @@ use super::vocab::Host;
 /// caller can only compare as text is one a test pins by substring: `phase`
 /// held the rendering of [`EntryPhase`], so "the point `Synced` in
 /// error-return mode" was asserted by looking for two words inside one string.
-/// The two free-text fields left are the ones whose values really are text a
-/// document supplied — a resume action in the fault matrix's words, and the
-/// name a suite gave a fast sequence.
+/// Its own free-text fields have two categories: a resume action in the fault
+/// matrix's words, and the name a suite gave a fast sequence. The embedded
+/// [`RegistryError`] can also carry a refused entry's residue detail, resume
+/// action, or site and phase names as text.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BijectionFailure {
     #[error("`{site}` was never observed executing its `{phase}` hook")]
@@ -164,7 +165,7 @@ pub enum BijectionFailure {
     },
 
     #[error(
-        "the fast sequence `{sequence}` was begun and ended with no hook observed inside it; a \
+        "the fast sequence `{sequence}` has no hook observed inside it; a \
          trace the harness saw nothing in is not an exercised fast integration"
     )]
     EmptyFastSequence {
@@ -269,11 +270,16 @@ pub enum BijectionFailure {
 /// over the handful of sites its self-test drives, and PR10 runs it over
 /// everything. A slice that narrows the inventory narrows its own claim, which
 /// is why the self-test also runs the check over the *full* claimed inventory
-/// and asserts that it fails. Nothing here refuses an empty slice: a check over
-/// no sites requires nothing of the harness, every entry it is handed is then
-/// outside the inventory and reported as such, and an empty inventory with an
-/// empty entry slice reports nothing at all — it is the caller that has to know
-/// which sites it meant.
+/// and asserts that it fails. An empty inventory requires no site coverage,
+/// but every supplied entry is outside that inventory and reported as such.
+/// Every begun fast sequence is checked for a hook observation independently
+/// of the inventory. An empty inventory and an empty entry slice therefore
+/// report nothing only when the harness contains no empty fast sequence.
+/// It is the caller that has to know which sites it meant.
+///
+/// A fast sequence is checked even while it is still open. A hook observation
+/// satisfies its nonempty-trace requirement; the check does not establish
+/// that the sequence ended or that an integration completed.
 ///
 /// `host` narrows the same way and is easier to miss, because it narrows
 /// silently in the middle of a claim that otherwise reads as total. A
@@ -381,8 +387,9 @@ pub fn check_bijection(
     // of them" and "no skipped site's hook was observed in any" — and a check
     // that asked only those three would answer empty for a run in which no
     // exact-base integration happened at all. The positive marker is a hook
-    // recorded inside the sequence, the one thing only a funnel can set; a
-    // sequence with none is reported once, here, whatever the records say.
+    // recorded inside the sequence through `HookHarness::hook`. A sequence
+    // with none is reported once, here, whatever the records say. This does
+    // not prove that the sequence ended or an integration completed.
     for sequence in harness.fast_sequences() {
         if sequence.touched().is_empty() {
             failures.push(BijectionFailure::EmptyFastSequence {
@@ -440,8 +447,6 @@ pub fn check_bijection(
             // the site in any of them — so there has to *be* a fast sequence,
             // the record has to hold within every one the suite exercised, and
             // it may not name one that never happened.
-            // substantiates the claim, which is the same false report as an
-            // empty coverage table.
             if harness.fast_sequences().is_empty() {
                 failures.push(BijectionFailure::NoFastSequenceExercised { site });
             }

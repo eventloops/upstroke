@@ -5806,6 +5806,46 @@ fn a_fast_sequence_the_harness_observed_nothing_in_is_not_an_exercised_one() {
 }
 
 #[test]
+fn an_empty_inventory_still_checks_fast_traces_without_claiming_they_ended() {
+    let host = Host::current();
+    let mut harness = HookHarness::new();
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+
+    // The sequence is still open. EmptyFastSequence says what was observed,
+    // and must not claim that end_fast_sequence has been called.
+    harness.begin_fast_sequence("fast/open");
+    let failure = BijectionFailure::EmptyFastSequence {
+        sequence: "fast/open".to_owned(),
+    };
+    let failures = check_bijection(&[], &harness, &[], host);
+    assert_eq!(failures, [failure]);
+    assert_eq!(
+        failures
+            .first()
+            .expect("the open empty trace must report its missing observation")
+            .to_string(),
+        "the fast sequence `fast/open` has no hook observed inside it; a \
+         trace the harness saw nothing in is not an exercised fast integration"
+    );
+
+    // A hook observation satisfies the trace check even before the sequence
+    // closes. With no inventoried sites there is no ordinary coverage to add.
+    harness.hook(EffectSiteId::Event(EventSite::AppendFirst), HookPhase::Before);
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+    harness.end_fast_sequence();
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+
+    harness.begin_fast_sequence("fast/closed");
+    harness.end_fast_sequence();
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [BijectionFailure::EmptyFastSequence {
+            sequence: "fast/closed".to_owned(),
+        }]
+    );
+}
+
+#[test]
 fn every_failing_residue_element_is_reported_with_its_own_element_and_predicate() {
     // Pass 2 on `2421651`, finding 2: the three element Directions above each
     // break `synthetic[0]` alone and match the variant alone, so a checker
