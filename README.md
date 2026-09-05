@@ -154,6 +154,6 @@ files. Use a dedicated OS account or VM for untrusted input.
 grant (Apache-2.0 §6): use "upstroke" to refer to this project, not to present a modified version
 as the original.
 
-Contributions are welcome under the CLA and workflow in [CONTRIBUTING.md](CONTRIBUTING.md); Rust
-changes follow the [coding standards](CODING_STANDARDS.md), and the design lives in
-[DESIGN.md](DESIGN.md).
+Outside contributions are not being accepted at present; [CONTRIBUTING.md](CONTRIBUTING.md) says
+why, and records the terms that would apply if that changes. Rust changes follow the
+[coding standards](CODING_STANDARDS.md), and the design lives in [DESIGN.md](DESIGN.md).
