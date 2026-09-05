@@ -58,10 +58,14 @@ reason.
 
 Everything. A module that gets a notes file gets *all* of its prose moved: the module essay, every
 item's rustdoc including its `# Errors` and `# Panics` sections, every inline comment, the section
-banners. The notes file opens with an *Item contracts* section so the API documentation is still
-one place, and carries the rationale below it.
+banners. By default a notes file is a faithful dump in source order: `## Module` for the `//!`
+block, then one section per comment headed by the line of code it sat above, with its enclosing
+item — `` ## `impl HostRunner` › `pub fn new() -> Self {` `` — so the heading is the grep string
+that finds the code. The pilot's `runner/host.md` is curated further, an *Item contracts* table
+first and the rationale after, and any file may be reorganised or reworded like other
+documentation; the source-order dump is the floor, not the ceiling.
 
-Three things do not move, because they are not this standard's to place:
+Four things do not move, because they are not this standard's to place:
 
 - a `SAFETY:` obligation (§11), which belongs against the `unsafe` block it discharges;
 - a concurrency protocol (§10), where the type cannot carry it;
@@ -77,11 +81,21 @@ Where one of these has to stay, it stays, and the notes file says so.
 
 ## Keeping them honest
 
-`.github/scripts/test-internals-notes.sh` runs in CI's `lint` job. It checks that every marker
-names a notes file that exists and an anchor some heading generates; that every notes file mirrors
-a live module and links back to it resolvably; that a module with notes carries exactly one marker,
-in its header; and that the marker spelling is uniform. It refuses to pass with zero markers or
-zero notes files, so it cannot go quietly inert.
+`.github/scripts/test-internals-notes.sh` runs in CI's `lint` job (the Ubuntu one, with the other
+four Bash gates) and holds the two trees to each other in both directions:
+
+- every marker is spelled exactly `//! Extended notes: \`docs/internals/<module>.md\`` — no
+  anchor, no prose, no other comment form — names the notes file that its own module's path
+  derives, and that file exists;
+- every notes file mirrors a live module, and that module carries exactly one marker, so a module
+  that loses its marker is caught from the notes side;
+- every notes file links back to its module, resolved against the repository root from the notes
+  file's own directory, at any depth;
+- a module carries at most one marker, above its first line of code.
+
+An absent `docs/internals/` is a failure, never "nothing to check": with markers in `src/` it is a
+deleted notes tree, and with none it is a gate measuring nothing. Each check has been broken on
+purpose and watched fail.
 
 What it cannot check is whether a note is still *true*. That is a review duty, and §4's rule that a
 stale comment is a defect applies to a stale note in the same way.
