@@ -8,28 +8,13 @@ reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/status.rs:41
 provenance: pre_existing
 first_bad:
-guard: row 57 of `standards/SWEEP.md` (`src/status.rs`), whose `RunStatus` owns the two flags; `render`'s doc in `src/status/render.rs` states the four readings it relies on
+guard: a RunStatus API change in src/status.rs deriving one liveness reading; production load currently constructs coherent flags
 ---
 
 ## Failure sequence
 
-`RunStatus` exposes `running` and `held` as `pub bool` fields (`src/status.rs:41`, `:50`)
-while `load` derives `running = held && finished.is_none()` -> a `RunStatus` constructed with
-`running: true, held: false` is a value the type admits -> `render` prints `state: running now
-(another process holds this run)` while nothing holds it, and `report()` renders the tasks as
-live; with `running: false, held: false` and `finished: None` the same value reads as
-interrupted, so the two derived flags carry an invariant (`running` implies `held`) that only
-one constructor keeps. No production path constructs the type outside `load` today — the
-sequence fires only from a caller that builds the struct by hand (the fields are `pub`, and
-`engine::tests::replay_of` goes through `load`), which is why this is P3 and a §5 finding
-("fields stay private where construction or mutation must preserve an invariant") rather than a
-defect an operator can reach.
+A caller can manually construct public RunStatus fields with `running: true, held: false` -> render reports a running process holding the run despite the supplied held flag. Production `load` computes running from held and the finish state, so its values are coherent. No supported production path or regression witness for an inconsistent load result has been established. The field-privacy guidance in standards section 5 motivates an API improvement; it is not an explicit MUST that this renderer change breaches.
 
 ## What the change that takes this up should do
 
-Replace the pair with one derived reading — an enum such as `Liveness { Running, Interrupted,
-Claimed, Ended }` computed once in `load` from `held` and `state.finished` — or keep the two
-facts and make `running` a method over them, so `render`'s four-way reading and `report()`'s
-`running` argument are one derivation. `render` in `src/status/render.rs` and `RunStatus::report`
-are the two readers to move. Out of the render sweep's reach because the type is the parent's
-(row 57).
+Have RunStatus derive liveness once from the held and finished facts, or expose a constructor/private representation that preserves the relationship. Move report and render readers together and assess compatibility for public field users. This remains a deferred P3 API design issue, not a claim that an operator currently reaches an inconsistent production value.

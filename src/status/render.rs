@@ -47,9 +47,8 @@
 //! none.
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-// `write!` and `writeln!` below go through this trait's `write_fmt` on a
-// `String`, whose impl never returns `Err`. Every `let _ =` on one of them
-// discards an `Ok` the type cannot withhold, not an error (§7).
+// The remaining `write!` calls append suffixes through String's fmt::Write
+// implementation, which cannot return Err. Their discarded results are Ok (§7).
 use std::fmt::Write as _;
 
 use super::RunStatus;
@@ -58,6 +57,7 @@ use crate::events::{
     ReviewPassOutcome, RunOutcome, TaskDeferred, TaskFailed,
 };
 use crate::ir::Answer;
+use crate::util::terminal::{TerminalLines, one_line};
 
 /// The settled view, assembled: the report and its ledger, then the trailing
 /// lines that say whether it is still moving and what it is waiting for.
@@ -70,18 +70,19 @@ use crate::ir::Answer;
 /// already printed, so it says nothing.
 pub(super) fn render(status: &RunStatus) -> String {
     let report = status.report();
-    let mut out = report.render();
-    out.push_str(&report.render_ledger());
+    let mut rendered = report.render();
+    rendered.push_str(&report.render_ledger());
+    let mut out = TerminalLines::default();
 
     // Liveness first among the trailing lines, because it decides whether any
     // of the above is still moving.
     if status.running {
-        let _ = writeln!(out, "state: running now (another process holds this run)");
+        out.push(format_args!(
+            "state: running now (another process holds this run)"
+        ));
     } else if status.interrupted_run() {
-        let _ = writeln!(
-            out,
-            "state: interrupted — this run stopped without finishing{}. Continue it with:\n    \
-             upstroke resume {}",
+        out.push(format_args!(
+            "state: interrupted — this run stopped without finishing{}. Continue it with:",
             if status.interrupted > 0 {
                 format!(
                     ", with {} attempt(s) cut off mid-flight",
@@ -89,28 +90,31 @@ pub(super) fn render(status: &RunStatus) -> String {
                 )
             } else {
                 String::new()
-            },
-            status.run_id
-        );
+            }
+        ));
+        out.push(format_args!("    upstroke resume {}", status.run_id));
     } else if status.held {
         // Finished, and somebody has claimed it anyway — a `resume` between
         // taking the lock and writing `run_resumed`. The outcome above is still
         // this run's outcome; it may just not be the last word for long.
-        let _ = writeln!(
-            out,
+        out.push(format_args!(
             "state: another process holds this run (a resume, most likely)"
-        );
+        ));
     }
 
     let open = status.state.open_questions();
     if !open.is_empty() {
-        let _ = writeln!(out, "waiting on {} answer(s):", open.len());
+        out.push(format_args!("waiting on {} answer(s):", open.len()));
         for record in open {
-            let _ = writeln!(out, "    upstroke answer {}", record.question.id);
+            out.push(format_args!("    upstroke answer {}", record.question.id));
         }
     }
-    let _ = writeln!(out, "transcripts: {}", status.paths.private.display());
-    out
+    out.push(format_args!(
+        "transcripts: {}",
+        status.paths.private.display()
+    ));
+    rendered.push_str(&out.into_string());
+    rendered
 }
 
 /// One line per event: the time of day out of the record's own timestamp,
@@ -119,9 +123,9 @@ pub(super) fn render(status: &RunStatus) -> String {
 ///
 /// The time is the record's, not the reader's: a `--follow` at 16:03 local in
 /// UTC+2 shows `14:03:07Z`, and the suffix is what says so. A timestamp not in
-/// `YYYY-MM-DDTHH:MM:SS…` shape — checked character by character by
-/// [`clock_of`], not by length — is printed whole rather than sliced into
-/// something that looks like a time and is not.
+/// the calendar, clock, and suffix form accepted by [`clock_of`] is printed
+/// whole. Leap-second values retain their date too, since abbreviating one
+/// would hide information needed to check it against the leap-second schedule.
 pub(super) fn describe(event: &Event) -> String {
     let (at, zone) = clock_of(&event.ts).unwrap_or((event.ts.as_str(), ""));
     let body = match &event.body {
@@ -200,43 +204,48 @@ pub(super) fn describe(event: &Event) -> String {
         EventBody::TaskDeferred { task, data } => {
             format!("{task}: {}", describe_deferral(data))
         }
-        EventBody::DeferWaitElapsed { data } => format!(
-            "waited {}s for a pool to come back (round {})",
-            data.waited.as_secs(),
-            data.round
-        ),
+        // Integer milliseconds preserve the wire's precision even beyond
+        // f64's exact range. A public caller's submillisecond remainder is
+        // truncated, matching the persisted format's precision.
+        EventBody::DeferWaitElapsed { data } => {
+            let waited_ms = data.waited.as_millis();
+            format!(
+                "waited {}.{:03}s for a pool to come back (round {})",
+                waited_ms / 1000,
+                waited_ms % 1000,
+                data.round
+            )
+        }
         EventBody::TaskParked { task, data } => {
             format!("{task}: parked on {}", data.question)
         }
         EventBody::TaskCommitted { task, data } => {
             format!("{task}: committed {}", short(&data.sha))
         }
-        EventBody::TaskFailed { task, data } => {
-            format!(
-                "{task}: failed — {}; {}",
-                data.reason,
-                describe_task_failure(data)
-            )
-        }
+        EventBody::TaskFailed { task, data } => format!("{task}: {}", describe_task_failure(data)),
         EventBody::QuestionRaised { task, data } => format!(
             "{task}: asking {} — answer with `upstroke answer {}`",
             data.question.kind, data.question.id
         ),
-        // Three answers, three lines. A decline is the affected task's
-        // failure at the human rung, and whether that halts the run was frozen
-        // with the answer; a question no channel could reach a person with was
-        // not answered at all.
+        // Three answers, three lines. A decline carries the halt policy
+        // frozen with it, and that is what this line reports — the policy, not
+        // a transition: the task failure a decline causes is its own later
+        // event (`task_failed`, which `resume` appends for a log that stopped
+        // before it), the answer names no task, and a question may park more
+        // than one. A question no channel could reach a person with was not
+        // answered at all.
         EventBody::QuestionAnswered { data } => match &data.answer {
             Answer::Answered { .. } => format!("{} answered via {}", data.question, data.via),
             Answer::Declined => format!(
-                "{} declined via {}; its task fails{}",
+                "{} declined via {}; the halt policy frozen with it {}",
                 data.question,
                 data.via,
                 match data.decline_halts_run {
-                    Some(halts_run) => halt_suffix(halts_run),
+                    Some(true) => "says the run halts",
+                    Some(false) => "says the run continues",
                     // Only a log older than schema 3, which requires the
                     // policy on every decline.
-                    None => " and the halt policy was not recorded",
+                    None => "was not recorded",
                 }
             ),
             Answer::Unanswered => format!(
@@ -323,10 +332,9 @@ pub(super) fn describe(event: &Event) -> String {
 /// `ReviewUnavailable` failure beside the pass's outcome), so the line a run
 /// produces is `failed — review failed: …; review \`review\` (model)
 /// rejected it`. A record carrying the outcome and no failure is rendered as
-/// it reads, "was not approved", whatever a fold does with it: the schema-4
-/// doors refuse it through `is_successful`, the schema-3 door classifies by
-/// `failure` alone (SWEEP-RENDER-014), and the line follows the record rather
-/// than either door.
+/// it reads, "was not approved". Schema-3 validation refuses this inconsistent
+/// shape, and schema-4 success checks reject it through `is_successful`.
+/// Public describe renders the supplied event without validating a log.
 fn attempt_outcome(record: &AttemptRecord) -> String {
     let verdict = record.reviews.iter().find_map(|pass| match pass.outcome {
         ReviewPassOutcome::Passed => None,
@@ -357,13 +365,18 @@ fn describe_transition(transition: &AttemptTransition) -> String {
     }
 }
 
-/// The terminal decision, in the one spelling both wire shapes use. The
-/// `Debug` of the kind is the log's `snake_case` spelt as a Rust identifier;
-/// a `Display` on `FailureKind` belongs to `src/ladder.rs` (SWEEP-RENDER-011).
+/// The terminal decision, in the one spelling both wire shapes use, carrying
+/// the transition's own reason: beside an attempt record it repeats the
+/// attempt's reason when the coordinator copied it, and shows the difference
+/// when a log carries two, which schema-3 validation admits (it requires the
+/// kinds to agree and says nothing about the reasons). The `Debug` of the kind
+/// is the log's `snake_case` spelt as a Rust identifier; a `Display` on
+/// `FailureKind` belongs to `src/ladder.rs` (SWEEP-RENDER-011).
 fn describe_task_failure(data: &TaskFailed) -> String {
     format!(
-        "task failed ({:?}){}",
+        "task failed ({:?}) — {}{}",
         data.kind,
+        data.reason,
         halt_suffix(data.halts_run)
     )
 }
@@ -398,52 +411,84 @@ fn halt_suffix(halts_run: bool) -> &'static str {
     }
 }
 
-/// The `HH:MM:SS` of a timestamp in RFC 3339 shape and whatever follows it —
-/// `Z`, an offset, or fractional seconds and then either — or `None` for any
-/// other text, so a timestamp the engine did not write is printed whole. The
-/// shape is checked character by character: ten digits and dashes as
-/// `YYYY-MM-DD`, a `T`, then `HH:MM:SS`; a string that merely has nineteen
-/// bytes is not a timestamp.
+/// The clock and suffix of a calendar-valid RFC 3339 timestamp with seconds
+/// in `00..=59`. Other text, including leap-second values, stays whole.
+///
+/// Month lengths and Gregorian leap years keep malformed dates visible.
+/// Fractions need digits, and a zone is required with no trailing text.
+/// This is an abbreviation rule, not event validation: it does not consult
+/// the historical leap-second schedule, so those values keep their date.
+/// Every Option propagation below selects the whole-timestamp fallback,
+/// including the checked slices. Absence never becomes an error (§7).
 fn clock_of(ts: &str) -> Option<(&str, &str)> {
     let bytes = ts.as_bytes();
-    let date = bytes.get(..10)?;
-    let separator = bytes.get(10)?;
-    let clock = bytes.get(11..19)?;
-    let shaped = |slice: &[u8], separators: &[usize], separator: u8| {
-        slice.iter().enumerate().all(|(index, byte)| {
-            if separators.contains(&index) {
-                *byte == separator
-            } else {
-                byte.is_ascii_digit()
-            }
-        })
+    let field = |range: std::ops::Range<usize>, low: u32, high: u32| -> Option<u32> {
+        let digits = bytes.get(range)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        // Every call below requests two or four digits, so the accumulated
+        // value is at most 9999 and both arithmetic operations fit u32.
+        let value = digits
+            .iter()
+            .fold(0u32, |acc, digit| acc * 10 + u32::from(digit - b'0'));
+        (low..=high).contains(&value).then_some(value)
     };
-    if *separator != b'T' || !shaped(date, &[4, 7], b'-') || !shaped(clock, &[2, 5], b':') {
+    let byte_at = |index: usize, expected: u8| -> Option<()> {
+        (*bytes.get(index)? == expected).then_some(())
+    };
+    let year = field(0..4, 0, 9999)?;
+    byte_at(4, b'-')?;
+    let month = field(5..7, 1, 12)?;
+    byte_at(7, b'-')?;
+    let days = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    field(8..10, 1, days)?;
+    if !matches!(bytes.get(10), Some(b'T' | b't')) {
         return None;
     }
-    // Every byte checked above is ASCII, so both boundaries are char
-    // boundaries; the `?`s are the type's, not a path the check leaves open.
-    Some((ts.get(11..19)?, ts.get(19..)?))
-}
-
-/// The assembled line with every control character made harmless: a newline,
-/// carriage return or tab becomes one space, so the event stays one line of
-/// `--follow`; anything else in the C0 and C1 ranges, ESC included, is written
-/// as its `\u{..}` escape rather than handed to the terminal. Text with no
-/// control character is returned as it came.
-fn one_line(text: String) -> String {
-    if !text.chars().any(char::is_control) {
-        return text;
-    }
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\n' | '\r' | '\t' => out.push(' '),
-            c if c.is_control() => out.extend(c.escape_default()),
-            c => out.push(c),
+    field(11..13, 0, 23)?;
+    byte_at(13, b':')?;
+    field(14..16, 0, 59)?;
+    byte_at(16, b':')?;
+    field(17..19, 0, 59)?;
+    // The suffix: an optional fraction, then `Z` or a signed `HH:MM` offset,
+    // and nothing after it.
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        let digits = bytes
+            .get(index + 1..)?
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
         }
+        index += 1 + digits;
     }
-    out
+    match bytes.get(index)? {
+        b'Z' | b'z' => {
+            if bytes.len() != index + 1 {
+                return None;
+            }
+        }
+        b'+' | b'-' => {
+            field(index + 1..index + 3, 0, 23)?;
+            byte_at(index + 3, b':')?;
+            field(index + 4..index + 6, 0, 59)?;
+            if bytes.len() != index + 6 {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    // Every byte checked above is ASCII, so both boundaries are char
+    // boundaries and the two `get`s below cannot fail.
+    Some((ts.get(11..19)?, ts.get(19..)?))
 }
 
 fn short(sha: &str) -> String {

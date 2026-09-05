@@ -642,7 +642,7 @@ pub enum AttemptTransition {
 impl AttemptRecord {
     /// Whether this record says the attempt **succeeded**.
     ///
-    /// **One definition, read by both of the fold's settlement doors.** "The
+    /// **One definition, read by schema-3 and schema-4 settlement validation.** "The
     /// attempt succeeded" is not `failure.is_none()`: a record can carry no
     /// failure and still hold a review whose outcome is `Failed` or
     /// `Unavailable`, both of which are authoritative — §11.2 requires every
@@ -664,7 +664,8 @@ impl AttemptRecord {
     // **There is deliberately no `is_failed`.** It was added as the complement
     // of the predicate above and never acquired a caller anywhere in the tree.
     // Every reader of this question is asking whether a record *claims success*
-    // — `check_candidate_prepared`, and both arms of `check_attempt_finished` —
+    // — the schema-3 boundary, `check_candidate_prepared`, and both arms of
+    // `check_attempt_finished` —
     // and each asks [`Self::is_successful`] directly, which is the question it
     // is actually asking. A named complement would put the same predicate under
     // two spellings, which is how two readers of one rule begin to disagree.
@@ -1765,6 +1766,11 @@ pub fn replay(
 /// Apply the event-schema compatibility boundary shared by every whole-log
 /// interpretation. Additive fields are safe inside the current schema; a
 /// future schema is not something an older binary may silently project.
+///
+/// # Errors
+/// Refuses unsupported schemas, incomplete verification identity, and
+/// inconsistent schema-3 settlements. A non-passing review must carry its
+/// failure record and decision; it cannot authorize a prepared commit.
 pub(crate) fn ensure_supported_schema(
     started: &RunStarted,
     events: &[Event],
@@ -1798,7 +1804,9 @@ pub(crate) fn ensure_supported_schema(
         });
     }
     let mut event_schema = started.schema;
-    let mut pending_prepared: Option<(String, PreparedCommit)> = None;
+    // Both identities remain owned by the immutable event slice throughout
+    // this validation walk, including the following-event comparison.
+    let mut pending_prepared: Option<(&str, &PreparedCommit)> = None;
     for event in events {
         if let EventBody::RunSchemaUpgraded { data } = &event.body {
             event_schema = data.to;
@@ -1807,12 +1815,12 @@ pub(crate) fn ensure_supported_schema(
         if event_schema < 3 {
             continue;
         }
-        if let Some((task, prepared)) = pending_prepared.as_ref() {
+        if let Some((task, prepared)) = pending_prepared {
             match &event.body {
                 EventBody::TaskCommitted {
                     task: committed_task,
                     data,
-                } if committed_task == task
+                } if committed_task.as_str() == task
                     && data.sha == prepared.commit_sha
                     && data.message == prepared.message =>
                 {
@@ -1840,7 +1848,20 @@ pub(crate) fn ensure_supported_schema(
                 prepared_commit,
                 ..
             } => {
-                let failed = data.failure.is_some();
+                if let (None, Some(review)) = (
+                    &data.failure,
+                    data.reviews.iter().find(|review| !review.outcome.passed()),
+                ) {
+                    return Err(UpstrokeError::EventLog {
+                        path: path.to_path_buf(),
+                        message: crate::util::terminal::one_line(format!(
+                            "event schema 3 attempt_finished for `{task}` has non-passing review \
+                             `{}` without a failure record",
+                            review.pass
+                        )),
+                    });
+                }
+                let failed = !data.is_successful();
                 if data.attempt != *attempt {
                     return Err(UpstrokeError::EventLog {
                         path: path.to_path_buf(),
@@ -1902,7 +1923,7 @@ pub(crate) fn ensure_supported_schema(
                                 ),
                             });
                         }
-                        pending_prepared = Some((task.clone(), prepared.clone()));
+                        pending_prepared = Some((task.as_str(), prepared));
                     }
                     _ => {}
                 }
@@ -3057,6 +3078,138 @@ mod tests {
             },
         }));
         assert_eq!(legacy_unsettled_failure(2, &log), None);
+    }
+
+    #[test]
+    fn schema_three_cannot_commit_a_nonpassing_review_without_a_failure_record() {
+        for outcome in [
+            ReviewPassOutcome::Passed,
+            ReviewPassOutcome::Failed,
+            ReviewPassOutcome::Unavailable,
+        ] {
+            let mut finished = attempt_finished("t1", 1, 0, "small");
+            let EventBody::AttemptFinished {
+                data,
+                prepared_commit: Some(prepared),
+                ..
+            } = &mut finished
+            else {
+                panic!("the fixture is a prepared successful settlement");
+            };
+            data.reviews.push(ReviewRecord {
+                pass: "review".to_owned(),
+                agent: "codex".to_owned(),
+                model: "reviewer".to_owned(),
+                adapter: None,
+                preflight_cli_version: None,
+                effort: None,
+                pool: None,
+                cost_usd: None,
+                outcome,
+            });
+            // The subsequent event owns the exact identity being promoted.
+            let committed = EventBody::TaskCommitted {
+                task: "t1".to_owned(),
+                data: TaskCommitted {
+                    sha: prepared.commit_sha.clone(),
+                    message: prepared.message.clone(),
+                },
+            };
+            let events = [
+                started(),
+                attempt_started("t1", 1, 0, "small"),
+                finished,
+                committed,
+            ]
+            .into_iter()
+            .map(|body| Event {
+                ts: "2026-09-05T12:00:00Z".to_owned(),
+                body,
+            })
+            .collect();
+            let result = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"));
+            match outcome {
+                ReviewPassOutcome::Passed => {
+                    let replayed =
+                        result.expect("an otherwise valid approved settlement can commit");
+                    assert!(matches!(replayed.state.states[0], TaskState::Done(_)));
+                }
+                ReviewPassOutcome::Failed | ReviewPassOutcome::Unavailable => {
+                    let error = result.expect_err("a forged approval must not replay to Done");
+                    assert!(error.to_string().contains("non-passing review"), "{error}");
+                    assert!(error.to_string().contains("review"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_three_accepts_production_review_failures_with_their_recorded_decisions() {
+        for (outcome, kind, transition) in [
+            (
+                ReviewPassOutcome::Failed,
+                FailureKind::ReviewFailed,
+                AttemptTransition::Retry(LadderRetry {
+                    resume: false,
+                    tier: "small".to_owned(),
+                    summary: "review failed".to_owned(),
+                    detail: None,
+                }),
+            ),
+            (
+                ReviewPassOutcome::Unavailable,
+                FailureKind::ReviewUnavailable,
+                AttemptTransition::Defer(TaskDeferred {
+                    reason: "reviewer unavailable".to_owned(),
+                    defers: 1,
+                }),
+            ),
+        ] {
+            let mut finished = attempt_finished("t1", 1, 0, "small");
+            let EventBody::AttemptFinished {
+                data,
+                prepared_commit,
+                transition: recorded,
+                ..
+            } = &mut finished
+            else {
+                panic!("the fixture is an attempt settlement");
+            };
+            data.reviews.push(ReviewRecord {
+                pass: "review".to_owned(),
+                agent: "codex".to_owned(),
+                model: "reviewer".to_owned(),
+                adapter: None,
+                preflight_cli_version: None,
+                effort: None,
+                pool: None,
+                cost_usd: None,
+                outcome,
+            });
+            data.failure = Some(FailureRecord {
+                kind,
+                origin: FailureOrigin::Reviewer,
+                reason: "review did not pass".to_owned(),
+                detail: None,
+            });
+            *prepared_commit = None;
+            *recorded = Some(Box::new(transition));
+            let events = [started(), attempt_started("t1", 1, 0, "small"), finished]
+                .into_iter()
+                .map(|body| Event {
+                    ts: "2026-09-05T12:00:00Z".to_owned(),
+                    body,
+                })
+                .collect();
+            let replayed = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
+                .expect("production review failures remain replayable");
+            assert!(!matches!(replayed.state.states[0], TaskState::Done(_)));
+            assert_eq!(replayed.state.progress[0].records.len(), 1);
+            assert_eq!(
+                replayed.state.progress[0].records[0].reviews[0].outcome,
+                outcome
+            );
+        }
     }
 
     #[test]

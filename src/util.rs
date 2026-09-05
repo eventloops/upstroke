@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::UpstrokeError;
 
+pub(crate) mod terminal;
+
 /// Last `max` bytes of trimmed text, cut on a char boundary, with an ellipsis
 /// marker when truncated.
 pub fn tail(text: &str, max: usize) -> String {

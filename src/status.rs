@@ -231,8 +231,10 @@ pub fn render(status: &RunStatus) -> String {
 
 /// One human line per event, for `--follow`.
 ///
-/// Delegates to the private `render` child, beside the view it belongs with:
-/// both turn a fold of the log into text and neither touches anything.
+/// Renders the supplied event without folding or validating a log. Recorded
+/// control characters are made safe for a terminal; malformed timestamps and
+/// leap-second values retain their full date. A supplied duration is shown at
+/// millisecond precision. See DESIGN.md §18 for the output contract.
 pub fn describe(event: &Event) -> String {
     render::describe(event)
 }
@@ -822,20 +824,24 @@ mod tests {
     fn a_decline_is_described_as_a_decline_with_the_halt_policy_frozen_with_it() {
         let halting = describe(&answered(Answer::Declined, Some(true)));
         assert!(
-            halting.contains("q-1 declined via terminal; its task fails; the run halts"),
+            halting.contains(
+                "q-1 declined via terminal; the halt policy frozen with it says the run halts"
+            ),
             "{halting}"
         );
         assert!(!halting.contains("answered"), "{halting}");
 
         let continuing = describe(&answered(Answer::Declined, Some(false)));
         assert!(
-            continuing.contains("q-1 declined via terminal; its task fails; the run continues"),
+            continuing.contains(
+                "q-1 declined via terminal; the halt policy frozen with it says the run continues"
+            ),
             "{continuing}"
         );
 
         let legacy = describe(&answered(Answer::Declined, None));
         assert!(
-            legacy.contains("its task fails and the halt policy was not recorded"),
+            legacy.contains("the halt policy frozen with it was not recorded"),
             "{legacy}"
         );
 
@@ -853,6 +859,170 @@ mod tests {
             None,
         ));
         assert!(answer.contains("q-1 answered via terminal"), "{answer}");
+    }
+
+    #[test]
+    fn a_decline_line_does_not_invent_a_failure_before_its_event() {
+        for halts_run in [false, true] {
+            let mut state = RunState::new(vec!["t1".to_owned(), "t2".to_owned()]);
+            state.apply(&event(EventBody::QuestionRaised {
+                task: "t1".to_owned(),
+                data: Box::new(events::QuestionRaised {
+                    question: Question {
+                        id: QuestionId::from("q-1"),
+                        kind: QuestionKind::Unblock,
+                        affected_tasks: vec![TaskId::from("t1"), TaskId::from("t2")],
+                        context: "both tasks need the same decision".to_owned(),
+                        options: Vec::new(),
+                    },
+                }),
+            }));
+            for task in ["t1", "t2"] {
+                state.apply(&event(EventBody::TaskParked {
+                    task: task.to_owned(),
+                    data: TaskParked {
+                        question: "q-1".to_owned(),
+                        refund_attempt: false,
+                    },
+                }));
+            }
+            // The coordinator writes the answer before either task failure.
+            // A crash here leaves this prefix as the entire durable truth.
+            let decline = answered(Answer::Declined, Some(halts_run));
+            state.apply(&decline);
+            assert_eq!(state.questions.len(), 1);
+            assert_eq!(state.questions[0].answer, Some(Answer::Declined));
+            assert_eq!(state.states.len(), 2);
+            assert!(state.states.iter().all(|task| {
+                *task == events::TaskState::AwaitingInput(QuestionId::from("q-1"))
+            }));
+            assert_eq!(state.halted_at, None);
+            assert_eq!(state.finished, None);
+            let line = describe(&decline);
+            assert!(line.contains("q-1 declined via terminal"), "{line}");
+            assert!(line.contains("halt policy frozen with it"), "{line}");
+            assert!(!line.contains("task fails"), "{line}");
+            assert!(!line.contains("task failed"), "{line}");
+
+            for task in ["t1", "t2"] {
+                let failure = event(EventBody::TaskFailed {
+                    task: task.to_owned(),
+                    data: TaskFailed {
+                        kind: FailureKind::Declined,
+                        reason: "declined at the human rung".to_owned(),
+                        halts_run,
+                    },
+                });
+                state.apply(&failure);
+                let line = describe(&failure);
+                assert!(line.contains(&format!("{task}: task failed")), "{line}");
+            }
+            assert!(state.states.iter().all(|task| {
+                matches!(
+                    task,
+                    events::TaskState::Failed {
+                        kind: FailureKind::Declined,
+                        ..
+                    }
+                )
+            }));
+            assert_eq!(state.halted_at.as_deref(), halts_run.then_some("t1"));
+        }
+    }
+
+    #[test]
+    fn settled_status_sanitizes_the_report_and_its_resume_and_answer_lines() {
+        let hostile = "x\n\u{1b}[2Jy";
+        let mut state = RunState::new(vec!["t1".to_owned()]);
+        state.apply(&event(EventBody::TaskFailed {
+            task: "t1".to_owned(),
+            data: TaskFailed {
+                kind: FailureKind::AgentError,
+                reason: hostile.to_owned(),
+                halts_run: false,
+            },
+        }));
+        state.apply(&event(EventBody::QuestionRaised {
+            task: "t1".to_owned(),
+            data: Box::new(events::QuestionRaised {
+                question: Question {
+                    id: QuestionId::from(hostile),
+                    kind: QuestionKind::Unblock,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "still needs an answer".to_owned(),
+                    options: Vec::new(),
+                },
+            }),
+        }));
+        let status = RunStatus {
+            run_id: hostile.to_owned(),
+            paths: RunPaths::from_parts(PathBuf::from("public"), PathBuf::from(hostile)),
+            started: RunStarted {
+                schema: 3,
+                upstroke_version: "0.1.0".to_owned(),
+                run_id: hostile.to_owned(),
+                branch: "upstroke/run-1".to_owned(),
+                base_sha: "a".repeat(40),
+                plan_path: "plan.md".to_owned(),
+                config_path: None,
+                plan_hash: "hash".to_owned(),
+                normalized_plan_digest: None,
+                private_dir: hostile.to_owned(),
+                gates: Vec::new(),
+                gates_from_config: false,
+                interaction_mode: "on_block".to_owned(),
+                chains: Vec::new(),
+                effort_policy: None,
+                gate_cmds: None,
+                reviews: None,
+            },
+            state,
+            plan: Plan {
+                source: crate::ir::PlanSource {
+                    adapter: "markdown".to_owned(),
+                    hash: "hash".to_owned(),
+                },
+                tasks: vec![crate::ir::Task {
+                    id: TaskId::from("t1"),
+                    kind: crate::ir::TaskKind::Fix,
+                    title: "repair the task".to_owned(),
+                    body: String::new(),
+                    depends_on: Vec::new(),
+                    acceptance: Vec::new(),
+                    path_hints: Vec::new(),
+                    suggested_tier: None,
+                    min_tier: None,
+                    artifacts_in: Vec::new(),
+                    artifacts_out: Vec::new(),
+                }],
+                artifacts: Vec::new(),
+            },
+            running: false,
+            held: false,
+            interrupted: 0,
+            warnings: vec![hostile.to_owned()],
+        };
+        let rendered = render(&status);
+        assert!(
+            rendered.chars().all(|c| c == '\n' || !c.is_control()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("FAILED [] — x \\u{1b}[2Jy"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("Continue it with:\n    upstroke resume x \\u{1b}[2Jy\n"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("    upstroke answer x \\u{1b}[2Jy\n"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("transcripts: x \\u{1b}[2Jy\n"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -977,16 +1147,32 @@ mod tests {
 
     #[test]
     fn a_deferral_wait_says_how_long_and_which_round() {
-        let line = describe(&event(EventBody::DeferWaitElapsed {
-            data: events::DeferWaitElapsed {
-                waited: Duration::from_secs(90),
-                round: 3,
-            },
-        }));
-        assert!(
-            line.contains("waited 90s for a pool to come back (round 3)"),
-            "{line}"
-        );
+        for (waited, expected, round) in [
+            (Duration::from_millis(999), "0.999", 2),
+            (Duration::ZERO, "0.000", 0),
+            (Duration::from_millis(1), "0.001", 1),
+            (Duration::from_secs(1), "1.000", 3),
+            (Duration::from_millis(1001), "1.001", 4),
+            (Duration::from_secs(90), "90.000", 5),
+            // Above f64's exact-integer range, milliseconds still survive.
+            (
+                Duration::from_millis(9_007_199_254_740_993),
+                "9007199254740.993",
+                6,
+            ),
+            (Duration::from_millis(u64::MAX), "18446744073709551.615", 7),
+            // Public describe also accepts values beyond the wire's u64 ms.
+            (Duration::MAX, "18446744073709551615.999", u32::MAX),
+            (Duration::from_nanos(999_999), "0.000", 9),
+        ] {
+            let line = describe(&event(EventBody::DeferWaitElapsed {
+                data: events::DeferWaitElapsed { waited, round },
+            }));
+            assert_eq!(
+                line,
+                format!("14:03:07Z  waited {expected}s for a pool to come back (round {round})")
+            );
+        }
     }
 
     #[test]
@@ -997,26 +1183,37 @@ mod tests {
                 reason: "gates exhausted".to_owned(),
                 halts_run,
             };
+            // Independent events own equal transition snapshots, so exercise
+            // both wire shapes with the same failure policy and reason.
             let standalone = describe(&event(EventBody::TaskFailed {
                 task: "t1".to_owned(),
                 data: failed.clone(),
             }));
+            for parked in [None, Some(parking("q-1"))] {
+                let expected_parking = if parked.is_some() {
+                    "; parked on question q-1"
+                } else {
+                    ""
+                };
+                // Public describe can receive either parking shape; its
+                // transition must retain reason B beside attempt reason A.
+                let atomic = describe(&finished(
+                    record(Some(gate_failure("the attempt failed")), Vec::new()),
+                    parked,
+                    Some(AttemptTransition::Fail(failed.clone())),
+                ));
+                assert_eq!(
+                    atomic,
+                    format!(
+                        "14:03:07Z  t1: attempt 1 failed — the attempt failed; task failed (GateFailed) — gates exhausted{expected}{expected_parking}"
+                    )
+                );
+            }
             assert!(
                 standalone.contains(&format!(
-                    "t1: failed — gates exhausted; task failed (GateFailed){expected}"
+                    "t1: task failed (GateFailed) — gates exhausted{expected}"
                 )),
                 "{standalone}"
-            );
-            let atomic = describe(&finished(
-                record(Some(gate_failure("the attempt failed")), Vec::new()),
-                None,
-                Some(AttemptTransition::Fail(failed)),
-            ));
-            assert!(
-                atomic.contains(&format!(
-                    "t1: attempt 1 failed — the attempt failed; task failed (GateFailed){expected}"
-                )),
-                "{atomic}"
             );
         }
     }
@@ -1126,8 +1323,8 @@ mod tests {
         ));
         assert!(
             parked_failure.contains(
-                "t1: attempt 1 failed — the attempt failed; task failed (GateFailed); the run \
-                 halts; parked on question q-1"
+                "t1: attempt 1 failed — the attempt failed; task failed (GateFailed) — \
+                 the attempt failed; the run halts; parked on question q-1"
             ),
             "{parked_failure}"
         );
@@ -1183,11 +1380,10 @@ mod tests {
         assert_eq!(plain, "14:03:07Z  t1: attempt 1 passed");
     }
 
-    /// The slice is taken only from a timestamp in RFC 3339 shape, checked
-    /// character by character: nineteen bytes that happen to end in something
-    /// clock-like are not a time, and a persisted value the engine did not
-    /// write is shown whole rather than dressed as one. `Event.ts` is an
-    /// unconstrained `String` and parsing validates nothing about it.
+    /// Abbreviation checks calendar dates, clock ranges, and the complete
+    /// suffix. Leap-second records retain their date because this renderer
+    /// does not consult the historical leap-second schedule. Event.ts is an
+    /// unconstrained String and parsing validates nothing about it.
     #[test]
     fn a_timestamp_the_engine_did_not_write_is_printed_whole_rather_than_sliced() {
         let with = |ts: &str| Event {
@@ -1208,22 +1404,49 @@ mod tests {
             "2026-08-09T14.03.07Z",
             "2026-08-09T1a:03:07Z",
             "2026-08-09T14:03:0",
+            "2026-00-09T14:03:07Z",
+            "2026-13-09T14:03:07Z",
+            "2026-08-00T14:03:07Z",
+            "2026-08-32T14:03:07Z",
+            "2026-04-31T14:03:07Z",
+            "2026-02-29T14:03:07Z",
+            "1900-02-29T14:03:07Z",
+            "2100-02-29T14:03:07Z",
+            "2000-02-30T14:03:07Z",
+            "2026-08-09T24:03:07Z",
+            "2026-08-09T14:60:07Z",
+            "2026-08-09T14:03:61Z",
+            "2016-12-31T23:59:60Z",
+            "2026-08-09T14:03:07",
+            "2026-08-09T14:03:07.Z",
+            "2026-08-09T14:03:07.25",
+            "2026-08-09T14:03:07+24:00",
+            "2026-08-09T14:03:07-00:60",
+            "2026-08-09T14:03:07+02:0",
+            "2026-08-09T14:03:07+0200",
+            "2026-08-09T14:03:07Zjunk",
+            "2026-08-09T14:03:07+02:00junk",
+            "2026-13-40T14:03:07+99:99junk",
+            "2026-08-09T14:03:07.１２Z",
+            "２０２６-08-09T14:03:07Z",
         ] {
             let line = describe(&with(whole));
             assert_eq!(line, format!("{whole}  t1: parked on q-1"), "{whole}");
         }
-        assert_eq!(
-            describe(&with("2026-08-09T14:03:07+02:00")),
-            "14:03:07+02:00  t1: parked on q-1"
-        );
-        assert_eq!(
-            describe(&with("2026-08-09T14:03:07.250Z")),
-            "14:03:07.250Z  t1: parked on q-1"
-        );
-        assert_eq!(
-            describe(&with("2026-08-09T14:03:07")),
-            "14:03:07  t1: parked on q-1",
-            "a zone-less shape is still a clock, with nothing to append"
-        );
+        for (timestamp, clock) in [
+            ("2026-08-09T14:03:07+02:00", "14:03:07+02:00"),
+            ("2026-08-09T14:03:07.250Z", "14:03:07.250Z"),
+            ("2026-08-09T14:03:07.1-00:00", "14:03:07.1-00:00"),
+            ("2026-08-09t14:03:07z", "14:03:07z"),
+            ("2000-02-29T00:00:00Z", "00:00:00Z"),
+            ("2024-02-29T23:59:59-23:59", "23:59:59-23:59"),
+            ("0000-01-01T00:00:00+23:59", "00:00:00+23:59"),
+            ("9999-12-31T23:59:59.123456789Z", "23:59:59.123456789Z"),
+        ] {
+            assert_eq!(
+                describe(&with(timestamp)),
+                format!("{clock}  t1: parked on q-1")
+            );
+        }
     }
 }

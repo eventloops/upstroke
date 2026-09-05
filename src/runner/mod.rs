@@ -2252,8 +2252,9 @@ mod tests {
                 3,
                 "reads an outcome to say, in a `--follow` line, whether a \
                  review pass rejected the code or never reached a verdict. A \
-                 reader, like `export.rs`: `attempt_outcome` decides nothing \
-                 the fold does not already decide through `is_successful`",
+                 reader, like `export.rs`: this changes display text, not \
+                 run state. Schema-3 and schema-4 success validation use \
+                 `is_successful`; this reader renders the supplied record",
             ),
         ];
 
