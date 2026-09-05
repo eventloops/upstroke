@@ -9708,10 +9708,13 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// so no kill shape reaches it. Measured 0/50 against 1/50, which is one
 /// event and is what it should be: both arms sample the same rate. It was
 /// diagnosed here as a contract defect and that diagnosis was measured wrong
-/// by PR #151, which fixed it: `git worktree list` skips a zero-length
-/// `gitdir` silently, so the classifier answers `None`, and the repair is a
-/// one-condition skip in `revalidate_removal`. Until #151 merges it remains a
-/// fingerprint this test can meet, and the bare arm names it as a known one.
+/// by PR #151 -- `git worktree list` skips a zero-length `gitdir` silently,
+/// so the classifier answers `None` -- which then withdrew its own repair:
+/// `git worktree add` writes `locked` before `gitdir`, so the in-flight window
+/// and the kill residue are one state, and telling them apart needs writer
+/// liveness, the live-writer finding's own open question. One missing
+/// capability, not two defects; it remains a fingerprint this test can meet,
+/// and the bare arm names it as a known one.
 ///
 /// So the sampled child is spawned with `process_group(0)` and the kill goes
 /// to `-pgid`, which is what production does. What the sampling test asserts
@@ -9789,6 +9792,9 @@ enum GroupSettle {
     Empty {
         after: std::time::Duration,
         queries: u32,
+        /// How many of those queries answered `EPERM`: an entry remained that
+        /// was not this process's to signal. See [`SampledChild::settle_group`].
+        not_mine: u32,
     },
     /// Still not empty at [`GROUP_SETTLE_BOUND`]. A descendant outliving a
     /// `SIGKILL` by that much is a fault in its own right, so this is a hard
@@ -9797,14 +9803,16 @@ enum GroupSettle {
     /// first version recorded it and let the sample go on to classify and
     /// force removal against the writer it had just failed to wait for).
     TimedOut(std::time::Duration),
-    /// The existence query itself was refused with this `errno`.
+    /// The existence query answered an `errno` that is neither `ESRCH` nor
+    /// `EPERM`, which is a bug, and fails at the point of detection.
     ///
-    /// Pass 2, finding 1: `kill(-pgid, 0) != 0` is not proof the group is
-    /// gone. Only `ESRCH` is. `EPERM` means a group with that id exists and
-    /// this process may not signal it -- every member of *our* group is ours
-    /// to signal, so that is a foreign group wearing a recycled id, and
-    /// anything else is a bug. Neither is "settled", and both fail at the
-    /// point of detection.
+    /// Pass 2, finding 1, made anything but `ESRCH` a failure, `EPERM`
+    /// included, on the POSIX reasoning that every member of our group is
+    /// ours to signal. **Darwin disproved that at `510f24c`**: after the
+    /// leader is reaped, `kill(-pgid, 0)` answers `EPERM` there while zombie
+    /// entries await launchd. `EPERM` is now read as what it says -- an entry
+    /// remains that is not this process's to signal -- and the barrier keeps
+    /// waiting for it, bounded as before. It is never recorded as settled.
     Refused(i32),
     /// Not waited for, because the child never led a group of its own. The
     /// same refusal [`GroupKill::NotItsOwnGroup`] is, and the sampling test
@@ -10066,13 +10074,20 @@ impl SampledChild {
     /// asking before the leader is reaped would be waiting for a condition
     /// this function itself prevents.
     ///
-    /// `kill(-pgid, 0)` delivers no signal; it reports whether the group has a
-    /// member this process could signal. **Only `ESRCH` is taken as absence**
-    /// (pass 2, finding 1). `EPERM` means a group with that id exists and is
-    /// not ours to signal -- a recycled id -- and is returned as
-    /// [`GroupSettle::Refused`] rather than folded into "gone", because the
-    /// question is whether *anything* is alive in that group, and a foreign
-    /// answer is not a no.
+    /// `kill(-pgid, 0)` delivers no signal; it reports whether the group has an
+    /// entry. **Only `ESRCH` is taken as absence.** `EPERM` is "an entry
+    /// remains that is not mine to signal", which is the barrier's own claim
+    /// that a zombie is an entry, so it is waited out like any other entry,
+    /// under the same bound, and counted. Anything else is a bug.
+    ///
+    /// **Third Darwin errno surprise on this branch, all in one direction,
+    /// and the reason this doc cites measurements and not POSIX.** A `kill`
+    /// on a zombie-only group returning 0, the group kill's delivery answer,
+    /// and now `kill(-pgid, 0)` after the leader is reaped: each was reasoned
+    /// from POSIX, was true on Linux, and was false on Darwin, where the
+    /// zombie-only group answers `EPERM`. Measured on CI at `036b4bc` and
+    /// `510f24c`. POSIX-reasoned signal semantics have failed on Darwin
+    /// three times in this file; the measurement is the only authority.
     ///
     /// What this buys is the premise the rest of the sample rests on: by the
     /// time the residue is classified and the tabled recovery runs, no entry
@@ -10094,21 +10109,30 @@ impl SampledChild {
         let killed_at = self.killed_at.expect("the kill fired");
         let deadline = self.deadline();
         let mut asked = 0_u32;
+        let mut not_mine = 0_u32;
         loop {
             // SAFETY: signal 0 delivers nothing. It is the standard existence
             // query, it borrows nothing, and a negative pid asks it of the
             // group rather than of one process.
             if unsafe { libc::kill(-pid, 0) } != 0 {
-                // Only `ESRCH` is absence. Anything else is a group that
-                // exists and answered, and it is not ours.
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno != libc::ESRCH {
-                    return GroupSettle::Refused(errno);
+                match errno {
+                    // Only `ESRCH` is absence.
+                    libc::ESRCH => {
+                        return GroupSettle::Empty {
+                            after: killed_at.elapsed(),
+                            queries: asked + 1,
+                            not_mine,
+                        };
+                    }
+                    // An entry remains that is not ours to signal. On Darwin
+                    // that is a zombie awaiting launchd (measured at
+                    // `510f24c`); on Linux a zombie answers 0 and an `EPERM`
+                    // would be a recycled id. Either way an entry remains,
+                    // which is the barrier's own claim, so keep waiting.
+                    libc::EPERM => not_mine += 1,
+                    other => return GroupSettle::Refused(other),
                 }
-                return GroupSettle::Empty {
-                    after: killed_at.elapsed(),
-                    queries: asked + 1,
-                };
             }
             asked += 1;
             let now = std::time::Instant::now();
@@ -10157,9 +10181,10 @@ fn kill_git_child(
             KillArm::Bare => settled == GroupSettle::NotAimed,
         },
         "{settled:?} -- the sampled child's process group is not known to be empty, so \
-         nothing may read the worktree yet. `TimedOut` is a descendant that outlived a \
-         SIGKILL by {GROUP_SETTLE_BOUND:?}; `Refused` is a group with this id that is not \
-         ours to signal; `NotItsOwnGroup` is a child `process_group(0)` never reached"
+         nothing may read the worktree yet. `TimedOut` is an entry -- a live descendant, or a \
+         zombie a subreaper has not collected -- that outlasted {GROUP_SETTLE_BOUND:?} after \
+         a SIGKILL; `Refused` is an existence query answering something other than ESRCH or \
+         EPERM, which is a bug; `NotItsOwnGroup` is a child `process_group(0)` never reached"
     );
     SAMPLED_LAUNCHES
         .lock()

@@ -8,7 +8,7 @@ reviewed_sha: ead3573882c931f9c7eaf0846a81be3bffd404a8
 location: src/workspace_manager.rs:1868
 provenance: pre_existing
 first_bad:
-guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence (PR #151 is its first result); escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
+guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence (PR #151, whose RESIDUE-LOCKED-INVALID-REGISTRATION-OUTLIVES-FORCED-CLEANUP shares this guard); escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
 ---
 
 ## Why this file exists at all
@@ -29,10 +29,12 @@ believing it answers this.
 The parent entry recorded a second error code under the same assertion — a `git worktree add`
 interrupted with a zero-length `gitdir` on disk, which `remove_worktree` refused. On this branch it
 was diagnosed as a contract defect (`recovery_proven` promised for a residue the funnel correctly
-declined) and filed; **that diagnosis was measured wrong by PR #151**, which fixed it: on git 2.43
-`git worktree list` skips a zero-length `gitdir` silently, the classifier answers `None`, and the
-repair is a one-condition skip in `revalidate_removal`. That fingerprint is inert residue and is
-fixed; this one is a live writer nothing killed, and is open. They share a parent and an assertion
-and nothing else. `SAMPLER-SIBLING-KILLS-A-BARE-CHILD` is a third thing again and belongs to the
+declined) and filed; **that diagnosis was measured wrong by PR #151** — on git 2.43
+`git worktree list` skips a zero-length `gitdir` silently and the classifier answers `None` — and
+#151's own one-condition repair was then withdrawn: `git worktree add` writes `locked` before
+`gitdir` and unlinks it last, so "locked present, zero-length gitdir" is both the in-flight window
+and the kill residue, and distinguishing them needs **liveness of the writer**, which is this
+finding's question. The two are one missing capability, recorded under #151's
+RESIDUE-LOCKED-INVALID-REGISTRATION-OUTLIVES-FORCED-CLEANUP, whose guard is this file's guard. They share a parent and an assertion and now a remedy. `SAMPLER-SIBLING-KILLS-A-BARE-CHILD` is a third thing again and belongs to the
 harness rather than the funnel.
 

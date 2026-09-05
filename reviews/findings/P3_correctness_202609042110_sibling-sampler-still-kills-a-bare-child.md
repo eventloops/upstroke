@@ -38,8 +38,8 @@ judgement that it does not matter.
 
 The repair this mirrors closes the `DirectoryNotEmpty` half of
 `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` and nothing else.
-The other half — a zero-length `gitdir` that `remove_worktree` refused — was a funnel defect and is
-fixed in PR #151; it would not have been helped by making this sampler kill a group either.
+The other half — a zero-length `gitdir` that `remove_worktree` refused — turned out to be the same
+missing capability as the live-writer question, recorded under PR #151's RESIDUE-LOCKED-INVALID-REGISTRATION-OUTLIVES-FORCED-CLEANUP; it would not have been helped by making this sampler kill a group either.
 
 ## Failure sequence
 
