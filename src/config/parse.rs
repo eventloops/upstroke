@@ -293,15 +293,17 @@ pub(super) fn read_runner(
 /// `runner::container::resolve::tests::legacy_container_selection_refused_before_effects`
 /// drives both commands and asserts the tree afterwards.
 ///
-/// ## Both readings refuse, and that is the whole of today's answer
+/// ## Every reading refuses, and that is the whole of today's answer
 ///
 /// [`EngineLimits`] distinguishes a run being created from a sequential run's
-/// resume, and `expected_failures_refusals[0]` names **both**. There is no
-/// third reading in this build: `EngineLimits::Fresh` means "a run being
-/// created now", and every run this binary creates is schema-3.
-/// `PR12 config acceptance for fresh schema-4 runs only` (INV-23's
-/// `enforced_by`) is where a fresh schema-4 run learns to accept it, and that is
-/// a new reading rather than a relaxation of this one.
+/// resume — in two flavours since 2026-09-05, by whether the log records its
+/// gates, which changes how `[[gates]]` is read and nothing here — and
+/// `expected_failures_refusals[0]` names a fresh run **and** a resume. No
+/// reading accepts a container selection in this build: `EngineLimits::Fresh`
+/// means "a run being created now", and every run this binary creates is
+/// schema-3. `PR12 config acceptance for fresh schema-4 runs only` (INV-23's
+/// `enforced_by`) is where a fresh schema-4 run learns to accept it, and that
+/// is a new reading rather than a relaxation of this one.
 ///
 /// # Errors
 ///
@@ -446,7 +448,12 @@ pub(super) fn parse_budgets(
 /// `name` an earlier entry has, compared without regard to ASCII case. Under
 /// `SequentialResume`, never: each of those is a warning in `warnings`. On
 /// every reading `Ok(None)` is an absent section and `Ok(Some(vec![]))` an
-/// explicitly empty one — the parent's `Config::gates` says what each means.
+/// explicitly empty one — the parent's `Config::gates` says what each means —
+/// with one exception the warning names: under `SequentialResume` a section
+/// that is not a list is also `Ok(None)`, there being no other shape for "no
+/// list", so the engine derives defaults to compare with the record and the
+/// warning says any reported difference is against those, not the file
+/// (`SWEEP-CONFIG-PARSE-026`).
 pub(super) fn parse_gates(
     raw: Option<toml::Value>,
     repo_path: &Path,
@@ -468,7 +475,19 @@ pub(super) fn parse_gates(
             value.type_str()
         );
         refuse_or_announce(reading, problem, repo_path, warnings)?;
-        // Compared only, and there is nothing to compare: the record runs.
+        // Compared only, and nothing in the section can be compared. `None`
+        // is the only shape `Config::gates` has for "no list", and downstream
+        // it means "derive from the repository", so the comparison the engine
+        // then reports is against derived defaults rather than the file — the
+        // warning says so, and `SWEEP-CONFIG-PARSE-026` records the typed
+        // state that would let the comparison be skipped instead.
+        warnings.push(format!(
+            "today's `gates` in {} cannot be compared with the gates this run recorded, because it \
+             is not a list of entries; if a difference is reported below, it is between the \
+             record and the gates derived from the repository's shape, not between the record \
+             and this file",
+            repo_path.display()
+        ));
         return Ok(None);
     };
     let mut list: Vec<GateConfig> = Vec::with_capacity(entries.len());
@@ -1306,6 +1325,15 @@ mod tests {
                 .first()
                 .is_some_and(|w| w.contains("must be an array") && w.contains("recorded")),
             "{warnings:?}"
+        );
+        // And the second warning disowns the comparison the engine will make
+        // against derived defaults, so a "difference" reported after it is
+        // not read as an edit to this file.
+        assert!(
+            warnings.iter().skip(1).any(|w| {
+                w.contains("cannot be compared") && w.contains("derived from the repository")
+            }),
+            "the comparison is disowned: {warnings:?}"
         );
 
         // The control: where the section governs, each of the three refuses.
