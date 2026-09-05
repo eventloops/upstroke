@@ -574,58 +574,55 @@ impl RunState {
                     self.overrides.insert(answered.key, binding.clone());
                 }
                 // Return the task to the state it was parked from — but only
-                // while it is *still* parked. `check_end.rs` at this head does
-                // not guarantee the task did not move between the question and
-                // its answer: nothing refuses a `task_merged` or a failing
-                // settlement on a task whose question is open, so restoring the
-                // recorded `parked_from` unconditionally would un-merge a
-                // `Merged` task and make `derived_outcome` a `FoldError`. **The
-                // invariant this restoration requires is that the task is still
-                // `AwaitingInput`.** When it is not, the move stands and the
-                // answer only closes the question. Guarding here rather than
-                // trusting a door in another file makes it correct whatever the
-                // check admits.
+                // when this answer closes the *last* open question for the task
+                // *and* the task is still parked. Both conjuncts are
+                // load-bearing, and each was a separate pass's finding when it
+                // stood alone:
+                //
+                // - **Still `AwaitingInput`.** `check_end.rs` at this head does
+                //   not refuse a `task_merged` on a task whose question is open
+                //   (that admission is `SWEEP-FOLD-APPLY-DECLINE-LINEAGE`), so a
+                //   task can reach `Merged` while parked; restoring its
+                //   `parked_from` then un-merges it and makes `derived_outcome`
+                //   a `FoldError`.
+                // - **Last open question.** A task can hold two open questions —
+                //   `check_new_question` forbids only an incomplete or duplicate
+                //   one. Restoring while another is open un-parks the task with a
+                //   question outstanding, and integration then verifies and
+                //   merges it. A non-final answer only closes its question.
+                //
+                // `parked_from` is the state of the parking *episode*, not of
+                // this one question (see its doc), so the restore returns the
+                // task there whichever of its questions is answered last.
                 if let Some(state) = parked_from {
-                    if self
+                    let still_parked = self
                         .tasks
                         .get(answered.key.index())
-                        .is_some_and(|task| task.state == TaskState::AwaitingInput)
-                    {
+                        .is_some_and(|task| task.state == TaskState::AwaitingInput);
+                    let last_open_question = !self
+                        .questions
+                        .values()
+                        .any(|open| open.question.key == answered.key);
+                    if still_parked && last_open_question {
                         self.set_state(answered.key, state);
                     }
                 }
             }
             Answer4::Declined { decline_halts_run } => {
-                // **A decline fails the whole lineage, not just the answered
-                // task** — `design/26`, "Declining fails the lineage.", and
-                // `release_holdings_of`'s own doc, "a declined lineage fails as a
-                // whole". A repair and every task back to its root fail together,
-                // because the original awaits a repair this decline abandons:
-                // failing the repair alone leaves the root `AwaitingRepair` with
-                // no queue, question, generation or runnable repair, so
-                // `derived_outcome` has no answer for it (`FoldError`) and refuses
-                // every `run_finished`. **Unconditional on `decline_halts_run`** —
-                // that flag decides only whether the run also halts, and setting
-                // it would otherwise hide this wedge behind the halt.
-                let root = self
-                    .registry
-                    .get(answered.key)
-                    .and_then(|entry| entry.lineage)
-                    .map_or(answered.key, |lineage| lineage.root);
-                let members: Vec<TaskKey> = std::iter::once(root)
-                    .chain(
-                        self.registry
-                            .entries()
-                            .iter()
-                            .filter(|entry| {
-                                entry.lineage.is_some_and(|lineage| lineage.root == root)
-                            })
-                            .map(|entry| entry.key),
-                    )
-                    .collect();
-                for member in members {
-                    self.set_state(member, TaskState::Failed);
-                }
+                // `design/26` — "Declining fails the lineage." — requires a
+                // decline to fail the whole lineage, not just the answered task,
+                // and this arm does not: it is master's behaviour, left in place
+                // deliberately. The complete fix cannot land in this file. A
+                // decline that fails the lineage must also clear the integration
+                // transaction, which `release_holdings_of` does not touch, and
+                // the question a repair is declined through is admitted on a task
+                // with a live transaction by `check_end.rs`'s `check_question_raised`
+                // (row 32) — so the transaction survives and `apply_task_merged`
+                // can still turn the declined lineage back to `Merged`, publishing
+                // declined work. Fixing it needs both files. Filed as
+                // `SWEEP-FOLD-APPLY-DECLINE-LINEAGE` for a successor that can hold
+                // both once #152 and #153 have landed.
+                self.set_state(answered.key, TaskState::Failed);
                 self.release_holdings_of(answered.key);
                 if *decline_halts_run {
                     self.record_halt(answered.key);
@@ -678,13 +675,26 @@ impl RunState {
         binding: Option<Vec<String>>,
     ) {
         // The state the question parks the task in, read before the caller sets
-        // `AwaitingInput`: every caller opens the question while the task is
-        // still in the state its answer should return it to. A missing task is
-        // impossible here — the check registered it — and defaults to `Pending`.
-        let parked_from = self
+        // `AwaitingInput`. When the task is *already* parked by an earlier open
+        // question, this one did not move it, so inherit that question's
+        // `parked_from` — the state the parking *episode* began in — rather than
+        // record the `AwaitingInput` the task is already sitting in. Recording it
+        // per-question would make the answer-return depend on which question is
+        // answered last, and this fold's state must be a function of the log, not
+        // of answer order. A missing task is impossible here — the check
+        // registered it — and defaults to `Pending`.
+        let current = self
             .tasks
             .get(question.key.index())
             .map_or(TaskState::Pending, |task| task.state);
+        let parked_from = if current == TaskState::AwaitingInput {
+            self.questions
+                .values()
+                .find(|open| open.question.key == question.key)
+                .map_or(current, |open| open.parked_from)
+        } else {
+            current
+        };
         self.seen_questions.insert(question.id.clone());
         self.questions.insert(
             question.id.clone(),

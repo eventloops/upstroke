@@ -7064,101 +7064,98 @@ fn an_answer_does_not_restore_a_task_that_merged_while_its_question_was_open() {
 }
 
 #[test]
-fn a_declined_repair_fails_the_whole_lineage_on_either_halt_arm() {
-    // `design/26`: "Declining fails the lineage." A repair `TaskKey(3)` descends
-    // from MID; declining it must fail MID too, or MID sits `AwaitingRepair` with
-    // nothing runnable and `derived_outcome` becomes a `FoldError` — the run
-    // cannot end. This is unconditional on `decline_halts_run`: both arms fail
-    // the lineage, and with the halt set the wedge would otherwise be hidden.
-    let base = sha("base");
-    let head = sha("head");
-    let proposal = sha("proposal");
+fn answering_the_first_question_first_returns_the_task_to_the_state_it_was_parked_from() {
+    // Two open questions on one task, answered in raise order. `parked_from` is
+    // the parking *episode*'s state, not this one question's, so the return is
+    // answer-order-independent: the last answer returns the task to
+    // `AwaitingMerge` whichever order the two are answered in. And a non-final
+    // answer must not restore — un-parking the task with a question still open
+    // lets integration verify and merge it with input outstanding.
+    let mut fold = two_queued();
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingMerge));
+    apply(&mut fold, &raised("q1-Ünicode", MID)); // parks from AwaitingMerge
+    apply(&mut fold, &raised("q2-Ünicode", MID)); // already parked; inherits AwaitingMerge
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingInput));
 
-    let lineage_up_to_decline = || {
-        let mut fold = started();
-        merge_task(&mut fold, ALPHA, 0, 0);
-        merge_task(&mut fold, ZETA, 0, 1);
-        apply(&mut fold, &dispatch(MID, 0, &base));
-        let start = attempt_started(&fold, MID, 0, 1, 0);
-        apply(&mut fold, &start);
-        apply(&mut fold, &candidate_prepared(MID, 0, &base));
-        apply(&mut fold, &candidate_created(MID, 0));
-        apply(
-            &mut fold,
-            &verification_started(MID, 0, 2, &head, &proposal),
-        );
-        let mut rejected = MergeRejected {
-            sequence: SequenceId(2),
-            candidate: candidate_of(MID, 0),
-            rejecting_head: head.clone(),
-            disposition: RejectionDisposition::CodeRejected {
-                verification: verification_record(Verdict::Rejected),
-            },
-            repair: repair_spawn(TaskKey(3), MID, MID),
-            lease_effect: RejectionLeaseEffect::CreatesLineage {
-                root: MID,
-                paths: region(MID),
-            },
-        };
-        rejected.repair.entry.deps = vec![ALPHA];
-        rejected.repair.entry.display_deps = vec![TaskId::from("alpha")];
-        apply(
-            &mut fold,
-            &ev(TopologyEventBody::MergeRejected {
-                data: Box::new(rejected),
-            }),
-        );
-        // MID is AwaitingRepair; its repair TaskKey(3) is Pending. Park it.
-        apply(&mut fold, &raised("q-repair-Ünicode", TaskKey(3)));
-        assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingRepair));
-        fold
-    };
-
-    // The wedge arm: decline_halts_run = false. The lineage fails and the run
-    // can now end, where before MID sat AwaitingRepair with no way out.
-    let mut ended = lineage_up_to_decline();
     apply(
-        &mut ended,
+        &mut fold,
         &answered(
-            TaskKey(3),
-            "q-repair-Ünicode",
-            Answer4::Declined {
-                decline_halts_run: false,
+            MID,
+            "q1-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
             },
         ),
     );
     assert_eq!(
-        ended.task_state(MID),
-        Some(TaskState::Failed),
-        "a decline fails the lineage root, not only the repair"
+        fold.task_state(MID),
+        Some(TaskState::AwaitingInput),
+        "a non-final answer leaves the task parked, not un-parked with a question open"
     );
-    assert_eq!(ended.task_state(TaskKey(3)), Some(TaskState::Failed));
-    assert_ne!(
-        ended.derived_outcome(),
-        DerivedOutcome::FoldError,
-        "with the lineage failed the run is no longer wedged"
-    );
-
-    // The halt arm: the lineage still fails; the halt only decides that the run
-    // also stops. Asserting MID is Failed here is what catches a fix made
-    // conditional on the flag, since the halt would otherwise mask the wedge.
-    let mut halted = lineage_up_to_decline();
     apply(
-        &mut halted,
+        &mut fold,
         &answered(
-            TaskKey(3),
-            "q-repair-Ünicode",
-            Answer4::Declined {
-                decline_halts_run: true,
+            MID,
+            "q2-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
             },
         ),
     );
     assert_eq!(
-        halted.task_state(MID),
-        Some(TaskState::Failed),
-        "the lineage failure is unconditional on decline_halts_run"
+        fold.task_state(MID),
+        Some(TaskState::AwaitingMerge),
+        "the last answer returns the task to where the parking episode began"
     );
-    assert_eq!(halted.halted_at(), Some(TaskKey(3)));
+}
+
+#[test]
+fn answering_the_second_question_first_returns_the_task_to_the_state_it_was_parked_from() {
+    // The mirror image: answering the later-raised question first must reach the
+    // same final `AwaitingMerge`. Without the episode-inherited `parked_from`,
+    // this order would restore the second question's raise-time `AwaitingInput`
+    // and leave the task stuck — the answer-order dependence the inheritance
+    // removes.
+    let mut fold = two_queued();
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingMerge));
+    apply(&mut fold, &raised("q1-Ünicode", MID));
+    apply(&mut fold, &raised("q2-Ünicode", MID));
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingInput));
+
+    apply(
+        &mut fold,
+        &answered(
+            MID,
+            "q2-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
+            },
+        ),
+    );
+    assert_eq!(
+        fold.task_state(MID),
+        Some(TaskState::AwaitingInput),
+        "a non-final answer leaves the task parked"
+    );
+    apply(
+        &mut fold,
+        &answered(
+            MID,
+            "q1-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
+            },
+        ),
+    );
+    assert_eq!(
+        fold.task_state(MID),
+        Some(TaskState::AwaitingMerge),
+        "the last answer returns the task to where the parking episode began"
+    );
 }
 
 #[test]

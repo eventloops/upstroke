@@ -19,9 +19,12 @@ its task to the state it was parked from. That is the whole of what `QuestionOri
 only role was the answer-return (`VerificationPark -> AwaitingMerge`, `Admission -> Pending`), and
 `parked_from` subsumes it exactly -> so `QuestionOrigin`, `OpenQuestion::origin`, and the
 `Derived::Answer(QuestionOrigin)` payload are now dead for the return -> `apply_answer` keeps the
-wire-carried `origin` only as a `debug_assert` cross-check (a verification park is parked from
-awaiting merge) rather than discarding it, because removing the type reaches two files this sweep's
-own-file bound does not cover.
+wire-carried `origin` only as a threaded-but-unread parameter (`let _ = origin`) rather than
+discarding it, because removing the type reaches two files this sweep's own-file bound does not
+cover. (A pass-2 `debug_assert` cross-check that read `origin` — a verification park is parked from
+awaiting merge — was withdrawn in pass 3: a bare `question_raised` can park a task `AwaitingInput`
+before a verification park raises its own on it, so a `VerificationPark` question's parked-from state
+is not always `AwaitingMerge`, and the assertion was reachable from a checked log.)
 
 ## What the change that takes this up should do
 

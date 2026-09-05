@@ -131,12 +131,13 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
-**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass, three repair rounds, and is not
+**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass, four repair rounds, and is not
 swept.** The pass and repairs landed the file's §5, §6 and §7 work. Five catch-alls over closed
 enums were made exhaustive, so a new variant is a compile error rather than a silent default:
-`apply_verification_unavailable` over `UnavailableOutcome`, and the guards in `apply_merge_prepared`
-(`PreparedDisposition`), `apply_merge_rejected` (`RejectionDisposition`) and `close_generation`
-(`GenerationLease`) that decided a `next_sequence` increment or a lease release from one variant. The
+`apply_verification_unavailable` over `UnavailableOutcome`, `apply_answer`'s dispatch over `Derived`,
+and the guards in `apply_merge_prepared` (`PreparedDisposition`), `apply_merge_rejected`
+(`RejectionDisposition`) and `close_generation` (`GenerationLease`) that decided a `next_sequence`
+increment or a lease release from one variant. The
 module doc's replay-purity and ownership claims were corrected against the source. And one
 correctness fix landed: an answered question now returns its task to the state it was parked from — a
 derived `OpenQuestion.parked_from`, restored in `apply_answer` — rather than to a fixed `Pending`,
@@ -153,24 +154,27 @@ The row stays in the queue, and the items found during the pass are labelled by 
   stream, `fix/declined-halt-wedge` at `7a6b23b`. What bears on row 29 is that its two doors —
   raise-time and answer-time — let `apply_answer` be written against a task that is still parked.
   This record does not restate #153's guard, which has moved across its heads; read it at that sha.
-- **A declined repair failing only the repair — FIXED here.** Distinct from the in-flight wedge and
-  in this file: `apply_answer`'s `Declined` arm failed only the answered task (`master`'s
-  behaviour), so declining a repair's question left the lineage root `AwaitingRepair` with nothing
-  runnable and `derived_outcome` a `FoldError` — the run could never end. `design/26` states the
-  rule — *Declining fails the lineage.* — as does `release_holdings_of`'s own doc; the arm now fails
-  the root and every task in its lineage, **unconditional on `decline_halts_run`** (that flag decides
-  only whether the run also halts, and setting it would otherwise mask the wedge). This is the
-  apply-half of the decline wedge; #153 owns the check-half.
+- **A declined repair failing only the repair — FILED, not fixed.** `apply_answer`'s `Declined` arm
+  fails only the answered task (`master`'s behaviour), so declining a repair's question leaves the
+  lineage root `AwaitingRepair` and the run wedges. Pass 3 fixed it in this file; pass 4 reverted the
+  fix, because it cannot be completed here: failing the lineage must also clear `self.transaction`,
+  which `release_holdings_of` does not, and the question is admitted on a task with a live transaction
+  by `check_end.rs`'s `check_question_raised` — so the surviving transaction lets `apply_task_merged`
+  turn the declined lineage back to `Merged` and publish declined work. `design/26` (*Declining fails
+  the lineage.*) and `release_holdings_of`'s own doc are the authority; the finding is
+  `SWEEP-FOLD-APPLY-DECLINE-LINEAGE`, naming both homes — row 29 for the failing and the transaction,
+  `check_end.rs` row 32 for the admission — for a successor once #152 and #153 land.
 - **`apply_answer` returning a parked task to a fixed `Pending` — FIXED here.** The correctness fix
-  above: `apply_answer` restores the parked-from state, but **only while the task is still
-  `AwaitingInput`** — a self-guard, not a trust in another file's door. `check_end.rs` at this head
-  refuses no `task_merged` or failing settlement on a task whose question is open, so an
-  unconditional restore would un-merge a task that merged while parked and make `derived_outcome` a
-  `FoldError`; the guard makes the return correct at apply time whatever the check admits. An earlier
-  draft called this right by construction against #153's answer-time door; a pass disproved it (that
-  is #153's tree, not this head) and the guard moved into `apply_answer`. Closes
-  `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`; #153 deletes that finding file in its next head movement,
-  citing this fix.
+  above. `apply_answer` restores the parked-from state under a conjunction guard: **only when the
+  answer closes the last open question for the task and the task is still `AwaitingInput`.** Each
+  conjunct was a separate pass's finding when it stood alone — still-parked, because a task can reach
+  `Merged` while a question is open and restoring then un-merges it; last-question, because a task can
+  hold two open questions and restoring while one is open un-parks it with input outstanding. And
+  because `open_question` records `parked_from` at raise time, a second question raised on an
+  already-parked task inherits the first's `parked_from` (the parking *episode*'s state), so the
+  answer-return is a function of the log and not of answer order. Closes
+  `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`; #153 deletes that finding file once this fix is on master,
+  citing the commit that introduces it.
 - **The answer-return rule — now in the design.** That a bare question on a non-`Pending` task is
   valid input was already settled by `design/12` and by `select/tests.rs`; what the design did not
   state was the answer-return, and `design/12` now does — an answered question returns the task to
