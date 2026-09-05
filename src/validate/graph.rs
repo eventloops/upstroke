@@ -151,10 +151,18 @@ fn find_cycle(plan: &Plan, index: &BTreeMap<&str, &Task>) -> Option<Vec<String>>
 
 /// A task that `needs` an artifact should depend — directly or transitively —
 /// on its producer, or execution order cannot guarantee the artifact exists.
-/// The plan is frozen (§5), so this warns rather than inventing edges. A task
-/// that needs an artifact it produces itself is warned about in its own words:
-/// no order puts that artifact in place before the task runs, and no edge
-/// could.
+/// The plan is frozen (§5), so this warns rather than inventing edges.
+///
+/// A task that needs an artifact whose recorded producer is the task itself
+/// is not warned about. `plan.artifacts` records one producer per artifact,
+/// and the markdown adapter records the first task that declares `out=`; a
+/// second declaration survives only in that task's `artifacts_out`. So a task
+/// that `needs` and `out`s the same artifact may be updating what an earlier
+/// task it depends on produced, which is a valid order, and the recorded
+/// producer cannot tell that plan from one where nothing else produces it.
+/// What a second `out=` means is the adapter's open question
+/// (`SWEEP-GRAPH-009`); this check stays silent rather than guess
+/// (`SWEEP-GRAPH-004`), which is what the base did.
 ///
 /// An artifact no task produces is not in `plan.artifacts` at all — the
 /// markdown adapter warns about it while assembling the plan — and one whose
@@ -168,12 +176,7 @@ fn check_artifact_wiring(plan: &Plan, index: &BTreeMap<&str, &Task>, warnings: &
                 .find(|a| a.id == *needed)
                 .and_then(|a| a.produced_by.as_ref());
             let Some(producer) = producer else { continue };
-            if *producer == task.id {
-                warnings.push(format!(
-                    "task `{}` needs artifact `{needed}` that it produces itself",
-                    task.id
-                ));
-            } else if !depends_transitively(index, task, producer) {
+            if *producer != task.id && !depends_transitively(index, task, producer) {
                 warnings.push(format!(
                     "task `{}` needs artifact `{needed}` produced by `{producer}` but does not \
                      depend on it (directly or transitively)",
@@ -187,8 +190,11 @@ fn check_artifact_wiring(plan: &Plan, index: &BTreeMap<&str, &Task>, warnings: &
 /// Whether `target` is reachable from `task` along `depends_on` edges. A
 /// depth-first walk seeded from the task's own dependencies, each id expanded
 /// at most once, so it terminates on any graph — the cycle check has run by
-/// the time this is called, but nothing here relies on that. An edge to an id
-/// the index lacks is a dead end, not a match.
+/// the time this is called, but nothing here relies on that. An edge is a
+/// match when its id is `target`, whether or not the index has it; an edge to
+/// any other id the index lacks is a dead end. `check_graph` refuses a plan
+/// with an unknown id before this runs, so both halves of that sentence
+/// describe an index that holds every id in play.
 fn depends_transitively(index: &BTreeMap<&str, &Task>, task: &Task, target: &TaskId) -> bool {
     let mut pending: Vec<&TaskId> = task.depends_on.iter().collect();
     let mut expanded: BTreeSet<&str> = BTreeSet::new();
@@ -375,16 +381,41 @@ mod tests {
     }
 
     #[test]
-    fn a_task_that_needs_what_it_produces_is_warned_about_in_its_own_words() {
+    fn a_task_that_needs_what_it_is_recorded_as_producing_is_not_warned_about() {
         let mut d = producing("d", &[], "contract");
         d.artifacts_in.push(ArtifactId::from("contract"));
         let plan = plan(vec![d], vec![produced("contract", "d")]);
-        assert_eq!(
-            check(&plan),
-            Ok(vec![
-                "task `d` needs artifact `contract` that it produces itself".to_owned()
-            ])
-        );
+        assert_eq!(check(&plan), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_task_updating_what_an_earlier_producer_made_is_not_warned_about_through_the_adapter() {
+        // The markdown adapter records `d1` as the one producer of `contract`
+        // and keeps `d2`'s claim only in its `artifacts_out`; `d1` needs the
+        // artifact `d2` produced first, which its dependency guarantees. A
+        // warning that `d1` needs what it produces itself would be wrong
+        // here, and this is the input a pass on `2bbf35b` showed producing one.
+        let raw = "## D1\n<!-- upstroke: id=d1 depends=d2 needs=contract out=contract -->\n\n\
+                   ## D2\n<!-- upstroke: id=d2 depends= out=contract -->\n";
+        let parsed = crate::plan::detect(raw)
+            .expect("markdown is recognised")
+            .parse_with_warnings(raw)
+            .expect("the plan parses");
+        let producers: Vec<String> = parsed
+            .plan
+            .artifacts
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} by {:?}",
+                    a.id,
+                    a.produced_by.as_ref().map(TaskId::as_str)
+                )
+            })
+            .collect();
+        assert_eq!(producers, vec!["contract by Some(\"d1\")".to_owned()]);
+        assert_eq!(parsed.warnings, Vec::<String>::new());
+        assert_eq!(check(&parsed.plan), Ok(Vec::new()));
     }
 
     #[test]
