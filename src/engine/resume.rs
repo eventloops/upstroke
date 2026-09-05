@@ -62,10 +62,12 @@ pub(super) fn resume_harness_inner_on(
 
     // Read-only, and before either lock. §14's refusals must reach the operator
     // without a worktree lease and without a `run.lock` file behind them, and
-    // the config is one of them — so the two things deciding *how* to read
+    // the config is one of them — so the three things deciding *how* to read
     // today's config have to be read first: the schema this run was recorded
     // at, which chooses between refusing an impossible ceiling and warning
-    // about one, and where the run's config lives.
+    // about one; whether the log records its gates, which decides whether
+    // today's `[[gates]]` is compared with them or settles them; and where the
+    // run's config lives.
     //
     // Only that. The authoritative whole-log read is below, under the locks,
     // and everything the resume actually acts on comes from there. This read
@@ -99,7 +101,10 @@ pub(super) fn resume_harness_inner_on(
     // here — but a value this engine cannot honour is a statement about some
     // future run, not an instruction to this one, so it warns rather than
     // stranding a run whose only fault is that someone edited a file it reads.
-    let limits = config::EngineLimits::for_resume(header_schema);
+    let limits = config::EngineLimits::for_resume(
+        header_schema,
+        events::recorded_gates(&header_events).is_some(),
+    );
     let validated = validate_inputs(&run_opts, limits)?;
 
     // The first effect of the command.
@@ -137,7 +142,10 @@ pub(super) fn resume_harness_inner_on(
     // on a reading derived from the header it saw first.
     let analysis = validated.confirm_under_lease(
         &run_opts,
-        config::EngineLimits::for_resume(effective_schema),
+        config::EngineLimits::for_resume(
+            effective_schema,
+            events::recorded_gates(&events).is_some(),
+        ),
     )?;
     let recorded_normalized_plan_digest =
         events::recorded_normalized_plan_digest(&events).map(str::to_owned);

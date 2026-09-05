@@ -1,21 +1,4 @@
-//! The recovery order, exercised against real directories, a real event log,
-//! real locks and the fake container runtime.
-//!
-//! # No raw effect primitive appears here
-//!
-//! `src/engine/topology/**` is a `TOPOLOGY_MODULE`: it may carry no
-//! module-level `allow` of a governed lint, and `std::fs`'s writing half is on
-//! the clippy denylist **in tests too**. So every byte this file puts on disk
-//! goes through the funnel that owns its site — `rundir::create_public_dir`
-//! for a directory, `rundir::stage_/publish_owner_record` and its commit-record
-//! pair for the two private records, and `EventLog` for the log. That is not a
-//! ceremony: a fixture that planted `owner.json` with `fs::write` would be
-//! asserting against a file the production writer never produced.
-//!
-//! `rundir::remove_public_husk` is what takes a fixture down. It removes a
-//! directory's children and then the directory, which is exactly a recursive
-//! delete through a site-taking funnel, and it is the only such funnel this
-//! module can reach.
+//! Extended notes: `docs/internals/engine/topology/recover/tests.md`
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -66,10 +49,6 @@ use crate::engine::topology::preflight::RunPreflight;
 use crate::engine::topology::seams::{HarnessTopologyHooks, TimeSource, TopologyHooks};
 use crate::engine::topology::startup::{FailedStep, RunDirOutcome};
 
-// ---------------------------------------------------------------------------
-// Fixed identities
-// ---------------------------------------------------------------------------
-
 const RUN_ID: &str = "01KZTPR7E00000000000000001";
 const CREATOR: &str = "01KZTAAAAAAAAAAAAAAAAAAAAA";
 const RESUMER: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
@@ -78,13 +57,8 @@ const IMAGE_REF: &str = "ghcr.io/example/upstroke-runner:1.4";
 const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const VOLUME: &str = "upstroke-creds-claude";
 const AGENT: &str = "claude-code";
-/// The pid the creator wrote into its `.creating` marker. Never consulted by
-/// the ownership proof — the marker's pid is not one of the twelve conjuncts —
-/// but a marker is not a marker without one.
 const CREATOR_PID: u32 = 4242;
 
-/// A clock that does not move, so a durable byte can be asserted against a
-/// literal.
 #[derive(Debug, Clone, Copy)]
 struct Frozen;
 
@@ -94,11 +68,6 @@ impl TimeSource for Frozen {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The fixture
-// ---------------------------------------------------------------------------
-
-/// A unique directory per fixture, in one per-process tree.
 fn fixture_root(tag: &str) -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -112,83 +81,34 @@ fn mkdir(path: &Path) {
     rundir::create_public_dir(path, &mut NoHooks).expect("the run-directory funnel creates a dir");
 }
 
-/// One repository, one committed schema-4 run, and both private records.
-///
-/// Every knob is a field rather than a constructor argument, because the
-/// refusal tests differ from the healthy case in exactly one of them and a
-/// nine-argument builder call would hide which.
 struct Fixture {
     root: PathBuf,
-    /// The seed commit every fixture's repository holds — the base a step (g)
-    /// worktree is cut at.
     base_sha: CommitSha,
     repo_root: PathBuf,
     git_dir: PathBuf,
     private_root: PathBuf,
     repo_key: RepoKey,
     started: RunStarted4,
-    /// The committed first line, without its newline.
     first_line: Vec<u8>,
     plan: Plan,
 }
 
-/// What a fixture may be built wrong in.
 #[derive(Default)]
 struct Damage {
-    /// Write no private half at all.
     no_private_half: bool,
-    /// Write no `owner.json`.
     no_owner_record: bool,
-    /// Rewrite one field of the owner record.
     owner: Option<fn(&mut OwnerRecord)>,
-    /// Rewrite one field of the commit record.
     commit: Option<fn(&mut CommitRecord)>,
-    /// Record a private locator of another shape.
     locator: Option<String>,
-    /// Record a host runner rather than the container one.
     host_runner: bool,
-    /// Extra events, appended after `run_started` in order.
     extra: Vec<TopologyEventBody>,
-    /// Leave one generation **open with no attempt** — the state a crash
-    /// between `task_dispatched` and `attempt_started` leaves, and the only
-    /// state recovery step (g) has anything to do in.
     open_generation: bool,
-    /// Register a **second task**, `beta`, beside `alpha`.
-    ///
-    /// The default plan has one task, so a recovery step that loops over tasks
-    /// or generations cannot be told apart from one that handles the first and
-    /// stops. Not hypothetical: catalogue entry `PR7-PIPELINE-010` reduced step
-    /// (e) to `.take(1)` and the whole suite stayed green. Opt-in rather than
-    /// default, so no existing fixture's registry size moves.
     two_tasks: bool,
-    /// Freeze a **two-tier** chain instead of the default one-tier one.
-    ///
-    /// The default chain has a single tier, so a task's rung is always 0 and a
-    /// driver that read the rung from the fold is indistinguishable from one
-    /// that assumed zero. That is not a hypothetical: it is why the `rung` half
-    /// of `PR7-FOLD-LADDER-POSITION`'s reader stayed unwitnessed through the
-    /// repair filed against it, and why S5 round 2 found it still open.
     two_tier: bool,
-    /// Freeze a two-tier chain with **two attempts per rung**.
-    ///
-    /// Neither existing chain can show an *accumulated* brief. `chain()` has one
-    /// tier, so its second failure exhausts the ladder and the task parks with
-    /// no third dispatch; `escalating_chain()` allows one attempt per rung, so
-    /// nothing ever carries two entries onto a rung. §11.4's second half —
-    /// "next rung, fresh session, **accumulated feedback summary included**" —
-    /// needs a ladder deep enough to hold two failures below the rung that reads
-    /// them, and this is that ladder. Additive so no existing fixture's chain
-    /// moves.
     deep_ladder: bool,
 }
 
 impl Fixture {
-    /// The manager recovery step (g) rebuilds worktrees through.
-    ///
-    /// Derived from the fixture's own repository and private root rather than
-    /// stubbed: (g)'s whole subject is a real `Worktree.Verify` against a real
-    /// checkout, and a manager that could not reach one would make every
-    /// assertion about the step vacuous.
     fn manager(&self) -> crate::workspace_manager::WorkspaceManager {
         crate::workspace_manager::WorkspaceManager::derive(
             &self.repo_root,
@@ -205,16 +125,7 @@ impl Fixture {
         let git_dir = repo_root.join(".git");
         let private_root = root.join("private");
         mkdir(&repo_root);
-        // A **real** repository, not a `.git` directory made with `mkdir`.
-        // Recovery step (g) rebuilds worktrees through a `WorkspaceManager`,
-        // and `WorkspaceManager::derive` asks Git where the common dir is — so
-        // a fixture whose `.git` is an empty directory cannot express the step
-        // at all, and every assertion about it would be vacuous.
         crate::workspace_manager::fixture::git(&repo_root, &["init", "-q", "-b", "main"]);
-        // A seed commit, so the repository has a real base a worktree can be
-        // cut at. Step (g) recreates `OpenNoAttempt` worktrees "at their bases",
-        // and a base that names no object makes the step's own funnel fail for
-        // a reason that has nothing to do with what is being tested.
         for setting in [
             ["config", "user.email", "tests@upstroke.local"],
             ["config", "user.name", "upstroke tests"],
@@ -259,14 +170,6 @@ impl Fixture {
             damage.two_tasks,
         );
 
-        // P1: the `.creating` marker the creator published and never removed,
-        // because this run was interrupted between P5b's commit record and P8's
-        // `RunDir.RemoveMarker`. That is the shape a resume exists for, and it
-        // is what makes recovery step (a1)'s "this run's own stale marker,
-        // **which the owner removes here**" a removal that removes something.
-        // Without it every "no census effect followed this refusal" assertion
-        // below is vacuously true, and the census's own write has nothing to be
-        // the anchor of.
         let marker = CreatingMarker {
             run_id: RUN_ID.to_owned(),
             repo_key: repo_key.as_str().to_owned(),
@@ -278,7 +181,6 @@ impl Fixture {
         rundir::stage_marker(&public, &marker, &mut NoHooks).expect("P1a stages the marker");
         rundir::publish_marker(&public, &mut NoHooks).expect("P1b publishes it");
 
-        // The log, through the Event funnel and nothing else.
         let mut warnings = Vec::new();
         let mut log = EventLog::open(
             EventSite::OpenLog,
@@ -373,15 +275,10 @@ impl Fixture {
         }
     }
 
-    /// The repository-scoped R25 lock file, whose *existence* is what a
-    /// `*_before_any_lock` test asserts about.
     fn worktree_lock_file(&self) -> PathBuf {
         self.git_dir.join("upstroke-worktree.lock")
     }
 
-    /// (a0), with the reader ceiling raised so a schema-4 log is readable at
-    /// all. Production's ceiling is 3 and refuses here; see
-    /// `RootDerived::derive_with`.
     fn derive(&self, explicit: Option<&Path>) -> Result<RootDerived, UpstrokeError> {
         RootDerived::derive_with(&self.repo_root, RUN_ID, explicit, TOPOLOGY_SCHEMA)
     }
@@ -389,29 +286,10 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // `remove_public_husk` removes a directory's children and then the
-        // directory. It is the one recursive delete this module can reach
-        // through a site-taking funnel, and a fixture per test is what
-        // exhausts inodes on the build box when nothing does.
         let _ = rundir::remove_public_husk(&self.root, &mut NoHooks);
     }
 }
 
-// ---------------------------------------------------------------------------
-// A husk beside the run
-// ---------------------------------------------------------------------------
-
-/// A husk this repository's next write command may reclaim, planted through the
-/// same funnels a creator would have used.
-///
-/// The prefix is a creator that died after P3b and before P5b: a published
-/// `.creating`, the private half it names, and the reciprocal `owner.json` — the
-/// twelve conjuncts of [`rundir::prove_private_half_ownership`] all satisfied,
-/// so [`crate::rundir::PrivateHalfOwnership::Proven`] and both halves
-/// reclaimable. `committed` publishes `committed.json` as well, which fails
-/// conjunct 12 and turns the same shape into a retention: the control half, so
-/// "the census reclaimed it" is a claim about the proof rather than about the
-/// census deleting whatever it walks over.
 struct PlantedHusk {
     public: PathBuf,
     private: PathBuf,
@@ -462,11 +340,6 @@ fn plant_husk(fixture: &Fixture, run_id: &str, committed: bool) -> PlantedHusk {
     PlantedHusk { public, private }
 }
 
-/// Every file under `root`, by relative path, with its bytes.
-///
-/// What a "retained" assertion compares. Byte-identity, not existence: a census
-/// that emptied `owner.json` would leave the directory present and every weaker
-/// assertion green.
 fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
@@ -490,7 +363,6 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
-/// Every `"event":"<kind>"` in a log, in order.
 fn event_kinds(log: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(log)
         .lines()
@@ -516,10 +388,6 @@ fn event(body: TopologyEventBody) -> TopologyEvent {
         body,
     }
 }
-
-// ---------------------------------------------------------------------------
-// The recorded run
-// ---------------------------------------------------------------------------
 
 fn plan_with(two_tasks: bool) -> Plan {
     let mut plan = plan();
@@ -608,24 +476,12 @@ fn chain() -> ChainSummary {
     }
 }
 
-/// A chain with a rung above the first, so an escalation has somewhere to go.
-///
-/// The binding's **model differs per tier**, which is what makes the rung
-/// observable in the dispatched attempt: a driver reading rung 0 for an
-/// escalated task runs it on the cheap model forever, and the only visible
-/// symptom is a task that never gets better.
 fn escalating_chain() -> ChainSummary {
     ChainSummary {
         task: "alpha".to_owned(),
         tiers: vec![Tier::Mid, Tier::Frontier],
         attempts_per: 1,
         bindings: Some(vec![
-            // **Rung 0 matches the default chain's binding on purpose.** The
-            // `attempt_started` helper seeds that binding, and the fold refuses
-            // an attempt whose binding is not the one the run froze for its rung
-            // — `check_attempt_started`'s `BindingMismatch`, which caught the
-            // first draft of this fixture. Only the rung *above* differs, which
-            // is the rung this test is about.
             BindingSummary {
                 tier: Tier::Mid,
                 agent: AGENT.to_owned(),
@@ -642,15 +498,6 @@ fn escalating_chain() -> ChainSummary {
     }
 }
 
-/// Two tiers **and** two attempts per rung.
-///
-/// The only chain in this file on which a rung can read more than one earlier
-/// failure. Rung 0 spends two attempts, both fail, and the escalation lands on
-/// rung 1 with two records below it — which is what §11.4's "accumulated
-/// feedback summary" is a claim about. Its bindings match
-/// [`escalating_chain`]'s for the same reason that one's match [`chain`]'s: the
-/// seeded `attempt_started` carries rung 0's binding, and the fold refuses an
-/// attempt whose binding is not the one the run froze for its rung.
 fn deep_chain() -> ChainSummary {
     ChainSummary {
         attempts_per: 2,
@@ -669,17 +516,6 @@ fn review_plan() -> ReviewPlan {
     }
 }
 
-/// A `run_started` whose two digests authenticate against the frozen plan.
-///
-/// The registry digest is derived the way the fold derives it — from the plan,
-/// this record and the probed agents — rather than written as a literal,
-/// because a literal would be a second authority on the same number and the
-/// fixture would drift from the fold the first time either changed.
-/// `base` is the repository's real seed commit rather than a literal, because
-/// the driver dispatches at it: a recorded base that names no object makes
-/// `git worktree add` fail for a reason that has nothing to do with what is
-/// being tested, and a fixture whose record disagrees with its own repository
-/// is not the shape any real run has.
 fn run_started(
     plan: &Plan,
     private_dir: &str,
@@ -749,9 +585,6 @@ fn run_started(
             review: Effort::Medium,
         },
         reviews: {
-            // `second_opinion` is per task, so a second task needs a second
-            // entry — the registry refuses a record whose review alignment does
-            // not match its plan, which is the check working.
             let mut reviews = review_plan();
             if two_tasks {
                 reviews.second_opinion.push(None);
@@ -772,11 +605,6 @@ fn run_started(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Seams
-// ---------------------------------------------------------------------------
-
-/// A runtime holding this run's recorded image and its credential volume.
 fn runtime_holding_the_record() -> FakeRuntime {
     let runtime = FakeRuntime::new(ContainerTrace::default());
     runtime.add_image(IMAGE_ID, Some("sha256:2222"));
@@ -785,30 +613,15 @@ fn runtime_holding_the_record() -> FakeRuntime {
     runtime
 }
 
-/// A `Runner` that answers every request with `exit 0` and records what it saw.
 #[derive(Debug, Default)]
 struct RecordingRunner {
     seen: Mutex<Vec<RunnerRequest>>,
-    /// A program whose invocation fails, so a probe refusal can be constructed.
     failing: Mutex<Option<String>>,
-    /// Whether the worker also declares a clean/smudge filter.
-    ///
-    /// A `.gitattributes` naming a filter makes the staged bytes and the bytes
-    /// a gate would see potentially different, which is what the ladder's third
-    /// cheap rung refuses.
     filters: Mutex<bool>,
-    /// Whether an `Implement` invocation edits the worktree it was given.
-    ///
-    /// Off by default, because most tests here only care that a process ran.
-    /// A driver test that means to reach the **candidate sequence** needs a
-    /// non-empty diff: the ladder's cheap rungs reject an empty one, which is
-    /// what `pr_sequence[8]`'s "empty-diff attempt failures" names.
     edits: Mutex<bool>,
 }
 
 impl RecordingRunner {
-    /// A worker that leaves a change behind **and** a filter declaration, so
-    /// the staged evidence is not the evidence a gate would see.
     fn filtering() -> Self {
         let runner = Self::editing();
         *runner
@@ -818,7 +631,6 @@ impl RecordingRunner {
         runner
     }
 
-    /// A runner whose worker leaves a change behind, so an attempt can succeed.
     fn editing() -> Self {
         let runner = Self::default();
         *runner.edits.lock().unwrap_or_else(PoisonError::into_inner) = true;
@@ -858,15 +670,10 @@ impl Runner for RecordingRunner {
         } else {
             0
         };
-        // The worker's edit, which is the whole difference between an attempt
-        // the cheap rungs reject and one that reaches a candidate.
         if code == 0
             && request.role == crate::runner::ExecutionRole::Implement
             && *self.edits.lock().unwrap_or_else(PoisonError::into_inner)
         {
-            // Through the fixture funnel every other test in this file uses:
-            // `std::fs::write` is on the effect denylist here, and a test that
-            // reached around it would be the first.
             crate::workspace_manager::fixture::write_file(
                 &request.workspace.join("worker.txt"),
                 b"the worker's edit\n",
@@ -889,7 +696,6 @@ impl Runner for RecordingRunner {
     }
 }
 
-/// An adapter that reports itself through one probe process.
 #[derive(Debug)]
 struct StubAdapter;
 
@@ -941,8 +747,6 @@ impl AdapterSource for StubAdapters {
     }
 }
 
-/// A `RunnerPreflight` that certifies without spawning, for the tests whose
-/// subject is a step other than (c).
 struct AlwaysCertifies;
 
 impl RunnerPreflight for AlwaysCertifies {
@@ -951,61 +755,23 @@ impl RunnerPreflight for AlwaysCertifies {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The integration ref namespace, with no Git behind it
-// ---------------------------------------------------------------------------
-
-/// What `assert_publishable` finds at the recorded ref.
-///
-/// The two refusing shapes are the two `WorkspaceManager::assert_publishable`
-/// has: `refuse_symbolic` first, then a walk of the worktree records. Both are
-/// reproduced with the production [`Refusal`] values rather than with invented
-/// messages, so an assertion on the sentence an operator reads is an assertion
-/// on the sentence the real funnel would have produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefShape {
-    /// A direct ref nothing has checked out. Publishable.
     Direct,
-    /// A symbolic ref. `INV-17` makes every engine ref direct.
     Symbolic,
-    /// A direct ref some worktree has checked out.
     CheckedOut,
 }
 
-/// [`IntegrationRefs`] with no repository behind it, which still enters the
-/// `Ref.CreateIntegration` funnel positions.
-///
-/// **It must enter them.** Every ordering claim in this file reads its evidence
-/// out of the shared [`HookHarness`], and a double that performed the effect
-/// without consulting `hooks.phase` would leave the one durable Git effect of
-/// the whole recovery order invisible to it — a site contributing nothing to
-/// the coverage evidence. `hooks` here is the bundle's own
-/// [`crate::workspace_manager::EffectHooks`], so the recording lands in the same
-/// harness the other four families record into and needs no second wiring.
-///
-/// It also snapshots the run's event log at each entry. The position claim this
-/// file has to make about the P7/P8 step is "the ref was created **before any
-/// recovery event was appended**", and the log's bytes at the instant of the
-/// effect are that claim directly, with no ordering index standing in for it.
 struct RecordingRefs {
-    /// Where this run's `events.jsonl` is, so an entry can snapshot it.
     log: PathBuf,
     shape: RefShape,
     at: Mutex<Option<String>>,
     created: Mutex<Vec<(String, String)>>,
-    /// How many times `direct_target` was asked. The control half of the
-    /// unpublishable-ref test: `assert_publishable` runs **first**, so a build
-    /// that dropped it would still refuse a symbolic ref — at
-    /// `direct_ref_target`'s own `refuse_symbolic` — and a test that asserted
-    /// only "it refused" would stay green through the loss.
     targets_read: Mutex<usize>,
-    /// The log's bytes at each entry into `Ref.CreateIntegration`.
     entered: Mutex<Vec<Vec<u8>>>,
 }
 
 impl RecordingRefs {
-    /// The general constructor, by log path — the kill child has no
-    /// [`Fixture`], only the repository the parent named it.
     fn with_log(log: &Path, shape: RefShape, at: Option<String>) -> Self {
         Self {
             log: log.to_path_buf(),
@@ -1017,22 +783,18 @@ impl RecordingRefs {
         }
     }
 
-    /// Nothing is there — a run killed between P6 and P8.
     fn absent(fixture: &Fixture) -> Self {
         Self::with_log(&fixture.log(), RefShape::Direct, None)
     }
 
-    /// A direct ref already at `sha`.
     fn at(fixture: &Fixture, sha: &str) -> Self {
         Self::with_log(&fixture.log(), RefShape::Direct, Some(sha.to_owned()))
     }
 
-    /// Nothing is there, and `assert_publishable` answers `shape`.
     fn shaped(fixture: &Fixture, shape: RefShape) -> Self {
         Self::with_log(&fixture.log(), shape, None)
     }
 
-    /// Every `(refname, sha)` the funnel actually created.
     fn created(&self) -> Vec<(String, String)> {
         self.created
             .lock()
@@ -1040,7 +802,6 @@ impl RecordingRefs {
             .clone()
     }
 
-    /// The ref's current target.
     fn target(&self) -> Option<String> {
         self.at
             .lock()
@@ -1048,7 +809,6 @@ impl RecordingRefs {
             .clone()
     }
 
-    /// How many times the ref's target was read.
     fn targets_read(&self) -> usize {
         *self
             .targets_read
@@ -1056,7 +816,6 @@ impl RecordingRefs {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The log's bytes at each entry into the funnel.
     fn log_bytes_at_entries(&self) -> Vec<Vec<u8>> {
         self.entered
             .lock()
@@ -1064,12 +823,6 @@ impl RecordingRefs {
             .clone()
     }
 
-    /// The event kinds the log held at each entry into the funnel.
-    ///
-    /// Beside [`Self::log_bytes_at_entries`] and asserted first, because the
-    /// byte comparison's failure output is two `run_started` lines rendered as
-    /// `Vec<u8>` and nobody can read which of them grew. The kinds say it in
-    /// one line, and the bytes still catch a difference the kinds cannot see.
     fn log_kinds_at_entries(&self) -> Vec<Vec<String>> {
         self.log_bytes_at_entries()
             .iter()
@@ -1100,11 +853,6 @@ impl IntegrationRefs for RecordingRefs {
             .targets_read
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 1;
-        // `WorkspaceManager::direct_ref_target` opens with `refuse_symbolic`
-        // too, and reproducing that is what makes the symbolic case's
-        // `targets_read` assertion load-bearing rather than decorative: without
-        // it, dropping `assert_publishable` would leave the symbolic arm still
-        // refusing here and nothing would notice which check caught it.
         if self.shape == RefShape::Symbolic {
             return Err(Refusal::SymbolicRef {
                 refname: refname.to_owned(),
@@ -1121,8 +869,6 @@ impl IntegrationRefs for RecordingRefs {
         refname: &str,
         new: &str,
     ) -> Result<(), UpstrokeError> {
-        // The contract's refusal, before the funnel is entered: the real
-        // primitive refuses a malformed or null value before its funnel runs.
         crate::workspace_manager::refuse_new(refname, new)?;
         let site = EffectSiteId::Ref(RefSite::CreateIntegration);
         self.entered
@@ -1137,8 +883,6 @@ impl IntegrationRefs for RecordingRefs {
         {
             let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
             if at.is_some() {
-                // What `git update-ref --no-deref <ref> <new> ""` answers when
-                // the ref appeared between the read and the write.
                 return Err(UpstrokeError::Git {
                     message: format!("`{refname}` already exists; zero-old refuses"),
                 });
@@ -1153,9 +897,6 @@ impl IntegrationRefs for RecordingRefs {
     }
 }
 
-/// The contract [`IntegrationRefs::create_zero_old`] states binds this double
-/// as it binds `WorkspaceManager` (`PR126-REVIEW2-DOUBLES-ACCEPT-NULL-NEW`):
-/// a null value is refused before the funnel is entered, and nothing is stored.
 #[test]
 fn the_recording_refs_refuse_a_null_new_value_as_the_real_primitive_does() {
     let refs = RecordingRefs::with_log(Path::new("no-log"), RefShape::Direct, None);
@@ -1180,9 +921,6 @@ fn the_recording_refs_refuse_a_null_new_value_as_the_real_primitive_does() {
     );
 }
 
-/// `workspace_manager::apply`, which is private to that module — the same three
-/// answers, so an arming at this site does here what it does at every other Git
-/// funnel.
 fn injected(
     injection: Injection,
     site: EffectSiteId,
@@ -1209,17 +947,6 @@ fn container_selection() -> RunnerSelection {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A funnel that refuses, inside the whole recovery order
-// ---------------------------------------------------------------------------
-
-/// [`HarnessTopologyHooks`] with its run-directory family replaced by one that
-/// returns [`Injection::Error`] at a nominated `(site, phase, nth)`, and records
-/// into the same [`HookHarness`] the other four families do.
-///
-/// Module-local, because `HookHarness::arm` takes a [`SubEffectPoint`] and
-/// `hook()` answers `Proceed` to `Before`/`After` unconditionally, so a
-/// `RunDir` site's two phases are not armable through it.
 struct ArmedHooks {
     inner: HarnessTopologyHooks,
     rundir: ArmedRunDir,
@@ -1291,30 +1018,16 @@ impl TopologyHooks for ArmedHooks {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Driving one resume
-// ---------------------------------------------------------------------------
-
-/// What one resume was given, beyond the fixture.
 struct Given<'a> {
     runtime: &'a dyn ContainerRuntime,
     preflight: &'a dyn RunnerPreflight,
     today: RunnerSelection,
     inputs: FrozenInputs,
     explicit_root: Option<PathBuf>,
-    /// The integration ref namespace the P7/P8 step publishes into.
-    ///
-    /// Owned rather than borrowed, so [`Given::healthy`] can build the
-    /// default — a resume killed between P6 and P8 finds **no** ref, which is
-    /// the shape every other test in this file already implied and none of them
-    /// could say. A test that needs another shape assigns the field.
     refs: RecordingRefs,
 }
 
 impl<'a> Given<'a> {
-    /// The healthy case: the runtime holds the record, the pre-flight
-    /// certifies, today's config is the recorded one, and the recorded
-    /// integration ref is not there yet.
     fn healthy(
         fixture: &Fixture,
         runtime: &'a FakeRuntime,
@@ -1331,21 +1044,15 @@ impl<'a> Given<'a> {
     }
 }
 
-/// Run (a0) and then the whole order, recording every site into `harness`.
 fn resume(
     fixture: &Fixture,
     harness: &Arc<Mutex<HookHarness>>,
     given: &Given<'_>,
 ) -> (Result<Recovered, UpstrokeError>, Vec<String>) {
     let (outcome, warnings) = resume_holding(fixture, harness, given);
-    // The handle is dropped here, which releases the run lock and then the
-    // worktree lease — the same thing that happened at the end of the recovery
-    // order before the loop existed to hold them. A test that needs them alive
-    // takes [`resume_holding`].
     (outcome.map(|(recovered, _handle)| recovered), warnings)
 }
 
-/// [`resume`], keeping the [`RunHandle`] the order hands back.
 fn resume_holding(
     fixture: &Fixture,
     harness: &Arc<Mutex<HookHarness>>,
@@ -1355,7 +1062,6 @@ fn resume_holding(
     resume_with(fixture, &mut hooks, given)
 }
 
-/// [`resume`], with the hook bundle supplied — so a test can arm one.
 fn resume_with(
     fixture: &Fixture,
     hooks: &mut dyn TopologyHooks,
@@ -1397,7 +1103,6 @@ fn harness() -> Arc<Mutex<HookHarness>> {
     Arc::new(Mutex::new(HookHarness::new()))
 }
 
-/// Whether any lock site ran — the R17 half of "no hold was taken".
 fn any_lock_site_ran(harness: &Arc<Mutex<HookHarness>>) -> Vec<&'static str> {
     let seen = harness.lock().unwrap_or_else(PoisonError::into_inner);
     LockSite::ALL
@@ -1408,7 +1113,6 @@ fn any_lock_site_ran(harness: &Arc<Mutex<HookHarness>>) -> Vec<&'static str> {
         .collect()
 }
 
-/// The index of a site's first observation, for an ordering assertion.
 fn first_observation(harness: &Arc<Mutex<HookHarness>>, site: EffectSiteId) -> Option<usize> {
     let seen = harness.lock().unwrap_or_else(PoisonError::into_inner);
     seen.coverage()
@@ -1420,20 +1124,6 @@ fn message(error: &UpstrokeError) -> String {
     error.to_string()
 }
 
-// ===========================================================================
-// (a0) — the read-only refusals, before any lock
-// ===========================================================================
-
-/// An explicit `--private-root` that names another root refuses **before any
-/// lock**, and "before any lock" is asserted as the packet states it: no R17
-/// hold was taken and no R25 lock file was created.
-///
-/// "The command refused" is a weaker claim and would be green for an
-/// implementation that took the worktree lease, created
-/// `upstroke-worktree.lock`, and then noticed. The lock file is the one that
-/// bites: `Lock.AcquireWorktree`'s funnel opens it with `create(true)`, so
-/// merely *reaching* the acquisition leaves a repository-scoped artifact behind
-/// on a command that was supposed to end read-only.
 #[test]
 fn resume_with_explicit_private_root_mismatch_refused_before_any_lock() {
     let fixture = Fixture::healthy("explicit-root");
@@ -1466,14 +1156,6 @@ fn resume_with_explicit_private_root_mismatch_refused_before_any_lock() {
     );
 }
 
-/// A recorded locator of any shape other than `<root>/runs/<run_id>` refuses
-/// before any lock, and every shape is refused rather than only the obvious
-/// one.
-///
-/// Three shapes, because each fails a different clause: a missing `runs`
-/// component, a trailing component that is not the run id, and a locator whose
-/// path escapes upwards. The third is the one a "does it end with the run id"
-/// check would accept.
 #[test]
 fn malformed_recorded_locator_refused_before_any_lock() {
     for (tag, locator) in [
@@ -1519,27 +1201,11 @@ fn malformed_recorded_locator_refused_before_any_lock() {
     }
 }
 
-/// A resume takes the private root **from the record**, not from today's
-/// default — even when the default root has moved somewhere else entirely.
-///
-/// The fixture's root is a temporary directory that is never
-/// `rundir::default_private_root()`, so a `derive` that consulted the default
-/// would produce a different path and the census below it would scan the wrong
-/// tree. Asserted as an equality against the recorded locator's parent rather
-/// than as "the resume succeeded".
 #[test]
 fn resume_derives_private_root_from_record_when_default_changed() {
     let fixture = Fixture::healthy("nondefault-root");
     let root = fixture.derive(None).expect("(a0) derives");
 
-    // Compared canonical-to-canonical, because `authorized_root` is
-    // deliberately **lexical**: it refuses a locator whose shape is not
-    // `<root>/runs/<run_id>` and resolves nothing, so it hands back the root in
-    // whatever form the record wrote. Canonicalising only the right-hand side
-    // compares two spellings of one directory and fails wherever the temporary
-    // directory sits under a symlink — which is macOS, where `TMPDIR` is under
-    // `/var` and `/var` is a link to `/private/var`. Linux's `/tmp` is real, so
-    // this passed there and failed only in CI's macOS leg.
     let canonical =
         |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     assert_eq!(
@@ -1556,18 +1222,6 @@ fn resume_derives_private_root_from_record_when_default_changed() {
     assert_eq!(root.first_line(), fixture.first_line.as_slice());
 }
 
-// ===========================================================================
-// (a) — the records, before any private write
-// ===========================================================================
-
-/// A recorded private half that is not on disk refuses, and **is not
-/// recreated**.
-///
-/// `recovery_order` (a): "a missing schema-4 private half is not recreated —
-/// deferred". So the assertion is two-sided: the command refuses, *and* the
-/// directory the record names is still absent afterwards. A build that
-/// helpfully created it would satisfy "refuses" for one more line and then
-/// authorize deletions against a boundary nobody wrote.
 #[test]
 fn resume_refuses_missing_private_half() {
     let fixture = Fixture::build(
@@ -1595,12 +1249,6 @@ fn resume_refuses_missing_private_half() {
     );
 }
 
-/// A missing `owner.json`, and a present one disagreeing in any of the four
-/// identity fields, both refuse — and each refusal names the field.
-///
-/// One test over five cases rather than five tests, because the claim is that
-/// the check is a *conjunction*: a build that compared only the run id passes
-/// any single-case test that happens to damage the run id.
 #[test]
 fn resume_refuses_missing_or_disagreeing_owner_record() {
     let cases: Vec<(&str, Damage, &str)> = vec![
@@ -1659,8 +1307,6 @@ fn resume_refuses_missing_or_disagreeing_owner_record() {
             text.contains(expected),
             "the refusal for `{tag}` must name `{expected}`: {text}"
         );
-        // Before any private write: the private half still holds exactly the
-        // two records the creator left, and nothing new.
         let private = fixture.private_root.join("runs").join(RUN_ID);
         assert!(
             !private.join("questions").exists() && !private.join("report.json").exists(),
@@ -1669,8 +1315,6 @@ fn resume_refuses_missing_or_disagreeing_owner_record() {
     }
 }
 
-/// `committed.json`'s `run_started_sha256` must equal the digest of the
-/// committed first line, and a mismatch refuses quoting **both** numbers.
 #[test]
 fn resume_refuses_commit_record_digest_mismatch() {
     let fixture = Fixture::build(
@@ -1704,14 +1348,6 @@ fn resume_refuses_commit_record_digest_mismatch() {
     );
 }
 
-/// `owner.json.runner` must equal `run_started(4).runner` exactly, and the
-/// refusal names **which field** moved.
-///
-/// INV-23 makes this an (a) refusal rather than a (c) one: "every later
-/// incarnation rebuilds the Runner from `run_started(4).runner` — **verified
-/// equal to `owner.json.runner`** — before its RunnerPreflight". A build that
-/// checked only at the rebuild would already have censused, which is a
-/// fold-derived reclaim decided under a runner identity nobody agreed on.
 #[test]
 fn resume_refuses_owner_record_runner_mismatch() {
     let fixture = Fixture::build(
@@ -1746,17 +1382,6 @@ fn resume_refuses_owner_record_runner_mismatch() {
     );
 }
 
-// ===========================================================================
-// (a1) — the stable-prefix barrier
-// ===========================================================================
-
-/// A plan whose digest is not the one the log recorded refuses at the barrier's
-/// **checked replay**, and nothing fold-derived happens.
-///
-/// `refusal_condition`'s first clause is "plan or registry digest mismatch",
-/// and `stable_prefix_barrier` step (5) is where a log is replayed through the
-/// checked fold. So the refusal is the replay's, and the assertion is that it
-/// names `CheckedReplay` — not merely that something went wrong.
 #[test]
 fn resume_refuses_digest_mismatch() {
     let fixture = Fixture::healthy("digest-mismatch");
@@ -1790,20 +1415,6 @@ fn resume_refuses_digest_mismatch() {
     );
 }
 
-/// `Event.OpenLog`, its `SyncPrefix` point and `Event.ProvePrefixStable` all
-/// execute **before** the first fold-derived effect of the census.
-///
-/// The ordering is asserted over the harness's first-observation order, which
-/// is what makes this a claim about the *sequence* rather than about
-/// possession. `RunDir.RemoveMarker` is the census's own write and, **in this
-/// fixture**, the earliest fold-derived effect the order performs — the runs
-/// tree holds this run's directory and nothing else, so no husk reclaim can
-/// precede it. That is a property of the fixture rather than of the order: a
-/// husk sorting before this run's id would put `RunDir.RemovePrivateHusk`
-/// first, and the census walks in ascending run-id order. So the fixture's
-/// emptiness is asserted rather than assumed, and the anchor is the census's
-/// first effect *here*: if the barrier's three sites do not all precede it, the
-/// resume decided something from a prefix it had not proven.
 #[test]
 fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     let fixture = Fixture::healthy("barrier-order");
@@ -1812,9 +1423,6 @@ fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     let certifies = AlwaysCertifies;
     let given = Given::healthy(&fixture, &runtime, &certifies);
 
-    // Asserted **before** the resume, because the resume reclaims what it walks:
-    // afterwards a husk that had preceded this run in the walk is gone and the
-    // same assertion passes vacuously.
     assert_eq!(
         rundir::run_dir_names(&fixture.repo_root),
         vec![RUN_ID.to_owned()],
@@ -1859,13 +1467,6 @@ fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     );
 }
 
-/// A `SyncPrefix` that returns `Err` ends the command with **nothing done**.
-///
-/// `stable_prefix_barrier`: "a failed sync … performs none of those effects:
-/// the write command ends … with an infrastructure error naming the run id and
-/// the failed step, no append handle is used, the run is NoRunFinished and
-/// resumable". Three assertions, because "it returned an error" is true of a
-/// build that censused first and refused afterwards.
 #[test]
 fn resume_refuses_before_any_fold_derived_effect_when_prefix_sync_fails() {
     let fixture = Fixture::healthy("sync-fails");
@@ -1903,18 +1504,9 @@ fn resume_refuses_before_any_fold_derived_effect_when_prefix_sync_fails() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Later events, for the prefixes a resume has to recover from
-// ---------------------------------------------------------------------------
-
 const ALPHA: TaskKey = TaskKey(0);
 const GEN: GenerationId = GenerationId(0);
 
-/// [`dispatched`], at a base that names a real object.
-///
-/// The constant-SHA version is enough for every test whose subject is the
-/// fold, because the fold does not resolve a base. Step (g) does — it cuts a
-/// worktree at it — so its fixture has to name the repository's own commit.
 fn dispatched_at(base: &CommitSha) -> TopologyEventBody {
     let TopologyEventBody::TaskDispatched { mut data } = dispatched() else {
         unreachable!("`dispatched` builds a `TaskDispatched`")
@@ -1940,16 +1532,6 @@ fn dispatched() -> TopologyEventBody {
     }
 }
 
-/// Re-key an event built for `alpha` onto another task.
-///
-/// The seeded-event helpers are all `ALPHA`'s, which was enough while every
-/// fixture had one task. A step that loops needs a second, and re-keying is
-/// cheaper than a second set of builders — and keeps the two tasks' events
-/// identical apart from the key, which is what makes "the step handled both" a
-/// claim about the step rather than about the fixture.
-///
-/// The predicted region moves with the key: two tasks holding the same region
-/// is an overlap the fold refuses, and rightly.
 fn for_task(key: TaskKey, prefix: &str, body: TopologyEventBody) -> TopologyEventBody {
     match body {
         TopologyEventBody::TaskDispatched { mut data } => {
@@ -1974,15 +1556,6 @@ fn for_task(key: TaskKey, prefix: &str, body: TopologyEventBody) -> TopologyEven
     }
 }
 
-/// Re-key an event built for generation 0 onto a later generation.
-///
-/// `for_task` moves a seeded event sideways; this moves it forward. A
-/// **closed** generation is what a sessionless retry and every escalation leave
-/// behind — `settle::failed` closes it and the next attempt runs in a fresh one
-/// — so a log with two failures below one rung has two generations in it, and
-/// `attempt_started` on a closed generation is a barrier refusal rather than a
-/// fixture. The worktree path moves with the generation because two live
-/// dispatches may not name the same one.
 fn in_generation(generation: GenerationId, body: TopologyEventBody) -> TopologyEventBody {
     match body {
         TopologyEventBody::TaskDispatched { mut data } => {
@@ -2039,21 +1612,6 @@ fn attempt_record(attempt: u32) -> AttemptRecord {
     }
 }
 
-/// `attempt_finished`, whose record **says the attempt failed** — because every
-/// settlement this helper can build is a failure.
-///
-/// `candidate_prepared` is the sole successful settlement, so an
-/// `attempt_finished` is a retry, an escalation, a park, a deferral, a retained
-/// hold or a terminal failure, and each of those is an attempt that did not
-/// succeed. This built `attempt_record(attempt)` — `failure: None`, no reviews —
-/// so every fixture using it produced a settlement that fails a task while
-/// carrying a ledger line saying the work passed. The fold accepted that until
-/// 2026-08-27; now `check_attempt_finished` refuses it, and this helper would
-/// have made ~8 fixtures refuse rather than making them coherent.
-///
-/// Deriving the record from the settlement is the fix, not attaching a failure
-/// at each call site: a fixture that has to remember to make its own event
-/// self-consistent is a fixture that will stop doing so.
 fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEventBody {
     let mut record = attempt_record(attempt);
     record.failure = Some(crate::events::FailureRecord {
@@ -2062,10 +1620,6 @@ fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEven
         reason: "the fixture's judged failure".to_owned(),
         detail: None,
     });
-    // The settlement's retained session and the record's `session_id` are one
-    // value in production — both come from `assessed.outcome.session_id` — and
-    // the fold refuses a retained settlement whose halves name different
-    // conversations.
     if let AttemptSettlement::Retained {
         retained_session, ..
     } = &settlement
@@ -2083,14 +1637,6 @@ fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEven
     }
 }
 
-/// `attempt_finished` carrying the failure — and the feedback — a crash left
-/// durable.
-///
-/// [`attempt_finished`] records `failure: None`, which is the shape of an
-/// attempt nothing judged. A crash-resume claim is about the other shape: the
-/// ladder decided something, and §11.4's feedback is on the record it decided
-/// from. `detail` is what the next attempt is told, and it is the field this
-/// helper exists to put in a log.
 fn attempt_finished_failing(
     attempt: u32,
     kind: crate::ladder::FailureKind,
@@ -2134,22 +1680,6 @@ fn run_finished(outcome: RunOutcome, halted_at: Option<TaskKey>) -> TopologyEven
     }
 }
 
-// ===========================================================================
-// (b) — Complete or Halted
-// ===========================================================================
-
-/// A Halted run does not continue.
-///
-/// # About the word "finalizes" in this test's name
-///
-/// Step (b) is "terminal finalization **then** refuse continuation", and this
-/// slice implements the refusal only: `RunDir.WriteReport` carries
-/// `fault_row: t_finalize`, which is not one of PR7's eleven rows, so writing a
-/// report here would be an out-of-row effect with no fault coverage in this
-/// slice. The name is the packet's and is kept unchanged so the row and the
-/// test still correspond; what it asserts is the half in range, and it asserts
-/// the other half's **absence** explicitly rather than leaving it unstated —
-/// no `report.json`, and no `RunDir.WriteReport`.
 #[test]
 fn resume_finalizes_halted_then_refuses() {
     for (tag, outcome, extra) in [
@@ -2178,11 +1708,6 @@ fn resume_finalizes_halted_then_refuses() {
             vec![
                 dispatched(),
                 attempt_started(1),
-                // `halts_run: false`: the task ends terminal and the run does
-                // not halt, so the derived outcome is Complete rather than
-                // Halted — which is what makes both arms of (b) constructible
-                // without any integration terminal this slice does not
-                // implement.
                 attempt_finished(
                     1,
                     AttemptSettlement::Closed {
@@ -2244,17 +1769,6 @@ fn resume_finalizes_halted_then_refuses() {
     }
 }
 
-// ===========================================================================
-// (c) — the rebuild and its warnings
-// ===========================================================================
-
-/// A `[runner]` config that differs from the record **warns naming the
-/// difference** and is ignored: the run resumes on its recorded runner.
-///
-/// Both halves asserted. A build that warned and then used today's config
-/// would satisfy the warning half, and `run_resumed(4).runner` would then
-/// differ from `run_started(4).runner` — which the fold refuses, but only if
-/// the record actually reaches it.
 #[test]
 fn resume_rebuilds_runner_from_record_and_warns_on_config_drift() {
     let fixture = Fixture::healthy("config-drift");
@@ -2278,7 +1792,6 @@ fn resume_rebuilds_runner_from_record_and_warns_on_config_drift() {
         "the warning names which field differs: {:?}",
         recovered.warnings
     );
-    // The record won: `run_resumed` carries the recorded volume, not today's.
     let log = String::from_utf8(fixture.log_bytes()).expect("the log is utf-8");
     let resumed = log.lines().last().expect("run_resumed is last");
     assert!(
@@ -2287,13 +1800,6 @@ fn resume_rebuilds_runner_from_record_and_warns_on_config_drift() {
     );
 }
 
-/// A recorded reference that now names another image warns, and the run keeps
-/// running **from the recorded id**.
-///
-/// INV-23: "a moved reference cannot change what executes". The fake's mutable
-/// tag table is what makes this constructible at all — the reference is moved
-/// to a second image the runtime also holds, so the refusal path (an absent id)
-/// is not what is being exercised.
 #[test]
 fn resume_warns_when_reference_moved_and_uses_recorded_image_id() {
     let fixture = Fixture::healthy("moved-reference");
@@ -2324,19 +1830,8 @@ fn resume_warns_when_reference_moved_and_uses_recorded_image_id() {
     );
 }
 
-/// An unavailable runtime, a recorded image id the runtime no longer holds, and
-/// an absent credential volume each refuse **before any spawn**.
-///
-/// The predicate is the type, not the prose: `RunnerRebuilt::rebuild` runs
-/// `rebuild_by_inspection`, and `PreflightCertified::certify` is the only thing
-/// that spawns — so a refusal that produced no `RunnerRebuilt` cannot have
-/// spawned. Asserted here through a pre-flight that would *panic* if it were
-/// reached.
 #[test]
 fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume_absent() {
-    /// A pre-flight that must never run. `certify` is unreachable if the
-    /// inspection refusals really do precede every spawn, and this is what
-    /// turns "unreachable" into a failing test rather than a comment.
     struct NeverRuns;
 
     impl RunnerPreflight for NeverRuns {
@@ -2345,7 +1840,6 @@ fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume
         }
     }
 
-    /// One way to leave a recorded runner un-re-establishable.
     type Damage = fn(&FakeRuntime);
     let cases: [(&str, Damage, &str); 3] = [
         (
@@ -2369,8 +1863,6 @@ fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume
         let harness = harness();
         let runtime = runtime_holding_the_record();
         if tag == "image-id" {
-            // Remove the image itself: moving the tag alone leaves the id
-            // present, and the id is what the rebuild asks about.
             runtime.add_image("sha256:absent", None);
         }
         damage(&runtime);
@@ -2401,12 +1893,6 @@ fn resume_refuses_by_inspection_before_any_spawn_when_runtime_image_id_or_volume
     }
 }
 
-// ---------------------------------------------------------------------------
-// Driving only as far as the census
-// ---------------------------------------------------------------------------
-
-/// (a0) → (a) → (a1) → (a), stopping at the census, so a test can read what it
-/// found. The full order consumes the witness at (h) and nothing survives it.
 fn chain_to_census(
     fixture: &Fixture,
     harness: &Arc<Mutex<HookHarness>>,
@@ -2417,7 +1903,6 @@ fn chain_to_census(
     chain_to_census_with(fixture, &mut hooks, runtime, incarnation)
 }
 
-/// [`chain_to_census`], with the hook bundle supplied — so a test can arm one.
 fn chain_to_census_with(
     fixture: &Fixture,
     hooks: &mut dyn TopologyHooks,
@@ -2454,28 +1939,12 @@ fn chain_to_census_with(
     )
 }
 
-// ===========================================================================
-// (a) — the census, in the recorded root
-// ===========================================================================
-
-/// A run whose private root is not today's default still has its **earlier
-/// incarnations'** containers reclaimed, and they are reclaimed **in the
-/// recorded root**.
-///
-/// Three assertions, and the third is the one the test is named for: the
-/// census's own report has to name the recorded root. A build that censused
-/// `default_private_root()` would find nothing, reclaim nothing, and return a
-/// perfectly successful report — so "the container was reclaimed" alone is not
-/// enough; the root the census scanned is part of the claim.
 #[test]
 fn resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorded_root() {
     let fixture = Fixture::healthy("earlier-incarnation");
     let harness = harness();
     let runtime = runtime_holding_the_record();
 
-    // An intent this run's *creator* incarnation left behind, in the recorded
-    // root. It is dead by construction: the run lock is exclusive, so only one
-    // incarnation of a run is ever live, and this process is a different one.
     let invocation = crate::runner::InvocationId::probe(
         crate::runner::ProbeTarget::Agent(crate::runner::AgentId::new(AGENT)),
         0,
@@ -2542,26 +2011,6 @@ fn resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorde
     );
 }
 
-/// A resume **reclaims** the husks beside the run it is resuming: the private
-/// half first, through the proof-token funnel, then the public directory with
-/// the marker last.
-///
-/// `recovery_order` (a1)'s census is a "run-directory census incl. this run's
-/// own stale marker, which the owner removes here, **and husk reclamation under
-/// the ownership proof**", and INV-15 reclaims pre-run husks "at write-command
-/// start under the worktree lock". A resume is a write command and holds that
-/// lock. A run-directory pass that classified and reported would leave a
-/// provable husk on disk for ever: every later resume would report it again, and
-/// only a fresh `upstroke run` would ever reclaim it.
-///
-/// Three claims, and the third is what makes the first two mean anything:
-///
-/// * the provable husk is gone, both halves, and the report names the arm;
-/// * `RunDir.RemovePrivateHusk` precedes `RunDir.RemovePublicHusk` — reversed, a
-///   kill between the two leaves a private half no marker names and no later
-///   census can ever prove;
-/// * the husk carrying `committed.json` is byte-identical afterwards. A census
-///   that deleted whatever it walked over would pass the first two.
 #[test]
 fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committed_one() {
     const RECLAIMED: &str = "01KZTHUSK00000000000000002";
@@ -2626,9 +2075,6 @@ fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committ
     );
     assert!(retained.public.exists(), "nor is its public half");
 
-    // And the run being resumed: its own stale marker repaired by its owner, and
-    // nothing else. The husk arms are gated on the run lock, which this process
-    // holds for its own directory.
     assert_eq!(
         report
             .of(RUN_ID)
@@ -2640,23 +2086,6 @@ fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committ
     assert!(fixture.log().exists(), "and the run itself is untouched");
 }
 
-/// **A husk this resume cannot reclaim does not fail this resume.**
-///
-/// Before the census was shared, the resume's run-directory half was
-/// `list_husks` + `husk_report` — both infallible — plus one `remove_marker`.
-/// Sharing the reclaiming census moved a command-fatal error path onto the
-/// resume: one dead run whose private half the filesystem will not release
-/// (`EACCES`, `EPERM`, `EBUSY`, or on Windows any still-open handle) made
-/// `upstroke resume <id>` fail for **every** run in the repository, on every
-/// attempt, for a different run's residue. T-RESUME enumerates its refusals and
-/// this is not among them, and `startup_census` and INV-15 answer "cannot be
-/// reclaimed" with *retain and report* everywhere else.
-///
-/// The husk sorts **before** this run's id, which is what makes the second claim
-/// worth making: `run_dir_names` sorts ascending, so a census that stopped at
-/// the failure never reached this run's own directory at all — and recovery step
-/// (a1) gives this run's stale-marker repair to its owner, which is this
-/// process. So the repair was collateral damage of a different run's residue.
 #[test]
 fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {
     const STUCK: &str = "01AAAASTUCK000000000000000";
@@ -2687,7 +2116,6 @@ fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {
 
     outcome.expect("a husk beside the run cannot end the resume");
 
-    // The husk: retained where it was, with the locator the next census needs.
     assert!(stuck.public.exists(), "the public half was removed anyway");
     assert!(
         stuck.public.join(rundir::MARKER).exists(),
@@ -2699,8 +2127,6 @@ fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {
         "the arming is `Before`, so the removal never ran"
     );
 
-    // And this run's own stale marker, which sorts after the failure, was still
-    // repaired by its owner.
     assert!(
         !fixture.public().join(rundir::MARKER).exists(),
         "the own-run stale-marker repair was skipped because a husk sorting \
@@ -2718,13 +2144,6 @@ fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {
     );
 }
 
-/// The same husk, from the report's side: an entry naming the step that refused
-/// and carrying its error, beside the own run's completed repair.
-///
-/// The sibling above asserts the **tree** and that the command survived; this
-/// asserts that the census *said* what happened rather than merely surviving
-/// it. INV-15's answer is retained **and reported**, and a census that swallowed
-/// the failure into a `Skipped` or an `Ok` with no entry would pass the sibling.
 #[test]
 fn the_resume_census_reports_the_husk_it_could_not_reclaim() {
     const STUCK: &str = "01AAAASTUCK000000000000000";
@@ -2768,7 +2187,6 @@ fn the_resume_census_reports_the_husk_it_could_not_reclaim() {
     );
     assert_eq!(report.unreclaimable().len(), 1);
 
-    // And the entry after it: this run's own repair, performed.
     assert_eq!(
         report
             .of(RUN_ID)
@@ -2778,39 +2196,12 @@ fn the_resume_census_reports_the_husk_it_could_not_reclaim() {
     );
 }
 
-// ===========================================================================
-// (a) — the surviving reaper hold
-// ===========================================================================
-
-/// A resume refuses while a surviving reaper's shared cleanup hold (R28) is
-/// observed, and succeeds once it is released.
-///
-/// The observation is [`rundir::observe_cleanup_hold`], which is fail-closed:
-/// a `cleanup.lock` it cannot inspect is a hold, because "an observation that
-/// was made to fail is not an observation that found nothing". A directory in
-/// the lock file's place is exactly that state and is constructible on every
-/// platform through the directory funnel, which is why it is what stands in for
-/// a live reaper here — the alternative is `libc::flock`, which is on the
-/// effect denylist and which this module may not reach.
-///
-/// The refusal half is `#[cfg(unix)]` because the hold is: R28 is "a surviving
-/// **Unix** reaper's shared cleanup hold", and `rundir`'s non-Unix `cleanup`
-/// module answers `false` unconditionally. The success half runs everywhere,
-/// and asserts on both platforms that the observation site executed — a Windows
-/// build that skipped the question entirely would pass a test that only
-/// asserted the outcome.
 #[test]
 fn resume_refused_while_reaper_hold_observed_then_succeeds() {
     let fixture = Fixture::healthy("reaper-hold");
 
     #[cfg(unix)]
     {
-        // Bound inside the `cfg`, because only the `cfg` uses it. Bound
-        // outside, Windows compiles an unused local and CI's `lint (windows)`
-        // leg refuses it under `-D warnings` — which is exactly the gap
-        // recorded as `windows-gate-lint-level-gap`: a local
-        // `--target x86_64-pc-windows-msvc` check accepts code the guest does
-        // not, because only the guest sets the lint level.
         let cleanup = fixture.public().join("cleanup.lock");
         mkdir(&cleanup);
         let harness = harness();
@@ -2859,32 +2250,12 @@ fn resume_refused_while_reaper_hold_observed_then_succeeds() {
     );
 }
 
-// ===========================================================================
-// (d), (e), (h)
-// ===========================================================================
-
-/// Replay the fixture's log from disk, which is the only way to read state a
-/// resume left behind: `run_resumed` consumes the witness that carried the
-/// live fold.
-///
-/// Replaying rather than keeping the live fold is also the stronger assertion.
-/// INV-02's "live state and replay use one checked transition over the exact
-/// wire event" means a claim made against the replayed fold is a claim about
-/// the bytes, not about a `TopologyFold` this process happens to hold.
 fn replayed(fixture: &Fixture) -> TopologyFold {
     let bytes = fixture.log_bytes();
     let events = TopologyFold::parse_log(&bytes).expect("the log parses");
     TopologyFold::replay(fixture.inputs(), &events).expect("and folds")
 }
 
-/// A resume clears the previous epoch's budget stop and wakes every Deferred
-/// task.
-///
-/// Both halves, and both read off the **replayed** log rather than off the
-/// return value: the epoch-scoped stop is what makes "raise the ceiling and
-/// resume" the answer to a budget stop, and a build that cleared it only in
-/// memory would leave the next process refusing for a stop the log still
-/// carries.
 #[test]
 fn resume_clears_budget_stop_and_wakes_deferred() {
     let fixture = Fixture::build(
@@ -2944,26 +2315,6 @@ fn resume_clears_budget_stop_and_wakes_deferred() {
     );
 }
 
-/// **Steps (d) and (e) handle every entry, not the first one.**
-///
-/// Two catalogue entries survived the whole suite at `6a21be6` for one reason —
-/// no fixture had a second thing for these loops to reach:
-///
-/// - `PR7-PIPELINE-010` reduced step (e) to
-///   `retained_idle(..).into_iter().take(1)`, closing only the first
-///   `RetainedIdle` generation. Green.
-/// - `PR7-PIPELINE-008` added `if lease == LineageHeld { continue; }` to step
-///   (d)'s loop, skipping a whole lease class. Green.
-///
-/// Both loops were already correct. What was missing was a fixture that could
-/// tell a loop from a `.first()`, which is why this is a witness and not a
-/// repair. `Damage::two_tasks` registers `beta` beside `alpha` so there are two
-/// of everything for the steps to walk.
-///
-/// **Live above `max_parallel = 1`, latent at it** — which is exactly the
-/// condition a carried row would have named. It is cheaper to hold it than to
-/// write it down: PR11 inherits a substrate whose recovery loops are witnessed
-/// rather than a note saying they are not.
 #[test]
 fn steps_d_and_e_reach_every_generation_not_the_first() {
     const BETA: TaskKey = TaskKey(1);
@@ -2973,7 +2324,6 @@ fn steps_d_and_e_reach_every_generation_not_the_first() {
         Damage {
             two_tasks: true,
             extra: vec![
-                // alpha: retained and idle — step (e)'s subject.
                 dispatched(),
                 attempt_started(1),
                 attempt_finished(
@@ -2983,7 +2333,6 @@ fn steps_d_and_e_reach_every_generation_not_the_first() {
                         retained_incarnation: Epoch(0),
                     },
                 ),
-                // beta: the same, and the second entry the loop must reach.
                 for_task(BETA, "beta", dispatched()),
                 for_task(BETA, "beta", attempt_started(1)),
                 for_task(
@@ -3002,8 +2351,6 @@ fn steps_d_and_e_reach_every_generation_not_the_first() {
         },
     );
 
-    // The premise: two retained generations before the resume. Without this the
-    // assertion below is satisfied by a fixture that only ever had one.
     let before = replayed(&fixture);
     assert!(
         before.ready_retry(ALPHA) && before.ready_retry(BETA),
@@ -3034,15 +2381,6 @@ fn steps_d_and_e_reach_every_generation_not_the_first() {
     }
 }
 
-/// A retained session belongs to the incarnation that retained it. Step (e)
-/// closes the generation, so after the resume there is no retry to evaluate —
-/// and the fold refuses one.
-///
-/// `recovery_order` (i): "`ready_retry` is never evaluated before (h) and the
-/// fold refuses a stale-incarnation retry". The first clause is structural
-/// here: nothing in this file evaluates `ready_retry`, and the loop that does
-/// is behind `run_resumed`, which consumes the witness. The second is asserted
-/// directly, against the replayed fold.
 #[test]
 fn retry_refused_after_resume() {
     let fixture = Fixture::build(
@@ -3085,8 +2423,6 @@ fn retry_refused_after_resume() {
         !after.ready_retry(ALPHA),
         "the retained session is gone, so there is no same-session retry to take"
     );
-    // And the transition itself is refused: a forged retry into the closed
-    // generation does not plan.
     let refused = after
         .plan_transition(&event(attempt_started(2)))
         .expect_err("a retry into a closed generation is refused");
@@ -3096,12 +2432,6 @@ fn retry_refused_after_resume() {
     );
 }
 
-/// `run_resumed(4).runner` equals `run_started(4).runner` field for field.
-///
-/// Read off the log rather than off the value this process passed in, and
-/// compared with `RunnerPolicy::difference` — which names which field moved —
-/// rather than with `assert_eq!`, so the failure message is the field rather
-/// than two pretty-printed records.
 #[test]
 fn run_resumed_records_identical_runner_identity() {
     let fixture = Fixture::healthy("identical-runner");
@@ -3136,14 +2466,6 @@ fn run_resumed_records_identical_runner_identity() {
     );
 }
 
-/// A `run_resumed` whose runner differs from `run_started`'s is refused **on
-/// replay**, not merely at the point it would be written.
-///
-/// The forged line is appended straight through the Event funnel, which is
-/// exactly what a hand-edited log or a hostile process would produce: the fold
-/// never saw it. So the refusal has to come from the reader, and it does — the
-/// barrier's checked replay refuses the whole prefix, which is what stops a
-/// forged identity from authorizing anything.
 #[test]
 fn forged_run_resumed_with_different_runner_identity_refused_on_replay() {
     let fixture = Fixture::healthy("forged-runner");
@@ -3176,7 +2498,6 @@ fn forged_run_resumed_with_different_runner_identity_refused_on_replay() {
         "the refusal names which field moved: {error}"
     );
 
-    // And a resume over that prefix refuses at the barrier, before anything.
     let harness = harness();
     let runtime = runtime_holding_the_record();
     let certifies = AlwaysCertifies;
@@ -3189,21 +2510,6 @@ fn forged_run_resumed_with_different_runner_identity_refused_on_replay() {
     );
 }
 
-/// An append that returns an error ends the command, and the **next** resume
-/// establishes the barrier over whichever prefix survived and continues from
-/// it.
-///
-/// The injection is at `Synced`, which is the case where the line is on disk
-/// and the process cannot tell whether it is durable. `append_error_protocol`:
-/// "the event is outcome-unknown; `apply_delta` is not run and the in-memory
-/// fold is marked poisoned … the append is never retried … the run is
-/// NoRunFinished and resumable and the next resume follows the fault row of the
-/// surviving prefix (T-APPEND) only after its own barrier".
-///
-/// So: the first resume fails with the line present, and the second resume sees
-/// a prefix ending in `run_resumed` and opens the epoch after it. Two
-/// `run_resumed` lines is the correct convergence for the after-append order,
-/// not a duplicate.
 #[test]
 fn resume_after_append_error_follows_surviving_prefix() {
     let fixture = Fixture::healthy("append-error");
@@ -3228,13 +2534,6 @@ fn resume_after_append_error_follows_surviving_prefix() {
         text.contains(crate::events::log::INJECTED_PREFIX),
         "the error is the funnel's own: {text}"
     );
-    // **The append is never retried.** A second attempt through the same handle
-    // would come back as the *poison* error rather than the injected one — the
-    // funnel poisons the handle at the point that failed — so the error the
-    // command ends with is what tells a retry from an end. `INJECTED_PREFIX`
-    // present and `POISONED_PREFIX` absent is that distinction, and it is the
-    // only observable one: a retry cannot succeed through a poisoned handle, so
-    // the line count is the same either way.
     assert!(
         !text.contains(crate::events::log::POISONED_PREFIX),
         "the command ended at the errored append; it did not attempt a second one: {text}"
@@ -3246,13 +2545,6 @@ fn resume_after_append_error_follows_surviving_prefix() {
         "the line is durable — this is the after-append order of T-APPEND (e-s)"
     );
 
-    // **The protocol ran, and its report is what the command ends with.**
-    // Everything above this point is true of a build that merely poisoned the
-    // fold and returned the funnel's error, which is why none of it can stand
-    // for `append_error_protocol`. Obligation (5) is the observable one: reopen
-    // through `Event.OpenLog` (torn-tail normalization), establish the
-    // stable-prefix barrier, and end "naming the run id, the event kind, and
-    // whether the proven prefix contains the line".
     assert!(text.contains(RUN_ID), "the report names the run: {text}");
     assert!(
         text.contains("run_resumed"),
@@ -3297,8 +2589,6 @@ fn resume_after_append_error_follows_surviving_prefix() {
     );
     drop(seen);
 
-    // The next resume: a fresh harness, nothing armed, and it follows the
-    // surviving prefix.
     let second = harness();
     let runtime = runtime_holding_the_record();
     let given = Given::healthy(&fixture, &runtime, &certifies);
@@ -3314,22 +2604,6 @@ fn resume_after_append_error_follows_surviving_prefix() {
     );
 }
 
-/// An outcome-unknown append during recovery cancels the provisional
-/// reservation and every still-running invocation.
-///
-/// `append_error_protocol` obligations (2) and (3):
-/// [`Reservations::cancel_any`] — `permits`: "cancellation on any pre-append
-/// failure, run end, shutdown, or a poisoned fold" — and
-/// [`InvocationLedger::cancel_all_running`], the ledger half of "in-flight
-/// invocations are cancelled through the Runner".
-///
-/// The recovery order's own ledgers are empty, so on that path both obligations
-/// are satisfied vacuously and no test of `resume` could tell a build that ran
-/// them from one that did not. So this test hands the emitter ledgers that are
-/// **not** empty — one held reservation, one registered running invocation —
-/// which is exactly why they are `EmitContext` fields rather than locals inside
-/// the recovery order. Both ledgers balance afterwards: every entry settled
-/// exactly once, which is the process-end condition R4 states.
 #[test]
 fn an_append_error_during_recovery_cancels_the_reservation_and_every_running_invocation() {
     let fixture = Fixture::healthy("append-error-ledgers");
@@ -3405,11 +2679,6 @@ fn an_append_error_during_recovery_cancels_the_reservation_and_every_running_inv
     );
 }
 
-// ===========================================================================
-// (c) — the RunnerPreflight probes
-// ===========================================================================
-
-/// The real pre-flight, over a runner that answers every process.
 fn real_preflight<'a>(
     runner: &'a dyn Runner,
     adapters: &'a StubAdapters,
@@ -3424,13 +2693,6 @@ fn real_preflight<'a>(
     )
 }
 
-/// A failing shell, and a failing agent CLI, each refuse **before any recovery
-/// event**.
-///
-/// Two cases and not one, because they are two different processes with two
-/// different accountings: the shell probe is non-slotted and the agent probe
-/// takes a slot pair. A build that refused correctly on one could hold a slot
-/// forever on the other, so both assert the ledgers as well as the refusal.
 #[test]
 fn resume_refuses_by_preflight_probe_when_shell_or_cli_fails_before_any_recovery_event() {
     for (tag, program, expected) in [
@@ -3468,10 +2730,6 @@ fn resume_refuses_by_preflight_probe_when_shell_or_cli_fails_before_any_recovery
              {:?}",
             preflight.running()
         );
-        // The shell probe fails first, so the agent CLI is never asked. That is
-        // the sequence `runner` states — "probes execute through it
-        // sequentially at pre-flight" — and it is what makes the shell the
-        // cheaper refusal.
         let programs: Vec<String> = runner
             .requests()
             .into_iter()
@@ -3493,15 +2751,6 @@ fn resume_refuses_by_preflight_probe_when_shell_or_cli_fails_before_any_recovery
     }
 }
 
-/// Every process-local ledger is empty after a resume, and the shell probe took
-/// no slot while the agent probe did.
-///
-/// `crash_reconstruction` requires "provisional reservations, slot table,
-/// invocation ledger, and the coordinator's own lock holds are empty at process
-/// start", and the resume path is what has to leave them that way. The
-/// asymmetry is asserted from the recorded requests rather than from the
-/// ledger's totals, because "one slot was taken" is true of a build that took
-/// it for the wrong process.
 #[test]
 fn ledgers_empty_after_resume() {
     let fixture = Fixture::healthy("ledgers-empty");
@@ -3539,23 +2788,11 @@ fn ledgers_empty_after_resume() {
         vec![("bash".to_owned(), false), ("claude".to_owned(), true)],
         "the shell probe is non-slotted and the agent probe is slotted"
     );
-    // And the process-local ledgers a fresh coordinator starts with are empty
-    // by construction, which is the other half of the row.
     assert!(crate::engine::topology::identity::Reservations::new().is_empty());
     assert!(crate::engine::topology::identity::SlotAssertion::new().is_empty());
     assert!(crate::engine::topology::identity::InvocationLedger::new().balances());
 }
 
-/// A `Runner` that gives every probe a real container through the container
-/// funnel, and releases it on both paths.
-///
-/// This is the shape `ContainerRunner::run` has — `launch` then `release`,
-/// with the release running whether or not the invocation succeeded — driven
-/// against the fake runtime so a test can read what survived. Built here rather
-/// than reused because `ContainerRunner` owns its runtime by value and hands
-/// back no way to inspect it, and because the four effectful `ContainerRuntime`
-/// methods are on the effect denylist for every module but the funnel — so a
-/// delegating wrapper around the fake is not something this module may write.
 struct ProbeContainerRunner<'a> {
     runtime: &'a dyn ContainerRuntime,
     private_root: PathBuf,
@@ -3563,7 +2800,6 @@ struct ProbeContainerRunner<'a> {
     repo_key: String,
     incarnation: String,
     policy_digest: String,
-    /// The program whose container exits non-zero.
     failing: String,
 }
 
@@ -3620,8 +2856,6 @@ impl Runner for ProbeContainerRunner<'_> {
         } else {
             0
         };
-        // Released on both paths: R26 is "released on complete …, cancel, or
-        // shutdown" and R19's view is "pruned on complete or cancel".
         release(
             &mut hooks,
             self.runtime,
@@ -3640,14 +2874,6 @@ impl Runner for ProbeContainerRunner<'_> {
     }
 }
 
-/// After a pre-flight refusal, the probe containers are reclaimed: no
-/// container, no intent, no Git view survives.
-///
-/// `expected_failures_refusals[2]` ends "…refuses before any recovery event or
-/// work spawn, **the probe containers reclaimed**", and R19/R26 both say
-/// "pruned/released on complete **or cancel**". A refusal is a cancel, so the
-/// namespace has to be empty afterwards — otherwise the next write command's
-/// census finds residue from a command that never started.
 #[test]
 fn resume_preflight_probe_containers_reclaimed_after_refusal() {
     let fixture = Fixture::healthy("probe-reclaim");
@@ -3694,16 +2920,6 @@ fn resume_preflight_probe_containers_reclaimed_after_refusal() {
     );
 }
 
-// ===========================================================================
-// T-RUNSTART's P7/P8 repair
-// ===========================================================================
-
-/// The `Ref.CreateIntegration` funnel's `Before` count, which is what "the
-/// funnel was entered" means everywhere below.
-///
-/// Counted rather than tested for presence: "no spend repeats" is a claim about
-/// *how many times* the effect ran, and `touched` would be green for a build
-/// that created the ref, then created it again.
 fn create_ref_entries(harness: &Arc<Mutex<HookHarness>>) -> u32 {
     harness
         .lock()
@@ -3714,30 +2930,6 @@ fn create_ref_entries(harness: &Arc<Mutex<HookHarness>>) -> u32 {
         )
 }
 
-/// `transaction_fault_matrix[T-RUNSTART].resume_action`, first clause:
-/// "**P7/P8: create the ref zero-old at the recorded base if absent**".
-///
-/// The fixture *is* the prefix a kill between P6 and P8 leaves —
-/// `run_started(4)` durable, `committed.json` naming its digest, the creator's
-/// `.creating` still on disk because P7 never ran — and the ref namespace is
-/// empty. A resume over it must leave the ref there.
-///
-/// # What this asserts that calling the function could not
-///
-/// This test used to live in `create::tests` and called
-/// [`super::super::create::ensure_integration_ref`] directly with two literals.
-/// That proved the *function* creates a ref, which was never in doubt. Driving
-/// [`run_recovery_order`] proves the three things that actually were:
-///
-/// 1. **that the recovery order calls it at all** — its only production caller
-///    used to be P8, so a run killed between P6 and P8 resumed with no ref and
-///    nothing to create one;
-/// 2. **with the recorded arguments** — asserted against
-///    `fixture.started.integration_ref` and `fixture.started.base_sha` rather
-///    than against constants, so a resume that published today's configured ref
-///    name, or the fold's current head, fails here;
-/// 3. **at a point before any recovery event** — the funnel snapshots the log
-///    on entry, and the bytes it saw are compared against the committed prefix.
 #[test]
 fn kill_after_run_started_creates_integration_ref() {
     let fixture = Fixture::healthy("ref-p78-create");
@@ -3770,10 +2962,6 @@ fn kill_after_run_started_creates_integration_ref() {
         "and the funnel was entered exactly once"
     );
 
-    // The position claim, read off the effect itself rather than off an index:
-    // when `Ref.CreateIntegration` ran, the log was still exactly the prefix
-    // the creator committed — no `attempt_interrupted`, no `generation_closed`,
-    // no `run_resumed`.
     assert_eq!(
         given.refs.log_kinds_at_entries(),
         vec![vec!["run_started".to_owned()]],
@@ -3784,8 +2972,6 @@ fn kill_after_run_started_creates_integration_ref() {
         vec![committed.clone()],
         "the log the funnel saw was not byte-identical to the committed prefix"
     );
-    // And the appends did happen — otherwise the assertion above is green for a
-    // resume that never got as far as (d)–(h) at all.
     let after = fixture.log_bytes();
     assert!(
         after.len() > committed.len()
@@ -3794,21 +2980,8 @@ fn kill_after_run_started_creates_integration_ref() {
     );
 }
 
-/// The second clause: "**if present == base continue (no spend repeats)**".
-///
-/// Two ways in, because they fail differently. A resume that *finds* the ref
-/// already at the recorded base is the ordinary case — some other process, or
-/// an earlier resume, got there first. A **second** resume of the same run is
-/// the idempotence case, and it is the one that would catch a step that
-/// remembered nothing and re-pointed the ref every time.
-///
-/// Both assert the funnel's entry count and not the command's exit status: an
-/// implementation that called `create_zero_old` again would get an `Err` back
-/// from Git ("already exists; zero-old refuses"), and a build that swallowed it
-/// would be green on `result.is_ok()` while having repeated the spend.
 #[test]
 fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {
-    // (1) Already there when the resume arrives.
     {
         let fixture = Fixture::healthy("ref-p78-adopt");
         let harness = harness();
@@ -3837,7 +3010,6 @@ fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {
         );
     }
 
-    // (2) Two resumes of one run: the second adopts what the first created.
     {
         let fixture = Fixture::healthy("ref-p78-twice");
         let runtime = runtime_holding_the_record();
@@ -3873,15 +3045,6 @@ fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {
     }
 }
 
-/// A ref at any other SHA refuses — and refuses **before anything the step
-/// would otherwise have done**.
-///
-/// `ensure_integration_ref`'s third disposition. "It refused" is the weak half
-/// of the claim; the load-bearing half is that the refusal costs nothing:
-/// `Ref.CreateIntegration` is never entered, the ref keeps the target it had,
-/// and the log is byte-identical to the prefix the resume started from. A ref
-/// that already names another commit belongs to something else, and a run is
-/// never made room for by moving it.
 #[test]
 fn a_resume_refuses_an_integration_ref_at_another_sha_before_touching_anything() {
     let fixture = Fixture::healthy("ref-p78-elsewhere");
@@ -3920,15 +3083,6 @@ fn a_resume_refuses_an_integration_ref_at_another_sha_before_touching_anything()
     );
 }
 
-/// A symbolic ref, and a checked-out one, refuse at `assert_publishable` —
-/// before the target is ever read.
-///
-/// Two shapes and not one: they are the two arms of
-/// `WorkspaceManager::assert_publishable`, and `refuse_symbolic` is also the
-/// first statement of `direct_ref_target`, so a symbolic ref has two chances to
-/// be caught and a build that lost the first would still pass a test that only
-/// asserted "it refused". The `direct_target` count is what separates them —
-/// neither shape may reach it.
 #[test]
 fn a_resume_refuses_a_symbolic_or_checked_out_integration_ref() {
     for (tag, shape, expected) in [
@@ -3982,29 +3136,8 @@ fn a_resume_refuses_a_symbolic_or_checked_out_integration_ref() {
     }
 }
 
-/// The step's three lower bounds, each asserted by the refusal that must
-/// precede it: **(b)**, **(c)** and **(f)** all leave the ref untouched.
-///
-/// The bounds are stated in this module's own comment and this is what makes
-/// them checkable rather than asserted in prose:
-///
-/// * **(b)** a Complete or Halted run does not continue, and publishing a
-///   finished run's integration ref is continuing it;
-/// * **(c)** the repository is touched only once the recorded Runner has been
-///   rebuilt and its probes have answered, so a resume that cannot run leaves
-///   the object store as it found it;
-/// * **(f)** an unresolved promotion — and, by the same clause, an unresolved
-///   integration transaction — is a prefix whose integration ref may be
-///   mid-move, and "present == base continue" would adopt one under a
-///   transaction this build cannot resolve. This case is also the first
-///   coverage [`refuse_unimplemented_terminals`] has had.
-///
-/// The fourth bound, "**before (d)**", is not here: it is asserted positively by
-/// [`kill_after_run_started_creates_integration_ref`], which reads the log at
-/// the instant the funnel ran.
 #[test]
 fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
-    // (b): a Halted run.
     {
         let fixture = Fixture::build(
             "ref-p78-after-b",
@@ -4046,7 +3179,6 @@ fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
         assert_eq!(given.refs.target(), None);
     }
 
-    // (c): a shell probe that does not answer.
     {
         let fixture = Fixture::healthy("ref-p78-after-c");
         let harness = harness();
@@ -4069,32 +3201,8 @@ fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
         );
         assert_eq!(given.refs.target(), None);
     }
-
-    // **(f)'s pin-absent refusal is gone with the convergence it guarded.**
-    // This case drove a `Promoting` generation whose prepared pin had vanished,
-    // and asserted that step (f) refuses it before P7/P8 publishes any ref.
-    // Since the 2026-08-27 CONFORM ruling there is no convergence to guard:
-    // `candidate_prepared` is the sole successful settlement and the only thing
-    // that promotes a generation, so a promoting generation carries its own
-    // candidate identity and a pin is no longer what recovery rebuilds from.
-    //
-    // The refusal that still bounds (f) is the integration transaction's, and
-    // `a_resume_refuses_an_integration_ref_at_another_sha_before_touching_anything`
-    // holds that ordering. Removed rather than rewritten around a predicate
-    // that cannot fire — a case asserting a refusal nothing can reach would
-    // pass for the wrong reason.
 }
 
-// ===========================================================================
-// A kill during recovery
-// ===========================================================================
-
-/// The child half of [`kill_during_recovery_repeats_recovery`].
-///
-/// `Injection::Kill` is `std::process::abort()` — a real process death, chosen
-/// so the claim is *what a coordinator that runs no cleanup leaves on disk*.
-/// The `unreachable!` at the end is load-bearing: it is what fails the test if
-/// the injection ever silently stops killing.
 #[test]
 #[ignore = "spawned as a subprocess by kill_during_recovery_repeats_recovery"]
 fn recovery_kill_child() {
@@ -4123,10 +3231,6 @@ fn recovery_kill_child() {
     let certifies = AlwaysCertifies;
     let incarnation = IncarnationId(RESUMER.to_owned());
     let today = container_selection();
-    // The child's ref namespace is process-local and empty, which is what a run
-    // killed before P8 has. The P7/P8 step runs before the first append, so the
-    // child creates it here and then dies at `Event.Append`'s `Written` point —
-    // nothing of it survives, and the parent's assertions are about the disk.
     let refs = RecordingRefs::with_log(
         &rundir::public_dir(&repo_root, RUN_ID).join(rundir::EVENT_LOG),
         RefShape::Direct,
@@ -4136,10 +3240,6 @@ fn recovery_kill_child() {
 
     let root = RootDerived::derive_with(&repo_root, RUN_ID, None, TOPOLOGY_SCHEMA)
         .expect("(a0) derives in the child");
-    // Step (g)'s manager, derived from the root (a0) just computed rather than
-    // from an env var the parent would have to pass: the private root is the
-    // one thing (a0) exists to establish, and taking it from anywhere else
-    // would let the child rebuild worktrees under a root the order refused.
     let manager = crate::workspace_manager::WorkspaceManager::derive(
         &repo_root,
         root.private_root(),
@@ -4173,20 +3273,6 @@ fn recovery_kill_child() {
     unreachable!("the kill must have taken this process");
 }
 
-/// A kill at a recovery event's append leaves the run resumable, and the next
-/// process **repeats the whole order from (a0)**.
-///
-/// `recovery_order` (i): "a kill at any point repeats from (a0)". So the
-/// assertion is not only that a second resume succeeds — it is that the second
-/// process re-derived the root, re-took the locks, re-established the barrier
-/// and re-censused, all of which are (a0), (a) and (a1) running again over a
-/// prefix a dead process left. A build that resumed from a checkpoint would
-/// skip them and still finish.
-///
-/// The child is spawned **through the host Runner**, not through
-/// `std::process::Command`: `std::process::Command` is on the effect denylist
-/// and `src/engine/topology/**` may not reach it even in tests. The Runner is
-/// the funnel that owns `Process.Spawn`, which is exactly the rule.
 #[test]
 fn kill_during_recovery_repeats_recovery() {
     let fixture = Fixture::healthy("kill-recovery");
@@ -4230,13 +3316,6 @@ fn kill_during_recovery_repeats_recovery() {
         Some(0),
         "the child must have died rather than finished: {output:?}"
     );
-    // **Died, rather than failed.** `Injection::Kill` is `std::process::abort()`,
-    // which takes the process before the test harness can print anything about
-    // the test — so an aborted child emits no result line at all. A child whose
-    // injection silently stopped killing reaches the `unreachable!`, panics, and
-    // the harness prints both its message and a result line. Asserting only a
-    // non-zero exit cannot tell those apart, because a failed test is also
-    // non-zero; this is what makes the `unreachable!` load-bearing.
     assert!(
         !output.stdout.contains("test result:"),
         "the child printed a test result, so it finished rather than dying: {}",
@@ -4250,23 +3329,12 @@ fn kill_during_recovery_repeats_recovery() {
         output.stdout
     );
 
-    // What the dead coordinator left: the line it was writing, unsynced, and no
-    // cleanup of any kind.
     let after_kill = fixture.log_bytes();
     assert!(
         after_kill.len() > before.len(),
         "the kill is at `Written`, after the bytes reached the file"
     );
 
-    // And the next process repeats the order from (a0).
-    //
-    // The census's evidence has to be something the *repeat* can act on. The
-    // dead child had already censused before it reached the append it died at,
-    // so this run's stale marker is gone and stays gone: `RunDir.RemoveMarker`
-    // would be absent from a build that repeated the census perfectly. A husk
-    // planted now is the evidence instead — another crashed run, arriving
-    // between the two processes — and it is the stronger one, because reclaiming
-    // it is a census *effect* rather than a repair that finds nothing to do.
     const AFTER_THE_KILL: &str = "01KZTKILL00000000000000004";
     let husk = plant_husk(&fixture, AFTER_THE_KILL, false);
     assert!(husk.private.exists() && husk.public.exists());
@@ -4304,32 +3372,6 @@ fn kill_during_recovery_repeats_recovery() {
     );
 }
 
-// ===========================================================================
-// The chain's one entry point, as a source census
-// ===========================================================================
-
-/// `StablePrefix::into_log_and_fold` is reached from exactly one production region of
-/// the topology engine: [`BarrierHeld::from`].
-///
-/// # Why this is a census and not a visibility
-///
-/// Design v4 §4 makes `BarrierHeld` unforgeable by taking a `StablePrefix` **by
-/// value**, and `StablePrefix`'s only constructor is
-/// `events::log::establish_stable_prefix` — so barrier *evidence* cannot be
-/// manufactured. What it does not close is the other direction:
-/// `StablePrefix::into_log_and_fold` is `pub`, so a topology module could take a
-/// proven prefix apart and hold the append handle and the fold **without**
-/// wrapping them in a `BarrierHeld`, and then everything the chain hangs off —
-/// `ResumeCensused`, and through it every recovery emitter — would be reachable
-/// beside the chain rather than through it.
-///
-/// Narrowing the visibility cannot fix that here. `pub(crate)` does not stop
-/// one topology module reaching another's dependency, and anything tighter than
-/// `pub(in crate::events)` would break `BarrierHeld::from` itself, which *is*
-/// built on `into_parts`. So the claim is the honest one — `BarrierHeld` is the
-/// only route **the topology engine takes** — and this is what makes it a
-/// checkable claim rather than a convention. Same idiom, and same reason, as
-/// `events::log::tests::the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`.
 #[test]
 fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {
     const ENTRY: &str = "into_log_and_fold(";
@@ -4368,65 +3410,16 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            // Only the topology engine is in scope: the funnel that defines
-            // `into_parts` and its own tests are not a second route into the
-            // chain, they are where it lives.
             if !relative.starts_with("engine/topology") {
                 continue;
             }
-            // A file the crate declares as a whole-file test module is test
-            // code in full and has no production half; counting one would
-            // count a fixture as a second route. **Through the crate's own
-            // declarations**, not through the file name: six of the crate's
-            // whole-file test modules are not called `tests.rs`, and one of
-            // those is `engine/topology/scaffold.rs` — inside this very
-            // census's `engine/topology` domain. `PR7-R5-ATT-001`.
             if test_modules.contains(&path) {
                 continue;
             }
             scanned += 1;
             let source = std::fs::read_to_string(&path).expect("a source file");
-            // The production half only. A test that takes a prefix apart is a
-            // fixture, not a path a run can take.
-            //
-            // **`effects::production_code`, not a cut at the first
-            // `#[cfg(test)]`.** The cut was the bug: it fired on the first *raw*
-            // occurrence of the text, comments included, and in
-            // `engine/topology/run.rs` that is **line 83 of 1777** — inside a
-            // doc comment — so this census was scanning 4.7% of the driver, the
-            // single most likely file for a second route to appear in. In
-            // `engine/topology.rs` it was line 39, inside the module doc.
-            //
-            // An earlier repair built the needle with `format!` so that a
-            // mention *in this file* could not cut it. That fixed one instance
-            // of `PR4-CENSUS-COMMENT-ORACLE` and left the class open in every
-            // file this walk reads. `production_code` blanks comments and
-            // string literals and removes each `#[cfg(test)]` **item** in place
-            // rather than truncating, which is the repair the four whole-tree
-            // censuses already have.
-            //
-            // Found by S5 round 2's `seams` lens, and it lands on this slice's
-            // own evidence: the guard was cited as proving that
-            // `StablePrefix::events` did not become a second entry point, and
-            // that check ran against the truncated domain.
             let production = crate::effects::production_code(&source);
             let production = production.as_str();
-            // Calls, not definitions — a definition is not a route.
-            //
-            // The needle used to be the bare `into_parts(`, and at integration
-            // it reported five false routes: three definitions in `startup.rs`
-            // and two calls in `create.rs`, every one of them a typestate
-            // witness of that lane handing back its own fields. The comment
-            // here said the fix was "to rename, not to widen the needle", and
-            // that is what was done: `StablePrefix`'s accessor is
-            // `into_log_and_fold`, a name nothing else in the crate carries,
-            // so the needle now means what it says.
-            // **The control this census did not have.** A zero count from an
-            // empty region is indistinguishable from a zero count from a clean
-            // file, and that is exactly how the truncation hid: the driver's
-            // region was 83 lines of 1777 and its zero looked like a pass. The
-            // four whole-tree censuses each carry this control; this one did
-            // not, which is why the class survived here.
             regions.push((relative.clone(), production.len(), source.len()));
 
             let count = production
@@ -4444,8 +3437,6 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
         scanned >= 4,
         "the walk found only {scanned} topology sources, so its zero counts would prove nothing"
     );
-    // Every region is a real fraction of its file. A tenth is a generous floor
-    // and still an order of magnitude above what the truncation left behind.
     for (file, region, whole) in &regions {
         assert!(
             *region * 10 > *whole,
@@ -4462,23 +3453,6 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
     );
 }
 
-// ---------------------------------------------------------------------------
-// The order's completeness against the packet's own list
-// ---------------------------------------------------------------------------
-
-/// **The recovery order performs every step `recovery_order` names.**
-///
-/// This is the test that did not exist while step (g) did not exist. For the
-/// whole of PR7's implementation and two review rounds, `run_recovery_order`
-/// performed nine of the ten steps it owns, with all 117 named tests passing,
-/// every gate green on three platforms, and its own doc comment claiming
-/// "steps (a) through (h)". Nothing could see it: a mutation catalogue measures
-/// whether existing code is pinned, and **omission has nothing to mutate**.
-///
-/// So the assertion is against [`RecoveryStep::ALL`], which is the packet's
-/// sentence transcribed into a type, and not against a second list written from
-/// the implementation. Two steps are excluded **by name and with a reason**
-/// rather than by being quietly absent — see [`RecoveryStep::performer`].
 #[test]
 fn the_recovery_order_performs_every_step_the_packet_names() {
     let fixture = Fixture::healthy("every-step");
@@ -4495,10 +3469,6 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
         .filter(|step| step.performer() == Performer::ThisOrder)
         .collect();
 
-    // Completeness first, and it is the half this test exists for: every step
-    // the packet gives this order was performed, exactly once. Sorted, so a
-    // step that moved for a stated reason cannot fail the completeness claim —
-    // that is the next assertion's subject and it is a different question.
     let mut performed = recovered.steps.clone();
     performed.sort_unstable();
     let mut expected = owed.clone();
@@ -4517,9 +3487,6 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
         owed.iter().map(|step| step.label()).collect::<Vec<_>>()
     );
 
-    // Then the order, for every step whose position the packet alone decides.
-    // `(f)` is excluded **by a named live clause**, not by being skipped: see
-    // `RecoveryStep::position_override`.
     let packet_order: Vec<RecoveryStep> = owed
         .iter()
         .copied()
@@ -4537,21 +3504,6 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
          must move carries the clause that moves it"
     );
 
-    // And the one that does move, moved for its reason and not by accident:
-    // **(f) had two halves and now has one.** Its refusing half — the
-    // unresolved integration transaction, one of the two things
-    // `checkpoint_refusals` authorises — still runs before any append. Its
-    // converging half, which appended a rebuilt `candidate_prepared` for a
-    // settled-but-unrecorded candidate, is deleted with erratum E6's window:
-    // since the 2026-08-27 CONFORM ruling `Promoting` is set only in the block
-    // that records the candidate, so a `Promoting` generation without one
-    // cannot occur and the walk could only ever have returned nothing.
-    //
-    // What survives at (f) is `finish_promotions`, which still appends —
-    // `T-CAND-REF`'s four-step sequence for candidates that *are* recorded —
-    // so the step keeps its position among the appending steps and is still
-    // what `steps` records here. The ordering this asserts is unchanged; the
-    // reason given for it was not.
     let at = |step: RecoveryStep| {
         recovered
             .steps
@@ -4571,13 +3523,6 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
     );
 }
 
-/// The transcribed list is the packet's list — eleven steps, these labels, in
-/// this order.
-///
-/// The companion to the test above, and it guards the *other* direction. That
-/// one proves the implementation covers [`RecoveryStep::ALL`]; this one proves
-/// `ALL` is still the packet's sentence, because a variant deleted from `ALL`
-/// would make the first test pass by asking for less.
 #[test]
 fn the_transcribed_recovery_steps_are_the_packets_eleven() {
     assert_eq!(
@@ -4601,18 +3546,6 @@ fn the_transcribed_recovery_steps_are_the_packets_eleven() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// (g) — recreate `OpenNoAttempt` worktrees at their bases
-// ---------------------------------------------------------------------------
-
-/// **The step does work, and the work is a worktree at the recorded base.**
-///
-/// The companion to `the_recovery_order_performs_every_step_the_packet_names`,
-/// and it is the half that test cannot give: over a healthy fixture (g) runs
-/// and finds nothing, so "the step ran" and "the step is a no-op" are the same
-/// observation. This fixture leaves the one state (g) exists for — a generation
-/// dispatched and never attempted, which is what a crash between
-/// `task_dispatched` and `attempt_started` leaves.
 #[test]
 fn resume_recreates_an_open_no_attempt_worktree_at_its_base() {
     let fixture = Fixture::build(
@@ -4661,24 +3594,8 @@ fn resume_recreates_an_open_no_attempt_worktree_at_its_base() {
     );
 }
 
-/// A repair generation cannot reach step (g) in this slice, and the reason is
-/// measured rather than asserted.
-///
-/// (g) refuses a generation whose lease is an inherited lineage: `T-DISPATCH`'s
-/// resume action for a repair is to re-run the recorded materialization, whose
-/// source candidate the fold does not retain, and `checkpoint_refusals` gives
-/// repair execution to PR8. That arm is **unreachable here**, and this test
-/// pins both walls that make it so, because "unreachable" written in a comment
-/// is the same sentence as "I did not check".
-///
-/// The wall this test will lose first is the second one: the day a slice admits
-/// repairs, `TaskRegistry::from_plan` starts producing entries with a lineage,
-/// this test fails, and (g)'s arm becomes reachable — which is precisely when
-/// someone should be made to look at it.
 #[test]
 fn a_repair_generation_cannot_reach_step_g_in_this_slice() {
-    // Wall one: the fold refuses an inherited lease on an ordinary task, at the
-    // barrier's checked replay — so the event never becomes fold state at all.
     let repair = {
         let TopologyEventBody::TaskDispatched { mut data } = dispatched() else {
             unreachable!("`dispatched` builds a `TaskDispatched`")
@@ -4711,8 +3628,6 @@ fn a_repair_generation_cannot_reach_step_g_in_this_slice() {
         "and it lands at the barrier, so nothing fold-derived was acted on: {text}"
     );
 
-    // Wall two: and there is no task it *would* be legal on, because this
-    // slice's registry gives every entry `lineage: None`.
     let registry = TaskRegistry::originals_with_agents(
         &fixture.plan,
         &fixture.started.registry_record(),
@@ -4734,18 +3649,6 @@ fn a_repair_generation_cannot_reach_step_g_in_this_slice() {
     );
 }
 
-/// **The recovery order hands its state on rather than dropping it.**
-///
-/// This is the assertion that did not exist while `TopologyRun` did not exist.
-/// `run_resumed` consumed the last witness and returned a two-field summary, so
-/// the append handle `(a1)` had just proved, the fold built from exactly those
-/// bytes, and both locks were destroyed at the end of the order. A loop cannot
-/// be written against a function that ends by throwing the run away — so the
-/// missing driver was not only a missing function, it was a missing *value*.
-///
-/// What is asserted is that the three survive and are the *same* three, not
-/// replacements: the log still appends to the proven prefix, the fold is the
-/// one the barrier replayed, and the locks are still held.
 #[test]
 fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
     let fixture = Fixture::healthy("hand-on");
@@ -4773,9 +3676,6 @@ fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
          disagree with the one the barrier proved"
     );
 
-    // The run lock is still held, which is the property that lets a loop run
-    // at all. Measured by asking for it: a second acquisition must be refused
-    // while the handle is alive.
     let contested = rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID));
     assert!(
         contested.is_err(),
@@ -4783,28 +3683,11 @@ fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
          it would be racing itself"
     );
 
-    // And released when the handle dies, in declaration order.
     drop(handle);
     rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID))
         .expect("dropping the handle releases the run lock");
 }
 
-// ---------------------------------------------------------------------------
-// The driver, taking over from the order
-// ---------------------------------------------------------------------------
-
-/// **`TopologyRun` drives a resumed run, and `Step` finally has a consumer.**
-///
-/// This test lives here rather than beside `run.rs` because the only thing that
-/// produces a real [`RunHandle`] is a real recovery, and the fixture for that
-/// is this file's. Duplicating it there to keep the test adjacent to its
-/// subject would be a second fixture for one state — the duplication shape this
-/// slice has paid for four times.
-///
-/// What it asserts is the seam that did not exist: the order hands the run on,
-/// the driver takes it, and one iteration of `loop` selects a branch and acts.
-/// Before `RunHandle`, there was no value to hand over; before `run.rs`,
-/// nothing outside `select.rs` so much as matched on a `Step`.
 #[test]
 fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
@@ -4831,11 +3714,6 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -4865,10 +3743,6 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         .step(&seams, &mut hooks)
         .expect("the branch performs its first four clauses");
 
-    // **The driver ran an attempt.** Named exactly, not with a `matches!` that
-    // would pass whichever branch the fixture happened to reach — a fixture
-    // that silently started reaching a different one would take the assertion
-    // with it.
     let Progress::Settled {
         key,
         accepted,
@@ -4879,27 +3753,12 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     };
     assert_eq!(key, TaskKey(0));
 
-    // **Not accepted, and the reason is the contract's.** This fixture's runner
-    // answers every request with `exit 0` and never touches the worktree, so
-    // the capture's tree is the base's and the diff is empty.
-    // `pr_sequence[8].slice_contract.expected_failures_refusals` names
-    // "empty-diff and unresolved-index attempt failures" as this slice's, and
-    // this is the driver reaching one.
-    //
-    // It asserted `accepted` before the ladder's cheap rungs were wired, and
-    // passed: `judge` starts at gates, the plan configures none, and nothing
-    // had asked what the diff contained. A driver that accepted this would have
-    // pinned a candidate whose commit is its own parent.
     assert!(
         !accepted,
         "a worker that edited nothing was judged acceptable, which means the \
          cheap rungs of the verification ladder did not run"
     );
 
-    // The dispatch AND the attempt are real and durable, in that order. Both
-    // went through the production emitter, which is what makes them subject to
-    // the append-error protocol; the scaffold's emitter re-implements the
-    // append and runs none of it.
     assert_eq!(
         durable_kinds(&fixture),
         {
@@ -4912,34 +3771,17 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         "the whole branch, in order: the dispatch, the attempt, the settlement"
     );
 
-    // **The allowance, from `ladder::spends_allowance` and nowhere else.** An
-    // empty diff spends: the line is "the worker ran", not "a verdict was
-    // reached". The settlement carries the answer out of the branch because it
-    // is the input the *next* ladder decision reads.
     assert!(
         spent_attempt,
         "an attempt whose worker ran and produced a diff to judge did not spend \
          one of its rung's attempts"
     );
 
-    // **The worker ran through the Runner**, which is what makes this the
-    // fourth clause rather than a plan that was built and dropped. The whole
-    // point of the driver is that something calls the machinery.
     assert!(
         !runner.requests().is_empty(),
         "the attempt appended `attempt_started` and never spawned anything"
     );
 
-    // **The recorded region is the fold's, not a second derivation.**
-    // `dispatch_lease_check` admits this task by computing the region and
-    // asking the lease table what it overlaps; the log then holds whatever the
-    // dispatch recorded, and the lease table keeps the log's. Two derivations
-    // means the fold admits on one answer and the run is protected by another.
-    //
-    // The fixture's hint is a glob (`src/alpha/*.rs`), which is what makes this
-    // assertion able to fail: the fold strips it to the literal prefix
-    // `src/alpha`, and a driver taking hints literally would record a prefix
-    // that overlaps nothing. Measured — that shipped, for one commit.
     let recorded = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -4959,9 +3801,6 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
          would agree with whichever derivation this test happened to use"
     );
 
-    // And the provisional reservation did not leak. O24 converts it AT the
-    // append; a refusal after that must not leave an entitlement held, or the
-    // next selection at width 1 sees a full pipeline forever.
     assert_eq!(
         run.entitlements_held(),
         0,
@@ -4973,20 +3812,6 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     );
 }
 
-/// **The driver carries an accepted attempt through the whole candidate
-/// sequence.**
-///
-/// The companion to `the_driver_takes_over_from_the_recovery_order_and_steps`,
-/// which is the rejection case: there the fixture's worker edits nothing and
-/// the ladder's cheap rungs stop it at the empty diff. Here it leaves a change
-/// behind, so nothing rejects and the branch runs the sequence
-/// `side_effect_vs_event_ordering` specifies — commit object, pin, settlement,
-/// `candidate_prepared`, candidates ref, `task_candidate_created`, then the pin
-/// prune and the forced scrub.
-///
-/// Two tests rather than one parameterised over a flag: the two paths append
-/// different events in different orders, and a grid would assert the union of
-/// them.
 #[test]
 fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
@@ -5013,11 +3838,6 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -5057,16 +3877,6 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
      so nothing could reject it"
     );
 
-    // **The settlement *is* `candidate_prepared`, so there are six events and
-    // not seven.** This comment required an `attempt_finished` between the pin
-    // and `candidate_prepared`, on the deleted settle_succeeded's own note that
-    // INV-07
-    // was "about which event records the candidate, not about which event
-    // settles the attempt". That reading is wrong and
-    // `decisions/2026-08-12-merge-queue-execution-topology.md` had already
-    // answered it: `attempt_finished` "is not also emitted for that attempt".
-    // Ruled CONFORM 2026-08-27, and the count below is the assertion — a build
-    // that re-introduced the pair puts a seventh kind back here.
     assert_eq!(
         durable_kinds(&fixture),
         {
@@ -5080,21 +3890,6 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
         "the whole branch, in the order the packet specifies"
     );
 
-    // -----------------------------------------------------------------------
-    // **The same clause over the EFFECTS, not only the events.**
-    //
-    // `side_effect_vs_event_ordering`: "commit object (R27) before pin
-    // (IdUnread between); **pin before `candidate_prepared`**; **candidates ref
-    // after `candidate_prepared`** and before `task_candidate_created`". The
-    // event list above cannot see any of that — it holds no refs and no objects.
-    //
-    // `candidate::tests::pin_pruned_after_promotion` asserts exactly this, over
-    // `candidate::promote`. The driver assembles the same steps from the three
-    // split halves, and **no ordering assertion reached that composition**:
-    // four `PR7-PIPELINE-*` catalogue mutations that reorder it — the pin moved
-    // after `candidate_prepared`, the candidates ref moved before it, the commit
-    // object moved to just after capture, the pin created before `commit-tree` —
-    // were all green. One rule, two production compositions, one witness.
     assert_eq!(
         hooks.timeline.order(&[
             EffectSiteId::Object(ObjectSite::CandidateCommitTree),
@@ -5105,47 +3900,20 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
             EffectSiteId::Worktree(WorktreeSite::Remove),
         ]),
         vec![
-            // task_dispatched and attempt_started: the branch's own prologue,
-            // which this fixture drives in the same step.
             "Event.Append".to_owned(),
             "Event.Append".to_owned(),
             "Object.CandidateCommitTree".to_owned(),
             "Ref.PinCandidatePrepared".to_owned(),
-            // **candidate_prepared — one append here, not two.** This list
-            // carried an `attempt_finished(succeeded)` above it; that event is
-            // not emitted for a candidate-producing attempt
-            // (`decisions/2026-08-12-merge-queue-execution-topology.md`, ruled
-            // CONFORM 2026-08-27), and the fold now refuses it. The count is
-            // part of the ordering claim.
             "Event.Append".to_owned(),
             "Ref.CreateCandidates".to_owned(),
-            // task_candidate_created.
             "Event.Append".to_owned(),
             "Ref.DeleteCandidatePin".to_owned(),
-            // O31's scrub, which `PR7-PIPELINE-029` moved to immediately after
-            // `candidate_prepared` — three appends too early — and was green.
             "Worktree.Remove".to_owned(),
         ],
         "the driver's candidate sequence, as one observed order over both families"
     );
 }
 
-/// **A run's spend is the same live as it is on replay.**
-///
-/// The ground-truth invariant, pinned as a property rather than as a count. The
-/// ceiling reads `Spend`; a live process keeps it current as it settles, and
-/// every fresh process rebuilds it with `Spend::replay` from the log. If those
-/// two disagree, a resumed run either refuses work it could afford or buys work
-/// it could not, and neither shows up as a wrong number anywhere — it shows up
-/// as a run that behaves differently after a restart.
-///
-/// **Why this class, not this instance.** Both `attempt_finished` and
-/// `candidate_prepared` carry an `AttemptRecord`, and for a successful attempt
-/// the driver appends both. `Spend::replay` counted each occurrence, so replay
-/// priced every success twice while live priced it once. Asserting a corrected
-/// number would have fixed the instance; asserting **live == replay over the
-/// run's own log** kills the class, including the next event kind that carries
-/// a record.
 #[test]
 fn a_runs_spend_is_the_same_live_as_on_replay() {
     use crate::engine::topology::run::{RunSeams, TopologyRun};
@@ -5172,11 +3940,6 @@ fn a_runs_spend_is_the_same_live_as_on_replay() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -5204,10 +3967,8 @@ fn a_runs_spend_is_the_same_live_as_on_replay() {
     run.step(&seams, &mut hooks)
         .expect("the accepted attempt runs the candidate sequence");
 
-    // What the process believes it has spent, after settling one success.
     let live = run.spend().run_total();
 
-    // What any fresh process would believe, from the same bytes.
     let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
     let replayed = Spend::replay(&events).run_total();
 
@@ -5224,31 +3985,11 @@ fn a_runs_spend_is_the_same_live_as_on_replay() {
     );
 }
 
-/// **The driver settles an outage from the fold's deferral count.**
-///
-/// The witness that closes the mutation named in `deferrals_recorded`'s own
-/// doc. The fold-level witness
-/// (`fold::tests::a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally`)
-/// covers the *accumulation*; this covers the **read**, which is load-bearing
-/// on exactly one branch and so needed a fixture that reaches it.
-///
-/// The chain is the one the ladder specifies: an agent whose CLI reports a rate
-/// limit -> `evaluate_outcome` maps it to `FailureKind::RateLimited` ->
-/// `is_outage` recognises it -> `next_step` defers rather than blaming the
-/// implementer -> `settle_failed` records `Deferred`.
-///
-/// **The prior deferral is what makes the read load-bearing.** The fixture's
-/// log already holds one, so the settlement must record `defers: 2`. Without
-/// it, a driver reading a constant zero would record `1` and be
-/// indistinguishable from a correct one — which is precisely why the mutation
-/// survived before this test existed.
 #[test]
 fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    // One deferral already in the log, and the resume wakes the task back to
-    // `Pending` so the driver can dispatch it again.
     let fixture = Fixture::build(
         "driver-outage",
         Damage {
@@ -5289,11 +4030,6 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -5335,17 +4071,12 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         "a rate-limited worker produced nothing to accept"
     );
 
-    // **An outage spends no allowance.** `next_step` defers precisely so that
-    // "retrying would burn attempts on a run that never got a verdict" does not
-    // happen, and `spends_allowance` prices it the same way.
     assert!(
         !spent_attempt,
         "an outage spent one of the rung's attempts, which is the cell \
          `ladder::spends_allowance` exists to get right"
     );
 
-    // **The count came from the fold**, not from a tally this process kept.
-    // One deferral was already durable, so the settlement records two.
     let settlements: Vec<u32> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -5368,20 +4099,6 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
     );
 }
 
-/// **The driver parks an attempt, and the question it raises is durable.**
-///
-/// The last case of the ready-dispatch branch. An agent that stops and asks has
-/// not failed at anything — `evaluate_outcome` reads `UPSTROKE-QUESTION:` out
-/// of the outcome before the evidence rules, precisely so that an agent is not
-/// punished for the empty diff its own question explains — so the chain is
-/// `NeedsHuman` -> `Next::AskHuman(Clarify)` -> a parking settlement.
-///
-/// **`settle_failed` refuses a park that carries no question**, so reaching a
-/// durable settlement at all is half the assertion. The other half is that the
-/// question is the one the legacy engine would have asked: its context comes
-/// from `coordinator::question_context` and its options from
-/// `coordinator::question_options`, and this test reads both back out of the
-/// log rather than out of the builder.
 #[test]
 fn the_driver_parks_an_attempt_with_the_question_it_raised() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
@@ -5408,11 +4125,6 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -5452,17 +4164,12 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
         "an agent that asked a question produced no verdict"
     );
 
-    // **A park spends no allowance.** "The code was never judged, so nothing is
-    // spent and nothing escalates" — `next_step`'s own words, and the cell that
-    // was wrong when the settlement derived the allowance from `Next` instead
-    // of from the failure.
     assert!(
         !spent_attempt,
         "a park spent one of the rung's attempts, which is the cell the \
          allowance fix exists for"
     );
 
-    // The settlement is durable and carries its question.
     let parked = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -5482,10 +4189,6 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
     assert_eq!(parked.key, TaskKey(0));
     assert_eq!(parked.kind, crate::ir::QuestionKind::Clarify);
 
-    // **The words are the legacy authorities', not the driver's.** The context
-    // quotes the agent as data and names the task; the options are what
-    // `question_options` gives a `Clarify`. A driver that worded its own would
-    // pass every assertion above and fail these.
     assert!(
         parked.context.contains("stopped and asked for a decision"),
         "the context is not `question_context`'s: {}",
@@ -5506,18 +4209,6 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
     );
 }
 
-/// **The driver refuses a tree whose bytes a gate would not see.**
-///
-/// The ladder's third cheap rung, and the one that was owed longest.
-/// `Workspace::review_input_problem_for_tree` refuses staged evidence a
-/// clean/smudge filter has transformed, or a worktree still holding unstaged or
-/// dirty nested state — either makes the reviewed diff describe something other
-/// than what the gates run against.
-///
-/// The worker here leaves a real edit **and** a `.gitattributes` naming a
-/// filter, so the diff is non-empty (the first two rungs pass) and the tree is
-/// still unreviewable. Without this rung the attempt would be accepted and a
-/// candidate pinned from a transformed blob.
 #[test]
 fn the_driver_refuses_a_tree_a_filter_has_transformed() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
@@ -5544,11 +4235,6 @@ fn the_driver_refuses_a_tree_a_filter_has_transformed() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -5586,10 +4272,6 @@ fn the_driver_refuses_a_tree_a_filter_has_transformed() {
          cheap rung did not run"
     );
 
-    // **The refusal is the policy's own words, attributed to the reviewer.**
-    // `classify::review_input_failure` is the one place that decides what an
-    // unreviewable tree means for the attempt, and the message is
-    // `Workspace`'s, not a driver paraphrase.
     let failure = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -5608,33 +4290,11 @@ fn the_driver_refuses_a_tree_a_filter_has_transformed() {
     );
 }
 
-/// **The retaining incarnation takes its next attempt in place.**
-///
-/// The ready-retry branch, end to end and in two iterations of the loop.
-///
-/// The first settles `Retained`: the agent reports its own error, which is
-/// neither an outage nor a question, so `next_step` retries on the same rung —
-/// and `resume: true`, because pre-flight probed the agent as
-/// `session_resume` and the attempt returned a session. **Both halves are
-/// required**, which is why the caps are given here and were empty everywhere
-/// else: with either missing the generation closes and the task retries from a
-/// fresh one instead.
-///
-/// The second is the retry itself: `{pipeline}` reservation, `Worktree.Verify`
-/// against the retained tree, `attempt_started(retry)` carrying the session,
-/// then the attempt and its settlement.
-///
-/// `Quiescence::HoldsTree` is the reason this needs a real worktree: a retry
-/// verified against the base would pass on a tree that had been reset and would
-/// re-gate an empty one as if it were the retained work.
 #[test]
 fn the_retaining_incarnation_retries_in_place() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    /// The pool this fixture's agent resolves to. Named rather than empty so
-    /// that "took the pool from the authority" and "took nothing" are different
-    /// observations.
     const RETRY_POOL: &str = "the-retrying-agents-pool";
 
     let fixture = Fixture::healthy("driver-retries");
@@ -5670,18 +4330,6 @@ fn the_retaining_incarnation_retries_in_place() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
-    // **A pool the implementer's agent resolves to**, because the two
-    // `attempt_started` appends below are asserted to carry it. With `pools:
-    // &[]` — what this fixture had — `AttemptPlans::pool_for` returns `None`
-    // for every agent, so the retry arm's `pool: None` and its repair are
-    // indistinguishable, and `run.rs` passing a literal `None` left the whole
-    // suite green. Measured, twice: once as `R3-SEAMS-001` and once when round
-    // 4 restored the literal.
     let pools = vec![crate::capacity::Pool::discovered(
         RETRY_POOL,
         crate::capacity::PoolKind::SubscriptionWindow,
@@ -5720,8 +4368,6 @@ fn the_retaining_incarnation_retries_in_place() {
     };
     assert!(!accepted, "an agent error is not an acceptable attempt");
 
-    // The generation is retained, not closed: only a retained one is retried in
-    // place, and `settle::retry` refuses any other class by name.
     let retained = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -5744,19 +4390,6 @@ fn the_retaining_incarnation_retries_in_place() {
     };
     assert_eq!(key, TaskKey(0));
 
-    // **Two attempts in one generation, the second resuming the first.** A
-    // driver that opened a fresh generation would append `task_dispatched`
-    // again; a driver that lost the session would append `attempt_started`
-    // with none.
-    //
-    // **And the pool each attempt drained**, which is the field `R3-SEAMS-001`
-    // was about and the one no test held. The dispatch arm reads `plan.pool`;
-    // the retry arm appends before its plan exists and takes the same answer
-    // from `AttemptPlans::pool_for` one step earlier. Both are asserted here, in
-    // one run, against the pool the assembler actually resolves — which is the
-    // behavioural witness `79cd9c8` said was unavailable because "no driver
-    // fixture can reach the arm". This fixture reaches it, and reached it then.
-    // `reviews/FINDINGS.md` §19, claims (2) and (3).
     let starts: Vec<(u32, bool, Option<String>)> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -5788,10 +4421,6 @@ fn the_retaining_incarnation_retries_in_place() {
         "the retry opened a fresh generation instead of continuing the retained one"
     );
 
-    // **And told what went wrong.** §11.4 sends the failure back to the same
-    // rung; the plan hard-coded `retry: None`, so the second attempt got the
-    // first attempt's prompt verbatim and no reason to behave differently. A
-    // retry that is not informed is a rung's allowance spent to learn nothing.
     let briefed = runner
         .requests()
         .iter()
@@ -5810,21 +4439,12 @@ fn the_retaining_incarnation_retries_in_place() {
          attempt's failure, and it is the second"
     );
 
-    // Balance, which says every registration was settled. It does **not** say
-    // the reviewers were registered — an empty ledger balances too — so R4's
-    // review coverage is asserted where reviewers actually run, in
-    // `attempt::tests`.
     assert!(
         run.invocations_balance(),
         "the invocation ledger does not balance, so some process was \
          registered and never settled"
     );
 
-    // **The worker was actually told to resume.** The event records that a
-    // session was retained; this records that the command carried it. They are
-    // different claims, and a retry that appended the first without the second
-    // would re-implement the task from scratch on a worktree that already holds
-    // its previous work.
     let resumed = runner
         .requests()
         .iter()
@@ -5838,22 +4458,6 @@ fn the_retaining_incarnation_retries_in_place() {
     );
 }
 
-/// **A step that refused holds no entitlement afterwards.**
-///
-/// `permits.protocol` is "every Runner process registered exactly once, settled
-/// exactly once", and `append_error_protocol`'s obligation (2) is
-/// `Reservations::cancel_any` on any outcome-unknown path. Three catalogue
-/// entries take an entitlement **before** the step that can refuse and leak it
-/// on the refusing path — `PR7-PIPELINE-014` (the `Dispatch` take moved into the
-/// `Ok` arm), `PR7-SELECT-024` (a `Retry` reservation taken before `select`),
-/// `PR7-SELECT-033` (an `Integration` pair taken before `checkpoint` refuses) —
-/// and all three were green, because nothing asked the ledger anything after a
-/// refusal.
-///
-/// The budget breach is the refusal this drives, because it is the one a fixture
-/// can reach without arming an injection: seed a settled attempt that cost
-/// something, resume, and set a ceiling below it. That the spend is visible at
-/// all is itself new — `Spend::replay` had no production caller until `6d3fc6f`.
 #[test]
 fn a_refused_step_leaves_no_entitlement_held() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
@@ -5884,7 +4488,6 @@ fn a_refused_step_leaves_no_entitlement_held() {
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
     let (_recovered, handle) = outcome.expect("the healthy resume completes");
 
-    // A ceiling the log's own spend has already passed.
     let mut run = TopologyRun::resumed(
         handle,
         fixture.inputs(),
@@ -5947,23 +4550,6 @@ fn a_refused_step_leaves_no_entitlement_held() {
     );
 }
 
-/// **A retried worker is told what the last one failed on.**
-///
-/// §11.4, quoted on `PlanRequest::feedback` itself: "failure feedback goes back
-/// to the same rung, and an escalation carries the accumulated feedback with
-/// it."
-///
-/// The driver accumulated the brief inside [`Retained`], which `settle::retry`
-/// produces **only** for a resumable same-rung retry that returned a session.
-/// Every escalation and every sessionless retry — which is every Copilot
-/// attempt, `DESIGN.md:452` — therefore dispatched with `feedback: Vec::new()`
-/// and handed the next worker attempt 1's prompt verbatim: a rung's allowance
-/// spent to be told nothing. Found by round 2's `contract`, `seams` and
-/// `attempt` lenses independently.
-///
-/// This drives **two** attempts through the real assembler and asserts on the
-/// second worker's own stdin, because the prompt is the only place the claim is
-/// observable — a brief the driver holds and does not send is the defect.
 #[test]
 fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
     use crate::engine::topology::run::{RunSeams, TopologyRun};
@@ -6020,10 +4606,8 @@ fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
         halts_run: false,
     };
 
-    // Attempt one fails and, with one attempt per rung, escalates onto rung 1.
     run.step(&seams, &mut hooks)
         .expect("the first attempt settles");
-    // Attempt two, on the rung above, from a fresh generation.
     run.step(&seams, &mut hooks)
         .expect("the second attempt settles");
 
@@ -6047,14 +4631,6 @@ fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
         prompts[1]
     );
 
-    // **And the feedback is on the durable record, because this engine has no
-    // other carrier.** The crash-resume witnesses seed a log directly, so they
-    // assert what a resume does with a `detail` that is already there and
-    // cannot tell whether a *live* schema-4 settlement writes one. Nothing did,
-    // until this: `classify::FeedbackCarrier` is a per-caller choice, and
-    // pointing the driver at `LadderEvent` — the legacy answer — left every
-    // test in this file green while making the brief empty again for every run
-    // that actually crashes. Measured 2026-08-26.
     let settled: Vec<serde_json::Value> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -6079,25 +4655,11 @@ fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
     );
 }
 
-/// The order the funnels ran in, for the **driver's** composition of the
-/// candidate sequence.
-///
-/// `candidate.rs` has one of these and it covers `candidate::promote`. The
-/// driver assembles the same four steps from the three split halves
-/// (`create_candidates_ref`, `append_candidate_created`,
-/// `reclaim_after_creation`), and until this existed **no ordering assertion
-/// reached that composition** — the only two `trace.order(` calls in the
-/// topology engine were both in `candidate.rs`. Found by S5 round 2's catalogue:
-/// four `PR7-PIPELINE-*` mutations that reorder the driver's sequence were green,
-/// while `pin_pruned_after_promotion` would have caught every one of them on the
-/// other path.
 #[derive(Clone, Default)]
 struct Timeline(Arc<Mutex<Vec<String>>>);
 
 impl Timeline {
     fn push(&self, site: EffectSiteId, phase: HookPhase) {
-        // `Before` only: one entry per funnel, at the point it begins, which is
-        // what an ordering clause is about.
         if phase != HookPhase::Before {
             return;
         }
@@ -6107,11 +4669,6 @@ impl Timeline {
             .push(site.to_string());
     }
 
-    /// The recorded sequence with everything not `of_interest` dropped.
-    ///
-    /// Filtered rather than compared whole: a driver step also creates an
-    /// execution root, writes an intent and adds a worktree, and an assertion
-    /// over the unfiltered list would be an assertion about the fixture.
     fn order(&self, of_interest: &[EffectSiteId]) -> Vec<String> {
         let names: Vec<String> = of_interest.iter().map(ToString::to_string).collect();
         self.0
@@ -6144,8 +4701,6 @@ impl crate::workspace_manager::EffectHooks for TracedEffects {
         self.inner.durability_ledger()
     }
 
-    // Forwarded, so a poison the inner observer found is reported as poison
-    // and not as a fault this double armed.
     fn refusal_cause(&self) -> Option<String> {
         self.inner.refusal_cause()
     }
@@ -6163,8 +4718,6 @@ impl crate::events::log::EventHooks for TracedEvents {
     }
 }
 
-/// [`HarnessTopologyHooks`] with the two families an ordering clause spans
-/// recorded onto one timeline.
 struct TracedHooks {
     effects: TracedEffects,
     events: TracedEvents,
@@ -6212,32 +4765,11 @@ impl TopologyHooks for TracedHooks {
     }
 }
 
-/// **The driver writes the rung an escalation climbs ONTO, not the one it leaves.**
-///
-/// The **write** side of `PR7-FOLD-LADDER-POSITION`'s class, and the exact
-/// mirror of the read-side gap closed at `6d3fc6f`. That repair witnessed the
-/// driver *reading* `ladder_position`; nothing witnessed the driver *writing*
-/// the escalation target, and `PR7-R3-ESCALATED-RUNG-WRITER-UNPINNED` is what
-/// got through: replacing `rung: position.0.saturating_add(1)` with
-/// `rung: position.0` left the whole suite green.
-///
-/// The consequence of that mutation is not a wrong number in a record. The fold
-/// assigns `task.rung = *rung` and resets the allowance, so the task escalates
-/// onto the rung it is **leaving**, `ready` selects it again, the binding
-/// resolves, and it loops without bound — never reaching the tier its chain
-/// escalated it to and never exhausting the chain.
-///
-/// **Written as the round trip, which is the class boundary.** Asserting the
-/// recorded number alone would pin the write and leave the same gap one step
-/// over. This drives the escalation, reads the durable settlement, and then
-/// drives the *next* attempt and asserts the model it actually ran at — so the
-/// value the driver wrote and the value it later reads are held by one test.
 #[test]
 fn the_driver_escalates_onto_the_rung_above() {
     use crate::engine::topology::run::{RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    // Two tiers, one attempt per rung: the first failure exhausts rung 0.
     let fixture = Fixture::build(
         "driver-escalates",
         Damage {
@@ -6289,7 +4821,6 @@ fn the_driver_escalates_onto_the_rung_above() {
         halts_run: false,
     };
 
-    // Attempt one, on rung 0, fails and exhausts the rung's allowance.
     run.step(&seams, &mut hooks)
         .expect("the first attempt settles");
 
@@ -6316,9 +4847,6 @@ fn the_driver_escalates_onto_the_rung_above() {
          forever — never reaching the tier its chain escalated it to"
     );
 
-    // And the read side, in the same test: the next attempt runs at rung 1's
-    // binding. Pinning the written number alone would leave the same gap one
-    // step over, which is how this class keeps recurring.
     run.step(&seams, &mut hooks)
         .expect("the second attempt settles");
     let ran_at = TopologyFold::parse_log(&fixture.log_bytes())
@@ -6335,19 +4863,6 @@ fn the_driver_escalates_onto_the_rung_above() {
         "the escalated task ran at {ran_at}, which is rung 0's model"
     );
 
-    // **And the third step exhausts the chain, which is where the human is
-    // told a number.** This is the class boundary the frontier review of
-    // `75da796` (finding 3) found unguarded: `park_question` hard-coded
-    // `rungs_spent: 1` and passed *this rung's* attempts as the total, so a
-    // two-rung exhaustion said "1 attempt(s) across 1 rung(s) all failed" when
-    // two attempts across two rungs had. Nothing asserted it — this file's
-    // two-rung test stopped at the escalated model, its count test drove a
-    // single rung, and **no topology test asserted `rung(s)` at all**.
-    //
-    // Asserted here rather than in a fixture of its own because the numbers are
-    // only true of a task that has *actually* climbed: a single-rung fixture
-    // reports 1 and 1 whether the code derives them or hard-codes them, which
-    // is exactly how the constant survived.
     run.step(&seams, &mut hooks)
         .expect("the exhausted chain settles");
     let parked = TopologyFold::parse_log(&fixture.log_bytes())
@@ -6373,32 +4888,11 @@ fn the_driver_escalates_onto_the_rung_above() {
     );
 }
 
-/// **The driver dispatches at the rung the log records, not at rung 0.**
-///
-/// The **other** driver-side half of `PR7-FOLD-LADDER-POSITION`, and the one
-/// that stayed open through the repair filed against it.
-/// `the_driver_spends_the_allowance_the_log_records` witnesses the
-/// `attempts_on_rung` half of the same reader; nothing witnessed `rung`, because
-/// that fixture's chain has one tier and a one-tier chain makes rung 0 the only
-/// rung there is. Measured at `cf22a8c`: replacing the driver's
-/// `self.ladder_position(key)?.0` with a literal `0` failed **no** topology
-/// test.
-///
-/// That is occurrence 4 of `reviews/FINDINGS.md` §4's accumulator class, and the
-/// sharpest argument for its re-scoping: the class was filed *from* this
-/// instance, and half of this instance was still open.
-///
-/// The fold half — `fold::tests::a_ladder_position_is_derived_by_replay_and_not_assumed`
-/// — already states the consequence in words: "A driver that assumed rung 0
-/// would dispatch an escalated task on rung 0 forever, never reaching the tier
-/// its chain escalated it to." This asserts it.
 #[test]
 fn the_driver_dispatches_at_the_rung_the_log_records() {
     use crate::engine::topology::run::{RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    // A two-tier chain, one attempt per rung, and an attempt already escalated
-    // off rung 0 in the durable log. The task is `Pending` on **rung 1**.
     let fixture = Fixture::build(
         "driver-rung",
         Damage {
@@ -6463,9 +4957,6 @@ fn the_driver_dispatches_at_the_rung_the_log_records() {
 
     run.step(&seams, &mut hooks).expect("the attempt settles");
 
-    // **The model the attempt actually ran at.** The rung selects the binding,
-    // and the two tiers of this chain differ by model — so this is the rung,
-    // observed rather than asserted about itself.
     let ran_at = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -6485,38 +4976,11 @@ fn the_driver_dispatches_at_the_rung_the_log_records() {
     );
 }
 
-/// **A crash does not erase what the last attempt was told to fix.**
-///
-/// §11.4's first half: "failure feedback (gate log or `required_changes`) goes
-/// back to the *same rung*". The brief that carries it was a process-local
-/// `BTreeMap` the live loop pushed to, and `TopologyRun::resumed` created it
-/// **empty** — so the sequence the 2026-08-26 frontier review of `75da796` set
-/// out in finding 2 held exactly: attempt 1 fails a gate with an 8-KiB
-/// diagnostic tail, `attempt_finished` is durably appended, the conductor
-/// crashes before the next dispatch, and the retry is handed attempt 1's prompt
-/// verbatim. A rung's allowance spent to be told nothing, and the same defect
-/// free to repeat.
-///
-/// The fixture is that crash: one attempt already settled in the durable log,
-/// carrying the tail, and a chain with a second attempt left on the rung. The
-/// process that wrote it is gone — this run is built by `resumed` from the log
-/// alone, which is the only path a real resume has.
-///
-/// **Asserted on the worker's own stdin**, because the prompt is the only place
-/// the claim is observable: a brief the driver rebuilds and does not send is the
-/// same defect one rung further along. And asserted on the tail's exact text
-/// rather than on the prompt's length — a longer prompt is evidence that
-/// *something* was carried, which is what the live-mode witness
-/// `a_retried_worker_is_told_what_the_last_attempt_failed_on` could say and is
-/// not what §11.4 requires.
 #[test]
 fn a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix() {
-    // §11.1's payload: what the gate printed, not the summary of it.
     const TAIL: &str = "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   \
                         expected `u32`, found `&str`";
 
-    // One tier, `attempts_per = 2`: the retry the log entitles this run to is on
-    // the **same rung**, which is the half of §11.4 this test is about.
     let fixture = Fixture::build(
         "driver-brief-resume",
         Damage {
@@ -6557,27 +5021,6 @@ fn a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix() {
     );
 }
 
-/// **An escalation after a crash carries the accumulated feedback.**
-///
-/// §11.4's second half: "`attempts_per` exhausted → next rung, fresh session,
-/// **accumulated feedback summary included**", and its other named source — the
-/// reviewer's `required_changes`, which §11.2 says the retry gets back verbatim.
-///
-/// Two failures are already durable on rung 0 and the ladder has a rung above,
-/// so the only dispatch this run can make is the escalation. The empty brief a
-/// resume used to rebuild sent it none of them: a fresh, stronger worker on the
-/// same task, given attempt 1's prompt and no reason to do anything different.
-///
-/// **What "accumulated" means here is what `feedback_section` actually sends**,
-/// and this asserts that rather than a stronger reading of the sentence. Every
-/// earlier attempt contributes its summary line; only the newest carries its
-/// full detail, because "older ones would bury it, and the newest is the one
-/// still standing in the way" — the production comment on that decision. So the
-/// claim under test is: both summaries reach the rung above, the newest
-/// reviewer's required changes reach it verbatim, and the accumulated section
-/// exists at all — `feedback_section` writes its header **only** when it is
-/// rendering more than one entry for a fresh rung, so that sentence is the
-/// accumulation itself and not a statement about it.
 #[test]
 fn an_escalation_after_a_crash_carries_the_accumulated_feedback() {
     const FIRST_SUMMARY: &str = "review failed: the parser accepts a trailing comma";
@@ -6602,9 +5045,6 @@ fn an_escalation_after_a_crash_carries_the_accumulated_feedback() {
                         lease: LeaseDisposition::PredictedReleased,
                     },
                 ),
-                // A closed generation cannot take another attempt, so the
-                // second failure is in the generation the retry opened —
-                // which is exactly what a sessionless retry leaves in a log.
                 in_generation(GenerationId(1), dispatched()),
                 in_generation(GenerationId(1), attempt_started(1)),
                 in_generation(
@@ -6658,20 +5098,6 @@ fn an_escalation_after_a_crash_carries_the_accumulated_feedback() {
     );
 }
 
-/// **A log written before the field existed still folds, and still resumes.**
-///
-/// `FailureRecord::detail` is additive and `SCHEMA_VERSION` does not move, which
-/// is a claim about *older logs* rather than about new ones:
-/// `decisions/2026-08-26-durable-retry-feedback.md` argues that a line without
-/// the key reads back as `None`, folds unchanged, and passes schema 4's strict
-/// door — the door being a witness comparison that reports "any key the input
-/// carried that the record did not claim back", so an added output key is not an
-/// unknown input key.
-///
-/// That argument is worth exactly as much as a log that tests it. This deletes
-/// the key from every `attempt_finished` in a real fixture's bytes — the shape a
-/// binary one commit older wrote — and resumes from the result through the
-/// production parse.
 #[test]
 fn a_log_predating_the_detail_field_folds_and_resumes() {
     let fixture = Fixture::build(
@@ -6695,23 +5121,16 @@ fn a_log_predating_the_detail_field_folds_and_resumes() {
         },
     );
 
-    // The older binary's bytes: the same log with the key it never wrote.
     let current = String::from_utf8(fixture.log_bytes()).expect("the log is utf-8");
     let aged: String = current
         .lines()
         .enumerate()
         .map(|(position, line)| {
-            // **The first line is passed through byte for byte.** The commit
-            // record pins its sha256, and a re-serialization that only reorders
-            // keys is enough to make recovery refuse for a reason that has
-            // nothing to do with this field.
             if position == 0 {
                 return format!("{line}\n");
             }
             let mut value: serde_json::Value =
                 serde_json::from_str(line).expect("every log line is a json object");
-            // Nested rather than a let-chain: MSRV is 1.85 and let-chains
-            // are 1.88.
             if let Some(failure) = value.pointer_mut("/data/record/failure") {
                 if let Some(object) = failure.as_object_mut() {
                     object.remove("detail");
@@ -6751,28 +5170,14 @@ fn a_log_predating_the_detail_field_folds_and_resumes() {
          older log folds to a different value than it was written with"
     );
 
-    // And the run it describes still resumes. **What the brief holds for those
-    // attempts is a line per failure carrying its `summary` and no `detail`** —
-    // not an empty brief, which is what this comment used to claim and what the
-    // 2026-08-26 re-review of `c2c0294` corrected as finding C. `Brief::record`
-    // adds an entry whenever the record carries a failure at all, and that is
-    // right: a summary is what an older log preserved, and sending the next
-    // worker "attempt 1 failed: gate `x` failed" beats sending it nothing.
-    // Asserted below rather than described, because a comment about content is
-    // the thing this slice keeps getting wrong.
     let harness = harness();
     let runtime = runtime_holding_the_record();
     let certifies = AlwaysCertifies;
     let given = Given::healthy(&fixture, &runtime, &certifies);
-    // `std::fs::write` is on the effect denylist here; the fixture writer is
-    // the sanctioned way a test plants bytes.
     crate::workspace_manager::fixture::write_file(&fixture.log(), aged.as_bytes());
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
     let (_recovered, handle) = outcome.expect("a run whose log predates the field still resumes");
 
-    // The brief that resume rebuilds from those bytes, asserted rather than
-    // described: one line for the failure the older log recorded, carrying its
-    // summary and no detail.
     let brief = crate::engine::topology::run::Brief::replay(&handle.events);
     let lines = brief.lines(ALPHA);
     assert_eq!(
@@ -6792,15 +5197,6 @@ fn a_log_predating_the_detail_field_folds_and_resumes() {
     );
 }
 
-/// Resume the fixture from its log alone, take one step, and return the
-/// implementer prompts the run actually sent.
-///
-/// The whole apparatus of the driver tests above, factored out because the two
-/// crash-resume witnesses differ only in what their logs already hold and in
-/// what they expect to come back. **Recovery is not stubbed**: this is
-/// `resume_holding` into `TopologyRun::resumed`, the same pair every other
-/// driver test in this file uses, so the brief under test is rebuilt from the
-/// barrier's own parse of the durable bytes.
 fn drive_one_attempt(fixture: &Fixture, runner: &RecordingRunner) -> Vec<String> {
     use crate::engine::topology::run::{RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
@@ -6858,29 +5254,11 @@ fn drive_one_attempt(fixture: &Fixture, runner: &RecordingRunner) -> Vec<String>
         .collect()
 }
 
-/// **The driver spends the allowance the log records, not the one it assumed.**
-///
-/// The driver-level half of `PR7-FOLD-LADDER-POSITION`. The fold half is
-/// `fold::tests::a_ladder_position_is_derived_by_replay_and_not_assumed`; this
-/// is the read, and it needed a fixture that makes the read observable.
-///
-/// This fixture's chain has **one** tier and `attempts_per = 2`, so an
-/// escalation has nowhere to climb and the allowance is the whole ladder. One
-/// attempt is already durable in the log. The driver's next attempt is
-/// therefore the **second** on that rung, which exhausts the allowance, and
-/// `next_step` has no rung to escalate onto — so the task fails terminally.
-///
-/// A driver that assumed `attempts_on_rung: 1` would hand `next_step` the first
-/// attempt of two and get `RetrySameRung` instead: the task would retry
-/// forever, spending a rung's allowance on every restart and never failing.
-/// That is what the constant did before this test existed.
 #[test]
 fn the_driver_spends_the_allowance_the_log_records() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    // One attempt already spent on rung 0, settled as a same-rung retry so the
-    // task returns to `Pending` and this branch selects it again.
     let fixture = Fixture::build(
         "driver-allowance",
         Damage {
@@ -6918,11 +5296,6 @@ fn the_driver_spends_the_allowance_the_log_records() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -6968,11 +5341,6 @@ fn the_driver_spends_the_allowance_the_log_records() {
     let AttemptSettlement::Closed { transition, .. } = last else {
         panic!("the second attempt did not close its generation: {last:?}");
     };
-    // **Parked, not failed** — and that is `next_step`'s answer, not a
-    // weakening of the assertion. A spent chain asks a human rather than
-    // failing the task: "Nothing further can move this task ... and the
-    // escalation chain is spent." What matters here is that the allowance was
-    // seen as spent at all.
     let SettlementTransition::Parked { question } = transition else {
         panic!(
             "the second attempt on a two-attempt rung with nowhere to escalate \
@@ -6981,10 +5349,6 @@ fn the_driver_spends_the_allowance_the_log_records() {
         );
     };
 
-    // **And the human is told how many attempts actually ran.** The count in
-    // the question is the task's spend on this rung, not the new generation's
-    // attempt number — a park that said "1 attempt" after two would send an
-    // operator looking for a run that had barely started.
     assert!(
         question.context.contains("2 attempt(s)"),
         "the question quotes the wrong attempt count: {}",
@@ -6992,28 +5356,11 @@ fn the_driver_spends_the_allowance_the_log_records() {
     );
 }
 
-/// **The loop continues an attempt in a generation recovery recreated.**
-///
-/// `T-DISPATCH`'s `resume_action` in its own words: "verify the worktree at the
-/// recorded base ... or remove it with force and recreate it ... **continue
-/// attempt (no spend repeats)**".
-///
-/// Step (g) recreated those worktrees and nothing then started an attempt in
-/// them. `fold::ready` excludes the task — correctly, since a task with an open
-/// generation is not *ready to be dispatched* — and `ready_retry` wants
-/// `RetainedIdle`, so no branch could select it. The run stalled with its only
-/// pipeline entitlement held by a generation nothing could drive, and the loop
-/// fell through to a closure it refuses.
-///
-/// `fold::open_no_attempt` is the predicate that makes it selectable, and
-/// `resume_open_no_attempt` — which had no production caller — is what reuses
-/// the ground.
 #[test]
 fn the_loop_continues_an_attempt_recovery_recreated() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
-    // Killed after `task_dispatched`, before `attempt_started`.
     let fixture = Fixture::build(
         "continue-open",
         Damage {
@@ -7041,11 +5388,6 @@ fn the_loop_continues_an_attempt_recovery_recreated() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **Through the production assembler, not a fixture plan shape.** The
-    // condition on this extraction was that the scaffold be re-pointed at the
-    // real one or round-tripped against it; a fixture that hand-built an
-    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
-    // precedent warns about.
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
@@ -7085,9 +5427,6 @@ fn the_loop_continues_an_attempt_recovery_recreated() {
     };
     assert_eq!(key, TaskKey(0));
 
-    // **No spend repeats**, in `T-DISPATCH`'s own words: the generation was
-    // already open, so continuing it appends an attempt and never a second
-    // `task_dispatched`.
     let after = durable_kinds(&fixture);
     assert_eq!(
         after.iter().filter(|k| *k == "task_dispatched").count(),
@@ -7104,17 +5443,6 @@ fn the_loop_continues_an_attempt_recovery_recreated() {
     );
 }
 
-/// **A reviewer runs at §10's review effort, not the implementer's.**
-///
-/// `ResolvedEffortPolicy` has four axes and `review` is one of them: the tier a
-/// rung binds decides what the *work* costs, and review has its own budget.
-/// `FrozenPlans` passed `request.binding.effort` — the implementer's — while its
-/// own comment said "the reviewer's effort, not the implementer's". A comment
-/// asserting the opposite of its line is worse than none: it answers the
-/// question a reader would otherwise ask.
-///
-/// This fixture's Mid rung is `High` and its review axis is `Medium`, so the two
-/// are distinguishable. A fixture where they matched would assert nothing.
 #[test]
 fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
     let fixture = Fixture::healthy("review-effort");
@@ -7152,24 +5480,6 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // **The reviewer is bound to a different agent than the implementer, and it
-    // has to be.** The comment here used to say the single pool was "named so
-    // that a plan inheriting the implementer's pool and one looking up the
-    // reviewer's own could not both pass" — and the fixture's primary reviewer
-    // is `(claude-code, opus)` while its rung-0 implementer is
-    // `(claude-code, alpha-Mid-model)`. `review::passes_for` rebinds only on
-    // **exact `(agent, model)` equality**, so it does not fire and the pass
-    // keeps agent `claude-code`: the two lookups were the same lookup, both
-    // behaviours passed, and the mutation recorded as killed died because the
-    // pool became *empty* rather than wrong. `reviews/FINDINGS.md` §19,
-    // claim (8).
-    //
-    // With `REVIEW_AGENT` on the primary and a pool for each agent, inheriting
-    // the implementer's pool yields `the-implementers-pool` and fails.
-    //
-    // Through the scaffold's own constant rather than a literal: it is the
-    // agent that fixture's `alternative` binding already names, so this is the
-    // second agent the run actually probed and not one invented here.
     use crate::engine::topology::scaffold::REVIEW_AGENT;
 
     let mut reviewer_bound = entry.clone();
@@ -7222,8 +5532,6 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
         !plan.reviewers.is_empty(),
         "this fixture plans no reviewer, so the effort below is unasserted"
     );
-    // The implementer's own pool, so the two values in play are distinguishable
-    // and the assertion below is about which one the reviewer got.
     assert_eq!(
         plan.pool.as_deref(),
         Some("the-implementers-pool"),
@@ -7245,17 +5553,6 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
             reviewer.lens.name()
         );
 
-        // **And its own agent's pool**, which is the other cell of
-        // `a_reviewers_profile_is_accounted_for_at_both_callers` whose value the
-        // extraction dropped. That census checks the roll is complete and cannot
-        // check a value — a cell is prose. This is the value.
-        //
-        // §11.3/§13: a cross-vendor second opinion draws on a different
-        // subscription than the implementer, so the pool is looked up from the
-        // reviewer's own agent. `coordinator.rs` did it and `assembly.rs` did
-        // not, leaving `profile_for`'s empty string — so the capacity engine
-        // attributed a reviewer's spend to a pool with no name. Sol's
-        // independent `seams` read, round 3.
         assert_eq!(
             reviewer.profile.pool,
             "the-reviewers-own-pool",
@@ -7267,18 +5564,6 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
     let _ = manager;
 }
 
-/// **The loop inherits the digest recovery verified.**
-///
-/// `committed.json.run_started_sha256` is what step (a) checks the committed
-/// first line against, and the append-error protocol reads it back: the creator
-/// disposition is a projection of the outcome onto the run's *commitment*
-/// boundary, and a run that cannot say whether it is committed cannot report
-/// one.
-///
-/// Recovery's own emitter passes `Some(...)`. `TopologyRun::resumed` passed
-/// `None` — so over one run, the two emitters disagreed about whether it was
-/// committed, and only the loop's appends lost the answer. Nothing observed it
-/// because nothing compared them.
 #[test]
 fn the_loop_inherits_the_committed_digest_recovery_verified() {
     let fixture = Fixture::healthy("digest-inherited");
@@ -7290,9 +5575,6 @@ fn the_loop_inherits_the_committed_digest_recovery_verified() {
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
     let (_recovered, handle) = outcome.expect("the healthy resume completes");
 
-    // Computed independently from the run's own committed first line, rather
-    // than read back from the record the handle came through: a comparison of
-    // the record with itself would pass however the digest was carried.
     let expected = crate::rundir::run_started_sha256(&fixture.first_line);
 
     assert_eq!(
@@ -7305,11 +5587,6 @@ fn the_loop_inherits_the_committed_digest_recovery_verified() {
          record for the comparison to mean anything"
     );
 
-    // **And it survives into the loop's own identity**, which is the hop that
-    // matters: `establish_stable_prefix` skips its check entirely when the
-    // digest is `None`, so a loop that carried the handle's value and then
-    // dropped it would reopen after an append error and accept a first line the
-    // commit record does not name. `PR31-CONTRACT-006`.
     let run = crate::engine::topology::run::TopologyRun::resumed(
         handle,
         fixture.inputs(),
@@ -7322,39 +5599,12 @@ fn the_loop_inherits_the_committed_digest_recovery_verified() {
     );
 }
 
-/// **A prepared pin with no `candidate_prepared` is orphan residue, not a
-/// candidate to reconstruct.**
-///
-/// This replaces three tests —
-/// `a_resume_converges_a_settled_candidate_that_was_never_recorded`,
-/// `a_second_resume_finishes_nothing_and_appends_nothing` and
-/// `a_converged_log_prices_its_attempt_once` — which drove erratum **E6**'s
-/// convergence: a `Promoting` generation with no recorded candidate, whose
-/// `candidate_prepared` a resume rebuilt from whatever the prepared pin pointed
-/// at, deriving tree, message and paths from that commit.
-///
-/// **They were witnesses for a window that no longer exists, and for a path that
-/// was a defect.** `Promoting` was reachable by `attempt_finished{Succeeded}`
-/// alone; since the 2026-08-27 CONFORM ruling `candidate_prepared` is the sole
-/// successful settlement and is the only thing that sets `Promoting`, in the
-/// same block that records the candidate. The `bf927f3` review's first P1 was
-/// exactly this reconstruction: substitute the pin between the settlement and
-/// the append and recovery builds a successful candidate around an object no
-/// gate judged — and the tree check cannot catch it, because recovery itself
-/// recorded that tree.
-///
-/// So the fixture is the same crash and the expectation is the other one: the
-/// attempt was never settled, so it settles **interrupted**, and the pin is
-/// residue that recovery prunes. Not patched to pass — the log this drives is
-/// one the fold accepts, which the old fixture no longer is.
 #[test]
 fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {
     let fixture = Fixture::build(
         "e6-orphan",
         Damage {
             open_generation: true,
-            // An attempt that started and never settled: the whole of what a
-            // crash between the pin and `candidate_prepared` leaves durable.
             extra: vec![attempt_started(1)],
             ..Damage::default()
         },
@@ -7379,8 +5629,6 @@ fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {
         recovered.finished
     );
 
-    // **And no `candidate_prepared` was invented.** This is the assertion the
-    // removed trio inverted: they required exactly one to appear.
     let prepared: Vec<_> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
@@ -7393,36 +5641,10 @@ fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {
     );
 }
 
-/// Put a real candidate commit and its pin in the fixture's repository.
-///
-/// **Both halves are real because the residue is real.** This said the halves
-/// had to be real so that erratum E6's convergence could reconstruct the
-/// candidate's identity from the object the pin points at, and called the state
-/// "what a run killed after its settlement leaves behind". Neither survives the
-/// 2026-08-27 CONFORM ruling: the convergence is deleted with the window it
-/// converged, and a run killed *after* its settlement has appended
-/// `candidate_prepared`, so it leaves a recorded candidate rather than a bare
-/// pin.
-///
-/// What this seeds is the crash **before** the settlement — the commit object
-/// and its pin written, R27's order, and the append that would have settled the
-/// attempt never reached. A fixture that seeded only events would leave nothing
-/// on disk for the pruning to be about, so the object and the pin are written
-/// for real.
-///
-/// Returns the commit sha, so a test can assert what became of the object the
-/// pin named.
 fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {
     use crate::workspace_manager::fixture::{git, write_file};
 
     let repo = &fixture.repo_root;
-    // A change on top of the base, committed without moving the branch: the
-    // candidate commit is unreferenced except by its pin, which is R23's shape.
-    //
-    // **One path, never `add -A`.** The run's own directory lives under
-    // `.upstroke/` inside this repository, so `add -A` stages it and any
-    // subsequent worktree restore deletes it — measured, as a resume that could
-    // not find its own run.
     write_file(&repo.join("candidate.txt"), b"the worker's edit\n");
     git(repo, &["add", "--", "candidate.txt"]);
     let tree = git(repo, &["write-tree"]);
@@ -7437,13 +5659,6 @@ fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {
             "upstroke: alpha attempt 1",
         ],
     );
-    // Unstage and remove just that path, so the index matches the base again
-    // and the pin is the only thing referencing the commit. Targeted for the
-    // same reason the add was.
-    //
-    // `git rm` rather than `std::fs::remove_file`: deletion is a funnel in this
-    // crate and the effect denylist refuses the raw call even in a fixture,
-    // which is the rule working rather than getting in the way.
     git(repo, &["rm", "-q", "-f", "--", "candidate.txt"]);
     let pin = crate::engine::topology::candidate::candidate_pin_ref(
         RUN_ID,
@@ -7454,12 +5669,6 @@ fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {
     commit
 }
 
-/// An [`IdSource`] whose question id is a constant.
-///
-/// A park appends the id it minted, and `rematerialize_question` reads it back
-/// on resume rather than re-deciding it — so a test that asserts on the durable
-/// question needs the id to be the same bytes every run. `RealIds` gives a
-/// ULID, which is right in production and unpinnable here.
 struct FixedIds;
 
 impl crate::engine::topology::seams::IdSource for FixedIds {
@@ -7480,7 +5689,6 @@ impl crate::engine::topology::seams::IdSource for FixedIds {
     }
 }
 
-/// The kinds in a fixture's durable log, in order.
 fn durable_kinds(fixture: &Fixture) -> Vec<String> {
     TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
@@ -7489,7 +5697,6 @@ fn durable_kinds(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
-/// A sleeper that records rather than sleeps.
 #[derive(Default)]
 struct RecordingSleeper {
     slept: std::sync::Mutex<Vec<Duration>>,
@@ -7504,19 +5711,6 @@ impl crate::interaction::Sleeper for RecordingSleeper {
     }
 }
 
-/// **A call census's needle is not satisfied by a longer name ending in it.**
-///
-/// The class boundary, not the instance. S5 round 4 found that
-/// `every_packet_named_recovery_action_has_a_production_caller` counted
-/// `refuse_unexpected_refs(` as a call to `expected_refs` — but the interesting
-/// half is that the same needle is built for **every** entry from a name the
-/// packet chose, so any future clause whose function name is a suffix of another
-/// identifier is satisfied by that other identifier's call sites, silently and
-/// in the passing direction.
-///
-/// So this asserts the needle's rule over the four shapes that decide it, and
-/// then over the real file the collision was found in — a unit assertion alone
-/// would pass against a helper that was never wired into the census.
 #[test]
 fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
@@ -7557,22 +5751,6 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
          to catch"
     );
 
-    // And on the file the collision was measured in, through the same region
-    // the census reads — a unit assertion over literals would pass against a
-    // helper nothing was wired into.
-    //
-    // **The two counts differ, and the difference is worth keeping.** The module
-    // carries four occurrences of `expected_refs(`; the region the census reads
-    // carries one, because three of the four sit inside `#[cfg(test)]` items
-    // that `production_code` blanks. The one that survives is the **definition
-    // line** of `refuse_unexpected_refs`, which the "calls, not definitions"
-    // filter does not catch: the text before the match is `pub fn refuse_un`,
-    // and that does not end in `fn`.
-    //
-    // The three that `production_code` blanks now sit in the sibling file
-    // `mod tests;` declares, so the module is two files and `whole` is read
-    // from both. The comparison is the one it always was: every occurrence the
-    // module carries, against the one the production region keeps.
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source =
         std::fs::read_to_string(manifest.join("src/workspace_manager.rs")).expect("a source file");
@@ -7599,55 +5777,8 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     );
 }
 
-/// **Every packet-named recovery action and refusal has a production caller.**
-///
-/// The class this slice produced more than any other, and the one census that
-/// closes it. Across three review rounds, ten separate things were found
-/// **built, correct, and never called**: `TopologyRun` itself, `settle_*`, the
-/// candidate sequence, `resume_open_no_attempt`, `Started`, `CandidateJournal`,
-/// `Spend::replay`, `complete_promotion`'s continuation, `prune_orphan_pin` and
-/// `refuse_unexpected_refs`.
-///
-/// Two of those were P0/P1 liveness defects — a converged promotion that stalled
-/// the run forever, and a resumed run that forgot its whole spend. The rest were
-/// coverage gaps that would have become defects the moment a caller appeared.
-/// Each was found separately, by a different reviewer noticing a different
-/// symptom, over four rounds.
-///
-/// **This asserts the property the packet states, rather than waiting for a
-/// reviewer to notice its absence.** A function that implements a
-/// `resume_action` or a `refusal_condition` and has no production caller is not
-/// an implementation of that clause — it is a plan to implement it.
-///
-/// **What this census covers, exactly.** The eleven entries below and nothing
-/// else. Of the ten never-called things listed above, `Spend::replay`,
-/// `TopologyRun`, `Started`, `CandidateJournal`, `settle_*` and
-/// `complete_promotion`'s continuation are **not** among them — this would not
-/// have caught them, and the commit that added it said otherwise. Corrected in
-/// `reviews/FINDINGS.md` §19, claim (7); recorded here because the reader who
-/// needs it is the one adding the twelfth entry.
-///
-/// Four ways this could pass while a clause stayed unperformed, and each is
-/// closed by a named thing rather than by the needle being "obviously right":
-///
-/// * **A mention in a doc comment or a string.** The region is
-///   `effects::production_code`, which blanks comments and string literals.
-/// * **A `#[cfg(test)]` caller in the same file.** The same region removes each
-///   configured item in place.
-/// * **A caller in an out-of-line `tests.rs`**, where the attribute is on the
-///   parent's declaration and there is nothing in the file to blank. Skipped by
-///   file stem in the walk below. This was live until S5 round 4.
-/// * **A longer identifier ending in the entry's name.** `expected_refs(` was
-///   satisfied by `refuse_unexpected_refs(`. Closed by [`crate::effects::census_domain::production_calls`],
-///   whose own witness is
-///   `a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it`.
-///
-/// The fourth is the one worth stating as a class: the needle is built from a
-/// name **the packet chose**, so it cannot be renamed out of a collision the way
-/// `into_log_and_fold` was.
 #[test]
 fn every_packet_named_recovery_action_has_a_production_caller() {
-    /// (function, how production calls it, the packet clause it performs).
     const CLAUSES: &[(&str, crate::effects::census_domain::Call, &str)] = &[
         (
             "prune_orphan_pin",
@@ -7723,25 +5854,10 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
                 }
             }
         }
-        // **The crate's own declarations, not a file-name rule.** This skipped
-        // by the stem `"tests"`, so it covered only the modules named
-        // `tests.rs`; the crate declares **more** whole-file test modules than
-        // that — `effects::tests::cfg::WHOLE_FILE_TEST_MODULES` lists them all,
-        // against the `tests.rs` entries of it the stem finds —
-        // and the six it missed — `scaffold`, `premove`, `fake`, `fixture`,
-        // `scratch_tree`, `readiness` — are the ones most likely to name what
-        // production names. `PR7-R5-ATT-001`.
         let test_modules = crate::effects::census_domain::whole_file_test_modules(&root, &all, 13);
         let mut out = Vec::new();
         {
             for path in all {
-                // **An out-of-line test file is test code in full, and
-                // `production_code` cannot tell.** The `#[cfg(test)]` is on the
-                // *declaration* in the parent, so the file it names carries no
-                // attribute of its own and nothing in it is blanked. Without
-                // this skip a fixture calling a packet-named function satisfies
-                // the clause on production's behalf, which is precisely the
-                // class this census exists to close.
                 if test_modules.contains(&path) {
                     test_files_skipped += 1;
                     continue;
@@ -7762,12 +5878,6 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         "the walk found {} sources, so its zero counts would prove nothing",
         sources.len()
     );
-    // The skip is in force and it removed something. A zero here would mean the
-    // control was silently inert — the same failure as an empty region, one
-    // level up. The floor is the pinned list's length rather than a literal,
-    // which is why it is that list and not `test_modules.len()`: the derivation
-    // is what this floor exists to catch, so a floor read off its own output
-    // would pass on an empty answer.
     assert!(
         test_files_skipped >= crate::effects::tests::cfg::WHOLE_FILE_TEST_MODULES.len()
             && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")
@@ -7789,11 +5899,6 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     let mut uncalled: Vec<String> = Vec::new();
     let mut undefined: Vec<String> = Vec::new();
     for (name, form, clause) in CLAUSES {
-        // **The named item exists.** The census never checked, so renaming a
-        // clause's definition out of the tree left it green — measured, S5
-        // round 4. Not pinned to exactly one definition, because
-        // `settle_interrupted` legitimately names three items and `form` is
-        // what separates them.
         let defined: usize = sources
             .iter()
             .map(|(_, code)| code.matches(&format!("fn {name}(")).count())

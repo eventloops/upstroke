@@ -1,22 +1,15 @@
-//! The integration checks: opening a transaction, the verification records,
-//! and the publication relations a merge is judged against (INV-09).
+//! Extended notes: `docs/internals/topology/fold/check_integration.md`
 
 use super::region::{GitRefName, ineligible_detail, ordinal};
 use super::*;
 
 impl RunState {
-    // --- integration: starting a transaction --------------------------------
-
-    /// The checks every first append of an integration transaction shares:
-    /// nothing else is open, the sequence is the next dense one, and the
-    /// candidate is the first *eligible* entry in the queue.
     pub(super) fn check_transaction_start(
         &self,
         kind: &'static str,
         sequence: SequenceId,
         candidate: &CandidateRef,
     ) -> Result<&QueueEntry, FoldError> {
-        // refusals[7]: one integration transaction at a time.
         if let Some(open) = &self.transaction {
             return Err(FoldError::TransactionAlreadyOpen {
                 kind,
@@ -24,7 +17,6 @@ impl RunState {
                 open: open.sequence.0,
             });
         }
-        // refusals[6] / refusals[10]: sequences are dense from 0 across the run.
         if sequence.0 != self.next_sequence {
             return Err(FoldError::NonDenseSequence {
                 kind,
@@ -32,8 +24,6 @@ impl RunState {
                 next: self.next_sequence,
             });
         }
-        // refusals[8]: the first eligible entry is integrated, and the fold
-        // refuses an integration start for any other candidate.
         let first = self
             .queue
             .first_eligible(
@@ -88,7 +78,6 @@ impl RunState {
             .is_some_and(|task| task.state == TaskState::AwaitingInput)
     }
 
-    /// The open transaction this event must belong to (refusals[6]).
     pub(super) fn open_transaction(
         &self,
         kind: &'static str,
@@ -112,8 +101,6 @@ impl RunState {
         Ok(open)
     }
 
-    // --- merge_verification_started ----------------------------------------
-
     pub(super) fn check_verification_started(
         &self,
         started: &MergeVerificationStarted,
@@ -122,9 +109,6 @@ impl RunState {
         let queued = self.check_transaction_start(KIND, started.sequence, &started.candidate)?;
         let prepared = self.prepared_candidate(KIND, &started.candidate)?;
 
-        // INV-09: the exact-base decision is made before any staging effect, so
-        // a candidate whose base *is* the head is published fast and is never
-        // cherry-picked or re-verified.
         if started.expected_head == prepared.base_sha {
             return Err(FoldError::InconsistentRecord {
                 kind: KIND,
@@ -163,7 +147,6 @@ impl RunState {
         Ok(())
     }
 
-    /// What `candidate_prepared` recorded for this candidate.
     pub(super) fn prepared_candidate(
         &self,
         kind: &'static str,
@@ -184,8 +167,6 @@ impl RunState {
                 ),
             })
     }
-
-    // --- merge_verification_unavailable ------------------------------------
 
     pub(super) fn check_verification_unavailable(
         &self,
@@ -218,16 +199,10 @@ impl RunState {
                 kind: KIND,
                 detail: "the candidate under verification holds no queue position".to_owned(),
             })?;
-        // The boundary is the same number read from both sides: the deferral
-        // this outage *would* be. `coordinator_integration.dispositions` gives
-        // Infrastructure `Deferred{defers}` while `defers < max_defers` and
-        // `Parked{question}` at `max_defers`, so the two arms partition on
-        // `next` and neither may take the other's cell.
         let max = self.started.limits.max_defers;
         let next = queued.defers.saturating_add(1);
         match &unavailable.outcome {
             UnavailableOutcome::Deferred { defers } => {
-                // refusals[17]: consecutive, and within the frozen allowance.
                 if *defers != next {
                     return Err(FoldError::InvalidDefers {
                         defers: *defers,
@@ -238,10 +213,6 @@ impl RunState {
                         ),
                     });
                 }
-                // refusals[16]: "Deferred at max_defers" is refused. The
-                // allowance is the number of deferrals the run may *take*, so
-                // the last one it may take is `max_defers - 1` and the outage
-                // that would be the `max_defers`th parks instead.
                 if *defers >= max {
                     return Err(FoldError::InvalidDefers {
                         defers: *defers,
@@ -254,10 +225,6 @@ impl RunState {
             }
             UnavailableOutcome::Parked { question } => {
                 self.check_new_question(KIND, question, transaction.candidate.key)?;
-                // refusals[16], the other half: `HumanRequired` always parks,
-                // whatever the count, and an Infrastructure outage parks
-                // exactly at the boundary — one earlier would consume an
-                // allowance the run still has.
                 if matches!(unavailable.cause, UnavailableCause::Infrastructure { .. })
                     && next != max
                 {
@@ -274,8 +241,6 @@ impl RunState {
         }
         Ok(())
     }
-
-    // --- merge_verification_interrupted ------------------------------------
 
     pub(super) fn check_verification_interrupted(
         &self,
@@ -297,12 +262,8 @@ impl RunState {
         Ok(())
     }
 
-    // --- merge_prepared ----------------------------------------------------
-
     pub(super) fn check_merge_prepared(&self, prepared: &MergePrepared) -> Result<(), FoldError> {
         const KIND: &str = "merge_prepared";
-        // A1's intra-event relations first: a record that disagrees with itself
-        // is refused before it is compared with anything else.
         prepared
             .self_consistency()
             .map_err(|defect| FoldError::InconsistentRecord {
@@ -315,11 +276,7 @@ impl RunState {
 
         match prepared.disposition {
             PreparedDisposition::Fast => {
-                // A fast publication opens and closes its own transaction: no
-                // verification ran, so there is nothing already open.
                 self.check_transaction_start(KIND, prepared.sequence, &prepared.candidate())?;
-                // refusals[9]: expected_head == the candidate's recorded base,
-                // proposed_sha == the candidate's recorded commit.
                 if prepared.expected_head != candidate_record.base_sha {
                     return Err(inconsistent(format!(
                         "a fast publication expects the head to be the candidate's base {} and \
@@ -380,17 +337,12 @@ impl RunState {
                         .to_owned(),
                     ));
                 }
-                // refusals[22], fold half: the head the CAS expects is the head
-                // the transaction read.
                 if prepared.expected_head != *expected_head {
                     return Err(inconsistent(format!(
                         "it expects head {} and the verification recorded head {expected_head}",
                         prepared.expected_head
                     )));
                 }
-                // refusals[9]: the proposal is the one that was verified — the
-                // pinned proposal for a stale publication, the head itself for
-                // an already-present one.
                 if prepared.proposed_sha != *proposed_sha {
                     return Err(inconsistent(format!(
                         "it publishes {} and the verification judged {proposed_sha}",
@@ -426,8 +378,6 @@ impl RunState {
             }
         }
 
-        // refusals[10]: the closure this publication settles is derived, not
-        // asserted.
         let derived = self.satisfies_closure(prepared.key);
         if prepared.satisfies != derived {
             return Err(FoldError::InvalidSatisfies {
@@ -439,13 +389,6 @@ impl RunState {
         Ok(())
     }
 
-    /// Every task one publication settles: the candidate's own task and, for a
-    /// repair, every entry back up its lineage to the root.
-    ///
-    /// A repair carries the work of everything it descends from — that is what
-    /// it was materialized from — so publishing it settles the whole chain.
-    /// Ascending key order, because the value is derived and two readers must
-    /// derive the same list.
     pub(super) fn satisfies_closure(&self, key: TaskKey) -> Vec<TaskKey> {
         let mut chain = vec![key];
         let mut current = key;
@@ -461,15 +404,11 @@ impl RunState {
         chain
     }
 
-    // --- merge_rejected ----------------------------------------------------
-
     pub(super) fn check_merge_rejected(&self, rejected: &MergeRejected) -> Result<(), FoldError> {
         const KIND: &str = "merge_rejected";
         let inconsistent = |detail: String| FoldError::InconsistentRecord { kind: KIND, detail };
         match &rejected.disposition {
             RejectionDisposition::Conflict { .. } => {
-                // A conflict is decided at the cherry-pick, before any
-                // verification starts: it opens and closes its own transaction.
                 self.check_transaction_start(KIND, rejected.sequence, &rejected.candidate)?;
             }
             RejectionDisposition::CodeRejected { verification } => {
@@ -508,9 +447,6 @@ impl RunState {
             }
         }
 
-        // The lease effect and the repair are one decision: a non-lineage
-        // candidate's lease becomes the new lineage's, and a lineage member's
-        // rejection widens the lineage it already belongs to.
         let entry = self.entry(KIND, rejected.candidate.key)?;
         let root = match (&rejected.lease_effect, entry.lineage) {
             (RejectionLeaseEffect::CreatesLineage { root, .. }, None) => {
@@ -568,7 +504,6 @@ impl RunState {
         Ok(())
     }
 
-    /// How many repairs lineage `root` already holds.
     pub(super) fn lineage_members(&self, root: TaskKey) -> u32 {
         u32::try_from(
             self.registry
@@ -579,8 +514,6 @@ impl RunState {
         )
         .unwrap_or(u32::MAX)
     }
-
-    // --- task_merged -------------------------------------------------------
 
     pub(super) fn check_task_merged(&self, merged: &TaskMerged) -> Result<(), FoldError> {
         const KIND: &str = "task_merged";
@@ -606,7 +539,6 @@ impl RunState {
                 ),
             });
         }
-        // "copied exactly from the authorization", not re-derived here.
         if merged.satisfies != *satisfies {
             return Err(FoldError::InvalidSatisfies {
                 kind: KIND,
