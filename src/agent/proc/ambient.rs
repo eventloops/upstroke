@@ -22,13 +22,20 @@
 //! **What this module reads from its environment: nothing.** No environment
 //! variable, argument, working directory or file is read here. The inputs are
 //! the caller's observer, the join step `windows_job` performs against the
-//! kernel, and a caller-built [`ReaperContainerScope`]. The one environment read
-//! reachable from this file is downstream of [`set_container_reclaim_scope`],
-//! on Unix: a scope whose program has no path separator is resolved against
-//! this process's `PATH` (`termination::resolve_reaper_program`), and a name
-//! `PATH` cannot resolve is refused rather than defaulted. That read is made
-//! when the scope is armed and again as each reaper starts; the second is
-//! `SWEEP-AMBIENT-010`.
+//! kernel, and a caller-built [`ReaperContainerScope`]. The environment reads
+//! reachable from this file are all downstream of
+//! [`set_container_reclaim_scope`], on Unix, in `termination`'s resolution of a
+//! bare reaper program (`resolve_reaper_program`, over
+//! `crate::util::find_program`): this process's `PATH`; through it the working
+//! directory, because a relative `PATH` entry is joined to the name and the
+//! result kept relative; and the filesystem's metadata at the moment of the
+//! probe, since the first entry naming a regular file wins. A name no entry
+//! resolves to a regular file is refused rather than defaulted. Two things are
+//! not refused, and both are `termination`'s (row 51): a regular file that is
+//! not executable is accepted, and a reaper handed it reads its own failed
+//! `execv` as an empty listing (`SWEEP-AMBIENT-012`); and the resolution is
+//! made again as each reaper starts, where a failure is folded into no scope
+//! (`SWEEP-AMBIENT-010`).
 //!
 //! `PR6-LANEF-004`: it states its own lint level rather than inheriting the
 //! funnel's `#![allow]`, and denies all three governed lints. No
@@ -109,7 +116,11 @@ pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError>
 ///
 /// * [`AMBIENT_REFUSAL_PREFIX`] followed by [`AMBIENT_REFUSAL_SIMULATED`] when
 ///   the observer answers `Error` at the error-return coordinate. That is
-///   before the join, so no job exists and nothing was established;
+///   before this call's join, so this call establishes nothing — but a job an
+///   earlier call established stays, because the memo is process-wide and
+///   nothing here can close it. `ambient_job_established` therefore answers
+///   for the process, not for the call, and the callers count establishments
+///   per call instead (`runner::host::containment_establishments`);
 /// * [`AMBIENT_REFUSAL_PREFIX`] followed by `join`'s own diagnostic and
 ///   "No process was spawned" when the join fails;
 /// * the funnel's own wording ("the process funnel was made to fail at its
@@ -128,8 +139,9 @@ pub(super) fn join_ambient_job_with(
     // The error-return coordinate is *before* the join: the point's error
     // contract is "failure refuses the write command", so an injected failure
     // stands in place of establishing the job rather than following a job that
-    // was in fact established. A refusal here leaves no ambient job, no child,
-    // and nothing to reclaim.
+    // was in fact established. A refusal here establishes no job in this call
+    // (an earlier call's stays), creates no child, and leaves nothing to
+    // reclaim.
     apply(
         hooks.point_mode(SubEffectPoint::AmbientJobJoined, InjectionMode::ErrorReturn),
         SubEffectPoint::AmbientJobJoined,
@@ -267,10 +279,13 @@ pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
 /// a reaper will `execv` — decided here, where there is still an error channel,
 /// rather than inside a reaper that has none:
 ///
-/// * its program has no path separator and this process's `PATH` cannot
-///   resolve it, or is not UTF-8 and so cannot be looked up
-///   (`termination::resolve_reaper_program`) — the one environment read
-///   reachable from this module;
+/// * its program has no path separator and no `PATH` entry joined to it names
+///   a regular file, or the name is not UTF-8 and so cannot be looked up
+///   (`termination::resolve_reaper_program`, over `crate::util::find_program`).
+///   What that probe reads is `PATH`, the working directory for a relative
+///   entry, and the filesystem's metadata; it asks `is_file`, not whether the
+///   file is executable, so a non-executable `docker` on `PATH` is accepted
+///   here and fails inside the reaper instead (`SWEEP-AMBIENT-012`);
 /// * a rendered string carries an interior NUL
 ///   (`termination::render_container_argv`).
 #[cfg(unix)]
