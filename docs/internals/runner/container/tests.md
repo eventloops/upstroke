@@ -56,7 +56,7 @@ A scratch private root, in the idiom of `effects::tests::scratch_dir`.
 The four name components used across this file, each a distinct value so a
 swap between two of them is visible.
 
-## `const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111…`
+## `const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";`
 
 The recorded image id, and a different one, and a third.
 
@@ -70,7 +70,7 @@ container name carries the incarnation.
 
 An agent probe identity.
 
-## `fn intent_for(run: &str, incarnation: &str, invocation: &InvocationId) -> ContainerIntent…`
+## `fn intent_for(run: &str, incarnation: &str, invocation: &InvocationId) -> ContainerIntent {`
 
 The intent record for `run`/`incarnation`, with every field a distinct
 value.
@@ -140,7 +140,7 @@ is here: the state the helper exists for is a SIGKILLed run whose container
 is still *running*, so "do not kill running ones" defeats the helper
 outright.
 
-## `fn a_pre_clean_refuses_every_name_a_concurrent_run_could_al…` › `const STRANGERS: &str = "cccccccccccccccc";`
+## `fn a_pre_clean_refuses_every_name_a_concurrent_run_could_also_ask_for() {` › `const STRANGERS: &str = "cccccccccccccccc";`
 
 Not this slot's, whatever slot this is: sixteen hex characters that no
 `CARGO_TARGET_DIR` digest and no empty-scope default can equal.
@@ -160,7 +160,7 @@ The refusal is asserted to land **before any reclaim**, through the trace,
 because a guard that fires after the `docker kill` has already killed the
 stranger's container.
 
-## `fn a_pre_clean_of_a_strangers_name_refuses_before_it_reclai…` › `let hook = std::panic::take_hook();`
+## `fn a_pre_clean_of_a_strangers_name_refuses_before_it_reclaims_anything() {` › `let hook = std::panic::take_hook();`
 
 The panic is expected and its message is the assertion, so the hook is
 silenced: an expected panic printing a backtrace into a green run is how
@@ -181,12 +181,12 @@ varies is only which key the table is read by. Without an id-keyed table,
 `image_by_id` could not answer at all and the rebuild path's refusal — "the
 **recorded image id** is absent from the runtime" — would be unwritable.
 
-## `fn the_image_table_is_keyed_by_id_and_references_resolve_th…` › `let without = runtime`
+## `fn the_image_table_is_keyed_by_id_and_references_resolve_through_it() {` › `let without = runtime`
 
 "the manifest digest **when reported**" — absent is a real state and a
 separately encodable one, not a missing fixture.
 
-## `fn the_image_table_is_keyed_by_id_and_references_resolve_th…` › `assert_eq!(runtime.image_by_reference("ghcr.io/nobody:v9"), Ok(None));`
+## `fn the_image_table_is_keyed_by_id_and_references_resolve_through_it() {` › `assert_eq!(runtime.image_by_reference("ghcr.io/nobody:v9"), Ok(None));`
 
 The two questions are independent: an id present under no reference is
 findable by id and by no reference.
@@ -204,7 +204,7 @@ Second field held constant: the image table itself. Both ids are present
 before and after; only the tag moves — which is the whole point, because a
 fixture that also deleted the old id would prove the wrong thing.
 
-## `fn a_reference_can_be_moved_to_another_id_and_the_old_id_st…` › `let answers: BTreeSet<String> = [`
+## `fn a_reference_can_be_moved_to_another_id_and_the_old_id_stays() {` › `let answers: BTreeSet<String> = [`
 
 Two distinct answers to two distinct questions about one reference: the
 intersection {image id recorded} x {reference moved} rather than either
@@ -220,15 +220,15 @@ substitution, and `substituted_image_id_refused_before_start` would be green
 because it could not be written. This is the test that proves the two are
 separate inputs.
 
-## `fn the_fake_can_report_an_image_id_that_differs_from_the_on…` › `let honest = runtime.create(&spec).expect("created");`
+## `fn the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for() {` › `let honest = runtime.create(&spec).expect("created");`
 
 Healthy: the runtime reports what it was asked for.
 
-## `fn the_fake_can_report_an_image_id_that_differs_from_the_on…` › `runtime.substitute_reported_image_id(&spec.name, OTHER_IMAGE_ID);`
+## `fn the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for() {` › `runtime.substitute_reported_image_id(&spec.name, OTHER_IMAGE_ID);`
 
 Injected: it does not.
 
-## `fn the_fake_can_report_an_image_id_that_differs_from_the_on…` › `let held = runtime.container(&spec.name).expect("held");`
+## `fn the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for() {` › `let held = runtime.container(&spec.name).expect("held");`
 
 And the container the fake holds records both, separately.
 
@@ -251,15 +251,15 @@ answers `docker ps` and fails `docker inspect` is a real state, and a seam
 with one global boolean could not express it. The intersection here is
 {operation} x {reachable?}, which one boolean collapses.
 
-## `fn the_availability_toggle_is_per_operation_so_ps_can_answe…` › `assert_eq!(`
+## `fn the_availability_toggle_is_per_operation_so_ps_can_answer_while_inspect_cannot() {` › `assert_eq!(`
 
 `ps` answers.
 
-## `fn the_availability_toggle_is_per_operation_so_ps_can_answe…` › `let error = runtime`
+## `fn the_availability_toggle_is_per_operation_so_ps_can_answer_while_inspect_cannot() {` › `let error = runtime`
 
 `inspect` does not, and says which operation could not be reached.
 
-## `fn the_availability_toggle_is_per_operation_so_ps_can_answe…` › `runtime.set_all_unreachable();`
+## `fn the_availability_toggle_is_per_operation_so_ps_can_answer_while_inspect_cannot() {` › `runtime.set_all_unreachable();`
 
 The whole daemon down is the other end of the same toggle, and every
 operation reports it.
@@ -273,11 +273,11 @@ Second field held constant: the label *keys* are the packet's five for both
 containers; what varies is the run and the incarnation, which is the axis
 the census classifies on.
 
-## `fn a_seeded_container_carries_owner_labels_and_an_incarnati…` › `IMAGE_ID,`
+## `fn a_seeded_container_carries_owner_labels_and_an_incarnation() {` › `IMAGE_ID,`
 
 Separate argument, always.
 
-## `fn a_seeded_container_carries_owner_labels_and_an_incarnati…` › `assert_eq!(runs.len(), 2, "{runs:?}");`
+## `fn a_seeded_container_carries_owner_labels_and_an_incarnation() {` › `assert_eq!(runs.len(), 2, "{runs:?}");`
 
 Distinct-value counts, not prose: two runs, two incarnations, two
 invocations, and the pairs are not the same partition — which is what
@@ -293,7 +293,7 @@ contents**". [`OwnerLiveness`] answers one bit about a public run directory,
 so there is no incarnation in the return type to read — the defect is not
 refused, it is unexpressible.
 
-## `fn owner_liveness_answers_one_bit_and_carries_no_incarnatio…` › `let probe = super::runtime::LockProbe;`
+## `fn owner_liveness_answers_one_bit_and_carries_no_incarnation() {` › `let probe = super::runtime::LockProbe;`
 
 The production probe is `rundir::is_running`, and it answers the same
 shape for a directory that never held a run.
@@ -323,13 +323,13 @@ Container.Start)", and `slice_contract.owned_resources` splits them:
 "R26 container + labels + global intent incl. runner digest", "R19
 disposable Git view per request".
 
-## `fn every_container_sites_row_adjacency_fault_row_and_scope_…` › `let r19 = EXPECTED.iter().filter(|e| e.1 == ResourceRow::R19).count();`
+## `fn every_container_sites_row_adjacency_fault_row_and_scope_is_the_packets() {` › `let r19 = EXPECTED.iter().filter(|e| e.1 == ResourceRow::R19).count();`
 
 Two of the eight are R19 and six are R26, which is the split
 `owned_resources` states. A count, so a site moved between rows fails
 here as well as in its own row above.
 
-## `fn every_container_sites_row_adjacency_fault_row_and_scope_…` › `for site in ContainerSite::ALL {`
+## `fn every_container_sites_row_adjacency_fault_row_and_scope_is_the_packets() {` › `for site in ContainerSite::ALL {`
 
 No Container site exposes a parent-side sub-effect point or registers a
 command-internal residue class, and both absences are **stated** rather
@@ -424,7 +424,7 @@ site), so hooks exist for every site by construction". This is the runtime
 evidence for that sentence — `effects::tests::every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent`
 is the source-level half.
 
-## `fn every_container_site_is_taken_by_value_by_a_funnel_that_…` › `let expected: Vec<(ContainerSite, TracePhase)> = [`
+## `fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {` › `let expected: Vec<(ContainerSite, TracePhase)> = [`
 
 Both phases, once each, for all eight, in the order they were called.
 
@@ -464,7 +464,7 @@ than passing vacuously.
 Second field held constant: the runtime is reachable and holds the recorded
 image throughout, so no cell can refuse because the runtime was armed.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `let proof = matches!(own_site, ContainerSite::Create | ContainerSite::Start).then(|| {`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `let proof = matches!(own_site, ContainerSite::Create | ContainerSite::Start).then(|| {`
 
 `create_container` and `start_container` take an `IntentWritten`, and
 there is no way to call them without one — that is
@@ -474,33 +474,33 @@ written **directly** rather than through `write_intent`, so this
 cell's trace still starts empty and assertion (2) keeps meaning what
 it says.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `match own_site {`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `match own_site {`
 
 The state in which THIS API's primitive succeeds.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `ContainerSite::WriteIntent => {}`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `ContainerSite::WriteIntent => {}`
 
 Nothing on disk, so a write would land.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `ContainerSite::Create => {}`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `ContainerSite::Create => {}`
 
 The name is free and the image is present, so a create would work.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `ContainerSite::MountGitView => {}`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `ContainerSite::MountGitView => {}`
 
 No directory, so a materialize would create one.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `assert_eq!(`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `assert_eq!(`
 
 (2) Nothing happened at all. The guard runs before `funnel`, so a
 correct refusal records neither hook phase — and a broken one
 records the phases AND the primitive's own entry.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `let held = runtime.container(name.as_str());`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `let held = runtime.container(name.as_str());`
 
 (3) And the state the primitive would have changed is untouched.
 
-## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_opera…` › `trace.clear();`
+## `fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {` › `trace.clear();`
 
 The positive control: the same API, its own site, and the primitive
 really does run. Without this a cell whose primitive could not have
@@ -536,12 +536,12 @@ round trip is asserted field by field. The distinct-value count is the
 hostility assertion: six fields, six distinct values, so a record that
 copied one field into another fails.
 
-## `fn the_intent_record_carries_the_six_fields_and_each_is_rea…` › `assert_eq!(written.record(), &read, "the proof and the file disagree");`
+## `fn the_intent_record_carries_the_six_fields_and_each_is_read_back() {` › `assert_eq!(written.record(), &read, "the proof and the file disagree");`
 
 The proof `write_intent` mints carries the record it read back, so the
 capability and the file are the same six fields rather than two.
 
-## `fn the_intent_record_carries_the_six_fields_and_each_is_rea…` › `let document: serde_json::Value =`
+## `fn the_intent_record_carries_the_six_fields_and_each_is_read_back() {` › `let document: serde_json::Value =`
 
 The serialized document has exactly six keys, in the packet's order, and
 the key names are pinned as literals rather than taken from the struct.
@@ -559,7 +559,7 @@ upstroke.run_dir, upstroke.incarnation, upstroke.invocation". Written out as
 literals, and each value asserted against the field it comes from — a label
 map with five keys and one value repeated would pass a count and fails here.
 
-## `fn the_five_labels_are_the_packets_five_and_each_carries_it…` › `assert!(`
+## `fn the_five_labels_are_the_packets_five_and_each_carries_its_own_field() {` › `assert!(`
 
 Discovery is by `upstroke.private_root` and the record's own location is
 inside that root, so the one label with no field of its own is the one
@@ -596,7 +596,7 @@ Every component is varied independently and the counts are asserted:
 names, and 16 distinct parses that each round-trip. A name produced two ways
 by two different tuples is an ownership record that lies.
 
-## `fn the_name_is_injective_over_every_component_varied_indepe…` › `assert!(ContainerName::from_parts("a-b", "c", INCARNATION_1, "d").is_err());`
+## `fn the_name_is_injective_over_every_component_varied_independently() {` › `assert!(ContainerName::from_parts("a-b", "c", INCARNATION_1, "d").is_err());`
 
 The adversarial pair: components chosen so that a template joining them
 without a refusal on the separator would collide. `a-b` + `c` and `a` +
@@ -611,12 +611,12 @@ path separator names a different file than the record says, which is the
 same class `workspace_manager::remove_intent` validates its slot names
 against.
 
-## `fn a_hostile_name_component_is_refused_and_the_refusal_says…` › `assert!(`
+## `fn a_hostile_name_component_is_refused_and_the_refusal_says_why() {` › `assert!(`
 
 Seven hostile values in four positions, and the message names the
 position, so the refusals are not one message repeated.
 
-## `fn a_hostile_name_component_is_refused_and_the_refusal_says…` › `let at_limit = "a".repeat(intent::MAX_COMPONENT_LEN);`
+## `fn a_hostile_name_component_is_refused_and_the_refusal_says_why() {` › `let at_limit = "a".repeat(intent::MAX_COMPONENT_LEN);`
 
 Over-long is refused too, and the boundary is exact.
 
@@ -747,7 +747,7 @@ The intent is still first, so moving the mount up did not move it past
 "stop/rm, view removal, intent removal after completion" — the four sites in
 the contract's own order.
 
-## `fn release_stops_removes_unmounts_and_removes_the_intent_in…` › `assert!(!launched.view_path.exists(), "the view is pruned");`
+## `fn release_stops_removes_unmounts_and_removes_the_intent_in_that_order() {` › `assert!(!launched.view_path.exists(), "the view is pruned");`
 
 R19 and R26 both balance.
 
@@ -794,12 +794,12 @@ the suite is threaded. The two halves are counted separately because
 The two axes: {which barrier} × {which call}. The trace is read only to show
 the two agree — never as the evidence that a barrier happened.
 
-## `fn the_intents_durability_barriers_are_entered_and_not_mere…` › `let file = fixture.plan.name.intent_file_name();`
+## `fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {` › `let file = fixture.plan.name.intent_file_name();`
 
 The other axis, and it is a different claim: the trace says the same
 thing. If these two ever disagree the trace is the one that is wrong.
 
-## `fn the_intents_durability_barriers_are_entered_and_not_mere…` › `let fixture = Fixture::new("barriers-launch", RUN_A, INCARNATION_1, &agent_probe());`
+## `fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {` › `let fixture = Fixture::new("barriers-launch", RUN_A, INCARNATION_1, &agent_probe());`
 
 Second cell: the whole launch. Exactly one of each, still — the view, the
 create and the start perform no barriers — so a barrier that quietly
@@ -846,30 +846,30 @@ drives the census that closes it.
 Second field held constant: the substitution, the image ids and the plan are
 identical in all four cells, so what varies is only which step was armed.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `assert!(message.contains(OTHER_IMAGE_ID), "{armed:?}: {message}");`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `assert!(message.contains(OTHER_IMAGE_ID), "{armed:?}: {message}");`
 
 The integrity refusal survives the cleanup failure. This is the whole
 finding: the operator needs to know the runtime executed something
 other than the record, not that `docker stop` said no.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `assert!(`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `assert!(`
 
 And the residue is reported rather than swallowed: fail-closed means
 the refusal names what it could not release.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `assert!(`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `assert!(`
 
 Never started, whatever else happened.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `let container_left = !fixture.runtime.container_names().is_empty();`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `let container_left = !fixture.runtime.container_names().is_empty();`
 
 The three steps that were NOT armed all ran.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `ContainerSite::UnmountGitView => (false, true, true),`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `ContainerSite::UnmountGitView => (false, true, true),`
 
 The anchor rule: an unpruned view keeps its record.
 
-## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_inte…` › `assert!(`
+## `fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {` › `assert!(`
 
 Retained on purpose, and said so — an operator reading "the view
 could not be pruned" and finding the record gone would have no
@@ -925,19 +925,19 @@ and the third intolerable one is `Unreachable` carrying tolerable *text*,
 because a runtime that could not be reached did not tell us anything about
 the container.
 
-## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a…` › `for detail in [`
+## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not() {` › `for detail in [`
 
 Real failures stay failures. `--force` removal and a kill the daemon could
 not deliver are things a reclaimer must NOT report as convergence.
 
-## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a…` › `let unreachable = super::settle_stop(Err(RuntimeError::Unreachable {`
+## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not() {` › `let unreachable = super::settle_stop(Err(RuntimeError::Unreachable {`
 
 And unreachable is a different answer even when its text would be
 tolerable: `crash_reconstruction` refuses a write command when the runtime
 "cannot be reached", and swallowing that here would turn a refusal into a
 convergence.
 
-## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a…` › `assert_eq!(super::settle_stop(Ok("upstroke-c\n".to_owned())), Ok(()));`
+## `fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not() {` › `assert_eq!(super::settle_stop(Ok("upstroke-c\n".to_owned())), Ok(()));`
 
 The control: a stop that simply worked.
 
@@ -952,7 +952,7 @@ is exercising the tolerance rather than a test-local copy of it. Every raw
 answer is recorded, so a test can assert the already-stopped branch actually
 fired instead of hoping it did.
 
-## `fn stop(&self, name: &str, mode: StopMode) -> Result<(), Ru…` › `let outcome = match self.inner.observe(name)? {`
+## `fn stop(&self, name: &str, mode: StopMode) -> Result<(), RuntimeError> {` › `let outcome = match self.inner.observe(name)? {`
 
 The daemon's own three answers, chosen by the state the container is
 actually in — which is what makes a second reclaimer see the
@@ -974,20 +974,20 @@ Second field held constant: the container, the intent and the view are all
 present when B starts, so B has real work to do at every one of its five
 steps and cannot pass by finding nothing.
 
-## `fn a_reclaimer_arriving_after_another_killed_the_container_…` › `stop_container(`
+## `fn a_reclaimer_arriving_after_another_killed_the_container_converges() {` › `stop_container(`
 
 Reclaimer A: kills it, and gets no further.
 
-## `fn a_reclaimer_arriving_after_another_killed_the_container_…` › `reclaim(`
+## `fn a_reclaimer_arriving_after_another_killed_the_container_converges() {` › `reclaim(`
 
 Reclaimer B: the whole sequence, over a container that is already stopped.
 
-## `fn a_reclaimer_arriving_after_another_killed_the_container_…` › `let answers = docker_like.raw_answers();`
+## `fn a_reclaimer_arriving_after_another_killed_the_container_converges() {` › `let answers = docker_like.raw_answers();`
 
 The already-stopped branch actually fired — without this the test could
 pass having never reached the tolerance at all.
 
-## `fn a_reclaimer_arriving_after_another_killed_the_container_…` › `assert!(!view_path.exists(), "B stopped before pruning the view");`
+## `fn a_reclaimer_arriving_after_another_killed_the_container_converges() {` › `assert!(!view_path.exists(), "B stopped before pruning the view");`
 
 And B finished the job: nothing of R19 or R26 is left.
 
@@ -1033,19 +1033,19 @@ would make lane C's refusal unwritable. The intersection here is {operation}
 x {reachable? failed? fine?} — three states over one operation, not two axes
 tested apart.
 
-## `fn a_failed_operation_and_an_unreachable_one_are_different_…` › `assert!(runtime.image_by_id(IMAGE_ID).expect("reachable").is_some());`
+## `fn a_failed_operation_and_an_unreachable_one_are_different_answers() {` › `assert!(runtime.image_by_id(IMAGE_ID).expect("reachable").is_some());`
 
 Fine.
 
-## `fn a_failed_operation_and_an_unreachable_one_are_different_…` › `runtime.set_failing(RuntimeOp::InspectImageById);`
+## `fn a_failed_operation_and_an_unreachable_one_are_different_answers() {` › `runtime.set_failing(RuntimeOp::InspectImageById);`
 
 Reached and failed.
 
-## `fn a_failed_operation_and_an_unreachable_one_are_different_…` › `runtime.set_unreachable(RuntimeOp::InspectImageById);`
+## `fn a_failed_operation_and_an_unreachable_one_are_different_answers() {` › `runtime.set_unreachable(RuntimeOp::InspectImageById);`
 
 Not reached at all.
 
-## `fn a_failed_operation_and_an_unreachable_one_are_different_…` › `runtime.set_reachable(RuntimeOp::InspectImageById);`
+## `fn a_failed_operation_and_an_unreachable_one_are_different_answers() {` › `runtime.set_reachable(RuntimeOp::InspectImageById);`
 
 And back: the toggle is a toggle, so a fixture can restore a runtime
 mid-test — which is what a census that refuses and then succeeds needs.
@@ -1059,12 +1059,12 @@ Second field held constant: one container, one runtime; what varies is only
 what it exited with. Three distinct exit values and two distinct streams, so
 a `collect` that returned a constant fails.
 
-## `fn a_containers_exit_status_and_streams_come_back_through_t…` › `runtime.set_container_state("upstroke-a-b-c-d", Liveness::Exited);`
+## `fn a_containers_exit_status_and_streams_come_back_through_the_seam() {` › `runtime.set_container_state("upstroke-a-b-c-d", Liveness::Exited);`
 
 Liveness is a separate axis from the exit status: a container can be
 observed running while carrying an exit value from its previous state.
 
-## `fn a_containers_exit_status_and_streams_come_back_through_t…` › `assert_eq!(`
+## `fn a_containers_exit_status_and_streams_come_back_through_the_seam() {` › `assert_eq!(`
 
 A container the runtime does not hold is Gone, not an error: that is what
 makes reclaim tolerant of already-gone.
@@ -1074,7 +1074,7 @@ makes reclaim tolerant of already-gone.
 The Docker gate refuses a test nothing counts, and its absence reason says
 what is missing.
 
-## `fn the_docker_gate_refuses_an_uncounted_test_and_names_what…` › `let unlisted = ["a", "test", "nobody", "listed"].join("_");`
+## `fn the_docker_gate_refuses_an_uncounted_test_and_names_what_is_absent() {` › `let unlisted = ["a", "test", "nobody", "listed"].join("_");`
 
 Built rather than written, so `every_docker_gated_test_is_named_and_present`
 — which reads gate call sites out of the source — does not see this
@@ -1104,12 +1104,12 @@ The scan reads every record and skips the writer-owned staged half.
 the rename; adopting it would be adopting a record that was never
 published.
 
-## `fn the_namespace_scan_reads_every_record_and_skips_the_stag…` › `let dir = containers_dir(&fixture.root);`
+## `fn the_namespace_scan_reads_every_record_and_skips_the_staged_half() {` › `let dir = containers_dir(&fixture.root);`
 
 Residue a reader must ignore: a staged half, and a file that is not an
 intent at all.
 
-## `fn the_namespace_scan_reads_every_record_and_skips_the_stag…` › `let mut sorted = found.iter().map(|f| f.name.clone()).collect::<Vec<_>>();`
+## `fn the_namespace_scan_reads_every_record_and_skips_the_staged_half() {` › `let mut sorted = found.iter().map(|f| f.name.clone()).collect::<Vec<_>>();`
 
 Sorted by name, so a census's report is stable across filesystems whose
 directory order is not.
@@ -1144,17 +1144,17 @@ and this census (a red test), and the two fail for different reasons.
 **Lanes A and C: if this test names your file, you are calling the runtime
 or the view directly. Call the funnel instead.**
 
-## `fn every_container_effect_in_the_tree_goes_through_the_funn…` › `const PRIMITIVES: &[&str] = &[`
+## `fn every_container_effect_in_the_tree_goes_through_the_funnel() {` › `const PRIMITIVES: &[&str] = &[`
 
 The effectful primitives, and the only file that may name them.
 
-## `fn every_container_effect_in_the_tree_goes_through_the_funn…` › `if relative == "src/runner/container/fake.rs"`
+## `fn every_container_effect_in_the_tree_goes_through_the_funnel() {` › `if relative == "src/runner/container/fake.rs"`
 
 Test modules of this subtree drive the funnel and may construct a
 fake; they are excluded by name rather than by a pattern, so a new
 one is a change here.
 
-## `fn every_container_effect_in_the_tree_goes_through_the_funn…` › `let funnel = fs::read_to_string(root.join(FUNNEL)).expect("the funnel");`
+## `fn every_container_effect_in_the_tree_goes_through_the_funnel() {` › `let funnel = fs::read_to_string(root.join(FUNNEL)).expect("the funnel");`
 
 The control: the funnel itself names every one of them, so a census that
 had stopped finding anything fails here rather than reporting silence.
@@ -1275,7 +1275,7 @@ state a level only inside a doc comment, that state a level inside a string
 literal, that state each level plainly, and that allow a lint the allowlist
 records for a *different* file.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `const FUNNELS: [&str; 5] = [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `const FUNNELS: [&str; 5] = [`
 
 Every funnel module that allows a governed lint at file scope, and
 therefore every module tree an out-of-line child can inherit one through.
@@ -1310,7 +1310,7 @@ entry exists so that the next one would be.
 Every funnel named here has a directory today, and the assertions below
 require that rather than tolerating it, so no arm of the domain is inert.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `let arm = walk(&directory);`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `let arm = walk(&directory);`
 
 **Per arm, not in aggregate.** A union floor cannot see one arm go
 missing once the other arms are large enough to cover for it: the arms
@@ -1320,14 +1320,14 @@ where the loss happens -- once per arm, over the class rather than
 over the arms that happen to have a named assertion below -- so the
 next funnel root inherits the guard instead of needing its own.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert_eq!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert_eq!(`
 
 Every funnel in the list, not a floor under it. The comment above says
 no arm is inert; this is that sentence asserted rather than believed, and
 a funnel that loses its directory is now the finding it always should
 have been rather than a silently skipped arm.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert!(`
 
 The union backstop stays, and it is a backstop: with the per-arm floor
 above it can no longer be the thing that catches a lost arm, and it is
@@ -1336,7 +1336,7 @@ W2 split adds files to one of these arms and a tightened union count
 would conflict at each merge while binding nothing the per-arm assertion
 does not already bind.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert!(`
 
 `readiness.rs` is in the domain **by name**. A count alone would stay
 green if the walk lost the `src/agent/proc/` arm entirely, and that arm is
@@ -1345,7 +1345,7 @@ there since the `m6-proc` split, so the pin is on this path rather than on
 the arm holding one file: a named path keeps saying the same thing however
 many children the arm grows.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for child in [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for child in [`
 
 And the RunDir funnel's five production children, by name, for the same
 reason: a count would stay green if the walk lost the `src/rundir/` arm
@@ -1353,7 +1353,7 @@ entirely, and those five are what this census was widened for. Named
 rather than counted, because *which* file stopped being graded is the
 finding -- a count survives a swap.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for child in [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for child in [`
 
 And the schema-4 workspace funnel's ten children, by name, for the same
 reason: a count would stay green if the walk lost the
@@ -1364,20 +1364,20 @@ children are named beside the eight the `m4-workspace` split added,
 because they are the two that were inheriting in silence until this entry
 existed.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `let stated = stated_lint_level(&source, lint);`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `let stated = stated_lint_level(&source, lint);`
 
 **A denial or a recorded allowance, and nothing else counts.** A
 `warn` or an `expect` is not a build error, so a module that
 states one has not closed the hole this census is about; it is
 reported as stating nothing rather than quietly accepted.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for funnel in FUNNELS {`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for funnel in FUNNELS {`
 
 The funnels themselves are the files that legitimately carry the allow,
 and each is in the allowlist. Asserted here so "everything denies" cannot
 become true by a funnel quietly denying itself out of existence.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))`
 
 And `readiness.rs` **denies all three at file scope**. It
 allowed one of them until `standards/02_standards_automated_baseline.md`,
@@ -1395,17 +1395,17 @@ for equality by `effects::tests::every_allow_of_a_governed_lint_is_module_\
 level_and_in_the_allowlist`, and this is the same claim read from the
 other end, so a row that grew a second lint fails here too.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert!(closes_the_hole(Some("deny")));`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert!(closes_the_hole(Some("deny")));`
 
 The accept/reject decision, over every level the reader can return --
 including the two this tree does not use, whose arms would otherwise be
 written and never executed.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert_eq!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert_eq!(`
 
 Negative controls: the predicate refuses what it is for.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for item_level in [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for item_level in [`
 
 **Item level is not file level**, and this is the one the scan used to
 accept. A lint level is scoped by the module tree, so an attribute on a
@@ -1413,22 +1413,22 @@ single `fn` governs that `fn` and leaves the rest of the file inheriting
 whatever its ancestors allow -- which is `PR6-LANEF-004` still open,
 reported closed.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert_eq!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert_eq!(`
 
 An inner attribute AFTER the prologue governs nothing above it and is not
 the file module's own statement either.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert_eq!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert_eq!(`
 
 `forbid` is a denial and must read as one; `warn` is not and must not
 read as a level the census accepts.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert_eq!(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert_eq!(`
 
 Both spellings of one lint are one lint, and a prologue of several
 attributes is walked through rather than stopped at.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for (fixture, lint, expected) in [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for (fixture, lint, expected) in [`
 
 **CRLF.** The prologue walk is over bytes, and the guest checks this tree
 out with `\r\n`. Every answer above is taken again over the same
@@ -1436,11 +1436,11 @@ fixtures converted, so a walk that treated `\r` as the first token of an
 item -- and so ended the prologue at the first line break -- fails here
 rather than on the Windows leg.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `for path in [`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `for path in [`
 
 And over the real files the census reads, both spellings.
 
-## `fn every_child_module_of_the_container_funnel_states_its_ow…` › `assert!(allowlist_records(`
+## `fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {` › `assert!(allowlist_records(`
 
 A path that is in the allowlist for one lint does not read as recorded
 for another, and a path that is in it at all does not vouch for a
@@ -1506,18 +1506,18 @@ only version of this census worth having, since an allowance is a claim
 about what a file may reach and a list of five needles can only confirm the
 five it already knows.
 
-## `fn the_readiness_allowance_names_the_paths_it_is_written_ag…` › `assert_eq!(`
+## `fn the_readiness_allowance_names_the_paths_it_is_written_against() {` › `assert_eq!(`
 
 **CRLF.** The guest checks this tree out with `\r\n`, and every count
 above has to be the same there. Converted deterministically from the
 source just read rather than assumed to be line-ending-blind.
 
-## `fn the_readiness_allowance_names_the_paths_it_is_written_ag…` › `let allowlist = fs::read_to_string(root.join("effects/allowlist.toml")).expect("the allow…`
+## `fn the_readiness_allowance_names_the_paths_it_is_written_against() {` › `let allowlist = fs::read_to_string(root.join("effects/allowlist.toml")).expect("the allowlist");`
 
 Both records carry the same two numbers, read through the wrapping and
 the line endings rather than around them.
 
-## `fn the_readiness_allowance_names_the_paths_it_is_written_ag…` › `let collapsed_row = collapsed_prose(row);`
+## `fn the_readiness_allowance_names_the_paths_it_is_written_against() {` › `let collapsed_row = collapsed_prose(row);`
 
 And the row names each path it is written against, so the record is a
 closed set on its own side too.
@@ -1547,13 +1547,13 @@ the call site is what names the test rather than the byte after the
 paren. Measured: with a contiguous `gate("` needle this census found
 **zero** call sites and reported the whole list as missing.
 
-## `const PREFERRED_IMAGES: &[&str] = &["alpine:3.20", "busybox:latest", "debian:stable-slim"…`
+## `const PREFERRED_IMAGES: &[&str] = &["alpine:3.20", "busybox:latest", "debian:stable-slim"];`
 
 ---------------------------------------------------------------------------
 8. Docker-gated: the real runtime
 ---------------------------------------------------------------------------
 
-## `const PREFERRED_IMAGES: &[&str] = &["alpine:3.20", "busybox:latest", "debian:stable-slim"…`
+## `const PREFERRED_IMAGES: &[&str] = &["alpine:3.20", "busybox:latest", "debian:stable-slim"];`
 
 The references the gated tests prefer, in order.
 
@@ -1564,7 +1564,7 @@ the very runtime it is meant to prove the refusal against. So the image is
 none reports absence through the same loud, counted gate as a machine with
 no Docker at all.
 
-## `fn gated_image(docker: &dyn ContainerRuntime) -> Result<(String, ImageInspection), String…`
+## `fn gated_image(docker: &dyn ContainerRuntime) -> Result<(String, ImageInspection), String> {`
 
 A reference the runtime holds, with its id and digest, or the reason there
 is none.
@@ -1574,7 +1574,7 @@ is none.
 The real runtime resolves a reference it holds to an id and, when it has
 one, a manifest digest.
 
-## `fn real_docker_reports_an_image_id_and_a_digest_for_a_refer…` › `let by_id = docker`
+## `fn real_docker_reports_an_image_id_and_a_digest_for_a_reference_it_holds() {` › `let by_id = docker`
 
 The same image asked for by id gives the same id back, and a prefix of it
 does not answer this question.
@@ -1605,22 +1605,22 @@ view is a bind-mount **source** of that call, and Docker requires a bind
 source to exist at create time — so `launch` could not produce a working
 container with a Git view at all, and this test passed anyway.
 
-## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_i…` › `mounts: vec![Mount::Path {`
+## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {` › `mounts: vec![Mount::Path {`
 
 The R19 view, as a REAL bind mount whose source is the directory
 `Container.MountGitView` materialises. This is the mount the
 daemon refuses if the view is not there when the container is
 created, and it is what makes this test able to see the ordering.
 
-## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_i…` › `let _ = reclaim(`
+## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {` › `let _ = reclaim(`
 
 Leave nothing behind even when the launch itself failed.
 
-## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_i…` › `let discovered = docker`
+## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {` › `let discovered = docker`
 
 Discovery finds it by `upstroke.private_root`, with its five labels.
 
-## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_i…` › `for round in 0..2 {`
+## `fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {` › `for round in 0..2 {`
 
 Reclaim, twice: idempotent and tolerant of already-gone.
 
@@ -1640,11 +1640,11 @@ issues — and asserts both that the phrase is still there and that the seam's
 Second field held constant: the same container, in one state; what varies is
 whether the question is asked raw or through the seam.
 
-## `fn real_docker_kill_on_an_already_exited_container_is_toler…` › `let raw = docker`
+## `fn real_docker_kill_on_an_already_exited_container_is_tolerated() {` › `let raw = docker`
 
 The raw answer, from the daemon, verbatim.
 
-## `fn real_docker_kill_on_an_already_exited_container_is_toler…` › `docker`
+## `fn real_docker_kill_on_an_already_exited_container_is_tolerated() {` › `docker`
 
 And through the seam, which is what a reclaimer calls: it converges.
 
@@ -1690,23 +1690,23 @@ The intersection: {a volume the run created} × {a volume the operator owns}.
 discharge of R26 rather than a violation of R20 — and the R20 half is
 asserted here too, with a named volume that must survive.
 
-## `fn real_docker_removing_a_container_reclaims_its_anonymous_…` › `let _ = docker.raw(`
+## `fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {` › `let _ = docker.raw(`
 
 R20's half: a NAMED volume the operator owns, mounted into the same
 container. `--volumes` must not touch it.
 
-## `fn real_docker_removing_a_container_reclaims_its_anonymous_…` › `"--volume",`
+## `fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {` › `"--volume",`
 
 An ANONYMOUS volume: `CreateSpec::Mount::Volume` cannot express
 one because it requires a name, which is why this goes through
 the test-only raw accessor.
 
-## `fn real_docker_removing_a_container_reclaims_its_anonymous_…` › `assert!(`
+## `fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {` › `assert!(`
 
 The control: it really is there before the removal, so this test cannot
 pass by never having created one.
 
-## `fn real_docker_removing_a_container_reclaims_its_anonymous_…` › `let _ = docker.raw(`
+## `fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {` › `let _ = docker.raw(`
 
 Clean up before asserting, so a failure does not leave the daemon dirty.
 
@@ -1726,7 +1726,7 @@ under the wrong name, which for `upstroke.run_dir` is a probe of another run's
 lock. The oracle is the format string's own text, scanned for `{{.Label
 "…"}}` — an independent derivation from `PS_LABELS`, not a restatement.
 
-## `fn the_ps_format_asks_for_exactly_the_labels_the_parser_nam…` › `assert!(PS_FORMAT.starts_with("{{.Names}}"));`
+## `fn the_ps_format_asks_for_exactly_the_labels_the_parser_names() {` › `assert!(PS_FORMAT.starts_with("{{.Names}}"));`
 
 The name field, and exactly one separator per field boundary.
 
@@ -1743,7 +1743,7 @@ Second field held constant: every line carries the same container name and
 the same four other labels; only `upstroke.run_dir`'s bytes move, across
 values that are and are not hostile to a comma-joined format.
 
-## `fn a_label_value_carrying_a_comma_or_an_equals_is_read_whol…` › `"/repo/a,b/.upstroke/runs/B",`
+## `fn a_label_value_carrying_a_comma_or_an_equals_is_read_whole() {` › `"/repo/a,b/.upstroke/runs/B",`
 
 Not values `path_label` emits — a foreign container may carry
 anything, and the parser must still read the field it was given
@@ -1819,7 +1819,7 @@ it, a racing reclaimer's tolerated error would become "the runtime cannot be
 reached" and refuse the write command. Asserted over both tables at once so
 a future entry in either is checked against the other.
 
-## `fn the_two_docker_diagnostic_tables_never_claim_one_message…` › `let racing =`
+## `fn the_two_docker_diagnostic_tables_never_claim_one_message() {` › `let racing =`
 
 And the one message that is *most* at risk: a racing reclaimer's kill.
 
@@ -1869,7 +1869,7 @@ It drives `docker` directly rather than through [`DockerCli`], because
 `DOCKER_HOST` is process-wide and the seam deliberately configures no
 socket (`non_goals[3]`, "remote runners").
 
-## `fn real_docker_prints_the_transcribed_unreachable_diagnosti…` › `let denied = {`
+## `fn real_docker_prints_the_transcribed_unreachable_diagnostics() {` › `let denied = {`
 
 A socket path this process may not reach into. `chmod 000` is the
 deterministic way to produce the *permission* diagnostic without a second
@@ -1926,15 +1926,15 @@ disallowed type.
 Second field held constant: one directory, one probe, one process asking;
 only whether the owner process is alive moves.
 
-## `fn the_production_lock_probe_sees_a_lock_another_process_ho…` › `assert!(`
+## `fn the_production_lock_probe_sees_a_lock_another_process_holds() {` › `assert!(`
 
 Before: nobody holds it.
 
-## `fn the_production_lock_probe_sees_a_lock_another_process_ho…` › `let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);`
+## `fn the_production_lock_probe_sees_a_lock_another_process_holds() {` › `let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);`
 
 Wait for it to say it has the lock rather than sleeping and hoping.
 
-## `fn the_production_lock_probe_sees_a_lock_another_process_ho…` › `let started = std::time::Instant::now();`
+## `fn the_production_lock_probe_sees_a_lock_another_process_holds() {` › `let started = std::time::Instant::now();`
 
 Held, and the probe says so **and returns**: `T-CONTAINER.resume_action`
 is "probe the owner's run.lock **non-blocking**", so this call is the one
@@ -1942,7 +1942,7 @@ a blocking implementation would never come back from. The bound is
 generous — it is here to fail a `LockProbe` that waits, not to measure
 one that does not.
 
-## `fn the_production_lock_probe_sees_a_lock_another_process_ho…` › `let _ = child.kill();`
+## `fn the_production_lock_probe_sees_a_lock_another_process_holds() {` › `let _ = child.kill();`
 
 And the answer follows the world rather than being a constant: once the
 owner is gone the same directory reads free. Without this half a probe
@@ -1975,14 +1975,14 @@ claim about the tree rather than about a call. It is the shape
 other half of this same seam. The behavioural halves are the two tests
 below.
 
-## `fn every_view_discard_removes_through_the_one_racing_remova…` › `const SUBSTRATE: &[&str] = &[`
+## `fn every_view_discard_removes_through_the_one_racing_removal() {` › `const SUBSTRATE: &[&str] = &[`
 
 The out-of-line test substrate of this subtree, excluded **by name**
 rather than by a pattern, so a new one is a change here. Everything else
 is cut at its first `#[cfg(test)]` by `production_region`; these files
 have none, being test modules in their entirety.
 
-## `fn every_view_discard_removes_through_the_one_racing_remova…` › `let production =`
+## `fn every_view_discard_removes_through_the_one_racing_removal() {` › `let production =`
 
 Strings blanked as well: this test's own doc comment and the literal
 it scans for would otherwise be findings about itself. Whitespace
@@ -2020,7 +2020,7 @@ only one of them is transient. Skipped under a uid that ignores the bit.
 Second field held constant: the same view, the same path, the same content;
 only the parent's permissions move.
 
-## `fn a_role_view_that_cannot_be_removed_refuses_and_records_n…` › `let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));`
+## `fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {` › `let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));`
 
 Running as root, or on a filesystem that ignores the mode. Restore
 and say so rather than asserting something that is not true here.
@@ -2055,18 +2055,18 @@ moves.
 `rt:create` and no `site:Create` entry at all, so the refusal precedes even
 the funnel's `Before` phase.
 
-## `fn a_create_whose_named_volume_is_absent_is_refused_before_…` › `const CREDENTIALS: &[(&str, &str)] = &[`
+## `fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {` › `const CREDENTIALS: &[(&str, &str)] = &[`
 
 Three agents, three volume names — all distinct, so a check that
 inspected the wrong one is visible.
 
-## `fn a_create_whose_named_volume_is_absent_is_refused_before_…` › `fixture.runtime.set_unreachable(RuntimeOp::InspectVolume);`
+## `fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {` › `fixture.runtime.set_unreachable(RuntimeOp::InspectVolume);`
 
 Only the volume inspection is armed: the whole daemon being
 down is a different refusal, and this cell is about a runtime
 that answers everything else and will not answer this.
 
-## `fn a_create_whose_named_volume_is_absent_is_refused_before_…` › `assert!(`
+## `fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {` › `assert!(`
 
 **Before ANY effect, asserted first.** This fake happens to
 refuse an absent mounted volume too, and a real daemon does the
@@ -2076,7 +2076,7 @@ claim that belongs to the engine: the create site was never
 entered at all, which is only true of a check that runs before
 the funnel.
 
-## `fn a_create_whose_named_volume_is_absent_is_refused_before_…` › `if reachable {`
+## `fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {` › `if reachable {`
 
 And nothing was created on the way past: the other two volumes
 are still exactly the two the fixture provisioned.
@@ -2096,11 +2096,11 @@ why the check lives in `create_container`.
 Second field held constant: the same image and the same container name in
 both halves; only whether the volume was provisioned first moves.
 
-## `fn real_docker_creates_an_absent_named_volume_rather_than_r…` › `assert!(`
+## `fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {` › `assert!(`
 
 The premise: it is not there.
 
-## `fn real_docker_creates_an_absent_named_volume_rather_than_r…` › `let _ = docker.remove(name);`
+## `fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {` › `let _ = docker.remove(name);`
 
 Clean up before asserting.
 
@@ -2152,22 +2152,22 @@ one string repeated. The `Unreachable` cell carries tolerable *text*,
 because a runtime that could not be reached said nothing about the
 container.
 
-## `fn a_removal_answer_meaning_already_in_progress_is_tolerate…` › `assert!(`
+## `fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_is_not() {` › `assert!(`
 
 The clause is its own predicate, and it is not covered by absence: the
 in-progress answer contains none of the "no such …" shapes.
 
-## `fn a_removal_answer_meaning_already_in_progress_is_tolerate…` › `assert!(super::remove_already_settled(`
+## `fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_is_not() {` › `assert!(super::remove_already_settled(`
 
 Case-insensitively, because a vendor that recapitalises its prose must
 not turn a convergence into a refusal.
 
-## `fn a_removal_answer_meaning_already_in_progress_is_tolerate…` › `assert!(super::stop_already_settled(DAEMON_REMOVAL_IN_PROGRESS));`
+## `fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_is_not() {` › `assert!(super::stop_already_settled(DAEMON_REMOVAL_IN_PROGRESS));`
 
 A `docker kill` racing a removal gets the same answer, and it is on its
 way out either way.
 
-## `fn a_removal_answer_meaning_already_in_progress_is_tolerate…` › `assert_eq!(super::settle_remove(Ok("upstroke-c\n".to_owned())), Ok(()));`
+## `fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_is_not() {` › `assert_eq!(super::settle_remove(Ok("upstroke-c\n".to_owned())), Ok(()));`
 
 The control: a removal that simply worked.
 
@@ -2188,25 +2188,25 @@ in which no racer loses is reported as a skip of the measurement rather than
 as a pass, so a machine fast enough to serialise them cannot make this
 vacuously green.
 
-## `fn real_docker_prints_the_transcribed_removal_in_progress_d…` › `for _ in 0..4 {`
+## `fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {` › `for _ in 0..4 {`
 
 A few attempts: the race is real and a machine may serve one removal
 before the others are issued.
 
-## `fn real_docker_prints_the_transcribed_removal_in_progress_d…` › `std::thread::sleep(std::time::Duration::from_millis(1_500));`
+## `fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {` › `std::thread::sleep(std::time::Duration::from_millis(1_500));`
 
 Let it write, so the removal has something to tear down.
 
-## `fn real_docker_prints_the_transcribed_removal_in_progress_d…` › `return no_image(`
+## `fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {` › `return no_image(`
 
 Not a pass: the measurement did not happen, and this says so in the
 same voice a missing image does.
 
-## `fn real_docker_prints_the_transcribed_removal_in_progress_d…` › `assert!(`
+## `fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {` › `assert!(`
 
 (a) The transcribed table names the same shape the daemon printed.
 
-## `fn real_docker_prints_the_transcribed_removal_in_progress_d…` › `assert_eq!(`
+## `fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {` › `assert_eq!(`
 
 (b) The production tolerance settles it.
 
@@ -2245,6 +2245,6 @@ Second field held constant: the launch succeeds identically in all four
 cells — same image ids, same plan, no substitution — so what varies is only
 which release step was armed.
 
-## `fn a_release_whose_cleanup_fails_still_attempts_every_remai…` › `assert!(!fixture.runtime.container_names().is_empty());`
+## `fn a_release_whose_cleanup_fails_still_attempts_every_remaining_step() {` › `assert!(!fixture.runtime.container_names().is_empty());`
 
 The control: everything the release has to remove is really there.

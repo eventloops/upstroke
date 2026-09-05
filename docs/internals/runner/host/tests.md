@@ -135,9 +135,11 @@ The refusal is `expected_failures_refusals[0]`: "reserved env conflict
 
 ## `fn a_reserved_key_in_the_overlay_is_a_preflight_error()` › `let expected_reserved = [`
 
-Written out from DESIGN.md:260-262 ("role-scoped HOME, PATH, and
-credential locations") and capacity.rs:36-37, not read from
-`reserved_keys()`.
+Written out from DESIGN.md §8's runner contract for role-scoped HOME, PATH,
+and credential locations. The capacity module's credential-profile
+documentation, `src/capacity.rs` and its notes pointer where present, names
+`COPILOT_HOME` and `CLAUDE_CONFIG_DIR`. The third adapter fixture names
+`CODEX_HOME`. The expected table does not read `reserved_keys()`.
 
 ## `fn a_reserved_key_is_refused_at_every_position_in_the_overlay() {`
 
@@ -153,12 +155,12 @@ which is a claim quantified over the whole vector.
 The grid is the positions a conflict can occupy in an overlay of four:
 first, two interior, and last.
 
-## `fn a_reserved_key_is_refused_at_every_position_in_the_overl…` › `let harmless: Vec<(String, String)> = HARMLESS`
+## `fn a_reserved_key_is_refused_at_every_position_in_the_overlay() {` › `let harmless: Vec<(String, String)> = HARMLESS`
 
 The control: four harmless pairs compose, so a refusal below is
 the reserved key and not the shape of the overlay.
 
-## `fn a_reserved_key_is_refused_at_every_position_in_the_overl…` › `assert_eq!(refusals, 6 * 4 * KeyCase::ALL.len());`
+## `fn a_reserved_key_is_refused_at_every_position_in_the_overlay() {` › `assert_eq!(refusals, 6 * 4 * KeyCase::ALL.len());`
 
 Six keys x four positions x two key cases, counted so a grid that
 quietly stopped traversing fails here rather than passing smaller.
@@ -176,12 +178,12 @@ it breaks silently the day the runner's value changes. Every other
 reserved-key fixture supplies a *different* value (`/tmp/hijacked`,
 `/nowhere`, `C:\hijack`), so equality is the one case they cannot see.
 
-## `fn windows_treats_reserved_keys_case_insensitively_and_unix…` › `let overlay = vec![("Path".to_owned(), "C:\\hijack".to_owned())];`
+## `fn windows_treats_reserved_keys_case_insensitively_and_unix_does_not() {` › `let overlay = vec![("Path".to_owned(), "C:\\hijack".to_owned())];`
 
 The platform axis is a value here, not a `cfg!`. Both arms are
 reached on every host, so a Linux cell proves the Windows rule.
 
-## `fn windows_treats_reserved_keys_case_insensitively_and_unix…` › `let composed = insensitive`
+## `fn windows_treats_reserved_keys_case_insensitively_and_unix_does_not() {` › `let composed = insensitive`
 
 And the same-key rule is what decides an upsert, not only a refusal.
 
@@ -219,7 +221,7 @@ exist because equality between two empty environments is also equality:
 one comes only from the base, the other only from the overlay, and both
 must arrive.
 
-## `fn a_probe_child_and_an_execution_child_of_one_adapter_carr…` › `let execution = crate::runner::worker_request(`
+## `fn a_probe_child_and_an_execution_child_of_one_adapter_carry_the_same_environment() {` › `let execution = crate::runner::worker_request(`
 
 The worker half comes from production's builder, so the request this
 compares against the probe is the request an attempt sends: the
@@ -252,13 +254,13 @@ base, one that can only have come from the overlay, and the credential
 location, which can only have come from the **binding** — which is the
 one the finding is about, and the one a stripped binding removes.
 
-## `fn every_credential_supplied_role_composes_one_environment_…` › `for (_, key) in CREDENTIAL_LOCATIONS {`
+## `fn every_credential_supplied_role_composes_one_environment_per_binding() {` › `for (_, key) in CREDENTIAL_LOCATIONS {`
 
 A credential location already in the base, which is the failure
 sequence's own starting state: composition strips reserved keys, and
 only the agent binding can put the value back.
 
-## `fn every_credential_supplied_role_composes_one_environment_…` › `assert!(`
+## `fn every_credential_supplied_role_composes_one_environment_per_binding() {` › `assert!(`
 
 The binding's own contribution. `key` is a reserved key, so a
 child carrying it carries a value composition put there —
@@ -303,20 +305,20 @@ five roles — a role dropped from both would be unasserted while every
 remaining assertion passed — so their union is compared against
 `ExecutionRole::all()` as a set, and not merely counted.
 
-## `fn the_reserved_values_every_role_gets_are_the_host_boundar…` › `let agent = AgentId::new(claude::ADAPTER_ID);`
+## `fn the_reserved_values_every_role_gets_are_the_host_boundarys_own() {` › `let agent = AgentId::new(claude::ADAPTER_ID);`
 
 The agent `ExecutionRole::all()` names, so the groups below can be
 compared against it as sets rather than by length alone.
 
-## `fn the_reserved_values_every_role_gets_are_the_host_boundar…` › `let from_the_boundary = ["PATH", "HOME", "USERPROFILE"];`
+## `fn the_reserved_values_every_role_gets_are_the_host_boundarys_own() {` › `let from_the_boundary = ["PATH", "HOME", "USERPROFILE"];`
 
 Written here, not read from RESERVED_ALWAYS: the set is the claim.
 
-## `fn the_reserved_values_every_role_gets_are_the_host_boundar…` › `let in_the_base = |key: &str| -> OsString {`
+## `fn the_reserved_values_every_role_gets_are_the_host_boundarys_own() {` › `let in_the_base = |key: &str| -> OsString {`
 
 The independent oracle: the base this fixture wrote.
 
-## `fn the_reserved_values_every_role_gets_are_the_host_boundar…` › `let certified: &[(&str, Vec<ExecutionRole>)] = &[`
+## `fn the_reserved_values_every_role_gets_are_the_host_boundarys_own() {` › `let certified: &[(&str, Vec<ExecutionRole>)] = &[`
 
 The roles each passage holds together, and the passage, so a failure
 names the sentence that was broken.
@@ -349,12 +351,12 @@ value of each of the three credential keys is written from the rule
 ("the bound agent's location, and only for a role that runs an agent
 CLI"), not read from `supplies_credentials` or `reserved_values`.
 
-## `fn compose_gives_a_child_the_credential_location_of_its_own…` › `let runs_an_agent_cli = |role: &ExecutionRole| match role {`
+## `fn compose_gives_a_child_the_credential_location_of_its_own_agent_and_no_other() {` › `let runs_an_agent_cli = |role: &ExecutionRole| match role {`
 
 Written from what each role executes, exactly as
 `credential_locations_are_role_scoped` writes it.
 
-## `fn compose_gives_a_child_the_credential_location_of_its_own…` › `for (key, expected) in [`
+## `fn compose_gives_a_child_the_credential_location_of_its_own_agent_and_no_other() {` › `for (key, expected) in [`
 
 And the keys that come from the host boundary itself are
 still there, for every role: DESIGN.md:262 names HOME
@@ -364,11 +366,11 @@ roles (see
 `the_reserved_values_every_role_gets_are_the_host_boundarys_own`
 for the passages that decide that).
 
-## `fn compose_gives_a_child_the_credential_location_of_its_own…` › `for (key, expected) in [("LANG", "C.UTF-8"), ("UPSTROKE_RUN", "01ABCDEF")] {`
+## `fn compose_gives_a_child_the_credential_location_of_its_own_agent_and_no_other() {` › `for (key, expected) in [("LANG", "C.UTF-8"), ("UPSTROKE_RUN", "01ABCDEF")] {`
 
 Nothing else was dropped on the way through.
 
-## `fn compose_gives_a_child_the_credential_location_of_its_own…` › `assert_eq!(supplied_count + denied_count, 2 * 5 * 5 * 3);`
+## `fn compose_gives_a_child_the_credential_location_of_its_own_agent_and_no_other() {` › `assert_eq!(supplied_count + denied_count, 2 * 5 * 5 * 3);`
 
 Hostility as counts: 2 rules x 5 roles x 5 agents x 3 keys = 150
 decisions, and both answers really occur.
@@ -443,23 +445,25 @@ deliberately yields. The subprocess adds an entry chosen to be
 awkward, so the equality is not satisfied merely by an environment with
 nothing interesting in it.
 
-## `fn the_base_of_a_process_environment_is_the_process_environ…` › `"runner::host::tests::base_witness_helper",`
+## `fn the_base_of_a_process_environment_is_the_process_environment() {` › `"runner::host::tests::base_witness_helper",`
 
 The **full path**. `--exact` matches the whole test name, so a
 bare `base_witness_helper` filters all 932 tests out and the
 child exits 0 having run nothing — a subprocess witness that
 witnesses nothing, and a green one.
 
-## `fn the_base_of_a_process_environment_is_the_process_environ…` › `assert!(`
+## `fn the_base_of_a_process_environment_is_the_process_environment() {` › `assert!(`
 
 Assert the **count**, never a bare `ok`: `ok. 0 passed` is what a
 filter that matched nothing prints, and it is indistinguishable from
 success at the exit code.
 
-## `fn the_credential_location_is_the_bound_agents_and_no_other…` › `for (agent, key, expected) in [`
+## `fn the_credential_location_is_the_bound_agents_and_no_others_value() {` › `for (agent, key, expected) in [`
 
-An independent table: adapter id -> the vendor's config-directory
-variable (capacity.rs:36-37 for two of the three).
+An independent table maps each adapter id to its config-directory variable.
+The capacity module's credential-profile documentation, `src/capacity.rs`
+and its notes pointer where present, supplies `COPILOT_HOME` and
+`CLAUDE_CONFIG_DIR`. The Codex fixture separately names `CODEX_HOME`.
 
 ## `struct ParityFixture {`
 
@@ -648,22 +652,22 @@ The resumed shape is carried too: `codex exec resume <id>` moves the
 subcommand's position, so a check on `args[0]` and one on "is this an
 exec" are different predicates.
 
-## `fn the_runner_returns_the_childs_whole_output_for_every_pro…` › `for adapter in crate::agent::ADAPTERS {`
+## `fn the_runner_returns_the_childs_whole_output_for_every_production_request_shape() {` › `for adapter in crate::agent::ADAPTERS {`
 
 The probe role too: pre-flight reads a CLI's own answer, and a
 truncated one is a capability read wrong rather than lost work.
 
-## `fn the_runner_returns_the_childs_whole_output_for_every_pro…` › `let script = if cfg!(windows) {`
+## `fn the_runner_returns_the_childs_whole_output_for_every_production_request_shape() {` › `let script = if cfg!(windows) {`
 
 And the unbound role, whose program is the recorded shell rather than
 a located CLI — the other half of the program-shape partition.
 
-## `fn the_runner_returns_the_childs_whole_output_for_every_pro…` › `TRANSPARENT_STDERR`
+## `fn the_runner_returns_the_childs_whole_output_for_every_production_request_shape() {` › `TRANSPARENT_STDERR`
 
 Redirection first, for the trailing-space reason on
 `transparency_shim`.
 
-## `fn the_runner_returns_the_childs_whole_output_for_every_pro…` › `assert_eq!(`
+## `fn the_runner_returns_the_childs_whole_output_for_every_production_request_shape() {` › `assert_eq!(`
 
 Hostility as counts, not prose.
 
@@ -698,11 +702,11 @@ The expected bound is written here (16 MiB per stream) rather than read
 from `proc`, so raising the constant to `usize::MAX` — or to anything
 else — fails here rather than agreeing with itself.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `const EXPECTED_LIMIT: usize = 16 * 1024 * 1024;`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `const EXPECTED_LIMIT: usize = 16 * 1024 * 1024;`
 
 `proc::OUTPUT_LIMIT_BYTES`, transcribed. Per stream.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `const HELPER_BUDGET: usize = 64 * 1024 * 1024;`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `const HELPER_BUDGET: usize = 64 * 1024 * 1024;`
 
 How much the helper writes before exiting, as a decimal byte count.
 
@@ -715,22 +719,22 @@ of memory and taking the whole test binary with it. A budget set
 *below* `EXPECTED_LIMIT` would fail this test's own
 `output_limited` assertion, so it cannot drift silently.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `let mut direct = Command::new(&exe);`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `let mut direct = Command::new(&exe);`
 
 (a) The direct entry point, which is what the legacy engine used
 before this slice.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `let workspace = scratch("output-limit");`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `let workspace = scratch("output-limit");`
 
 (b) The same child through the Runner.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `env: vec![(`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `env: vec![(`
 
 Not a reserved key: the helper reads it to decide it is the
 helper rather than an ordinary test run, and to size its
 output.
 
-## `fn the_runner_bounds_output_at_the_same_allowance_the_direc…` › `assert!(`
+## `fn the_runner_bounds_output_at_the_same_allowance_the_direct_funnel_does() {` › `assert!(`
 
 And it really did have to *reach* the allowance: a limit of zero
 would also satisfy the bound above.
@@ -799,12 +803,12 @@ certifies a shell that did not run `exit 0`.
 The grid is written from those three fields rather than from
 `run_shell_probe`'s branches, so a field it stops reading fails here.
 
-## `fn a_shell_probe_that_did_not_exit_zero_is_a_preflight_erro…` › `name: "killed, with no exit code and no timeout",`
+## `fn a_shell_probe_that_did_not_exit_zero_is_a_preflight_error_however_it_failed() {` › `name: "killed, with no exit code and no timeout",`
 
 Killed by a signal, or by anything else that leaves no exit
 code: `None` is not `Some(0)` and must not be read as one.
 
-## `fn a_shell_probe_that_did_not_exit_zero_is_a_preflight_erro…` › `name: "output-limited after exiting zero",`
+## `fn a_shell_probe_that_did_not_exit_zero_is_a_preflight_error_however_it_failed() {` › `name: "output-limited after exiting zero",`
 
 The bounded-output contract terminated the owned tree; the
 funnel can still report the code the leader exited with,
@@ -920,13 +924,13 @@ match run_shell_probe(self, shell, workspace.to_path_buf(), invocation) {
 survives every remaining case — (a) succeeds, (c) has no workspace, (d)
 does not use the method, and (e) does not spawn.
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `runner`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `runner`
 
 (a) The recorded shell, actually spawned. `gates::shell_available`
 is a PATH check; this is a spawn, which is the only thing that
 establishes availability (packet finding F-43 / V14-VERIFY-004).
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `let empty_path_dir = scratch("empty-path");`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `let empty_path_dir = scratch("empty-path");`
 
 (b) A recorded shell that is **missing**, with the workspace that
 (a) just used still in place, through the same method — the
@@ -935,7 +939,7 @@ has to be constructed out of both `PATH`s and one of them is the
 process's; see [`shell_probe_missing_shell_helper`], which holds the
 assertions.
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));`
 
 (c) and (d): the other two ways the host can fail to complete a
 probe, neither of which is a claim about what happens to be
@@ -943,7 +947,7 @@ installed. Both fail because of something this test constructs and
 then checks, so they fail identically on a machine with every shell
 in existence installed.
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));`
 
 (c) The recorded shell, asked to run in a directory that is not
 there. `HostRunner::run` gives every child an absolute
@@ -956,7 +960,7 @@ surface as `Err` from `Command::spawn`, which is the same production
 path an absent shell binary takes, and the caller must be handed a
 pre-flight error naming the shell rather than an `Ok`.
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `let mut request = shell_probe_request(native(), workspace.clone(), shell_probe_invocation…`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `let mut request = shell_probe_request(native(), workspace.clone(), shell_probe_invocation());`
 
 (d) The missing-program fault at the `Runner::run` layer, expressed
 so that no installed program can satisfy it: an absolute path inside
@@ -968,7 +972,7 @@ nothing at the name. (b) is the same fault one layer up, through the
 method and against the recorded shell, which is what the contract
 names; this one pins the layer beneath it.
 
-## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_…` › `let refusing = StubRunner(Box::new(|| Ok(stub_output(Some(127), false))));`
+## `fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {` › `let refusing = StubRunner(Box::new(|| Ok(stub_output(Some(127), false))));`
 
 (e) A shell that runs and refuses, and one that hangs. Both are
 pre-flight errors and neither is a `ProcessOutput` the caller has to
@@ -1025,17 +1029,17 @@ pre-resume coordinate for a hook that fires after the child can execute.
 The expected sequence is transcribed from that sentence, not read back
 from the funnel.
 
-## `fn the_containment_points_of_a_spawn_fire_in_the_packets_or…` › `vec![`
+## `fn the_containment_points_of_a_spawn_fire_in_the_packets_order() {` › `vec![`
 
 `AmbientJobJoined` is a write-command startup step rather than a
 per-spawn one, so a spawn reaches the other three.
 
-## `fn the_containment_points_of_a_spawn_fire_in_the_packets_or…` › `assert_eq!(`
+## `fn the_containment_points_of_a_spawn_fire_in_the_packets_order() {` › `assert_eq!(`
 
 Each point once: a point consulted twice at one spawn would make the
 sequence above ambiguous about which coordinate it names.
 
-## `fn windows_containment_points_execute_and_unix_points_do_no…` › `for point in &[`
+## `fn windows_containment_points_execute_and_unix_points_do_not() {` › `for point in &[`
 
 `AmbientJobJoined` is a write-command startup step, not a per-spawn
 one, so it is not reached by running a command; it is exercised by
@@ -1083,11 +1087,11 @@ In the forked child, before `exec`.
 
 In the child, at `exec` itself.
 
-## `fn the_two_points_whose_operation_is_not_parent_side_are_na…` › `let table: &[(SubEffectPoint, Coordinate, Coordinate)] = &[`
+## `fn the_two_points_whose_operation_is_not_parent_side_are_named_and_counted() {` › `let table: &[(SubEffectPoint, Coordinate, Coordinate)] = &[`
 
 (point, where the operation happens, where the injection is controlled)
 
-## `fn the_two_points_whose_operation_is_not_parent_side_are_na…` › `for point in &elsewhere {`
+## `fn the_two_points_whose_operation_is_not_parent_side_are_named_and_counted() {` › `for point in &elsewhere {`
 
 The reason, asserted rather than described: both declare `Kill`
 alone, and `Kill` is a coordinator death. The expected modes are the
@@ -1148,7 +1152,7 @@ inventory, so the only way to lose a point from both is to delete it
 from the `topology::effects` inventory (`vocab.rs` holds the points since
 that module was split).
 
-## `fn the_startup_and_per_spawn_domains_partition_this_platfor…` › `let expected: &[SubEffectPoint] = if cfg!(windows) {`
+## `fn the_startup_and_per_spawn_domains_partition_this_platforms_points() {` › `let expected: &[SubEffectPoint] = if cfg!(windows) {`
 
 Derived, not transcribed: the domain agrees with the packet's own
 platform split for this host.
@@ -1230,7 +1234,7 @@ native executable, and `CreateProcessW`/`execve` reach both only through
 an interpreter — which is precisely why a runner that treats them as a
 different kind of program is a defect this suite has to be able to see.
 
-## `fn forwarding_shim(dir: &Path, name: &str) -> String` › `std::fs::write(&path, format!("@echo off\r\n\"{exe}\" %*\r\n"))`
+## `fn forwarding_shim(dir: &Path, name: &str) -> String` › `format!("@echo off\r\n\"{exe}\" %*\r\n")`
 
 `@echo off` so the batch text itself does not reach stdout, and
 the target quoted because its own path may contain a space.
@@ -1464,7 +1468,7 @@ assertion rather than left to silence: the day production carries an
 overlay, this row has to become a varying dimension like the four
 above, and this is what says so.
 
-## `fn the_role_grid_sends_the_shapes_production_sends()` › `let workspaces: BTreeSet<&Path> = requests.iter().map(|r| r.workspace.as_path()).collect(…`
+## `fn the_role_grid_sends_the_shapes_production_sends()` › `let workspaces: BTreeSet<&Path> = requests.iter().map(|r| r.workspace.as_path()).collect();`
 
 Field 8: the workspace. Two distinct values, and which is which is
 production's: a probe has no workspace of its own and runs in the
@@ -1498,7 +1502,7 @@ them. `InvocationId::Sequence` has no production call site in this slice
 `ordinal` is always 0, because `engine::attempt::AttemptCx::invocation`
 says why: "nothing inside one attempt runs a given role twice".
 
-## `fn every_production_invocation_identity_reaches_the_contain…` › `let grid: BTreeSet<String> = ExecutionRole::all()`
+## `fn every_production_invocation_identity_reaches_the_containment_points() {` › `let grid: BTreeSet<String> = ExecutionRole::all()`
 
 Every identity here renders differently from every identity the role
 grid sends, or this test would be re-proving the grid.
@@ -1550,11 +1554,11 @@ Same two claims as every other axis in this file — the points are
 reached, and the observer's answer is honoured — so a shape that is
 merely *observed* and not *injectable* fails here too.
 
-## `fn every_production_program_shape_reaches_the_containment_p…` › `assert_eq!(`
+## `fn every_production_program_shape_reaches_the_containment_points() {` › `assert_eq!(`
 
 The axes, as counts, so the list cannot shrink in silence.
 
-## `fn every_production_program_shape_reaches_the_containment_p…` › `let mut injections = 0_usize;`
+## `fn every_production_program_shape_reaches_the_containment_points() {` › `let mut injections = 0_usize;`
 
 And the observer's answer is honoured for every shape, at every
 point — observation and injection are two claims.
@@ -1577,7 +1581,7 @@ shell by production's own rule, which
 that handed a gate an agent shim would be asserting something production
 never does.
 
-## `fn the_cli_roles_of_the_grid_run_a_shim_shaped_program_thro…` › `std::fs::create_dir_all(&request.workspace).expect("the request's workspace");`
+## `fn the_cli_roles_of_the_grid_run_a_shim_shaped_program_through_the_funnel() {` › `std::fs::create_dir_all(&request.workspace).expect("the request's workspace");`
 
 A probe chooses its own workspace, so the run has to happen where
 the request says rather than where this test would prefer.
@@ -1630,18 +1634,18 @@ proof. This is the runtime proof, and it is asserted for all five roles
 rather than for the two the count names, because a suppression keyed on
 any single role is the same defect.
 
-## `fn every_role_reaches_the_containment_points_of_this_platfo…` › `assert_eq!(`
+## `fn every_role_reaches_the_containment_points_of_this_platform() {` › `assert_eq!(`
 
 The same points, in the packet's order and each exactly once —
 so a role whose funnel reached them in another order, or twice,
 fails here too and not only the set above.
 
-## `fn every_role_reaches_the_containment_points_of_this_platfo…` › `assert_eq!(`
+## `fn every_role_reaches_the_containment_points_of_this_platform() {` › `assert_eq!(`
 
 The funnel's other observation, and the evidence a fault
 injected at `child_created` would need.
 
-## `fn every_role_reaches_the_containment_points_of_this_platfo…` › `assert_eq!(`
+## `fn every_role_reaches_the_containment_points_of_this_platform() {` › `assert_eq!(`
 
 Unix: the containment *operation* — not only its hook — ran for
 this role. The witness is the kernel.
@@ -1824,12 +1828,12 @@ so the second call must be a no-op that still hands back a proof — and
 on the platform where it does something, the process must still be a
 member afterwards.
 
-## `fn a_containment_proof_exists_only_where_containment_was_es…` › `let _first = contain_write_command(&mut NoHooks).expect("containment establishes on this …`
+## `fn a_containment_proof_exists_only_where_containment_was_established() {` › `let _first = contain_write_command(&mut NoHooks).expect("containment establishes on this host");`
 
 The tokens are held rather than discarded: two live proofs at once is
 what a coordinator entered from an already-contained CLI has.
 
-## `fn a_containment_proof_exists_only_where_containment_was_es…` › `{`
+## `fn a_containment_proof_exists_only_where_containment_was_established() {` › `{`
 
 A refused establishment mints nothing. Only Windows can refuse — on
 Unix the step is the reaper and the isolated process group, and
@@ -1899,13 +1903,13 @@ cannot record a Windows containment point as executed — so there is no
 failure on that platform for anything to propagate. The Linux suite
 cannot kill that mutation and does not claim to.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `let mut refusing = RefuseAmbientJoin::default();`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `let mut refusing = RefuseAmbientJoin::default();`
 
 The observer is borrowed rather than owned here, so it can simply be
 read afterwards — `with_hooks` takes ownership and needs a channel,
 this does not.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `let message = error.to_string();`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `let message = error.to_string();`
 
 The diagnostic reaches the caller. The three fragments are
 `proc::AMBIENT_REFUSAL_PREFIX` and `proc::AMBIENT_REFUSAL_SIMULATED`,
@@ -1913,24 +1917,24 @@ named rather than matched whole: what the operator has to be told is
 that it is the ambient job, which invariant it enforces, and that
 nothing ran.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `assert_eq!(`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `assert_eq!(`
 
 No effect precedes it: the funnel reached the join's own coordinate
 and nothing past it, and no child exists.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `assert_eq!(`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `assert_eq!(`
 
 And no proof was minted — which is the half the mutation above
 breaks. The count is per-thread and per-call, so it says exactly that
 *this* call established nothing, where `proc::ambient_job_established`
 is a process-wide latch other tests in this binary legitimately set.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `let _proof = contain_write_command(&mut NoHooks).expect("the real join succeeds on this h…`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `let _proof = contain_write_command(&mut NoHooks).expect("the real join succeeds on this host");`
 
 The success direction, so the assertion above is about the refusal
 and not about a function that never mints at all.
 
-## `fn the_production_containment_mint_propagates_a_join_refusa…` › `let mut refusing = RefuseAmbientJoin::default();`
+## `fn the_production_containment_mint_propagates_a_join_refusal_and_mints_nothing() {` › `let mut refusing = RefuseAmbientJoin::default();`
 
 `start_write_command` is the same step for the caller with nothing to
 prove it to — `src/main.rs`'s dispatch, which is the CLI's whole
@@ -2018,7 +2022,7 @@ everywhere.
 Where the coordinator helper writes the identity of the stub it created
 before it dies.
 
-## `fn point(&mut self, point: SubEffectPoint) -> crate::topolo…` › `crate::topology::effects::Injection::Kill`
+## `fn point(&mut self, point: SubEffectPoint) -> crate::topology::effects::Injection {` › `crate::topology::effects::Injection::Kill`
 
 The kill hook: after `CreateProcess` and before private-job
 assignment. `apply_io` aborts, so no destructor runs and the
@@ -2088,6 +2092,50 @@ varies while the content is held constant, and the marker is the
 caller's so "a shim ran" and "*this* shim ran" are different
 observations.
 
+All three executable fixture builders, `marker_shim`, `transparency_shim`,
+and `forwarding_shim`, use `write_shim` to publish their scripts.
+
+## `fn write_shim(path: &Path, script: &str) {`
+
+On Unix, a supervised `/bin/sh` child writes the script with `printf '%s'` and
+positional arguments. The harness never opens that inode for writing. A fork
+in another harness thread therefore cannot inherit its writer, which closes
+when the writer child exits. The 60-second supervision bound fails and cleans
+up a stuck writer. Windows retains the batch-file writer.
+
+This repairs `W2-HOST-TESTS-WRITE-THEN-EXEC-ETXTBSY` and the same writer pattern
+in the transparency and forwarding fixtures. The finding is recorded in
+`reviews/FINDINGS.md` §43. Closing the harness's original file descriptor, or
+renaming that inode, would leave an inherited writer alive. Moving the write
+into a separate process prevents that inheritance.
+
+## `mod inherited_writer {`
+
+The Linux test `marker_shims_do_not_leave_writers_in_another_threads_fork`
+runs one isolated helper under a 180-second process-tree timeout. Its held
+forks cannot inherit descriptors from other tests in the outer harness.
+
+The regular-file control opens a writer, forks from another thread, closes
+the original descriptor, and requires `ETXTBSY` from executing that same inode.
+Execution succeeds after the forked holder exits.
+
+The ownership witness runs the actual `marker_shim` against a FIFO whose
+capacity is smaller than its script. Reading the first byte proves the writer
+is open; the undrained payload keeps it open while another thread forks.
+After draining exactly the expected script and joining the original writer,
+the reader must see EOF while the forked holder is still alive. An in-process
+writer leaves its descriptor in that holder and produces `WouldBlock` instead.
+The holder's lifetime is checked immediately before and after the EOF read.
+The path and marker include shell metacharacters to check literal transport.
+
+Socket readiness and release establish the interleaving. Reads and writer
+supervision are bounded, the held child is reaped on return or unwinding, and
+the outer supervisor contains a wedged helper and its descendants. The
+adjacent source comments retain the fork safety proof and lifetime protocol.
+Linux CI executes the inheritance and `ETXTBSY` witness. The existing native
+Linux and macOS marker tests execute the Unix writer; Windows tests retain
+their existing batch-shim behavior.
+
 ## `fn environment_on_path(dirs: &[&Path], pathext: Option<&str>) -> HostEnvironment {`
 
 This process's environment with `PATH` — and `PATHEXT` — replaced.
@@ -2150,7 +2198,7 @@ the whole reason that type exists: `PR6D-001` is a Windows rule, and a
 Windows rule only the guest can execute is a rule that ships untested
 six days out of seven.
 
-## `fn path_directory_order_decides_between_installations_and_p…` › `assert_eq!(`
+## `fn path_directory_order_decides_between_installations_and_pathext_only_within_one() {` › `assert_eq!(`
 
 `first/x.cmd`, `second/x.exe`, `both/x.com`, `both/x.cmd`,
 `both/x.exe` — one per way the two axes can decide, and a grid that
@@ -2172,30 +2220,30 @@ machine has no programs" rather than as a malformed variable.
 Every row holds the directory and the file set constant and varies only
 `PATHEXT` and the naming rule.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `for absent in [None, Some(""), Some(";;;"), Some("exe"), Some(".")] {`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `for absent in [None, Some(""), Some(";;;"), Some("exe"), Some(".")] {`
 
 The default is the platform's, in the platform's order: `.COM` first.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `assert_eq!(`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `assert_eq!(`
 
 And it really is read, not assumed: a PATHEXT naming one extension
 nobody ships picks that file over the `.exe` sitting beside it.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `assert!(`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `assert!(`
 
 The widening that must not happen: `x` exists and is never chosen.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `for pathext in [None, Some(REAL_PATHEXT), Some(".FOO")] {`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `for pathext in [None, Some(REAL_PATHEXT), Some(".FOO")] {`
 
 Unix has no extensions: the bare file is the only answer, and
 `PATHEXT` changes nothing.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `let value = OsString::from(".FOO");`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `let value = OsString::from(".FOO");`
 
 A name that carries an extension is tried verbatim first, under a
 PATHEXT that would otherwise send it elsewhere.
 
-## `fn a_windows_name_is_pathext_and_never_the_extensionless_fi…` › `let shadow = root.join("shadow");`
+## `fn a_windows_name_is_pathext_and_never_the_extensionless_file() {` › `let shadow = root.join("shadow");`
 
 And a directory is not a program, on either rule.
 
@@ -2210,7 +2258,7 @@ along `PATH`, so a resolution that stopped at the first *existing* file
 would refuse — or spawn `EACCES` — where the code it replaced ran. Two
 directories, same name, and the answer must be the second.
 
-## `fn a_candidate_without_the_execute_bit_is_skipped_the_way_e…` › `assert_eq!(`
+## `fn a_candidate_without_the_execute_bit_is_skipped_the_way_execvp_skips_it() {` › `assert_eq!(`
 
 Windows has no such bit, so the same file is a program there — the
 two rules must not be the same rule.
@@ -2228,7 +2276,7 @@ would actually execute: an empty `PATH` entry means "the current
 directory" to some shells, and this runner's current directory is the
 workspace — repository content, under automation.
 
-## `fn a_name_that_matches_nothing_is_refused_and_an_empty_path…` › `let mixed = path_of(&[Path::new(""), &dir]);`
+## `fn a_name_that_matches_nothing_is_refused_and_an_empty_path_entry_is_never_searched() {` › `let mixed = path_of(&[Path::new(""), &dir]);`
 
 The empty entry is skipped rather than treated as "here", and a real
 directory beside it is still searched: the count is the observable.
@@ -2256,7 +2304,7 @@ distinct values so a fixture that ran one shim twice reports it; what is
 held constant is the `PATH` directory, the runner and the composed
 environment.
 
-## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_…` › `let stem = format!("upstroke-d1-{}", crate::ulid::ulid());`
+## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_host_runner() {` › `let stem = format!("upstroke-d1-{}", crate::ulid::ulid());`
 
 Unique per run, so nothing on this machine's real PATH, in the
 application directory or in the system directories can satisfy it.
@@ -2272,14 +2320,14 @@ guest: with `second & argument` the `.bat` shim exits 1 with
 "'argument' is not recognized", and the `.cmd` shim beside it — same
 resolution, benign argument — passes.
 
-## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_…` › `let mut direct = Command::new(name);`
+## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_host_runner() {` › `let mut direct = Command::new(name);`
 
 The platform fact, executed. `std` searches the child PATH, the
 application directory, the system directories and the parent
 PATH, appending `.exe` to each — so a `.cmd`/`.bat` on PATH is
 invisible to it, and this is `PR6D-001` itself.
 
-## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_…` › `let output = runner`
+## `fn a_bare_name_that_only_pathext_resolves_runs_through_the_host_runner() {` › `let output = runner`
 
 The claim: the same name, through the runner.
 
@@ -2311,7 +2359,7 @@ program at that path. Here there are two copies, so "used as given" and
 "searched for" produce different output. The space in the directory name
 is `bin.rs`'s own production shape, `C:\Users\John Smith\npm\`.
 
-## `fn an_absolute_program_is_spawned_as_given_even_when_path_h…` › `let by_name = runner`
+## `fn an_absolute_program_is_spawned_as_given_even_when_path_holds_that_name() {` › `let by_name = runner`
 
 The control: the same runner, the same name without its directory,
 reaches the other file — so the two really are distinguishable and
@@ -2325,7 +2373,7 @@ Everything one spawn's containment observers can see about resolution.
 
 `program_resolutions()` as each containment point saw it, in order.
 
-## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_and_never_before_compose_refuses…`
+## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_and_never_before_compose_refuses() {`
 
 One program name is resolved **once per spawn**, **before** any of the
 spawn, and **not at all** when the request is refused earlier.
@@ -2346,13 +2394,13 @@ is not — and the bare name is a `PATHEXT`-resolved batch shim, which is
 the intersection {a name to resolve} x {a file `CreateProcessW` reaches
 only through an interpreter} that no fixture in this crate had.
 
-## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_an…` › `let witness = ResolutionWitness::new();`
+## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_and_never_before_compose_refuses() {` › `let witness = ResolutionWitness::new();`
 
 A request the environment refuses is refused **before** anything is
 resolved: `compose` runs first, so a reserved-key overlay never
 reaches the filesystem and never reaches a containment point.
 
-## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_an…` › `let witness = ResolutionWitness::new();`
+## `fn a_program_is_resolved_once_per_spawn_before_any_of_it_and_never_before_compose_refuses() {` › `let witness = ResolutionWitness::new();`
 
 And a name that resolves to nothing is refused **after** resolution
 and **before** any of the spawn: the count moves, the points do not.
@@ -2374,7 +2422,7 @@ What is held constant is the directory, the shim content and the naming
 rule; what varies is the name, and the resolved files are counted so a
 rule that special-cased one name collapses the count.
 
-## `fn every_bare_program_this_crate_ships_goes_through_one_res…` › `const NAMES: [&str; 8] = [`
+## `fn every_bare_program_this_crate_ships_goes_through_one_resolution_rule() {` › `const NAMES: [&str; 8] = [`
 
 The five shells `gates::ShellKind::spec` can put in a spec, and the
 three agent CLIs `bin::Invocation::named` can.
@@ -2471,18 +2519,18 @@ gets a spawn failure naming the file pre-flight certified. An operator
 reading it learns that the CLI moved under a running run, which is true,
 instead of a `Caps.version` that quietly stopped describing anything.
 
-## `fn one_boundary_executes_one_file_for_a_name_across_a_probe…` › `std::fs::remove_file(&first).expect("remove the certified installation");`
+## `fn one_boundary_executes_one_file_for_a_name_across_a_probe_and_the_attempt() {` › `std::fs::remove_file(&first).expect("remove the certified installation");`
 
 The CLI moves under the run: the file pre-flight executed is gone,
 and the other one — same name, same PATH, different executable — is
 still there.
 
-## `fn one_boundary_executes_one_file_for_a_name_across_a_probe…` › `let fresh = HostRunner::new().with_environment(environment());`
+## `fn one_boundary_executes_one_file_for_a_name_across_a_probe_and_the_attempt() {` › `let fresh = HostRunner::new().with_environment(environment());`
 
 The oracle. A boundary that had not decided yet reaches `second`, so
 "resolve per spawn" really does change the answer here.
 
-## `fn one_boundary_executes_one_file_for_a_name_across_a_probe…` › `let outcome = runner.run(&attempt);`
+## `fn one_boundary_executes_one_file_for_a_name_across_a_probe_and_the_attempt() {` › `let outcome = runner.run(&attempt);`
 
 The claim. The runner that certified `first` does not silently run
 `second`.
@@ -2526,14 +2574,14 @@ shell, not a caller's choice. [`role_request_for`] is exhaustive over
 [`ExecutionRole`], so it is absent by classification rather than by
 omission.
 
-## `fn one_name_is_searched_once_for_a_boundary_and_asked_for_o…` › `let on_path = environment_on_path(&[&bin], Some(REAL_PATHEXT));`
+## `fn one_name_is_searched_once_for_a_boundary_and_asked_for_once_per_spawn() {` › `let on_path = environment_on_path(&[&bin], Some(REAL_PATHEXT));`
 
 `host-v1` supplies a credential location only when the *base* carries
 it, so the base has to carry one for the roles to differ at all —
 this machine's own environment has no `CLAUDE_CONFIG_DIR` and every
 role would otherwise compose the same thing.
 
-## `fn one_name_is_searched_once_for_a_boundary_and_asked_for_o…` › `let composed: BTreeSet<Vec<(OsString, OsString)>> = requests`
+## `fn one_name_is_searched_once_for_a_boundary_and_asked_for_once_per_spawn() {` › `let composed: BTreeSet<Vec<(OsString, OsString)>> = requests`
 
 The premise: these roles really do compose different environments, so
 "one answer for all of them" is a claim and not a tautology.
@@ -2560,7 +2608,7 @@ Held constant: the runner, the name, and the naming rule. Varied: the
 composed `PATH`, and — on Windows, where it decides anything — the
 composed `PATHEXT`. The resolved files are counted as distinct values.
 
-## `fn a_resolution_question_is_the_program_and_the_environment…` › `{`
+## `fn a_resolution_question_is_the_program_and_the_environment_that_answers_it() {` › `{`
 
 The other field of the key, where it decides anything.
 
@@ -2584,11 +2632,11 @@ which is what makes storing the refusal as its message safe:
 [`UpstrokeError::Refused`] displays as exactly its message, and if that
 ever stops being true this row says so.
 
-## `fn a_refused_name_is_refused_identically_without_asking_the…` › `marker_shim(&bin, &shim_file_name(&name), "LATE");`
+## `fn a_refused_name_is_refused_identically_without_asking_the_filesystem_again() {` › `marker_shim(&bin, &shim_file_name(&name), "LATE");`
 
 The CLI appears under the run.
 
-## `fn a_refused_name_is_refused_identically_without_asking_the…` › `let fresh = HostRunner::new().with_environment(environment());`
+## `fn a_refused_name_is_refused_identically_without_asking_the_filesystem_again() {` › `let fresh = HostRunner::new().with_environment(environment());`
 
 The oracle: it really is installed now.
 
@@ -2614,17 +2662,17 @@ The expectation is written out — two construction sites, both in
 than counted from the tree, because a count read from the tree grows
 with it.
 
-## `fn production_reaches_a_spawn_through_one_host_runner_per_r…` › `const SITES: [(&str, usize); 6] = [`
+## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `const SITES: [(&str, usize); 6] = [`
 
 Where a `HostRunner` is constructed in the engine's production code,
 and how many times in each file.
 
-## `fn production_reaches_a_spawn_through_one_host_runner_per_r…` › `assert_eq!(`
+## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `assert_eq!(`
 
 The control: the pattern matches when it is present, so a zero means
 absence rather than a broken search.
 
-## `fn production_reaches_a_spawn_through_one_host_runner_per_r…` › `let engine = crate::effects::production_region(include_str!("../../engine/mod.rs"));`
+## `fn production_reaches_a_spawn_through_one_host_runner_per_run() {` › `let engine = crate::effects::production_region(include_str!("../../engine/mod.rs"));`
 
 And the two are the run and the resume facade, each of which then
 borrows that one runner for pre-flight and every attempt.
@@ -2673,14 +2721,14 @@ What varies: the CLI name and the spelling of the program. Held constant:
 the runner, the environment, the argument and the files on disk — so a
 difference in output can only be a difference in which file ran.
 
-## `fn an_npm_style_installation_runs_by_bare_name_exactly_as_i…` › `const CLIS: [&str; 3] = ["claude", "codex", "copilot"];`
+## `fn an_npm_style_installation_runs_by_bare_name_exactly_as_it_runs_by_path() {` › `const CLIS: [&str; 3] = ["claude", "codex", "copilot"];`
 
 The three names `bin::Invocation::named` ships, written here rather
 than read from the adapters' private `CLI` constants;
 `agent::built_program_tests::an_adapters_program_is_the_boundarys_…`
 is what ties each adapter to its own name.
 
-## `fn an_npm_style_installation_runs_by_bare_name_exactly_as_i…` › `let mut contents: Vec<String> = std::fs::read_dir(&bin)`
+## `fn an_npm_style_installation_runs_by_bare_name_exactly_as_it_runs_by_path() {` › `let mut contents: Vec<String> = std::fs::read_dir(&bin)`
 
 The installation really is the failing shape: one file per CLI, and
 on Windows not one of them is an `.exe`.
@@ -2737,7 +2785,7 @@ row below is a claim about `resolve_program` and not about `std`. What
 varies is the entry; what is held constant is the program name, the
 candidates and the composed environment.
 
-## `fn every_path_entry_this_runner_searches_names_a_location_o…` › `let bin = root.join("bin");`
+## `fn every_path_entry_this_runner_searches_names_a_location_on_its_own() {` › `let bin = root.join("bin");`
 
 And "searched" means searched: the one kind of entry that is not
 skipped does find a program in it.
@@ -2773,20 +2821,20 @@ What varies: where the empty entry sits, and whether a real installation
 is on the `PATH` at all. Held constant: the workspace, its planted
 executable, the name and the argument.
 
-## `fn an_empty_path_entry_never_reaches_the_workspaces_own_cop…` › `marker_shim(&workspace, &file, "WORKSPACE");`
+## `fn an_empty_path_entry_never_reaches_the_workspaces_own_copy_of_a_bare_name() {` › `marker_shim(&workspace, &file, "WORKSPACE");`
 
 Repository content, under automation: the workspace's own copy.
 
-## `fn an_empty_path_entry_never_reaches_the_workspaces_own_cop…` › `let rows: [(&str, String, &str, &str); 4] = [`
+## `fn an_empty_path_entry_never_reaches_the_workspaces_own_copy_of_a_bare_name() {` › `let rows: [(&str, String, &str, &str); 4] = [`
 
 (what, PATH, what a raw spawn reaches, what the runner must reach)
 
-## `fn an_empty_path_entry_never_reaches_the_workspaces_own_cop…` › `let mut direct = Command::new(&name);`
+## `fn an_empty_path_entry_never_reaches_the_workspaces_own_copy_of_a_bare_name() {` › `let mut direct = Command::new(&name);`
 
 The platform fact. `execvp` searches the child's PATH from the
 child's working directory, so the empty entry is the workspace.
 
-## `fn an_empty_path_entry_never_reaches_the_workspaces_own_cop…` › `let witness = ResolutionWitness::new();`
+## `fn an_empty_path_entry_never_reaches_the_workspaces_own_copy_of_a_bare_name() {` › `let witness = ResolutionWitness::new();`
 
 The claim, through the boundary, with an observer so that a
 refusal is a refusal *before* any spawn rather than a failed one.
@@ -2811,17 +2859,17 @@ Windows depends on the temporary directory and the working directory
 sharing a drive, and a row that silently stops applying is worse than
 one that is not there.
 
-## `fn a_relative_path_entry_is_refused_even_when_it_names_a_re…` › `let mut workspace = root.clone();`
+## `fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {` › `let mut workspace = root.clone();`
 
 Deeper than the coordinator's own directory, so that the same
 relative entry names a *different* place from each of them — which is
 the whole hazard, and a workspace that happened to sit at the same
 depth would hide it.
 
-## `fn a_relative_path_entry_is_refused_even_when_it_names_a_re…` › `assert!(`
+## `fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {` › `assert!(`
 
 The row's own premise, both halves.
 
-## `fn a_relative_path_entry_is_refused_even_when_it_names_a_re…` › `let reachable = HostRunner::new()`
+## `fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {` › `let reachable = HostRunner::new()`
 
 The oracle: the same directory, named as a location, does run.

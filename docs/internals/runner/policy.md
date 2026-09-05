@@ -145,18 +145,18 @@ Two pairs, because there are two places this encoding could collapse:
 carried, and a host record carrying container-only fields, which nothing
 pushed through `canonical_bytes` at all.
 
-## `fn the_canonical_encoding_separates_records_the_type_separa…` › `let absent = host_policy();`
+## `fn the_canonical_encoding_separates_records_the_type_separates() {` › `let absent = host_policy();`
 
 Absent is not the same as present-and-empty. "No credential volumes
 were configured" and "credential volumes were configured, and there
 are none" are different records, and `Option` is how the type says so.
 
-## `fn the_canonical_encoding_separates_records_the_type_separa…` › `assert_eq!(`
+## `fn the_canonical_encoding_separates_records_the_type_separates() {` › `assert_eq!(`
 
 Written by hand from the field list, like the two above it: version,
 kind, contract, image-absent, volumes-present, zero entries.
 
-## `fn the_canonical_encoding_separates_records_the_type_separa…` › `let mut mislabelled = host_policy();`
+## `fn the_canonical_encoding_separates_records_the_type_separates() {` › `let mut mislabelled = host_policy();`
 
 A malformed record is encoded as what it is, not projected into the
 record it ought to have been. `canonical_bytes` is INV-23's
@@ -208,18 +208,18 @@ so a `to_ascii_lowercase()` anywhere in `field()` passes all of them.
 This crosses each field with a case-distinct twin and asserts the
 **count** of distinct digests.
 
-## `fn ascii_case_is_significant_in_every_string_field_of_the_r…` › `let volumes = upper_volume_agent`
+## `fn ascii_case_is_significant_in_every_string_field_of_the_record() {` › `let volumes = upper_volume_agent`
 
 A case-distinct *key*: `Codex` and `codex` are two entries of
 the map, so this also proves the agent name is encoded and not
 normalised on the way in.
 
-## `fn ascii_case_is_significant_in_every_string_field_of_the_r…` › `for (name, policy) in &fixtures[1..] {`
+## `fn ascii_case_is_significant_in_every_string_field_of_the_record() {` › `for (name, policy) in &fixtures[1..] {`
 
 Every twin differs from the base in ASCII case alone, which is what
 makes the digest counts below a statement about case.
 
-## `fn ascii_case_is_significant_in_every_string_field_of_the_r…` › `let upper_host = RunnerPolicy {`
+## `fn ascii_case_is_significant_in_every_string_field_of_the_record() {` › `let upper_host = RunnerPolicy {`
 
 And the bytes themselves carry the case, pinned against a payload
 written by hand rather than against `canonical_bytes` output.
@@ -267,13 +267,13 @@ agree while carrying different execution identities, and
 `prove_private_half_ownership`'s digest conjunct would mint deletion
 authority for a private half belonging to a different runner.
 
-## `fn a_normalisable_difference_in_any_string_position_moves_t…` › `const PAIRS: &[(&str, &str, &str)] = &[`
+## `fn a_normalisable_difference_in_any_string_position_moves_the_digest() {` › `const PAIRS: &[(&str, &str, &str)] = &[`
 
 Pairs a normaliser would fold together. Each is *one* transformation
 away from its twin, so a digest that cannot separate them names the
 transformation that was applied.
 
-## `fn a_normalisable_difference_in_any_string_position_moves_t…` › `let positions: &[(&str, fn(&mut RunnerPolicy, &str))] = &[`
+## `fn a_normalisable_difference_in_any_string_position_moves_the_digest() {` › `let positions: &[(&str, fn(&mut RunnerPolicy, &str))] = &[`
 
 Every string position of the record, by name, as a setter.
 
@@ -308,11 +308,11 @@ variable-length sequence, and those are where an encoding collapses:
 The expected bytes are written out from the module docs' field list, so
 the oracle is the grammar and not `canonical_bytes`.
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `let mut absent = container_fixture();`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `let mut absent = container_fixture();`
 
 -- 1. absent digest vs empty digest --------------------------------
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `const DIGEST_ABSENT: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `const DIGEST_ABSENT: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\`
 
 version, kind, contract, image-present, reference, id, digest-absent,
 volumes-present, 2, the two pairs.
@@ -320,20 +320,20 @@ Written out with the file's own line-continuation idiom, which strips
 the newline *and* the leading indentation, so the literal is the
 bytes and nothing else.
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `const DIGEST_EMPTY: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `const DIGEST_EMPTY: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\`
 
 The same, with digest-present and a zero-length value.
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `assert_ne!(DIGEST_ABSENT, DIGEST_EMPTY);`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `assert_ne!(DIGEST_ABSENT, DIGEST_EMPTY);`
 
 The two literals differ, and by the one field: a copy-paste that made
 them equal would make both assertions above vacuous.
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `let mut no_volumes = container_fixture();`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `let mut no_volumes = container_fixture();`
 
 -- 2. absent volume map vs empty one, on a container record ---------
 
-## `fn the_container_fields_option_and_sequence_boundaries_are_…` › `let volume_pair = |key: &str, value: &str| {`
+## `fn the_container_fields_option_and_sequence_boundaries_are_injective() {` › `let volume_pair = |key: &str, value: &str| {`
 
 -- 3. concatenation coincidences ------------------------------------
 Every pair below flattens to the same character sequence and differs
@@ -361,17 +361,17 @@ then *encoding* obligations rather than *shape* ones, which is why
 `the_container_fields_option_and_sequence_boundaries_are_injective`
 exists.
 
-## `fn completeness_covers_one_direction_of_the_host_container_…` › `for has_image in [false, true] {`
+## `fn completeness_covers_one_direction_of_the_host_container_field_split() {` › `for has_image in [false, true] {`
 
 The host direction: any container field at all is refused, and by the
 one defect.
 
-## `fn completeness_covers_one_direction_of_the_host_container_…` › `assert_eq!(`
+## `fn completeness_covers_one_direction_of_the_host_container_field_split() {` › `assert_eq!(`
 
 The container direction is not the mirror image: a missing field is
 named by its own defect, and a *present but empty* one is accepted.
 
-## `fn completeness_covers_one_direction_of_the_host_container_…` › `for digest in [None, Some(String::new()), Some("sha256:b".to_owned())] {`
+## `fn completeness_covers_one_direction_of_the_host_container_field_split() {` › `for digest in [None, Some(String::new()), Some("sha256:b".to_owned())] {`
 
 And the digest is not a completeness question at all, in either
 state — which is what makes it an encoding one.

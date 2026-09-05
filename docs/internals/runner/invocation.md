@@ -197,7 +197,7 @@ carries a character outside `[0-9A-Za-z_-]`, or is long enough to push
 the rendering past [`MAX_LEN`]. Every other form is infallible: its
 fields are integers, and their longest rendering *is* [`MAX_LEN`].
 
-## `pub fn probe(target: ProbeTarget, ordinal: u32) -> Result<S…` › `if let ProbeTarget::Agent(agent) = &target {`
+## `pub fn probe(target: ProbeTarget, ordinal: u32) -> Result<Self, UpstrokeError> {` › `if let ProbeTarget::Agent(agent) = &target {`
 
 The *component*, not only the whole rendering. `.` is inside the
 charset the whole value is checked against, so an agent named
@@ -394,7 +394,7 @@ an empty agent name
 
 outside the charset
 
-## `fn probe_refuses_a_target_that_would_not_survive_a_containe…` › `let longest = "a".repeat(50);`
+## `fn probe_refuses_a_target_that_would_not_survive_a_container_name() {` › `let longest = "a".repeat(50);`
 
 `p.agent-<name>.o<ordinal>` spends `p`, two separators, `agent-`,
 `o` and up to ten ordinal digits: 1 + 1 + 6 + 1 + 1 + 10 = 20. So

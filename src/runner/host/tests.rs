@@ -1197,13 +1197,7 @@ fn transparency_shim(dir: &Path, name: &str) -> String {
         }
         script.push_str("exit 0\n");
     }
-    std::fs::write(&path, script).expect("write the transparency shim");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make the shim executable");
-    }
+    write_shim(&path, &script);
     path.to_str()
         .expect("a scratch path this crate can name")
         .to_owned()
@@ -2334,19 +2328,12 @@ fn forwarding_shim(dir: &Path, name: &str) -> String {
     std::fs::create_dir_all(dir).expect("create the shim directory");
     let path = dir.join(name);
     let exe = this_test_binary();
-    if cfg!(windows) {
-        std::fs::write(&path, format!("@echo off\r\n\"{exe}\" %*\r\n"))
-            .expect("write the batch shim");
+    let script = if cfg!(windows) {
+        format!("@echo off\r\n\"{exe}\" %*\r\n")
     } else {
-        std::fs::write(&path, format!("#!/bin/sh\nexec \"{exe}\" \"$@\"\n"))
-            .expect("write the shell shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make the shim executable");
-        }
-    }
+        format!("#!/bin/sh\nexec \"{exe}\" \"$@\"\n")
+    };
+    write_shim(&path, &script);
     path.to_str()
         .expect("a scratch path this crate can name")
         .to_owned()
@@ -3932,20 +3919,278 @@ fn shim_file_name(name: &str) -> String {
 fn marker_shim(dir: &Path, file_name: &str, marker: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("create the shim directory");
     let path = dir.join(file_name);
-    if cfg!(windows) {
-        std::fs::write(&path, format!("@echo off\r\necho {marker}:%~1\r\n"))
-            .expect("write the batch shim");
+    let script = if cfg!(windows) {
+        format!("@echo off\r\necho {marker}:%~1\r\n")
     } else {
-        std::fs::write(&path, format!("#!/bin/sh\necho \"{marker}:$1\"\n"))
-            .expect("write the shell shim");
+        format!("#!/bin/sh\necho \"{marker}:$1\"\n")
+    };
+    write_shim(&path, &script);
+    path
+}
+
+fn write_shim(path: &Path, script: &str) {
+    if cfg!(windows) {
+        std::fs::write(path, script).expect("write the batch shim");
+    } else {
+        let mut writer = Command::new("/bin/sh");
+        writer
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "write-shim"])
+            .arg(path)
+            .arg(script);
+        let written = proc::test_support::run_with_timeout(writer, "", Duration::from_secs(60))
+            .expect("run the shell shim writer in its own process");
+        assert_eq!(written.code, Some(0), "write the shell shim: {written:?}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
                 .expect("make the shim executable");
         }
     }
-    path
+}
+
+#[cfg(target_os = "linux")]
+mod inherited_writer {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir_all(&self.0);
+            if !std::thread::panicking() {
+                removed.expect("remove the inherited-writer fixture");
+            }
+        }
+    }
+
+    // This guard owns one forked child's lifetime. Its socket releases the child
+    // after observation; shutdown also releases it on failure. The child closes
+    // the parent's socket endpoint before announcing readiness and exits after
+    // release or its read timeout. Drop waits for that exact pid, never a group.
+    struct HeldFork {
+        pid: libc::pid_t,
+        release: UnixStream,
+    }
+
+    impl HeldFork {
+        fn assert_alive(&self) {
+            let mut status = 0;
+            // SAFETY: pid is this guard's unreaped child and status is writable.
+            // WNOHANG observes whether it exited without waiting for release.
+            let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            assert_eq!(
+                waited, 0,
+                "the descriptor holder exited before the observation: {status}"
+            );
+        }
+    }
+
+    impl Drop for HeldFork {
+        fn drop(&mut self) {
+            let released = self.release.shutdown(std::net::Shutdown::Write);
+            let mut status = 0;
+            let waited = loop {
+                // SAFETY: pid is our unreaped direct child; status is a live,
+                // writable c_int. The socket's read timeout bounds the child.
+                let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break result;
+            };
+            if !std::thread::panicking() {
+                released.expect("release the inherited-descriptor holder");
+                assert_eq!(waited, self.pid, "reap the inherited-descriptor holder");
+                assert_eq!(status, 0, "the holder completed its socket protocol");
+            }
+        }
+    }
+
+    fn hold_inherited_descriptors() -> HeldFork {
+        let (release, child_socket) = UnixStream::pair().expect("the fork handshake");
+        release
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("bound fork readiness");
+        child_socket
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("bound the held fork");
+        let parent_fd = release.as_raw_fd();
+        let pid = std::thread::spawn(move || {
+            let child_fd = child_socket.as_raw_fd();
+            // SAFETY: only the parent returns into Rust after fork. The child
+            // uses only close/write/read/_exit, all async-signal-safe, with live
+            // inherited fds and one-byte stack buffers. It never allocates,
+            // unwinds, drops Rust owners, or touches inherited locks. Closing
+            // parent_fd removes its copy of the release endpoint. The separate
+            // child endpoint stays live until _exit closes all inherited fds.
+            unsafe {
+                let pid = libc::fork();
+                if pid == 0 {
+                    libc::close(parent_fd);
+                    let ready = [1_u8];
+                    if libc::write(child_fd, ready.as_ptr().cast(), 1) != 1 {
+                        libc::_exit(1);
+                    }
+                    let mut release = [0_u8];
+                    let read = libc::read(child_fd, release.as_mut_ptr().cast(), 1);
+                    libc::_exit(if read == 0 { 0 } else { 1 });
+                }
+                pid
+            }
+        })
+        .join()
+        .expect("join the thread that forked with inherited descriptors");
+        assert!(pid > 0, "fork the inherited-descriptor holder");
+        let mut held = HeldFork { pid, release };
+        let mut ready = [0_u8];
+        held.release
+            .read_exact(&mut ready)
+            .expect("the forked holder is ready");
+        assert_eq!(ready, [1]);
+        held
+    }
+
+    fn read_fifo(reader: &mut std::fs::File, bytes: &mut [u8]) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the shim writer did not supply its complete script"
+            );
+            let mut ready = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: ready is one initialized pollfd and remains live for this
+            // call; its descriptor is borrowed from reader. The wait is bounded.
+            let polled = unsafe { libc::poll(&mut ready, 1, 1000) };
+            if polled < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert!(
+                polled >= 0,
+                "poll the FIFO: {}",
+                std::io::Error::last_os_error()
+            );
+            if polled == 0 {
+                continue;
+            }
+            match reader.read(rest) {
+                Ok(0) => panic!("the shim writer closed before writing the complete script"),
+                Ok(count) => rest = &mut rest[count..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("read the shim FIFO: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn marker_shims_do_not_leave_writers_in_another_threads_fork() {
+        let mut helper = Command::new(std::env::current_exe().expect("the test executable"));
+        helper.args([
+            "runner::host::tests::inherited_writer::inherited_writer_helper",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        let output = proc::test_support::run_with_timeout(helper, "", Duration::from_secs(180))
+            .expect("supervise the isolated inherited-writer witness");
+        assert_eq!(output.code, Some(0), "{output:?}");
+        assert!(
+            output.stdout.contains("1 passed"),
+            "the helper must run one test: {output:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper; holds forked descriptors away from other tests"]
+    fn inherited_writer_helper() {
+        let root = Scratch(scratch("inherited-writer"));
+        let executable = root.0.join("regular");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("write the regular-file control");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make the regular-file control executable");
+        let original = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("open the writer that another thread's fork will inherit");
+        let held = hold_inherited_descriptors();
+        drop(original);
+        let error = Command::new(&executable)
+            .output()
+            .expect_err("the fork still owns a writer after the original closes");
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+        drop(held);
+        let output = proc::test_support::run_with_timeout(
+            Command::new(&executable),
+            "",
+            Duration::from_secs(60),
+        )
+        .expect("the executable is available after the inherited writer exits");
+        assert_eq!(output.code, Some(0), "{output:?}");
+
+        let fifo_name = "shim fifo ' $name";
+        let fifo = root.0.join(fifo_name);
+        let name =
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("a NUL-free FIFO path");
+        // SAFETY: name is a live NUL-terminated path in our private scratch
+        // directory, and 0600 grants access only to this test's user.
+        assert_eq!(
+            unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+            0,
+            "create the shim FIFO"
+        );
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the FIFO reader before the shim writer");
+        // SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
+        // integer size, and shrinking an empty pipe needs no extra privilege.
+        let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        assert_eq!(capacity, 4096, "bound the pipe so the script cannot fit");
+        let marker = format!("{} ' $name `printf literal`", "x".repeat(16 * 1024));
+        let expected = format!("#!/bin/sh\necho \"{marker}:$1\"\n").into_bytes();
+        let mut actual = vec![0; expected.len()];
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| marker_shim(&root.0, fifo_name, &marker));
+            read_fifo(&mut reader, &mut actual[..1]);
+            let held = hold_inherited_descriptors();
+            read_fifo(&mut reader, &mut actual[1..]);
+            assert_eq!(writer.join().expect("join the shim writer"), fifo);
+            held.assert_alive();
+            let eof = reader.read(&mut [0_u8]);
+            held.assert_alive();
+            drop(held);
+            assert_eq!(
+                actual, expected,
+                "the actual marker helper wrote the complete script"
+            );
+            assert!(
+                matches!(eof, Ok(0)),
+                "the fork inherited a shim writer: {eof:?}"
+            );
+        });
+    }
 }
 
 fn environment_on_path(dirs: &[&Path], pathext: Option<&str>) -> HostEnvironment {

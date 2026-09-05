@@ -1187,6 +1187,11 @@ impl ContainerRuntime for DockerCli {
     }
 }
 
+// The daemon owns container state and arbitrates concurrent reclaimers' stop/remove
+// requests. The winner moves running -> stopped -> removing -> absent; a loser
+// seeing stopped, removing or absent continues observe/remove/view/intent cleanup.
+// Other failures remain errors so failed or cancelled reclamation can be retried
+// from the retained intent. "Removing" is settled for stop, not proof of absence.
 fn stop_already_settled(detail: &str) -> bool {
     remove_already_settled(detail) || detail.contains("is not running")
 }

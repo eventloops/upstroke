@@ -331,7 +331,7 @@ set of identities a whole run's worth of Runner processes carries —
 INV-20's "worker, gate, review, re-ask, agent probe, shell probe" — is
 exactly one per process, with no expected value taken from a generator.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `fn run_requests() -> Vec<RunnerRequest> {`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `fn run_requests() -> Vec<RunnerRequest> {`
 
 One run's Runner processes, in the order the run would produce
 them. A function rather than a literal because it is called twice:
@@ -362,23 +362,23 @@ carries its agent. A grid whose sequence reviews bound
 no agent would be varying the role and the binding
 together and calling it one field.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `let expected = 1`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `let expected = 1`
 
 The size comes from the run's shape, written here, not from the
 vector under test.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `let counted = |prefix: &str| ids.iter().filter(|id| id.starts_with(prefix)).count();`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `let counted = |prefix: &str| ids.iter().filter(|id| id.starts_with(prefix)).count();`
 
 All three forms are in the set, and each is in it the number of times
 the run's shape says.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `assert_eq!(`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `assert_eq!(`
 
 The binding is R3's rule in every form, and it is a count rather
 than a claim: a grid that let the agent binding ride along with the
 role would prove the identities of a run this crate never executes.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `let again: Vec<String> = run_requests()`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `let again: Vec<String> = run_requests()`
 
 Deterministic in the sequential substrate: the same run yields the
 same identities. A generator that mints a fresh value per call — a
@@ -387,12 +387,12 @@ ULID, a counter, a clock — fails here, and this is the assertion
 "so deterministic InvocationIds never collide across incarnations
 and no earlier ownership evidence is overwritten".
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `let probes: Vec<&RunnerRequest> = requests`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `let probes: Vec<&RunnerRequest> = requests`
 
 The probes are in the set, and they are accounted the way INV-18
 accounts them: agent probes slotted, the shell probe not.
 
-## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_sh…` › `let workers: Vec<&InvocationId> = requests`
+## `fn invocation_ids_are_unique_within_a_run_incl_agent_and_shell_probes() {` › `let workers: Vec<&InvocationId> = requests`
 
 "changes with every attempt": the same task, agent and role at two
 attempts are two invocations, and they differ in the attempt field
@@ -471,13 +471,13 @@ envelope after a non-zero exit is an `AgentError`; and Copilot has no
 envelope at all, so it reports no session and no cost even on success.
 None of them is read back from `parse`.
 
-## `fn the_host_runners_adapter_parsing_table_is_the_one_pr6_mu…` › `detail: Some("the work is done".to_owned()),`
+## `fn the_host_runners_adapter_parsing_table_is_the_one_pr6_must_match() {` › `detail: Some("the work is done".to_owned()),`
 
 The failure path reports the agent's own text, and the
 envelope's session and cost survive it: spend already
 happened.
 
-## `fn the_host_runners_adapter_parsing_table_is_the_one_pr6_mu…` › `let mut statuses: Vec<String> =`
+## `fn the_host_runners_adapter_parsing_table_is_the_one_pr6_must_match() {` › `let mut statuses: Vec<String> =`
 
 Hostility as counts: two adapters, two statuses, three distinct
 details, and both "reports a session" dispositions.
@@ -522,11 +522,11 @@ tests (ST-07 subset)" — and it is discharged at runtime, for all five
 roles, by `host::tests::every_role_reaches_the_containment_points_of_this_platform`
 and `host::tests::a_fault_armed_at_any_containment_point_stops_any_role`.
 
-## `fn the_spawn_site_files_every_role_under_one_context_and_th…` › `assert_eq!(SPAWN_SITE, EffectSiteId::Process(ProcessSite::Spawn));`
+## `fn the_spawn_site_files_every_role_under_one_context_and_the_count_says_which() {` › `assert_eq!(SPAWN_SITE, EffectSiteId::Process(ProcessSite::Spawn));`
 
 Transcribed from PR3's inventory, not read back from PR4.
 
-## `fn the_spawn_site_files_every_role_under_one_context_and_th…` › `let roles: Vec<(ExecutionRole, bool)> = vec![`
+## `fn the_spawn_site_files_every_role_under_one_context_and_the_count_says_which() {` › `let roles: Vec<(ExecutionRole, bool)> = vec![`
 
 Which roles this slice spawns, and whether each runs inside an
 attempt — i.e. after the durable event the site is adjacent to.
@@ -558,11 +558,11 @@ Two spellings, because there are two: the coordinate the packet writes
 deliberate — a rename of the variant itself stops this table compiling,
 which is the same failure by a shorter route.
 
-## `fn the_containment_coordinates_are_pinned_against_written_l…` › `const PINNED: &[(SubEffectPoint, &str, &str)] = &[`
+## `fn the_containment_coordinates_are_pinned_against_written_literals() {` › `const PINNED: &[(SubEffectPoint, &str, &str)] = &[`
 
 (variant, the coordinate `containment_sub_effects` writes, wire form)
 
-## `fn the_containment_coordinates_are_pinned_against_written_l…` › `let decoded: SubEffectPoint =`
+## `fn the_containment_coordinates_are_pinned_against_written_literals() {` › `let decoded: SubEffectPoint =`
 
 And the written literal decodes back to this point: a rename that
 kept the encoder and the decoder agreeing would otherwise be
@@ -633,7 +633,7 @@ either cannot open or close a body here.
 When `code` defines `name` more than once: two bodies is two answers and
 the caller would silently read the first.
 
-## `fn function_body<'a>(code: &'a str, name: &str) -> Option<&…` › `let mut at = found + needle.len() - 1;`
+## `fn function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {` › `let mut at = found + needle.len() - 1;`
 
 The signature first: the body opens at the first `{` outside the
 parameter list and outside any bracketed bound. A `;` there instead
@@ -773,15 +773,15 @@ grid in this very file writes one that way. So the type's own name is
 counted beside it, and that count includes the declaration and the
 builders' return types, which is why the numbers are what they are.
 
-## `fn every_production_runner_request_is_built_by_its_roles_bu…` › `const EXPECTED: &[(&str, usize, usize, &str)] = &[`
+## `fn every_production_runner_request_is_built_by_its_roles_builder() {` › `const EXPECTED: &[(&str, usize, usize, &str)] = &[`
 
 (file, `role: ExecutionRole::`, `RunnerRequest {`, and what they are).
 
-## `fn every_production_runner_request_is_built_by_its_roles_bu…` › `for absent in [`
+## `fn every_production_runner_request_is_built_by_its_roles_builder() {` › `for absent in [`
 
 The four words of `scope`, and the file that would hold a fifth.
 
-## `fn every_production_runner_request_is_built_by_its_roles_bu…` › `"src/engine/assembly.rs",`
+## `fn every_production_runner_request_is_built_by_its_roles_builder() {` › `"src/engine/assembly.rs",`
 
 Assembles a worker's *command* and must never assemble its
 request: the command says what to run and the request says the
@@ -885,12 +885,12 @@ counted too, which is why
 `src/runner/host.rs` shows one (the declaration) and `src/main.rs` shows
 two.
 
-## `fn write_command_containment_has_one_join_site_and_one_mint…` › `const EXPECTED: &[(&str, usize, usize, usize, &str)] = &[`
+## `fn write_command_containment_has_one_join_site_and_one_mint() {` › `const EXPECTED: &[(&str, usize, usize, usize, &str)] = &[`
 
 (file, `proc::join_ambient_job(`, `Contained::new()`, `Contained(`,
 and why).
 
-## `fn write_command_containment_has_one_join_site_and_one_mint…` › `let counts = (`
+## `fn write_command_containment_has_one_join_site_and_one_mint() {` › `let counts = (`
 
 `production_sources` already blanks comments and string literals,
 so a doc comment naming either symbol — and two of them do it to
@@ -970,7 +970,7 @@ The column counts `AttemptRecord {` struct literals in production code,
 anchored to a line of its own for the reason the profile census is:
 a return type and the definition contain the same text.
 
-## `fn an_attempts_ledger_line_is_constructed_in_one_production…` › `const EXPECTED: &[(&str, usize, &str)] = &[(`
+## `fn an_attempts_ledger_line_is_constructed_in_one_production_place() {` › `const EXPECTED: &[(&str, usize, &str)] = &[(`
 
 (file, `AttemptRecord {` literals, why).
 
@@ -994,7 +994,7 @@ code, anchored to a line of its own: a return type (`-> WorkerProfile
 the same text and neither constructs anything. Measured without the
 anchor this census reported five sites and three files.
 
-## `fn a_worker_profile_is_constructed_in_one_production_place_…` › `const EXPECTED: &[(&str, usize, &str)] = &[`
+## `fn a_worker_profile_is_constructed_in_one_production_place_per_role() {` › `const EXPECTED: &[(&str, usize, &str)] = &[`
 
 (file, `WorkerProfile {` literals, why).
 
@@ -1020,7 +1020,7 @@ for `review_failure`, which was **already a function** — a pure move of
 something already callable is churn, not extraction — and `src/ladder.rs`
 keeps its own for the escalation vocabulary it owns.
 
-## `fn an_observation_about_an_attempt_is_classified_in_one_pro…` › `const EXPECTED: &[(&str, usize, usize, &str)] = &[`
+## `fn an_observation_about_an_attempt_is_classified_in_one_production_place() {` › `const EXPECTED: &[(&str, usize, usize, &str)] = &[`
 
 (file, `AttemptFailure::new` calls, `ReviewPassOutcome::` uses, why).
 
@@ -1485,15 +1485,15 @@ strict-config parser probes' shape, and the gate/shell dialects — so
 this is a statement about the values production actually passes and not
 about invented ones.
 
-## `fn a_command_specs_payload_does_not_depend_on_its_arguments…` › `let invocation = Invocation::at(if cfg!(windows) {`
+## `fn a_command_specs_payload_does_not_depend_on_its_arguments() {` › `let invocation = Invocation::at(if cfg!(windows) {`
 
 (a) `bin::Invocation::spec`, the agent-CLI constructor.
 
-## `fn a_command_specs_payload_does_not_depend_on_its_arguments…` › `type Payload = (Vec<(String, String)>, Vec<u8>);`
+## `fn a_command_specs_payload_does_not_depend_on_its_arguments() {` › `type Payload = (Vec<(String, String)>, Vec<u8>);`
 
 One spec's payload: its overlay and its stdin.
 
-## `fn a_command_specs_payload_does_not_depend_on_its_arguments…` › `let mut shell_payloads: Vec<Payload> = Vec::new();`
+## `fn a_command_specs_payload_does_not_depend_on_its_arguments() {` › `let mut shell_payloads: Vec<Payload> = Vec::new();`
 
 (b) `gates::ShellKind::spec`, the other one. Every dialect, because
 the shell is a field of the record and not a constant.

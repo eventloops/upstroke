@@ -159,7 +159,7 @@ The two are complementary and neither replaces the other: the harness
 answers "was this site's phase executed", the trace answers "in what
 order did the daemon see these calls".
 
-## `fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), Upstro…`
+## `fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), UpstrokeError> {`
 
 Turn a hook's answer into what the funnel must do at that point.
 
@@ -399,7 +399,7 @@ is no argument to pass that is not evidence.
 [`UpstrokeError::Refused`] when `site` does not name this operation or the
 runtime refuses.
 
-## `fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(), Upstro…`
+## `fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(), UpstrokeError> {`
 
 Refuse a proof that owns some other container.
 
@@ -760,7 +760,7 @@ ownership evidence it could not read.
 [`UpstrokeError::Io`] when it is still there and still unreadable after
 [`RACING_ACCESS_ATTEMPTS`] attempts.
 
-## `fn read_racing(path: &Path) -> Result<Option<ContainerInten…` › `Err(other) => return Err(other),`
+## `fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {` › `Err(other) => return Err(other),`
 
 Not an IO answer at all: the bytes were read and are not a
 record. Retrying cannot change that.
@@ -784,7 +784,7 @@ that no reader may adopt, exactly as `Answer.StageWrite`'s `.partial` is.
 [`UpstrokeError::Io`] when the directory cannot be read, or whatever
 [`read_intent`] returns.
 
-## `pub fn list_intents(private_root: &Path) -> Result<Vec<Foun…` › `let Some(record) = read_racing(&path)? else {`
+## `pub fn list_intents(private_root: &Path) -> Result<Vec<FoundIntent>, UpstrokeError> {` › `let Some(record) = read_racing(&path)? else {`
 
 A record that vanished between the directory read and this one is a
 record another reclaimer removed, and that is not an error: "every
@@ -830,7 +830,7 @@ directory. `None` is genuinely torn — the ownership evidence is the
 **name**, which carries the run id and the incarnation but not the run
 directory, so arm (ii)'s lock probe has nothing to ask about.
 
-## `pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, UpstrokeErro…`
+## `pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, UpstrokeError> {`
 
 Every staged intent under `<R>/containers` whose published half is absent,
 sorted by name.
@@ -847,7 +847,7 @@ container name — the same refusal [`list_intents`] gives a malformed
 published one, for the same reason: an unreadable name in this namespace is
 evidence the census could not classify, not evidence it may ignore.
 
-## `pub fn list_staged_intents(private_root: &Path) -> Result<V…` › `let record = match fs::read(&path) {`
+## `pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, UpstrokeError> {` › `let record = match fs::read(&path) {`
 
 Tolerant of already-gone, like every other read in this namespace: a
 staged file that vanished under the scan is a writer that finished
@@ -881,7 +881,7 @@ A runtime failure, as the engine's error type.
 
 `<name>.intent` -> `<name>.intent.tmp`.
 
-## `fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(), Upstroke…`
+## `fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(), UpstrokeError> {`
 
 Write `bytes` durably: stage, fsync, rename, fsync the directory.
 
@@ -947,7 +947,7 @@ daemon-unreachable message when the binary is present and the daemon is
 not — the same shape as `codex login status`, whose exit code and output
 disagree.
 
-## `impl DockerCli` › `fn exec(&self, op: RuntimeOp, target: &str, args: &[&str]) -> Result<String, RuntimeError…`
+## `impl DockerCli` › `fn exec(&self, op: RuntimeOp, target: &str, args: &[&str]) -> Result<String, RuntimeError> {`
 
 Run one `docker` subcommand and capture it.
 
@@ -1175,7 +1175,7 @@ diagnostic is checked against the live daemon by
 `tests::real_docker_prints_the_transcribed_removal_in_progress_diagnostic`,
 so the table's oracle is `docker` and not this file.
 
-## `fn image_by_id(&self, id: &str) -> Result<Option<runtime::I…` › `if found.id != id {`
+## `fn image_by_id(&self, id: &str) -> Result<Option<runtime::ImageInspection>, RuntimeError> {` › `if found.id != id {`
 
 `docker image inspect` resolves a *prefix* of an id and a tag alike,
 so an answer whose id is not the value asked for is not an answer to
@@ -1183,13 +1183,13 @@ this question. The rebuild path's refusal is "the recorded image id
 is absent from the runtime", and a different id present is exactly
 that.
 
-## `fn collect(&self, name: &str) -> Result<ContainerExecution,…` › `let (stdout, stderr) = self.exec_streams(RuntimeOp::Collect, name, &["logs", name])?;`
+## `fn collect(&self, name: &str) -> Result<ContainerExecution, RuntimeError> {` › `let (stdout, stderr) = self.exec_streams(RuntimeOp::Collect, name, &["logs", name])?;`
 
 Both streams, separately. `docker logs` writes the container's stdout
 to its own stdout and the container's stderr to its own stderr
 (measured, docker 29.7.2) — see [`Self::exec_streams`].
 
-## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContai…` › `args.push("--read-only".to_owned());`
+## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContainer, RuntimeError> {` › `args.push("--read-only".to_owned());`
 
 `expected_failures_refusals[5]`. Measured against `docker`
 29.7.2: without it `sh -c 'printf owned >/outside-role-mount'`
@@ -1198,11 +1198,11 @@ so a gate's write outside every declared mount succeeds and only
 the weaker "the host is unharmed" holds. With it the same command
 answers `Read-only file system` and exits non-zero.
 
-## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContai…` › `args.push(spec.image_id.clone());`
+## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContainer, RuntimeError> {` › `args.push(spec.image_id.clone());`
 
 The **image id**, never a reference (INV-23).
 
-## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContai…` › `let reported = self`
+## `fn create(&self, spec: &CreateSpec) -> Result<CreatedContainer, RuntimeError> {` › `let reported = self`
 
 The id the runtime says it used, read back from the created
 container. Never `spec.image_id`: the whole point of the check the
@@ -1228,6 +1228,11 @@ here a discharge of R26 rather than a violation of R20.
 Whether a `docker stop` / `docker kill` failure means the container has
 already reached the state the caller asked for.
 
+The adjacent source comment retains the daemon's concurrent-reclaimer
+protocol under standards §10 and §13. A stopped or removing container lets a
+losing stop request continue cleanup, while other failures retain the intent
+for retry. A removal in progress does not prove absence.
+
 "every step idempotent and tolerant of already-gone so **two concurrent
 reclaimers converge**" has two shapes on a real daemon, and only one of them
 is "gone". Measured on `docker` 29.7.2, verbatim:
@@ -1243,8 +1248,10 @@ The **first** row is the load-bearing one and it is what a *racing*
 reclaimer sees: A kills the container, B reaches `docker kill` after the
 state has become `Exited`, and without this tolerance B returns an error
 before observe / rm / view / intent cleanup — the opposite of the sentence.
-`PR6-LANEF-003` is the entry for it: deleting the tolerance passed every
-test, because every fixture serialized the reclaimers.
+`PR6-LANEF-003` records that deleting the tolerance passed the tests at that
+historical head because the fixtures serialized the reclaimers. That is not
+a claim about the current suite, which directly checks the stop-settlement
+predicate, including the daemon's removal-in-progress response.
 
 ## `fn stop_already_settled(detail: &str) -> bool` › `remove_already_settled(detail) || detail.contains("is not running")`
 
