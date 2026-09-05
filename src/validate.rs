@@ -1,4 +1,7 @@
 //! Extended notes: `docs/internals/validate.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods)]
 
 mod graph;
