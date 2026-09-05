@@ -1,28 +1,19 @@
 //! The application half of INV-02: what a checked transition does to the
 //! state, and nothing that decides whether it may.
 //!
-//! **A pure function of `(state, event, derived)`.** Nothing here reads a
-//! clock, the environment, or randomness, and nothing performs I/O; the only
-//! values it computes rather than copies are `epoch + 1` on a resume, the
-//! `next_sequence` increments, and a task's per-rung attempt count, each a
-//! function of prior durable state alone. So a live fold and a replay of the
-//! bytes it appended reach the same [`RunState`], which is the equality INV-02
-//! turns into a property of the type: [`RunState`] derives `PartialEq`, and two
-//! of them are how a live fold and a replay are proved identical. The one value
-//! a transition needs that is not in its own body — a question's origin, gone
-//! from `questions` the instant [`RunState::apply_answer`] removes it — is
-//! carried by [`super::Derived`], decided by the check and therefore identical
-//! on replay.
+//! Application is a deterministic function of the prior state, event and
+//! checked derivation. It reads no clock, environment or randomness and performs
+//! no I/O. Live/replay equality requires the caller to check each event against
+//! the current state, append it once and apply its delta once before checking
+//! the next event. Purity and [`RunState`]'s `PartialEq` support testing that
+//! protocol; they do not enforce single application or reject a stale delta.
+//! [`super::Derived`] carries facts checked before application, including a
+//! question's origin before [`RunState::apply_answer`] removes the question.
 //!
-//! **The state owns snapshots of what the log records.** Almost every `.clone()`
-//! in this module copies a value into durable fold state — a `TaskEntry` into
-//! the registry, a region into the lease table or the queue, a session, base or
-//! candidate identity into a generation — the owned-snapshot semantics §6
-//! blesses, since the fold outlives every event it folded. The one exception is
-//! in `apply_merge_rejected`, which clones a held candidate region into a local
-//! so the borrow of `self.tasks` is released before `self.leases` is widened: a
-//! small owned value taken to unborrow, named here rather than claimed a
-//! snapshot.
+//! Clones retain event data in fold state, which outlives the borrowed event.
+//! Registry entries, lease regions, queued candidates and generation records
+//! each own the data they retain. Rejection borrows the recorded candidate
+//! region while updating the disjoint lease table.
 
 use super::*;
 
@@ -33,16 +24,12 @@ use super::*;
 impl RunState {
     /// Apply a transition the check accepted.
     ///
-    /// Total by construction: every lookup here was proved to succeed by the
-    /// check that produced the delta, so no lookup misses on a path this fold
-    /// takes. The safety is that the miss is unreachable, not that each miss is
-    /// inert — most lookups leave the state alone on a miss, but two do not:
-    /// `apply_candidate_created` falls back to the conservative
-    /// `PathSet::RepoWide` and still enqueues, and `apply_verification_started`
-    /// advances `next_sequence` before its queue lookup.
-    /// Nothing in this function decides anything — a decision made here would be
-    /// one the live path and the replay path could reach differently, which
-    /// INV-02 forbids.
+    /// Checking establishes the lookup preconditions for immediate application
+    /// to that same state. A lookup miss is not generally inert: candidate
+    /// creation still enqueues, verification start advances its sequence,
+    /// verification unavailability takes the transaction, and dispatch grants
+    /// its lease before the corresponding lookup. Callers must preserve the
+    /// check/append/apply protocol instead of relying on these fallbacks.
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
@@ -103,7 +90,9 @@ impl RunState {
                 self.set_state(data.question.key, TaskState::AwaitingInput);
             }
             TopologyEventBody::QuestionAnswered { data } => match derived {
-                Derived::Answer(origin) => self.apply_answer(data, *origin),
+                Derived::Answer(QuestionOrigin::VerificationPark | QuestionOrigin::Admission) => {
+                    self.apply_answer(data);
+                }
                 // Exhaustive over `Derived`, so a new variant is a compile error
                 // here rather than a silent no-op: the check pairs every
                 // `question_answered` with `Derived::Answer`, and these two
@@ -139,10 +128,10 @@ impl RunState {
 
     pub(super) fn wake_backoff(&mut self) {
         self.queue.wake_deferred();
-        for task in &mut self.tasks {
-            if task.state == TaskState::Deferred {
-                task.state = TaskState::Pending;
-            }
+        // Move the keys out before deriving visible states. An open question
+        // keeps a task parked but cannot preserve an already elapsed wait.
+        for key in std::mem::take(&mut self.deferred_tasks) {
+            self.refresh_task_state(key);
         }
     }
 
@@ -508,9 +497,9 @@ impl RunState {
                             .find(|generation| generation.id == candidate.generation)
                     })
                     .and_then(|generation| generation.candidate.as_ref())
-                    .map(|prepared| prepared.paths.clone());
+                    .map(|prepared| &prepared.paths);
                 if let Some(held) = held {
-                    self.leases.widen_lineage(*root, &held);
+                    self.leases.widen_lineage(*root, held);
                 }
                 self.leases.widen_lineage(*root, paths);
                 self.leases.release(LeaseOwner::Candidate {
@@ -548,7 +537,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, origin: QuestionOrigin) {
+    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4) {
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -557,40 +546,10 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                // A verification park returns to awaiting merge to be re-verified
-                // under a new sequence; every other origin — a bare
-                // `question_raised`, a parked settlement, a gated admission —
-                // returns to `Pending`. Exhaustive over `QuestionOrigin`, so a new
-                // origin is a compile error rather than a silent `Pending`: this
-                // is master's `_ => Pending` catch-all made §5-clean.
-                //
-                // This pull request tried to return each task to the *exact* state
-                // it was parked from (a recorded `OpenQuestion.parked_from`) and
-                // withdrew it on evidence. A state snapshotted at raise time goes
-                // stale through events that never touch the question — the task can
-                // merge, defer or move while parked — so no guard over the snapshot
-                // is sound; the return state has to be *derived* from the fold's
-                // current facts instead. See `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`.
-                let state = match origin {
-                    QuestionOrigin::VerificationPark => TaskState::AwaitingMerge,
-                    QuestionOrigin::Admission => TaskState::Pending,
-                };
-                self.set_state(answered.key, state);
+                self.refresh_task_state(answered.key);
             }
             Answer4::Declined { decline_halts_run } => {
-                // Master's behaviour, untouched: fail the answered task and
-                // release its holdings. `design/26` — "Declining fails the
-                // lineage." — requires more, and the complete fix needs a second
-                // file. `release_holdings_of` does not clear `self.transaction`,
-                // and `check_end.rs`'s `check_question_raised` (row 32) admits the
-                // question on a task with a live transaction, so the transaction
-                // survives a decline and `check_task_merged` — which validates the
-                // transaction, not task state — lets `apply_task_merged` mark the
-                // declined lineage `Merged`, publishing declined work. That is
-                // live on master, not introduced here. Filed as
-                // `SWEEP-FOLD-APPLY-DECLINE-LINEAGE`.
-                self.set_state(answered.key, TaskState::Failed);
-                self.release_holdings_of(answered.key);
+                self.fail_lineage(answered.key);
                 if *decline_halts_run {
                     self.record_halt(answered.key);
                 }
@@ -598,24 +557,97 @@ impl RunState {
         }
     }
 
-    /// A declined question consumes the task's queue position and releases what
-    /// it held: its candidate lease, or the lineage lease when the task belongs
-    /// to a lineage — a declined lineage fails as a whole.
+    /// Derive the visible state after answering or waking a task. Question
+    /// origin does not capture a queued candidate, later wake or other answer.
+    fn refresh_task_state(&mut self, key: TaskKey) {
+        let Some(task) = self.tasks.get(key.index()) else {
+            return;
+        };
+        if task.state.is_terminal() {
+            return;
+        }
+        let state = if self.open_question_for(key).is_some() {
+            TaskState::AwaitingInput
+        } else if self.queue.holds_task(key)
+            || self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.candidate.key == key)
+        {
+            TaskState::AwaitingMerge
+        } else if self
+            .registry
+            .entries()
+            .iter()
+            .any(|entry| entry.lineage.is_some_and(|lineage| lineage.parent == key))
+        {
+            TaskState::AwaitingRepair
+        } else if self.deferred_tasks.contains(&key) {
+            TaskState::Deferred
+        } else {
+            TaskState::Pending
+        };
+        self.set_state(key, state);
+    }
+
+    /// Decline terminates all unpublished work in the lineage. Already merged
+    /// work stays merged; a human answer cannot undo a recorded publication.
+    fn fail_lineage(&mut self, key: TaskKey) {
+        let root = self.lineage_root(key);
+        let cancels_verification = self.transaction.as_ref().is_some_and(|transaction| {
+            self.lineage_root(transaction.candidate.key) == root
+                && match &transaction.class {
+                    TransactionClass::VerificationStarted { .. } => true,
+                    // The answer check refuses decline before append in this
+                    // class. Its already authorized publication must survive.
+                    TransactionClass::Prepared { .. } => false,
+                }
+        });
+        if cancels_verification {
+            self.release_transaction();
+        }
+        // Owned keys let each member's resources be consumed without retaining
+        // a registry borrow across those mutations.
+        let members: Vec<TaskKey> = self
+            .registry
+            .entries()
+            .iter()
+            .filter(|entry| entry.key == root || entry.lineage.is_some_and(|l| l.root == root))
+            .map(|entry| entry.key)
+            .collect();
+        for member in members {
+            self.close_generation(member);
+            self.release_holdings_of(member);
+            self.deferred_tasks.remove(&member);
+            if self
+                .tasks
+                .get(member.index())
+                .is_some_and(|task| task.state != TaskState::Merged)
+            {
+                self.set_state(member, TaskState::Failed);
+            }
+        }
+        let registry = &self.registry;
+        self.questions.retain(|_, open| {
+            open.question.key != root
+                && !registry
+                    .get(open.question.key)
+                    .and_then(|entry| entry.lineage)
+                    .is_some_and(|lineage| lineage.root == root)
+        });
+    }
+
+    /// Remove this member's queued candidates and candidate/lineage holdings.
+    /// The caller closes its generation and visits every affected member.
     pub(super) fn release_holdings_of(&mut self, key: TaskKey) {
-        let generations: Vec<GenerationId> = self
-            .tasks
-            .get(key.index())
-            .map(|task| {
-                task.generations
-                    .iter()
-                    .map(|generation| generation.id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        for generation in generations {
-            self.queue.remove(key, generation);
-            self.leases
-                .release(LeaseOwner::Candidate { key, generation });
+        if let Some(task) = self.tasks.get(key.index()) {
+            for generation in &task.generations {
+                self.queue.remove(key, generation.id);
+                self.leases.release(LeaseOwner::Candidate {
+                    key,
+                    generation: generation.id,
+                });
+            }
         }
         let root = self
             .registry
@@ -653,6 +685,19 @@ impl RunState {
     }
 
     pub(super) fn set_state(&mut self, key: TaskKey, state: TaskState) {
+        match state {
+            TaskState::Deferred => {
+                self.deferred_tasks.insert(key);
+            }
+            TaskState::AwaitingInput => {}
+            TaskState::Pending
+            | TaskState::AwaitingMerge
+            | TaskState::AwaitingRepair
+            | TaskState::Merged
+            | TaskState::Failed => {
+                self.deferred_tasks.remove(&key);
+            }
+        }
         if let Some(task) = self.tasks.get_mut(key.index()) {
             task.state = state;
         }
@@ -669,6 +714,8 @@ impl RunState {
         }
     }
 
+    /// `None` means this key has no task or no open generation. Checked callers
+    /// establish which generation they need before application mutates it.
     pub(super) fn open_generation_mut(&mut self, key: TaskKey) -> Option<&mut GenerationFold> {
         self.tasks.get_mut(key.index())?.open_mut()
     }

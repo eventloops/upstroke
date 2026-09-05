@@ -5,7 +5,7 @@ use crate::topology::events::{
     CandidateLeaseEffect, CandidatePrepared, GitRef, RunStarted4, TaskCandidateCreated,
     TopologyLimits,
 };
-use crate::topology::fold::TopologyFold;
+use crate::topology::fold::{TaskState, TopologyFold};
 
 use super::super::settle;
 use super::super::settle::tests::{

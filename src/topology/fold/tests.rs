@@ -22,6 +22,8 @@ use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{FrozenReviews, FrozenRung, FrozenTaskSpec, Lineage, Origin};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
+mod questions;
+
 const RUN_ID: &str = "01FOLD0000000000000000000A";
 
 /// One way to damage an otherwise valid record, for the refusal tables.
@@ -7566,7 +7568,7 @@ fn grid_state(
         };
         match backoff {
             Backoff::None => {}
-            Backoff::DeferredTask => run.tasks[MID.index()].state = TaskState::Deferred,
+            Backoff::DeferredTask => run.set_state(MID, TaskState::Deferred),
             Backoff::DeferredCandidate => run.queue.push(QueueEntry {
                 candidate: candidate_of(MID, 0),
                 paths: region(MID),

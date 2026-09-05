@@ -131,56 +131,47 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
-**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass, five repair rounds, and is not
-swept.** The pass and repairs landed the file's §5, §6 and §7 work. Five catch-alls over closed enums
-were made exhaustive, so a new variant is a compile error rather than a silent default:
-`apply_verification_unavailable` over `UnavailableOutcome`, `apply_answer`'s answer-return over
-`Derived`/`QuestionOrigin`, and the guards in `apply_merge_prepared` (`PreparedDisposition`),
-`apply_merge_rejected` (`RejectionDisposition`) and `close_generation` (`GenerationLease`) that
-decided a `next_sequence` increment or a lease release from one variant. The module doc's
-replay-purity and ownership claims were corrected against the source. `apply` was otherwise found
-sound: a pure function of `(state, event, derived)` with no clock, environment, randomness or I/O;
-transitions total over the closed 24-variant vocabulary; §7 clean.
+**Row 29 (`src/topology/fold/apply.rs`) remains open pending review of PR #152's
+complete repair.** All six legacy frontier verdicts were `CHANGES_REQUIRED`.
+The canonical PR ledger preserves each finding and the failed repair sequences.
+The owner expanded the repair scope to include the required checks and callers;
+the prior claim that those files were beyond this PR's reach is superseded.
 
-**No correctness fix landed.** The one this sweep attempted — returning an answered task to the exact
-state it was parked from, rather than master's origin-based `AwaitingMerge`/`Pending` — was withdrawn
-on evidence across five passes (below). The answer-return is master's behaviour, with the catch-all
-that chose it made §5-exhaustive.
+The application dispatches are exhaustive over `UnavailableOutcome`,
+`Derived`/`QuestionOrigin`, `PreparedDisposition`, `RejectionDisposition` and
+`GenerationLease`. This forces a decision at each application site when an enum
+grows. The old outage witness overstated the effect: the transaction was consumed
+and the queue sequence cleared, while the new outcome's effect would be omitted.
+The checker already had its own exhaustive match. Neither whole-event inertness
+nor automatic checker acceptance was established by that witness.
 
-The row stays in the queue, and the items found during the pass are labelled by stage:
+The repair derives answer state from current questions, queue/transaction
+ownership, repair children and execution backoff. It preserves hidden waits until
+wake or resume consumes them. Decline terminates the whole unmerged lineage,
+cancels matching unprepared verification and preserves unrelated work; a prepared
+publication refuses decline until completion. Bare questions cannot enter active
+lineage work or park terminal tasks. The engine selector uses the fold's eligible
+candidate, including lineage questions. DESIGN §26 records these behavior changes.
+Checked-log regressions cover the interactions and compare live state with replay
+of serialized records. Current checkpoint runtime still refuses human answers;
+these fold effects do not implement process cancellation.
 
-- **The in-flight wedge — FIXED in #153.** A fold-legal `question_raised` then `Declined` on a task
-  whose attempt was in flight wedged the run so `derived_outcome` could never end it. Ruled a
-  check-layer behaviour change and fixed in `src/topology/fold/check_end.rs` (row 32) on its own
-  stream, `fix/declined-halt-wedge` at `7a6b23b`. This record does not restate #153's guard, which has
-  moved across its heads; read it at that sha.
-- **A declined repair failing only the repair, and publishing declined work — FILED, live on master.**
-  `apply_answer`'s `Declined` arm fails only the answered task, so declining a repair's question
-  leaves the lineage root `AwaitingRepair` and the run wedges. And because `release_holdings_of` never
-  clears `self.transaction` while `check_end.rs`'s `check_question_raised` admits the question on a
-  task with a live transaction, the surviving transaction lets `check_task_merged` (which validates
-  the transaction, not task state) and `apply_task_merged` mark the declined lineage `Merged` —
-  **publishing declined work, live on master.** Pass 3/4 attempted the apply-half fix and reverted it;
-  the complete fix needs both `apply.rs` (the failing and the transaction) and `check_end.rs` (the
-  admission), so it is beyond this pull request's reach. `design/26` (*Declining fails the lineage.*)
-  and `release_holdings_of`'s own doc are the authority; the finding is
-  `SWEEP-FOLD-APPLY-DECLINE-LINEAGE` (P1, deferred, with an escalate-if-reclassified clause), for a
-  successor once #152 and #153 land.
-- **The answer-return snapshot — ATTEMPTED and WITHDRAWN, refiled open.** #152 tried to return each
-  task to the state it was parked from (a recorded `OpenQuestion.parked_from`, restored under a
-  guard). Five passes found **four independent stalenesses** — merged-while-parked; two questions with
-  the guard satisfied; a `Deferred` park losing its durable wake; and move-while-parked (there is not
-  one parking episode but overlapping ones) — each a way a state snapshotted at raise time goes stale
-  through events that never touch the question. The conclusion is that the return state must be
-  *derived* from the fold's current facts, not restored from a snapshot; `parked_from`,
-  `#[non_exhaustive]` on `OpenQuestion`, the four tests and the `design/12` sentence are all reverted,
-  and the finding is refiled open as `PR153-FOLD-ANSWER-RETURNS-TO-PENDING` (P2, deferred) carrying
-  the four sequences and the derivation direction. A finding that records a failed approach and why
-  saves the next attempt.
-- **The design-authority claim — WITHDRAWN on evidence.** An earlier draft held the row open because
-  the contracts `apply.rs` states the effect of (INV-02, ST-06, `transaction_fault_matrix[T-ATTEMPT]`,
-  the retired `decisions/2026-08-12` record) name no `DESIGN.md` section. Wrong: `DESIGN.md`'s row for
-  `decisions/2026-08-12` maps it to §26, which carries that decision verbatim. The finding is deleted.
+The rejected `parked_from` repairs remain historical failed approaches. Their
+merged-state, multiple-question, hidden-wake and overlapping-episode witnesses do
+not prove that every possible snapshot representation is unsound. This repair
+adds no public question field or `non_exhaustive` attribute. The old
+`SWEEP-FOLD-APPLY-DESIGN-AUTHORITY` claim was rejected because DESIGN.md already
+mapped the retired protocol to §26. `SWEEP-FOLD-APPLY-ORIGIN-SUPERSEDED` depended on
+the withdrawn snapshot premise and is withdrawn too.
+
+Rejection now borrows the candidate region while updating the disjoint lease
+table. Remaining application clones retain owned event or historical state in
+independent fold records. The module performs no I/O and its optional generation
+lookup documents absence. Determinism and equality support replay checks;
+private delta construction establishes prior checking, not freshness or single
+use. The public delta API still requires the documented check/append/apply-once
+protocol. The cloned/stale-delta witness remains valid and is not claimed fixed
+by the documentation correction.
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and

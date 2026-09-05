@@ -1,18 +1,17 @@
 //! The checked fold: one transition function for a live run and for a replay.
 //!
-//! **INV-02 — an invalid transition is never appended, and never applied.**
-//! [`TopologyFold::plan_transition`] decides whether an event may be applied
-//! and returns a [`TopologyDelta`] when it may; [`TopologyFold::apply_delta`]
-//! is the only thing that changes the state, and a `TopologyDelta` is the only
-//! thing it accepts. The delta has no public constructor, so there is no way to
-//! reach the state except through the check — which is what makes "the live run
-//! and the replay use one transition" a property of the types rather than a
-//! convention two call sites are expected to keep.
+//! [`TopologyFold::plan_transition`] checks an event against the current fold
+//! and returns an opaque [`TopologyDelta`]. Private construction guarantees
+//! that a delta was checked, but does not guarantee freshness or single use.
+//! A cloned delta, or two deltas planned before either is applied, can become
+//! stale. [`TopologyFold::apply_delta`] does not recheck them.
 //!
 //! A live emission is `plan_transition` → append the exact bytes → `apply_delta`
-//! only after the append returned `Ok`. A replay is
-//! [`TopologyFold::replay`], which is those same two calls per event with the
-//! append taken out. Nothing else exists.
+//! only after the append returned `Ok`. Apply the delta exactly once to the
+//! fold that checked it, before planning or applying another transition.
+//! [`TopologyFold::replay`] uses those same calls once per event in order,
+//! with the append removed. This protocol preserves INV-02 and DESIGN §26's
+//! single transition implementation for live execution and replay.
 //!
 //! # What the fold refuses
 //!
@@ -38,10 +37,8 @@
 //!
 //! # What it does not do
 //!
-//! No production path writes or reads a schema-4 log yet, and nothing here
-//! performs an effect: no ref moves, no worktree is created, no report is
-//! written. The fold decides what a log *means*; the effects that log
-//! authorizes, and the typed sites they run through, arrive in later slices.
+//! This module performs no I/O or Git effects. The schema-4 emitter owns the
+//! append protocol, while this fold checks transitions and derives run state.
 
 mod apply;
 mod check_attempt;
@@ -544,15 +541,15 @@ impl TaskFold {
     }
 }
 
-/// Why a question is open, which is what decides where its answer returns the
-/// task to.
+/// What raised a question. Answer state is derived from current fold facts,
+/// including outstanding questions, queued work and unelapsed backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionOrigin {
-    /// A verification could not be run. An answer returns the task to awaiting
-    /// merge, to be re-verified under a new sequence.
+    /// A verification could not be run. Its queued candidate remains available
+    /// for verification under a new sequence after the lineage's last answer.
     VerificationPark,
-    /// An attempt parked, or a repair's admission is gated. An answer returns
-    /// the task to pending.
+    /// An attempt parked, a repair's admission is gated, or a bare question was
+    /// raised. The origin alone does not determine the task's next state.
     Admission,
 }
 
@@ -602,7 +599,7 @@ pub struct Transaction {
 ///
 /// `PartialEq` and not `Eq`: the run record it holds carries the reported
 /// spend of a budget stop, and a float has no total equality. Comparing two of
-/// these is how a live fold and a replayed one are proved identical (INV-02).
+/// these tests live/replay agreement for the event trace being compared.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     started: Box<RunStarted4>,
@@ -613,6 +610,9 @@ pub struct RunState {
     questions: BTreeMap<QuestionId, OpenQuestion>,
     /// Every question id this log has used, open or not: an id is never reused.
     seen_questions: BTreeSet<QuestionId>,
+    /// Execution backoff still owed, including tasks parked on questions.
+    /// Accepted settlements add keys; elapsed waits and resume clear them.
+    deferred_tasks: BTreeSet<TaskKey>,
     overrides: BTreeMap<TaskKey, BindingOverride>,
     queue: CandidateQueue,
     leases: LeaseTable,
@@ -643,11 +643,11 @@ pub struct FrozenInputs {
 
 /// One checked transition, ready to apply.
 ///
-/// Deliberately opaque and deliberately unconstructible outside this module:
-/// [`TopologyFold::apply_delta`] takes one of these and nothing else, so the
-/// only path into the state runs through [`TopologyFold::plan_transition`].
-/// That is INV-02 expressed as a type rather than as a rule two call sites are
-/// asked to remember.
+/// Construction is private, so each delta came from
+/// [`TopologyFold::plan_transition`]. The caller must apply it once to the
+/// same fold, with no intervening transition. Cloning does not renew that
+/// precondition, and applying a stale or duplicate delta is not checked.
+/// On the live path, append its event successfully once before applying it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopologyDelta {
     event: TopologyEvent,
@@ -670,7 +670,7 @@ enum Derived {
     /// The registry rebuilt from the frozen plan and this record, already
     /// authenticated against the recorded digest.
     Registry(Box<TaskRegistry>),
-    /// Where an answered question returns its task to.
+    /// The checked question's origin, retained before application removes it.
     Answer(QuestionOrigin),
 }
 
@@ -716,6 +716,11 @@ impl TopologyFold {
 
     /// Whether `event` may be applied to this state, and what applying it does.
     ///
+    /// The returned delta is for this fold in its current state. On success,
+    /// append its exact event and apply it once before any other transition.
+    /// Planning a second delta does not reserve either transition or make the
+    /// deltas safe to apply successively without checking again.
+    ///
     /// # Errors
     ///
     /// The [`FoldError`] naming what the event disagrees with. A refusal is a
@@ -741,8 +746,12 @@ impl TopologyFold {
         }
     }
 
-    /// Apply a checked transition. Total: every value it needs was decided by
-    /// the check that produced the delta.
+    /// Apply a delta once to the fold that checked it, with no intervening
+    /// transition. On the live path its exact event must first be appended
+    /// successfully once; replay applies it once for the corresponding record.
+    ///
+    /// These are caller preconditions. This method does not validate freshness,
+    /// reject duplicate application or verify that an append occurred.
     pub fn apply_delta(&mut self, delta: TopologyDelta) {
         let TopologyDelta { event, derived } = delta;
         if let (TopologyEventBody::RunStarted { data }, Derived::Registry(registry)) =
@@ -781,6 +790,7 @@ impl RunState {
             incarnation,
             questions: BTreeMap::new(),
             seen_questions: BTreeSet::new(),
+            deferred_tasks: BTreeSet::new(),
             overrides: BTreeMap::new(),
             queue: CandidateQueue::new(),
             leases: LeaseTable::new(),
@@ -830,6 +840,20 @@ impl RunState {
         self.questions
             .values()
             .find(|open| open.question.key == key)
+    }
+
+    fn lineage_root(&self, key: TaskKey) -> TaskKey {
+        self.registry
+            .get(key)
+            .and_then(|entry| entry.lineage)
+            .map_or(key, |lineage| lineage.root)
+    }
+
+    fn lineage_has_question(&self, key: TaskKey) -> bool {
+        let root = self.lineage_root(key);
+        self.questions
+            .values()
+            .any(|open| self.lineage_root(open.question.key) == root)
     }
 }
 

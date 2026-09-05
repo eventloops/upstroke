@@ -259,6 +259,58 @@ Its payload includes:
   answer records an explicit one-off binding. Declining fails the lineage. The
   engine never silently breaks a pin or policy ceiling.
 
+Questions may park a nonterminal task whose lineage has no open generation or
+integration transaction. This includes queued work, execution backoff and a
+quiet `AwaitingRepair` parent. Distinct question IDs may remain open together;
+an ID is never reused. Standalone admission questions obey the same active-work
+check. A rejection may embed its new admission question because that event
+settles its transaction. An attempt settlement may close its own generation and
+embed a question while a sibling generation or verification is still active.
+
+An open question blocks new dispatch, attempt starts and integration throughout
+its lineage. Unrelated work stays eligible. Candidate selection and integration
+admission use the same question rule. `merge_prepared` checks again before
+authorizing publication because a sibling may have parked after verification
+started.
+
+An answer removes only its question. The answered task keeps a terminal state;
+otherwise another question of its own implies `AwaitingInput`, a queued
+candidate or owned transaction implies `AwaitingMerge`, a registered repair
+child implies `AwaitingRepair`, unelapsed execution backoff implies `Deferred`,
+and otherwise it becomes `Pending`. Questions elsewhere in the lineage still
+block admission. These are current facts, not a state restored from raise time.
+Execution backoff remains pending beneath a question. An elapsed wait or resume
+consumes it once, including hidden waits, without closing questions. Queue
+verification backoff remains a separate fact.
+
+A decline fails every unmerged lineage member, including the root. It closes
+their generations, removes candidates and questions, clears execution backoff,
+and releases their generation, candidate and lineage holdings. A matching
+`VerificationStarted` transaction is cancelled; late results for closed
+generations or sequences are refused. A `Prepared` transaction has already
+authorized publication, so a decline affecting it is refused before append
+until that publication completes. Already merged ancestors remain merged.
+Unrelated transactions and holdings survive. `decline_halts_run` additionally
+records a run halt; it does not decide whether the lineage fails. New repairs
+must name a coherent root and parent and cannot revive a failed ancestor.
+
+These are durable fold and replay rules. The current topology checkpoint
+driver still refuses human answer ingestion before append. It does not yet
+cancel running agent processes on a decline. A concurrent driver that ingests
+answers must stop the affected work and discard late results before appending
+their completion. Event shapes are unchanged; schema-4 replay now refuses the
+unsafe event orders excluded above, including bare questions during active
+lineage work and questions on terminal tasks.
+
+The live writer checks one event, appends that exact event successfully once,
+and applies its delta once to the same fold with no intervening transition.
+Replay uses the same check and application once per record in order. Private
+delta construction establishes that checking occurred; it does not enforce
+freshness, append ordering or single application. Cloned deltas and separately
+planned deltas can be stale. The public API does not reject this misuse. The
+engine emitter's exclusive mutable ownership and call order enforce the live
+protocol.
+
 At actual dispatch, the engine records the then-current integration head as the
 repair's generation base. For a text conflict, it applies the candidate there
 without committing, leaving the unmerged index for the worker to resolve. For a
