@@ -477,9 +477,9 @@ Whether the ambient job has been established in this process.
 
 Whether `pid` is a member of this process's ambient job.
 
-`None` when no ambient job has been established, or the process cannot
-be opened. The kernel answers, so this is an oracle independent of the
-spawn path it checks.
+`None` when no ambient job has been established, the process cannot be
+opened, or `IsProcessInJob` itself fails. The kernel answers, so this is
+an oracle independent of the spawn path it checks.
 
 ## `mod windows_job` › `struct OpenHandle(HANDLE);`
 

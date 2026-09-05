@@ -851,6 +851,47 @@ fn a_real_ambient_join_failure_refuses_the_write_command() {
     join_ambient_job_with(&mut NoHooks, || Ok(())).expect("a successful ambient join proceeds");
 }
 
+#[cfg(not(windows))]
+#[test]
+fn the_unix_ambient_join_is_a_no_op_that_consults_no_observer() {
+    use crate::topology::effects::InjectionMode;
+
+    #[derive(Default)]
+    struct Refusing {
+        consulted: Vec<(SubEffectPoint, Option<InjectionMode>)>,
+        children: Vec<u32>,
+    }
+
+    impl SpawnHooks for Refusing {
+        fn point(&mut self, point: SubEffectPoint) -> Injection {
+            self.consulted.push((point, None));
+            Injection::Error
+        }
+
+        fn point_mode(&mut self, point: SubEffectPoint, mode: InjectionMode) -> Injection {
+            self.consulted.push((point, Some(mode)));
+            Injection::Error
+        }
+
+        fn child_created(&mut self, pid: u32) {
+            self.children.push(pid);
+        }
+    }
+
+    let mut hooks = Refusing::default();
+    join_ambient_job(&mut hooks).expect("on Unix the ambient join has nothing that can refuse");
+    assert!(
+        hooks.consulted.is_empty(),
+        "a Unix host consulted the observer at a Windows containment point: {:?}",
+        hooks.consulted
+    );
+    assert!(
+        hooks.children.is_empty(),
+        "the Unix ambient join created a process: {:?}",
+        hooks.children
+    );
+}
+
 #[cfg(windows)]
 fn windows_descendant_command(ready: &std::path::Path, marker: &std::path::Path) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("test executable"));

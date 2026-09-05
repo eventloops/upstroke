@@ -423,6 +423,20 @@ an injected failure must not be able to stand in for the real one.
 
 And a join that succeeds is not turned into a refusal.
 
+## `fn the_unix_ambient_join_is_a_no_op_that_consults_no_observer() {`
+
+On Unix the ambient join is a no-op that consults no observer.
+
+`join_ambient_job`'s Unix contract, in its own words: "The hook is not
+consulted here either — recording a Windows containment point as executed
+on a Unix host would let a Linux CI cell claim Windows coverage." Every
+test of the point above is `#[cfg(windows)]`, and the Unix suite asserted
+only that the step returns `Ok`, so a Unix arm that consulted the observer
+— and let a `HookHarness` record `Spawn.AmbientJobJoined` as reached on
+Linux — passed the whole Linux suite. The observer here answers `Error` to
+everything, so an arm that consults *and applies* is caught by the `Ok`,
+and an arm that consults and discards the answer is caught by the record.
+
 ## (end of `fn windows_direct_exit_parent_helper()`)
 
 Returning successfully while the child is live models a CLI shim

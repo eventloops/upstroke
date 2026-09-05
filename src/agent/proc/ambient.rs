@@ -7,6 +7,7 @@
 )]
 
 use crate::error::UpstrokeError;
+use crate::runner::container::census::ReaperContainerScope;
 #[cfg(windows)]
 use crate::topology::effects::{InjectionMode, SubEffectPoint};
 
@@ -83,20 +84,21 @@ pub fn child_in_ambient_job(pid: u32) -> Option<bool> {
 }
 
 #[cfg(all(windows, test))]
+#[must_use]
 pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
     windows_job::poison_ambient_for_tests(message)
 }
 
+#[cfg(unix)]
 pub fn set_container_reclaim_scope(
-    scope: Option<&crate::runner::container::census::ReaperContainerScope>,
+    scope: Option<&ReaperContainerScope>,
 ) -> Result<(), UpstrokeError> {
-    #[cfg(unix)]
-    {
-        super::termination::set_container_reclaim_scope(scope)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = scope;
-        Ok(())
-    }
+    super::termination::set_container_reclaim_scope(scope)
+}
+
+#[cfg(not(unix))]
+pub fn set_container_reclaim_scope(
+    _scope: Option<&ReaperContainerScope>,
+) -> Result<(), UpstrokeError> {
+    Ok(())
 }
