@@ -5830,7 +5830,10 @@ fn an_empty_inventory_still_checks_fast_traces_without_claiming_they_ended() {
 
     // A hook observation satisfies the trace check even before the sequence
     // closes. With no inventoried sites there is no ordinary coverage to add.
-    harness.hook(EffectSiteId::Event(EventSite::AppendFirst), HookPhase::Before);
+    harness.hook(
+        EffectSiteId::Event(EventSite::AppendFirst),
+        HookPhase::Before,
+    );
     assert!(check_bijection(&[], &harness, &[], host).is_empty());
     harness.end_fast_sequence();
     assert!(check_bijection(&[], &harness, &[], host).is_empty());
