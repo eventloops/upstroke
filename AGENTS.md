@@ -56,11 +56,12 @@ bash .github/scripts/test-release-record.sh
 bash .github/scripts/test-pr-policy.sh
 bash .github/scripts/test-pr-ledger-evidence.sh
 bash .github/scripts/test-docs-consistency.sh
+bash .github/scripts/test-internals-notes.sh
 ```
 
 The crate defines no features today, so `--all-features` is a no-op; use the CI form regardless.
 `1.85.0` is the MSRV and CI pins it; there is **no** `rust-toolchain.toml`, so toolchain selection
-is explicit at call sites. The 4 `test-*.sh` gates in `.github/scripts/` run in CI's `lint` job.
+is explicit at call sites. The 5 `test-*.sh` gates in `.github/scripts/` run in CI's `lint` job.
 `test-release-record.sh` needs `jq`. `test-pr-policy.sh` derives its own directory with
 `${BASH_SOURCE[0]%/*}`, which works from any directory except one: invoked by bare name from
 inside `.github/scripts/`, the expansion strips nothing and it fails. Invoke it by path, as above.
@@ -89,7 +90,7 @@ Read the `standards/` sections a change touches. In particular:
 
 ## How a change lands
 
-`MAINTAINING.md` is authoritative. In outline: draft PR early; the eight gates and both required
+`MAINTAINING.md` is authoritative. In outline: draft PR early; the nine gates and both required
 contexts (`upstroke-ci`, `upstroke-pr-policy`) green; one frontier review of the exact green head
 (`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage: serious
 P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in touched code and any
@@ -109,7 +110,8 @@ body when it has been.
 | `CODING_STANDARDS.md`, `standards/` | Implementation standards, one section per file; `standards/SWEEP.md` |
 | `MAINTAINING.md` | Change lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
-| `.github/scripts/` | The 4 `test-*.sh` gates and the `validate-*` helpers they exercise |
+| `docs/internals/` | Internal module notes, one file per module mirroring `src/`. A module with notes carries a single `Extended notes:` pointer in its header and no other prose (§13), held both ways by `test-internals-notes.sh`. `docs/` is also the GitHub Pages source for upstroke.rs, so anything added there is published |
+| `.github/scripts/` | The 5 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `reviews/` | `reviews/findings/`, the standing finding ledger, one file per finding; `reviews/FINDINGS.md`, the same ledger up to 2026-09-04, closed to new sections; historical review records moved to the private lab repository on 2026-09-04 |
 | `effects/` | The effect-governance allowlists the `src/effects/tests.rs` census enforces |
 
