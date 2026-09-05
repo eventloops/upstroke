@@ -1034,6 +1034,8 @@ mod termination {
     const REAPER_FAIL: u8 = 0x85;
     const REAPER_CANCEL: u8 = 0x86;
     const REAPER_RESUME_STABLE_POLLS: u8 = 50;
+    const HELPER_ABORT: u8 = 0x71;
+    const SETUP_FAILURE_FRAME_LEN: usize = 7;
 
     const HELPER_READY_BUDGET: Duration = Duration::from_secs(2);
 
@@ -1923,16 +1925,22 @@ mod termination {
         }
         if pid == 0 {
             if !install_reaper_dispositions() {
-                unsafe { libc::_exit(1) };
+                report_setup_failure_and_exit(
+                    ack[1],
+                    SetupFailure::at(SetupStep::SignalDispositions, last_errno()),
+                );
             }
             close_fd(command[1]);
             close_fd(ack[0]);
             if unsafe { libc::setpgid(0, 0) } != 0 {
-                unsafe { libc::_exit(1) };
+                report_setup_failure_and_exit(
+                    ack[1],
+                    SetupFailure::at(SetupStep::OwnProcessGroup, last_errno()),
+                );
             }
             close_inherited_fds(&[command[0], ack[1]], open_max);
-            if !lock_cleanup_paths(&cleanup_paths) {
-                unsafe { libc::_exit(1) };
+            if let Err(failure) = lock_cleanup_paths(&cleanup_paths) {
+                report_setup_failure_and_exit(ack[1], failure);
             }
             let mut delay_left = ready_delay_ms;
             while delay_left > 0 {
@@ -1976,12 +1984,14 @@ mod termination {
             pid,
         };
         let ready_wait_began = std::time::Instant::now();
-        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
+        let wait = await_ready(ack[0], REAPER_READY, HELPER_READY_BUDGET);
+        if wait != ReadyWait::Ready {
             let waited = ready_wait_began.elapsed();
+            let how = describe_ready_wait("reaper", wait, &cleanup_paths);
             let end = describe_helper_end(reaper.abandon());
             return Err(format!(
                 "Unix cleanup reaper did not initialize; waited {waited:?} of \
-                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}"
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; {how}; ending it: {end}"
             ));
         }
         #[cfg(test)]
@@ -2033,17 +2043,31 @@ mod termination {
         true
     }
 
-    fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> bool {
-        for path in paths {
+    fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> Result<(), SetupFailure> {
+        for (index, path) in paths.iter().enumerate() {
+            // A report names the lease by position; more than 255 active
+            // leases is not a state the conductor produces, and a saturated
+            // position reads as "a lease past the ones the message can name".
+            let index = u8::try_from(index).unwrap_or(u8::MAX);
             let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 || unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-                if fd >= 0 {
-                    close_fd(fd);
-                }
-                return false;
+            if fd < 0 {
+                return Err(SetupFailure {
+                    step: SetupStep::OpenCleanupLease,
+                    index,
+                    errno: last_errno(),
+                });
+            }
+            if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                let errno = last_errno();
+                close_fd(fd);
+                return Err(SetupFailure {
+                    step: SetupStep::LockCleanupLease,
+                    index,
+                    errno,
+                });
             }
         }
-        true
+        Ok(())
     }
 
     fn reaper_loop(
@@ -2278,7 +2302,7 @@ mod termination {
         }
 
         fn arm(self) -> bool {
-            write_byte(self.command_fd, GUARD_ARM) && self.read_ack() == Some(GUARD_ARM)
+            write_byte(self.command_fd, GUARD_ARM) && self.read_ack() == AckRead::Byte(GUARD_ARM)
         }
 
         fn stop_parent(self) -> Option<bool> {
@@ -2296,7 +2320,7 @@ mod termination {
             let _ = write_byte(self.command_fd, GUARD_DISARM);
         }
 
-        fn read_ack(self) -> Option<u8> {
+        fn read_ack(self) -> AckRead {
             read_guard_ack(self.ack_fd, HELPER_READY_BUDGET)
         }
     }
@@ -2341,57 +2365,296 @@ mod termination {
         format!("{signalled}, {reaped}")
     }
 
-    fn read_guard_ack(fd: libc::c_int, timeout: Duration) -> Option<u8> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return None;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SetupStep {
+        SignalDispositions,
+        OwnProcessGroup,
+        OpenCleanupLease,
+        LockCleanupLease,
+        ForkProbe,
+    }
+
+    impl SetupStep {
+        fn to_byte(self) -> u8 {
+            match self {
+                Self::SignalDispositions => 1,
+                Self::OwnProcessGroup => 2,
+                Self::OpenCleanupLease => 3,
+                Self::LockCleanupLease => 4,
+                Self::ForkProbe => 5,
             }
-            let timeout_ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128))
-                .unwrap_or(i32::MAX)
-                .max(1);
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN | libc::POLLHUP,
-                revents: 0,
-            };
-            // SAFETY: `poll_fd` is valid for one entry and the bounded timeout
-            // prevents a failed guard wedging the signal monitor.
-            let polled = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if polled == 0 {
-                return None;
-            }
-            if polled < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return None;
-            }
-            let mut ack = 0_u8;
-            // SAFETY: `fd` is the dedicated guard-to-parent pipe and `ack` is
-            // valid writable storage for exactly one byte.
-            let read = unsafe { libc::read(fd, (&mut ack as *mut u8).cast(), 1) };
-            if read == 1 {
-                return Some(ack);
-            }
-            if read == 0 {
-                return None;
-            }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                return None;
+        }
+
+        fn from_byte(byte: u8) -> Option<Self> {
+            match byte {
+                1 => Some(Self::SignalDispositions),
+                2 => Some(Self::OwnProcessGroup),
+                3 => Some(Self::OpenCleanupLease),
+                4 => Some(Self::LockCleanupLease),
+                5 => Some(Self::ForkProbe),
+                _ => None,
             }
         }
     }
 
-    fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SetupFailure {
+        step: SetupStep,
+        index: u8,
+        errno: libc::c_int,
+    }
+
+    impl SetupFailure {
+        fn at(step: SetupStep, errno: libc::c_int) -> Self {
+            Self {
+                step,
+                index: 0,
+                errno,
+            }
+        }
+
+        fn encode(self) -> [u8; SETUP_FAILURE_FRAME_LEN] {
+            let [e0, e1, e2, e3] = self.errno.to_ne_bytes();
+            [
+                HELPER_ABORT,
+                self.step.to_byte(),
+                self.index,
+                e0,
+                e1,
+                e2,
+                e3,
+            ]
+        }
+
+        fn decode(frame: [u8; SETUP_FAILURE_FRAME_LEN]) -> Option<Self> {
+            let [marker, step, index, e0, e1, e2, e3] = frame;
+            if marker != HELPER_ABORT {
+                return None;
+            }
+            Some(Self {
+                step: SetupStep::from_byte(step)?,
+                index,
+                errno: libc::c_int::from_ne_bytes([e0, e1, e2, e3]),
+            })
+        }
+    }
+
+    fn report_setup_failure_and_exit(ack_fd: libc::c_int, failure: SetupFailure) -> ! {
+        // Best-effort by design: this process ends with status 1 whether or
+        // not the frame arrives, and a parent that does not receive it reports
+        // "closed with no report", which `helper_ready_failure_helper` pins.
+        let _ = write_raw(ack_fd, &failure.encode());
+        unsafe { libc::_exit(1) }
+    }
+
+    fn describe_setup_failure(failure: SetupFailure, lease_paths: &[std::ffi::CString]) -> String {
+        use std::os::unix::ffi::OsStrExt;
+
+        let lease = || match lease_paths.get(usize::from(failure.index)) {
+            Some(path) => std::path::Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
+                .display()
+                .to_string(),
+            None => format!("number {}", failure.index),
+        };
+        let step = match failure.step {
+            SetupStep::SignalDispositions => "installing its signal dispositions".to_owned(),
+            SetupStep::OwnProcessGroup => "moving into its own process group".to_owned(),
+            SetupStep::OpenCleanupLease => format!("opening the cleanup lease {}", lease()),
+            SetupStep::LockCleanupLease => {
+                format!("taking the shared lock on the cleanup lease {}", lease())
+            }
+            SetupStep::ForkProbe => "forking its probe".to_owned(),
+        };
+        format!(
+            "{step} failed: {}",
+            std::io::Error::from_raw_os_error(failure.errno)
+        )
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AckRead {
+        Byte(u8),
+        EndOfFile,
+        TimedOut,
+        Failed(libc::c_int),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Readiness {
+        Readable,
+        TimedOut,
+        Failed(libc::c_int),
+    }
+
+    fn read_guard_ack(fd: libc::c_int, timeout: Duration) -> AckRead {
+        let started = std::time::Instant::now();
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return AckRead::TimedOut;
+            }
+            match wait_readable(fd, remaining) {
+                Readiness::Readable => {}
+                Readiness::TimedOut => return AckRead::TimedOut,
+                Readiness::Failed(libc::EINTR) => continue,
+                Readiness::Failed(errno) => return AckRead::Failed(errno),
+            }
+            let mut ack = 0_u8;
+            // SAFETY: `fd` is the dedicated helper-to-parent pipe and `ack` is
+            // valid writable storage for exactly one byte.
+            let read = unsafe { libc::read(fd, (&mut ack as *mut u8).cast(), 1) };
+            if read == 1 {
+                return AckRead::Byte(ack);
+            }
+            if read == 0 {
+                return AckRead::EndOfFile;
+            }
+            let errno = last_errno();
+            if errno != libc::EINTR {
+                return AckRead::Failed(errno);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn wait_readable(fd: libc::c_int, timeout: Duration) -> Readiness {
+        let timeout_ms = libc::c_int::try_from(timeout.as_millis())
+            .unwrap_or(libc::c_int::MAX)
+            .max(1);
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is valid storage for exactly one entry for the
+        // duration of the call, and the timeout is finite.
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        match polled {
+            0 => Readiness::TimedOut,
+            ready if ready > 0 => Readiness::Readable,
+            _ => Readiness::Failed(last_errno()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "select$DARWIN_EXTSN"]
+        fn select_beyond_fd_setsize(
+            nfds: libc::c_int,
+            readfds: *mut u32,
+            writefds: *mut u32,
+            errorfds: *mut u32,
+            timeout: *mut libc::timeval,
+        ) -> libc::c_int;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_readable(fd: libc::c_int, timeout: Duration) -> Readiness {
+        const BITS_PER_WORD: usize = 32;
+        let (Ok(slot), Some(nfds)) = (usize::try_from(fd), fd.checked_add(1)) else {
+            return Readiness::Failed(libc::EBADF);
+        };
+        let mut readfds = vec![0_u32; slot / BITS_PER_WORD + 1];
+        if let Some(word) = readfds.get_mut(slot / BITS_PER_WORD) {
+            *word |= 1_u32 << (slot % BITS_PER_WORD);
+        }
+        // `subsec_micros` is below one million, so the second conversion
+        // cannot fail; a `Duration` past `time_t` is clamped, not refused.
+        let mut remaining = libc::timeval {
+            tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_usec: libc::suseconds_t::try_from(timeout.subsec_micros()).unwrap_or(0),
+        };
+        // SAFETY: `readfds` holds `slot / 32 + 1` words, so every bit below
+        // `nfds` lies inside it, which is the contract of the unlimited
+        // variant; the write and error sets may be null; `remaining` is valid
+        // for the call, which may write the time left back into it. The
+        // function is `select(2)` under the symbol the header binds when
+        // `_DARWIN_UNLIMITED_SELECT` is defined, with the same signature.
+        let ready = unsafe {
+            select_beyond_fd_setsize(
+                nfds,
+                readfds.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut remaining,
+            )
+        };
+        match ready {
+            0 => Readiness::TimedOut,
+            ready if ready > 0 => Readiness::Readable,
+            _ => Readiness::Failed(last_errno()),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReadyWait {
+        Ready,
+        SetupFailed(SetupFailure),
+        TruncatedReport,
+        Unexpected(u8),
+        EndOfFile,
+        TimedOut,
+        Failed(libc::c_int),
+    }
+
+    fn await_ready(fd: libc::c_int, ready: u8, budget: Duration) -> ReadyWait {
+        let started = std::time::Instant::now();
+        match read_guard_ack(fd, budget) {
+            AckRead::Byte(byte) if byte == ready => ReadyWait::Ready,
+            AckRead::Byte(HELPER_ABORT) => {
+                let mut frame = [HELPER_ABORT; SETUP_FAILURE_FRAME_LEN];
+                for slot in frame.iter_mut().skip(1) {
+                    match read_guard_ack(fd, budget.saturating_sub(started.elapsed())) {
+                        AckRead::Byte(byte) => *slot = byte,
+                        AckRead::EndOfFile | AckRead::TimedOut | AckRead::Failed(_) => {
+                            return ReadyWait::TruncatedReport;
+                        }
+                    }
+                }
+                SetupFailure::decode(frame)
+                    .map_or(ReadyWait::TruncatedReport, ReadyWait::SetupFailed)
+            }
+            AckRead::Byte(other) => ReadyWait::Unexpected(other),
+            AckRead::EndOfFile => ReadyWait::EndOfFile,
+            AckRead::TimedOut => ReadyWait::TimedOut,
+            AckRead::Failed(errno) => ReadyWait::Failed(errno),
+        }
+    }
+
+    fn describe_ready_wait(
+        helper: &str,
+        wait: ReadyWait,
+        lease_paths: &[std::ffi::CString],
+    ) -> String {
+        match wait {
+            ReadyWait::Ready => format!("the {helper} said READY"),
+            ReadyWait::SetupFailed(failure) => format!(
+                "the {helper} reported that {}",
+                describe_setup_failure(failure, lease_paths)
+            ),
+            ReadyWait::TruncatedReport => format!("the {helper}'s failure report was cut short"),
+            ReadyWait::Unexpected(byte) => {
+                format!("the acknowledgement pipe carried {byte:#04x} where READY was expected")
+            }
+            ReadyWait::EndOfFile => "the acknowledgement pipe closed with no report".to_owned(),
+            ReadyWait::TimedOut => {
+                "the budget elapsed with nothing on the acknowledgement pipe".to_owned()
+            }
+            ReadyWait::Failed(errno) => format!(
+                "waiting on the acknowledgement pipe failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+        }
+    }
+
+    fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
             match read_guard_ack(fd, remaining) {
-                Some(byte) if byte == expected => return true,
-                Some(_) => continue,
-                None => return false,
+                AckRead::Byte(byte) if byte == expected => return true,
+                AckRead::Byte(_) => continue,
+                AckRead::EndOfFile | AckRead::TimedOut | AckRead::Failed(_) => return false,
             }
         }
     }
@@ -2505,12 +2768,18 @@ mod termination {
         }
         if pid == 0 {
             if !install_guard_dispositions(policy) {
-                unsafe { libc::_exit(1) };
+                report_setup_failure_and_exit(
+                    ack[1],
+                    SetupFailure::at(SetupStep::SignalDispositions, last_errno()),
+                );
             }
             let parent = unsafe { libc::getppid() };
             let probe_pid = unsafe { libc::fork() };
             if probe_pid < 0 {
-                unsafe { libc::_exit(1) };
+                report_setup_failure_and_exit(
+                    ack[1],
+                    SetupFailure::at(SetupStep::ForkProbe, last_errno()),
+                );
             }
             if probe_pid == 0 {
                 if !install_probe_dispositions() {
@@ -2554,11 +2823,17 @@ mod termination {
         };
         let ready_wait_began = std::time::Instant::now();
         let mut probe_pid_bytes = [0_u8; 4];
-        if guard.read_ack() != Some(GUARD_READY)
-            || !read_raw_exact(ack[0], &mut probe_pid_bytes)
-            || i32::from_ne_bytes(probe_pid_bytes) <= 0
-        {
+        let wait = await_ready(ack[0], GUARD_READY, HELPER_READY_BUDGET);
+        let probe_pid_arrived = wait == ReadyWait::Ready
+            && read_raw_exact(ack[0], &mut probe_pid_bytes)
+            && i32::from_ne_bytes(probe_pid_bytes) > 0;
+        if !probe_pid_arrived {
             let waited = ready_wait_began.elapsed();
+            let how = if wait == ReadyWait::Ready {
+                "READY arrived but the probe pid behind it did not".to_owned()
+            } else {
+                describe_ready_wait("guard", wait, &[])
+            };
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
@@ -2579,7 +2854,7 @@ mod termination {
             });
             return Err(format!(
                 "Unix job-control guard did not initialize; waited {waited:?} of \
-                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}"
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; {how}; ending it: {end}"
             ));
         }
         PROBE_PID.store(i32::from_ne_bytes(probe_pid_bytes), Ordering::SeqCst);
@@ -3706,12 +3981,14 @@ mod termination {
                 .expect("a temporary path without a null byte");
             let held = std::slice::from_ref(&target);
 
-            assert!(
+            assert_eq!(
                 lock_cleanup_paths(held),
+                Ok(()),
                 "the first invocation's reaper could not take R28 at all"
             );
-            assert!(
+            assert_eq!(
                 lock_cleanup_paths(held),
+                Ok(()),
                 "a second overlapping invocation's reaper was refused the shared hold: \
                  R28 is `one per reaper`, not one per run"
             );
@@ -4444,6 +4721,11 @@ mod termination {
                     ),
                     "the teardown's own answers did not reach the message: {message}"
                 );
+                assert!(
+                    message.contains("; the acknowledgement pipe closed with no report; "),
+                    "a helper that exited without a report was not seen to close its pipe: \
+                     {message}"
+                );
             }
             assert_eq!(
                 PENDING_TERMINATION.load(Ordering::SeqCst),
@@ -4456,6 +4738,200 @@ mod termination {
             assert!(
                 waited < 0 && !last_errno_is_interrupted(),
                 "a helper was left behind (waitpid(-1, WNOHANG) returned {waited})"
+            );
+        }
+
+        /// Collect `pid`, retrying an interrupted wait, so that everything the
+        /// child held is closed before the test looks at the pipe.
+        fn reap(pid: libc::pid_t) -> libc::c_int {
+            let mut status = 0;
+            loop {
+                // SAFETY: `pid` is a child this test forked and has not reaped.
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    return status;
+                }
+                assert!(
+                    waited < 0 && last_errno_is_interrupted(),
+                    "waitpid({pid}): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        /// Witnessed against `wait_readable` polling the descriptor on macOS:
+        /// `poll(2)` on a Darwin FIFO reports data and never the last writer's
+        /// close, so the wait ran to its budget and answered `TimedOut` for a
+        /// child that was already collected. There is no clock in this test:
+        /// the child is reaped before the wait begins, so its write end is
+        /// closed whatever the scheduler does.
+        #[test]
+        fn a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file() {
+            let ack = create_cloexec_pipe().expect("an acknowledgement pipe");
+            // SAFETY: the forked child calls only `_exit`.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            assert!(
+                pid > 0,
+                "fork a stand-in helper: {}",
+                std::io::Error::last_os_error()
+            );
+            close_fd(ack[1]);
+            let status = reap(pid);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the stand-in helper did not exit cleanly: {status}"
+            );
+            let read = read_guard_ack(ack[0], HELPER_READY_BUDGET);
+            close_fd(ack[0]);
+            assert_eq!(
+                read,
+                AckRead::EndOfFile,
+                "a pipe whose only other writer has been collected did not read as closed"
+            );
+        }
+
+        /// Witnessed against a `describe_setup_failure` that drops the lease
+        /// path or the errno, and against a `decode` that accepts a frame
+        /// without the marker.
+        #[test]
+        fn a_setup_failure_report_names_the_step_the_lease_and_the_errno() {
+            let failure = SetupFailure {
+                step: SetupStep::LockCleanupLease,
+                index: 0,
+                errno: libc::EWOULDBLOCK,
+            };
+            let ack = create_cloexec_pipe().expect("an acknowledgement pipe");
+            assert!(write_raw(ack[1], &failure.encode()), "queue the report");
+            let wait = await_ready(ack[0], REAPER_READY, HELPER_READY_BUDGET);
+            close_fd(ack[0]);
+            close_fd(ack[1]);
+            assert_eq!(wait, ReadyWait::SetupFailed(failure));
+
+            let lease = std::ffi::CString::new("/runs/01J/cleanup.lock").expect("a path");
+            let described = describe_ready_wait("reaper", wait, std::slice::from_ref(&lease));
+            let errno_text = std::io::Error::from_raw_os_error(libc::EWOULDBLOCK).to_string();
+            assert_eq!(
+                described,
+                format!(
+                    "the reaper reported that taking the shared lock on the cleanup lease \
+                     /runs/01J/cleanup.lock failed: {errno_text}"
+                )
+            );
+            let unnamed = describe_ready_wait(
+                "reaper",
+                ReadyWait::SetupFailed(SetupFailure {
+                    index: 3,
+                    ..failure
+                }),
+                std::slice::from_ref(&lease),
+            );
+            assert!(
+                unnamed.contains("the cleanup lease number 3 failed"),
+                "a lease past the ones the parent knows was not named by position: {unnamed}"
+            );
+
+            let mut forged = failure.encode();
+            forged[0] = REAPER_READY;
+            assert_eq!(
+                SetupFailure::decode(forged),
+                None,
+                "a frame without the marker decoded"
+            );
+            let mut unknown_step = failure.encode();
+            unknown_step[1] = 0xff;
+            assert_eq!(
+                SetupFailure::decode(unknown_step),
+                None,
+                "an unknown step decoded"
+            );
+            for step in [
+                SetupStep::SignalDispositions,
+                SetupStep::OwnProcessGroup,
+                SetupStep::OpenCleanupLease,
+                SetupStep::LockCleanupLease,
+                SetupStep::ForkProbe,
+            ] {
+                assert_eq!(SetupStep::from_byte(step.to_byte()), Some(step));
+            }
+        }
+
+        /// A report cut short by the writer's exit is not misread as a step.
+        #[test]
+        fn a_report_cut_short_is_not_read_as_a_step() {
+            let ack = create_cloexec_pipe().expect("an acknowledgement pipe");
+            assert!(
+                write_raw(ack[1], &[HELPER_ABORT, 4]),
+                "queue a partial report"
+            );
+            close_fd(ack[1]);
+            let wait = await_ready(ack[0], REAPER_READY, HELPER_READY_BUDGET);
+            close_fd(ack[0]);
+            assert_eq!(wait, ReadyWait::TruncatedReport);
+        }
+
+        /// End to end through `spawn_reaper`: a lease another holder has
+        /// exclusively refuses the reaper's shared lock, the reaper reports
+        /// which lease and which call before it ends, and the parent's failure
+        /// names both. Witnessed against a child that exits without reporting
+        /// (the message then says the pipe closed with no report) and against
+        /// a parent that waits its whole budget for a child that has ended.
+        #[test]
+        fn a_reaper_refused_its_cleanup_lease_says_which_lease_and_why() {
+            use std::os::fd::AsRawFd;
+
+            let public = std::env::temp_dir().join(format!(
+                "upstroke-ready-lease-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            std::fs::create_dir_all(&public).expect("a run directory");
+            let lock = crate::rundir::RunLock::acquire(&public).expect("take the run lock");
+            let scope = lock.enter_cleanup_scope();
+            let paths = crate::rundir::active_cleanup_lease_paths();
+            assert_eq!(
+                paths.len(),
+                1,
+                "exactly one cleanup lease is active: {paths:?}"
+            );
+            let holder = std::fs::File::open(paths.first().expect("the active lease"))
+                .expect("open the lease file");
+            // SAFETY: `holder` is open for the duration of the call.
+            let exclusive =
+                unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(
+                exclusive,
+                0,
+                "hold the lease exclusively: {}",
+                std::io::Error::last_os_error()
+            );
+
+            let launch = spawn_reaper();
+            drop(holder);
+            drop(scope);
+            drop(lock);
+            let _ = std::fs::remove_dir_all(&public);
+
+            let message = match launch {
+                Err(message) => message,
+                Ok(reaper) => {
+                    reaper.cancel();
+                    panic!("a reaper whose shared lock was refused was accepted as initialized")
+                }
+            };
+            assert!(
+                message.contains(&format!(
+                    "; the reaper reported that taking the shared lock on the cleanup lease {} \
+                     failed: ",
+                    paths.first().expect("the active lease").display()
+                )),
+                "the refused lease was not named: {message}"
+            );
+            assert!(
+                message.contains("having already exited with status 1"),
+                "the reaper's own exit did not reach the message: {message}"
             );
         }
 
