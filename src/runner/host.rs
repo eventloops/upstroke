@@ -1,5 +1,3 @@
-//! The host runner: `host-v1`.
-//!
 //! Extended notes: `docs/internals/runner/host.md`
 
 // Allowlist placement: the funnel section of `effects/allowlist.toml`, which

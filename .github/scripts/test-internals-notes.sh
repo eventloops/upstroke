@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Gate: the internal module notes and the source agree.
+# Gate: the internal module notes and the source agree, in both directions.
 #
-#   N1  Every `Extended notes:` marker in src/ names a docs/internals/ file
-#       that exists, and an anchor that some heading in that file generates.
+#   N1  Every `Extended notes:` marker in src/ is spelled exactly
+#         //! Extended notes: `docs/internals/<module>.md`
+#       where <module> is the marker's own file with `src/` and `.rs` stripped,
+#       and that notes file exists. Nothing else on the line: no anchor, no
+#       prose, no other comment form.
 #   N2  Every docs/internals/**/*.md (except README.md) mirrors a Rust module
-#       that exists: docs/internals/X.md <-> src/X.rs.
-#   N3  Every notes file links back to its module, and the link resolves.
-#   N4  The marker spelling is uniform, so `grep -rn 'Extended notes:' src/` is
-#       the whole inventory. A marker names its path in backticks and nothing
-#       else on the line.
-#   N5  A module with a notes file carries exactly one marker, in its module
-#       header. The notes carry the module's prose; the source carries none, so
-#       one pointer at the top is the whole of the cross-reference and a second
-#       marker further down means prose crept back in beside it.
+#       that exists, and that module carries exactly one marker. A notes file
+#       whose module lost its marker is caught from this side.
+#   N3  Every notes file links back to its module, and the link resolves from
+#       the notes file's own directory to the repository root, at any depth.
+#   N4  A module carries at most one marker, and it sits above the first code.
 #
-# Drift this catches: a module renamed or split out from under its notes, a
-# notes file deleted while markers still point at it, an anchor that stopped
-# existing when a heading was reworded.
+# An absent docs/internals/ is a failure, never "nothing to check": with
+# markers in src/ it is a deleted notes tree, and with none it is a gate
+# measuring nothing. Both refuse.
 set -euo pipefail
 export PATH="/usr/bin:/bin:$PATH"
 
 cd "${BASH_SOURCE[0]%/*}/../.."
+root="$(pwd)"
 
 failed=0
 error() {
@@ -28,34 +28,10 @@ error() {
   failed=1
 }
 
-# Every anchor a notes file's headings generate, one line each, under GitHub's
-# rules for the subset we need: strip the leading hashes, lower-case, drop
-# anything that is not alphanumeric/space/underscore/hyphen, spaces to hyphens.
-#
-# Computed once per file and cached. Doing it per heading per marker is ~1700
-# processes on this tree and minutes of wall clock on Windows.
-declare -A anchor_cache=()
-anchors_of() {
-  local path="$1"
-  if [[ -z "${anchor_cache[$path]+set}" ]]; then
-    anchor_cache[$path]="$(
-      grep '^#\{1,6\} ' "$path" \
-        | sed 's/^#\{1,6\} *//' \
-        | tr '[:upper:]' '[:lower:]' \
-        | sed -e 's/[^a-z0-9 _-]//g' -e 's/ /-/g' || true
-    )"
-  fi
-  printf '%s' "${anchor_cache[$path]}"
-}
-
 notes_root='docs/internals'
+marker_re='^//! Extended notes: `(docs/internals/[A-Za-z0-9_./-]+\.md)`$'
 
-if [[ ! -d "$notes_root" ]]; then
-  echo "no $notes_root; nothing to check"
-  exit 0
-fi
-
-# --- N1 + N4. every marker resolves -----------------------------------------
+# --- N1. every marker is exact, names its own module's notes, and they exist --
 
 marker_count=0
 while IFS= read -r hit; do
@@ -64,32 +40,24 @@ while IFS= read -r hit; do
   line="${rest%%:*}"
   text="${rest#*:}"
 
-  target="$(sed -n 's/.*`\(docs\/internals\/[^`]*\)`.*/\1/p' <<< "$text")"
-  if [[ -z "$target" ]]; then
-    error "$file:$line: marker does not name a \`docs/internals/...\` path in backticks"
+  if [[ ! "$text" =~ $marker_re ]]; then
+    error "$file:$line: marker is not spelled exactly \`//! Extended notes: \`docs/internals/<module>.md\`\`: $text"
     continue
   fi
+  target="${BASH_REMATCH[1]}"
   marker_count=$((marker_count + 1))
 
-  path="${target%%#*}"
-  anchor=""
-  [[ "$target" == *'#'* ]] && anchor="${target#*#}"
-
-  if [[ ! -f "$path" ]]; then
-    error "$file:$line: marker names $path, which does not exist"
-    continue
-  fi
-
-  if [[ -n "$anchor" ]]; then
-    if ! grep -Fqx -- "$anchor" <<< "$(anchors_of "$path")"; then
-      error "$file:$line: $path has no heading generating anchor #$anchor"
-    fi
-  fi
+  expected="$notes_root/${file#src/}"
+  expected="${expected%.rs}.md"
+  [[ "$target" == "$expected" ]] \
+    || error "$file:$line: marker names $target; this module's notes are $expected"
+  [[ -f "$target" ]] \
+    || error "$file:$line: marker names $target, which does not exist"
 done < <(grep -rn 'Extended notes:' src/ --include='*.rs' || true)
 
 (( marker_count > 0 )) || error "no \`Extended notes:\` markers found in src/; this gate is inert"
 
-# --- N5. one marker per module, in the module header ------------------------
+# --- N4. at most one marker per module, in the module header -----------------
 
 while IFS= read -r module; do
   count="$(grep -c 'Extended notes:' "$module" || true)"
@@ -108,7 +76,9 @@ while IFS= read -r module; do
   fi
 done < <(grep -rl 'Extended notes:' src/ --include='*.rs' | sort)
 
-# --- N2 + N3. every notes file mirrors a live module -------------------------
+# --- N2 + N3. every notes file mirrors a live, marked module -----------------
+
+[[ -d "$notes_root" ]] || error "$notes_root is absent; with markers in src/ that is a deleted notes tree"
 
 notes_count=0
 while IFS= read -r notes; do
@@ -122,22 +92,27 @@ while IFS= read -r notes; do
     continue
   fi
 
-  # N3: the file links back, and the relative link resolves from its own
-  # directory.
+  # N2: the module points back at this file, exactly once.
+  back="$(grep -c 'Extended notes:' "$module" || true)"
+  (( back == 1 )) \
+    || error "$notes exists but $module carries $back \`Extended notes:\` marker(s); a module with notes carries exactly one"
+
+  # N3: the file links back, and the relative link resolves against the
+  # repository root from the notes file's own directory.
   link="$(awk 'match($0, /\(\.\.[^)]*\.rs\)/) { print substr($0, RSTART + 1, RLENGTH - 2); exit }' "$notes")"
   if [[ -z "$link" ]]; then
     error "$notes does not link back to its module"
     continue
   fi
-  resolved="$(cd "${notes%/*}" && realpath -m --relative-to="$(cd ../../.. && pwd)" "$link" 2>/dev/null || true)"
+  resolved="$(cd "${notes%/*}" && realpath -m --relative-to="$root" "$link" 2>/dev/null || true)"
   [[ "$resolved" == "$module" ]] \
     || error "$notes links to $link, which resolves to '${resolved:-nothing}' rather than $module"
-done < <(find "$notes_root" -name '*.md' | sort)
+done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 
 (( notes_count > 0 )) || error "no notes files under $notes_root; this gate is inert"
 
 if (( failed == 0 )); then
-  echo "internals notes: $marker_count marker(s), $notes_count notes file(s), all resolve"
+  echo "internals notes: $marker_count marker(s), $notes_count notes file(s), all resolve both ways"
 fi
 
 exit "$failed"
