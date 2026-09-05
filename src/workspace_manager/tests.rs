@@ -8202,80 +8202,11 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         // anything derived from the tally, because a refusal is a different
         // failure from an unclassifiable residue and deserves to be reported
         // as itself.
-        //
-        // **The bound is asserted before the refusals it produced.** A retry
-        // is not a tolerance and must not become one: the attempt count of
-        // every sample is checked against `RESIDUE_INSPECTION_ATTEMPTS` here,
-        // and `1` is a floor for the same reason `unclassified == 0` is
-        // asserted beside the histogram — a sample whose inspection was never
-        // attempted is not a sample that answered.
-        //
-        // What this cannot catch, said here rather than left for a reader to
-        // find: **raising the constant**. Every attempt count stays inside a
-        // larger ceiling, so no assertion here fires. What stops that being
-        // silent is not an assertion but a report — the ceiling is printed
-        // beside the consumption and written into the evidence file, and both
-        // move together, so a bound raised to absorb a rising refusal rate is
-        // visible in the artifact of the run that raised it.
-        assert_eq!(
-            run.attempts.len(),
-            SAMPLING_N as usize,
-            "{site}: one inspection record per sample, or the retry accounting below is \
-                 over the wrong list"
-        );
-        let outside: Vec<u32> = run
-            .attempts
-            .iter()
-            .copied()
-            .filter(|attempts| *attempts < 1 || *attempts > RESIDUE_INSPECTION_ATTEMPTS)
-            .collect();
-        assert!(
-            outside.is_empty(),
-            "{site}: {outside:?} attempts, outside the 1..={RESIDUE_INSPECTION_ATTEMPTS} \
-                 bound this test declares — a bound that is not the one being spent is not \
-                 a bound"
-        );
-
-        // **What the bound cost, reported whether or not it was exhausted.**
-        // A tolerance that hides its own consumption is how the swallowed
-        // refusal went silent the first time: a run one attempt short of
-        // failing and a run that never retried at all read identically until
-        // the day the first one goes red. Per sample rather than summed, so
-        // one sample spending the whole bound every run is distinguishable
-        // from the whole site spending one extra attempt.
-        let retried: u32 = run
-            .attempts
-            .iter()
-            .map(|attempts| attempts.saturating_sub(1))
-            .sum();
-        println!(
-            "residue inspection {site}: attempts {:?} (bound {RESIDUE_INSPECTION_ATTEMPTS} \
-             each, {retried} retries over {SAMPLING_N} samples)",
-            run.attempts
-        );
-        // **A refusal a retry rescued is reported, not swallowed** (PR #145
-        // pass 1, finding 3). It is not asserted on: the whole point of the
-        // bound is that the delete-pending refusal must not be fatal. But an
-        // unexpected error that clears inside 50 ms used to leave nothing at
-        // all, so the suite could pass having masked a failure nobody could
-        // name. Now it names it.
-        if !run.rescued.is_empty() {
-            println!(
-                "residue inspection {site}: {} of {SAMPLING_N} samples met a refusal a later \
-                 attempt rescued, kept here because a retry may spare a failure from the \
-                 verdict and not from the record: {:?}",
-                run.rescued.len(),
-                run.rescued
-            );
-        }
-
         assert!(
             run.refusals.is_empty(),
-            "{site}: the classifier refused {} of {SAMPLING_N} samples through all \
-                 {RESIDUE_INSPECTION_ATTEMPTS} attempts each, which is not the same thing \
-                 as a residue in no class — it is an inspection that failed, and the \
-                 assertions below would have called it unclassified. Every attempt, with \
-                 the path it could not read: {:?}",
+            "{site}: the classifier refused {} of {SAMPLING_N} samples, which is not the \
+                 same thing as a residue in no class — it is an inspection that failed, and \
+                 the assertions below would have called it unclassified: {:?}",
             run.refusals.len(),
             run.refusals
         );
@@ -8323,13 +8254,32 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             record.recovered,
             "every sample recovered by its classified action"
         );
+        // **The bare arm's non-convergences, bounded rather than reported**
+        // (PR #145 pass 3, finding 3, as ruled). A bare-arm sample converges
+        // or fails with one of the two fingerprints
+        // `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` recorded, and
+        // anything else is a new failure. The known ones are printed and
+        // written to the artifact as a count with their words; they are not
+        // the guarantee, because this test's stdout and its artifact are both
+        // channels CI discards on a passing run. When the funnel stream that
+        // owns the live-writer race lands, `known` tightens to empty.
+        assert!(
+            run.bare.other.is_empty(),
+            "{site}: a bare-arm sample failed to recover with something other than the two \
+                 known fingerprints (`DirectoryNotEmpty`, an empty `gitdir`): {:?}",
+            run.bare.other
+        );
+        println!(
+            "bare arm {site}: {} of {} samples did not converge, all with a known fingerprint",
+            run.bare.known.len(),
+            SAMPLING_N / 2
+        );
         records.push(SiteEvidence {
             site,
             record,
             budget: run.budget,
             replayed: run.replayed,
-            attempts: run.attempts,
-            rescued: run.rescued,
+            bare_known: run.bare.known,
         });
     }
     assert_eq!(
@@ -8502,48 +8452,39 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 );
             }
 
-            // **Every kill was aimed at the child's own process group**
-            // (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`). The aim and
-            // the landing are two different facts and only the first is
-            // assertable, which is the same split the `kill_error` printing
-            // above makes and is argued at `SampledChild::kill_group`:
-            // `NotItsOwnGroup` means `process_group(0)` did not run, so there
-            // was no group of this child's own to aim at and none was fired;
-            // a `Refused` errno means the aim was right and the call reported
-            // a failure, which on Darwin it does for a group whose only
-            // member is already an unreaped zombie. The first is asserted,
-            // the second printed.
-            //
-            // What this is evidence about is *what changed*. Before this
-            // repair the sampler killed the bare child, `getpgid(pid) == pid`
-            // was **false** for every one of these children, and the assertion
-            // below fails on that code — which is the discrimination a new
-            // assertion has to have and the reason it is not a restatement of
-            // the firing count above. What the group kill buys is the
-            // descendants `git worktree add` spawns: they survive a bare
-            // child kill and go on writing into the worktree
-            // `recover_sample` then forces the removal of, and a forced
-            // removal cannot converge against a live writer. Measured at
-            // this head, fifty runs per arm alternating under load: that
-            // error code 2/50 with the bare child, 0/50 with the group,
-            // agreeing with the 5/50 against 0/50 the finding measured on the
-            // pre-repair tree.
-            //
-            // **It is one of two error codes under the assertion this
-            // protects, and the other is untouched by anything here.** A
-            // zero-length `gitdir` left by the same interrupted command races
-            // nothing, so no kill reaches it; it is a funnel and contract
-            // question filed as its own finding. Nothing below should be read
-            // as saying this test now converges.
-            //
-            // Neither arm is a claim that the kill *emptied* the group. That
-            // is a statement about processes this harness never owned, and
-            // the honest oracle for it is the failure rate above rather than
-            // an assertion from inside this process.
+            // **Two arms, four rungs each, and each arm witnessed by the
+            // kernel** (PR #145 pass 3, finding 3). The group arm is
+            // `agent::proc`'s kill path; the bare arm is what an external
+            // kill of a manager-spawned `git` leaves. Alternation is asserted
+            // here rather than trusted, because a ladder that silently
+            // dropped one arm would leave every count below intact.
+            let group_arm: Vec<&&SampledLaunch> = shape
+                .iter()
+                .filter(|launch| launch.arm == KillArm::Group)
+                .collect();
+            let bare_arm: Vec<&&SampledLaunch> = shape
+                .iter()
+                .filter(|launch| launch.arm == KillArm::Bare)
+                .collect();
+            assert_eq!(
+                (group_arm.len(), bare_arm.len()),
+                (SAMPLING_N as usize / 2, SAMPLING_N as usize / 2),
+                "{label}: the ladder alternates production's two kill shapes, half each"
+            );
+
             #[cfg(unix)]
             {
+                // **The group arm: every kill was aimed at the child's own
+                // process group** (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-
+                // CONVERGE`). The aim and the landing are two facts; the aim
+                // is asserted everywhere and the landing only where it is
+                // measured deterministic. `NotItsOwnGroup` means
+                // `process_group(0)` did not run, which is the pre-repair
+                // state -- `getpgid(pid) == pid` was false for every child
+                // the old sampler spawned, so this assertion is about the
+                // property and not a restatement of the new code.
                 let mut refused = Vec::new();
-                for launch in &shape {
+                for launch in &group_arm {
                     let group = launch.group_kill.expect(
                         "a kill fired at every one of this command's children, asserted \
                          just above, and the group kill is written by that same statement",
@@ -8551,69 +8492,33 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                     assert_ne!(
                         group,
                         GroupKill::NotItsOwnGroup,
-                        "{label}: the sampled child does not lead its own process group, so \
+                        "{label}: a group-arm child does not lead its own process group, so \
                              there was no group of its own to aim a kill at and none was \
-                             fired — `process_group(0)` in `SampledChild::spawn` is what puts \
-                             it there, and without it the descendants of the sampled command \
-                             survive the kill and keep writing into the worktree the tabled \
-                             recovery forces the removal of"
+                             fired -- `process_group(0)` in `SampledChild::spawn` is what \
+                             puts it there"
+                    );
+                    assert_ne!(
+                        group,
+                        GroupKill::NotAimed,
+                        "{label}: a group-arm child was not aimed at, which is the bare arm's \
+                             shape under the group arm's label"
                     );
                     if let GroupKill::Refused(errno) = group {
                         refused.push(errno);
                     }
                 }
 
-                // **What the group kill answered is recorded and printed, and
-                // asserted only on Linux** (below), which on the other Unix is
-                // the same treatment `kill_error` has three assertions above,
-                // and is here for a related reason.
-                // The first version of this test asserted `Delivered` on the
-                // strength of a sentence that was true on Linux and false on
-                // Darwin: a signal to a group whose only surviving member is
-                // an unreaped zombie returns 0 on Linux and `EPERM` on macOS.
-                // CI measured it at `036b4bc` — `git add`, the shape whose
-                // children most often reach their own exit before the kill
-                // lands, `Refused(1)` against `Delivered`, one failed test in
-                // 1917 — so the claim is withdrawn rather than given a
-                // platform arm, because what the call reports depends on
-                // whether the child was still alive at the instant it ran and
-                // that is a race this process cannot observe from inside.
-                //
-                // The assertion above is the half that does not depend on it.
-                // `getpgid(pid) == pid` is a kernel fact about the spawn, not
-                // about the kill's timing, and it is **false for every child
-                // the pre-repair sampler spawned** — measured by deleting
-                // `process_group(0)` at this head, which fails it with
-                // `NotItsOwnGroup`. That is what makes it a statement about
-                // the repair rather than a restatement of it.
                 // **On Linux the delivery is asserted too, because on Linux
-                // it is deterministic** (PR #145 pass 1, finding 2). The
-                // assertion was withdrawn wholesale after `test
-                // (macos-latest)` measured `EPERM` for a group whose only
-                // member is an unreaped zombie -- but that measurement was
-                // about Darwin, and nothing had ever established that Linux
-                // answers anything but 0. It does not: **640 of 640 group
-                // kills answered `Delivered`** across twenty runs at this
-                // head, 160 per shape, `git add` included, which is the
-                // zombie-only shape and the one Darwin refuses. The earlier
-                // head's unconditional assertion had already passed some
-                // 3 200 Linux launches for the same reason.
-                //
-                // This is what closes the reviewer's mutation:
-                // `kill_group()` replaced by `GroupKill::Refused(1)` passes
-                // every other assertion here -- the aim is still right, the
-                // group still settles, the histogram does not move, because
+                // it is deterministic**: 640 of 640 group kills answered
+                // `Delivered` across twenty runs, 160 per shape, `git add`
+                // included -- the zombie-only shape, and the one Darwin
+                // refuses with `EPERM`. This is what catches `kill_group()`
+                // replaced by a constant, which the barrier alone does not:
                 // this fixture's checkout finishes in about a millisecond
-                // whether it is signalled or not -- and fails this one
-                // outright.
-                //
-                // A `cfg` on a **measured** platform difference, which is not
-                // the platform arm refused earlier in this branch: that one
-                // would have encoded a Darwin errno set inferred from one
-                // observation. Darwin keeps the printed record below and no
-                // assertion, which is what the measurement there supports.
+                // whether it is signalled or not. A `cfg` on a *measured*
+                // platform difference; Darwin keeps the printed record.
                 #[cfg(target_os = "linux")]
-                for launch in &shape {
+                for launch in &group_arm {
                     let group = launch
                         .group_kill
                         .expect("a kill fired at every one of this command's children");
@@ -8627,40 +8532,59 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                              happen"
                     );
                 }
-
                 if !refused.is_empty() {
                     println!("group kill refused {label}: errnos {refused:?}");
                 }
 
-                // **The group was empty before anything read the worktree**
-                // (PR #145 pass 1, finding 2), which is the premise the
-                // classification, the retry and the forced removal all rest
-                // on and which nothing here checked before. `kill` returns
-                // once the signals are queued -- `agent::proc::tests::
-                // kill_tree_settles_the_whole_unix_group_before_it_returns`
-                // is that fact written down -- so reaping the leader left
-                // the descendants of `git worktree add` free to finish a
-                // write into the worktree the tabled recovery was about to
-                // remove. This is an assertion about the world rather than
-                // about a return value, and no errno disagreement between
-                // platforms can weaken it.
-                // A settle that did not happen never reaches this list: it
-                // is a hard failure inside `kill_git_child`, at the instant
-                // it is detected and before the sample reads anything (pass
-                // 2, finding 1). What is left to do here is report the cost.
-                // How long that cost, printed rather than asserted. It is
-                // normally one `kill(-pgid, 0)` answering `ESRCH`, and a
-                // sample that had to wait is the interesting one: see the
-                // note on what this does and does not witness.
-                let waited: Vec<GroupSettle> = shape
+                // **The bare arm: witnessed as bare by the same oracle.** The
+                // kernel says the child did *not* lead its own group -- it is
+                // in this test binary's group, where a `Command::output`
+                // child of the manager lives in production -- and no group
+                // kill was aimed at it. Without this, "bare" would be a label
+                // on a rung and not a property of the child.
+                for launch in &bare_arm {
+                    assert!(
+                        !launch.led_its_own_group,
+                        "{label}: a bare-arm child led its own process group, which is the \
+                             group arm's shape under the bare arm's label"
+                    );
+                    assert_eq!(
+                        launch.group_kill,
+                        Some(GroupKill::NotAimed),
+                        "{label}: a group kill was aimed at a bare-arm child"
+                    );
+                    assert_eq!(
+                        launch.settled,
+                        GroupSettle::NotAimed,
+                        "{label}: a bare-arm child was waited for as a group; the bare arm \
+                             has no group of its own, and waiting for the harness's would \
+                             never end"
+                    );
+                }
+
+                // **The group arm was empty before anything read the
+                // worktree** -- and only that (PR #145 pass 3, finding 5).
+                // `kill(-pgid, 0)` proves an entry of the group remains; it
+                // does not prove the checkout is alive and writing. A zombie
+                // holds an entry, and an orphan under a slow subreaper holds
+                // one until it is reaped. So the 6-7 of 8 `git worktree add`
+                // samples that had to wait establish "the group was not yet
+                // empty", which is the whole justification for the barrier
+                // and is the weaker claim. A settle that did not happen never
+                // reaches this list: it is a hard failure inside
+                // `kill_git_child`, at detection, before the sample reads
+                // anything (pass 2, finding 1). What is left is the cost,
+                // measured from the kill and including the leader's reap.
+                let waited: Vec<GroupSettle> = group_arm
                     .iter()
                     .map(|launch| launch.settled)
-                    .filter(|settled| matches!(settled, GroupSettle::After(_)))
+                    .filter(|settled| !matches!(settled, GroupSettle::Empty { queries: 1, .. }))
                     .collect();
                 println!(
-                    "group settle {label}: {} of {launched} emptied at once, {} after a \
-                     wait {waited:?}",
-                    launched - waited.len(),
+                    "group settle {label}: {} of {} empty at the first query, {} not yet \
+                     empty {waited:?}",
+                    group_arm.len() - waited.len(),
+                    group_arm.len(),
                     waited.len()
                 );
             }
@@ -8743,11 +8667,6 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                      the kill and Git -- so it is emitted here rather than pinned into \
                      effects/residue-classes.json, which carries the declarations.",
         "sampling_n": SAMPLING_N,
-        // The retry ceiling every site's inspections were held to, beside the
-        // consumption of it below. A reader of one run's artifact cannot tell
-        // "two retries" from "two retries away from red" without it, and the
-        // number is the whole difference between a bound and a tolerance.
-        "inspection_attempts": RESIDUE_INSPECTION_ATTEMPTS,
         "sites": records
             .iter()
             .map(|site| serde_json::json!({
@@ -8765,20 +8684,12 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 "internal": site.record.histogram.internal,
                 "after": site.record.histogram.after,
                 "unclassified": site.record.unclassified,
-                // How much of `inspection_attempts` each sample spent, **per
-                // sample and not summed** (PR #145 pass 1, finding 3). The sum
-                // was written first and cannot tell `[3,1,1,…]` from
-                // `[2,2,1,…]`: both are two retries, and only the first is a
-                // sample one attempt from red. Since the signal this exists to
-                // carry is a rate climbing towards the ceiling, the shape of
-                // the spend is the whole of it.
-                "inspection_attempts_per_sample": site.attempts,
-                // Refusals a later attempt rescued. Empty on a healthy run,
-                // and never fatal -- the bound exists so the delete-pending
-                // refusal is not -- but never discarded either: a retry may
-                // spare a failure from the verdict and not from the record.
-                "inspection_rescued": site.rescued,
                 "recovered": site.record.recovered,
+                // The bare arm's known non-convergences: production's
+                // direct-kill fault, sampled, and its rate kept visible
+                // without being load-bearing. The guarantee is the assertion
+                // that nothing *other* than these two fingerprints occurred.
+                "bare_arm_known_non_convergences": site.bare_known,
             }))
             .collect::<Vec<_>>(),
     }))
@@ -8790,13 +8701,6 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             .expect("the emitted histogram parses");
     let sites = back["sites"].as_array().expect("a sites array");
     assert_eq!(sites.len(), 4, "one histogram per sampled site");
-    assert_eq!(
-        back["inspection_attempts"].as_u64(),
-        Some(u64::from(RESIDUE_INSPECTION_ATTEMPTS)),
-        "the artifact must carry the retry ceiling the run was held to; the per-site \
-         consumption below means nothing without the number it is a fraction of, and a \
-         raised ceiling is a thing this test reports rather than refuses"
-    );
     for (entry, evidence) in sites.iter().zip(&records) {
         let site = evidence.site;
         assert_eq!(
@@ -8814,31 +8718,15 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             "{site}: the written histogram accounts for every sample"
         );
         assert_eq!(entry["unclassified"], evidence.record.unclassified);
-        let written: Vec<u32> = entry["inspection_attempts_per_sample"]
+        let bare_known: Vec<&str> = entry["bare_arm_known_non_convergences"]
             .as_array()
-            .expect("an attempts array")
+            .expect("a bare-arm array")
             .iter()
-            .map(|value| {
-                u32::try_from(value.as_u64().expect("an attempt count"))
-                    .expect("an attempt count fits in u32")
-            })
+            .map(|value| value.as_str().expect("a fingerprint line"))
             .collect();
         assert_eq!(
-            written, evidence.attempts,
-            "{site}: the artifact must carry what the retry bound cost per sample, or a \
-                 run with one sample an attempt from red is indistinguishable in the \
-                 record from one with two samples that retried once each"
-        );
-        let rescued: Vec<&str> = entry["inspection_rescued"]
-            .as_array()
-            .expect("a rescued array")
-            .iter()
-            .map(|value| value.as_str().expect("a rescued refusal is a string"))
-            .collect();
-        assert_eq!(
-            rescued, evidence.rescued,
-            "{site}: a refusal a retry rescued must reach the artifact; it is not fatal \
-                 and it is not discardable either"
+            bare_known, evidence.bare_known,
+            "{site}: the artifact carries the bare arm's known non-convergences verbatim"
         );
         assert_eq!(
             entry["budget_us"].as_u64(),
@@ -8852,9 +8740,8 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
 /// One site's row of the evidence file: everything the packet's
 /// [`SamplingRecord`] cannot carry.
 ///
-/// A struct rather than the tuple this was, because the tuple reached six
-/// fields and a reader had to count commas to find out which `Vec<u32>` was
-/// which. `records` is built once per site and read twice -- once to write the
+/// A struct rather than the tuple this was, because the tuple had reached six
+/// fields and a reader had to count commas. `records` is built once per site and read twice -- once to write the
 /// artifact, once to check what was written -- so both readers name the same
 /// fields.
 struct SiteEvidence {
@@ -8865,10 +8752,9 @@ struct SiteEvidence {
     /// Whether that timescale was measured here or replayed from
     /// `UPSTROKE_RESIDUE_BUDGET_US`.
     replayed: bool,
-    /// What each sample's inspection cost, per sample rather than summed.
-    attempts: Vec<u32>,
-    /// Refusals a later attempt rescued, one line per sample that met one.
-    rescued: Vec<String>,
+    /// The bare arm's non-convergences with a known fingerprint, one line
+    /// each. See `BareArm`.
+    bare_known: Vec<String>,
 }
 
 /// One site's sampling run: the packet's record, and the per-sample
@@ -8893,33 +8779,15 @@ struct SamplingRun {
     /// What `classify_object_residue` answered for each sample, in order.
     /// `None` is a sample it could not classify at all.
     observed: Vec<Option<ObjectResidue>>,
-    /// What the classifier said when it *refused* a sample, one line each,
-    /// carrying every attempt [`inspect_sample`] made at that sample.
+    /// The bare arm's non-convergences, by fingerprint. See [`BareArm`].
+    bare: BareArm,
+    /// What the classifier said when it *refused* a sample, one line each.
     ///
     /// A refusal and an unclassifiable residue both arrive in `observed` as
     /// `None`, and the assertion they fail is worded for the second of them.
     /// The words that tell the two apart are here, so a red run says which it
     /// met instead of naming only the one it probably did not.
     refusals: Vec<String>,
-    /// Refusals a later attempt rescued, one line per sample that met one,
-    /// carrying every attempt's own words.
-    ///
-    /// **Not fatal and not silent** (PR #145 pass 1, finding 3). A retry that
-    /// works removes the failure from the verdict; §7 does not let it remove
-    /// the failure from the record, because the error it swallowed may not be
-    /// the one the bound exists for. Printed per site and written to the
-    /// evidence file beside the attempt counts.
-    rescued: Vec<String>,
-    /// How many attempts each sample's inspection took, in order.
-    ///
-    /// The consumption of the retry bound, kept per sample rather than
-    /// summed, because a bound that hides how much of itself is being spent
-    /// goes silent exactly the way the swallowed refusal did: one sample
-    /// costing three attempts every run is a rate on its way to the ceiling
-    /// and reads identically to eight samples costing one, once both are a
-    /// total. Asserted against [`RESIDUE_INSPECTION_ATTEMPTS`], printed, and
-    /// written to the evidence file.
-    attempts: Vec<u32>,
 }
 
 /// Tally per-sample observations into the packet's histogram.
@@ -9210,433 +9078,6 @@ impl WorkspaceManager {
     );
 }
 
-/// How many times one sample's residue inspection is attempted before the
-/// refusal **is** the answer.
-///
-/// # Why a failed inspection is retried at all, and why it is still fatal
-///
-/// The assertion this bound serves — a classifier refusal is not a residue in
-/// no class — is right on the merits and is the class this whole sweep has
-/// been about: an I/O failure is not evidence of absence. It is kept. What it
-/// cannot be is a *hard red for an environmental rate*: on the self-hosted
-/// Windows runner an inspection genuinely does fail, `failed to read <a temp
-/// object file>` while a delete-pending removal is still holding the name, at
-/// a rate reported as around 2% and not measured from here, and this test's
-/// subject is classification rather than
-/// read reliability. The assertion is on master, so every branch that merges
-/// master is exposed to it -- exposed, not billed: what is known to have been
-/// spent is #137's one rerun.
-///
-/// So a refusal is retried rather than tolerated. The two shapes are not
-/// equivalent and this is the one that keeps the assertions: a tolerated
-/// refusal has to be excluded from the histogram, which costs
-/// `histogram.total() == SAMPLING_N`, the independent tally that crosses the
-/// classifier's answer against the bucket it was counted in, and the evidence
-/// file's own total. A retry costs none of them — the sample still gets
-/// exactly one class — and it is sound here for a reason worth writing down:
-/// after the repair above the sampled command's whole process group is dead
-/// before the first inspection runs, so re-reading is re-reading a tree at
-/// rest rather than sampling a race a second time.
-///
-/// **The bound is explicit, asserted and reported.** A tolerance with no
-/// ceiling is how this goes silent again. Exhausting it is still a failure of
-/// the same assertion, with the count and every attempt's own words; the
-/// attempt counts are asserted against this constant, printed per site, and
-/// written to `effects/residue-histogram.json`, so a rate climbing towards
-/// the ceiling is visible before it arrives there.
-///
-/// **This number is chosen, not measured.** The Windows delete-pending window
-/// cannot be measured from the Linux build host, and three attempts spanning
-/// [`RESIDUE_INSPECTION_BACKOFF`] then twice it is a bet that the window is
-/// shorter than 150 ms. If it is not, the red comes back — loudly, which is
-/// the correct outcome for a bound that turns out to be wrong.
-const RESIDUE_INSPECTION_ATTEMPTS: u32 = 3;
-
-/// A bound of one has no retry in it and a bound of zero inspects nothing,
-/// which would make a sample that was never looked at indistinguishable from
-/// one that refused. Checked where the constant is, so it is a build failure
-/// rather than a test that quietly stops testing anything.
-const _: () = assert!(
-    RESIDUE_INSPECTION_ATTEMPTS > 1,
-    "an inspection bound below two attempts has no retry in it"
-);
-
-/// The first wait between inspection attempts; the `n`-th wait is `n` times
-/// it.
-///
-/// Linear rather than flat so the same small bound covers a window several
-/// times its own length, and short enough that the cost of the retries a
-/// healthy run never needs is nothing: the sleeps happen only after a
-/// refusal.
-const RESIDUE_INSPECTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// What the sampler knows about whether the sampled command is finished
-/// writing, before it reads the worktree.
-///
-/// PR #145 pass 2, finding 2. The retry's premise is that a second read sees
-/// the same tree as the first; that is true only when nothing of the sampled
-/// command is alive. On Unix the settle barrier establishes it. Elsewhere the
-/// only thing that does is the child having reached its own exit -- `git`
-/// waits for its checkout, so `Completed` covers the descendants too. A
-/// **killed** child on a platform with no barrier establishes nothing, and a
-/// refusal there is not retried: the sequence the reviewer wrote -- a sharing
-/// violation from a live checkout, retried, and the completed checkout then
-/// classified `After` under a kill sample -- must fail, not pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeAtRest {
-    /// The whole process group is gone (Unix, after `settle_group`).
-    Settled,
-    /// The child reached its own exit, and so did everything it waited for.
-    Completed,
-    /// Nothing established. A refusal is final on its first attempt.
-    Unknown,
-}
-
-/// One sample's inspection: what it answered, what it cost, and every refusal
-/// it met on the way -- including the ones a later attempt rescued.
-#[derive(Debug)]
-struct Inspection {
-    /// The class, or `None` when no attempt produced one.
-    ///
-    /// The answer and the record are separate fields on purpose: once a
-    /// rescued refusal is kept, "this sample refused" stops being the same
-    /// question as "this sample met a refusal", and collapsing them is how the
-    /// rescued one would go missing again.
-    answer: Option<ObjectResidue>,
-    /// How many attempts were made, 1 through the bound.
-    attempts: u32,
-    /// **Every refusal observed, whether or not a later attempt succeeded.**
-    ///
-    /// PR #145 pass 1, finding 3, and it is a §7 MUST: "do not discard an
-    /// error ... unless the operation is explicitly best-effort, in which case
-    /// its observability is defined". The first version kept refusals only
-    /// when the bound was exhausted, so a first attempt that failed for a
-    /// reason nobody expected -- a corrupt read, a permission failure, a Git
-    /// error -- and cleared within 50 ms left an empty `refusals`, a green
-    /// suite and no fingerprint of what had been masked. Now the observability
-    /// is the definition: a rescued refusal is recorded, printed and written
-    /// to the evidence file, so the retry can hide a *failure* from the
-    /// verdict but never from the record.
-    refusals: Vec<String>,
-}
-
-/// Inspect one sample, retrying a refusal up to [`RESIDUE_INSPECTION_ATTEMPTS`]
-/// attempts.
-///
-/// Takes the inspection as a closure rather than calling
-/// [`classify_object_residue`] itself, so
-/// [`a_refused_inspection_is_never_scored_as_a_residue_in_no_class`] can drive
-/// it against an inspection that always refuses and one that stops refusing —
-/// neither of which a real sampler can be asked to produce on demand.
-///
-/// **The bound is read here and is not a parameter.** As a parameter it was
-/// the call site's number, and a call site passing `1` retries nothing while
-/// every assertion in the sampling test still holds: the attempt counts are
-/// all `1`, which is inside any ceiling, and the constant goes on being
-/// printed and written to the evidence file as though it were the one being
-/// spent. Measured against this code before the parameter was removed. Read
-/// here, the only way to change what is spent is to change what is reported.
-fn inspect_sample(
-    quiescence: TreeAtRest,
-    mut inspect: impl FnMut() -> Result<ObjectResidue, UpstrokeError>,
-) -> Inspection {
-    let bound = RESIDUE_INSPECTION_ATTEMPTS;
-    let mut refusals = Vec::new();
-    let mut attempts = 0;
-    let mut answer = None;
-    while attempts < bound {
-        attempts += 1;
-        match inspect() {
-            Ok(class) => {
-                answer = Some(class);
-                break;
-            }
-            Err(error) => {
-                // **Recorded before it is classified**, so the classification
-                // decides whether to try again and never whether the failure
-                // is reportable. Those were one question in the first version
-                // and that is finding 3: an error that was not retried was
-                // also not kept.
-                // Two gates, and the record says which one closed. The
-                // failure's kind decides whether asking again could help;
-                // the quiescence decides whether asking again is *sound*,
-                // which is the one pass 2 found missing.
-                let kind_allows = retryable(&error);
-                let rest_allows = quiescence != TreeAtRest::Unknown;
-                let again = kind_allows && rest_allows;
-                refusals.push(format!(
-                    "attempt {attempts}/{bound}{}: {error}",
-                    if again {
-                        ""
-                    } else if !kind_allows {
-                        " (not retryable)"
-                    } else {
-                        " (not retried: the tree is not known to be at rest)"
-                    }
-                ));
-                if !again {
-                    break;
-                }
-                if attempts < bound {
-                    std::thread::sleep(RESIDUE_INSPECTION_BACKOFF * attempts);
-                }
-            }
-        }
-    }
-    Inspection {
-        answer,
-        attempts,
-        refusals,
-    }
-}
-
-/// Whether a refused inspection is the kind of failure this bound exists for.
-///
-/// **The classification is the variant, and that is a decision rather than an
-/// omission.** §7 requires a bounded retry to classify what it retries, and the
-/// failure this bound exists for is one shape: a *read of a path* that fails
-/// while a delete-pending removal still holds the name, which
-/// `classify_object_residue` reports as [`UpstrokeError::Io`] carrying the path
-/// and the OS error. Every other variant this classifier can answer is a
-/// different kind of thing and is not retried -- `Git` is a Git command that
-/// failed, `Refused` is a site with no residue class, `Filesystem` is a
-/// mutation that failed, and none of them becomes true by being asked again 50
-/// ms later.
-///
-/// **It is not narrowed to an [`std::io::ErrorKind`], deliberately.** The
-/// obvious narrowing is `PermissionDenied`, which is what a delete-pending
-/// `open` gives on the Windows runner -- but `ERROR_SHARING_VIOLATION` is the
-/// other spelling of the same state and Rust maps it to `Uncategorized`, so a
-/// kind-level filter would refuse to retry half of the very failure this
-/// exists for. That cannot be measured from the Linux build box, which is the
-/// same reason the rate itself cannot be, so the line is drawn where it can be
-/// drawn honestly: at the variant, which says "an inspection could not read a
-/// path".
-///
-/// What stops the width mattering is the other half of the repair: **every
-/// refusal is recorded whether or not it was retried**, so an unexpected `Io`
-/// that a retry rescues is in the run's output and in
-/// `effects/residue-histogram.json`, and the retry can spare it from the
-/// verdict but not from the record.
-fn retryable(error: &UpstrokeError) -> bool {
-    matches!(error, UpstrokeError::Io { .. })
-}
-
-/// The bound's controls: what a retry rescues, what it does not, and the one
-/// property no retry may cost.
-///
-/// **The property.** A refusal that survives every attempt stays a refusal. It
-/// does not become `ObjectResidue::None`, and it is not counted into any
-/// class: [`tally`] puts it in `unclassified`, which is the bucket the
-/// sampling test asserts is empty and reports by its own assertion. That is
-/// what an inspection failure is — the absence of an answer, never an answer
-/// of absence — and it is asserted here over the pair, the answer and the
-/// tally of it, because the two can disagree.
-///
-/// **What each case says about the code that is not there.** A single
-/// unretried inspection answers case 2 with a refusal where this answers it
-/// with the class the residue actually had, which is the whole of the change;
-/// it answers cases 1 and 3 identically, which is the whole of what the
-/// change was not allowed to alter. Cases 4 and 5 are PR #145 pass 1,
-/// finding 3, and they are about the code that *was* there: a version that
-/// retried every error kind answers case 4 by spending the whole bound on a
-/// Git failure no delay can clear, and a version that kept refusals only when
-/// the bound was exhausted answers case 5 with an empty record.
-#[test]
-fn a_refused_inspection_is_never_scored_as_a_residue_in_no_class() {
-    let refusal = || UpstrokeError::Io {
-        path: PathBuf::from("objects/tmp_object_deleted_under_the_read"),
-        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-    };
-
-    // 1. An inspection that never succeeds. The bound is spent, every
-    //    attempt's words are kept, and the sample is unclassified rather than
-    //    classified `None`.
-    let mut calls = 0_u32;
-    let refused = inspect_sample(TreeAtRest::Settled, || {
-        calls += 1;
-        Err(refusal())
-    });
-    assert_eq!(calls, RESIDUE_INSPECTION_ATTEMPTS, "every attempt is spent");
-    assert_eq!(refused.attempts, RESIDUE_INSPECTION_ATTEMPTS);
-    assert_eq!(
-        refused.answer, None,
-        "an inspection that always refuses produces no class"
-    );
-    assert_eq!(
-        u32::try_from(refused.refusals.len()).expect("a refusal count fits in u32"),
-        RESIDUE_INSPECTION_ATTEMPTS,
-        "each attempt's own refusal is kept: {:?}",
-        refused.refusals
-    );
-    assert!(
-        refused
-            .refusals
-            .iter()
-            .all(|line| line.contains("tmp_object_deleted_under_the_read")),
-        "a red run has to name the path it could not read: {:?}",
-        refused.refusals
-    );
-    let (histogram, unclassified) = tally(&[refused.answer]);
-    assert_eq!(
-        (
-            histogram.none,
-            histogram.internal,
-            histogram.after,
-            unclassified
-        ),
-        (0, 0, 0, 1),
-        "a refusal that survived the bound is an inspection that failed, and it is counted \
-         in no class -- least of all in `None`, which is the answer that a residue was \
-         looked for and was not there"
-    );
-
-    // 2. An inspection that stops refusing. What the retry is for: the answer
-    //    is the class the residue really had.
-    let mut calls = 0_u32;
-    let rescued = inspect_sample(TreeAtRest::Settled, || {
-        calls += 1;
-        if calls < RESIDUE_INSPECTION_ATTEMPTS {
-            Err(refusal())
-        } else {
-            Ok(ObjectResidue::Internal)
-        }
-    });
-    assert_eq!(
-        rescued.answer,
-        Some(ObjectResidue::Internal),
-        "the answer is the class the inspection finally gave, not a default"
-    );
-    assert_eq!(
-        rescued.attempts, RESIDUE_INSPECTION_ATTEMPTS,
-        "the attempts it cost are reported even though it succeeded"
-    );
-
-    // 3. An inspection that answers first time costs one attempt and records
-    //    nothing. The bound is a ceiling on a failure, not a repetition of a
-    //    healthy read.
-    let mut calls = 0_u32;
-    let clean = inspect_sample(TreeAtRest::Completed, || {
-        calls += 1;
-        Ok(ObjectResidue::After)
-    });
-    assert_eq!(calls, 1, "a successful inspection is not repeated");
-    assert_eq!(clean.attempts, 1);
-    assert_eq!(clean.answer, Some(ObjectResidue::After));
-    assert!(
-        clean.refusals.is_empty(),
-        "a healthy inspection leaves no record to read"
-    );
-
-    // 4. **A failure that is not the one this bound exists for is not
-    //    retried.** §7: a bounded retry classifies what it retries. A Git
-    //    error is not a read that lost a race with a delete-pending removal,
-    //    and asking again 50 ms later cannot make it true; spending the bound
-    //    on it would also delay the sample by 150 ms for nothing.
-    let mut calls = 0_u32;
-    let refused_once = inspect_sample(TreeAtRest::Settled, || {
-        calls += 1;
-        Err(UpstrokeError::Git {
-            message: "worktree registration has an empty gitdir".to_owned(),
-        })
-    });
-    assert_eq!(calls, 1, "a non-retryable failure is asked once");
-    assert_eq!(refused_once.attempts, 1);
-    assert_eq!(refused_once.answer, None);
-    assert_eq!(
-        refused_once.refusals.len(),
-        1,
-        "and it is still recorded: {:?}",
-        refused_once.refusals
-    );
-    assert!(
-        refused_once
-            .refusals
-            .first()
-            .expect("a refusal was recorded, asserted just above")
-            .contains("(not retryable)"),
-        "the record says why it was not asked again, or a reader cannot tell a \
-         classification from a bound that was never reached: {:?}",
-        refused_once.refusals
-    );
-
-    // 5. **A refusal a later attempt rescued is still recorded.** The
-    //    false-green this closes: an unrelated transient error clears inside
-    //    50 ms, the second attempt classifies, and the first version left
-    //    nothing at all behind -- a green suite that had masked a failure
-    //    nobody could name. The retry may spare it from the verdict; §7 does
-    //    not let it spare it from the record.
-    let mut calls = 0_u32;
-    let masked = inspect_sample(TreeAtRest::Settled, || {
-        calls += 1;
-        if calls == 1 {
-            Err(UpstrokeError::Io {
-                path: PathBuf::from("objects/pack/corrupt-under-the-read"),
-                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
-            })
-        } else {
-            Ok(ObjectResidue::None)
-        }
-    });
-    assert_eq!(
-        masked.answer,
-        Some(ObjectResidue::None),
-        "the retry did its job and the sample has a class"
-    );
-    assert_eq!(
-        masked.refusals.len(),
-        1,
-        "and the failure it swallowed is still here"
-    );
-    assert!(
-        masked
-            .refusals
-            .first()
-            .expect("a refusal was recorded, asserted just above")
-            .contains("corrupt-under-the-read"),
-        "carrying the path, which is the whole of what makes it identifiable: {:?}",
-        masked.refusals
-    );
-
-    // 6. **A refusal is not retried when the tree is not known to be at
-    //    rest** (PR #145 pass 2, finding 2). This is the reviewer's sequence
-    //    with the second half made to fail: on a platform with no settle
-    //    barrier, a killed `git worktree add` leaves its checkout running, the
-    //    first read meets a sharing violation, and the *same* closure would
-    //    answer `After` fifty milliseconds later because the checkout has
-    //    finished in the meantime. Retrying would record completion state
-    //    under a kill sample. The refusal has to be the answer -- the very
-    //    same case 2 above rescues when the tree is known to be at rest.
-    let mut calls = 0_u32;
-    let unrested = inspect_sample(TreeAtRest::Unknown, || {
-        calls += 1;
-        if calls == 1 {
-            Err(refusal())
-        } else {
-            Ok(ObjectResidue::After)
-        }
-    });
-    assert_eq!(
-        calls, 1,
-        "nothing vouched for the tree, so it is not asked again"
-    );
-    assert_eq!(unrested.attempts, 1);
-    assert_eq!(
-        unrested.answer, None,
-        "a refusal that could not be safely retried stays a refusal; `After` would have \
-         been a completed checkout filed under a kill"
-    );
-    assert!(
-        unrested
-            .refusals
-            .first()
-            .expect("the refusal is recorded")
-            .contains("not retried: the tree is not known to be at rest"),
-        "the record says which gate closed: {:?}",
-        unrested.refusals
-    );
-}
-
 /// Kill the Git child of one site `SAMPLING_N` times and classify what is
 /// left.
 fn sample_site(site: EffectSiteId) -> SamplingRun {
@@ -9662,8 +9103,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
     );
     let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
-    let mut rescued: Vec<String> = Vec::new();
-    let mut attempts: Vec<u32> = Vec::new();
+    let mut bare = BareArm::default();
     let mut recovered = true;
 
     for run in 0..SAMPLING_N {
@@ -9683,7 +9123,12 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
 
         let (args, cwd) = sampled_command(site, &fixture, &slot);
         let delay = budget.mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1));
-        let quiescence = kill_git_child(&cwd, &args, delay);
+        let arm = if run % 2 == 0 {
+            KillArm::Group
+        } else {
+            KillArm::Bare
+        };
+        kill_git_child(&fixture.manager, &cwd, &args, delay, arm);
 
         let target = ResidueTarget::new(&base).at(&path).from_base(&fixture.head);
         // Bounded retry, and then `.ok()`. The `.ok()` is what the tally
@@ -9693,39 +9138,63 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         // is worded for the second. §7 asks that a discard be best-effort
         // with defined observability, so every attempt's own words are kept
         // and go into that assertion's message. The bound and the argument
-        // for retrying at all are at [`RESIDUE_INSPECTION_ATTEMPTS`].
-        let inspected = inspect_sample(quiescence, || classify_object_residue(site, &target));
-        attempts.push(inspected.attempts);
-        // **Two lists, because a refusal that a later attempt rescued is not
-        // the same event as one that ended the bound** (PR #145 pass 1,
-        // finding 3). The first is fatal and the second is reportable, and
-        // recording only the first is what let an unexpected error clear
-        // inside 50 ms and leave nothing behind.
-        if !inspected.refusals.is_empty() {
-            let line = format!("run {run}: {}", inspected.refusals.join(" | "));
-            // **Printed here, before `recover_sample` can panic** (PR #145
-            // pass 2, finding 3). The lists below reach stdout and the
-            // evidence file only after every sample has run, and a later
-            // sample's recovery panic unwinds through both of those without
-            // running either. Stdout at the point of detection is the
-            // record that survives an unwind; the artifact is the summary.
-            println!(
-                "residue inspection {site}: {} refusal, {line}",
-                if inspected.answer.is_some() {
-                    "rescued"
-                } else {
-                    "unrescued"
-                }
-            );
-            if inspected.answer.is_some() {
-                rescued.push(line);
-            } else {
-                refusals.push(line);
-            }
+        // `.ok()` is what the tally needs, and it is not what a reader of a
+        // red run needs: it folds "the classifier refused, and here is why"
+        // into the same `None` as "this residue is in no class", and the
+        // assertion those `None`s fail is worded for the second. §7 asks that
+        // a discard be best-effort with defined observability, so the error's
+        // own words are kept and go into that assertion's message.
+        //
+        // **No retry** (PR #145, withdrawn at pass 3). Three passes found the
+        // bounded retry unsound on the one platform its refusal occurs on,
+        // because that platform has no barrier to make a second read a read
+        // of the same tree, and the last pass showed the observability that
+        // was meant to make a rescued error visible does not exist in CI. A
+        // refusal is what master made it: a hard red, with its words.
+        let classified = classify_object_residue(site, &target);
+        if let Err(error) = &classified {
+            refusals.push(format!("run {run}: {error}"));
         }
-        observed.push(inspected.answer);
-        if !recover_sample(&fixture, &slot) {
-            recovered = false;
+        observed.push(classified.ok());
+        match recover_sample(&fixture, &slot) {
+            Ok(true) => {}
+            Ok(false) => recovered = false,
+            // **The bare arm is held to a bounded set of outcomes, not to
+            // success** (PR #145 pass 3, finding 3, as the coordinator
+            // ruled it). Its residue may be a live writer, and forced removal
+            // against a live writer is the funnel P2 another stream owns; a
+            // test red at that stream's known rate is a test people learn
+            // to ignore, and a bare arm whose failures are merely reported
+            // lands in the two channels CI throws away. So: converge, or
+            // fail with exactly one of the two fingerprints
+            // `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` recorded --
+            // and anything else is a new failure and reddens the suite.
+            // When that stream lands, this arm tightens to full convergence
+            // and this match arm is what gets deleted.
+            Err(error) if cfg!(unix) && arm == KillArm::Bare => {
+                let text = format!("{error:?}");
+                let known =
+                    text.contains("DirectoryNotEmpty") || text.contains("has an empty gitdir");
+                println!(
+                    "bare-arm recovery {site} run {run}: {} -- {text}",
+                    if known {
+                        "known fingerprint"
+                    } else {
+                        "UNKNOWN FAILURE"
+                    }
+                );
+                if known {
+                    bare.known.push(format!("run {run}: {text}"));
+                } else {
+                    bare.other.push(format!("run {run}: {text}"));
+                }
+                // Harness hygiene, not recovery: the residue the funnel
+                // refused to clear would poison every later sample's
+                // enumeration of the registrations. It is the fixture's own
+                // temporary repository, and what is removed is named.
+                bare_arm_hygiene(&fixture, &slot);
+            }
+            Err(error) => panic!("forced removal converges: {error:?}"),
         }
     }
 
@@ -9741,8 +9210,55 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         },
         observed,
         refusals,
-        rescued,
-        attempts,
+        bare,
+    }
+}
+
+/// What the bare arm's recoveries did, kept apart from the packet's
+/// `recovered`, which is defined over the group arm and over bare-arm samples
+/// that converged.
+#[derive(Debug, Default)]
+struct BareArm {
+    /// Non-convergences carrying one of the two known fingerprints. Reported
+    /// per run and in the artifact; asserted only to be the *only* kind.
+    known: Vec<String>,
+    /// Non-convergences carrying anything else. Asserted empty.
+    other: Vec<String>,
+}
+
+/// Clear what the funnel refused to, so the next sample is not poisoned.
+///
+/// Only ever reached after a bare-arm non-convergence with a known
+/// fingerprint. Both paths are inside the fixture's temporary repository:
+/// the slot's checkout, which may still have a writer finishing in it, and
+/// the registration directory whose empty `gitdir` the funnel correctly
+/// declines to guess at. `remove_dir_all` failing here is not tolerated --
+/// it would be a third fingerprint, and it panics with the path.
+fn bare_arm_hygiene(fixture: &Fixture, slot: &Slot) {
+    let path = fixture.manager.slot_path(slot);
+    for _ in 0..3 {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            // A live writer can recreate a directory under the walk; a second
+            // pass after it has finished is the same removal.
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    assert!(
+        !path.exists(),
+        "bare-arm hygiene could not clear {}",
+        path.display()
+    );
+    let worktrees = fixture.base.join(".git").join("worktrees");
+    if let Ok(entries) = fs::read_dir(&worktrees) {
+        for entry in entries.flatten() {
+            let gitdir = entry.path().join("gitdir");
+            let empty = fs::read(&gitdir).map(|bytes| bytes.iter().all(u8::is_ascii_whitespace));
+            if matches!(empty, Ok(true)) {
+                fs::remove_dir_all(entry.path()).expect("clear the poisoned registration");
+            }
+        }
     }
 }
 
@@ -10075,6 +9591,13 @@ fn launch_end(status: &std::process::ExitStatus) -> LaunchEnd {
 struct SampledLaunch {
     argv: Vec<String>,
     after: std::time::Duration,
+    /// Which of production's two kill shapes this child got.
+    arm: KillArm,
+    /// The kernel's answer at the spawn instant: `true` for the group arm,
+    /// and -- asserted -- `false` for the bare arm, which is the bare arm's
+    /// own oracle for being bare.
+    #[cfg(unix)]
+    led_its_own_group: bool,
     fired: Option<std::time::Duration>,
     /// What [`SampledChild::kill`] answered, when it answered an error.
     ///
@@ -10209,6 +9732,13 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// [`Child::kill`]: std::process::Child::kill
 struct SampledChild {
     child: std::process::Child,
+    /// Which of production's two kill shapes this child gets. Read only on
+    /// Unix, where the two shapes differ; elsewhere both are the bare kill.
+    #[cfg(unix)]
+    arm: KillArm,
+    /// The instant the kill fired: the one clock every bound after it is
+    /// measured from (pass 3, finding 2).
+    killed_at: Option<std::time::Instant>,
     /// Started once [`Command::spawn`] has returned, so what [`Self::kill`]
     /// reads off it is time the child was left *running* rather than the
     /// cost of starting it — and so an unwaited kill reads as the ~0 it is.
@@ -10249,11 +9779,14 @@ struct SampledChild {
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupSettle {
-    /// Empty the first time it was asked, which is after `wait` reaped the
-    /// leader.
-    AtOnce,
-    /// Empty, after this long.
-    After(std::time::Duration),
+    /// Empty. `after` is measured **from the kill**, so it includes the
+    /// leader's own reap (pass 3, finding 2: the first version started its
+    /// clock only after `wait` returned and could report a 9.9 s reap as
+    /// "at once"); `queries` is how many times the group had to be asked.
+    Empty {
+        after: std::time::Duration,
+        queries: u32,
+    },
     /// Still not empty at [`GROUP_SETTLE_BOUND`]. A descendant outliving a
     /// `SIGKILL` by that much is a fault in its own right, so this is a hard
     /// failure **at the point it is detected**, inside `kill_git_child`,
@@ -10274,6 +9807,9 @@ enum GroupSettle {
     /// same refusal [`GroupKill::NotItsOwnGroup`] is, and the sampling test
     /// fails on it there.
     NotItsOwnGroup,
+    /// Not waited for, by design: the bare arm has no group of its own to
+    /// wait for, and waiting for the harness's group would never end.
+    NotAimed,
 }
 
 /// How long a sampled child may take to be reaped after the kill, and on
@@ -10286,7 +9822,30 @@ enum GroupSettle {
 /// suite on a loaded machine. A `SIGKILL`ed process that is not stuck in an
 /// uninterruptible read is gone in microseconds; the whole of the group wait
 /// is normally the one `kill(-pgid, 0)` that answers `ESRCH`.
+#[cfg(unix)]
 const GROUP_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Which of production's two kill shapes a sampled child is given.
+///
+/// PR #145 pass 3, finding 3. "Production never produces a bare-child death"
+/// was false: the workspace manager spawns its Git through `Command::output`
+/// and not through `agent::proc`'s containment, so an operator, a supervisor
+/// or the OOM killer ending only the leader is a production sequence -- and
+/// this pull request's own empty-`gitdir` finding calls an OOM kill of `git`
+/// production-reachable. A sampler that always group-kills therefore removes
+/// coverage of a real fault. The ladder alternates the two: even rungs kill
+/// the group and wait for it, odd rungs kill the bare child as master did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillArm {
+    /// `process_group(0)`, `SIGKILL` to the group, then wait for the group to
+    /// empty: `agent::proc`'s kill path.
+    Group,
+    /// `Child::kill` on the leader only, in this harness's own process group,
+    /// nothing waited for: what an external kill of a manager-spawned `git`
+    /// leaves. Its residue may be a live writer, and its recovery is held to
+    /// a bounded set of outcomes rather than to success (see `BareArm`).
+    Bare,
+}
 
 /// What the process-group kill did to one sampled child.
 ///
@@ -10306,33 +9865,54 @@ enum GroupKill {
     Refused(i32),
     /// Not attempted: the kernel says this child does not lead its own group.
     NotItsOwnGroup,
+    /// Not aimed, by design: the bare arm kills the leader only.
+    NotAimed,
 }
 
 impl SampledChild {
-    fn spawn(cwd: &Path, args: &[String]) -> Self {
-        let mut command = Command::new("git");
+    /// Spawn the site's Git child **through the production builder**.
+    ///
+    /// PR #145 pass 3, finding 4. The first version transcribed one of
+    /// production's pins (`core.fsmonitor=false`) and left the other three
+    /// behind -- an empty `core.hooksPath`, `protocol.file.allow=never` and
+    /// `GIT_NO_REPLACE_OBJECTS` -- so the sampled child ran under the user's
+    /// global Git configuration: a clean filter in a global attributes file
+    /// makes `git add` spawn a child, a global `post-checkout` hook alters
+    /// `worktree add`, and a daemonising hook escapes the group before the
+    /// barrier. Every one of those falsified the "spawns no children" control
+    /// and broke §12's hermeticity rule. Taking the `Command` from
+    /// [`WorkspaceManager::command`] makes the pins production's **by
+    /// construction**: a pin added there is a pin here, with no list to keep
+    /// in step.
+    fn spawn(manager: &WorkspaceManager, cwd: &Path, args: &[String], arm: KillArm) -> Self {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut command = manager.command(cwd, &args);
         command
-            .arg("-C")
-            .arg(cwd)
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         // `setpgid(0, 0)` in the forked child before `exec`, which is where
         // `agent::proc::run_with_timeout_at` puts it and what `std` does for
-        // this call. Without it the child shares this test binary's group and
-        // there is no group of the child's own for a kill to name.
+        // this call -- for the group arm. The bare arm deliberately stays in
+        // this test binary's group, which is where a `Command::output` child
+        // of the manager lives in production.
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        if arm == KillArm::Group {
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        }
         let child = command.spawn().expect("spawn the sampled git child");
         let spawned = std::time::Instant::now();
         #[cfg(unix)]
         let led_its_own_group = crate::agent::proc::child_leads_its_own_group(child.id());
+        #[cfg(not(unix))]
+        let _ = arm;
         Self {
             child,
             spawned,
+            #[cfg(unix)]
+            arm,
             fired: None,
+            killed_at: None,
             #[cfg(unix)]
             led_its_own_group,
             #[cfg(unix)]
@@ -10363,16 +9943,30 @@ impl SampledChild {
     /// test is what covers that: it is over wait statuses, which nothing
     /// but a real kill produces.
     fn kill(&mut self) -> std::io::Result<()> {
-        let fired = self.spawned.elapsed();
+        let now = std::time::Instant::now();
+        let fired = now.duration_since(self.spawned);
         #[cfg(unix)]
-        let group = self.kill_group();
+        let group = match self.arm {
+            KillArm::Group => self.kill_group(),
+            KillArm::Bare => GroupKill::NotAimed,
+        };
         let outcome = self.child.kill();
         self.fired = Some(fired);
+        self.killed_at = Some(now);
         #[cfg(unix)]
         {
             self.group_kill = Some(group);
         }
         outcome
+    }
+
+    /// The deadline every wait after the kill shares: one clock, started at
+    /// the kill (pass 3, finding 2).
+    #[cfg(unix)]
+    fn deadline(&self) -> std::time::Instant {
+        self.killed_at
+            .expect("a kill fired before anything waited on it")
+            + GROUP_SETTLE_BOUND
     }
 
     /// `SIGKILL` the whole process group this child leads.
@@ -10434,19 +10028,31 @@ impl SampledChild {
     /// and a leader that a `SIGKILL` does not reap inside it is the same
     /// hard failure as a descendant that does not.
     fn wait(&mut self) -> std::process::ExitStatus {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll the sampled git child") {
-                return status;
+        // Windows: master's blocking reap, unchanged. Pass 3, finding 2: the
+        // first bounded version was not `cfg(unix)`, so it panicked after ten
+        // seconds where master blocked -- a behaviour change on a first-class
+        // target the body had said was untouched.
+        #[cfg(not(unix))]
+        {
+            self.child.wait().expect("reap the sampled git child")
+        }
+        #[cfg(unix)]
+        {
+            let deadline = self.deadline();
+            loop {
+                if let Some(status) = self.child.try_wait().expect("poll the sampled git child") {
+                    return status;
+                }
+                let now = std::time::Instant::now();
+                assert!(
+                    now < deadline,
+                    "the sampled git child was not reaped {:?} after its kill; a leader a \
+                     SIGKILL does not end inside {GROUP_SETTLE_BOUND:?} is stuck in the \
+                     kernel, and nothing about its residue can be sampled",
+                    now.duration_since(self.killed_at.expect("the kill fired"))
+                );
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
-            let waited = start.elapsed();
-            assert!(
-                waited < GROUP_SETTLE_BOUND,
-                "the sampled git child was not reaped {waited:?} after its kill; a leader a \
-                 SIGKILL does not end inside {GROUP_SETTLE_BOUND:?} is stuck in the kernel, \
-                 and nothing about its residue can be sampled"
-            );
-            std::thread::sleep(std::time::Duration::from_micros(50));
         }
     }
 
@@ -10466,18 +10072,24 @@ impl SampledChild {
     /// answer is not a no.
     ///
     /// What this buys is the premise the rest of the sample rests on: by the
-    /// time the residue is classified and the tabled recovery runs, no
-    /// descendant of the sampled command is alive to be writing into the
-    /// worktree. Before it, that was an assumption, and
+    /// time the residue is classified and the tabled recovery runs, no entry
+    /// of the sampled command's process group remains -- which is the claim
+    /// exactly, and not "no descendant is alive and writing": a zombie, or an
+    /// orphan an unhurried subreaper has not yet reaped, holds an entry too
+    /// (pass 3, finding 5). Before it, that was an assumption, and
     /// `agent::proc::tests::kill_tree_settles_the_whole_unix_group_before_it_returns`
     /// exists precisely because it is not a safe one.
     #[cfg(unix)]
     fn settle_group(&self) -> GroupSettle {
+        if self.arm == KillArm::Bare {
+            return GroupSettle::NotAimed;
+        }
         if !self.led_its_own_group {
             return GroupSettle::NotItsOwnGroup;
         }
         let pid = libc::pid_t::try_from(self.child.id()).expect("a child pid fits in a pid_t");
-        let start = std::time::Instant::now();
+        let killed_at = self.killed_at.expect("the kill fired");
+        let deadline = self.deadline();
         let mut asked = 0_u32;
         loop {
             // SAFETY: signal 0 delivers nothing. It is the standard existence
@@ -10490,24 +10102,29 @@ impl SampledChild {
                 if errno != libc::ESRCH {
                     return GroupSettle::Refused(errno);
                 }
-                return if asked == 0 {
-                    GroupSettle::AtOnce
-                } else {
-                    GroupSettle::After(start.elapsed())
+                return GroupSettle::Empty {
+                    after: killed_at.elapsed(),
+                    queries: asked + 1,
                 };
             }
             asked += 1;
-            let waited = start.elapsed();
-            if waited >= GROUP_SETTLE_BOUND {
-                return GroupSettle::TimedOut(waited);
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return GroupSettle::TimedOut(now.duration_since(killed_at));
             }
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
     }
 }
 
-fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) -> TreeAtRest {
-    let mut child = SampledChild::spawn(cwd, args);
+fn kill_git_child(
+    manager: &WorkspaceManager,
+    cwd: &Path,
+    args: &[String],
+    after: std::time::Duration,
+    arm: KillArm,
+) {
+    let mut child = SampledChild::spawn(manager, cwd, args, arm);
     std::thread::sleep(after);
     // Kept, not discarded. A kill of a child that has already reached its own
     // exit legitimately fails on Windows -- `TerminateProcess` answers
@@ -10532,7 +10149,10 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) -> Tr
     let settled = child.settle_group();
     #[cfg(unix)]
     assert!(
-        matches!(settled, GroupSettle::AtOnce | GroupSettle::After(_)),
+        match arm {
+            KillArm::Group => matches!(settled, GroupSettle::Empty { .. }),
+            KillArm::Bare => settled == GroupSettle::NotAimed,
+        },
         "{settled:?} -- the sampled child's process group is not known to be empty, so \
          nothing may read the worktree yet. `TimedOut` is a descendant that outlived a \
          SIGKILL by {GROUP_SETTLE_BOUND:?}; `Refused` is a group with this id that is not \
@@ -10544,53 +10164,36 @@ fn kill_git_child(cwd: &Path, args: &[String], after: std::time::Duration) -> Tr
         .push(SampledLaunch {
             argv: args.to_vec(),
             after,
+            arm,
             fired: child.fired,
             kill_error,
+            #[cfg(unix)]
+            led_its_own_group: child.led_its_own_group,
             #[cfg(unix)]
             group_kill: child.group_kill,
             #[cfg(unix)]
             settled,
             end: launch_end(&status),
         });
-    // **What the caller may rely on** (pass 2, finding 2). On Unix the group
-    // is empty, asserted just above. Elsewhere the only rest this harness
-    // can vouch for is a child that reached its own exit: `git` waits for
-    // its checkout, so `Completed` means the descendants are done too, and a
-    // killed child on a platform with no barrier vouches for nothing.
-    #[cfg(unix)]
-    {
-        let _ = launch_end(&status);
-        TreeAtRest::Settled
-    }
-    #[cfg(not(unix))]
-    {
-        match launch_end(&status) {
-            LaunchEnd::Completed => TreeAtRest::Completed,
-            LaunchEnd::Killed | LaunchEnd::Failed(_) => TreeAtRest::Unknown,
-        }
-    }
 }
 
 /// The tabled recovery for whatever the sample left: forced removal of the
 /// worktree and its intent, which is the before-phase action every
 /// `Internal` residue routes to and is idempotent for the other two.
-fn recover_sample(fixture: &Fixture, slot: &Slot) -> bool {
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, slot)
-        .expect("forced removal converges");
-    fixture
-        .manager
-        .remove_intent(&mut NoHooks, slot)
-        .expect("intent removal converges");
+///
+/// Returns the removal's error rather than panicking on it, because the bare
+/// arm decides what a non-convergence means (see `BareArm`); the group arm
+/// and every non-Unix sample still panic on it, with master's words.
+fn recover_sample(fixture: &Fixture, slot: &Slot) -> Result<bool, UpstrokeError> {
+    fixture.manager.remove_worktree(&mut NoHooks, slot)?;
+    fixture.manager.remove_intent(&mut NoHooks, slot)?;
     let path = fixture.manager.slot_path(slot);
-    !path.exists()
+    Ok(!path.exists()
         && !fixture
             .manager
-            .worktree_records()
-            .expect("records")
+            .worktree_records()?
             .iter()
-            .any(|record| canonical_prefix(record.path()).ok() == canonical_prefix(&path).ok())
+            .any(|record| canonical_prefix(record.path()).ok() == canonical_prefix(&path).ok()))
 }
 
 // -----------------------------------------------------------------------
