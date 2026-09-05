@@ -4877,12 +4877,12 @@ enum TreeEntry {
     Dir,
     /// A regular file and its bytes.
     File(Vec<u8>),
-    /// A symbolic link and its target, read with `read_link`, never followed.
+    /// A symbolic link or junction and its target, never followed.
     Link(PathBuf),
 }
 
 /// Everything under `root`, by path relative to it: every directory, every
-/// regular file with its bytes, every symbolic link with its target. Nothing
+/// regular file with its bytes, every symbolic link or junction with its target. Nothing
 /// is followed, so replacing a file with a link to equal bytes is a
 /// difference, and so is a deleted empty directory.
 fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
@@ -4894,7 +4894,7 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
                 .expect("an entry is under its root")
                 .to_path_buf();
             let metadata = fs::symlink_metadata(&path).expect("entry metadata");
-            if metadata.is_symlink() {
+            if is_reparse_point(&metadata) {
                 out.insert(
                     relative,
                     TreeEntry::Link(fs::read_link(&path).expect("read a link's target")),
@@ -4903,7 +4903,10 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
                 out.insert(relative, TreeEntry::Dir);
                 walk(root, &path, out);
             } else {
-                out.insert(relative, TreeEntry::File(fs::read(&path).expect("read an entry")));
+                out.insert(
+                    relative,
+                    TreeEntry::File(fs::read(&path).expect("read an entry")),
+                );
             }
         }
     }
@@ -4911,7 +4914,7 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
     // Only an actual not-found is an absent tree, which the empty map records
     // as a difference from a present one; any other failure is the test's.
     match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() => {
+        Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {
             out.insert(PathBuf::new(), TreeEntry::Dir);
             walk(root, root, &mut out);
         }
@@ -4920,6 +4923,59 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
         Err(error) => panic!("{}: {error}", root.display()),
     }
     out
+}
+
+#[cfg(unix)]
+#[test]
+fn tree_bytes_detects_a_file_replaced_by_a_link_to_equal_contents() {
+    let scratch = acquire("tree-bytes-file-link").expect("scratch tree");
+    let root = scratch.path().join("observed");
+    fs::create_dir(&root).expect("observed directory");
+    let file = root.join("file");
+    let target = scratch.path().join("same-bytes");
+    fs::write(&file, b"unchanged bytes\n").expect("original file");
+    fs::write(&target, b"unchanged bytes\n").expect("equal-content target");
+    let before = tree_bytes(&root);
+
+    fs::remove_file(&file).expect("remove original file");
+    std::os::unix::fs::symlink(&target, &file).expect("substitute the link");
+    assert_eq!(
+        fs::read(&file).expect("read through the link"),
+        b"unchanged bytes\n",
+        "a snapshot that follows the link would see the original bytes"
+    );
+    assert_ne!(
+        tree_bytes(&root),
+        before,
+        "file-to-link substitution must change the refusal snapshot"
+    );
+}
+
+#[test]
+fn tree_bytes_detects_a_directory_replaced_by_a_link_to_equal_contents() {
+    let scratch = acquire("tree-bytes-directory-link").expect("scratch tree");
+    let root = scratch.path().join("observed");
+    let directory = root.join("directory");
+    let target = scratch.path().join("same-tree");
+    fs::create_dir_all(&directory).expect("original directory");
+    fs::create_dir(&target).expect("target directory");
+    fs::write(directory.join("file"), b"unchanged bytes\n").expect("original contents");
+    fs::write(target.join("file"), b"unchanged bytes\n").expect("equal-content target");
+    let before = tree_bytes(&root);
+
+    fs::remove_file(directory.join("file")).expect("remove original contents");
+    fs::remove_dir(&directory).expect("remove original directory");
+    plant_directory_link(&target, &directory);
+    assert_eq!(
+        fs::read(directory.join("file")).expect("read through the directory link"),
+        b"unchanged bytes\n",
+        "a snapshot that follows the link would see the original subtree"
+    );
+    assert_ne!(
+        tree_bytes(&root),
+        before,
+        "directory-to-link substitution must change the refusal snapshot"
+    );
 }
 
 /// What `git worktree add` leaves when it is killed before it writes `gitdir`,
