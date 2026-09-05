@@ -7,7 +7,7 @@ pr: 161
 reviewed_sha: 787d945010bfc02d7584af6076f8fe942bc57a41
 location: src/effects.rs:329
 provenance: pre_existing
-first_bad:
+first_bad: 0bf8157e48d57b49e6a069077ab95e878628b152
 guard: PR #157 bounded configured_item_end correction with typed-wrapper and later-production regressions
 ---
 
@@ -31,8 +31,11 @@ zero. The peer's `census-evidence/candidate.log` records the failing assertion, 
 The same helper is present at the local SHA and location recorded above. This
 entry binds the local source inspection to that SHA; the four-versus-two test
 result belongs to the peer candidate, whose ancestry is not asserted here. No new
-independent approval of either candidate is claimed. The helper predates this
-documentation repair, and its first bad commit remains unknown.
+independent approval of either candidate is claimed. Commit
+`0bf8157e48d57b49e6a069077ab95e878628b152` introduces `production_code` and
+`configured_item_end` with this top-level comma terminator. Inspection of that
+commit establishes the first bad implementation; it predates this documentation
+repair.
 
 This finding is distinct from `PR157-CENSUS-01`. It is deferred under the owner's
 documentation policy; PR #161 does not change the scanner or executable tests.
