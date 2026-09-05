@@ -1,5 +1,23 @@
 //! The application half of INV-02: what a checked transition does to the
 //! state, and nothing that decides whether it may.
+//!
+//! **A pure function of `(state, event, derived)`.** Nothing here reads a
+//! clock, the environment, or randomness, and nothing performs I/O; the only
+//! values it computes rather than copies are `epoch + 1` on a resume and the
+//! `next_sequence` increments, each a function of prior durable state alone. So
+//! a live fold and a replay of the bytes it appended reach the same
+//! [`RunState`], which is the equality INV-02 turns into a property of the type
+//! ([`super::TopologyFold`]'s `PartialEq`). The one value a transition needs
+//! that is not in its own body — a question's origin, gone from `questions` the
+//! instant [`RunState::apply_answer`] removes it — rides on [`super::Derived`],
+//! decided by the check and therefore identical on replay.
+//!
+//! **The state owns snapshots of what the log records.** Every `.clone()` in
+//! this module copies a value out of the borrowed event body into durable fold
+//! state: a `TaskEntry` into the registry, a region into the lease table, a
+//! session, base or candidate identity into a generation or queue entry. That
+//! is the owned-snapshot semantics §6 blesses, never a borrow-checker
+//! workaround — the fold outlives every event it folded.
 
 use super::*;
 
@@ -386,16 +404,28 @@ impl RunState {
             return;
         };
         let candidate = transaction.candidate;
-        if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
-            entry.sequence = None;
-            if let UnavailableOutcome::Deferred { defers } = &unavailable.outcome {
-                entry.verification_deferred = true;
-                entry.defers = *defers;
+        // Exhaustive over the outcome, so a new `UnavailableOutcome` variant is
+        // a compile error here rather than a silent no-op: two separate
+        // `if let`s over a closed two-variant enum is a wildcard by another
+        // spelling, which §5 forbids over a domain a new variant should force a
+        // decision at. Behaviour is unchanged — both outcomes drop the open
+        // sequence from the queue entry, only a defer sets the backoff, and only
+        // a park raises a question and moves the task to awaiting input.
+        match &unavailable.outcome {
+            UnavailableOutcome::Deferred { defers } => {
+                if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
+                    entry.sequence = None;
+                    entry.verification_deferred = true;
+                    entry.defers = *defers;
+                }
             }
-        }
-        if let UnavailableOutcome::Parked { question } = &unavailable.outcome {
-            self.open_question(question, QuestionOrigin::VerificationPark, None);
-            self.set_state(candidate.key, TaskState::AwaitingInput);
+            UnavailableOutcome::Parked { question } => {
+                if let Some(entry) = self.queue.get_mut(candidate.key, candidate.generation) {
+                    entry.sequence = None;
+                }
+                self.open_question(question, QuestionOrigin::VerificationPark, None);
+                self.set_state(candidate.key, TaskState::AwaitingInput);
+            }
         }
     }
 

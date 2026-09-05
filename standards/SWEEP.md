@@ -131,6 +131,23 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
+**Row 29 (`src/topology/fold/apply.rs`) has had a pass and is not swept.** The pass landed a §5
+fix — `apply_verification_unavailable` dispatched a closed two-variant `UnavailableOutcome` through
+two separate `if let`s, so a third variant would compile to a silent no-op; it is now an exhaustive
+`match` — and stated the file's replay purity and ownership model, both re-derived by reading. `apply`
+was found sound: a pure function of `(state, event, derived)` with no clock, environment, randomness
+or I/O; its transitions total over the closed event vocabulary; every lookup a no-op on a miss. The
+row stays open for the reason #146 (`effects/bijection.rs`), #139 and #143 (`rundir`) stay open: the
+contracts this file states the effect of — INV-02, ST-06, `transaction_fault_matrix[T-ATTEMPT]`, the
+`refusals` inventory, the retired `decisions/2026-08-12-merge-queue-execution-topology.md` record —
+occur nowhere in `DESIGN.md` or `design/`, the family's normative source being a packet in the
+private lab repository. Listing the file would assert a conformance whose contract half is
+unanchored, and `#108`'s design authority is with the owner as one decision beside those three. The
+row is `SWEEP-FOLD-APPLY-DESIGN-AUTHORITY`. A liveness defect found during the pass — a fold-legal
+`question_raised` then `Declined` sequence that leaves a task `Failed` with an open generation and
+wedges the run so it can never end — is a behaviour change to the check layer
+(`src/topology/fold/check_end.rs`, row 32) and was routed to its own stream, not carried here.
+
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and
 "Merged" is when that split landed; neither says which pull request first created the file at
