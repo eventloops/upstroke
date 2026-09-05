@@ -1,31 +1,7 @@
-//! Lane B's suite: container `RunnerPolicy` resolution, the rebuild-from-record
-//! path, and the schema-1..3 container refusal.
-//!
-//! Kept out of `resolve.rs` so `effects::production_region` — which cuts a
-//! source at its **first** `#[cfg(test)]` — sees that module whole
-//! (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+//! Extended notes: `docs/internals/runner/container/resolve/tests.md`
 
-// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
-// attachment to `src/runner/container.rs` -- the same shape
-// `src/runner/container/tests.rs` and `src/runner/container/census/tests.rs`
-// have.
-//
-// `PR6-LANEF-004`: this file states its level **of its own** rather than
-// inheriting the Container funnel's inner `#![allow(...)]` through the module
-// tree. `resolve.rs`, the production half, carries `#![deny(...)]` for all
-// three and reaches no denied primitive at all.
-//
-// WHAT IT NEEDS THE ALLOW FOR, and the residual is stated rather than implied:
-// it builds real temporary Git repositories (`std::process::Command` running
-// `git`, `fs::write`, `fs::create_dir_all`, `fs::remove_dir_all`) and wraps a
-// `ContainerRuntime` whose four effectful methods it delegates. It is the one
-// child of this directory that allows `clippy::disallowed_types` as well as
-// `clippy::disallowed_methods`, so a `std::process::Command` here is NOT a
-// build error the way it is in the two sibling test modules -- a real
-// difference, recorded here and in `effects/allowlist.toml` instead of being
-// left to a reviewer to discover. `src/events/log/tests.rs` and
-// `src/engine/tests.rs` are the precedent for a test module needing both.
-// `clippy::disallowed_macros` is re-denied, so a `println!` is still an error.
+// Allowlist placement: the funnel section of `effects/allowlist.toml`, which
+// carries this module's review clause. `effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![deny(clippy::disallowed_macros)]
 
@@ -47,10 +23,6 @@ use crate::runner::container::FakeRuntime;
 use crate::runner::container::runtime::{ContainerTrace, Liveness};
 use crate::runner::policy::{canonical_bytes, runner_policy_sha256};
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 const REFERENCE: &str = "upstroke/ci:3.2";
 const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const OTHER_ID: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -58,11 +30,6 @@ const MANIFEST: &str = "sha256:3333333333333333333333333333333333333333333333333
 const CLAUDE_VOLUME: &str = "upstroke-creds-claude-code";
 const CODEX_VOLUME: &str = "upstroke-creds-codex";
 
-/// The two credential volumes, as an independent table.
-///
-/// Written out rather than read back from a `RunnerSelection`, so a test that
-/// compares a record against this is comparing it against a value nothing under
-/// test produced.
 fn volumes() -> BTreeMap<String, String> {
     let mut volumes = BTreeMap::new();
     volumes.insert("claude-code".to_owned(), CLAUDE_VOLUME.to_owned());
@@ -70,7 +37,6 @@ fn volumes() -> BTreeMap<String, String> {
     volumes
 }
 
-/// The `[runner]` selection every fixture starts from.
 fn selection() -> RunnerSelection {
     RunnerSelection {
         kind: RunnerKind::Container,
@@ -81,9 +47,6 @@ fn selection() -> RunnerSelection {
     }
 }
 
-/// A runtime holding the image at [`IMAGE_ID`] under [`REFERENCE`], with both
-/// credential volumes present. Every refusal fixture below is this, minus one
-/// thing.
 fn ready_runtime() -> (FakeRuntime, ContainerTrace) {
     let trace = ContainerTrace::recording();
     let runtime = FakeRuntime::new(trace.clone());
@@ -94,8 +57,6 @@ fn ready_runtime() -> (FakeRuntime, ContainerTrace) {
     (runtime, trace)
 }
 
-/// The record a first incarnation would have written, built by hand from
-/// INV-23's field list rather than by calling `resolve_container`.
 fn recorded() -> RunnerPolicy {
     RunnerPolicy {
         kind: RunnerKind::Container,
@@ -109,13 +70,6 @@ fn recorded() -> RunnerPolicy {
     }
 }
 
-/// A [`RunnerPreflight`] that records what it was asked and can be armed to
-/// refuse.
-///
-/// It also snapshots the runtime trace **at the moment it is called**, which is
-/// what makes "before any spawn" a statement about a sequence rather than about
-/// a boolean: the snapshot is the prefix of runtime operations that had already
-/// happened when the first spawn was about to occur.
 struct RecordingPreflight {
     trace: ContainerTrace,
     calls: Mutex<Vec<(RunnerPolicy, Vec<String>)>>,
@@ -163,24 +117,12 @@ impl RunnerPreflight for RecordingPreflight {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. Resolution by read-only inspection
-// ---------------------------------------------------------------------------
-
-/// The five obligations `pr_sequence[7].scope` packs into one sentence, each
-/// read off the resolved record and compared against an independent value.
-///
-/// Second field held constant: the runtime's whole state — one image, one tag,
-/// both volumes — is identical for every assertion. What varies is which field
-/// of the record is being asked about.
 #[test]
 fn the_resolved_container_policy_is_the_record_inv23_describes() {
     let (runtime, _trace) = ready_runtime();
     let policy = resolve_container(&runtime, &selection()).expect("a ready runtime resolves");
 
     assert_eq!(policy.kind, RunnerKind::Container);
-    // "policy container-v1" — the mount, environment, Git-view and supervision
-    // contract this binary implements for that kind.
     assert_eq!(policy.policy, RunnerContract::ContainerV1);
     let image = policy.image.as_ref().expect("a container records an image");
     assert_eq!(
@@ -201,27 +143,14 @@ fn the_resolved_container_policy_is_the_record_inv23_describes() {
         Some(&volumes()),
         "the per-agent credential volume names, verbatim"
     );
-    // A run must not start with a record its own resume would reject.
     policy
         .completeness()
         .expect("PR3 accepts the record PR6 resolves");
 }
 
-/// The recorded reference is the one an operator wrote, never one the runtime
-/// volunteered.
-///
-/// `ImageInspection` carries **every** reference the runtime says resolves to
-/// the id. A resolver that took the record's `reference` from there would make
-/// the record its own oracle and "the recorded reference now names another
-/// image" unconstructible — `runtime.rs` says so in as many words, and this is
-/// the assertion behind it.
-///
-/// Second field held constant: the id and digest, which are the runtime's in
-/// both cells.
 #[test]
 fn the_recorded_reference_is_the_operators_and_never_the_runtimes() {
     let (runtime, _trace) = ready_runtime();
-    // The same image, additionally tagged twice under names nobody configured.
     runtime.tag("mirror.example/upstroke:latest", IMAGE_ID);
     runtime.tag("aaa-sorts-first/upstroke:1", IMAGE_ID);
 
@@ -249,16 +178,6 @@ fn the_recorded_reference_is_the_operators_and_never_the_runtimes() {
     );
 }
 
-/// Resolution issues read-only operations only, in the order the scope names.
-///
-/// "Before any lock or effect" has two halves and this is the effect half:
-/// every operation the resolution performs is one [`RuntimeOp::is_effect`]
-/// calls false. Asserted as the **sequence**, not as a set, because
-/// `probe → reference → volumes` is what "the runtime must already hold the
-/// image and the volumes must exist" means in order.
-///
-/// Second field held constant: the runtime is ready in every cell, so the trace
-/// is the full happy-path sequence rather than a truncated one.
 #[test]
 fn resolution_issues_only_read_only_operations_in_the_scopes_order() {
     let (runtime, trace) = ready_runtime();
@@ -269,7 +188,6 @@ fn resolution_issues_only_read_only_operations_in_the_scopes_order() {
         vec![
             RuntimeOp::Probe,
             RuntimeOp::InspectImageByReference,
-            // One per credential volume, in the map's sorted order.
             RuntimeOp::InspectVolume,
             RuntimeOp::InspectVolume,
         ],
@@ -281,7 +199,6 @@ fn resolution_issues_only_read_only_operations_in_the_scopes_order() {
         "resolution reached an effectful operation: {:?}",
         trace.rendered()
     );
-    // The volumes are asked about by name, and both of them are.
     let asked: Vec<String> = trace
         .rendered()
         .into_iter()
@@ -296,16 +213,6 @@ fn resolution_issues_only_read_only_operations_in_the_scopes_order() {
     );
 }
 
-/// A digest the runtime does not report, and one it reports as an empty string,
-/// both resolve to `None` — and the *record* still separates them.
-///
-/// Two halves, because collapsing them at the inspection seam is only safe if
-/// the encoding underneath has not collapsed them too. INV-23 compares four
-/// copies of this record exactly; a canonicalisation in which `None` and
-/// `Some("")` agree would let a marker attest a record the fold calls different.
-///
-/// Second field held constant: the image id and the reference, identical in all
-/// three cells, so what varies is only what the runtime said about the manifest.
 #[test]
 fn a_runtime_reporting_no_digest_and_one_reporting_an_empty_string_both_resolve_to_none() {
     for (label, reported) in [("absent", None), ("empty string", Some(""))] {
@@ -328,8 +235,6 @@ fn a_runtime_reporting_no_digest_and_one_reporting_an_empty_string_both_resolve_
             .expect("a container without a digest is a complete record");
     }
 
-    // And the encoding underneath has not collapsed them, so a record that
-    // acquired an empty digest by some other route is still a different record.
     let mut absent = recorded();
     let mut empty = recorded();
     absent.image.as_mut().expect("image").digest = None;
@@ -347,18 +252,6 @@ fn a_runtime_reporting_no_digest_and_one_reporting_an_empty_string_both_resolve_
     );
 }
 
-/// The three resolution refusals, each with a control that differs in exactly
-/// one thing, and each proved to have reached no lock and no effect.
-///
-/// The grid is **{fault} × {phase = resolve}** with the selection held constant;
-/// `the_rebuild_refuses_each_of_its_faults_before_any_spawn` is the same faults
-/// at the other phase, and
-/// `resolution_and_rebuild_ask_different_questions_of_the_runtime` is the cross.
-///
-/// Each cell asserts the **typed** refusal rather than `is_err()`: a test that
-/// only proves an error came back is green when the fixture is misspelt, which
-/// is the failure this grid is built against. The `none` cell is the control
-/// that says the fixture would otherwise resolve.
 #[test]
 fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,8 +264,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
         VolumeAbsent,
     }
 
-    // Written out so a fault that stops being driven is a compile-time hole
-    // rather than a silently shorter grid.
     const FAULTS: &[Fault] = &[
         Fault::None,
         Fault::RuntimeUnreachable,
@@ -389,8 +280,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
             Fault::None => {}
             Fault::RuntimeUnreachable => runtime.set_unreachable(RuntimeOp::Probe),
             Fault::RuntimeFails => runtime.set_failing(RuntimeOp::InspectImageByReference),
-            // The image is still in the table; only the tag is gone, so this
-            // cell is about the *reference* and nothing else.
             Fault::ReferenceAbsent => runtime.tag(REFERENCE, "sha256:not-a-real-id"),
             Fault::ImageUnidentified => {
                 runtime.add_image("", None);
@@ -401,7 +290,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
 
         let outcome = resolve_container(&runtime, &selection());
 
-        // No effect, ever, on any path.
         assert!(
             trace.ops().iter().all(|op| !op.is_effect()),
             "{fault:?}: resolution reached an effectful operation: {:?}",
@@ -422,7 +310,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
                     }
                 );
                 assert!(refusal.is_runtime_unavailable());
-                // Nothing was asked after the runtime failed to answer.
                 assert_eq!(trace.ops(), vec![RuntimeOp::Probe]);
                 refusals.insert("runtime unreachable");
             }
@@ -450,8 +337,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
                     refusal.to_string().contains("nothing is pulled implicitly"),
                     "the refusal does not say why it is not a fetch: {refusal}"
                 );
-                // The volumes were never asked about: the refusal is the end of
-                // the command, not a step in it.
                 assert!(!trace.ops().contains(&RuntimeOp::InspectVolume));
                 refusals.insert("reference absent");
             }
@@ -473,8 +358,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
                     },
                     "the refusal must name the agent, not just the volume"
                 );
-                // The *other* volume was asked about and answered yes, so this
-                // cell is about one absent volume and not about volumes at all.
                 assert_eq!(
                     trace
                         .rendered()
@@ -495,20 +378,6 @@ fn resolution_refuses_each_of_its_faults_before_any_lock_or_effect() {
     );
 }
 
-/// "Before any lock or effect", as one ordered sequence.
-///
-/// The effect half is asserted above. This is the **lock** half, and it needs a
-/// caller: `resolve_container` cannot take a lock — it is handed a runtime and
-/// values and has no path, no run directory and no runner — but that is an
-/// argument from a signature, and INV-23's clause is about an order.
-///
-/// So the documented pre-lock sequence is driven against one log that both the
-/// runtime and the driver write into: resolution's operations and the caller's
-/// worktree lock, public directory, marker and first probe, interleaved in the
-/// order they actually happened. A refusal must leave the last four absent.
-///
-/// Second field held constant: the driver is identical in both cells: only the
-/// runtime's readiness varies.
 #[test]
 fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_refuses() {
     for (label, ready) in [("ready", true), ("no image", false)] {
@@ -522,9 +391,6 @@ fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_
             log: log.clone(),
         };
 
-        // INV-23's pre-lock order, as a caller performs it: "resolved once by
-        // read-only inspection before the worktree lock (before the public
-        // directory, the marker, and any probe)".
         let resolved = resolve_container(&runtime, &selection());
         if resolved.is_ok() {
             log.push("lock:worktree");
@@ -559,7 +425,6 @@ fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_
                 ],
                 "{label}: {entries:?}"
             );
-            // And every one of them is after every inspection.
             let first_after = entries
                 .iter()
                 .position(|entry| !entry.starts_with("rt:"))
@@ -577,16 +442,6 @@ fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_
     }
 }
 
-/// Resolution and rebuild ask **different** questions, and the four cells of
-/// {reference present} × {recorded id present} prove it.
-///
-/// `expected_failures_refusals[1]`'s two sets of three are not the same three:
-/// resolution looks up the **reference**, the rebuild looks up the **recorded
-/// id**. A seam with one image question would make the two indistinguishable,
-/// and a suite that never crossed them would not notice.
-///
-/// Second field held constant: the credential volumes, present in every cell,
-/// so no cell can pass or fail for the volume reason.
 #[test]
 fn resolution_and_rebuild_ask_different_questions_of_the_runtime() {
     for reference_present in [true, false] {
@@ -599,9 +454,6 @@ fn resolution_and_rebuild_ask_different_questions_of_the_runtime() {
                 runtime.add_image(IMAGE_ID, Some(MANIFEST));
             }
             if reference_present {
-                // A reference that resolves — to *another* image when the
-                // recorded id is gone, which is the only way to have one
-                // without the other.
                 let target = if id_present { IMAGE_ID } else { OTHER_ID };
                 runtime.add_image(target, Some(MANIFEST));
                 runtime.tag(REFERENCE, target);
@@ -642,17 +494,6 @@ fn resolution_and_rebuild_ask_different_questions_of_the_runtime() {
     }
 }
 
-/// Two runtimes holding the same reference at different ids resolve to two
-/// execution identities.
-///
-/// The digest is what the marker, the owner record and every container intent
-/// carry, so "the runtime's immutable image id" being in the record is only
-/// worth something if moving it moves the digest. Pinned against
-/// `canonical_bytes` written by hand in `crate::runner::policy`, not round-
-/// tripped here.
-///
-/// Second field held constant: the reference and the volume set, identical in
-/// both cells.
 #[test]
 fn the_resolved_records_digest_moves_with_the_id_the_runtime_reported() {
     let mut digests = BTreeSet::new();
@@ -676,20 +517,6 @@ fn the_resolved_records_digest_moves_with_the_id_the_runtime_reported() {
     );
 }
 
-/// R20 is operator-owned, and the seam makes that structural rather than
-/// merely observed.
-///
-/// The row says `persistent_output` in all five `at_run_end` outcomes and
-/// "never created or pruned by a run" — and a run that tidied a volume it
-/// mounted would destroy operator credentials, which CLIs rotate on use, so a
-/// discarded rotation forces re-login. `ContainerRuntime` has exactly **one**
-/// volume operation, it is read-only, and there is therefore no create or prune
-/// for this module to reach: the enumeration is derived from `RuntimeOp::ALL`
-/// rather than from a list somebody remembered to write.
-///
-/// The runtime half of the same claim is lane C's
-/// `r20_is_persistent_output_in_every_at_run_end_outcome_and_no_census_path_touches_it`;
-/// this is the resolution half.
 #[test]
 fn the_only_volume_operation_the_seam_has_is_a_read_only_presence_question() {
     let volume_ops: Vec<RuntimeOp> = RuntimeOp::ALL
@@ -704,7 +531,6 @@ fn the_only_volume_operation_the_seam_has_is_a_read_only_presence_question() {
     );
     assert!(!RuntimeOp::InspectVolume.is_effect());
 
-    // And this module reaches nothing else: resolution and rebuild both.
     let (runtime, trace) = ready_runtime();
     resolve_container(&runtime, &selection()).expect("resolves");
     let mut warnings = Vec::new();
@@ -719,24 +545,10 @@ fn the_only_volume_operation_the_seam_has_is_a_read_only_presence_question() {
         "two volumes, twice"
     );
     assert!(trace.ops().iter().all(|op| !op.is_effect()));
-    // The volume is still there afterwards, which is the thing the row is
-    // actually about.
     assert!(runtime.volume_present(CLAUDE_VOLUME).expect("inspects"));
     assert!(runtime.volume_present(CODEX_VOLUME).expect("inspects"));
 }
 
-/// A `[runner] mounts` entry changes the boundary and **does not** move the
-/// recorded execution identity.
-///
-/// Stated as an assertion rather than left implicit, because it is a real gap
-/// and a reviewer should find it named rather than derive it. INV-23's
-/// `RunnerPolicy` has four fields — kind, policy, image, credential volumes —
-/// and none of them is a mount list, so two runs whose `[runner]` sections
-/// differ only in `mounts` record the same runner and carry the same
-/// `runner_policy_sha256`. Filed as `PR6B-MOUNTS-ARE-NOT-EXECUTION-IDENTITY`.
-///
-/// Second field held constant: everything but `mounts`, so the equality below
-/// is about that field alone.
 #[test]
 fn a_configured_mount_does_not_reach_the_recorded_execution_identity() {
     let bare = selection();
@@ -762,8 +574,6 @@ fn a_configured_mount_does_not_reach_the_recorded_execution_identity() {
         runner_policy_sha256(&with),
         "the digest the marker and every container intent carry does not separate them"
     );
-    // And a rebuild therefore cannot warn about a mount that changed: the
-    // comparison has no field for it.
     let mut warnings = Vec::new();
     rebuild_by_inspection(&runtime, &recorded(), &mounted, &mut warnings).expect("rebuilds");
     assert!(
@@ -772,7 +582,6 @@ fn a_configured_mount_does_not_reach_the_recorded_execution_identity() {
     );
 }
 
-/// A selection this module is not for.
 #[test]
 fn resolution_refuses_a_selection_that_does_not_ask_for_a_container() {
     let (runtime, trace) = ready_runtime();
@@ -797,20 +606,6 @@ fn resolution_refuses_a_selection_that_does_not_ask_for_a_container() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2. The rebuild-from-record path
-// ---------------------------------------------------------------------------
-
-/// However today's config differs, the rebuilt runner is the recorded one,
-/// field for field.
-///
-/// "warns naming the difference and **is ignored**" — the second half is the
-/// one a plausible implementation drops, by merging the config in "where it does
-/// not conflict". `run_resumed(4).runner` must equal `run_started(4).runner`
-/// exactly, so anything today's config reaches is a `FoldError` later.
-///
-/// Second field held constant: the runtime, ready in every cell, so no cell can
-/// succeed or fail for an inspection reason.
 #[test]
 fn the_rebuild_returns_the_recorded_runner_exactly_however_the_config_differs() {
     let mut moved_reference = selection();
@@ -846,17 +641,6 @@ fn the_rebuild_returns_the_recorded_runner_exactly_however_the_config_differs() 
     }
 }
 
-/// A config that differs warns **naming the field that moved**, and the fields
-/// it can name are ST-20's three.
-///
-/// "warns naming the difference" is a real assertion and "config differs" fails
-/// it: PR3 built `RunnerPolicy::difference()` to name *which* field moved
-/// precisely so a warning could. The grid drives one config edit per field and
-/// asserts the named field, and then asserts the **set** of reachable fields —
-/// so a comparison that started reporting `image id` (which no operator can
-/// edit and no operator can fix) fails here.
-///
-/// Second field held constant: the record, identical in every cell.
 #[test]
 fn a_config_that_differs_warns_naming_the_field_that_moved() {
     let mut host_now = RunnerSelection::host_default();
@@ -871,17 +655,9 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
     extra_volume
         .credential_volumes
         .insert("copilot".to_owned(), "creds-copilot".to_owned());
-    // **Two fields at once.** Every other cell moves exactly one, and an
-    // implementation that answered `None` whenever more than one had moved
-    // would pass all of them while a two-field edit warned about nothing
-    // (`PR6-CORRECTNESS-015`). `RunnerPolicy::difference` reports the first
-    // field in its own order, which for these two is the reference.
     let mut reference_and_volumes = selection();
     reference_and_volumes.image = Some("someone/else:9".to_owned());
     reference_and_volumes.credential_volumes.remove("codex");
-    // The control: each half of that edit is independently a difference, so the
-    // cell below is genuinely the *intersection* and not one edit with a
-    // no-op beside it.
     let mut only_reference = selection();
     only_reference.image = Some("someone/else:9".to_owned());
     let mut only_volumes = selection();
@@ -953,8 +729,6 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
         }
     }
 
-    // ST-20: "a `[runner]` config that differs (kind, image reference, or
-    // credential volumes)". Three, and only three, are reachable.
     assert_eq!(
         named,
         [
@@ -980,26 +754,6 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
     }
 }
 
-/// An absent `[runner]` section is a **selection**, and whether it differs
-/// depends on what the run recorded.
-///
-/// The intersection **{section present or absent} × {recorded kind}**, which is
-/// the cell `PR6-CORRECTNESS-015` found missing. This test previously asserted
-/// only the first axis — "absent never warns" — against a **container** record,
-/// and so pinned the defect: a run that recorded a container runner and whose
-/// `[runner]` section was subsequently **deleted** is running under an
-/// effective selection of host/default, which is as real an edit as changing
-/// `kind` in place, and it warned about nothing.
-///
-/// The claim the original test was protecting is still here and is still true,
-/// and it is the **host-record** row: a repository that never configured a
-/// runner is not told its runner kind moved. It holds because
-/// `RunnerSelection::host_default()` renders to exactly what a host run
-/// records, not because a flag suppresses the comparison — which is the
-/// difference between a guarantee and a silence.
-///
-/// Second field held constant: the runtime, ready in every cell, so no cell can
-/// warn or not warn for an inspection reason.
 #[test]
 fn an_absent_runner_section_warns_only_when_the_record_is_not_the_default() {
     let mut present_host = RunnerSelection::host_default();
@@ -1021,8 +775,6 @@ fn an_absent_runner_section_warns_only_when_the_record_is_not_the_default() {
         credential_volumes: None,
     };
 
-    // {section} x {record}: four cells, and only the three that are a real
-    // difference warn.
     let cells: Vec<(&str, RunnerPolicy, RunnerSelection, Option<RunnerField>)> = vec![
         (
             "absent section, host record",
@@ -1078,14 +830,6 @@ fn an_absent_runner_section_warns_only_when_the_record_is_not_the_default() {
     }
 }
 
-/// A reference that now names another image warns and the recorded id is used;
-/// a reference that no longer resolves at all warns too, and neither refuses.
-///
-/// `expected_failures_refusals[1]` names the **id** and not the reference, and
-/// INV-23 says "so a moved reference cannot change what executes". The grid is
-/// {reference resolves to the recorded id, to another id, to nothing} with the
-/// recorded id present in all three — that is the second field, held constant,
-/// and it is what makes every cell a rebuild that succeeds.
 #[test]
 fn a_moved_or_vanished_reference_warns_and_the_rebuild_keeps_the_recorded_id() {
     for (label, retag, expect) in [
@@ -1097,8 +841,6 @@ fn a_moved_or_vanished_reference_warns_and_the_rebuild_keeps_the_recorded_id() {
         runtime.add_image(OTHER_ID, Some(MANIFEST));
         match retag {
             Some(target) => runtime.move_tag(REFERENCE, target),
-            // Point the tag at an id the table does not hold, which is how a
-            // reference stops resolving while the recorded id stays present.
             None => runtime.move_tag(REFERENCE, "sha256:nothing-here"),
         }
 
@@ -1128,28 +870,8 @@ fn a_moved_or_vanished_reference_warns_and_the_rebuild_keeps_the_recorded_id() {
     }
 }
 
-/// The three rebuild refusals, each **before any spawn**, each with a control.
-///
-/// Two independent witnesses of the same ordering predicate, because one of them
-/// could be a lie: [`RebuildRefusal::before_any_spawn`] is what the code says,
-/// and the preflight's own call count is what actually happened. A refusal that
-/// classified itself correctly while having already spawned fails the second.
-///
-/// The grid is **{fault} × {phase = rebuild}**, the record held constant across
-/// every cell.
-///
-/// **Today's config differs in every cell, deliberately.** A refused rebuild
-/// must emit no warnings — the refusals come first and a warning about a config
-/// difference describes a run that is about to continue — and with an identical
-/// config there is nothing for the warning block to say, so the assertion holds
-/// vacuously and a mutation that hoisted the warnings above the refusals
-/// survives. Measured: it did (M15). The control at the end of the test proves
-/// the same `today` *does* warn when the rebuild succeeds, so the emptiness
-/// above is about the ordering rather than about the fixture.
 #[test]
 fn the_rebuild_refuses_each_of_its_faults_before_any_spawn() {
-    // Differs from the record in its image reference, so `configured_difference`
-    // has something to name in every cell.
     let today = RunnerSelection {
         image: Some("someone/else:9".to_owned()),
         ..selection()
@@ -1179,8 +901,6 @@ fn the_rebuild_refuses_each_of_its_faults_before_any_spawn() {
         match fault {
             Fault::None => {}
             Fault::RuntimeUnavailable => runtime.set_all_unreachable(),
-            // The reference still resolves; only the recorded id is gone, so
-            // this cell is about the id.
             Fault::RecordedIdAbsent => {
                 runtime.add_image(OTHER_ID, Some(MANIFEST));
                 runtime.move_tag(REFERENCE, OTHER_ID);
@@ -1190,8 +910,6 @@ fn the_rebuild_refuses_each_of_its_faults_before_any_spawn() {
                 replacement.tag(REFERENCE, OTHER_ID);
                 replacement.add_volume(CLAUDE_VOLUME);
                 replacement.add_volume(CODEX_VOLUME);
-                // Drive the replacement rather than the ready fixture: it holds
-                // the reference and not the recorded id.
                 let preflight = RecordingPreflight::accepting(ContainerTrace::off());
                 let mut warnings = Vec::new();
                 let outcome = rebuild_from_record(
@@ -1226,8 +944,6 @@ fn the_rebuild_refuses_each_of_its_faults_before_any_spawn() {
             (Fault::None, Ok(rebuilt)) => {
                 assert_eq!(rebuilt, recorded());
                 assert_eq!(preflight.spawns(), 1, "the control never spawned");
-                // The control for every `warnings.is_empty()` below: this same
-                // `today` warns when the rebuild gets that far.
                 assert!(
                     warnings.iter().any(
                         |warning| warning.contains("differs from the runner this run recorded")
@@ -1283,17 +999,6 @@ fn the_rebuild_refuses_each_of_its_faults_before_any_spawn() {
     assert_eq!(refusals.len(), 3, "three distinct refusals: {refusals:?}");
 }
 
-/// The fourth behaviour: a shell or CLI that fails inside the recorded image is
-/// observed **only** by a spawn, and refuses on the other side of the split.
-///
-/// The two arms of [`RebuildRefusal`] are the contract's own refusal split, and
-/// this is the arm that is not `before_any_spawn`. The preflight's snapshot of
-/// the trace at call time is the ordering evidence: every inspection had already
-/// happened when the first spawn was about to.
-///
-/// Second field held constant: the runtime, which is ready in both cells — so
-/// what varies is only what the *process* did, exactly as
-/// `non_goals[2]` ("non-spawn shell/CLI presence inspection") requires.
 #[test]
 fn a_failing_preflight_probe_refuses_after_every_inspection_and_only_a_spawn_observes_it() {
     for (label, message) in [
@@ -1325,7 +1030,6 @@ fn a_failing_preflight_probe_refuses_after_every_inspection_and_only_a_spawn_obs
         assert!(matches!(refusal, RebuildRefusal::Preflight(_)));
         assert!(refusal.to_string().contains(message), "{refusal}");
 
-        // The observation is a spawn, and it came after every inspection.
         let calls = preflight.calls();
         assert_eq!(calls.len(), 1, "`{label}`: the probe did not run");
         let (certified, prefix) = &calls[0];
@@ -1351,12 +1055,10 @@ fn a_failing_preflight_probe_refuses_after_every_inspection_and_only_a_spawn_obs
                 && ops[4].starts_with("rt:inspect-image-by-reference:"),
             "`{label}`: the inspection prefix is not the rebuild's: {ops:?}"
         );
-        // Nothing was created, started, stopped or removed on the way.
         assert!(trace.ops().iter().all(|op| !op.is_effect()));
     }
 }
 
-/// A record the fold would refuse never reaches an inspection.
 #[test]
 fn the_rebuild_refuses_an_incomplete_record_before_asking_the_runtime_anything() {
     let mut without_volumes = recorded();
@@ -1383,41 +1085,6 @@ fn the_rebuild_refuses_an_incomplete_record_before_asking_the_runtime_anything()
     );
 }
 
-// ---------------------------------------------------------------------------
-// 3. `[runner]` config and the schema-1..3 refusal
-// ---------------------------------------------------------------------------
-
-/// **T-CONTAINER (13).** `[runner] kind = "container"` under a schema-1..3
-/// fresh run **or** resume is a config error before any effect.
-///
-/// Both write commands, because `expected_failures_refusals[0]` names both and a
-/// suite that covers one covers half. The grid is
-/// **{command = run, resume} × {`[runner]` = host, container}**, in two phases
-/// with two different witnesses, because "before any effect" is an ordering and
-/// an ordering needs something on the far side of it to be visible.
-///
-/// **Phase A — a competing worktree lease is held for the whole grid.**
-/// `WorktreeLock::acquire_in` is the first effect either command performs
-/// (`coordinator.rs`: "every read-only refusal precedes every lock";
-/// `resume.rs` marks the line after `validate_inputs` "the first effect of the
-/// command"). So with the lease held by this test:
-///
-/// * `kind = "host"` fails with the **lease** refusal — it reached the lock;
-/// * `kind = "container"` fails with the **config** error — it did not.
-///
-/// One fixture, one held lease, two configs, two *different* failures. A
-/// refusal moved after the lock fails this by turning the container cell into a
-/// lease refusal, and a test that only asserted "an error came back" would not
-/// notice.
-///
-/// **Phase B — the lease is released, and the tree is inspected.** No run
-/// directory under either half of the §15 split, no `run.lock`, no branch, no
-/// container intent namespace, and — for the fresh run — no adapter ever
-/// resolved, so no pre-flight probe could have been spawned. The `host` control
-/// of phase B is what proves the run command reaches pre-flight at all.
-///
-/// The whole-tree half of ST-16 (i)'s second clause is
-/// [`no_module_outside_the_container_runner_writes_a_container_intent`].
 #[test]
 fn legacy_container_selection_refused_before_effects() {
     const CONTAINER_TOML: &str = "container";
@@ -1438,9 +1105,6 @@ fn legacy_container_selection_refused_before_effects() {
         fs::write(repo.join("upstroke.toml"), &config).expect("config");
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "config"]);
-        // One seeded run per legacy schema: `EngineLimits::for_resume` reads the
-        // header's schema, so a suite driving only one of the three has driven
-        // only one reading.
         let seeded: Vec<(u32, String)> = [1_u32, 2, 3]
             .into_iter()
             .map(|schema| {
@@ -1467,7 +1131,6 @@ fn legacy_container_selection_refused_before_effects() {
             opts
         };
 
-        // -- phase A: the lease is the far side of the ordering ---------------
         {
             let _lease = crate::rundir::WorktreeLock::acquire(&repo).expect("the test's lease");
             let adapters = RecordingAdapters::default();
@@ -1510,7 +1173,6 @@ fn legacy_container_selection_refused_before_effects() {
             }
         }
 
-        // -- phase B: nothing was created ------------------------------------
         let adapters = RecordingAdapters::default();
         let run = crate::engine::run_with(&run_opts(), &adapters);
         assert!(run.is_err(), "the fixture has no agents");
@@ -1579,12 +1241,6 @@ fn legacy_container_selection_refused_before_effects() {
     }
 }
 
-/// Every reading of `[engine]`'s limits refuses a container selection.
-///
-/// `EngineLimits` is what distinguishes "a run being created now" from "a
-/// sequential run's resume", and `expected_failures_refusals[0]` names both. The
-/// grid is written out with an exhaustive `match` beside it, so a third variant
-/// is a compile error here rather than a reading that quietly escapes.
 #[test]
 fn every_engine_limits_reading_refuses_a_container_selection() {
     let all = [
@@ -1594,7 +1250,6 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
     ];
     for limits in all {
         match limits {
-            // Exhaustive on purpose: a new variant must be classified here.
             EngineLimits::Fresh
             | EngineLimits::SequentialResume
             | EngineLimits::SequentialResumeWithRecordedGates => {}
@@ -1625,8 +1280,6 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
         );
         refused += 1;
 
-        // The control, byte-identical apart from the kind: the same reading
-        // accepts a host selection, so the refusal is about the value.
         fs::write(dir.join("upstroke.toml"), "[runner]\nkind = \"host\"\n").expect("config");
         let config = crate::config::load_limits(
             Some(&dir.join("upstroke.toml")),
@@ -1642,26 +1295,8 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
     assert_eq!(refused, all.len(), "every reading was driven");
 }
 
-/// ST-16 (i)'s second clause: **no legacy process ever writes a container
-/// intent** — a claim about the whole tree, not about the parser.
-///
-/// A census rather than a behavioural test, because the clause is a universal:
-/// it is not satisfied by showing that one legacy path does not write one. The
-/// set of files whose production region names the intent record or the funnel
-/// that writes it is written out here; a legacy module that acquired one fails
-/// this by name.
-///
-/// The control at the bottom is what stops this from becoming
-/// `PR6F-DOCKER-CENSUS-CANNOT-FAIL`: the census must still be finding the files
-/// it is supposed to find, or "no offenders" means "the needle is unfindable".
 #[test]
 fn no_module_outside_the_container_runner_writes_a_container_intent() {
-    /// Everything that could put a record in `<R>/containers`.
-    ///
-    /// Container-specific by construction: `write_intent` alone would also match
-    /// `crate::workspace_manager`'s **worktree** intent (DESIGN.md:234, a
-    /// different R-row and a different namespace), and a census that reported
-    /// that would be a census nobody could keep green. Measured — it did.
     const WRITERS: &[&str] = &[
         "ContainerIntent",
         "ContainerName",
@@ -1669,7 +1304,6 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         "CONTAINERS_DIR",
         "container::write_intent",
     ];
-    /// The files allowed to name one, each with the reason.
     const ALLOWED: &[(&str, &str)] = &[
         ("src/runner/container.rs", "the funnel that writes them"),
         ("src/runner/container/intent.rs", "the record itself"),
@@ -1690,11 +1324,6 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
              leave needle control (b) matching nothing",
         ),
     ];
-    /// The files left out of the scan, each an **exact** repo-relative path.
-    ///
-    /// Every one of them is asserted to exist below: an exclusion that names no
-    /// file excludes nothing today and silently excludes whatever is created at
-    /// that path tomorrow.
     const EXCLUDED: &[&str] = &[
         "src/effects/tests.rs",
         "src/engine/topology/create/tests.rs",
@@ -1732,71 +1361,10 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             .expect("under the manifest")
             .to_string_lossy()
             .replace('\\', "/");
-        // Test modules of the container subtree drive the funnel and name its
-        // types; they are excluded by name, so a new one is a change here.
-        //
-        // **Every exclusion is an exact path.** Three of them were
-        // `starts_with` — `src/runner/container/tests`,
-        // `.../census/tests`, `.../resolve/tests` — under a comment claiming
-        // the opposite, and a prefix widens to every sibling whose name begins
-        // the same way. Measured: a `pub fn write_one(intent: &ContainerIntent)`
-        // module failed this census as `src/runner/container/rogue.rs` and
-        // passed it as `src/runner/container/tests_of_the_funnel.rs`. The list
-        // is `EXCLUDED` above, every entry of it is asserted to name a file that
-        // exists, and the match is `==`.
-        //
-        // `src/effects/tests.rs` is the fourth, added by PR6 lane E. It is the
-        // `#[cfg(test)] mod tests;` of `src/effects.rs` — a test module, never
-        // reachable from production — and it names `ContainerName` for one
-        // reason: `the_view_directory_has_one_definition_in_the_tree` calls
-        // `exec::view_dir` and `census::view_path` with the same name and
-        // asserts they answer the same path (`PR6E-005`, a divergence that
-        // survived all 1324 tests). It writes no intent and constructs no
-        // container. The exclusion is by exact path rather than by prefix, so
-        // it cannot widen to a sibling.
-        //
-        // `src/engine/topology/recover/tests.rs` is the fifth, added by PR7
-        // lane E. It is the `mod tests;` of `src/engine/topology/recover.rs`,
-        // declared under a test configuration and never reachable from
-        // production, and it names these types for one reason: recovery step
-        // (a)'s row is "containers **incl. every earlier incarnation of this
-        // run** under `<R>/containers`", so
-        // `resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorded_root`
-        // has to *plant* a dead incarnation's intent for the census to find,
-        // and it plants it through this very funnel rather than with `fs`. A
-        // fixture that writes an intent for the census to reclaim is the same
-        // category as `src/runner/container/census/tests.rs` above. The
-        // exclusion is by exact path, so it cannot widen to a sibling.
-        // `src/engine/topology/create/tests.rs` is the seventh, added by PR7
-        // lane B, on the same terms. It is the `#[cfg(test)] mod tests;` of the
-        // schema-4 creator. It names `ContainerIntent`, `ContainerName` and
-        // `containers_dir` to **read back** the intent a containerized probe
-        // left after a kill —
-        // `probe_intent_carries_runner_policy_digest_matching_owner_record` and
-        // `kill_during_containerized_probe_...` — and writes none: the one that
-        // exists was written by `ContainerRunner` through the funnel. Exact, so
-        // it cannot widen to `src/engine/topology/create.rs`, which is
-        // production and is scanned.
         if EXCLUDED.contains(&relative.as_str()) {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source");
-        // The WHOLE file, comments and strings blanked — deliberately **not**
-        // `effects::production_region`. That helper cuts a source at its first
-        // `#[cfg(test)]`, and `src/engine/coordinator.rs` has a `#[cfg(test)]
-        // use` on **line 36 of 1599**: 97% of the schema-1..3 coordinator, and
-        // 96% of `attempt.rs` and `resume.rs`, are outside it. A prohibition
-        // about the legacy engine that could not see the legacy engine would be
-        // the vacuous census this project has already paid for twice
-        // (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, `PR6F-DOCKER-CENSUS-CANNOT-FAIL`).
-        // Measured: with `production_region` a planted `ContainerIntent` in
-        // `run_harness_inner_on` SURVIVED. Filed as
-        // `PR6B-PRODUCTION-REGION-CUT-AT-A-CFG-TEST-USE`.
-        //
-        // Scanning the whole file is strictly stronger for a prohibition, and
-        // its only cost is that a *test* naming these types is an offender —
-        // which is why the container subtree's test files are excluded above,
-        // by name.
         let scanned_text = crate::effects::blank_comments_and_strings(&source);
         scanned += 1;
         for writer in WRITERS {
@@ -1809,8 +1377,6 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
                 }
             }
         }
-        // The domain control, and the reason this census is not the one above:
-        // the body of the legacy coordinator must be inside what was scanned.
         if relative == "src/engine/coordinator.rs" {
             assert!(
                 scanned_text.contains("fn run_harness_inner_on"),
@@ -1825,25 +1391,11 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         "a module outside the container runner can write a container intent, so a legacy \
          process could own a container with no run identity behind it: {offenders:#?}"
     );
-    // The needle control, in two halves, because the file half alone does not
-    // hold. Without either, a census whose needles stopped matching would be
-    // silently green — `PR6F-DOCKER-CENSUS-CANNOT-FAIL`, measured this slice, in
-    // this repository, on this clause.
-    //
-    // (a) Every allowed file was reached.
     assert_eq!(
         found.len(),
         ALLOWED.len(),
         "the census found {found:?} of {ALLOWED:?}, so it is not looking at what it claims to"
     );
-    // (b) Every needle matched something. This half was missing, and (a) does
-    // not imply it: `ContainerName` alone appears in all four allowed files, so
-    // the other four `WRITERS` could each have stopped matching anywhere in the
-    // tree and (a) would still have counted four. Measured: rewriting the two
-    // `crate::runner::container::write_intent(` call sites as
-    // `super::super::write_intent(` — a legal, meaning-preserving refactor —
-    // left the needle `container::write_intent` matching nothing in the scanned
-    // set, and this census stayed green.
     assert_eq!(
         matched_needles,
         WRITERS.iter().copied().collect::<BTreeSet<_>>(),
@@ -1852,12 +1404,6 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
     );
 }
 
-/// This module reaches no lock, no filesystem and no spawn.
-///
-/// The structural half of "before any lock or effect": the argument that
-/// `resolve_container` cannot take a worktree lock is an argument about what it
-/// is given, and this is that argument executed. A call planted in the
-/// production region fails it.
 #[test]
 fn the_resolution_module_names_no_lock_no_write_and_no_spawn() {
     const FORBIDDEN: &[&str] = &[
@@ -1889,18 +1435,12 @@ fn the_resolution_module_names_no_lock_no_write_and_no_spawn() {
         named.is_empty(),
         "resolution reaches {named:?}, so it is no longer read-only by construction"
     );
-    // The control: the census is reading the module and not an empty string.
     assert!(
         production.contains("fn resolve_container"),
         "the production region is empty, so the census above proves nothing"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test-only substrate
-// ---------------------------------------------------------------------------
-
-/// One ordered log both a runtime and its caller write into.
 #[derive(Debug, Clone, Default)]
 struct SharedLog(std::sync::Arc<Mutex<Vec<String>>>);
 
@@ -1914,8 +1454,6 @@ impl SharedLog {
     }
 }
 
-/// A [`ContainerRuntime`] that records every call into a log the caller also
-/// writes into, so "before the worktree lock" is one sequence.
 struct LoggingRuntime {
     inner: FakeRuntime,
     log: SharedLog,
@@ -1998,12 +1536,6 @@ impl ContainerRuntime for LoggingRuntime {
     }
 }
 
-/// An [`AdapterSource`] that records every id it was asked for and hands back
-/// nothing.
-///
-/// The recording is the point: an empty log proves the command refused before
-/// pre-flight ever tried to resolve an agent, which is what "before any effect"
-/// buys and what a refusal returning the right message would not.
 #[derive(Default)]
 struct RecordingAdapters {
     asked: Mutex<Vec<String>>,
@@ -2047,7 +1579,6 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-/// A clean repository with a two-task plan, seeded and committed.
 fn temp_repo(tag: &str) -> PathBuf {
     let dir = scratch(tag);
     git(&dir, &["init", "-q", "-b", "main"]);
@@ -2064,7 +1595,6 @@ fn temp_repo(tag: &str) -> PathBuf {
     dir
 }
 
-/// An explicit pools file with no pools in it — never the operator's real one.
 fn empty_pools(dir: &Path) -> PathBuf {
     let path = dir.join("pools.toml");
     if !path.exists() {
@@ -2073,13 +1603,6 @@ fn empty_pools(dir: &Path) -> PathBuf {
     path
 }
 
-/// A legacy run directory with a `run_started` header and nothing else.
-///
-/// Enough for `resume` to reach `validate_inputs`, which is the statement under
-/// test: `resume.rs` marks the line after it "the first effect of the command".
-/// `schema` is 1, 2 or 3 — `expected_failures_refusals[0]` says "a schema-1..3
-/// fresh run **or** resume", and the reading a resume gets is chosen by
-/// `EngineLimits::for_resume(header_schema)`, so all three are driven.
 fn seed_legacy_run(repo: &Path, run_id: &str, private: &Path, schema: u32) {
     let public = crate::rundir::public_dir(repo, run_id);
     fs::create_dir_all(&public).expect("public dir");
@@ -2102,10 +1625,6 @@ fn seed_legacy_run(repo: &Path, run_id: &str, private: &Path, schema: u32) {
         plan_path: "plan.md".to_owned(),
         config_path: Some("upstroke.toml".to_owned()),
         plan_hash: "unused-by-the-refusal".to_owned(),
-        // Both required by `ensure_supported_schema` for a schema-3 header,
-        // which runs *before* `validate_inputs` — so without them a schema-3
-        // resume never reaches the refusal under test. Schemas 1 and 2 accept
-        // them and do not require them, so they are set unconditionally.
         normalized_plan_digest: Some(format!("sha256:{}", "0".repeat(64))),
         private_dir: private.join("runs").join(run_id).display().to_string(),
         gates: Vec::new(),
@@ -2123,7 +1642,6 @@ fn seed_legacy_run(repo: &Path, run_id: &str, private: &Path, schema: u32) {
     fs::write(public.join("events.jsonl"), format!("{line}\n")).expect("events.jsonl");
 }
 
-/// Every `src/**/*.rs`, sorted.
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .expect("read dir")
