@@ -422,12 +422,16 @@ are each reported. Legacy-scoped sites are inventoried and carry no requirement.
 **The fast-path no-execution record.** Item 4 above fixes that an integration whose base is still
 the head publishes the exact candidate: no staging worktree is added, nothing is cherry-picked, and
 no prepared pin is taken. The three sites those effects belong to therefore carry a fifth kind of
-entry, the no-execution record, naming every fast sequence the suite exercised. The check holds
-the record to the harness: it fails when the suite exercised no fast sequence at all (an empty
-harness is not evidence), when the record names a sequence the harness never exercised, when the
-record says nothing about an exercised sequence (reporting beside the gap whether the harness
-observed a hook of the site in it), and when the record names a sequence in which the harness
-did observe a hook of the site — a contradiction between record and observation. The record is
+entry, the no-execution record, naming every fast sequence the suite exercised. A sequence is
+exercised only by what the harness observed inside it: the harness records a hook of some site
+between the sequence's begin and end, and that is the only marker, because only a funnel can set
+it. The check holds the record to the harness: it fails when the suite began no fast sequence at
+all (an empty harness is not evidence), when a begun sequence had no hook observed inside it (a
+trace the harness saw nothing in is not an exercised fast integration, whatever the records say of
+it), when the record names a sequence the harness never began, when the record says nothing about
+a begun sequence (reporting beside the gap whether the harness observed a hook of the site in it),
+and when the record names a sequence in which the harness did observe a hook of the site — a
+contradiction between record and observation. The record is
 additional to, never instead of, the site's ordinary coverage: the same three sites execute on
 the stale path and are held to every requirement above.
 
@@ -441,6 +445,9 @@ count `n` is checked for self-consistency and not against any authority: the num
 registry's, and whether it held across runs is a property no single document can show.
 
 **Diagnostics are typed.** A failure names its site as `EffectSiteId` and its phase as the hook
-phase or entry phase it is about; the only free text a failure carries is a resume action in the
-fault matrix's own words and the name a suite gave a fast sequence. An entry the format refuses
-is reported with the format's own error value.
+phase or entry phase it is about. The free text a failure carries in its own fields is a document's
+own words: a resume action in the fault matrix's wording, and the name a suite gave a fast
+sequence. An entry the format refuses is reported with the format's own error value embedded, and
+that value carries what the entry wrote in the field the format refused — a residue detail, a
+resume action, a site or phase name as text — so a hand-edited document's own text can reach a
+reader through that one variant, quoted, never interpreted.

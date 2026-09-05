@@ -5745,6 +5745,67 @@ fn the_bijection_fails_on_every_missing_link() {
 }
 
 #[test]
+fn a_fast_sequence_the_harness_observed_nothing_in_is_not_an_exercised_one() {
+    // Pass 5 on `da3204f`, finding 1 (P2). `begin_fast_sequence` records a
+    // sequence the moment it is called, so a suite that begins and ends every
+    // name with no funnel in between had "fast sequences", and a record
+    // naming each of them held within all of them vacuously. With ordinary
+    // coverage satisfied outside the sequences — which is what keeps
+    // `Unobserved` from masking the hole, as it does in the Direction that
+    // builds empty sequences — `check_bijection` answered an empty vector for
+    // a run in which no exact-base integration happened. The same inference
+    // pass 4 removed from the `observed` field, one level up: exercised was
+    // being inferred from the map being non-empty.
+    let host = Host::current();
+    let inventory = self_test_inventory();
+    let entries = self_test_registry(host);
+
+    let mut hollow = HookHarness::new();
+    for sequence in FAST_SEQUENCES {
+        hollow.begin_fast_sequence(sequence);
+        hollow.end_fast_sequence();
+    }
+    for site in &inventory {
+        if !site.scope().is_claimed() {
+            continue;
+        }
+        drive(&mut hollow, *site, host);
+    }
+    assert_eq!(hollow.fast_sequences().len(), FAST_SEQUENCES.len());
+    assert!(
+        hollow
+            .fast_sequences()
+            .iter()
+            .all(|sequence| sequence.touched().is_empty()),
+        "the fixture's sequences must be empty for this test to mean anything"
+    );
+
+    let failures = check_bijection(&inventory, &hollow, &entries, host);
+    let mut empty: Vec<&str> = failures
+        .iter()
+        .filter_map(|failure| match failure {
+            BijectionFailure::EmptyFastSequence { sequence } => Some(sequence.as_str()),
+            _ => None,
+        })
+        .collect();
+    empty.sort_unstable();
+    let mut expected: Vec<&str> = FAST_SEQUENCES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        empty, expected,
+        "every empty sequence is reported once, by name: {failures:#?}"
+    );
+    // And nothing else: ordinary coverage, every record and every name are
+    // satisfied, so the empty sequences are the only thing wrong with this
+    // run — which is exactly why the check used to answer empty.
+    assert_eq!(
+        failures.len(),
+        FAST_SEQUENCES.len(),
+        "the hollow run reported something besides its empty sequences: {failures:#?}"
+    );
+}
+
+#[test]
 fn every_failing_residue_element_is_reported_with_its_own_element_and_predicate() {
     // Pass 2 on `2421651`, finding 2: the three element Directions above each
     // break `synthetic[0]` alone and match the variant alone, so a checker

@@ -164,6 +164,15 @@ pub enum BijectionFailure {
     },
 
     #[error(
+        "the fast sequence `{sequence}` was begun and ended with no hook observed inside it; a \
+         trace the harness saw nothing in is not an exercised fast integration"
+    )]
+    EmptyFastSequence {
+        /// The sequence the harness recorded nothing in.
+        sequence: String,
+    },
+
+    #[error(
         "`{site}`'s no-execution record says nothing about the exercised fast sequence \
          `{sequence}`, in which the harness {}",
         if *observed { "observed the site's hook" } else { "observed no hook of the site" }
@@ -362,6 +371,23 @@ pub fn check_bijection(
                     order: entry.order,
                 }),
             }
+        }
+    }
+
+    // A fast sequence counts as exercised only by what the harness observed
+    // inside it. `begin_fast_sequence` records the sequence at once, so a
+    // suite that begins and ends every name with no funnel in between
+    // satisfies "the harness has fast sequences" and "the record names each
+    // of them" and "no skipped site's hook was observed in any" — and a check
+    // that asked only those three would answer empty for a run in which no
+    // exact-base integration happened at all. The positive marker is a hook
+    // recorded inside the sequence, the one thing only a funnel can set; a
+    // sequence with none is reported once, here, whatever the records say.
+    for sequence in harness.fast_sequences() {
+        if sequence.touched().is_empty() {
+            failures.push(BijectionFailure::EmptyFastSequence {
+                sequence: sequence.name().to_owned(),
+            });
         }
     }
 
