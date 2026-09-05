@@ -886,6 +886,107 @@ mod tests {
             !complete.contains("Complete"),
             "a derived Debug spelling is not a contract: {complete}"
         );
+        // The parser admits both inconsistent shapes; each is shown as what
+        // the record says rather than folded into a halt or a silence.
+        let unnamed = finished(RunOutcome::Halted, None);
+        assert!(
+            unnamed.contains(
+                "run finished: halted at a task the record does not name (1 committed, 0 parked)"
+            ),
+            "{unnamed}"
+        );
+        let odd = finished(RunOutcome::Complete, Some("t2"));
+        assert!(
+            odd.contains(
+                "run finished: complete (`t2` recorded as halted_at on a run that did not halt) \
+                 (1 committed, 0 parked)"
+            ),
+            "{odd}"
+        );
+        assert!(!odd.contains("complete at"), "{odd}");
+    }
+
+    /// The record production writes for a rejected review carries both the
+    /// pass's `Failed` outcome and a `ReviewFailed` failure whose reason is
+    /// `review failed: …` (`engine::attempt::evaluate_review`); an unavailable
+    /// reviewer carries `Unavailable` and a `ReviewUnavailable` failure. The
+    /// line names the pass and the model beside the reason on that shape — the
+    /// one a run produces — and not only on a record with the outcome alone.
+    #[test]
+    fn a_real_review_rejection_names_the_pass_and_the_model_beside_its_reason() {
+        let rejected = describe(&finished(
+            record(
+                Some(events::FailureRecord {
+                    kind: FailureKind::ReviewFailed,
+                    origin: FailureOrigin::Reviewer,
+                    reason: "review failed: no tests were added".to_owned(),
+                    detail: None,
+                }),
+                vec![
+                    review("review", ReviewPassOutcome::Passed),
+                    review("second-opinion", ReviewPassOutcome::Failed),
+                ],
+            ),
+            None,
+            Some(AttemptTransition::Retry(LadderRetry {
+                resume: false,
+                tier: "small".to_owned(),
+                summary: "review failed: no tests were added".to_owned(),
+                detail: None,
+            })),
+        ));
+        assert!(
+            rejected.contains(
+                "t1: attempt 1 failed — review failed: no tests were added; review \
+                 `second-opinion` (gpt-5) rejected it; retrying on small"
+            ),
+            "{rejected}"
+        );
+        let unavailable = describe(&finished(
+            record(
+                Some(events::FailureRecord {
+                    kind: FailureKind::ReviewUnavailable,
+                    origin: FailureOrigin::Reviewer,
+                    reason: "reviewer unavailable: rate limited".to_owned(),
+                    detail: None,
+                }),
+                vec![review("review", ReviewPassOutcome::Unavailable)],
+            ),
+            None,
+            None,
+        ));
+        assert!(
+            unavailable.contains(
+                "t1: attempt 1 failed — reviewer unavailable: rate limited; review `review` \
+                 (gpt-5) reached no verdict"
+            ),
+            "{unavailable}"
+        );
+        // A gate failure has no review to name, and says nothing about one.
+        let gates = describe(&finished(
+            record(Some(gate_failure("gate `test` failed: exit 1")), Vec::new()),
+            None,
+            None,
+        ));
+        assert!(
+            gates.contains("t1: attempt 1 failed — gate `test` failed: exit 1"),
+            "{gates}"
+        );
+        assert!(!gates.contains("review"), "{gates}");
+    }
+
+    #[test]
+    fn a_deferral_wait_says_how_long_and_which_round() {
+        let line = describe(&event(EventBody::DeferWaitElapsed {
+            data: events::DeferWaitElapsed {
+                waited: Duration::from_secs(90),
+                round: 3,
+            },
+        }));
+        assert!(
+            line.contains("waited 90s for a pool to come back (round 3)"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -902,7 +1003,7 @@ mod tests {
             }));
             assert!(
                 standalone.contains(&format!(
-                    "t1: failed — gates exhausted (GateFailed){expected}"
+                    "t1: failed — gates exhausted; task failed (GateFailed){expected}"
                 )),
                 "{standalone}"
             );
@@ -1082,10 +1183,15 @@ mod tests {
         assert_eq!(plain, "14:03:07Z  t1: attempt 1 passed");
     }
 
+    /// The slice is taken only from a timestamp in RFC 3339 shape, checked
+    /// character by character: nineteen bytes that happen to end in something
+    /// clock-like are not a time, and a persisted value the engine did not
+    /// write is shown whole rather than dressed as one. `Event.ts` is an
+    /// unconstrained `String` and parsing validates nothing about it.
     #[test]
     fn a_timestamp_the_engine_did_not_write_is_printed_whole_rather_than_sliced() {
-        let odd = Event {
-            ts: "sometime".to_owned(),
+        let with = |ts: &str| Event {
+            ts: ts.to_owned(),
             body: EventBody::TaskParked {
                 task: "t1".to_owned(),
                 data: TaskParked {
@@ -1094,11 +1200,30 @@ mod tests {
                 },
             },
         };
-        assert_eq!(describe(&odd), "sometime  t1: parked on q-1");
-        let offset = Event {
-            ts: "2026-08-09T14:03:07+02:00".to_owned(),
-            ..odd
-        };
-        assert_eq!(describe(&offset), "14:03:07+02:00  t1: parked on q-1");
+        for whole in [
+            "sometime",
+            "xxxxxxxxxxx14:03:07Z",
+            "2026-08-09 14:03:07Z",
+            "2026/08/09T14:03:07Z",
+            "2026-08-09T14.03.07Z",
+            "2026-08-09T1a:03:07Z",
+            "2026-08-09T14:03:0",
+        ] {
+            let line = describe(&with(whole));
+            assert_eq!(line, format!("{whole}  t1: parked on q-1"), "{whole}");
+        }
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07+02:00")),
+            "14:03:07+02:00  t1: parked on q-1"
+        );
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07.250Z")),
+            "14:03:07.250Z  t1: parked on q-1"
+        );
+        assert_eq!(
+            describe(&with("2026-08-09T14:03:07")),
+            "14:03:07  t1: parked on q-1",
+            "a zone-less shape is still a clock, with nothing to append"
+        );
     }
 }

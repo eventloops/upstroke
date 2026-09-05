@@ -55,7 +55,7 @@ use std::fmt::Write as _;
 use super::RunStatus;
 use crate::events::{
     AttemptRecord, AttemptTransition, Event, EventBody, LadderEscalated, LadderRetry,
-    ReviewPassOutcome, RunOutcome, TaskDeferred,
+    ReviewPassOutcome, RunOutcome, TaskDeferred, TaskFailed,
 };
 use crate::ir::Answer;
 
@@ -119,13 +119,11 @@ pub(super) fn render(status: &RunStatus) -> String {
 ///
 /// The time is the record's, not the reader's: a `--follow` at 16:03 local in
 /// UTC+2 shows `14:03:07Z`, and the suffix is what says so. A timestamp not in
-/// `YYYY-MM-DDTHH:MM:SS…` shape is printed whole rather than sliced into
+/// `YYYY-MM-DDTHH:MM:SS…` shape — checked character by character by
+/// [`clock_of`], not by length — is printed whole rather than sliced into
 /// something that looks like a time and is not.
 pub(super) fn describe(event: &Event) -> String {
-    let (at, zone) = match (event.ts.get(11..19), event.ts.get(19..)) {
-        (Some(at), Some(zone)) => (at, zone),
-        _ => (event.ts.as_str(), ""),
-    };
+    let (at, zone) = clock_of(&event.ts).unwrap_or((event.ts.as_str(), ""));
     let body = match &event.body {
         EventBody::RunStarted { data } => {
             format!("run {} started on {}", data.run_id, data.branch)
@@ -213,12 +211,13 @@ pub(super) fn describe(event: &Event) -> String {
         EventBody::TaskCommitted { task, data } => {
             format!("{task}: committed {}", short(&data.sha))
         }
-        EventBody::TaskFailed { task, data } => format!(
-            "{task}: failed — {} ({:?}){}",
-            data.reason,
-            data.kind,
-            halt_suffix(data.halts_run)
-        ),
+        EventBody::TaskFailed { task, data } => {
+            format!(
+                "{task}: failed — {}; {}",
+                data.reason,
+                describe_task_failure(data)
+            )
+        }
         EventBody::QuestionRaised { task, data } => format!(
             "{task}: asking {} — answer with `upstroke answer {}`",
             data.question.kind, data.question.id
@@ -283,9 +282,24 @@ pub(super) fn describe(event: &Event) -> String {
                 RunOutcome::Halted => "halted",
                 RunOutcome::BudgetExceeded => "stopped at its budget",
             };
+            // The two fields are read together: a halt names its task or
+            // says the record did not, and a task named on a run that did not
+            // halt is shown as the oddity it is rather than as a halt.
             let mut line = format!("run finished: {outcome}");
-            if let Some(task) = &data.halted_at {
-                let _ = write!(line, " at `{task}`");
+            match (&data.outcome, &data.halted_at) {
+                (RunOutcome::Halted, Some(task)) => {
+                    let _ = write!(line, " at `{task}`");
+                }
+                (RunOutcome::Halted, None) => {
+                    line.push_str(" at a task the record does not name");
+                }
+                (_, Some(task)) => {
+                    let _ = write!(
+                        line,
+                        " (`{task}` recorded as halted_at on a run that did not halt)"
+                    );
+                }
+                (_, None) => {}
             }
             let _ = write!(
                 line,
@@ -300,27 +314,36 @@ pub(super) fn describe(event: &Event) -> String {
 
 /// What one settled attempt's record says happened.
 ///
-/// "Passed" is decided by the crate's one definition of success — the same
-/// facts [`AttemptRecord::is_successful`] reads, in the same order — and not
-/// by `failure.is_none()`. A record that carries no failure and a review pass
-/// that rejected the code, or never reached a verdict, has not passed: the
-/// fold refuses to promote such a record, and a `--follow` line announcing it
-/// as passed would be the one place in the product that disagreed.
+/// "Passed" is the record's own claim of success — no failure and every
+/// review pass passed, the facts [`AttemptRecord::is_successful`] reads, in
+/// the same order — and not `failure.is_none()`. A review that rejected the
+/// code or never reached a verdict is named by pass and model whether or not
+/// the engine also recorded a failure for it: in production it always does
+/// (`engine::attempt::evaluate_review` writes a `ReviewFailed` or
+/// `ReviewUnavailable` failure beside the pass's outcome), so the line a run
+/// produces is `failed — review failed: …; review \`review\` (model)
+/// rejected it`. A record carrying the outcome and no failure is rendered as
+/// it reads, "was not approved", whatever a fold does with it: the schema-4
+/// doors refuse it through `is_successful`, the schema-3 door classifies by
+/// `failure` alone (SWEEP-RENDER-014), and the line follows the record rather
+/// than either door.
 fn attempt_outcome(record: &AttemptRecord) -> String {
-    if let Some(failure) = &record.failure {
-        return format!("failed — {}", failure.reason);
-    }
-    let unapproved = record.reviews.iter().find_map(|pass| match pass.outcome {
+    let verdict = record.reviews.iter().find_map(|pass| match pass.outcome {
         ReviewPassOutcome::Passed => None,
-        ReviewPassOutcome::Failed => Some((pass, "rejected it")),
-        ReviewPassOutcome::Unavailable => Some((pass, "reached no verdict")),
-    });
-    match unapproved {
-        None => "passed".to_owned(),
-        Some((pass, verdict)) => format!(
-            "was not approved — review `{}` ({}) {verdict}",
+        ReviewPassOutcome::Failed => Some(format!(
+            "review `{}` ({}) rejected it",
             pass.pass, pass.model
-        ),
+        )),
+        ReviewPassOutcome::Unavailable => Some(format!(
+            "review `{}` ({}) reached no verdict",
+            pass.pass, pass.model
+        )),
+    });
+    match (&record.failure, verdict) {
+        (Some(failure), Some(verdict)) => format!("failed — {}; {verdict}", failure.reason),
+        (Some(failure), None) => format!("failed — {}", failure.reason),
+        (None, Some(verdict)) => format!("was not approved — {verdict}"),
+        (None, None) => "passed".to_owned(),
     }
 }
 
@@ -330,14 +353,19 @@ fn describe_transition(transition: &AttemptTransition) -> String {
         AttemptTransition::Retry(data) => describe_retry(data),
         AttemptTransition::Escalate(data) => describe_escalation(data),
         AttemptTransition::Defer(data) => describe_deferral(data),
-        AttemptTransition::Fail(data) => {
-            format!(
-                "task failed ({:?}){}",
-                data.kind,
-                halt_suffix(data.halts_run)
-            )
-        }
+        AttemptTransition::Fail(data) => describe_task_failure(data),
     }
+}
+
+/// The terminal decision, in the one spelling both wire shapes use. The
+/// `Debug` of the kind is the log's `snake_case` spelt as a Rust identifier;
+/// a `Display` on `FailureKind` belongs to `src/ladder.rs` (SWEEP-RENDER-011).
+fn describe_task_failure(data: &TaskFailed) -> String {
+    format!(
+        "task failed ({:?}){}",
+        data.kind,
+        halt_suffix(data.halts_run)
+    )
 }
 
 fn describe_retry(data: &LadderRetry) -> String {
@@ -368,6 +396,34 @@ fn halt_suffix(halts_run: bool) -> &'static str {
     } else {
         "; the run continues"
     }
+}
+
+/// The `HH:MM:SS` of a timestamp in RFC 3339 shape and whatever follows it —
+/// `Z`, an offset, or fractional seconds and then either — or `None` for any
+/// other text, so a timestamp the engine did not write is printed whole. The
+/// shape is checked character by character: ten digits and dashes as
+/// `YYYY-MM-DD`, a `T`, then `HH:MM:SS`; a string that merely has nineteen
+/// bytes is not a timestamp.
+fn clock_of(ts: &str) -> Option<(&str, &str)> {
+    let bytes = ts.as_bytes();
+    let date = bytes.get(..10)?;
+    let separator = bytes.get(10)?;
+    let clock = bytes.get(11..19)?;
+    let shaped = |slice: &[u8], separators: &[usize], separator: u8| {
+        slice.iter().enumerate().all(|(index, byte)| {
+            if separators.contains(&index) {
+                *byte == separator
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+    };
+    if *separator != b'T' || !shaped(date, &[4, 7], b'-') || !shaped(clock, &[2, 5], b':') {
+        return None;
+    }
+    // Every byte checked above is ASCII, so both boundaries are char
+    // boundaries; the `?`s are the type's, not a path the check leaves open.
+    Some((ts.get(11..19)?, ts.get(19..)?))
 }
 
 /// The assembled line with every control character made harmless: a newline,

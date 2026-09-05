@@ -27,10 +27,13 @@ which ladder move follows and whether the task was parked on a question, and eac
 settlement renders on its own, so no pairing is dropped. A terminal failure says whether the run
 halts or continues, the policy frozen with it. A declined question is a decline, with its task's
 failure and that same policy, never an answer; a question no channel could reach a person with is
-unanswered. An attempt is "passed" by the one definition the fold promotes on — no failure and
-every review pass passed — and otherwise the line names the pass that rejected it or reached no
-verdict. A resume says how many uncommitted paths it discarded. A finished run names its outcome
-in words and, when halted, the task it halted at. Every field on the line is on-disk data, so the
+unanswered. An attempt is "passed" only on the record's own claim of success — no failure and
+every review pass passed — and a review that rejected the code or reached no verdict is named by
+pass and model beside the failure's reason, on the record the engine writes (a `review failed:`
+failure with the pass's outcome) as much as on one carrying the outcome alone. A resume says how
+many uncommitted paths it discarded; a deferral wait says how long it waited and which round. A
+finished run names its outcome in words and, when halted, the task it halted at — or that the
+record names none. Every field on the line is on-disk data, so the
 line is one line by construction: a newline, carriage return or tab inside a quoted reason becomes
 one space and any other control character is written as its `\u{..}` escape rather than reaching
 the terminal. The set of events a line can describe is closed — a variant the binary does not know
