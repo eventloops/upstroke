@@ -43,6 +43,9 @@ The opening paragraph may follow an H1 and blank lines. The H1 may include a
 description, and ordinary prose may follow the backlink on the same line.
 The generated wording is an example; a `[Source](relative/path.rs)` link also
 satisfies the same contract.
+The recognized link label is plain text or a single code span closed inside its
+brackets. The opening is a paragraph; lists, blockquotes, and code blocks do not
+supply it, even when their source contains link-like text.
 
 The repository-relative link works in a checkout and on GitHub. A separate
 `Source on GitHub` link points to the module's GitHub page for readers on

@@ -106,20 +106,26 @@ while IFS= read -r notes; do
     { sub(/\r$/, "") }
     /^[[:space:]]*$/ { next }
     {
+      if (!heading && $0 ~ /^# [^<>]+$/) { heading = 1; next }
+      # Navigation is an opening paragraph, not a list, quote, heading, or
+      # code block. Container prefixes can otherwise hide code indentation.
+      if ($0 ~ /^(    | *\t| *[>#]| *[-+*][ \t]| *[0-9]+[.)][ \t]| *~~~)/) exit
       if (match($0, /\[[^][]+\]\(\.\.\/[A-Za-z0-9_.\/-]+\.rs\)/)) {
         before = substr($0, 1, RSTART - 1)
         # Only ordinary prose may precede the link. A code span, HTML block,
         # image, escape, enclosing link, or code indentation cannot supply it.
-        if (before ~ /[`<\\!\[]/ || $0 ~ /^(    | *\t| *~~~)/) exit
+        if (before ~ /[`<\\!\[]/) exit
         link = substr($0, RSTART, RLENGTH)
         label = substr(link, 2, index(link, "](") - 2)
         if (label ~ /[<&\\]/ || label !~ /[[:alnum:]_]/) exit
+        # A single code-span label must close inside the brackets. Otherwise
+        # Markdown can consume the apparent closing bracket as code.
+        if (label ~ /`/ && label !~ /^`[^`]+`$/) exit
         sub(/^\[[^][]+\]\(/, "", link)
         sub(/\)$/, "", link)
         print link
         exit
       }
-      if (!heading && $0 ~ /^# [^<>]+$/) { heading = 1; next }
       exit
     }
   ' "$notes")"

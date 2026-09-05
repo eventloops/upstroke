@@ -573,9 +573,13 @@ So the claim is structural and the census is the only thing that can
 make it: an adapter that starts remembering an answer fails here on the
 line that declares the cell, before any behaviour depends on it.
 
-Comments are stripped, and the strip is asserted to have removed
-something — `PR4-CENSUS-COMMENT-ORACLE` is a census over a file format
-that has comments, and this file's own prose names every pattern below.
+The checker uses `effects::production_code`, which blanks comments and literals
+and removes test-only items. A string constant containing `OnceLock` does not
+declare state. The same checker reads all four source files and the controls:
+inert comments and literals, excluded test-only state, and real holder
+declarations. A production declaration after a test-only item remains visible.
+The `static ` needle excludes a preceding apostrophe, so a `'static` lifetime
+does not count as a static declaration; the harmless-code control covers it.
 
 ## `fn the_adapters_hold_no_process_wide_resolution_state()` › `const HOLDERS: [&str; 4] = ["static ", "thread_local!", "OnceLock", "LazyLock"];`
 
@@ -592,8 +596,9 @@ caught too.
 
 ## `fn the_adapters_hold_no_process_wide_resolution_state()` › `assert!(`
 
-The control: the pattern really does match when it is present, so an
-empty result means absence rather than a broken search.
+The controls run actual holder declarations through the checker and assert the
+detected holder names. They also combine declarations with inert literal/comment
+text and test-only items, so those regions cannot hide later production state.
 
 ## `mod built_program_tests` › `fn the_host_runner_executes_a_bare_program_name_as_it_executes_the_resolved_path() {`
 

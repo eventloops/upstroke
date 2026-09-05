@@ -45,6 +45,23 @@ printf '[Source](%s) with continuation prose.\n' "$link" > "$tree/$notes"
 check 0 source_label_does_not_require_generated_wording
 
 fixture capacity
+printf '[`Source`](%s) with continuation prose.\n' "$link" > "$tree/$notes"
+check 0 balanced_code_span_label_is_visible
+
+for context in quoted_tilde_fence listed_tilde_fence quoted_indented_code listed_indented_code ordered_indented_code code_span_crosses_link_bracket; do
+  fixture capacity
+  case "$context" in
+    quoted_tilde_fence) printf '> ~~~markdown [Source](%s)\n> example\n> ~~~\n' "$link" ;;
+    listed_tilde_fence) printf -- '- ~~~markdown [Source](%s)\n  example\n  ~~~\n' "$link" ;;
+    quoted_indented_code) printf '>     [Source](%s)\n' "$link" ;;
+    listed_indented_code) printf -- '-     [Source](%s)\n' "$link" ;;
+    ordered_indented_code) printf '1.     [Source](%s)\n' "$link" ;;
+    code_span_crosses_link_bracket) printf '[`Source](%s)`\n' "$link" ;;
+  esac > "$tree/$notes"
+  check 1 "${context}_does_not_supply_opening_backlink"
+done
+
+fixture capacity
 sed 's/$/\r/' "$tree/$notes" > "$tree/crlf"
 mv "$tree/crlf" "$tree/$notes"
 check 0 backlink_with_crlf

@@ -903,42 +903,68 @@ mod built_program_tests {
             ("src/agent/copilot.rs", include_str!("copilot.rs")),
         ];
 
-        let planted = sources.len();
-        let mut stripped = 0_usize;
-        let mut offenders: Vec<String> = Vec::new();
-        for (name, source) in sources {
-            let production = format!(
-                "{}\n// STRIP-CONTROL: a comment this strip must remove",
-                crate::effects::production_region(source)
-            );
-            let kept: Vec<&str> = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect();
-            stripped += production.lines().count() - kept.len();
-            let code = kept.join("\n");
-            assert!(
-                !code.contains("STRIP-CONTROL"),
-                "{name}: the planted control survived the strip"
-            );
-            for holder in HOLDERS {
-                if code.contains(holder) {
-                    offenders.push(format!("{name}: {holder}"));
-                }
-            }
-        }
-        assert!(
-            stripped >= planted,
-            "the comment strip removed {stripped} lines across {planted} files, fewer than the \
-             one control line planted in each, so it is not working and this census would be \
-             reading prose"
-        );
-        assert!(
+        assert_eq!(sources.len(), ADAPTERS.len() + 1, "each adapter and bin.rs");
+        let holders_in = |source: &str| {
+            let code = crate::effects::production_code(source);
             HOLDERS
                 .into_iter()
-                .all(|holder| format!("let x: {holder} = ();").contains(holder)),
-            "the census pattern matches nothing at all"
+                .filter(|holder| {
+                    code.match_indices(*holder).any(|(at, _)| {
+                        *holder != "static "
+                            || code.get(..at).and_then(|before| before.chars().next_back())
+                                != Some('\'')
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let inert = r###"
+pub const REVIEW_CANARY_TEXT: &str = "OnceLock";
+fn label() -> &'static str { "OnceLock" }
+const RAW: &str = r#"static CACHE: LazyLock; #[cfg(test)]"#;
+const BYTES: &[u8] = b"thread_local!";
+const RAW_BYTES: &[u8] = br#"OnceLock"#;
+const CHARACTER: char = 's';
+// static COMMENT: OnceLock<LazyLock<()>>;
+/* thread_local! { static BLOCK: usize = 0; } */
+"###;
+        assert!(
+            holders_in(inert).is_empty(),
+            "literals and comments are inert"
         );
+        let test_only = r#"
+#[cfg(test)]
+mod tests {
+    static TEST_CACHE: OnceLock<()> = OnceLock::new();
+}
+"#;
+        assert!(
+            holders_in(test_only).is_empty(),
+            "test-only state is excluded"
+        );
+        for (declaration, expected) in [
+            ("static CACHE: usize = 0;", vec!["static "]),
+            (
+                "thread_local! { static CACHE: usize = 0; }",
+                vec!["static ", "thread_local!"],
+            ),
+            ("struct Cache { value: OnceLock<String> }", vec!["OnceLock"]),
+            ("struct Cache { value: LazyLock<String> }", vec!["LazyLock"]),
+        ] {
+            assert_eq!(holders_in(declaration), expected, "{declaration}");
+            assert_eq!(
+                holders_in(&format!("{inert}\n{test_only}\n{declaration}")),
+                expected,
+                "production state after inert or test-only text remains visible"
+            );
+        }
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, source) in sources {
+            for holder in holders_in(source) {
+                offenders.push(format!("{name}: {holder}"));
+            }
+        }
         assert!(
             offenders.is_empty(),
             "an adapter holds a value across calls: {offenders:?}. A resolution remembered in one \
