@@ -1548,19 +1548,33 @@ fn only_a_retained_generation_is_retried_in_place() {
 /// second `RunStarted`: both kill tests red together, at their `the log
 /// replays` expectations, with every earlier assertion passing.
 ///
-/// An exclusive `create_dir` on a name no other process can compute leaves
-/// that collision no interleaving, which a check before the create could
-/// not say. And the guard reclaims the tree on return and on unwind: the
-/// **child** still dies without cleanup, which is the claim the kill tests
-/// make, and the **parent** removes what it left once the assertions have
-/// read it.
+/// What the allocator guarantees, and what it does not. The root is created
+/// with one exclusive `create_dir`, so a leftover is never **reused**: a
+/// name that is already there is refused, and the refusal is a panic naming
+/// the root, never a second run appended to a dead child's log. The name is
+/// a tag and a ULID, and the ULID is not unguessable: it is a millisecond
+/// timestamp and eighty bits from a `splitmix64` stream seeded by that
+/// timestamp, the pid and a per-process nonce, so two harnesses can draw one
+/// name in one millisecond for particular pid-and-nonce pairs, and a dead
+/// harness's name can recur after a clock rollback with the same pid and
+/// nonce. Either is an `Occupied` refusal and a red that says so; this
+/// fixture does not draw again, because a refusal it cannot arrange is a
+/// refusal it cannot witness. And the guard reclaims the tree on return and
+/// on unwind: the **child** still dies without cleanup, which is the claim
+/// the kill tests make, and the **parent** removes what it left once the
+/// assertions have read it. A removal the filesystem refuses during an
+/// unwind is reported and the tree leaks, and a parent that aborts runs no
+/// `Drop` at all, so "reclaimed" is the normal path's word and not every
+/// path's.
 fn scratch(label: &str) -> ScratchTree {
     scratch_tree::acquire(&std::env::temp_dir(), &format!("pr7h-{label}")).expect("a scratch tree")
 }
 
 /// The fixture hands back the guard, and the guard reclaims: nothing is at
 /// the tree's path once it drops. The kill tests hold it through their
-/// assertions, so their residue is read and then removed.
+/// assertions, so their residue is read and then removed. Absence is
+/// [`scratch_tree::proves_absent`]'s `NotFound`, not `Path::exists`'s
+/// `false`, which a stat the filesystem refused to answer would also give.
 #[test]
 fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {
     let tree = scratch("reclaimed");
@@ -1568,7 +1582,7 @@ fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {
     assert!(path.is_dir(), "the tree was created: {}", path.display());
     drop(tree);
     assert!(
-        !path.exists(),
+        scratch_tree::proves_absent(&path),
         "the tree was not reclaimed: {}",
         path.display()
     );
