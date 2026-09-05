@@ -3,12 +3,12 @@ id: SWEEP-CONNECT-RENDER-008
 severity: P3
 disposition: deferred
 category: docs-contract
-pr: 155
+pr: 168
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/connect.rs:75
 provenance: pre_existing
 first_bad:
-guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 57); `connect::render::tests::the_summary_and_the_file_agree_on_which_agents_are_usable` pins what the renderers do with the two extra states meanwhile
+guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 62); `connect::render::tests::the_summary_and_the_file_agree_on_which_agents_are_usable` pins what the renderers do with the two extra states meanwhile
 ---
 
 ## Failure sequence
@@ -21,7 +21,7 @@ admits, two are never built by `run_with`. Both renderers had to read the pair a
 pool in hand that the file dropped without saying so. `CODING_STANDARDS.md` §5: "An enum, not
 string tags or a set of booleans, encodes alternatives with different meaning."
 
-PR #155 makes the two renderers decide once (`render::usable`) and name every agent in the summary,
+PR #168 makes the two renderers decide once (`render::usable`) and name every agent in the summary,
 so the extra states now render consistently; the type still admits them, and `connect` is a
 `pub mod` of a published crate, so anything can build one.
 

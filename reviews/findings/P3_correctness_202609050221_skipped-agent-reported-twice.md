@@ -3,12 +3,12 @@ id: SWEEP-CONNECT-RENDER-009
 severity: P3
 disposition: deferred
 category: correctness
-pr: 155
+pr: 168
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/connect.rs:173
 provenance: pre_existing
 first_bad:
-guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 57)
+guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 62)
 ---
 
 ## Failure sequence

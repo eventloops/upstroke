@@ -3,12 +3,12 @@ id: SWEEP-CONNECT-RENDER-010
 severity: P3
 disposition: deferred
 category: correctness
-pr: 155
+pr: 168
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/connect.rs:233
 provenance: pre_existing
 first_bad:
-guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 57)
+guard: the sweep of `src/connect.rs` (`standards/SWEEP.md` row 62)
 ---
 
 ## Failure sequence
@@ -26,7 +26,7 @@ renderer's is therefore a conflict:
 The refusal exists so that a hand edit is never silently overwritten; a refusal that fires on
 spelling trains the operator to reach for the flag that discards hand edits, which is the failure
 the parent's own doc names ("a refusal an operator is trained to bypass protects nothing").
-PR #155 makes the renderer's spelling canonical and deterministic (basic strings, integers for
+PR #168 makes the renderer's spelling canonical and deterministic (basic strings, integers for
 whole allowances), so the refusal now fires at most once per hand-written file and never between
 two files `connect` wrote; it does not remove the class.
 

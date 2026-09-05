@@ -3,7 +3,7 @@ id: SWEEP-CONNECT-RENDER-014
 severity: P3
 disposition: deferred
 category: docs-contract
-pr: 155
+pr: 168
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/connect.rs:375
 provenance: pre_existing
@@ -16,7 +16,7 @@ guard: the owner, in `DESIGN.md` §17; the sentence "Not decided here" in `desig
 `~/.upstroke/pools.toml` is a persisted format: `upstroke connect` writes it, `config` reads it on
 every `run`, `validate` and `capacity`, and `connect` reads it back on its next run to carry the
 operator's `profile`, `monthly_allowance` and `endpoint` across a `--force` — **by pool name**
-(`src/connect.rs`, `carried.get(&pool.name)`). Since PR #155, `DESIGN.md` §17 describes what
+(`src/connect.rs`, `carried.get(&pool.name)`). Since PR #168, `DESIGN.md` §17 describes what
 `connect` writes: the keys, the default pool name (the agent's id, `default_pool_name`), the
 comments and the rewrite rules. What it says it does not decide, in so many words, is whether
 those keys and that name are frozen across versions. Nothing else in `design/` decides it either:
@@ -40,13 +40,13 @@ whole suite: **3 failed** (`a_missing_agent_skips_its_pool_without_taking_the_ot
 `what_connect_writes_parses_back_into_the_pools_it_describes`,
 `an_existing_file_that_differs_is_never_clobbered`), every one because it asserts the literal
 `claude-code` — a renamer edits all three with the rename. The same measurement over the keys:
-renaming `endpoint` failed **0** tests at `323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b` (PR #155 adds the test that
+renaming `endpoint` failed **0** tests at `323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b` (PR #168 adds the test that
 now fails), `profile` and `monthly_allowance` 1 each, `safety_margin` and `sources` 1 each. The
 guards are tests about carrying and round-tripping that happen to spell the names, not a rule.
 
 ## Why this is recorded rather than fixed
 
-Describing what the code writes was PR #155's to do and is done (`design/17`). Deciding whether
+Describing what the code writes was PR #168's to do and is done (`design/17`). Deciding whether
 the format is a compatibility surface — frozen keys and name, or a migration rule for a file an
 older `connect` wrote — is a product decision the code does not settle, and `CODING_STANDARDS.md`
 §8 asks for it ("A persisted or inter-process representation is an explicit schema ... Serde

@@ -3,7 +3,7 @@ id: SWEEP-CONNECT-RENDER-011
 severity: P3
 disposition: deferred
 category: docs-contract
-pr: 155
+pr: 168
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/connect.rs:271
 provenance: pre_existing
@@ -28,14 +28,14 @@ not `stable_content` filtered anything — it pins the `Unchanged` answer for an
 says nothing about the one line that is supposed to be allowed to move. The same holds if the
 filter is deleted outright.
 
-PR #155 names the renderer's spelling `render::WRITTEN_BY`, documents the coupling on it, and pins
+PR #168 names the renderer's spelling `render::WRITTEN_BY`, documents the coupling on it, and pins
 the literal in `the_header_prefix_is_the_literal_the_parent_filters_by`, whose comment says why;
 the parent's literal stands, so the two are still spelled twice.
 
 ## Why this is recorded rather than fixed
 
 One line in the parent (`.starts_with(render::WRITTEN_BY)`) and one test with a controlled
-timestamp, but the parent is row 57's and this sweep's bound is its own file. The render-side test
+timestamp, but the parent is row 62's and this sweep's bound is its own file. The render-side test
 is the guard meanwhile.
 
 ## What the change that takes this up should do
