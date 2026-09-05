@@ -29,9 +29,12 @@ within this repository. Those facts do not make the library API unshipped.
 
 This P3 records the missing design policy. It does not establish a violation of section 15's
 gate/review sentence or reproduce a shipped CLI resume failure. It also does not replace the
-separate P2 sampler/classifier defect, `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`, assigned
-to PR145. The old finding's CLI/design claim was rejected against its actual subject and caller,
-not because the task-slot refusal or the sampler failure disappeared.
+separate P2 assertion, `SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR`, whose permanent
+record is [PR145's body ledger](https://github.com/eventloops/upstroke/pull/145). That lane owns
+its repair and the correction of its historical supersession record. The broader parent,
+`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE`, included multiple failure fingerprints. The old
+CLI/design claim was rejected against its actual subject and caller, not because the task-slot
+refusal or the sampler failure disappeared.
 
 ## Historical Git 2.43.0 observations on the build box
 
