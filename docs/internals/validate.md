@@ -2,36 +2,31 @@
 
 Extended notes for [`src/validate.rs`](../../src/validate.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+These notes preserve the module comments after the annotation repairs. Item headings quote source lines for navigation.
 
 ## Module
 
 `upstroke validate`: parse → config → graph checks → routing preview →
 rendered report. No execution of anything.
-
-## `#![allow(clippy::disallowed_methods)]`
-
 LEGACY-EFFECT: this module is in the **frozen legacy section** of
 `effects/allowlist.toml`, which carries its justification and the condition
 under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 
-## `pub struct ValidateOptions` › `pub config_path: Option<PathBuf>,`
+## `pub config_path: Option<PathBuf>,`
 
 Explicit `--config` path; `None` looks for `upstroke.toml` in
 `config_root`.
 
-## `pub struct ValidateOptions` › `pub config_root: PathBuf,`
+## `pub config_root: PathBuf,`
 
 Root of the repo the plan targets: config discovery and gate
 derivation both resolve here, never against the process CWD.
 
-## `pub struct ValidateOptions` › `pub pools_path: Option<PathBuf>,`
+## `pub pools_path: Option<PathBuf>,`
 
 Pools file override for tests; `None` discovers `~/.upstroke/pools.toml`.
 
-## `pub struct ValidateOptions` › `pub engine_limits: config::EngineLimits,`
+## `pub engine_limits: config::EngineLimits,`
 
 Which reading of `[engine]`'s ceilings applies (see
 [`config::EngineLimits`]). `Fresh` for `upstroke validate` and for a run
@@ -41,30 +36,30 @@ selects.
 Carried here rather than decided inside `analyze` because only the
 caller knows which it is, and the difference is a refusal.
 
-## `pub struct Report` › `pub review: String,`
+## `pub review: String,`
 
 Who reviews, and where a second opinion applies (§11.2–§11.3).
 
-## `pub struct Report` › `pub effort: String,`
+## `pub effort: String,`
 
 Effective reasoning policy before any process is spawned.
 
-## `pub struct Analysis {`
+## `#[derive(Debug)]`
 
 The shared front half of `validate` and the engine's pre-flight (§14:
 "plan parses cycle-free"): parse, load config, check the graph, resolve
 every routing chain. Executes nothing.
 
-## `pub struct Analysis` › `pub chains: Vec<ResolvedChain>,`
+## `pub chains: Vec<ResolvedChain>,`
 
 One resolved chain per task, aligned with `plan.tasks`.
 
-## `pub struct Analysis` › `pub gates: Vec<ShellGate>,`
+## `pub gates: Vec<ShellGate>,`
 
 Effective gates: `[[gates]]` verbatim, else derived from the repo's
 shape (§17) — the single derivation point for validate and the engine.
 
-## `pub struct CapturedInputs {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 Every file an [`Analysis`] is derived from, captured at one instant.
 
@@ -75,7 +70,7 @@ compares equal captures, concludes nothing moved, and adopts an analysis that
 depended on something outside the comparison. So this names all of them, and
 [`analyze_captured`] parses out of it rather than beside it.
 
-## `pub struct CapturedInputs` › `gate_inputs: Vec<config::FileSnapshot>,`
+## `gate_inputs: Vec<config::FileSnapshot>,`
 
 The worktree files the gate derivation looks at when `[[gates]]` does not
 spell the gates out: `Cargo.toml`, `go.mod`, and `package.json` beside
@@ -89,14 +84,22 @@ keep this list in step with `gates::derive` itself.
 The gate derivation's inputs, relative to the repo root — see
 [`CapturedInputs::gate_inputs`].
 
-## `impl CapturedInputs` › `pub fn capture(opts: &ValidateOptions) -> Self {`
+## `#[must_use]`
 
 Capture what an [`analyze`] with these options reads.
 
-## `impl CapturedInputs` › `pub fn paths(&self) -> Vec<PathBuf> {`
+## `pub fn paths(&self) -> Vec<PathBuf> {`
 
 Every captured file, in a stable order, for a caller that has to name
 them in a message.
+
+## `pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, UpstrokeError> {`
+
+Capture validation inputs and resolve the plan, configuration and task chains.
+
+# Errors
+Returns the contextual input, configuration, graph or adapter refusal from
+[`analyze_captured`], including any warnings gathered before it failed.
 
 ## `pub fn analyze_captured(`
 
@@ -115,10 +118,21 @@ are captured but not consumed. A caller that needs the derivation pinned runs
 this where the worktree cannot move — see the engine's pre-flight, which
 takes its answer under the worktree lease.
 
+# Errors
+Returns the captured input's read or parse error, a configuration refusal,
+an invalid task graph, or an unsupported pinned adapter. Warnings gathered
+before a refusal accompany its original category in
+[`UpstrokeError::WithWarnings`]; failures without warnings keep that category.
+
 ## `let raw = captured.plan.text()?.ok_or_else(|| UpstrokeError::Io {`
 
 Named off the capture rather than off `opts`, so an error cannot report a
 path other than the one that was actually read.
+
+## `Some(configured) => configured`
+
+Analysis retains the config and a separately owned executable
+gate list, so the names and commands are copied into that snapshot.
 
 ## `pub fn builtin_adapter(agent: &str) -> bool {`
 
@@ -141,11 +155,21 @@ today's table, not a property: §13 says the catalog ships ahead of support
 (Aider models are catalogued in v0.2 before its adapter lands), and the
 moment it does, this is what stops a preview from promising them.
 
-## `pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {` › `gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);`
+## `pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {`
+
+Build a zero-spend validation preview, including routing, gates and reviews.
+
+# Errors
+Returns an input, configuration, graph or adapter refusal from [`analyze`],
+or a refusal to construct the requested review plan. Warnings gathered
+before failure accompany the original typed error; successful previews
+return them in [`Report::warnings`].
+
+## `gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);`
 
 Zero-spend preview of the §14 gate pre-flight: warn, never refuse.
 
-## `pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {` › `let reviews = review::plan_for(`
+## `let reviews = match review::plan_for(`
 
 Who would judge the work (§11.2–§11.3), against the adapters this binary
 ships. A run asks the same question of the adapters its own harness
@@ -172,7 +196,7 @@ A run that exists but cannot be folded is not "no run" — and
 loud error the event-log design exists to produce, so swallowing it
 and reporting an empty repository hid two things at once.
 
-## `impl Report` › `pub fn render(&self) -> String {`
+## `pub fn render(&self) -> String {`
 
 The rendered preview.
 
@@ -180,7 +204,7 @@ The surface stays here — it is the one every caller names, and the one
 `effects/wrappers.toml` classifies under this module — while the table
 it produces is `render::report`.
 
-## `fn opts(plan: &str) -> ValidateOptions` › `static PATH: OnceLock<PathBuf> = OnceLock::new();`
+## `static PATH: OnceLock<PathBuf> = OnceLock::new();`
 
 A real, empty pools file: an explicit `--pools` that does not
 exist is a hard error, and `None` would reach for the
@@ -188,16 +212,20 @@ operator's own `~/.upstroke/pools.toml`.
 Created once: identical for every caller, and rewriting one
 shared path from parallel tests truncates it under a reader.
 
-## `mod tests` › `fn scratch_root(tag: &str) -> PathBuf {`
+## `fn scratch_root(tag: &str) -> PathBuf {`
 
 A scratch repo root of its own, so a test that rewrites its inputs
 cannot be read half-written by another running beside it.
 
-## `mod tests` › `fn opts_in(root: &Path, plan: &str) -> ValidateOptions {`
+## `fn opts_in(root: &Path, plan: &str) -> ValidateOptions {`
 
 [`opts`], rooted in `root` rather than in the shared hermetic directory.
 
-## `fn the_captured_set_names_every_file_an_analysis_reads()` › `let root = scratch_root("capturedset");`
+## `options.config_path = Some(PathBuf::from("fixtures/annotation-invalid-plan.md"));`
+
+This tracked Markdown fixture is deliberately invalid TOML.
+
+## `let root = scratch_root("capturedset");`
 
 Completeness is the property, and it is the one an incomplete capture
 silently loses: a caller comparing two equal captures concludes
@@ -205,63 +233,63 @@ nothing moved, so anything outside the comparison is free to move.
 The plan, the repo config, the pools file, and the three worktree
 files the gate derivation consults are the whole set.
 
-## `fn an_analysis_is_parsed_out_of_the_captured_plan_not_a_second_read_of_it() {` › `let root = scratch_root("capturedplan");`
+## `let root = scratch_root("capturedplan");`
 
 The plan is an input like any other, and it was the one an earlier
 capture left out. Same interleaving as the config's: capture, let the
 file become something else for exactly as long as the parse takes,
 restore it. What comes back has to describe the captured plan.
 
-## `fn a_gate_derivation_input_is_part_of_the_captured_set()` › `let root = scratch_root("capturedgates");`
+## `let root = scratch_root("capturedgates");`
 
 `gates::derive` takes a directory, so these three are captured rather
 than consumed — which makes it worth proving they are genuinely
 inputs, and that a change to one of them is a change the capture sees.
 
-## `fn a_pin_without_an_adapter_fails_validate_not_just_run()` › `let pins = vec![config::Pin {`
+## `let pins = vec![config::Pin {`
 
 Every catalogued agent has an adapter as of step 9, so the guard is
 driven directly rather than through a config file it can no longer be
 reached from. §13 ships the catalog ahead of adapter support, which is
 when this fires for real.
 
-## `fn a_pin_without_an_adapter_fails_validate_not_just_run()` › `let pins = vec![config::Pin {`
+## `let pins = vec![config::Pin {`
 
 And it passes what this build really does ship.
 
-## `fn the_preview_shows_who_reviews_without_promising_a_binary_it_cannot_probe() {` › `let root = env::temp_dir().join(format!("upstroke-validate-review-{}", std::process::id()));`
+## `let root = env::temp_dir().join(format!("upstroke-validate-review-{}", std::process::id()));`
 
 §18: `validate` and `--dry-run` execute nothing, so they cannot check
 that a named reviewer is installed. Saying "would be, if installed"
 is the difference between a plan and a promise.
 
-## `fn the_preview_shows_who_reviews_without_promising_a_binary_it_cannot_probe() {` › `let rotate = rendered`
+## `let rotate = rendered`
 
 The per-task decision belongs in the row that explains what this
 task's paths bought it — and only on the task whose paths matched.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
+## `assert!(`
 
 D2's seam is echoed even though nothing acts on it.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
+## `assert!(`
 
 §13's conservatism, visible: an unmeasured pool reads as unknown, and
 the block says that is not the same as full.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(`
+## `assert!(`
 
 A source the estimate did not read must not pass as accounted for.
 
-## `fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {` › `assert!(rendered.contains("never probes"), "rendered:\n{rendered}");`
+## `assert!(rendered.contains("never probes"), "rendered:\n{rendered}");`
 
 §18: this command executes nothing, and says which side of that line
 it is on rather than letting a preview read as a promise.
 
-## `fn derived_gates_appear_in_the_preview()` › `let report = run(&opts("fixtures/sample-plan.md")).expect("validates");`
+## `let report = run(&opts("fixtures/sample-plan.md")).expect("validates");`
 
 Hermetic root with no markers: no gates, still explicit.
 
-## `fn artifact_needed_from_a_non_dependency_warns()` › `let clean = run(&opts("fixtures/sample-plan.md")).expect("sample validates");`
+## `let clean = run(&opts("fixtures/sample-plan.md")).expect("sample validates");`
 
 The sample plan wires artifacts along its dependency chain — silent.

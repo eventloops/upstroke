@@ -2,9 +2,7 @@
 
 Extended notes for [`src/plan/markdown.rs`](../../../src/plan/markdown.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+These notes preserve the module comments after the annotation repairs. Item headings quote source lines for navigation.
 
 ## Module
 
@@ -17,7 +15,7 @@ the heuristics;
 annotations are read from pulldown-cmark HTML events, never regexed out of
 raw text. Unknown annotation attributes warn and never error.
 
-### The concerns are private children; this module is their facade
+# The concerns are private children; this module is their facade
 
 `sections` finds the heading boundaries, `annotation` extracts and parses
 the upstroke comments, `hints` harvests path mentions, `drafts` turns
@@ -27,26 +25,35 @@ direction is one-way and acyclic: `annotation`, `hints` and `sections` feed
 `drafts`; `drafts` and `hints` feed `assemble`; every child feeds this
 module and none of them is reachable from outside it.
 
-The one thing that flows the other way is `md_options`, the single
-`pulldown_cmark::Options` value every child parses with — it stays here so
-that the three parse sites cannot drift apart.
+`md_options` supplies the same parser options to every child. `parser_source`
+makes lone-CR line boundaries visible to the parser without moving source
+byte offsets. Both stay here so the three walks use the same input rules.
+
+## `fn parser_source(raw: &str) -> Cow<'_, str> {`
+
+pulldown-cmark 0.13.4's HTML-block scanner advances only at LF, although
+its paragraph scanner also recognizes lone CR. Give every walk the same
+line boundaries. Replacing a lone ASCII CR by LF keeps byte ranges valid
+against the original source used for bodies and the input hash. CRLF is
+already supported and stays unchanged. The owned copy exists only when
+this parser boundary needs normalization.
 
 ## `fn is_ordered_item(line: &str) -> bool {`
 
 `1. step` / `1) step` — Claude Code plan mode often writes numbered steps.
 
-## `fn bare_fixture_uses_heuristics()` › `assert!(tasks[0].depends_on.is_empty());`
+## `assert!(tasks[0].depends_on.is_empty());`
 
 Document-order dependencies: task N depends on task N-1.
 
-## `fn bare_fixture_uses_heuristics()` › `assert_eq!(parsed.plan.artifacts.len(), 1);`
+## `assert_eq!(parsed.plan.artifacts.len(), 1);`
 
 Bare plan with a Design task gets the default conventions brief.
 
-## `fn malformed_attribute_and_bad_values_warn()` › `assert_eq!(parsed.plan.tasks[0].suggested_tier, None);`
+## `assert_eq!(parsed.plan.tasks[0].suggested_tier, None);`
 
 Bad values fall back rather than erroring.
 
-## `fn acceptance_heading_forms_arm_without_becoming_tasks()` › `let parsed = parse("## Task\n\n#### Done when\n- it works\n");`
+## `let parsed = parse("## Task\n\n#### Done when\n- it works\n");`
 
 Deeper heading form inside a section arms too.

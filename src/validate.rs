@@ -111,14 +111,19 @@ pub fn analyze_captured(
         plan,
         warnings: mut all_warnings,
     } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
-    let config = config::load_captured(&captured.config, opts.engine_limits, &mut all_warnings)?;
-    graph::check_graph(&plan, &mut all_warnings)?;
-    let config_path = || {
-        opts.config_path
-            .clone()
-            .unwrap_or_else(|| opts.config_root.join("upstroke.toml"))
-    };
-    check_pin_adapters(&config.pins, builtin_adapter, &config_path())?;
+    let config =
+        match config::load_captured(&captured.config, opts.engine_limits, &mut all_warnings) {
+            Ok(config) => config,
+            Err(error) => return Err(error.with_warnings(all_warnings)),
+        };
+    if let Err(error) = graph::check_graph(&plan, &mut all_warnings) {
+        return Err(error.with_warnings(all_warnings));
+    }
+    let default_config_path = opts.config_root.join("upstroke.toml");
+    let config_path = opts.config_path.as_deref().unwrap_or(&default_config_path);
+    if let Err(error) = check_pin_adapters(&config.pins, builtin_adapter, config_path) {
+        return Err(error.with_warnings(all_warnings));
+    }
     let chains: Vec<ResolvedChain> = plan
         .tasks
         .iter()
@@ -185,22 +190,25 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
     let analysis = analyze(opts)?;
     let mut warnings = analysis.warnings;
     gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);
-    let reviews = review::plan_for(
+    let reviews = match review::plan_for(
         &analysis.plan,
         &analysis.chains,
         &analysis.config,
         builtin_adapter,
         &mut warnings,
-    )?;
+    ) {
+        Ok(reviews) => reviews,
+        Err(error) => return Err(error.with_warnings(warnings)),
+    };
     let rows = analysis
         .plan
         .tasks
         .iter()
-        .zip(&analysis.chains)
+        .zip(analysis.chains)
         .enumerate()
         .map(|(index, (task, chain))| {
             let second = reviews.second_opinion.get(index).and_then(Option::as_ref);
-            render::to_row(task, chain.clone(), second)
+            render::to_row(task, chain, second)
         })
         .collect();
     let (observations, run_id) = latest_run_observations(
@@ -215,7 +223,7 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
         capacity: render::capacity_echo(&analysis.config, &observations, run_id.as_deref()),
         review: render::review_echo(&reviews),
         effort: render::effort_echo(&analysis.config),
-        gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
+        gates: analysis.gates.into_iter().map(|gate| gate.name).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
@@ -309,6 +317,136 @@ mod tests {
         let mut opts = opts(plan);
         opts.config_root = root.to_path_buf();
         opts
+    }
+
+    #[test]
+    fn annotation_pass2_literal_quote_marker_does_not_create_a_duplicate_id() {
+        use crate::plan::PlanAdapter;
+
+        let parsed = plan::markdown::MarkdownPlanAdapter
+            .parse_with_warnings(
+                "## First\n<!-- upstroke: id=a -->\n\n## Second\n<!-- upstroke: >id=a -->\n",
+            )
+            .expect("an unknown annotation key must still parse");
+        let mut warnings = parsed.warnings;
+        let result = graph::check_graph(&parsed.plan, &mut warnings);
+        assert!(result.is_ok(), "graph: {result:?}; warnings: {warnings:?}");
+        assert_eq!(parsed.plan.tasks[1].id.as_str(), "second");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown annotation attribute `>id`")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_pass2_lone_cr_quote_keeps_the_frontier_routing_floor() {
+        use crate::plan::PlanAdapter;
+
+        let parsed = plan::markdown::MarkdownPlanAdapter
+            .parse_with_warnings(
+                "## Fix bug\r> Context <!-- upstroke: id=a\r>min=frontier --> more.\r",
+            )
+            .expect("a plan with lone CR line endings must parse");
+        let options = opts("fixtures/bare-plan.md");
+        let config = config::load(
+            None,
+            &options.config_root,
+            options.pools_path.as_deref(),
+            &mut Vec::new(),
+        )
+        .expect("the isolated default config must load");
+        let chain = route::resolve(&parsed.plan.tasks[0], &config);
+        assert_eq!(
+            chain.rungs.first().map(|rung| rung.tier),
+            Some(crate::ir::Tier::Frontier),
+            "warnings: {:?}",
+            parsed.warnings
+        );
+        assert_eq!(
+            parsed.plan.tasks[0].min_tier,
+            Some(crate::ir::Tier::Frontier)
+        );
+        assert!(
+            parsed.warnings.is_empty(),
+            "warnings: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn annotation_pass2_graph_refusal_preserves_the_unknown_attribute_warning() {
+        let error = analyze(&opts("fixtures/annotation-invalid-plan.md"))
+            .expect_err("the duplicate task IDs must refuse validation");
+        let rendered = error.to_string();
+        assert!(rendered.contains("duplicate task id `a`"), "{rendered}");
+        assert!(
+            rendered.contains("unknown annotation attribute `wibble`"),
+            "the refusal must retain the gathered warning: {rendered}"
+        );
+    }
+
+    #[test]
+    fn annotation_warnings_survive_config_refusal_without_changing_a_clean_error_variant() {
+        for (plan, warned) in [
+            ("fixtures/annotation-invalid-plan.md", true),
+            ("fixtures/bare-plan.md", false),
+        ] {
+            let mut options = opts(plan);
+            options.config_path = Some(PathBuf::from("fixtures/annotation-invalid-plan.md"));
+            let error = analyze(&options).expect_err("Markdown is not a TOML config");
+            if warned {
+                let UpstrokeError::WithWarnings(bundle) = &error else {
+                    panic!("the parser warning must accompany the config refusal");
+                };
+                assert!(matches!(
+                    bundle.error.as_ref(),
+                    UpstrokeError::Config { .. }
+                ));
+                assert_eq!(
+                    error
+                        .to_string()
+                        .matches("unknown annotation attribute `wibble`")
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(matches!(error, UpstrokeError::Config { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_warnings_reach_successful_previews_and_review_planning_refusals_once() {
+        let mut options = opts("fixtures/annotation-warning-plan.md");
+        let rendered = run(&options)
+            .expect("an unknown attribute does not refuse a valid plan")
+            .render();
+        assert_eq!(
+            rendered
+                .matches("unknown annotation attribute `wibble`")
+                .count(),
+            1
+        );
+        options.config_path = Some(PathBuf::from("fixtures/annotation-review-conflict.toml"));
+        let error =
+            run(&options).expect_err("disabled review conflicts with a demanded second opinion");
+        let UpstrokeError::WithWarnings(bundle) = &error else {
+            panic!("the annotation warning must accompany the review-planning refusal");
+        };
+        assert!(matches!(
+            bundle.error.as_ref(),
+            UpstrokeError::Refused { .. }
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("turns review off"), "{rendered}");
+        assert_eq!(
+            rendered
+                .matches("unknown annotation attribute `wibble`")
+                .count(),
+            1
+        );
     }
 
     #[test]

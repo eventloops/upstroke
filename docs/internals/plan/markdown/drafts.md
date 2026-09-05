@@ -2,9 +2,7 @@
 
 Extended notes for [`src/plan/markdown/drafts.rs`](../../../../src/plan/markdown/drafts.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+These notes preserve the module comments after the annotation repairs. Item headings quote source lines for navigation.
 
 ## Module
 
@@ -22,28 +20,47 @@ The confluence of the DAG: [`super::sections`], [`super::annotation`] and
 [`super::hints`] all feed it, and [`super::assemble`] consumes what it
 produces.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut annotation_spans: Vec<Range<usize>> = Vec::new();`
+## `let Some(slice) = raw.get(section.content.clone()) else {`
+
+The range came from `split_sections`' own walk of `raw`, so it lies on
+event boundaries of this text; answering its absence beats a panic on a
+plan file.
+
+## `let mut annotation_spans: Vec<Range<usize>> = Vec::new();`
 
 Spans of upstroke annotation comments (slice-relative), removed from body.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut armed = false;`
+## `let mut armed = false;`
 
 An `Acceptance:` paragraph or heading arms the next list.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `let mut item_slots: Vec<usize> = Vec::new();`
+## `let mut item_slots: Vec<usize> = Vec::new();`
 
 Slots in `draft.acceptance`, one per open item, so a criterion with a
 nested sub-list keeps both its own text and the children, in order.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `if let Event::Html(t) | Event::InlineHtml(t) = &event {`
+## `for comment in html.observe(&event, &range, &normalized) {`
 
-HTML accumulates across events; everything else flushes it first.
+The accumulator sees every event and hands a comment back once the
+HTML block or inline construct holding it is complete.
 
-## `pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {` › `Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,`
+## `Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,`
 
 Blocks that end an acceptance run; HTML comments and headings
 deliberately do not, so an invisible annotation between the
 header and its list cannot silently disarm collection.
+
+## `draft.body = match strip_spans(slice, &annotation_spans) {`
+
+The spans are the comments' own source bytes, mapped by the accumulator
+through the ranges the parser reported, so a refusal here is a defect in
+that mapping and not in the plan; the body is kept whole and says so.
+
+## `fn open_criterion<'a>(`
+
+The criterion the innermost open acceptance item is collecting into. The
+slots are indices pushed when the item opened, each beside the criterion
+it names, so the lookup cannot miss; answering absence keeps it total.
 
 ## `pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {`
 
@@ -52,6 +69,24 @@ Fallback when a plan has no `##`/`###` sections: top-level checklist items
 plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
 would false-positive. Nested content joins the body.
 
-## `pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {` › `Event::SoftBreak | Event::HardBreak => {`
+## `Some((draft, sink)) => {`
+
+The body is built from the text events, which an HTML
+block never produces, so the span the sink returns has
+nothing to cut here — and the prose an unterminated
+comment swallowed is put back from the original source,
+preserving its line endings and container prefixes too.
+
+## `None => {`
+
+Top-level HTML before, between or after the items belongs
+to no task; an annotation there would bind to nothing.
+
+## `Event::SoftBreak | Event::HardBreak => {`
 
 A wrapped title must not run its words together.
+
+## `for comment in html.finish() {`
+
+Every block is closed by the parser; the contract is that nothing fed
+to the accumulator goes unreported.
