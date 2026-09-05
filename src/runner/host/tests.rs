@@ -340,7 +340,9 @@ fn a_reserved_key_the_base_does_not_carry_is_not_supplied() {
 #[test]
 fn a_reserved_key_in_the_overlay_is_a_preflight_error() {
     // Written out from DESIGN.md:260-262 ("role-scoped HOME, PATH, and
-    // credential locations") and capacity.rs:36-37, not read from
+    // credential locations"). The "Credential profiles" section of
+    // `docs/internals/capacity.md` names CLAUDE_CONFIG_DIR and COPILOT_HOME,
+    // two of the three vendor entries. This list is independent of
     // `reserved_keys()`.
     let expected_reserved = [
         "PATH",
@@ -1251,7 +1253,8 @@ fn the_base_of_a_process_environment_is_the_process_environment() {
 fn the_credential_location_is_the_bound_agents_and_no_others_value() {
     let environment = HostEnvironment::with_base(synthetic_base(), KeyCase::current());
     // An independent table: adapter id -> the vendor's config-directory
-    // variable (capacity.rs:36-37 for two of the three).
+    // variable. The "Credential profiles" section of `docs/internals/capacity.md`
+    // names CLAUDE_CONFIG_DIR and COPILOT_HOME, two of the three entries.
     for (agent, key, expected) in [
         ("claude-code", "CLAUDE_CONFIG_DIR", "/home/upstroke/.claude"),
         ("copilot", "COPILOT_HOME", "/home/upstroke/.copilot"),

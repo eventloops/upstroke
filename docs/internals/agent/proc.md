@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/proc.rs`](../../../src/agent/proc.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/proc.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` and `INV-18` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -241,7 +247,7 @@ The pipe reader, out of line in `proc/drain.rs`, with the predicate the
 supervisor asks it for. Both are visible in `proc` and its descendants,
 exactly as they were when they were private items of this file.
 
-## `fn kill_tree(terminate_site: ProcessSite, child: &mut ProcessTree) -> Result<(), Upstroke…`
+## `fn kill_tree`
 
 Kill the whole process tree. Killing only the direct child is not enough
 when it is a `cmd.exe` shim: the real agent process would survive, keep
@@ -485,7 +491,7 @@ an oracle independent of the spawn path it checks.
 
 A borrowed process handle with query and synchronise rights.
 
-## `pub(super) fn process_alive(pid: u32, expected_creation_tim…` › `return false;`
+## `fn process_alive` › `return false;`
 
 The pid was reused: whatever is running under it now is not the
 process the caller asked about.
@@ -527,7 +533,7 @@ portion.
 The expected mapping is Win32's, written here, not read from the
 code under test.
 
-## `fn the_ambient_join_reads_a_win32_bool_the_way_win32_define…` › `for value in [1_i32, -1, i32::MIN, i32::MAX] {`
+## `fn the_ambient_join_reads_a_win32_bool_the_way_win32_defines_one` › `for value in [1_i32, -1, i32::MIN, i32::MAX] {`
 
 Every other value is success. Each of these creates a real job
 object this process is deliberately *not* a member of; the
@@ -552,11 +558,11 @@ at all — with the suite green.
 Both failures are unreachable on a working machine, which is why
 they need the seam rather than a fixture.
 
-## `fn the_ambient_job_refuses_when_it_cannot_be_created_or_con…` › `let configured = Cell::new(false);`
+## `fn the_ambient_job_refuses_when_it_cannot_be_created_or_configured` › `let configured = Cell::new(false);`
 
 A job that cannot be created is not configured and not joined.
 
-## `fn the_ambient_job_refuses_when_it_cannot_be_created_or_con…` › `let refused = create_ambient_with(`
+## `fn the_ambient_job_refuses_when_it_cannot_be_created_or_configured` › `let refused = create_ambient_with(`
 
 A job that cannot be configured is refused, not kept: without
 KILL_ON_JOB_CLOSE the ambient job terminates nothing on
@@ -608,7 +614,7 @@ the life of the process. The bound is asserted from outside, on a
 worker thread, so an unbounded loop fails this test with a named
 message instead of hanging the whole binary.
 
-## `fn child_exited_unreaped(child: &Child) -> std::io::Result<…` › `Ok(matches!(`
+## `fn child_exited_unreaped` › `Ok(matches!(`
 
 WEXITED should filter non-terminal transitions, but Darwin can leave a
 stopped/continued record observable around job-control delivery. Never
@@ -704,7 +710,7 @@ Preserve every host-owned stop disposition. Each remaining default
 terminal stop is proxied, and the policy check above guarantees the
 matching default SIGCONT can release the isolated groups again.
 
-## `fn prepare_monitor_signal_mask(policy: SignalPolicy) -> Res…` › `unsafe {`
+## `fn prepare_monitor_signal_mask` › `unsafe {`
 
 An embedding host may have blocked SIGCONT on the thread that first
 called Upstroke, and new threads inherit that mask. SIGCONT still wakes
@@ -862,19 +868,19 @@ retain a FIFO writer until it exits, so EOF is not a trustworthy
 parent-liveness signal on Darwin. Reparenting is authoritative
 and lets this fork-only helper settle independently.
 
-## `fn cleanup_reaper_group(pgid: i32, anchor: libc::pid_t, cle…` › `unsafe {`
+## `fn cleanup_reaper_group` › `unsafe {`
 
 Signal the kernel-owned group identity first. Even if the platform's
 membership scanner subsequently becomes unavailable, no owned
 process can keep running or spending while cleanup waits fail-closed.
 
-## `fn cleanup_reaper_group(pgid: i32, anchor: libc::pid_t, cle…` › `let mut delay_left = cleanup_delay_ms;`
+## `fn cleanup_reaper_group` › `let mut delay_left = cleanup_delay_ms;`
 
 Test subprocesses can widen the otherwise tiny post-crash window so
 the reaper-owned cleanup lease is asserted deterministically.
 Release builds always pass zero and pay no delay.
 
-## `fn cleanup_reaper_group(pgid: i32, anchor: libc::pid_t, cle…` › `while group_has_non_zombie_members(pgid) != Some(false) {`
+## `fn cleanup_reaper_group` › `while group_has_non_zombie_members(pgid) != Some(false) {`
 
 The stopped anchor pins the PGID until it becomes our unreaped
 zombie. Only release the reaper-owned run-cleanup lease once every
@@ -942,19 +948,19 @@ byte first. A reaper that came up after its READY deadline has that
 stale byte queued ahead of its CANCEL acknowledgement; judging the first
 byte alone failed a cancel the reaper had accepted (`C-004`).
 
-## `fn spawn_guard(policy: SignalPolicy) -> Result<Guard, Strin…` › `let exit_before_ready = std::env::var("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY")`
+## `fn spawn_guard` › `let exit_before_ready = std::env::var("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY")`
 
 A helper that ends before it writes READY; see the same seam in
 `spawn_reaper`. Read before fork: the multithreaded child may call
 only async-signal-safe primitives.
 
-## `fn spawn_guard(policy: SignalPolicy) -> Result<Guard, Strin…` › `let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };`
+## `fn spawn_guard` › `let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };`
 
 Resolve the descriptor ceiling before fork: sysconf may take libc
 locks, whereas the multithreaded child may call only async-safe
 primitives until it enters the guard loop.
 
-## `fn spawn_guard(policy: SignalPolicy) -> Result<Guard, Strin…` › `if !install_guard_dispositions(policy) {`
+## `fn spawn_guard` › `if !install_guard_dispositions(policy) {`
 
 Replace inherited host callbacks and clear the inherited mask as
 the first child-side action. Descriptor scrubbing can be long on
@@ -1042,7 +1048,7 @@ run a fork-copied callback against the guard's private
 memory; translate it into the same self-pipe wake as a
 default Upstroke-owned termination signal instead.
 
-## `fn close_inherited_fds(keep: &[libc::c_int], open_max: libc…` › `if close_ranges_except(keep) {`
+## `fn close_inherited_fds` › `if close_ranges_except(keep) {`
 
 The fork must not retain the run lock, event file, pipes, or secrets.
 Linux close_range keeps this bounded even when RLIMIT_NOFILE is in
@@ -1082,7 +1088,7 @@ A disappearing target-group pid is resolved by the next
 complete snapshot. Never turn an incomplete observation
 into permission to release the cleanup lease.
 
-## `fn create_cloexec_pipe() -> Result<[libc::c_int; 2], std::i…` › `let template = std::env::temp_dir().join(format!(".upstroke-pipe-{}-XXXXXX", unsafe {`
+## `fn create_cloexec_pipe` › `let template = std::env::temp_dir().join(format!(".upstroke-pipe-{}-XXXXXX", unsafe {`
 
 Darwin has no pipe2. Build the anonymous-equivalent channel from a
 FIFO inside an atomic, private mkdtemp directory: each endpoint is
@@ -1118,7 +1124,7 @@ the final close parenthesis is the only reliable field boundary.
 `/bin/ps` is a fixed base-system interface on macOS; no
 repository-controlled PATH entry can substitute for it.
 
-## `fn quiescent_snapshot_is_complete(groups: &[i32], observed:…` › `if unsafe { libc::kill(-*pgid, 0) } == 0`
+## `fn quiescent_snapshot_is_complete` › `if unsafe { libc::kill(-*pgid, 0) } == 0`
 
 A group that disappeared between SIGSTOP and the snapshot is
 already quiescent. Any other result means `ps` failed to account
@@ -1302,7 +1308,7 @@ a mounted named volume survives `rm --force --volumes`).
 Run `docker ps …` and read its ids into `buffer`, returning how many
 bytes arrived.
 
-## `fn list_labeled_containers(containers: &ReaperContainers, b…` › `if fds[1] != 1 && libc::dup2(fds[1], 1) < 0 {`
+## `fn list_labeled_containers` › `if fds[1] != 1 && libc::dup2(fds[1], 1) < 0 {`
 
 The reaper closed every inherited descriptor including 0, 1
 and 2, so `pipe` may well have handed back fd 0 and fd 1
@@ -1449,30 +1455,30 @@ Second field held constant: the private root and the incarnation are the
 same in every cell, so the only thing that moves is the **spelling of
 the program** — bare-and-resolvable, bare-and-absent, and a path.
 
-## `fn the_reaper_program_is_resolved_to_an_absolute_path_befor…` › `let rendered = render_container_argv(&scope("git")).expect("git is on PATH");`
+## `fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork` › `let rendered = render_container_argv(&scope("git")).expect("git is on PATH");`
 
 (1) A bare name that `PATH` resolves. `git` rather than `docker`
 because the property is about resolution and every machine that
 builds this repository has git; `util::find_program_resolves_real_
 tools_and_misses_fake_ones` is where that is already relied on.
 
-## `fn the_reaper_program_is_resolved_to_an_absolute_path_befor…` › `let argv0 = unsafe { std::ffi::CStr::from_ptr(rendered.ps_argv[0]) };`
+## `fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork` › `let argv0 = unsafe { std::ffi::CStr::from_ptr(rendered.ps_argv[0]) };`
 
 `argv[0]` is the resolved path too, so the string the child execs and
 the string it reports itself as cannot drift apart.
 
-## `fn the_reaper_program_is_resolved_to_an_absolute_path_befor…` › `let absent = scope("upstroke-definitely-not-a-real-docker");`
+## `fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork` › `let absent = scope("upstroke-definitely-not-a-real-docker");`
 
 (2) A bare name `PATH` cannot resolve is refused, while there is
 still somewhere to report it: a reaper has no error channel.
 
-## `fn the_reaper_program_is_resolved_to_an_absolute_path_befor…` › `assert!(`
+## `fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork` › `assert!(`
 
 And the refusal reaches the caller that arms the reaper, which is the
 only place with an error channel. Nothing is installed on this path,
 so no other test in this process inherits a scope.
 
-## `fn the_reaper_program_is_resolved_to_an_absolute_path_befor…` › `let rendered = render_container_argv(&scope("/usr/bin/docker")).expect("a path");`
+## `fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork` › `let rendered = render_container_argv(&scope("/usr/bin/docker")).expect("a path");`
 
 (3) A name carrying a separator is a path and is used verbatim —
 exactly `execvp`'s own rule, and what `execv` already does correctly.
@@ -1482,7 +1488,7 @@ exactly `execvp`'s own rule, and what `execv` already does correctly.
 A scratch directory, a recording `docker` stub, and the rendered
 argument vectors that name it.
 
-## `fn reaper_stub(tag: &str, script: &str) -> (std::path::Path…` › `let scope = crate::runner::container::census::ReaperContainerScope::new(`
+## `fn reaper_stub` › `let scope = crate::runner::container::census::ReaperContainerScope::new(`
 
 The stub finds its own scratch directory through `dirname $0`,
 so nothing about this fixture depends on process-wide state and
@@ -1545,7 +1551,7 @@ on — so a loop that could not end would turn "docker is wedged" into
 Second field held constant: the id set, which never changes; only
 the number of times the reaper is willing to ask about it moves.
 
-## `fn a_runtime_that_keeps_answering_the_same_listing_ends_the…` › `let (dir, rendered) = reaper_stub(`
+## `fn a_runtime_that_keeps_answering_the_same_listing_ends_the_loop` › `let (dir, rendered) = reaper_stub(`
 
 The stub answers with the same two ids twice and then with
 nothing. The third listing is what makes this fixture finite: an
@@ -1553,7 +1559,7 @@ implementation with **no** no-progress guard still terminates
 here, and is caught by the counts rather than by a hang, because
 a test that measures a missing bound by hanging measures nothing.
 
-## `fn a_runtime_that_keeps_answering_the_same_listing_ends_the…` › `assert_eq!(`
+## `fn a_runtime_that_keeps_answering_the_same_listing_ends_the_loop` › `assert_eq!(`
 
 Two listings: the first is acted on, the second is recognised as
 the same answer and ends the loop **there** — the third listing,
@@ -1581,7 +1587,7 @@ Witnessed against two mutations: the `WIFSIGNALED` and
 `WIFEXITED` arms swapped, and `kill_errno` replaced by a constant
 `0`. Each fails a named case below.
 
-## `fn a_helper_ending_is_described_by_what_the_kill_and_the_wa…` › `let exited_one = 1 << 8;`
+## `fn a_helper_ending_is_described_by_what_the_kill_and_the_wait_answered` › `let exited_one = 1 << 8;`
 
 `waitpid` fills a status word, so the fixtures are built the
 way the kernel builds them rather than by the code under test.

@@ -2,9 +2,10 @@
 
 Extended notes for [`src/agent/bin.rs`](../../../src/agent/bin.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/bin.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
 
 ## Module
 
@@ -122,7 +123,7 @@ to DESIGN.md:222 rather than to this function.
 
 [`UpstrokeError::Refused`] when the resolved path is not valid Unicode.
 
-## `pub fn boundary_refused(name: &str, install_hint: &str, cause: &UpstrokeError) -> Upstrok…`
+## `fn boundary_refused`
 
 Rewrite a runner's refusal to execute `name` into something an operator can
 act on, saying **where** the CLI is missing.

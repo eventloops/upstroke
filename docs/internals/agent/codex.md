@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/codex.rs`](../../../src/agent/codex.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/codex.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` and `INV-20` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -115,7 +121,7 @@ The strict-config control must be rejected before the missing-schema guard.
 If it is not, a CLI has stopped enforcing the parser contract this probe
 relies on and an apparently successful effort-key check would mean nothing.
 
-## `const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config…`
+## `const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config"];`
 
 Flags `exec` must still advertise, checked at pre-flight.
 
@@ -151,45 +157,45 @@ The six strict-config parser probes: two surfaces x
 
 Every fixed ordinal above, for the uniqueness assertion.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `let fresh_help = runner.run(&probe_request(`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `let fresh_help = runner.run(&probe_request(`
 
 Fresh and resumed attempts are different CLI surfaces. Both carry
 the reasoning override, so both must prove `--config` before spend;
 only fresh attempts carry the sandbox.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `let models = runner.run(&probe_request(`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `let models = runner.run(&probe_request(`
 
 The strict local parser above proves the exact key and the two role
 policy values. The CLI's local catalog is separate zero-spend
 evidence for each model × effort pair, so require every known Codex
 model to expose every shared effort level before a run can start.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `json_output: true,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `json_output: true,`
 
 Asked for and parsed, unlike Copilot's route where the flag's
 existence would promise an envelope no caller reads.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `session_resume: true,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `session_resume: true,`
 
 `codex exec resume <id>` — proven to round-trip: the resumed turn
 returned the same `thread_id` and recalled the prior exchange.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `cost_reporting: false,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `cost_reporting: false,`
 
 Tokens, not dollars. See the module header — this is a decision
 about what upstroke is willing to claim, not a missing feature.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `acp: false,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `acp: false,`
 
 The CLI has `mcp-server` and `app-server`, neither of which is
 ACP, and this adapter spawns a process per attempt either way.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `model_list: true,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `model_list: true,`
 
 `debug models` is a local catalog rather than a network query;
 probe validated it above and discovery exposes its slugs.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `cli().spec(&build_args(run))`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `cli().spec(&build_args(run))`
 
 The working root comes from the process, not from `-C`: `exec resume`
 has no `-C`, and one mechanism that works for both shapes beats two
@@ -203,7 +209,7 @@ string `probe` certified. `build` being data-only used to force a
 second, non-spawning resolution path beside the probing one; there is
 now one path, and it is a function of its argument.
 
-## `impl AgentAdapter for CodexAdapter` › `fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError>…`
+## `impl AgentAdapter for CodexAdapter` › `fn discover`
 
 The one thing this CLI does better than either incumbent: it answers
 "am I signed in?" without spending anything.
@@ -383,12 +389,12 @@ Fold one `turn.completed`'s usage into the running total.
 an addition to it, so it is carried across rather than added in — summing
 both would double-count the thinking.
 
-## `fn add_usage(total: Option<Usage>, reported: Option<&Value>…` › `add(`
+## `fn add_usage` › `add(`
 
 Vendor names differ; the concepts line up. `cached_input_tokens` is a
 read from the cache, `cache_write_input_tokens` is a write into it.
 
-## `fn add_usage(total: Option<Usage>, reported: Option<&Value>…` › `total.num_turns = Some(total.num_turns.unwrap_or(0) + 1);`
+## `fn add_usage` › `total.num_turns = Some(total.num_turns.unwrap_or(0) + 1);`
 
 One `turn.completed` is one turn, so this counts them for free.
 
@@ -428,7 +434,7 @@ container runner it is not this machine's filesystem at all
 (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`). Skipping an unspawnable candidate is
 now the job of whatever resolves the name; so is `PATHEXT`.
 
-## `const INSTALL_HINT: &str = "Install the OpenAI Codex CLI there (npm install -g @openai/co…`
+## `const INSTALL_HINT`
 
 What to tell an operator whose boundary has no `codex`.
 
@@ -442,7 +448,7 @@ reached through the concrete type.
 Flags that would hand the agent the machine. §20 says none is ever
 passed, so the list exists to be asserted against.
 
-## `fn a_fresh_attempt_sets_its_sandbox_and_a_resumed_one_must_…` › `let fresh = build_args(&run(PermissionMode::Edit, None));`
+## `fn a_fresh_attempt_sets_its_sandbox_and_a_resumed_one_must_not` › `let fresh = build_args(&run(PermissionMode::Edit, None));`
 
 The CLI's two shapes, which are not one shape with a flag swapped.
 `exec resume` rejects `-s` outright — observed as exit 2, "unexpected
@@ -450,7 +456,7 @@ argument '-s' found" — because the sandbox belongs to the session and
 is inherited. Passing it anyway would fail every same-rung retry for
 a reason that has nothing to do with the code.
 
-## `fn a_profile_without_an_effort_passes_none_rather_than_gues…` › `let mut run = run(PermissionMode::Edit, None);`
+## `fn a_profile_without_an_effort_passes_none_rather_than_guessing` › `let mut run = run(PermissionMode::Edit, None);`
 
 Only reachable from a hand-built profile: the engine sets an effort
 on every profile it makes. Passing a guess here would be worse than
@@ -468,7 +474,7 @@ prompt's own arguments.
 And the payload is actually written, or the CLI sits waiting on a
 pipe nobody closed.
 
-## `fn an_implementer_is_refused_where_no_sandbox_can_enforce_i…` › `let err = edit_refusal(&profile(PermissionMode::Edit))`
+## `fn an_implementer_is_refused_where_no_sandbox_can_enforce_it` › `let err = edit_refusal(&profile(PermissionMode::Edit))`
 
 Windows has no sandbox helper (`codex doctor`: `linux helper: none`),
 so `exec` degrades to read-only and writes nothing while returning 0.
@@ -477,7 +483,7 @@ on empty diffs and then parked asking for write access it had been
 granted. A capability this platform cannot deliver is a refusal to
 start (§19), not a task that fails after spending.
 
-## `fn an_implementer_is_refused_where_no_sandbox_can_enforce_i…` › `assert!(text.contains("Linux"), "{text}");`
+## `fn an_implementer_is_refused_where_no_sandbox_can_enforce_it` › `assert!(text.contains("Linux"), "{text}");`
 
 And where to go instead: Linux, or another agent.
 
@@ -488,12 +494,12 @@ wrote inside the workspace and was blocked outside it, both measured
 in a container. The refusal above is scoped to the platform that
 cannot enforce a boundary, not to the CLI.
 
-## `fn a_reviewer_is_read_only_and_nothing_is_ever_given_the_ma…` › `assert!(edit_refusal(&profile(PermissionMode::ReadOnly)).is_none());`
+## `fn a_reviewer_is_read_only_and_nothing_is_ever_given_the_machine` › `assert!(edit_refusal(&profile(PermissionMode::ReadOnly)).is_none());`
 
 Never refused anywhere: read-only is enforced on every platform, and
 it is the seat this adapter is most useful in.
 
-## `fn a_successful_run_yields_its_session_message_and_tokens()` › `let stdout = r#"{"type":"thread.started","thread_id":"019ff122-4d61-7323-a217-843ddfe5932…`
+## `fn a_successful_run_yields_its_session_message_and_tokens()` › `let stdout = r#"{"type":"thread.started","thread_id":"019ff122-4d61-7323-a217-843ddfe5932c"}`
 
 The real event stream, from a tool-using run against codex-cli
 0.147.0 on 2026-08-11.
@@ -513,7 +519,7 @@ A reviewer's verdict travels in exactly this field.
 Tokens, never a price: this route reports no dollars and upstroke does
 not own a rate table.
 
-## `fn several_turns_are_summed_rather_than_last_wins()` › `let stdout = r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2,"re…`
+## `fn several_turns_are_summed_rather_than_last_wins()` › `let stdout = r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2,"reasoning_output_tokens":1}}`
 
 One invocation emits one `turn.completed` today, tool call and all.
 This is the guard for a version that reports per step, where taking
@@ -523,7 +529,7 @@ the last would silently under-count the run.
 
 Carried, not double-counted: reasoning tokens are a subset of output.
 
-## `fn an_unauthenticated_run_is_an_agent_error_not_an_exhauste…` › `let stdout = r#"{"type":"thread.started","thread_id":"t1"}`
+## `fn an_unauthenticated_run_is_an_agent_error_not_an_exhausted_pool` › `let stdout = r#"{"type":"thread.started","thread_id":"t1"}`
 
 Observed: five 401 retries then exit 101. The ladder acts on this
 distinction — a rate limit defers and waits for a window, an agent
@@ -602,18 +608,18 @@ The invocation is built with [`Invocation::at`] rather than named, so
 this drives the six config probes over an absolute program without
 depending on what this machine has installed.
 
-## `fn the_six_config_parser_probes_are_six_distinct_identities…` › `assert!(`
+## `fn the_six_config_parser_probes_are_six_distinct_identities` › `assert!(`
 
 And they are the probe form naming this agent, so a "distinct" set
 cannot be six values of some other shape.
 
-## `fn the_six_config_parser_probes_are_six_distinct_identities…` › `let resumed = runner`
+## `fn the_six_config_parser_probes_are_six_distinct_identities` › `let resumed = runner`
 
 The two surfaces are really two: the resumed one carries `resume`
 and the fresh one does not, so the six requests are six *different*
 processes and not one repeated six times.
 
-## `fn the_six_config_parser_probes_are_six_distinct_identities…` › `let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();`
+## `fn the_six_config_parser_probes_are_six_distinct_identities` › `let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();`
 
 No computed ordinal may land on a declared one, which is the other
 way this block can collide.
@@ -636,7 +642,7 @@ domain at once, against the requests rather than against the table.
 Both entry points, because `probe` and `discover` are separately
 droppable and each has its own ordinals: ten and two.
 
-## `fn preflight_starts_exactly_the_processes_the_ordinal_table…` › `let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();`
+## `fn preflight_starts_exactly_the_processes_the_ordinal_table_declares` › `let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();`
 
 Every ordinal actually used is one the table declares. The table is
 the expected value here and the requests are the result, which is
@@ -654,7 +660,7 @@ resolution memoised in a process-wide cell — which is what this adapter
 had — is invisible to any test that constructs one runner, and would
 hand the second boundary the first one's answer.
 
-## `fn every_preflight_process_names_the_cli_at_whichever_bound…` › `let programs = first.programs();`
+## `fn every_preflight_process_names_the_cli_at_whichever_boundary_is_asked` › `let programs = first.programs();`
 
 `codex`, written here rather than read from `CLI`: a constant
 compared against itself proves nothing.

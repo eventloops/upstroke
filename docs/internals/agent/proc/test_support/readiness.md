@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/proc/test_support/readiness.rs`](../../../../../src/agent/proc/test_support/readiness.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/proc/test_support/readiness.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -86,7 +92,9 @@ under the `-D warnings` the gate runs with:
 
 `effects/allowlist.toml` records the lint and the exact number of sites, and
 `effects::tests::the_readiness_expectations_are_per_site_and_both_records_say_so`
-asserts the file, the row and the prose agree. The rule that admits a
+asserts the source attributes, the row and these notes agree. The two censuses
+read the count from these notes; the source keeps its header pointer and lint
+attributes. The rule that admits a
 per-site `#[expect]` below module level at all is the lints paragraph of
 `standards/02_standards_automated_baseline.md`: the allowlist's own
 mechanism otherwise permits an allowance only as module-level attributes,
@@ -260,7 +268,7 @@ not ambiguous with a one-field record truncated to nothing, because
 [`std::io::Error`] from the read, and `UnexpectedEof` for content
 that does not end with the terminator.
 
-## `pub(crate) fn await_signal(signal: &Path, producer: &mut Child, bound: Duration) -> Waite…`
+## `fn await_signal`
 
 Await a file-shaped readiness signal from `producer`, bounded by
 `bound`.
@@ -270,7 +278,7 @@ liveness fact there is: without it a producer that died before
 publishing is indistinguishable from a slow one, and the waiter
 reports the clock instead of the death.
 
-## `pub(crate) fn await_signal(signal: &Path, producer: &mut Ch…` › `if signal.exists() {`
+## `fn await_signal` › `if signal.exists() {`
 
 One last look. The producer may have published and
 then exited between the stat above and this call, and

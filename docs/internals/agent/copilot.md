@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/copilot.rs`](../../../src/agent/copilot.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/copilot.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -101,36 +107,36 @@ are two.
 
 Every ordinal above, for the uniqueness assertion.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `json_output: false,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `json_output: false,`
 
 False even if a JSON flag exists: `Caps` describes what this
 adapter's route delivers, and Route A neither asks for JSON nor
 parses it. Reporting the flag would promise a structured envelope
 no caller could read.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `session_resume: has("--resume"),`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `session_resume: has("--resume"),`
 
 Optional capabilities stay pessimistic. Required surfaces were
 proven above; an unreadable help is a refusal, not permission to
 assume support.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `cost_reporting: false,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `cost_reporting: false,`
 
 No JSON envelope on this route, so nothing reports spend. The
 ledger says so rather than recording zero (§13).
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `read_only_mode: true,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `read_only_mode: true,`
 
 No single flag; achieved by denying the write and shell tools.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `cli().spec(&build_args(run))`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `cli().spec(&build_args(run))`
 
 No `current_dir`: the runner owns cwd (DESIGN.md:118). No
 resolution either: `cli()` names the CLI and the runner decides
 which file that is, so this and `probe` send one program string by
 construction.
 
-## `impl AgentAdapter for CopilotAdapter` › `fn discover(&self, _runner: &dyn Runner, caps: &Caps) -> Result<Discovery, UpstrokeError>…`
+## `impl AgentAdapter for CopilotAdapter` › `fn discover`
 
 Honestly, almost nothing — and the same pessimistic temperament as this
 adapter's `Caps`.
@@ -147,13 +153,13 @@ here, and it still is: [`Caps::model_list`] gates any future
 enumeration, so the day this CLI grows one, `connect` starts
 cross-checking the catalog without another decision being made.
 
-## `fn discover(&self, _runner: &dyn Runner, caps: &Caps) -> Re…` › `let invocation = cli();`
+## `fn discover` › `let invocation = cli();`
 
 Named rather than located: this reports on the CLI a run would
 execute, and which file that is belongs to the boundary that
 executes it. Nothing here asks this machine what it has.
 
-## `fn discover(&self, _runner: &dyn Runner, caps: &Caps) -> Re…` › `Ok(discovery)`
+## `fn discover` › `Ok(discovery)`
 
 §13 gives Copilot two billing shapes — credits (post-Jun 2026) and
 legacy premium requests — and nothing this CLI prints distinguishes
@@ -218,7 +224,7 @@ Reading is not granted explicitly because this CLI allows the working
 directory by default and `--add-dir` is what widens that; the engine never
 widens it, so an agent sees the workspace and nothing else.
 
-## `pub fn permission_args(profile: &WorkerProfile, gate_cmds: …` › `args.push("--deny-tool=write".to_owned());`
+## `fn permission_args` › `args.push("--deny-tool=write".to_owned());`
 
 Denied rather than merely not-allowed: a reviewer that edits the
 code it is judging invalidates the verdict, and one that runs
@@ -262,7 +268,7 @@ One name, not a platform-dependent candidate list: choosing between
 `copilot.exe`, `copilot.cmd` and `copilot.bat` was a filesystem lookup, and
 this adapter no longer performs one. See [`Invocation::named`].
 
-## `const INSTALL_HINT: &str = "Install the GitHub Copilot CLI there (npm install -g @github/…`
+## `const INSTALL_HINT`
 
 What to tell an operator whose boundary has no `copilot`.
 
@@ -324,7 +330,7 @@ version numbers, so a cap of 3 would collide with `gpt-5.3-codex` and
 the substitution check below would fail on the model rather than on a
 turn cap that leaked.
 
-## `fn a_successful_run_carries_its_response_as_the_detail()` › `let verdict = "json\n{\"pass\": true, \"reasons\": [\"ok\"]}\n";`
+## `fn a_successful_run_carries_its_response_as_the_detail()` › `let verdict =`
 
 The reviewer's verdict travels in exactly this field on the SUCCESS
 path — leaving it empty makes every review unparseable (step-6 #1).

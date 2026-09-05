@@ -728,8 +728,10 @@ mod tests {
     /// Second field held constant: the role is `Implement` throughout, so what
     /// varies is only which key is offered. The expected list is written from
     /// DESIGN.md:260 ("role-scoped `HOME`, `PATH`, and credential locations")
-    /// and `src/capacity.rs:36-37`'s naming of the three vendor variables — not
-    /// read back from `reserved_keys()`, which is the function this pins.
+    /// and the "Credential profiles" section of `docs/internals/capacity.md`,
+    /// which names CLAUDE_CONFIG_DIR and COPILOT_HOME, two of the three vendor
+    /// variables. CODEX_HOME is the Codex CLI equivalent. The expected list is
+    /// independent of `reserved_keys()`, which is the function this pins.
     #[test]
     fn the_reserved_key_enumeration_is_the_hosts_and_not_a_second_list() {
         const EXPECTED: &[&str] = &[

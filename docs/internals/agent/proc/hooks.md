@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/proc/hooks.rs`](../../../../src/agent/proc/hooks.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/proc/hooks.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -71,7 +77,7 @@ funnel knows the pid before it dies.
 
 What production passes: nothing is armed and nothing is recorded.
 
-## `pub(super) fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), UpstrokeEr…`
+## `pub(super) fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), UpstrokeError> {`
 
 Do what a hook answered.
 
@@ -81,7 +87,7 @@ running any cleanup** still leaves no host process, and both of those run
 destructors — including the one that closes the very job handle whose
 close-on-death is the mechanism.
 
-## `pub(super) fn apply_io(injection: Injection, point: SubEffectPoint) -> std::io::Result<()…`
+## `fn apply_io`
 
 [`apply`] for the funnel steps whose only declared mode is `Kill`.
 

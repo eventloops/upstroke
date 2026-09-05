@@ -2,9 +2,15 @@
 
 Extended notes for [`src/capacity.rs`](../../src/capacity.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/capacity.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `INV-18` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -39,7 +45,9 @@ Three properties hold by construction and are pinned by tests:
    a higher one — a rate-limit signal is ground truth, and a self-metered
    guess must not talk it back up.
 
-**v0.2 sketch — credential profiles.** §13 wants one vendor backing several
+### Credential profiles
+
+The v0.2 sketch in DESIGN.md §13 calls for one vendor backing several
 pools (two Claude Max accounts, say), selected per attempt "through the
 provider's own profile mechanism, an environment variable on the subprocess
 rather than a token the engine ever handles". That mechanism is real on both
@@ -217,7 +225,7 @@ the source of truth). Attempts that name no pool contribute nothing — an
 unattributed cost belongs to no subscription, and guessing which would be
 worse than leaving the pool unmeasured.
 
-## `fn retire_signals(exhausted: &mut BTreeMap<String, Option<String>>, record: &AttemptRecor…`
+## `fn retire_signals`
 
 Withdraw the exhausted mark from any pool this attempt proves is serving
 again.
@@ -239,12 +247,12 @@ failure says nothing about the subscription. A rate-limited one proves the
 opposite. An interrupted one proves nothing at all: the engine died without
 ever learning whether a reply was coming.
 
-## `fn retire_signals(exhausted: &mut BTreeMap<String, Option<S…` › `for review in &record.reviews {`
+## `fn retire_signals` › `for review in &record.reviews {`
 
 A review pass that reached a verdict proves its own pool served, which on
 a cross-vendor second opinion is a different subscription entirely.
 
-## `fn retire_signals(exhausted: &mut BTreeMap<String, Option<S…` › `if let Some(failure) = &record.failure {`
+## `fn retire_signals` › `if let Some(failure) = &record.failure {`
 
 The attempt settlement itself is the durable source of a rate-limit
 signal. `pool_exhausted` remains useful detail, but a crash between the
@@ -259,13 +267,13 @@ Shared with [`observe`] rather than written twice: the ledger's per-pool
 column and the estimator's self-metered source must be the same number, or
 one of them is wrong and nothing says which.
 
-## `fn accumulate(drain: &mut BTreeMap<String, Spend>, record: …` › `if let Some(pool) = &record.pool {`
+## `fn accumulate` › `if let Some(pool) = &record.pool {`
 
 An attempt naming no pool contributes nothing: unattributed cost belongs
 to no subscription, and guessing which would be worse than leaving the
 pool unmeasured.
 
-## `fn accumulate(drain: &mut BTreeMap<String, Spend>, record: …` › `for review in &record.reviews {`
+## `fn accumulate` › `for review in &record.reviews {`
 
 A cross-vendor second opinion drains a different subscription than the
 implementer it judged (§11.3), so each pass is attributed on its own.
@@ -358,21 +366,21 @@ One line: the pool, what is left, and how confident that is.
 Pure and total. Every branch is reachable from plain values, so the three
 properties in the module docs are testable without a CLI, a repo, or a file.
 
-## `fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEst…` › `let mut remaining = Remaining::Unknown;`
+## `fn estimate_one` › `let mut remaining = Remaining::Unknown;`
 
 Ranked candidates, strongest first. `take` refuses anything that does not
 outrank what is already held, so the trust order cannot be inverted by
 adding a rule below an existing one.
 
-## `fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEst…` › `if let Some(reset) = obs.exhausted.get(&pool.name) {`
+## `fn estimate_one` › `if let Some(reset) = obs.exhausted.get(&pool.name) {`
 
 (1) Signals — ground truth, and the only thing that can say "exhausted".
 
-## `fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEst…` › `if pool.kind == PoolKind::Unmetered {`
+## `fn estimate_one` › `if pool.kind == PoolKind::Unmetered {`
 
 A pool that cannot run out is a fact about its shape, not a measurement.
 
-## `fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEst…` › `if let (Some(spend), Allowance::Units(allowance)) = (&self_spend, pool.monthly_allowance)…`
+## `fn estimate_one` › `if let (Some(spend), Allowance::Units(allowance)) = (&self_spend, pool.monthly_allowance) {`
 
 (2) Self-metering. It bounds what is left only when the allowance's size
 is known: `spend / auto` is not a fraction of anything. Otherwise the
@@ -380,7 +388,7 @@ draw is reported beside an Unknown remaining rather than dressed up as
 one — §13's conservatism is about never overstating what is left, and
 "we measured some spend" is not a measurement of the ceiling.
 
-## `fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEst…` › `let unread: Vec<String> = pool`
+## `fn estimate_one` › `let unread: Vec<String> = pool`
 
 The two sources v0.1 parses but does not read. Saying so is the point: a
 pool that lists `local-logs` and gets an estimate anyway would read as
@@ -497,11 +505,11 @@ Property 1. The trap this exists to stop: rendering "no observation"
 as 100% would make a dry subscription look like the best pool to
 route to, which is exactly backwards.
 
-## `fn margins_apply_multiplicatively_then_subtract_the_reserve…` › `let pool = pool("claude-max");`
+## `fn margins_apply_multiplicatively_then_subtract_the_reserve` › `let pool = pool("claude-max");`
 
 Property 2, on the arithmetic itself: 0.5 × 0.85 − 0.20 = 0.225.
 
-## `fn margins_apply_multiplicatively_then_subtract_the_reserve…` › `assert_eq!(effective_remaining(0.1, &pool), 0.0);`
+## `fn margins_apply_multiplicatively_then_subtract_the_reserve` › `assert_eq!(effective_remaining(0.1, &pool), 0.0);`
 
 Never negative, never above one, and never NaN-propagating.
 
@@ -560,7 +568,7 @@ pool the CLI has already refused.
 The draw is still reported — the signal says the pool is empty, not
 that this run drew nothing.
 
-## `fn an_unknown_allowance_reports_the_draw_without_inventing_…` › `let mut obs = Observations::default();`
+## `fn an_unknown_allowance_reports_the_draw_without_inventing_a_ceiling` › `let mut obs = Observations::default();`
 
 `spend / auto` is not a fraction of anything.
 

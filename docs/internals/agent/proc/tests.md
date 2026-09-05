@@ -2,9 +2,10 @@
 
 Extended notes for [`src/agent/proc/tests.rs`](../../../../src/agent/proc/tests.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/proc/tests.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
 
 ## `#![allow(`
 
@@ -53,17 +54,17 @@ have executed the failing arm was one where the arm was unreachable —
 a process that memoised a failure never got a coordinator to observe it
 with.
 
-## `fn a_memoised_establishment_failure_reaches_every_later_cal…` › `assert_eq!(memoised_outcome::<()>(&Ok(())), Ok(()));`
+## `fn a_memoised_establishment_failure_reaches_every_later_caller` › `assert_eq!(memoised_outcome::<()>(&Ok(())), Ok(()));`
 
 The success arm, so this is not a test that only ever says "Err".
 
-## `fn a_memoised_establishment_failure_reaches_every_later_cal…` › `for message in [`
+## `fn a_memoised_establishment_failure_reaches_every_later_caller` › `for message in [`
 
 The failure arm, and the diagnostic is the memo's own: the caller
 renders it into the operator-facing refusal, so a fresh or empty
 message would name something that did not happen.
 
-## `fn a_memoised_establishment_failure_reaches_every_later_cal…` › `let memo: Result<(), String> = Err("it could not be created".to_owned());`
+## `fn a_memoised_establishment_failure_reaches_every_later_caller` › `let memo: Result<(), String> = Err("it could not be created".to_owned());`
 
 And it is stable: the *second* caller gets the same answer as the
 first, which is the whole of what a memo promises.
@@ -209,14 +210,14 @@ it learned from the child.
 `try_wait` in the loop and `kill` + `wait` in the fallback do settle the
 child on every path; the lint does not model `try_wait`.
 
-## `fn a_child_registered_pre_exec_is_settled_when_the_parent_n…` › `drop(supervisor);`
+## `fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it` › `drop(supervisor);`
 
 Not registered by the parent: this is the prefix the packet says
 must not exist unregistered. Dropping here is the coordinator dying
 in that window, and `Drop` in the `Spawning` phase cancels the
 reaper — which settles whatever the reaper knows about.
 
-## `fn a_child_registered_pre_exec_is_settled_when_the_parent_n…` › `let _ = child.kill();`
+## `fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it` › `let _ = child.kill();`
 
 Do not leak a 60-second sleeper into the rest of the suite when
 this fails.
@@ -276,19 +277,19 @@ The oracle is `kill_tree`'s own doc comment turned into a question:
 pipes open**". A group member that outlived the call still holds the
 inherited stderr, so the read end is not at EOF.
 
-## `fn kill_tree_settles_the_whole_unix_group_before_it_returns…` › `let mut command = shell(`
+## `fn kill_tree_settles_the_whole_unix_group_before_it_returns` › `let mut command = shell(`
 
 Staged and renamed, not written in place. The waiter below polls for
 the path, and a path that is created and then filled is observable
 before the state it stands for (CODING_STANDARDS.md §12).
 
-## `fn kill_tree_settles_the_whole_unix_group_before_it_returns…` › `let published = readiness::await_signal(&ready, &mut tree.child, Duration::from_secs(10))`
+## `fn kill_tree_settles_the_whole_unix_group_before_it_returns` › `let published = readiness::await_signal(&ready, &mut tree.child, Duration::from_secs(10))`
 
 Producer-aware: the direct child is the only liveness fact a file
 signal has, and a fixture whose `sh` never started would otherwise
 have spent the whole bound before saying so.
 
-## `fn kill_tree_settles_the_whole_unix_group_before_it_returns…` › `let deadline = Instant::now() + Duration::from_secs(5);`
+## `fn kill_tree_settles_the_whole_unix_group_before_it_returns` › `let deadline = Instant::now() + Duration::from_secs(5);`
 
 Bounded rather than instantaneous, and the bound is the kernel's:
 `kill(-pgid, SIGKILL)` returns as soon as the signals are queued, so
@@ -348,7 +349,7 @@ Whether an exclusive probe of R28 is refused right now.
 Whether somebody holds R28 shared, asked with R28's own
 primitive from a descriptor this test opened.
 
-## `fn every_unix_containment_point_is_measured_against_its_own…` › `let public = std::env::temp_dir().join(format!(`
+## `fn every_unix_containment_point_is_measured_against_its_own_operation` › `let public = std::env::temp_dir().join(format!(`
 
 A run directory with a live cleanup lease, so the reaper has an R28
 to take. Without one `lock_cleanup_paths` is handed an empty list and
@@ -372,7 +373,7 @@ The reaper's own `target_os` gates are a different thing and stay: the
 group scanner reads `/proc` on Linux and asks `/bin/ps` on macOS, which
 is two implementations of one behaviour, not one platform dropped.
 
-## `fn every_unix_containment_point_is_gated_on_unix_and_not_on…` › `let gate = lines[..index]`
+## `fn every_unix_containment_point_is_gated_on_unix_and_not_on_one_unix` › `let gate = lines[..index]`
 
 The nearest preceding attribute is the gate this emission is
 compiled behind.
@@ -419,7 +420,7 @@ test stayed green.
 The two failures are told apart by their wording, which is the point:
 an injected failure must not be able to stand in for the real one.
 
-## `fn a_real_ambient_join_failure_refuses_the_write_command()` › `join_ambient_job_with(&mut NoHooks, || Ok(())).expect("a successful ambient join proceeds…`
+## `fn a_real_ambient_join_failure_refuses_the_write_command()` › `join_ambient_job_with(&mut NoHooks, || Ok(())).expect("a successful ambient join proceeds");`
 
 And a join that succeeds is not turned into a refusal.
 
@@ -508,7 +509,7 @@ job, and the coordinator is a member of the ambient one. A tree that
 carried the ambient handle instead would answer this query the other
 way — and would terminate the coordinator on the next timeout.
 
-## `fn kill_tree_observes_the_windows_job_empty_before_it_retur…` › `if tree.job.contains(std::process::id()) != Some(false) {`
+## `fn kill_tree_observes_the_windows_job_empty_before_it_returns` › `if tree.job.contains(std::process::id()) != Some(false) {`
 
 Read the answer before acting on it. If the coordinator really is a
 member, *closing* this handle terminates this process — so a plain
@@ -517,7 +518,7 @@ the run ends with `running 1 test` and no result line, which reads
 like infrastructure rather than like this assertion. Leak the handle
 instead, and fail in words.
 
-## `fn kill_tree_observes_the_windows_job_empty_before_it_retur…` › `let deadline = Instant::now() + Duration::from_secs(3);`
+## `fn kill_tree_observes_the_windows_job_empty_before_it_returns` › `let deadline = Instant::now() + Duration::from_secs(3);`
 
 Bounded rather than instantaneous: a job the kernel has already
 emptied can still be running the last of its exit paths when this
@@ -578,7 +579,7 @@ so neither answer would mean anything.
 Turn absence-at-an-instant into an observation: a running
 child writes its first instruction in milliseconds.
 
-## `fn every_windows_containment_point_is_measured_against_its_…` › `wait_for_marker(&ready, Duration::from_secs(20));`
+## `fn every_windows_containment_point_is_measured_against_its_own_operation` › `wait_for_marker(&ready, Duration::from_secs(20));`
 
 The positive control: the absences above were suspension, not a
 helper that never runs.
@@ -625,13 +626,13 @@ A failed assertion must never strand either the helper's guard
 group or its separately isolated agent group (the macOS runner
 would otherwise wait forever for a suspended descendant).
 
-## `fn spawn_signal_helper(tag: &str, expect_return: bool, igno…` › `.process_group(0)`
+## `fn spawn_signal_helper` › `.process_group(0)`
 
 Keep a broken child-group setup inside the disposable helper's
 group. A regression must fail the test, never suspend the test
 runner that is responsible for reporting and cleaning it up.
 
-## `fn spawn_signal_helper(tag: &str, expect_return: bool, igno…` › `unsafe {`
+## `fn spawn_signal_helper` › `unsafe {`
 
 Block before exec so every thread subsequently created by the
 Rust test harness inherits the host policy. Blocking only in the
@@ -655,7 +656,7 @@ or directory"* on a tree whose suite had grown to 1243 macOS tests. The
 race is PR4-era and pre-existing; it surfaced when the runner got busier.
 A test that passes because a spawn usually wins a race is not a test.
 
-## `fn settled_progress_after_stop(marker: &std::path::Path, co…` › `let deadline = Instant::now() + Duration::from_secs(2);`
+## `fn settled_progress_after_stop` › `let deadline = Instant::now() + Duration::from_secs(2);`
 
 A process-group snapshot can report every member stopped while a
 write already accepted by the kernel is still becoming visible on
@@ -675,12 +676,12 @@ fork-copied callback before unblocking signals.
 The private cleanup reaper is in its own group; target it directly so
 both fork-only helper types prove the same callback boundary.
 
-## `fn sigkill_of_upstroke_job_still_reaps_the_isolated_agent_g…` › `helper.active = false;`
+## `fn sigkill_of_upstroke_job_still_reaps_the_isolated_agent_group` › `helper.active = false;`
 
 From here onward the test harness must not kill the agent on drop:
 only the helper's external reaper is allowed to make progress stop.
 
-## `fn sigkill_of_upstroke_job_still_reaps_the_isolated_agent_g…` › `let _ = unsafe { libc::kill(-agent_pgid, libc::SIGKILL) };`
+## `fn sigkill_of_upstroke_job_still_reaps_the_isolated_agent_group` › `let _ = unsafe { libc::kill(-agent_pgid, libc::SIGKILL) };`
 
 Clean up only after recording the result, so a regression cannot be
 hidden while still avoiding a leaked worker after a failed test.
@@ -695,7 +696,7 @@ whether it has reached its final stop instruction.
 A terminal signal targets the foreground group. The guard remains
 runnable and wakes a parent that SIGSTOP may already have committed.
 
-## `fn pid_directed_termination_kills_a_suspended_tree_without_…` › `assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);`
+## `fn pid_directed_termination_kills_a_suspended_tree_without_continue` › `assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);`
 
 Target only Upstroke, not its foreground group and therefore not the
 external guard. No external SIGCONT follows: the guard's bounded
@@ -906,7 +907,7 @@ noise arm at all. Batching the records is what makes this
 producer actually outrun its reader, which is the condition
 the arm exists for.
 
-## `fn readiness_producer(role: &str, signal: Option<&Path>, stdout: Stdio) -> readiness::Pro…`
+## `fn readiness_producer(role: &str, signal: Option<&Path>, stdout: Stdio) -> readiness::Producer {`
 
 Spawn [`readiness_producer_helper`] in `role`, adopted by the RAII
 producer so it is terminated, reaped and its reader joined on every path.
@@ -924,11 +925,11 @@ what every hand-rolled reader in this crate did: `str::lines` hands the
 truncated tail back as a value, and a path is exactly the payload for
 which a short value still looks like a plausible one.
 
-## `fn a_partial_record_is_refused_rather_than_read_as_a_short_…` › `readiness::publish(&signal, &["/tmp/upstroke-snapshot", "cafe"]).expect("publish");`
+## `fn a_partial_record_is_refused_rather_than_read_as_a_short_one` › `readiness::publish(&signal, &["/tmp/upstroke-snapshot", "cafe"]).expect("publish");`
 
 The same fields, framed and published, read back whole.
 
-## `fn a_partial_record_is_refused_rather_than_read_as_a_short_…` › `let error = readiness::publish(&signal, &["two\nfields"])`
+## `fn a_partial_record_is_refused_rather_than_read_as_a_short_one` › `let error = readiness::publish(&signal, &["two\nfields"])`
 
 And the payload is kept inside what the framing can carry, at the
 producer — the only place it can still be told apart from two fields.
@@ -991,12 +992,12 @@ Two claims, and the second is the one that keeps the first honest — a
 wait that always returned at its bound would satisfy the timing half and
 still be useless.
 
-## `fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_…` › `let silent = scratch.join("never");`
+## `fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_producer` › `let silent = scratch.join("never");`
 
 Two bounds against one silent producer: each wait ends at the value
 its caller passed, and the longer bound spends longer.
 
-## `fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_…` › `const GENEROUS: Duration = Duration::from_secs(30);`
+## `fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_producer` › `const GENEROUS: Duration = Duration::from_secs(30);`
 
 And a producer that is slow but fine is not timed out, at the bound
 `src/rundir.rs`'s waits already use.
@@ -1078,25 +1079,25 @@ up" rather than the cleanup. Failing the rename after the record is
 staged is what reaches the real one, and the staging name being unique
 to the call is what makes removing it safe to do unconditionally.
 
-## `fn a_publication_that_fails_after_staging_removes_what_it_m…` › `let refused = scratch.join("refused");`
+## `fn a_publication_that_fails_after_staging_removes_what_it_made` › `let refused = scratch.join("refused");`
 
 A refused publish creates nothing at all: the framing check runs
 before the staging write.
 
-## `fn a_publication_that_fails_after_staging_removes_what_it_m…` › `let blocked = scratch.join("blocked");`
+## `fn a_publication_that_fails_after_staging_removes_what_it_made` › `let blocked = scratch.join("blocked");`
 
 THE POST-STAGING FAILURE. At the seam the record is fully staged;
 putting a directory in the signal's place makes the rename that
 follows fail on every platform this ships on, which is the only
 reachable way to arrive at the cleanup with a file to remove.
 
-## `fn a_publication_that_fails_after_staging_removes_what_it_m…` › `let marker = scratch.join("marker");`
+## `fn a_publication_that_fails_after_staging_removes_what_it_made` › `let marker = scratch.join("marker");`
 
 The marker form: an empty published file reads as no fields rather
 than as a truncated record, and it is unambiguous because `publish`
 renames — a partial record is never given this name.
 
-## `fn a_publication_that_fails_after_staging_removes_what_it_m…` › `readiness::publish(&signal, &["second"]).expect("republish");`
+## `fn a_publication_that_fails_after_staging_removes_what_it_made` › `readiness::publish(&signal, &["second"]).expect("republish");`
 
 Republishing replaces the record whole, and stages under a name of
 its own rather than a shared one.

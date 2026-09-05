@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/mod.rs`](../../../src/agent/mod.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/mod.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` and `INV-18` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -191,7 +197,7 @@ Read one attempt's process output as an [`Outcome`].
 
 Output this adapter cannot interpret at all.
 
-## `pub trait AgentAdapter: Send + Sync` › `fn discover(&self, _runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError…`
+## `pub trait AgentAdapter: Send + Sync` › `fn discover`
 
 §13's `upstroke connect`: ask this agent's CLI about the account behind
 it — signed in or not, what shape its quota is, which models it offers.
@@ -306,17 +312,17 @@ had ever parsed an output-limited or timed-out Codex execution. That is
 the "guarantee proved for the variant that was looked at" class, and the
 guard for it is a domain taken from the type.
 
-## `fn every_adapter_maps_every_supervision_result_the_same_way…` › `type SupervisionCell = (`
+## `fn every_adapter_maps_every_supervision_result_the_same_way` › `type SupervisionCell = (`
 
 One supervision shape: name, exit code, `timed_out`,
 `output_limited`, the status every adapter must report, and a
 substring the detail must carry.
 
-## `fn every_adapter_maps_every_supervision_result_the_same_way…` › `assert_eq!(outcome.duration, out.duration, "{cell}: duration");`
+## `fn every_adapter_maps_every_supervision_result_the_same_way` › `assert_eq!(outcome.duration, out.duration, "{cell}: duration");`
 
 The duration is the supervisor's, on every route.
 
-## `fn every_adapter_maps_every_supervision_result_the_same_way…` › `assert_ne!(OutcomeStatus::Timeout, OutcomeStatus::AgentError);`
+## `fn every_adapter_maps_every_supervision_result_the_same_way` › `assert_ne!(OutcomeStatus::Timeout, OutcomeStatus::AgentError);`
 
 A `Timeout` really is a different answer from an `AgentError`, which
 is what makes cells 4 and 5 worth having: the ladder acts on it.
@@ -336,20 +342,20 @@ identity names the agent, never `shell`.
 The expected values are written from those sentences, not read back
 from the request under test.
 
-## `fn an_agent_probe_request_is_slotted_names_its_agent_and_ca…` › `assert_ne!(request.invocation.render(), "p.shell.o0");`
+## `fn an_agent_probe_request_is_slotted_names_its_agent_and_carries_the_probe_identity` › `assert_ne!(request.invocation.render(), "p.shell.o0");`
 
 The role the request carries and the target its identity carries are
 the same agent, and neither is the shell probe's. A request whose
 identity said `shell` would be a non-slotted process wearing a
 slotted role.
 
-## `fn an_agent_probe_request_is_slotted_names_its_agent_and_ca…` › `let ids: std::collections::BTreeSet<String> = ADAPTERS`
+## `fn an_agent_probe_request_is_slotted_names_its_agent_and_carries_the_probe_identity` › `let ids: std::collections::BTreeSet<String> = ADAPTERS`
 
 Every shipped adapter id can be one, and the three are three
 distinct identities at the same ordinal — the target is a field, not
 decoration.
 
-## `fn an_agent_probe_request_is_slotted_names_its_agent_and_ca…` › `let ordinals: std::collections::BTreeSet<String> = (0..4)`
+## `fn an_agent_probe_request_is_slotted_names_its_agent_and_carries_the_probe_identity` › `let ordinals: std::collections::BTreeSet<String> = (0..4)`
 
 And one adapter's successive pre-flight processes are successive
 identities, which is what makes "unique per process" hold for a
@@ -414,7 +420,7 @@ file exists to avoid. The one place the program is consulted is
 [`Boundary::run`]'s presence check, which is the boundary's own
 question — "do I have this?" — and the thing under test.
 
-## `fn scripted_answer(cli: &str, args: &[String], version: &st…` › `if joined.contains("upstroke_probe_deliberately_unknown") {`
+## `fn scripted_answer` › `if joined.contains("upstroke_probe_deliberately_unknown") {`
 
 Codex's six strict-config parser probes. The two assignments are
 transcribed here rather than read from that adapter's private
@@ -461,7 +467,7 @@ installed**: the assertions above are true whichever branch a machine
 takes, and both branches are counted so a machine cannot make the test
 mean less by having more.
 
-## `fn an_adapters_program_is_the_boundarys_and_the_coordinator…` › `match crate::util::find_program(name) {`
+## `fn an_adapters_program_is_the_boundarys_and_the_coordinator_host_is_never_asked` › `match crate::util::find_program(name) {`
 
 The discrimination against the old behaviour, on either kind of
 machine. Where this host has the CLI, the old code would have
@@ -503,14 +509,14 @@ it, so a machine with all three installed reports that it cannot observe
 this instead of passing vacuously. Both measured machines satisfy it:
 this box has no `copilot`, the Windows guest has none of the three.
 
-## `fn a_cli_this_host_does_not_have_is_refused_by_name_and_by_…` › `assert!(`
+## `fn a_cli_this_host_does_not_have_is_refused_by_name_and_by_boundary` › `assert!(`
 
 And it is the **resolution's** refusal, not a spawn's. This is
 the fail-closed clause itself: a runner that handed the name to
 `Command` anyway would produce a `NotFound` here, which names no
 boundary and is what an operator cannot act on.
 
-## `fn a_cli_this_host_does_not_have_is_refused_by_name_and_by_…` › `assert_eq!(`
+## `fn a_cli_this_host_does_not_have_is_refused_by_name_and_by_boundary` › `assert_eq!(`
 
 One distinct sentence per absent CLI: a refusal that named the first
 adapter for all of them would collapse this to one.
@@ -639,12 +645,12 @@ Both iteration orders, because "the first configured agent" is a
 property of order: a fixture that only ever built them in one order
 would pass for the agent that happened to be first.
 
-## `fn each_agent_probe_request_names_its_own_agent_in_every_fi…` › `const NAMES: [&str; 3] = ["claude-code", "codex", "copilot"];`
+## `fn each_agent_probe_request_names_its_own_agent_in_every_field` › `const NAMES: [&str; 3] = ["claude-code", "codex", "copilot"];`
 
 Written here, not read from the adapter registry: the names are the
 expected values.
 
-## `fn each_agent_probe_request_names_its_own_agent_in_every_fi…` › `assert_eq!(roles.len(), 3, "{roles:?}");`
+## `fn each_agent_probe_request_names_its_own_agent_in_every_field` › `assert_eq!(roles.len(), 3, "{roles:?}");`
 
 Hostility as counts: three names in, three distinct values out of
 each field that carries one.

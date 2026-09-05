@@ -2,9 +2,15 @@
 
 Extended notes for [`src/ladder.rs`](../../src/ladder.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/ladder.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -231,34 +237,34 @@ analogy, one merge-verification "no attempt burned". The rule below is the
 legacy engine's, preserved under `invariants_preserved[1]`, and the G2 pass
 carries it into the packet.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `return true;`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `return true;`
 
 No failure: the worker ran, and its work was judged and accepted.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `if failure.is_outage() {`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `if failure.is_outage() {`
 
 An outage is not a run that produced work. `next_step` defers rather than
 escalating for exactly this reason — "Escalating here would move the task
 to a pricier rung because a *pool* was busy, and retrying would burn
 attempts on a run that never got a verdict."
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `match failure.kind {`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `match failure.kind {`
 
 Listed rather than defaulted, so a new `FailureKind` does not compile
 until someone decides whether it spends. A default arm here would answer
 a question nobody asked, in the direction that costs an operator a rung.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `FailureKind::NeedsHuman => false,`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `FailureKind::NeedsHuman => false,`
 
 "Asked for a human explicitly: the code was never judged, so nothing
 is spent and nothing escalates." The agent declined to work.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `FailureKind::NoChain => false,`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `FailureKind::NoChain => false,`
 
 No chain resolved, so no worker ran at all: "A task whose chain
 resolved to nothing cannot be retried into existence."
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `FailureKind::Interrupted => false,`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `FailureKind::Interrupted => false,`
 
 "The engine died between an attempt starting and finishing, so
 nothing judged the code … hands the task back to the scheduler still
@@ -267,7 +273,7 @@ agrees: T-ATTEMPT's resume action is "append `attempt_interrupted`
 (unknown spend, allowance refunded …)". Two independent sources, one
 answer.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `FailureKind::Declined => false,`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `FailureKind::Declined => false,`
 
 "A human was asked to unblock the task and said no … it is how a
 question resolves, not how an attempt fails." Unreachable as an
@@ -275,7 +281,7 @@ attempt outcome — `next_step` never produces it — and answered
 anyway, because a match that is total is what makes a new variant
 stop the build instead of taking a default. No worker ran for it.
 
-## `pub fn spends_allowance(failure: Option<FailureShape>) -> b…` › `FailureKind::EmptyDiff`
+## `pub fn spends_allowance(failure: Option<FailureShape>) -> bool {` › `FailureKind::EmptyDiff`
 
 Every remaining kind is a completed run. `ReviewInputTooLarge` and
 `ReviewInputOpaque` are the instructive pair — the diff could not be
@@ -283,37 +289,37 @@ judged, and it still spends, because "The worker ran, so the attempt
 is spent and must stay in the ledger". The line is *the worker ran*,
 not *a verdict was reached*.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `if failure.kind == FailureKind::NeedsHuman {`
+## `fn next_step` › `if failure.kind == FailureKind::NeedsHuman {`
 
 Asked for a human explicitly: the code was never judged, so nothing is
 spent and nothing escalates. Straight to a question (§12).
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `if matches!(`
+## `fn next_step` › `if matches!(`
 
 The worker ran, so the attempt is spent and must stay in the ledger, but
 no amount of automatic retrying can make the same complete diff fit the
 review contract. Ask for a scope decision instead of paying again.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `if failure.is_outage() {`
+## `fn next_step` › `if failure.is_outage() {`
 
 Outages defer. Escalating here would move the task to a pricier rung
 because a *pool* was busy, and retrying would burn attempts on a run
 that never got a verdict.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `Next::AskHuman(QuestionKind::Unblock)`
+## `fn next_step` › `Next::AskHuman(QuestionKind::Unblock)`
 
 The pool stayed down across every deferral: that is now a
 genuine blocker, and blockers go to the top rung.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `if failure.kind == FailureKind::NoChain || policy.rungs == 0 {`
+## `fn next_step` › `if failure.kind == FailureKind::NoChain || policy.rungs == 0 {`
 
 A task whose chain resolved to nothing cannot be retried into existence.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `if state.attempts_on_rung < policy.attempts_per {`
+## `fn next_step` › `if state.attempts_on_rung < policy.attempts_per {`
 
 A real rejection of the work: spend an attempt.
 
-## `pub fn next_step(failure: &AttemptFailure, state: &LadderSt…` › `Next::AskHuman(QuestionKind::Unblock)`
+## `fn next_step` › `Next::AskHuman(QuestionKind::Unblock)`
 
 §11.4: chain exhausted — the human is the top rung.
 
@@ -411,7 +417,7 @@ contribute two shapes each.
 §11.4 prefers session resume, but only where the adapter supports it
 and a session actually came back; otherwise the retry starts fresh.
 
-## `fn exhausting_a_rung_escalates_and_exhausting_the_chain_ask…` › `assert_eq!(`
+## `fn exhausting_a_rung_escalates_and_exhausting_the_chain_asks_a_human` › `assert_eq!(`
 
 Last rung, attempts spent: nothing cheaper or stronger is left.
 
@@ -426,7 +432,7 @@ Step 6's rule, enforced by the ladder: a judge that could not run
 says nothing about the code, so the implementer is not retried,
 escalated, or blamed.
 
-## `fn an_implementer_timeout_is_a_rejection_even_though_a_revi…` › `let worker = failure(FailureKind::Timeout);`
+## `fn an_implementer_timeout_is_a_rejection_even_though_a_reviewer_timeout_is_not` › `let worker = failure(FailureKind::Timeout);`
 
 Same kind, opposite handling — this is why origin exists.
 

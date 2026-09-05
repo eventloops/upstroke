@@ -2,9 +2,15 @@
 
 Extended notes for [`src/route.rs`](../../src/route.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/route.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -54,7 +60,7 @@ holds the start up, and removing the annotation would not lower it.
 
 `min=` is binding: clip everything below it.
 
-## `fn raise_start(tiers: &mut Vec<(Tier, ChainSource)>, floor: Tier, source: ChainSource) ->…`
+## `fn raise_start`
 
 Drop rungs below `floor`; if that empties the chain, the floor itself
 becomes the only rung. Returns whether anything changed, relabeling the new

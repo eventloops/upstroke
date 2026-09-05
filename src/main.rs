@@ -656,7 +656,7 @@ mod tests {
 
     /// The two commands that spawn a host child outside a run, counted so the
     /// boundary cannot grow in silence. `connect` and `capacity` both probe the
-    /// installed agent CLIs (`connect.rs:133`, `capacity.rs:840`); neither
+    /// installed agent CLIs (`connect.rs:133`, `capacity::report`); neither
     /// drives a run, so neither is the "coordinator" whose ambient job INV-18
     /// names.
     #[test]

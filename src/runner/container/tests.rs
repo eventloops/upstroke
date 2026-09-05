@@ -3605,8 +3605,8 @@ fn denied_call_needles() -> Vec<(String, Vec<String>)> {
 
 /// Every denied method `readiness.rs` reaches, and how many times.
 ///
-/// Over the blanked source, so the prologue's own prose -- which spells every
-/// one of these names -- is not counted as a call. `PR4-CENSUS-COMMENT-ORACLE`.
+/// Over the blanked source, so comments and literals cannot count as calls.
+/// `PR4-CENSUS-COMMENT-ORACLE`.
 fn denied_calls_in(source: &str) -> BTreeMap<String, usize> {
     let code = crate::effects::blank_comments_and_strings(source);
     let mut found = BTreeMap::new();
@@ -3680,6 +3680,9 @@ fn the_readiness_allowance_names_the_paths_it_is_written_against() {
         .split("[[")
         .find(|block| block.contains("path = \"src/agent/proc/test_support/readiness.rs\""))
         .expect("the readiness row");
+    let notes =
+        fs::read_to_string(root.join("docs/internals/agent/proc/test_support/readiness.md"))
+            .expect("the readiness notes");
     for (record, text, phrase) in [
         (
             "effects/allowlist.toml",
@@ -3687,8 +3690,8 @@ fn the_readiness_allowance_names_the_paths_it_is_written_against() {
             "FIVE DISTINCT DENIED PATHS ACROSS SIX SITES",
         ),
         (
-            "readiness.rs",
-            source.as_str(),
+            "docs/internals/agent/proc/test_support/readiness.md",
+            notes.as_str(),
             "five distinct denied paths across six sites",
         ),
     ] {

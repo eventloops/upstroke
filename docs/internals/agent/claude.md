@@ -2,9 +2,15 @@
 
 Extended notes for [`src/agent/claude.rs`](../../../src/agent/claude.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/claude.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
+
+References below to `decisions.*` use retired v0.2 planning identifiers.
+They record implementation history and do not add current requirements.
+[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+is the living design authority.
 
 ## Module
 
@@ -52,18 +58,18 @@ earlier step was skipped. Dense from 0, and pairwise distinct — asserted by
 
 Every ordinal above, for the uniqueness assertion.
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `let help = runner.run(&probe_request(`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `let help = runner.run(&probe_request(`
 
 Capabilities are read from `--help`, not assumed: this CLI has
 removed and hidden flags between releases, and a missing flag must
 surface as a pre-flight refusal rather than as per-task failures
 once a run is already spending (§16, §19).
 
-## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, Upstro…` › `read_only_mode: true,`
+## `fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {` › `read_only_mode: true,`
 
 No single flag; achieved through the permission settings.
 
-## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, Upstr…` › `cli().spec(&build_args(run))`
+## `fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {` › `cli().spec(&build_args(run))`
 
 No `current_dir`: the workspace is the runner's, carried on
 `RunnerRequest.workspace` (DESIGN.md:118 — the runner "owns cwd").
@@ -71,13 +77,13 @@ No resolution either: `cli()` names the CLI and the runner decides
 which file that is, so this and `probe` above send one program
 string by construction.
 
-## `impl AgentAdapter for ClaudeCodeAdapter` › `fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError>…`
+## `impl AgentAdapter for ClaudeCodeAdapter` › `fn discover`
 
 `claude auth status --json` — a zero-spend auth probe that handles no
 token and reads no credential file: the CLI answers about itself, and
 this reads its answer.
 
-## `fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Re…` › `discovery.notes.push(`
+## `fn discover` › `discovery.notes.push(`
 
 §13's tier classification comes from the catalog either way, but
 saying so is what stops the pools file reading as though the roster
@@ -107,7 +113,7 @@ exactly the gate commands; reviewers are read-only. Nobody gets network
 tools. The engine writes this JSON to the run directory and the command
 carries it via `--settings`.
 
-## `pub fn permission_settings(profile: &WorkerProfile, gate_cm…` › `"deny": [`
+## `pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Value {` › `"deny": [`
 
 No network tools; and no writing to the files that decide what
 later attempts may do — an agent that can edit .claude/ or
@@ -178,7 +184,7 @@ field that names the billing relationship outright rather than implying
 it — an enterprise SSO whose `authMethod` matches no token still says
 `subscriptionType: "enterprise"` here.
 
-## `fn classify_shape(method: &str, provider: &str, subscription_type: &str) -> Option<PoolKi…`
+## `fn classify_shape`
 
 §13's two billing shapes, from what the CLI says about the account.
 
@@ -193,7 +199,7 @@ this returns `None`, so a confident misclassification is written into the
 pools file with the caveat suppressed. Anything ambiguous — a description
 matching both sets, or neither — is therefore `None` on purpose.
 
-## `fn classify_shape(method: &str, provider: &str, subscriptio…` › `_ => None,`
+## `fn classify_shape` › `_ => None,`
 
 Both or neither: say so by saying nothing, and let the writer mark
 the pool's kind as the default it is.
@@ -284,19 +290,19 @@ The host runner's boundary *is* this machine, so what gates this is
 whether this machine has the CLI — asked of `util::find_program`
 rather than of the adapter, which no longer knows.
 
-## `fn auth_status_reads_the_signed_in_shape_including_the_plan…` › `let signed_in = output(`
+## `fn auth_status_reads_the_signed_in_shape_including_the_plan` › `let signed_in = output(`
 
 Verbatim field set observed on a real signed-in machine (2026-08-10,
 Max plan), identifiers dummied. `subscriptionType` is the definitive
 billing field: it must classify even if `authMethod` were something
 no token matches (an enterprise SSO spelling, say).
 
-## `fn auth_status_reads_the_signed_in_shape_including_the_plan…` › `let sso = output(`
+## `fn auth_status_reads_the_signed_in_shape_including_the_plan` › `let sso = output(`
 
 The same payload with an unrecognized auth method still classifies,
 because subscriptionType alone names the billing relationship.
 
-## `fn auth_status_reads_the_signed_in_shape_including_the_plan…` › `let signed_out = output(`
+## `fn auth_status_reads_the_signed_in_shape_including_the_plan` › `let signed_out = output(`
 
 Signed out (verbatim from this machine, earlier the same day): no
 subscriptionType, nothing conclusive — shape honestly None.

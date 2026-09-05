@@ -2,9 +2,10 @@
 
 Extended notes for [`src/catalog.rs`](../../src/catalog.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/catalog.rs).
+
+The code defines current behavior. These notes preserve contracts and implementation
+history. Search each backticked heading fragment separately in the source.
 
 ## Module
 
@@ -116,7 +117,7 @@ not *the CLI has no models* — so it returns nothing rather than condemning
 the whole roster. The check fires when a future CLI grows enumeration;
 `Caps::model_list` is what gates asking at all.
 
-## `pub fn missing_from(agent: &str, advertised: &[String]) -> …` › `let overlap = CATALOG`
+## `fn missing_from` › `let overlap = CATALOG`
 
 Zero overlap is a format mismatch, not a stale catalog. GitHub's own
 reference writes display names ("GPT-5.3-Codex", "Gemini 3.1 Pro") beside
@@ -131,12 +132,12 @@ Case and separators folded away, so `GPT-5.3-Codex`, `gpt-5.3-codex` and
 `GPT 5.3 Codex` all compare equal. Slugs are the contract, but a listing
 meant for humans is not obliged to use them.
 
-## `fn a_cli_that_enumerates_models_is_cross_checked_against_th…` › `assert!(missing_from("copilot", &[]).is_empty());`
+## `fn a_cli_that_enumerates_models_is_cross_checked_against_the_catalog` › `assert!(missing_from("copilot", &[]).is_empty());`
 
 Silence is not disagreement: a CLI that advertises nothing must not
 read as one that has repudiated the whole roster.
 
-## `fn a_cli_that_enumerates_models_is_cross_checked_against_th…` › `assert!(!missing.contains(&"claude-haiku-4-5"));`
+## `fn a_cli_that_enumerates_models_is_cross_checked_against_the_catalog` › `assert!(!missing.contains(&"claude-haiku-4-5"));`
 
 Scoped to the agent asked about — Claude Code's roster is not
 evidence about Copilot's.
@@ -152,7 +153,7 @@ it — and the "different families share fewer blind spots" claim
 
 Asked from the other side, it comes back to Anthropic.
 
-## `fn a_tier_with_no_reachable_other_family_resolves_to_nothin…` › `let claude_only = |agent: &str| agent == "claude-code";`
+## `fn a_tier_with_no_reachable_other_family_resolves_to_nothing` › `let claude_only = |agent: &str| agent == "claude-code";`
 
 The single-vendor install: only claude-code has an adapter, and every
 claude-code entry is Anthropic. Callers must handle this rather than
