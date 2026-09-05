@@ -151,7 +151,10 @@ crate_path = "upstroke::rundir::discovery"
 funnel = []
 effectful = []
 effectful_unnameable = []
+# These enumeration helpers observe directory entries and metadata and return
+# names or contextual errors. They perform no write or process operation.
 effect_free = [
+    "collect_run_directories",
     "describe",
     "find_question",
     "husk_report",
@@ -160,6 +163,7 @@ effect_free = [
     "list_runs",
     "resolve_run_id",
     "run_dir_names",
+    "run_ids",
 ]
 
 [[module]]
@@ -366,6 +370,11 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # Conjunct 8's expected value, on the same terms as conjunct 12's below it:
+    # it takes the canonicalization that was already performed and answers with
+    # the canonical path or the refusal that stands in for one, performing no
+    # effect of its own.
+    "canonical_public_or_refusal",
     # Conjunct 12's classification, read-only and total: it takes the stat that
     # was already performed and answers whether it *proves* the private commit
     # record absent. Only `NotFound` does.

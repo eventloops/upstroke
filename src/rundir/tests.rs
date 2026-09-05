@@ -125,8 +125,14 @@ fn runs_list_chronologically_and_resolve_by_prefix() {
     for id in ["01AAA", "01BBB", "01BCC"] {
         commit_run(&repo, id);
     }
-    assert_eq!(list_runs(&repo), ["01AAA", "01BBB", "01BCC"]);
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BCC"));
+    assert_eq!(
+        list_runs(&repo).expect("run directories list"),
+        ["01AAA", "01BBB", "01BCC"]
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BCC")
+    );
 
     assert_eq!(resolve_run_id(&repo, "01AAA").expect("exact"), "01AAA");
     assert_eq!(resolve_run_id(&repo, "01A").expect("prefix"), "01AAA");
@@ -1659,8 +1665,16 @@ fn every_reader_returns_committed_directories_only() {
     fs::create_dir_all(&questions).expect("questions");
     fs::write(questions.join("q-REAL.json"), "{}").expect("question");
 
-    assert_eq!(list_runs(&repo), ["01BBBRUN"], "list_runs");
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BBBRUN"), "latest_run");
+    assert_eq!(
+        list_runs(&repo).expect("run directories list"),
+        ["01BBBRUN"],
+        "list_runs"
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BBBRUN"),
+        "latest_run"
+    );
     assert_eq!(
         resolve_run_id(&repo, "01BBBRUN").expect("the committed run resolves"),
         "01BBBRUN"
@@ -1683,10 +1697,10 @@ fn every_reader_returns_committed_directories_only() {
 
     // And the husks are still there: a reader observes, it never reclaims.
     assert_eq!(
-        list_husks(&repo),
+        list_husks(&repo).expect("run directories list"),
         ["01AAAHUSK", "01ZZZHUSK", "01ZZZMALFORMED"]
     );
-    assert_eq!(run_dir_names(&repo).len(), 4);
+    assert_eq!(run_dir_names(&repo).expect("run directories list").len(), 4);
 }
 
 #[test]
@@ -1709,9 +1723,12 @@ fn a_committed_run_is_never_excluded_because_of_a_marker() {
     );
     fs::create_dir_all(runs_root(&repo).join("01ZZZHUSK")).expect("newer husk");
 
-    assert_eq!(list_runs(&repo), ["01AAAMARKED", "01BBBSTAGED"]);
     assert_eq!(
-        latest_run(&repo).as_deref(),
+        list_runs(&repo).expect("run directories list"),
+        ["01AAAMARKED", "01BBBSTAGED"]
+    );
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
         Some("01BBBSTAGED"),
         "a committed-but-marked run is the latest run, and a husk newer \
              than it does not become one"
@@ -1731,9 +1748,13 @@ fn latest_run_skips_a_husk_that_would_otherwise_shadow_it() {
     // longer listed". Asserted from the shadowing direction, because that
     // is the operator-visible symptom.
     let repo = repo_with_a_committed_run_between_two_husks("shadow");
-    assert_eq!(latest_run(&repo).as_deref(), Some("01BBBRUN"));
+    assert_eq!(
+        latest_run(&repo).expect("run directories list").as_deref(),
+        Some("01BBBRUN")
+    );
     assert!(
         run_dir_names(&repo)
+            .expect("run directories list")
             .last()
             .is_some_and(|last| last == "01ZZZHUSK"),
         "the husk really is the newest directory, so the skip is doing work"
@@ -1944,6 +1965,29 @@ fn proof_cases() -> Vec<ProofCase> {
             expect: Expect::Retained("marker-repo-key-mismatch", None),
         },
         ProofCase {
+            // The existence step, refusing on a stat that is not an answer.
+            // The input is a path holding a NUL, which `std` rejects before
+            // any syscall: measured on Linux as `InvalidInput` ("file name
+            // contained an unexpected NUL byte"), and expected to be
+            // `InvalidInput` on Windows too, where the wide-string conversion
+            // refuses interior NULs. **That second half is expected, not
+            // measured here** — CI's Windows leg is what settles it, and this
+            // case is what asks the question. Either way it is not `NotFound`,
+            // which is the only kind this conjunct now takes as proof, and it
+            // needs no privilege and no mode bits.
+            //
+            // A reachable input rather than a contrivance: `private_dir` is a
+            // JSON string read off disk, and `\u0000` is valid JSON. The
+            // `EACCES` shape an operator actually meets is the Unix witness
+            // below.
+            name: "a marker whose recorded target cannot be asked about",
+            before: |husk| {
+                husk.marker.private_dir = format!("{}\0nul", husk.private.display());
+            },
+            after: nothing_after,
+            expect: Expect::Retained("target-undecidable", None),
+        },
+        ProofCase {
             name: "locator outside the authorized private root",
             before: |husk| {
                 let foreign = husk.root.join("foreign-root").join("runs");
@@ -2033,6 +2077,23 @@ fn proof_cases() -> Vec<ProofCase> {
                 write(&lock_file(&husk.public()), b"");
             },
             expect: Expect::Retained("markerless-with-content", None),
+        },
+        ProofCase {
+            // The other answer `unbound_shape` gives, and the one this grid
+            // could not reach before `SWEEP-CLASSIFY-009`: a listing that did
+            // not happen used to be an empty one, which is the *reclaiming*
+            // answer. Removing the public directory is how a `read_dir` is made
+            // to fail on every platform this crate builds for; the `EACCES`
+            // shape the finding is actually about — a transient the whole
+            // process hits, where the marker read and the listing fail together
+            // and clear before the removal runs — needs mode bits and is the
+            // Unix witness below.
+            name: "a public half whose listing does not answer",
+            before: nothing,
+            after: |husk| {
+                fs::remove_dir_all(husk.public()).expect("remove the public half");
+            },
+            expect: Expect::Retained("listing-unreadable", None),
         },
         ProofCase {
             name: "private half carrying a commit record",
@@ -2476,6 +2537,77 @@ fn a_committed_private_half_is_never_provable_however_bound_it_is() {
 /// present and absent — are asserted through the whole proof by
 /// `a_committed_private_half_is_never_provable_however_bound_it_is` and by
 /// the wiring half below.
+/// Conjunct 8's expected value is a canonical path or a refusal — never the
+/// path it was handed.
+///
+/// `fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf())` was the
+/// one fold in this file that could turn an I/O failure into a **proving**
+/// answer rather than a reclaiming one: the fallback supplies the value the
+/// comparison uses, and `create.rs`'s `canonical_string` uses the identical
+/// fallback when *recording* `owner.public_dir`, so a recorder and a prover
+/// that both failed agreed on the un-canonical spelling and the conjunct
+/// passed — establishing nothing while minting the token that authorises
+/// deleting a private half. Pass 1 of this pull request's review found it, and
+/// found it missing from the audit table in the body, which is where it should
+/// have been.
+///
+/// Asserted directly for the same reason conjunct 12's predicate is: a
+/// `public` this proof has already read a marker out of canonicalizes, so
+/// making it fail here needs a race. The reachable shape — a canonicalization
+/// that succeeds, and a record that agrees or disagrees with it — goes through
+/// the whole proof in the grid.
+#[test]
+fn a_public_path_that_cannot_be_canonicalized_carries_no_conjunct() {
+    use std::io::{Error, ErrorKind};
+
+    let husk = BoundHusk::new("conjunct8");
+    husk.publish();
+    let public = husk.public();
+    let canonical = fs::canonicalize(&public).expect("the fixture canonicalizes");
+
+    // (1) A canonicalization that succeeded is the value the comparison uses.
+    assert_eq!(
+        ownership::canonical_public_or_refusal(&public, Ok(canonical.clone()), "anything")
+            .expect("a canonical path is not a refusal"),
+        canonical,
+        "the expected side of conjunct 8 is the canonical path, unchanged"
+    );
+
+    // (2) Every failure refuses, and none of them falls back to the path it
+    // was handed — which is what let a failed lookup carry the conjunct.
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotFound,
+        ErrorKind::Other,
+        ErrorKind::InvalidInput,
+    ] {
+        let recorded = public.to_string_lossy().into_owned();
+        let refusal =
+            ownership::canonical_public_or_refusal(&public, Err(Error::from(kind)), &recorded)
+                .expect_err("a canonicalization that failed establishes nothing");
+        assert_eq!(
+            refusal.kind(),
+            "owner-record-disagrees",
+            "{kind:?} must refuse, not carry the conjunct"
+        );
+        assert_eq!(
+            refusal.owner_field(),
+            Some(OwnerField::PublicDir),
+            "and refuse on the field it could not compare"
+        );
+        assert!(
+            refusal.to_string().contains(&recorded),
+            "the refusal quotes what the record said: {refusal}"
+        );
+    }
+
+    // (3) The wiring: the reachable shape still proves through the real proof.
+    assert!(
+        matches!(husk.prove(), PrivateHalfOwnership::Proven(_)),
+        "a public path that canonicalizes and a record that agrees still prove"
+    );
+}
+
 #[test]
 fn a_commit_record_stat_that_is_not_not_found_is_not_proof_of_absence() {
     use std::io::{Error, ErrorKind};
@@ -2653,6 +2785,1266 @@ fn a_public_husk_removal_that_fails_partway_leaves_the_marker_that_locates_it() 
     assert!(!public.exists(), "including the marker and the directory");
 }
 
+/// `SWEEP-CLASSIFY-009`: a committed run whose directory could not be read
+/// is **not** an empty one, and its public half is still there afterwards.
+///
+/// **This is a unit witness of the fold, not of the census.** It calls
+/// classify, prove and remove directly, so it never reaches `scan` or
+/// `is_running`. Pass 1 of this pull request's review found the earlier version
+/// of this comment claiming an `EMFILE` sequence that `is_running` gates one
+/// layer up, and it was right: under a whole-process exhaustion the census
+/// skips the husk before reaching any of this. The failure that does reach it
+/// is a selective one, and `engine::topology::startup::tests` records that
+/// measurement and why its fixture cannot be committed as a test there.
+///
+/// The fold itself, in the order it happens: the marker read at conjunct 1 and
+/// the listing under it both fail, `read_dir_names` answered `[]` for the
+/// failed listing, `[]` is `unbound_shape`'s `Bare` arm, so the proof answers
+/// `NothingBound(Bare)` and the plan is `ReclaimPublicOnly` — which carries no
+/// commit-record check anywhere on its path. Both call sites do the same thing
+/// with that answer (`engine::topology::startup::apply`'s `ReclaimPublicOnly`
+/// arm and `create.rs`'s `stat_after_error`): they call `remove_public_husk`,
+/// which lists the directory a **second** time, once the failure has cleared,
+/// and removes what it finds.
+///
+/// So the fixture is that sequence and nothing else: the answer is taken
+/// while the directory cannot be read, the permissions go back before the
+/// reclaim, and the reclaim runs exactly when the answer licenses it. The
+/// control above it is the same directory, readable: it is retained as a
+/// marker-less husk carrying content, so readability is the only difference
+/// between the two runs.
+///
+/// Unix only, and the mode bits are asserted rather than assumed: a process
+/// with the privilege to ignore them measures nothing, and this fails there
+/// rather than passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_committed_run_the_census_could_not_read_is_not_reclaimed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("unreadable-committed");
+    husk.publish();
+    let public = husk.public();
+    // A committed run in its ordinary end state: the log has its first line
+    // and the creator's marker is gone.
+    fs::remove_file(public.join(MARKER)).expect("the run committed, so the marker went");
+    write(
+        &public.join(EVENT_LOG),
+        format!("{}\n", committed_line(BOUND_RUN, 4)).as_bytes(),
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Committed,
+        "the fixture must be a committed run, or this measures nothing"
+    );
+
+    // The control. Readable, this directory is retained: the listing holds
+    // `events.jsonl`, which is content no marker binds.
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "markerless-with-content",
+            "readable, it is content with no marker: {reason}"
+        ),
+        other => panic!("readable, this husk is retained, not {other:?}"),
+    }
+
+    // The transient. Everything that reads this directory fails at once.
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o000)).expect("close it");
+    assert!(
+        fs::read_dir(&public).is_err(),
+        "this fixture needs a listing that fails, and here one does not — a process with \
+         the privilege to ignore the permission bits cannot measure this"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Husk,
+        "the classifier's own open fails in the same moment, which is what makes the \
+         census reach the proof at all"
+    );
+    let answer = husk.prove();
+    // And it clears, before anything is deleted — which is the whole point:
+    // the second listing succeeds.
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o700)).expect("open it again");
+
+    match answer {
+        // What both call sites do with a `NothingBound`, done here rather
+        // than described: the public half is reclaimed, no commit record
+        // consulted. Before the fix this arm ran and took `events.jsonl`
+        // with it.
+        PrivateHalfOwnership::NothingBound(shape) => {
+            let reclaimed = remove_public_husk(&public, &mut NoHooks);
+            panic!(
+                "an unreadable listing answered {shape:?}, the reclaiming answer; the \
+                 reclaim it licenses returned {reclaimed:?} and the committed log is {}",
+                if public.join(EVENT_LOG).is_file() {
+                    "still there"
+                } else {
+                    "GONE"
+                }
+            );
+        }
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "listing-unreadable", "{reason}");
+            assert!(
+                reason.to_string().contains(&public.display().to_string()),
+                "the operator is told which directory did not answer: {reason}"
+            );
+        }
+        PrivateHalfOwnership::Proven(_) => {
+            panic!("a directory that could not be read proved nothing")
+        }
+    }
+
+    assert!(
+        public.join(EVENT_LOG).is_file(),
+        "the committed run's log is still here"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Committed,
+        "and the run is still a committed run"
+    );
+}
+
+/// A name the listing cannot render as UTF-8 is still removed **by its real
+/// name**, rather than missed.
+///
+/// `read_dir_names` mapped every entry through `to_string_lossy()` and
+/// `remove_public_husk` joined the result back into a path, so an entry named
+/// with the bytes `x` + `0xff` — a perfectly ordinary Unix filename — was
+/// listed as `x` + `U+FFFD` and the removal targeted a **different file**. It
+/// returned `NotFound`, left the real entry and the marker behind, and every
+/// later census repeated it. A pull request about not deleting the wrong thing
+/// on bad evidence cannot itself name the wrong thing.
+///
+/// **Linux only, and that bound is measured rather than assumed.** The fixture
+/// needs a filename that is not valid UTF-8. Windows names are UTF-16, so it
+/// cannot be built there; and macOS refuses to create one at all — CI's
+/// `test (macos-latest)` leg, job `101160788949`, failed this test with
+/// `write: Os { code: 92, kind: Uncategorized, message: "Illegal byte
+/// sequence" }`, because APFS and HFS+ enforce UTF-8 in names. So the leg that
+/// witnesses this property is `test (ubuntu-latest)`; the other two compile the
+/// change without exercising it. The first version of this test said `cfg(unix)`
+/// and named macOS as a proving leg, and CI falsified that.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_entry_whose_name_is_not_utf8_is_removed_by_its_real_name() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let husk = BoundHusk::new("lossy-miss");
+    husk.publish();
+    let public = husk.public();
+    let raw = OsStr::from_bytes(b"x\xff");
+    write(&public.join(raw), b"the entry the removal must target");
+    assert!(
+        public.join(raw).is_file(),
+        "the fixture needs an entry whose name is not valid UTF-8"
+    );
+
+    remove_public_husk(&public, &mut NoHooks)
+        .expect("the removal names every entry exactly as the filesystem spells it");
+
+    assert!(
+        !public.exists(),
+        "the husk is gone: the entry that could not be rendered was removed rather than missed"
+    );
+}
+
+/// Two entries whose lossy renderings are equal stay **two entries**, so the
+/// removal cannot take a valid neighbour in a mangled entry's place.
+///
+/// This is the second half of the same defect and the dangerous one. A
+/// directory holding both `x` + `0xff` and a genuine `x` + `U+FFFD` listed one
+/// name twice under `to_string_lossy()`: the removal deleted the valid
+/// neighbour, then failed `NotFound` on the second copy of that name, and the
+/// entry it was actually asked to remove survived. So the wrong file was
+/// deleted — the failure mode this pull request exists to close, reached
+/// through the name rather than through the listing.
+///
+/// The listing is asserted directly as well as through the removal, because
+/// the removal alone cannot say *which* of the two it took.
+///
+/// Linux only, for the reason measured above.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_entries_with_one_lossy_rendering_stay_two_entries() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let husk = BoundHusk::new("lossy-collision");
+    husk.publish();
+    let public = husk.public();
+    let raw = OsStr::from_bytes(b"x\xff");
+    let neighbour = OsStr::new("x\u{FFFD}");
+    assert_ne!(
+        raw, neighbour,
+        "the fixture needs two genuinely different names"
+    );
+    assert_eq!(
+        raw.to_string_lossy(),
+        neighbour.to_string_lossy(),
+        "whose lossy renderings are the same, or this witnesses nothing"
+    );
+    write(&public.join(raw), b"the entry a lossy listing loses");
+    write(
+        &public.join(neighbour),
+        b"the valid neighbour it was removed in place of",
+    );
+
+    let listed = read_dir_names(&public).expect("the husk lists");
+    let distinct: std::collections::BTreeSet<&std::ffi::OsString> = listed.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        listed.len(),
+        "two entries collapsed to one name in the listing: {listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|name| public.join(name).symlink_metadata().is_ok()),
+        "every name the listing gives must name an entry that is there: {listed:?}"
+    );
+
+    remove_public_husk(&public, &mut NoHooks).expect("both entries are removed, each by its name");
+    assert!(!public.exists(), "and the husk is gone");
+}
+
+/// A private root whose bytes are not valid UTF-8 is **retained**, never
+/// reclaimed — the P1 pass 2 found, and the cost of not fixing it losslessly.
+///
+/// The sequence needs no hostile input and no failing syscall. `\xff-private`
+/// is an ordinary Unix directory name; `create.rs` records the marker's
+/// `private_dir` through `to_string_lossy()`, so the marker names
+/// `<U+FFFD>-private` while the real private half lives at `\xff-private`. The
+/// census then stated the mangled locator, got `NotFound`, and answered
+/// `NothingBound(TargetAbsent)` — the reclaiming answer, whose reclaim deletes
+/// `.creating` and orphans a private half that is still on disk. Measured on
+/// this crate at `cc202c8` before the repair, with `real_still_there=true`.
+///
+/// The repair is an ordering one: `TargetAbsent` is now reachable only after
+/// the recorded locator has been shown to be this run's child of the authorized
+/// runs directory, which a mangled locator is not. **The refusal is the cost as
+/// well as the fix**: with the recorder still lossy — three persisted records
+/// carry that `String`, and PR #39 parks the policy — a run under such a root
+/// can never be reclaimed at all. That is the fail-closed direction, and this
+/// test is what makes it a property rather than a sentence in a risk section.
+///
+/// Linux only, measured: macOS refuses to create the name at all (`Illegal byte
+/// sequence`), and Windows names are UTF-16.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_private_root_that_is_not_utf8_is_retained_rather_than_reclaimed() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut husk = BoundHusk::new("nonutf8-root");
+    let raw_root = std::ffi::OsString::from_vec(b"\xff-private".to_vec());
+    let real_root = husk.root.join(&raw_root);
+    fs::create_dir_all(real_root.join("runs")).expect("the raw private root");
+    let real_root = fs::canonicalize(&real_root).expect("canonical raw root");
+    husk.private = real_root.join("runs").join(BOUND_RUN);
+    husk.private_root = real_root;
+    // Recorded the way `create.rs` records it, which is where the identity dies.
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "the real private half is on disk at the raw path"
+    );
+    assert_ne!(
+        Path::new(&husk.marker.private_dir),
+        husk.private.as_path(),
+        "and the marker does not name it: the fixture needs a mangled record"
+    );
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "locator-outside-authorized-root",
+            "a locator that is not this run's child of the runs directory is refused \
+             before any question about whether it exists: {reason}"
+        ),
+        other => panic!(
+            "a mangled locator answered {other:?}; the real private half is {}",
+            if husk.private.join(OWNER_RECORD).is_file() {
+                "still there and would now be orphaned"
+            } else {
+                "gone"
+            }
+        ),
+    }
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and nothing was touched"
+    );
+}
+
+/// A configured private root reached through a **link** still reclaims at P1
+/// — the macOS and Windows shape, reproduced where this box can run it.
+///
+/// `prelock::authorized_private_root` canonicalizes the root and records
+/// `<canonical R>/runs/<id>`, while the census is configured with the root as
+/// the operator spelled it. On a machine where those differ — `/var` reaching
+/// `/private/var` on macOS, a verbatim `\\?\` prefix on Windows — the recorded
+/// locator matches neither the raw spelling nor `canonicalize(<R>/runs)` at P1,
+/// because `<R>/runs` does not exist yet and cannot be canonicalized at all.
+///
+/// The first version of the identity gate checked exactly those two spellings,
+/// so it turned the legitimate `TargetAbsent` into a refusal — green on Linux,
+/// red on `test (macos-latest)` and `test (winguest)` with `the census does not
+/// converge on ST-19's answer`. CI caught it; this test is what would have.
+/// The third spelling — the root canonicalized, which is the one the recorder
+/// uses — is now checked, and a symlinked root reproduces the shape here.
+///
+/// Unix, because it needs a symlink; the property it guards is a Windows one
+/// too, and there the verbatim prefix plays the link's part.
+#[cfg(unix)]
+#[test]
+fn a_private_root_reached_through_a_link_still_reclaims_a_husk_at_p1() {
+    let husk = BoundHusk::new("linked-root");
+    // The real root, and a link to it that is what the census is configured
+    // with. `BoundHusk` records the marker from the canonical path, which is
+    // what `prelock` does.
+    let real_root = husk.private_root.clone();
+    let linked_root = husk.root.join("configured-root");
+    std::os::unix::fs::symlink(&real_root, &linked_root).expect("the link");
+    assert_ne!(
+        linked_root, real_root,
+        "the fixture needs two spellings of one root"
+    );
+
+    // P1: the marker is published and the private half was never created, so
+    // `<R>/runs` does not exist — this is the state whose answer is
+    // `TargetAbsent`.
+    fs::remove_dir_all(real_root.join("runs")).expect("no runs directory yet");
+    let public = husk.public();
+    create_public_dir(&public, &mut NoHooks).expect("P0");
+    stage_marker(&public, &husk.marker, &mut NoHooks).expect("P1a");
+    publish_marker(&public, &mut NoHooks).expect("P1b");
+    assert!(
+        fs::canonicalize(linked_root.join("runs")).is_err(),
+        "the fixture needs a runs directory that cannot be canonicalized"
+    );
+
+    let answer = prove_private_half_ownership(&public, &husk.repo_key, &linked_root);
+    match answer {
+        PrivateHalfOwnership::NothingBound(shape) => assert_eq!(
+            shape,
+            UnboundShape::TargetAbsent,
+            "the recorded target was never created, and the census reclaims the public husk"
+        ),
+        other => panic!(
+            "a root reached through a link refused its own marker at P1: {other:?} — this is \
+             the macOS and Windows shape, and refusing here disables the one state \
+             `TargetAbsent` exists for"
+        ),
+    }
+}
+
+/// A runs directory that cannot be resolved does not establish a locator —
+/// the reviewer's own sequence, which the fail-open gate walked straight past.
+///
+/// Pass 3 found the fifth instance of this pull request's class **inside the
+/// fix for the first four**: the identity gate read
+/// `locator != expected_raw && expected_canonical.as_ref().is_ok_and(…)`, and
+/// `is_ok_and` answers `false` for `Err`. So a canonicalization that failed was
+/// indistinguishable from one that agreed, and every locator unequal to the raw
+/// spelling walked past the refusal into a `NotFound` stat and the reclaiming
+/// `TargetAbsent`.
+///
+/// This is the sequence the reviewer wrote, built exactly: the real private
+/// root carries bytes that are not valid UTF-8, the marker records the lossy
+/// path the way `create.rs` does, and the real root is then made unsearchable —
+/// so canonicalizing `<R>/runs` returns `EACCES` while statting the distinct
+/// lossy locator returns `NotFound`. Under the fail-open gate the proof
+/// answered `NothingBound(TargetAbsent)` and the reclaim it licenses deletes
+/// `.creating`, orphaning a private half that is still on disk.
+///
+/// The added non-UTF-8 test above cannot see this: it leaves `runs` readable,
+/// so it only ever exercises the successful canonicalization. That is why this
+/// test exists beside it rather than instead of it — one covers the answer, the
+/// other covers the error branch that produces it.
+///
+/// Linux only: it needs a name that is not valid UTF-8 *and* a mode bit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runs_directory_that_cannot_be_resolved_does_not_establish_a_locator() {
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut husk = BoundHusk::new("unresolvable-runs");
+    let raw_root = std::ffi::OsString::from_vec(b"\xff-private".to_vec());
+    let real_root = husk.root.join(&raw_root);
+    fs::create_dir_all(real_root.join("runs")).expect("the raw private root");
+    let real_root = fs::canonicalize(&real_root).expect("canonical raw root");
+    husk.private = real_root.join("runs").join(BOUND_RUN);
+    husk.private_root = real_root.clone();
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    // The transient: the real root cannot be searched, so `<R>/runs` cannot be
+    // canonicalized — while the lossy locator, whose parent never existed,
+    // still stats `NotFound`.
+    fs::set_permissions(&real_root, fs::Permissions::from_mode(0o000)).expect("close the root");
+    let readable_again =
+        || fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700)).expect("open it");
+    let runs_resolves = fs::canonicalize(real_root.join("runs")).is_ok();
+    let locator_stat = fs::symlink_metadata(Path::new(&husk.marker.private_dir))
+        .err()
+        .map(|error| error.kind());
+    if runs_resolves || locator_stat != Some(std::io::ErrorKind::NotFound) {
+        readable_again();
+        panic!(
+            "this fixture needs an unresolvable runs directory and a locator that stats \
+             NotFound, and here it has runs_resolves={runs_resolves} locator_stat={locator_stat:?} \
+             — a process with the privilege to ignore the permission bits cannot measure this"
+        );
+    }
+
+    let answer = husk.prove();
+    readable_again();
+
+    match answer {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "target-undecidable",
+            "a runs directory that could not be resolved establishes no locator: {reason}"
+        ),
+        other => panic!(
+            "an unresolvable runs directory answered {other:?}; the real private half is {}",
+            if husk.private.join(OWNER_RECORD).is_file() {
+                "still there and would now be orphaned"
+            } else {
+                "gone"
+            }
+        ),
+    }
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and the real private half is untouched"
+    );
+}
+
+/// The same three-way answer, reached without a permission bit: a runs
+/// directory that is **not there** resolves no better than one that cannot be
+/// read, and a locator that is not the raw expected path is therefore not
+/// established either.
+///
+/// Portable, and it is the arm that says the refusal is about the *answer*
+/// rather than about `EACCES` in particular.
+#[test]
+fn a_runs_directory_that_is_absent_establishes_no_locator_either() {
+    let mut husk = BoundHusk::new("absent-runs");
+    // A private root that was never created, and a locator that is not the raw
+    // expected path under it.
+    husk.private_root = husk.root.join("never-created");
+    husk.private = husk.private_root.join("elsewhere").join(BOUND_RUN);
+    husk.marker.private_dir = husk.private.to_string_lossy().into_owned();
+    husk.publish();
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => assert_eq!(
+            reason.kind(),
+            "target-undecidable",
+            "the runs directory does not resolve, so nothing places the locator: {reason}"
+        ),
+        other => panic!("an unresolvable runs directory answered {other:?}"),
+    }
+}
+
+/// Conjunct 8 compares **paths**, so two canonical paths that render to one
+/// lossy string do not prove each other.
+///
+/// `create.rs`'s `canonical_string` records `owner.public_dir` through
+/// `to_string_lossy()`, and this conjunct used to compare the recorded string
+/// against `canonicalize(<public>).to_string_lossy()`. Both sides degrade
+/// identically, so a husk whose canonical path is not valid UTF-8 satisfied the
+/// conjunct against a record written for a *different* path with the same lossy
+/// rendering — and the answer at the end of that is `Proven`, which mints the
+/// token authorising a private-half deletion.
+///
+/// The fixture is the smallest form of that: a public directory whose canonical
+/// path carries a byte that is not valid UTF-8, and an owner record holding the
+/// lossy rendering of it — which is what the recorder writes. The strings are
+/// equal; the paths are not.
+///
+/// Linux only, for the reason given on the test above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lossy_public_path_does_not_satisfy_the_owner_record() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    // Only the *public* side is under the non-UTF-8 path: the private half
+    // stays where it is, so this fixture exercises conjunct 8 rather than the
+    // locator identity the test above covers.
+    let mut husk = BoundHusk::new("nonutf8-public");
+    let raw = std::ffi::OsString::from_vec(b"\xff-repo".to_vec());
+    let raw_repo = husk.root.join(&raw);
+    fs::create_dir_all(&raw_repo).expect("the raw repo root");
+    husk.repo = fs::canonicalize(&raw_repo).expect("canonical raw repo");
+    let public = husk.public();
+    fs::create_dir_all(&public).expect("the public directory");
+    let canonical_public = fs::canonicalize(&public).expect("canonical public");
+    // What `create.rs`'s recorder writes for that path.
+    husk.owner.public_dir = canonical_public.to_string_lossy().into_owned();
+    husk.publish();
+    assert!(
+        canonical_public.to_str().is_none(),
+        "the fixture needs a public path that is not valid UTF-8"
+    );
+    // What the recorder writes, and what the record on disk already holds.
+    assert_eq!(
+        husk.owner.public_dir,
+        canonical_public.to_string_lossy(),
+        "the record holds the lossy rendering, which is the whole defect"
+    );
+    assert_ne!(
+        Path::new(&husk.owner.public_dir),
+        canonical_public.as_path(),
+        "and the lossy rendering is not that path"
+    );
+
+    match husk.prove() {
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "owner-record-disagrees", "{reason}");
+            assert_eq!(
+                reason.owner_field(),
+                Some(OwnerField::PublicDir),
+                "and it is the public directory that could not be shown to agree"
+            );
+        }
+        other => panic!("a lossy public path proved {other:?} — that answer mints a token"),
+    }
+}
+
+/// The enumeration returns every name exactly, and the run-id view skips a
+/// name that is not valid UTF-8 rather than mangling it.
+///
+/// `run_dir_names` mapped each entry through `to_string_lossy()` and
+/// `engine::topology::startup::scan` rebuilt a path from the result, so a
+/// directory named `x` + `0xff` was enumerated as `x` + `U+FFFD`: the census
+/// inspected a directory that does not exist while the real one was never
+/// inspected, and where both names existed the valid one was scanned twice and
+/// the other not at all. Now the enumeration is exact — every name it returns
+/// opens the entry it was read from — and `run_ids` is the UTF-8 restriction:
+/// `x` + `U+FFFD` *is* a run-id candidate (it is not a ULID either; callers
+/// filter as they always did) and the raw name is not.
+///
+/// Linux only, for the reason given above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_directory_name_that_is_not_utf8_is_enumerated_exactly_and_skipped_as_a_run_id() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = scratch("nonutf8-enumeration");
+    let repo = root.join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(&runs).expect("the runs root");
+    let raw = OsStr::from_bytes(b"x\xff");
+    fs::create_dir(runs.join(raw)).expect("the raw-named directory");
+    fs::create_dir(runs.join("x\u{FFFD}")).expect("its lossy twin");
+    fs::create_dir(runs.join("01REALRUN00000000000000000")).expect("an ordinary run directory");
+
+    let names = run_dir_names(&repo).expect("the runs directory lists");
+    assert_eq!(names.len(), 3, "every directory, exactly once: {names:?}");
+    assert!(
+        names.iter().all(|name| runs.join(name).is_dir()),
+        "every name the enumeration returns must open the entry it came from: {names:?}"
+    );
+    let mut distinct = names.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        names.len(),
+        "two directories collapsed to one name: {names:?}"
+    );
+
+    let ids = run_ids(&repo).expect("the run-id view lists");
+    assert_eq!(
+        ids,
+        vec![
+            "01REALRUN00000000000000000".to_owned(),
+            "x\u{FFFD}".to_owned()
+        ],
+        "the raw-named directory is not a run id and is skipped; its valid twin is returned once"
+    );
+}
+
+/// A runs directory that cannot be listed is **not** a runs directory with no
+/// run still cleaning: the worktree lease refuses rather than assumes.
+///
+/// Pass 5 of this pull request's review wrote the harm chain down. A killed
+/// conductor's Unix reaper deliberately retains the old run's cleanup lease;
+/// the next coordinator takes the primary worktree lease and then probes every
+/// run directory for that hold — through `run_dir_names`, which answered an
+/// empty vector when the directory could not be listed. So the probe never
+/// ran, and the lease was granted over a reaper that was still active: the
+/// overlapping engine ownership R28 exists to refuse. This is the class this
+/// pull request closes, surviving in the one caller whose empty answer decides
+/// ownership.
+///
+/// Unix only, precondition asserted: the runs directory is made unsearchable so
+/// its listing fails, and a process privileged enough to ignore that fails here
+/// rather than passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_runs_directory_that_cannot_be_listed_refuses_the_worktree_lease() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "unlistable-runs-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(&runs).expect("the runs root");
+    let permissions = RestoreFixturePermissions::set(&runs, 0o000);
+    assert_eq!(
+        fs::read_dir(&runs)
+            .expect_err("fixture permissions must prevent enumeration")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    let outcome = WorktreeLock::acquire_in(&repo, &git_dir);
+    drop(permissions);
+
+    match outcome {
+        Err(UpstrokeError::Filesystem {
+            operation,
+            path,
+            source,
+        }) => {
+            assert_eq!(operation, "enumerate directory");
+            assert_eq!(path, runs);
+            assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+        }
+        Err(other) => panic!("refused for the wrong reason: {other}"),
+        Ok(_lock) => {
+            panic!(
+                "the lease was granted over a runs directory nobody could list — R28 was never probed"
+            )
+        }
+    }
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect("the refused acquisition released its file and process claim"),
+    );
+}
+
+#[test]
+fn an_absent_runs_root_allows_the_first_worktree_lease_and_empty_readers() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "first-worktree-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    assert_eq!(
+        fs::symlink_metadata(runs_root(&repo))
+            .expect_err("no runs root")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(
+        run_dir_names(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert!(
+        list_runs(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert!(
+        list_husks(&repo)
+            .expect("actual absence is empty")
+            .is_empty()
+    );
+    assert_eq!(latest_run(&repo).expect("actual absence is empty"), None);
+    let first = WorktreeLock::acquire_in(&repo, &git_dir).expect("first acquisition succeeds");
+    drop(first);
+    drop(WorktreeLock::acquire_in(&repo, &git_dir).expect("a later acquisition succeeds"));
+}
+
+#[test]
+fn a_partial_run_directory_iterator_never_returns_a_partial_answer() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "partial-run-listing")
+        .expect("a unique scratch tree");
+    let candidate = root.path().join("01OBSERVED");
+    fs::create_dir(&candidate).expect("the first directory can be inspected");
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+        let entries = [
+            Ok((OsString::from("01OBSERVED"), candidate.clone())),
+            Err(io::Error::new(
+                kind,
+                "the next directory entry could not be read",
+            )),
+        ];
+        let error = discovery::collect_run_directories(root.path(), entries)
+            .expect_err("a completed prefix is not a completed enumeration");
+        match error {
+            UpstrokeError::Filesystem {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "enumerate run directories in");
+                assert_eq!(path, root.path());
+                assert_eq!(source.kind(), kind);
+            }
+            other => panic!("the enumeration error lost its context: {other}"),
+        }
+    }
+    let disappeared = root.path().join("02DISAPPEARED");
+    let error = discovery::collect_run_directories(
+        root.path(),
+        [
+            Ok((OsString::from("01OBSERVED"), candidate)),
+            Ok((OsString::from("02DISAPPEARED"), disappeared.clone())),
+        ],
+    )
+    .expect_err("an entry that disappeared is not a completed enumeration");
+    match error {
+        UpstrokeError::Filesystem {
+            operation,
+            path,
+            source,
+        } => {
+            assert_eq!(operation, "inspect run directory entry");
+            assert_eq!(path, disappeared);
+            assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        }
+        other => panic!("the metadata error lost its context: {other}"),
+    }
+}
+
+#[test]
+fn unreadable_run_enumeration_is_reported_by_every_reader() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "reader-enumeration-error")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    fs::write(&runs, b"a file cannot be enumerated").expect("the unreadable runs root");
+    let errors = [
+        run_dir_names(&repo).expect_err("exact-name enumeration fails"),
+        list_runs(&repo).expect_err("committed-run enumeration fails"),
+        list_husks(&repo).expect_err("husk enumeration fails"),
+        latest_run(&repo).expect_err("latest-run lookup fails"),
+        resolve_run_id(&repo, "01").expect_err("run-id resolution fails"),
+        find_question(&repo, "q").expect_err("question lookup fails"),
+        crate::status::load(&repo, None)
+            .err()
+            .expect("latest status fails"),
+        crate::status::load(&repo, Some("01"))
+            .err()
+            .expect("named status fails"),
+    ];
+    for error in errors {
+        match error {
+            UpstrokeError::Filesystem {
+                operation, path, ..
+            } => {
+                assert_eq!(operation, "enumerate directory");
+                assert_eq!(path, runs);
+            }
+            other => panic!("a reader converted an enumeration failure: {other}"),
+        }
+    }
+}
+
+#[test]
+fn capacity_reports_an_unreadable_runs_root_as_a_warning() {
+    struct NoAdapters;
+    impl crate::agent::AdapterSource for NoAdapters {
+        fn get(&self, _id: &str) -> Option<&dyn crate::agent::AgentAdapter> {
+            panic!("the empty pool fixture must not request an agent adapter");
+        }
+    }
+
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "capacity-discovery-error")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let runs = runs_root(&repo);
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    fs::write(&runs, b"not a directory").expect("unreadable runs root");
+    let config_path = tree.path().join("config.toml");
+    let pools_path = tree.path().join("pools.toml");
+    fs::write(&config_path, "").expect("empty explicit configuration");
+    fs::write(&pools_path, "").expect("empty explicit pools");
+    let options = crate::capacity::CapacityOptions {
+        config_path: Some(config_path),
+        pools_path: Some(pools_path),
+        repo_root: repo,
+    };
+    let report =
+        crate::capacity::report(&options, &NoAdapters).expect("capacity can report signals only");
+    assert!(report.run_id.is_none());
+    assert!(report.pools.is_empty());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not discover runs")
+                && warning.contains(&runs.display().to_string())),
+        "the failed observation is reported: {:?}",
+        report.warnings
+    );
+    fs::remove_file(&runs).expect("restore actual absence");
+    let report = crate::capacity::report(&options, &NoAdapters).expect("capacity without runs");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("could not discover runs"))
+    );
+}
+
+#[test]
+fn question_directory_enumeration_failure_is_reported() {
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "question-directory-error")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let public = commit_run(&repo, "01QUESTIONS");
+    let questions = public.join("questions");
+    fs::write(&questions, b"not a directory").expect("unreadable questions directory");
+    match find_question(&repo, "Q").expect_err("question enumeration must fail") {
+        UpstrokeError::Filesystem {
+            operation, path, ..
+        } => {
+            assert_eq!(operation, "enumerate directory");
+            assert_eq!(path, questions);
+        }
+        other => panic!("the question enumeration error lost its context: {other}"),
+    }
+    fs::remove_file(&questions).expect("restore actual absence");
+    assert!(matches!(
+        find_question(&repo, "Q"),
+        Err(UpstrokeError::Refused { .. })
+    ));
+    fs::create_dir(&questions).expect("a real questions directory");
+    fs::write(questions.join("QREAL.json"), b"{}").expect("a question entry");
+    assert_eq!(
+        find_question(&repo, "Q")
+            .expect("the real question")
+            .question_id,
+        "QREAL"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_question_name_does_not_become_a_lossy_identifier() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let tree = scratch_tree::acquire(&std::env::temp_dir(), "question-exact-name")
+        .expect("a unique scratch tree");
+    let repo = tree.path().join("repo");
+    let public = commit_run(&repo, "01QUESTIONS");
+    let questions = public.join("questions");
+    fs::create_dir(&questions).expect("a questions directory");
+    let raw = questions.join(OsStr::from_bytes(b"Q\xff.json"));
+    fs::write(&raw, b"{}").expect("an entry that cannot be a UTF-8 question identifier");
+    assert!(raw.file_name().expect("raw filename").to_str().is_none());
+    fs::write(questions.join("QREAL.json"), b"{}").expect("the valid question entry");
+    let found = find_question(&repo, "Q").expect("only the exact UTF-8 identifier matches");
+    assert_eq!(found.question_id, "QREAL");
+    assert!(
+        found
+            .public
+            .join("questions")
+            .join(format!("{}.json", found.question_id))
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_directory_link_is_an_error_for_enumeration_and_worktree_ownership() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "dangling-run-listing")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let runs = runs_root(&repo);
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+    std::os::unix::fs::symlink(root.path().join("absent"), &runs).expect("dangling runs-root link");
+    assert!(
+        run_dir_names(&repo).is_err(),
+        "an existing link is not absence"
+    );
+    assert!(WorktreeLock::acquire_in(&repo, &git_dir).is_err());
+    fs::remove_file(&runs).expect("remove the fixture link");
+    fs::create_dir(&runs).expect("a real runs directory");
+    let entry = runs.join("01DANGLING");
+    std::os::unix::fs::symlink(root.path().join("absent"), &entry).expect("dangling entry link");
+    assert!(
+        run_dir_names(&repo).is_err(),
+        "entry metadata failure is not a file"
+    );
+    assert!(WorktreeLock::acquire_in(&repo, &git_dir).is_err());
+    fs::remove_file(&entry).expect("remove the fixture entry");
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect("both refusal paths released the primary lease and process claim"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cleanup_lease_renamed_to_a_non_utf8_directory_still_refuses_worktree_ownership() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "nonutf8-cleanup-lease")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let original = public_dir(&repo, "01LIVE");
+    fs::create_dir_all(&original).expect("the original public directory");
+    let mut reaper = readiness::Producer::adopt(
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "rundir::tests::cleanup_hold_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_TEST_CLEANUP_DIR", &original)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the surviving cleanup holder"),
+    );
+    reaper
+        .await_line("held", Duration::from_secs(30))
+        .or_fail("the reaper never acquired its cleanup lease");
+    let renamed = runs_root(&repo).join(OsStr::from_bytes(b"x\xff"));
+    fs::rename(&original, &renamed).expect("rename the held directory without releasing its lease");
+    let twin = public_dir(&repo, "x\u{fffd}");
+    fs::create_dir(&twin).expect("the distinct UTF-8 neighbor");
+    assert!(renamed.file_name().expect("a filename").to_str().is_none());
+    assert!(
+        observe_cleanup_hold(&renamed, &mut NoHooks),
+        "the original lease is still held"
+    );
+    assert!(
+        !observe_cleanup_hold(&twin, &mut NoHooks),
+        "the UTF-8 neighbor has no lease"
+    );
+    let error = WorktreeLock::acquire_in(&repo, &git_dir)
+        .expect_err("the exact-name lease prevents overlapping ownership");
+    assert!(
+        error.to_string().contains("still cleaning agent processes"),
+        "{error}"
+    );
+    assert!(
+        observe_cleanup_hold(&renamed, &mut NoHooks),
+        "refusal returned while the lease was held"
+    );
+    drop(reaper);
+    assert!(!observe_cleanup_hold(&renamed, &mut NoHooks));
+    drop(
+        WorktreeLock::acquire_in(&repo, &git_dir).expect("the released lease permits acquisition"),
+    );
+}
+
+/// Restore fixture permissions before the scratch tree is reclaimed, including
+/// when a witness fails. A disappeared name can be the mutation's failure.
+#[cfg(unix)]
+struct RestoreFixturePermissions {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl RestoreFixturePermissions {
+    fn set(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = fs::metadata(path)
+            .expect("read original fixture permissions")
+            .permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .expect("set fixture permissions");
+        Self {
+            path: path.to_path_buf(),
+            permissions,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreFixturePermissions {
+    fn drop(&mut self) {
+        if let Err(error) = fs::set_permissions(&self.path, self.permissions.clone()) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return;
+            }
+            if std::thread::panicking() {
+                eprintln!(
+                    "could not restore fixture permissions at {}: {error}",
+                    self.path.display()
+                );
+            } else {
+                panic!(
+                    "could not restore fixture permissions at {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Selective permission failures leave run.lock observable, so the actual
+/// census reaches ownership proof. A deletion hook restores listing access
+/// only if a broken scan requests deletion, exposing loss of the committed log.
+#[cfg(unix)]
+#[test]
+fn census_retains_a_committed_log_when_only_its_log_and_public_listing_are_unreadable() {
+    use crate::engine::topology::startup::{CensusInputs, RunDirOutcome, census_run_dirs};
+    use crate::runner::container::runtime::ContainerTrace;
+    use crate::runner::container::{DisposableDirView, FakeOwnerLiveness, FakeRuntime};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct RestoreBeforeDeletion<'a> {
+        public: &'a Path,
+        deletions: usize,
+    }
+    impl RunDirHooks for RestoreBeforeDeletion<'_> {
+        fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+            if phase == HookPhase::Before
+                && matches!(site, EffectSiteId::RunDir(RunDirSite::RemovePublicHusk))
+            {
+                self.deletions += 1;
+                fs::set_permissions(self.public, fs::Permissions::from_mode(0o700))
+                    .expect("restore listing before a mistaken deletion");
+            }
+            Injection::Proceed
+        }
+    }
+
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "census-permission-composition")
+        .expect("a unique scratch tree");
+    let repo = root.path().join("repo");
+    let git_dir = root.path().join("git-dir");
+    fs::create_dir_all(&git_dir).expect("the worktree git directory");
+    let run_id = "01COMMITTED";
+    let public = commit_run(&repo, run_id);
+    let log = public.join(EVENT_LOG);
+    let bytes = fs::read(&log).expect("the committed log bytes");
+    fs::write(lock_file(&public), b"").expect("a free observable run lock");
+    assert_eq!(classify_run_dir(&public), RunDirClass::Committed);
+    let worktree = WorktreeLock::acquire_in(&repo, &git_dir).expect("the census owns the worktree");
+    let log_permissions = RestoreFixturePermissions::set(&log, 0o000);
+    let public_permissions = RestoreFixturePermissions::set(&public, 0o300);
+    assert_eq!(
+        fs::read(&log).expect_err("log read must be denied").kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::read_dir(&public)
+            .expect_err("listing must be denied")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        !is_running(&public),
+        "the run lock remains observable and free"
+    );
+    assert_eq!(
+        classify_run_dir(&public),
+        RunDirClass::Husk,
+        "the classifier reaches the proof route"
+    );
+    let runtime = FakeRuntime::new(ContainerTrace::off());
+    let liveness = FakeOwnerLiveness::new();
+    let view = DisposableDirView::new(ContainerTrace::off());
+    let repo_key = RepoKey::v1(&git_dir);
+    let authorized_root = root.path().join("private");
+    let inputs = CensusInputs {
+        repo_root: &repo,
+        repo_key: &repo_key,
+        authorized_root: &authorized_root,
+        incarnation: "01TESTINCARNATION",
+        runtime: &runtime,
+        liveness: &liveness,
+        view: &view,
+    };
+    let mut hooks = RestoreBeforeDeletion {
+        public: &public,
+        deletions: 0,
+    };
+    let result = census_run_dirs(&mut hooks, &inputs, None);
+    drop(public_permissions);
+    drop(log_permissions);
+    let report = result.expect("the runs root itself remains enumerable");
+    let entry = report
+        .of(run_id)
+        .expect("the real census inspected this run");
+    assert_eq!(fs::read(&log).expect("the committed log survives"), bytes);
+    match &entry.outcome {
+        RunDirOutcome::Retained(reason) => assert_eq!(reason.kind(), "listing-unreadable"),
+        other => panic!("the real census failed to retain unobserved state: {other:?}"),
+    }
+    assert_eq!(hooks.deletions, 0, "retention performs no deletion effect");
+    assert!(
+        runtime.calls().is_empty(),
+        "run-directory census performs no container effects"
+    );
+    drop(worktree);
+}
+
+/// A private target the census cannot ask about is not a target that is
+/// gone, and the marker that locates it survives.
+///
+/// `TargetAbsent` is a reclaiming answer, and its reclaim deletes the public
+/// directory with `.creating` inside it. That marker is the private half's
+/// only locator, so reading a stat that failed as "the target is gone"
+/// orphans a private half that is still there — permanently, because
+/// `create.rs` says "a private half no marker names is one no census, no
+/// `status` and no deferred prune can ever reach again".
+///
+/// The door is a permission on a **parent component** of the recorded
+/// locator, which is what an operator meets: the private root's own
+/// directory bits, an `EACCES` from a mount, a directory another process is
+/// re-creating. `lstat(2)` takes no file descriptor, so this is a different
+/// door from `SWEEP-CLASSIFY-009`'s descriptor exhaustion and the listing's
+/// repair does not close it; the grid case above pins the classification on
+/// every platform, and this pins the shape that actually happens.
+///
+/// Unix only, and the precondition is asserted rather than assumed: a
+/// process privileged enough to ignore the mode bits fails here rather than
+/// passing vacuously.
+#[cfg(unix)]
+#[test]
+fn a_private_target_that_cannot_be_stat_ed_is_not_a_target_that_is_gone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("target-unstattable");
+    husk.publish();
+    let public = husk.public();
+    let parent = husk
+        .private
+        .parent()
+        .expect("the runs directory")
+        .to_path_buf();
+
+    // The control: readable, this husk proves and is reclaimable in full.
+    match husk.prove() {
+        PrivateHalfOwnership::Proven(token) => {
+            assert_eq!(
+                token.run_id(),
+                BOUND_RUN,
+                "the control must be the happy path"
+            )
+        }
+        other => panic!("the control must prove, not {other:?}"),
+    }
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("close the parent");
+    let stat = fs::symlink_metadata(&husk.private);
+    let readable_again = || {
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("open the parent")
+    };
+    if stat.is_ok() {
+        readable_again();
+        panic!(
+            "this fixture needs a stat that fails, and here one does not — a process with \
+             the privilege to ignore the permission bits cannot measure this"
+        );
+    }
+
+    let answer = husk.prove();
+    readable_again();
+
+    match answer {
+        // What the census does with a `NothingBound`: the public half goes,
+        // and `.creating` goes with it. Before the fix this arm ran.
+        PrivateHalfOwnership::NothingBound(shape) => {
+            let reclaimed = remove_public_husk(&public, &mut NoHooks);
+            panic!(
+                "a stat that could not answer answered {shape:?}, a reclaiming answer; the \
+                 reclaim it licenses returned {reclaimed:?} and the marker that locates the \
+                 private half is {}",
+                if public.join(MARKER).is_file() {
+                    "still there"
+                } else {
+                    "GONE"
+                }
+            );
+        }
+        PrivateHalfOwnership::Retained(reason) => {
+            assert_eq!(reason.kind(), "target-undecidable", "{reason}");
+            assert!(
+                reason
+                    .to_string()
+                    .contains(&husk.private.display().to_string()),
+                "the operator is told which target could not be asked about: {reason}"
+            );
+        }
+        PrivateHalfOwnership::Proven(_) => {
+            panic!("a target that could not be stat-ed proved nothing")
+        }
+    }
+
+    assert!(
+        public.join(MARKER).is_file(),
+        "the marker that locates the private half is still here"
+    );
+    assert!(
+        husk.private.join(OWNER_RECORD).is_file(),
+        "and so is the private half it names"
+    );
+}
+
+/// The removal's **own** listing, which is the second observation and the
+/// one that deletes.
+///
+/// `remove_public_husk` ran its loop over `read_dir_names`' silent
+/// `Vec::new()`, so a directory it could not list was one it removed nothing
+/// from — and then unlinked the marker anyway and failed on the non-empty
+/// directory. That leaves a husk carrying content whose private half no
+/// marker names any more, and `create.rs` says what that costs: "a private
+/// half no marker names is one no census, no `status` and no deferred prune
+/// can ever reach again".
+///
+/// Mode `0o300` is the shape descriptor exhaustion has, built without
+/// privilege: search and write, no read. `read_dir` fails, and the unlink of
+/// the marker inside it would succeed — a listing needs a descriptor and an
+/// unlink does not.
+#[cfg(unix)]
+#[test]
+fn a_public_removal_whose_listing_does_not_answer_removes_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let husk = BoundHusk::new("publichusk-unlistable");
+    husk.publish();
+    let public = husk.public();
+    write(&public.join(PLAN), b"{}");
+
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o300)).expect("no read bit");
+    assert!(
+        fs::read_dir(&public).is_err(),
+        "this fixture needs a listing that fails, and here one does not — a process with \
+         the privilege to ignore the permission bits cannot measure this"
+    );
+
+    let error = remove_public_husk(&public, &mut NoHooks)
+        .expect_err("a removal that cannot list what it is removing refuses");
+
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o700)).expect("open it again");
+    assert!(
+        public.join(MARKER).is_file(),
+        "the marker that locates the private half survived: {error}"
+    );
+    assert!(
+        public.join(PLAN).is_file(),
+        "and so did the content the listing never named: {error}"
+    );
+    assert!(
+        error.to_string().contains(&public.display().to_string()),
+        "the failure names the directory it could not list: {error}"
+    );
+}
+
 /// A public half whose only content is `.creating.tmp` is **removed**, not
 /// retained.
 ///
@@ -2723,8 +4115,8 @@ fn p0_creates_the_public_directory_and_nothing_private() {
 
     assert!(public.is_dir(), "P0 created the public run directory");
     assert_eq!(
-        read_dir_names(&public),
-        Vec::<String>::new(),
+        read_dir_names(&public).expect("the public directory lists"),
+        Vec::<std::ffi::OsString>::new(),
         "and it is bare: no skeleton, no marker, no private half beneath it"
     );
     assert!(
@@ -2755,22 +4147,22 @@ fn the_owner_record_is_the_first_content_of_a_private_half() {
 
     create_private_dir(&private, &mut NoHooks).expect("P3");
     assert_eq!(
-        read_dir_names(&private),
-        Vec::<String>::new(),
+        read_dir_names(&private).expect("the private half lists"),
+        Vec::<std::ffi::OsString>::new(),
         "immediately after P3 the private half is empty"
     );
 
     stage_owner_record(&private, &owner, &mut NoHooks).expect("P3a");
     assert_eq!(
-        read_dir_names(&private),
-        vec![OWNER_RECORD_STAGED.to_owned()],
+        read_dir_names(&private).expect("the private half lists"),
+        vec![std::ffi::OsString::from(OWNER_RECORD_STAGED)],
         "the staged owner record is the only thing in it"
     );
 
     publish_owner_record(&private, &mut NoHooks).expect("P3b");
     assert_eq!(
-        read_dir_names(&private),
-        vec![OWNER_RECORD.to_owned()],
+        read_dir_names(&private).expect("the private half lists"),
+        vec![std::ffi::OsString::from(OWNER_RECORD)],
         "and after publication the owner record is the only content there has ever been"
     );
 }
@@ -3364,7 +4756,7 @@ fn a_surviving_reaper_hold_refuses_the_next_coordinator_until_released() {
     fs::create_dir_all(&husk).expect("husk");
     assert_eq!(classify_run_dir(&husk), RunDirClass::Husk);
     assert!(
-        list_runs(&repo).is_empty(),
+        list_runs(&repo).expect("run directories list").is_empty(),
         "the reader does not return it, which is the point"
     );
 

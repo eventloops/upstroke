@@ -431,8 +431,9 @@ impl AgentAdapter for FakeAdapter {
         }
         if scripted(&self.effects, index, Effect::EditFile) == Effect::LargeEditQuestionWriteFailure
         {
-            let run_id =
-                rundir::latest_run(&run.workspace).ok_or_else(|| UpstrokeError::Agent {
+            let run_id = rundir::latest_run(&run.workspace)
+                .expect("run directories list")
+                .ok_or_else(|| UpstrokeError::Agent {
                     message: "fake could not find the active run".to_owned(),
                 })?;
             let questions = rundir::public_dir(&run.workspace, &run_id).join("questions");
@@ -1318,7 +1319,9 @@ fn failed_parking_payload_still_settles_and_cleans_the_attempt() {
         "wrong failure surfaced: {error}"
     );
 
-    let run_id = rundir::latest_run(&repo).expect("failed run remains resumable");
+    let run_id = rundir::latest_run(&repo)
+        .expect("run directories list")
+        .expect("failed run remains resumable");
     let logged = events_of(&repo, &run_id);
     let parking = logged.iter().find_map(|event| match &event.body {
         EventBody::AttemptFinished { parking, .. } => parking.as_deref(),
@@ -2345,9 +2348,11 @@ fn max_parallel_above_one_refuses_before_the_run_touches_the_workspace() {
         "nothing may be spawned, let alone paid for"
     );
     assert!(
-        rundir::list_runs(&repo).is_empty(),
-        "no run directory: {:?}",
         rundir::list_runs(&repo)
+            .expect("run directories list")
+            .is_empty(),
+        "no run directory: {:?}",
+        rundir::list_runs(&repo).expect("run directories list")
     );
     assert_eq!(
         git_in(&repo, &["branch", "--list", "upstroke/run-*"]),
@@ -2445,9 +2450,11 @@ fn a_refused_ceiling_beats_the_lease_rather_than_racing_it() {
         "nothing may be spawned, let alone paid for"
     );
     assert!(
-        rundir::list_runs(&repo).is_empty(),
-        "and no run directory: {:?}",
         rundir::list_runs(&repo)
+            .expect("run directories list")
+            .is_empty(),
+        "and no run directory: {:?}",
+        rundir::list_runs(&repo).expect("run directories list")
     );
 }
 
@@ -5411,7 +5418,9 @@ fn killing_a_run_mid_attempt_leaves_a_resumable_record() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    let run_id = rundir::latest_run(&repo).expect("the child started a run");
+    let run_id = rundir::latest_run(&repo)
+        .expect("run directories list")
+        .expect("the child started a run");
     let paths = paths_of(&repo, &run_id);
 
     // What a kill leaves: a dirty tree and an attempt that never reported.
@@ -7587,7 +7596,7 @@ fn a_run_that_never_started_leaves_no_directory_behind() {
     run_with(&opts, &source).expect_err("the run branch cannot be created");
 
     assert_eq!(
-        rundir::latest_run(&repo),
+        rundir::latest_run(&repo).expect("run directories list"),
         None,
         "no husk left behind to shadow the next run"
     );
@@ -7614,7 +7623,9 @@ impl AnswerSource for BacklogAnswers {
             return Ok(Answer::Unanswered);
         }
         *used = true;
-        let run = rundir::latest_run(&self.repo).expect("a run");
+        let run = rundir::latest_run(&self.repo)
+            .expect("run directories list")
+            .expect("a run");
         let dir = rundir::public_dir(&self.repo, &run).join("questions");
         let other = fs::read_dir(&dir)
             .expect("questions dir")
@@ -9368,7 +9379,9 @@ fn a_worker_that_cannot_be_spawned_returns_an_error_and_settles_nothing() {
 
     // Nothing was settled: one attempt started, no attempt finished, no task
     // failed, and the ladder bought no second attempt.
-    let run_id = rundir::latest_run(&repo).expect("the run created its directory");
+    let run_id = rundir::latest_run(&repo)
+        .expect("run directories list")
+        .expect("the run created its directory");
     let log = fs::read_to_string(paths_of(&repo, &run_id).events()).expect("events.jsonl");
     let kinds: Vec<String> = log
         .lines()

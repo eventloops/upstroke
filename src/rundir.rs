@@ -27,6 +27,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -830,8 +831,22 @@ pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<
         hooks,
         EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
         || {
-            for entry in read_dir_names(public) {
-                if entry == MARKER {
+            // The listing first, and the whole listing, before anything is
+            // removed. This loop used to run over `read_dir_names`' silent
+            // `Vec::new()`, so a directory this call could not read was one it
+            // removed nothing from — and then unlinked the marker anyway and
+            // failed on the non-empty directory, leaving a husk carrying content
+            // whose private half no marker names any more. A listing that did
+            // not answer now refuses the whole removal, with nothing touched
+            // (`SWEEP-CLASSIFY-009`).
+            let entries = read_dir_names(public).map_err(|source| UpstrokeError::Io {
+                path: public.to_path_buf(),
+                source,
+            })?;
+            for entry in entries {
+                // `OsStr`, so the comparison is against the name the
+                // filesystem gave rather than a lossy rendering of it.
+                if entry == OsStr::new(MARKER) {
                     continue;
                 }
                 let path = public.join(&entry);
@@ -886,16 +901,70 @@ fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
     }
 }
 
-fn read_dir_names(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+/// Every name in `dir` **as the filesystem spells it**, sorted — or the
+/// failure that stopped the listing.
+///
+/// **A listing that did not happen is not an empty one** (`SWEEP-CLASSIFY-009`).
+/// This returned `Vec::new()` for a `read_dir` that failed and dropped every
+/// per-entry error with `flatten()`, so "I could not read this directory" and
+/// "this directory is empty" were the same value — and empty is the *reclaiming*
+/// answer at `unbound_shape` and the *nothing to remove* answer in
+/// [`remove_public_husk`]. A failure that refuses this listing while the
+/// census's earlier gates still answer therefore removed a committed run's
+/// public half on the evidence that it was empty: measured with a public
+/// directory that can be searched but not listed, where the classification
+/// probe's `open` is refused, [`is_running`] still opens `run.lock` and
+/// answers "free", the marker read finds nothing and this listing is refused.
+/// That measurement is recorded in `engine::topology::startup::tests`, beside
+/// [`retention`]'s reason-agnostic retain arm, along with why the fixture
+/// cannot be committed as a test in that module.
+///
+/// A **whole-process** descriptor exhaustion is not that failure and is
+/// deliberately not claimed as one: `EMFILE` refuses the `run.lock` open too,
+/// [`is_running`] maps every non-`NotFound` error to "held", and the census
+/// skips the husk before it reaches any of this. That gate is the same rule
+/// one layer up; this function is the same rule where the deletion is.
+///
+/// So the answer is a `Result` and every caller decides for itself. The two on
+/// the reclaim path both decide the same way — refuse — and this function makes
+/// no decision at all, which is why it is a `Result` rather than an enum of
+/// shapes: the shapes are `unbound_shape`'s vocabulary and it already has them.
+///
+/// **No error kind is privileged, `NotFound` included.** The question this
+/// answers is "what is in this directory", and only a listing that completed
+/// answers it; a directory that is not there has not answered it either. That is
+/// also the portable rule: this crate has already measured the Windows guest
+/// mapping a stat beneath a file ancestor to `NotFound`
+/// (`PR77-WIN-UNDECIDABLE-STAT-ORACLE`), so a rule reading one `ErrorKind` as
+/// established absence would mean one thing on Linux and another there.
+///
+/// Per-entry errors are propagated for the same reason: `read_dir` succeeding
+/// and an entry failing is a directory that listed *partially*, which is not a
+/// directory that is empty and not one whose contents are known.
+///
+/// The file already answers two other unanswerable probes this way and this was
+/// the one that did not: [`is_running`] calls a lock it cannot inspect held, and
+/// [`commit_record_after_error`] calls a stat it cannot take `Unknown`.
+///
+/// **`OsString`, not `String`, and that is a correctness property rather than a
+/// style one.** This mapped every name through `to_string_lossy()`, and
+/// [`remove_public_husk`] joined the results back into paths — so a Unix entry
+/// named with the bytes `x\\xff` was listed as `x` followed by
+/// `U+FFFD` and the removal targeted a **different filename**: `NotFound`, the
+/// real entry and the marker left behind, and every later census repeating it.
+/// Worse, a directory holding both that entry and a genuine `x` + `U+FFFD`
+/// listed one name twice, so the valid neighbour was removed in the mangled
+/// entry's place. A lossy name is not the name, and this function's answer is
+/// fed straight to a deletion. It is also `CODING_STANDARDS.md` §8 and
+/// `CLAUDE.md`'s "all paths through `std::path`", which a `String` round trip
+/// breaks outright.
+fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        names.push(entry?.file_name());
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +1048,7 @@ pub use ownership::{PrivateHalfProof, prove_private_half_ownership};
 mod discovery;
 pub use discovery::{
     FoundQuestion, HuskDisposition, HuskReport, Reclaimable, find_question, husk_report,
-    latest_run, list_husks, list_runs, resolve_run_id, run_dir_names,
+    latest_run, list_husks, list_runs, resolve_run_id, run_dir_names, run_ids,
 };
 
 /// The lock beside one run's ops surface.
@@ -1051,6 +1120,8 @@ impl WorktreeLock {
     ) -> Result<Self, UpstrokeError> {
         let path = worktree_lock_file(worktree_git_dir);
         let claim = claim_key(worktree_git_dir).join("upstroke-worktree.lock");
+        // The process-wide claim set owns its lookup key; the returned guard
+        // retains the same key to release that claim after closing the file.
         if !claims().insert(claim.clone()) {
             return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
         }
@@ -1064,7 +1135,8 @@ impl WorktreeLock {
                     .write(true)
                     .read(true)
                     .open(&path)
-                    .map_err(|source| UpstrokeError::Io {
+                    .map_err(|source| UpstrokeError::Filesystem {
+                        operation: "open worktree lease",
                         path: path.clone(),
                         source,
                     })
@@ -1077,7 +1149,8 @@ impl WorktreeLock {
                 || match imp::take(&file) {
                     Holder::Nobody => Ok(()),
                     Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
-                    Holder::Unknown(source) => Err(UpstrokeError::Io {
+                    Holder::Unknown(source) => Err(UpstrokeError::Filesystem {
+                        operation: "acquire worktree lease",
                         path: path.clone(),
                         source,
                     }),
@@ -1098,9 +1171,22 @@ impl WorktreeLock {
                 // a reaper still settling its groups is precisely the one that
                 // died before its log committed. Scanning the readers' view
                 // would leave R28 held and unobserved for exactly that run.
-                if let Some(cleaning) = run_dir_names(repo_root)
-                    .into_iter()
-                    .map(|run_id| public_dir(repo_root, &run_id))
+                // And the enumeration itself is fail-closed: a runs directory
+                // this process could not list is not a runs directory with no
+                // run still cleaning. `run_dir_names` used to answer an empty
+                // vector for that failure, so the probe below never ran and the
+                // lease was granted over a reaper that was still active — the
+                // overlapping ownership R28 exists to refuse (PR #139 pass 5).
+                let names = match run_dir_names(repo_root) {
+                    Ok(names) => names,
+                    Err(error) => {
+                        release_claim_after_file(Some(file), &claim, || {});
+                        return Err(error);
+                    }
+                };
+                if let Some(cleaning) = names
+                    .iter()
+                    .map(|name| runs_root(repo_root).join(name))
                     .find(|public| observe_cleanup_hold(public, hooks))
                 {
                     release_claim_after_file(Some(file), &claim, || {});

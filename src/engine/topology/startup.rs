@@ -642,7 +642,7 @@ impl StartupCensus {
 /// Whatever half (a) refuses with — an unreachable runtime with intents present,
 /// an intent naming this process's own incarnation, a labeled container whose
 /// ownership cannot be established, a dead container that cannot be observed
-/// terminated — and [`UpstrokeError::Io`] from half (b) when the runs directory
+/// terminated — and [`UpstrokeError::Filesystem`] from half (b) when the runs directory
 /// exists and cannot be enumerated. A reclaim or a repair that fails in half (b)
 /// is a [`RunDirOutcome::Unreclaimable`] entry and not an error.
 pub fn startup_census(
@@ -709,11 +709,11 @@ fn both_halves(
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Io`] when `<repo>/.upstroke/runs` exists and cannot be read.
-/// [`rundir::run_dir_names`] swallows that failure into an empty vector, and a
-/// census that reported success having scanned nothing would convert INV-15's
-/// "reclaims pre-run husks at write-command start" from an unproven claim into
-/// an apparently-proven one. Phase 1 is otherwise read-only and cannot fail.
+/// [`UpstrokeError::Filesystem`] when `<repo>/.upstroke/runs` exists and cannot be read,
+/// or an entry in it cannot be. A census that reported success having scanned
+/// nothing would convert INV-15's "reclaims pre-run husks at write-command
+/// start" from an unproven claim into an apparently-proven one. Phase 1 is
+/// otherwise read-only and cannot fail.
 pub(crate) fn census_run_dirs(
     hooks: &mut dyn RunDirHooks,
     inputs: &CensusInputs<'_>,
@@ -740,39 +740,27 @@ pub(crate) fn census_run_dirs(
 
 /// Which run ids this census walks, in run-id order.
 ///
-/// [`rundir::run_dir_names`] with the one thing it cannot say added: **an empty
-/// answer is two answers.** It opens the runs directory with
-/// `let Ok(entries) = fs::read_dir(…) else { return Vec::new() }`, so "there is
-/// nothing there" and "this process could not read it" are the same value. Only
+/// [`rundir::run_ids`], with its failure kept as a failure. "There is nothing
+/// there" and "this process could not read it" used to be one value — the
+/// enumeration answered an empty vector for a `read_dir` that failed — and only
 /// the first is a census: the second reports success having scanned nothing,
 /// which turns INV-15's "reclaims pre-run husks at write-command start" from an
-/// unproven claim into an apparently-proven one, and — because the walk is now
-/// the only way this census reaches a directory — silently skips the resuming
-/// run's own stale-marker repair as well.
-///
-/// So an empty answer is checked rather than believed. The probe runs *only*
-/// then, because an empty vector is the only shape the swallow can produce, and
-/// a runs directory that does not exist yet is a real emptiness — the shape the
-/// first write command in a repository sees.
+/// unproven claim into an apparently-proven one. This function used to probe an
+/// empty answer with a second `read_dir` to tell the two apart; the enumeration
+/// says which now, and the probe is gone.
 ///
 /// Refusing rather than reporting is deliberate, and it is not the refusal
 /// [`RunDirOutcome::Unreclaimable`] removes: that one is "this census could not
 /// finish one directory", which retains and reports; this one is "no census
-/// happened", which no report can express. The enumeration is not forked to
-/// close it — `status` and `rundir::list_husks` walk the same
-/// `rundir::run_dir_names`, and a census that enumerated differently from what
-/// an operator reads would drift from it.
+/// happened", which no report can express. `status` and `rundir::list_husks`
+/// walk the same enumeration, so the census cannot drift from what an operator
+/// reads; what they do with its failure is theirs and is stated there.
 fn enumerate(repo_root: &Path) -> Result<Vec<String>, UpstrokeError> {
-    let names = rundir::run_dir_names(repo_root);
-    if names.is_empty() {
-        let runs = rundir::runs_root(repo_root);
-        match std::fs::read_dir(&runs) {
-            Ok(_) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(UpstrokeError::Io { path: runs, source }),
-        }
-    }
-    Ok(names)
+    // The ID view skips names that are not UTF-8; worktree acquisition has
+    // already checked cleanup leases using every exact filesystem name.
+    // Only proven runs-root absence is empty. Open, entry, and metadata
+    // failures propagate before the census can apply any plan.
+    rundir::run_ids(repo_root)
 }
 
 /// One directory, classified and decided. Read-only from end to end.

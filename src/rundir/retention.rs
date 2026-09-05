@@ -48,6 +48,27 @@ pub enum RetainReason {
     /// The marker's repository key is not this repository's: a directory
     /// copied from another repository.
     MarkerRepoKeyMismatch { recorded: String, expected: String },
+    /// A question about the marker's recorded private target that the
+    /// filesystem declined to answer, so its absence was never established.
+    /// Two questions can go unanswered, and the detail names which path did:
+    ///
+    /// - **whether it exists** — the stat of the recorded locator failed for a
+    ///   reason that is not `NotFound`: an `EACCES` on a parent component, an
+    ///   `ELOOP`, a Windows sharing violation, or a locator the platform will not
+    ///   even accept as a path;
+    /// - **where it should be** — the authorized private root, or its `runs`
+    ///   directory, could not be canonicalized, so the recorded locator could not
+    ///   be placed against the path this run's private half would have. The
+    ///   target's own stat may have succeeded or answered `NotFound`; that answer
+    ///   is not acted on, because it is an answer about a path nothing has shown
+    ///   to be this run's.
+    ///
+    /// The census reclaims the public husk alone "if the marker's private
+    /// target does not exist", and that needs both questions answered: only
+    /// `NotFound` says it does not exist, and only an established locator says
+    /// *which* path's `NotFound` counts. The husk's removal takes `.creating`
+    /// with it — the private half's only locator — so neither is guessed.
+    TargetUndecidable { detail: String },
     /// The recorded locator does not canonicalize to
     /// `<authorized private root>/runs/<basename>`.
     LocatorOutsideAuthorizedRoot { locator: PathBuf, expected: PathBuf },
@@ -66,6 +87,16 @@ pub enum RetainReason {
     },
     /// A husk with no marker at all, carrying run-scoped content.
     MarkerlessWithContent,
+    /// The public half's own listing did not answer, so its shape was never
+    /// established and neither reclaiming shape can be ruled in.
+    ///
+    /// `startup_census` (i) reclaims a husk that *is* "a bare directory or one
+    /// holding only a staged `.creating.tmp`", and a directory that could not be
+    /// listed has not been shown to be either. The detail carries the path and
+    /// the error, because "could not be listed" leaves an operator no way to
+    /// tell a descriptor exhaustion that has since cleared from a permission
+    /// that has not.
+    ListingUnreadable { detail: String },
     /// `committed.json` is present: the private half may have crossed P5b, so
     /// no census and no creating process ever deletes it.
     PossiblyCommitted,
@@ -82,12 +113,14 @@ impl RetainReason {
         "marker-unparseable",
         "marker-run-id-mismatch",
         "marker-repo-key-mismatch",
+        "target-undecidable",
         "locator-outside-authorized-root",
         "locator-through-reparse-point",
         "owner-record-missing",
         "owner-record-unparseable",
         "owner-record-disagrees",
         "markerless-with-content",
+        "listing-unreadable",
         "possibly-committed",
     ];
 
@@ -98,22 +131,43 @@ impl RetainReason {
             Self::MarkerUnparseable => "marker-unparseable",
             Self::MarkerRunIdMismatch { .. } => "marker-run-id-mismatch",
             Self::MarkerRepoKeyMismatch { .. } => "marker-repo-key-mismatch",
+            Self::TargetUndecidable { .. } => "target-undecidable",
             Self::LocatorOutsideAuthorizedRoot { .. } => "locator-outside-authorized-root",
             Self::LocatorThroughReparsePoint { .. } => "locator-through-reparse-point",
             Self::OwnerRecordMissing => "owner-record-missing",
             Self::OwnerRecordUnparseable => "owner-record-unparseable",
             Self::OwnerRecordDisagrees { .. } => "owner-record-disagrees",
             Self::MarkerlessWithContent => "markerless-with-content",
+            Self::ListingUnreadable { .. } => "listing-unreadable",
             Self::PossiblyCommitted => "possibly-committed",
         }
     }
 
     /// Which owner-record field disagreed, when that is what happened.
+    ///
+    /// Exhaustive rather than wildcarded. `CODING_STANDARDS.md` §5 requires a
+    /// closed-domain match to force a decision per variant, and [`Self::KINDS`]
+    /// is that closed domain: under `_ => None` a variant added later answers
+    /// "no field" by default, which is right for most of them and would be
+    /// wrong, silently, for any later variant that carries one. An earlier
+    /// version of this pull request's body presented the absence of new arms
+    /// here as a virtue; pass 2 of its review pointed out that it is the
+    /// finding.
     #[must_use]
     pub const fn owner_field(&self) -> Option<OwnerField> {
         match self {
             Self::OwnerRecordDisagrees { field, .. } => Some(*field),
-            _ => None,
+            Self::MarkerUnparseable
+            | Self::MarkerRunIdMismatch { .. }
+            | Self::MarkerRepoKeyMismatch { .. }
+            | Self::TargetUndecidable { .. }
+            | Self::LocatorOutsideAuthorizedRoot { .. }
+            | Self::LocatorThroughReparsePoint { .. }
+            | Self::OwnerRecordMissing
+            | Self::OwnerRecordUnparseable
+            | Self::MarkerlessWithContent
+            | Self::ListingUnreadable { .. }
+            | Self::PossiblyCommitted => None,
         }
     }
 }
@@ -167,6 +221,11 @@ impl std::fmt::Display for RetainReason {
                 f,
                 "its marker carries repository key `{recorded}`, not this repository's `{expected}`"
             ),
+            Self::TargetUndecidable { detail } => write!(
+                f,
+                "its marker's private target could not be placed or asked about, so nothing about \
+                 it is established: {detail}"
+            ),
             Self::LocatorOutsideAuthorizedRoot { locator, expected } => write!(
                 f,
                 "its recorded private locator {} is not {}",
@@ -194,6 +253,11 @@ impl std::fmt::Display for RetainReason {
             Self::MarkerlessWithContent => {
                 f.write_str("it carries run-scoped content but no marker to bind it")
             }
+            Self::ListingUnreadable { detail } => write!(
+                f,
+                "its contents could not be listed, so nothing about its shape is \
+                 established: {detail}"
+            ),
             Self::PossiblyCommitted => {
                 f.write_str("its private half carries a commit record, so the run may have started")
             }

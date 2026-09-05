@@ -1756,16 +1756,9 @@ fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {
     }
 }
 
-/// The public removal is best-effort — and its two windows are the two shapes
-/// a best-effort removal can leave.
-///
-/// `After` is the removal that ran and then returned `Err`: both halves really
-/// are gone and the error is swallowed, so the run is reported with the error
-/// that stopped it rather than with a second one about the cleanup. `Before` is
-/// the removal that never ran: the private half is gone, the public husk
-/// survives carrying a marker whose target is absent, and the next census
-/// reclaims it public-only. Nothing is orphaned in either — the public half
-/// needs no proof and no locator.
+/// Public cleanup failure is reported beside the creation failure. Before and
+/// after faults can leave different public trees with the same error, so the
+/// report claims only that the private half's removal completed.
 #[test]
 fn a_failed_public_half_removal_is_best_effort_and_converges() {
     for (tag, phase, public_survives) in [
@@ -1807,13 +1800,18 @@ fn a_failed_public_half_removal_is_best_effort_and_converges() {
             public_survives,
             "{tag}: the public half is not in the state this window leaves it in"
         );
-        // Best-effort: the operator is given the error that stopped the run,
-        // not the one the cleanup hit on the way out.
         assert!(
-            matches!(*refused.disposition, Disposition::BothHalvesRemoved { .. }),
+            matches!(&*refused.disposition, Disposition::PublicHalfRemovalFailed {
+                public,
+                private_removed: Some(private),
+                ..
+            } if public == &fixture.public() && private == &fixture.private()),
             "{tag}: {:?}",
             refused.disposition
         );
+        assert!(refused.disposition.removed_anything());
+        assert!(refused.disposition.removed_the_private_half());
+        assert!(refused.disposition.may_have_removed_the_private_half());
         let sentence = refused.into_error().to_string();
         assert!(
             sentence.contains(RunDirSite::WritePlan.name()),
@@ -1821,21 +1819,24 @@ fn a_failed_public_half_removal_is_best_effort_and_converges() {
              {sentence}"
         );
         assert!(
-            !sentence.contains(RunDirSite::RemovePublicHusk.name()),
-            "{tag}: a best-effort cleanup's error was reported over the error \
-             that stopped the run: {sentence}"
+            sentence.contains(RunDirSite::RemovePublicHusk.name()),
+            "{tag}: the public cleanup failure was lost: {sentence}"
+        );
+        assert!(
+            !sentence.contains("both halves were reclaimed"),
+            "{tag}: {sentence}"
         );
         // `run_dir_names`, not `list_runs`: the survivor is a husk, and
         // `list_runs` answers only for committed runs. `run_dir_names` is the
         // enumeration the census walks, so it is the one that says whether the
         // next census can still see this directory.
-        let enumerated = crate::rundir::run_dir_names(&fixture.repo);
+        let enumerated = crate::rundir::run_dir_names(&fixture.repo).expect("run directories list");
         if public_survives {
             // The survivor needs no proof and no locator: its marker names a
             // private half that is no longer there.
             assert_eq!(
                 enumerated,
-                vec![RUN_ID.to_owned()],
+                vec![std::ffi::OsString::from(RUN_ID)],
                 "{tag}: the surviving husk is invisible to the census's own walk"
             );
             assert_eq!(
@@ -1849,6 +1850,83 @@ fn a_failed_public_half_removal_is_best_effort_and_converges() {
                 enumerated.is_empty(),
                 "{tag}: the public half survived a removal that succeeded: \
                  {enumerated:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_public_cleanup_without_a_private_half_never_reports_completed_removal() {
+    for (tag, failed_site, failed_phase) in [
+        (
+            "bare",
+            EffectSiteId::RunDir(RunDirSite::StageMarker),
+            HookPhase::Before,
+        ),
+        (
+            "staged",
+            EffectSiteId::RunDir(RunDirSite::StageMarker),
+            HookPhase::After,
+        ),
+        (
+            "target-absent",
+            EffectSiteId::Lock(LockSite::AcquireRun),
+            HookPhase::Before,
+        ),
+    ] {
+        for removal_phase in [HookPhase::Before, HookPhase::After] {
+            let fixture = Fixture::new(&format!("public-cleanup-{tag}-{removal_phase:?}"));
+            let probes = RecordingProbes::new(&host_digest());
+            let refs = FakeRefs::empty();
+            let mut hooks = TestHooks::new();
+            hooks
+                .faults()
+                .arm_phase(failed_site, failed_phase, Injection::Error)
+                .arm_phase(
+                    EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
+                    removal_phase,
+                    Injection::Error,
+                );
+            let mut driver = Driver::new(&fixture, &probes, &refs);
+            let refused = driver
+                .run(&mut hooks)
+                .expect_err("creation and public cleanup fail");
+            assert!(hooks.observed(
+                EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
+                HookPhase::Before
+            ));
+            assert!(!fixture.private().exists(), "no private half was created");
+            assert_eq!(
+                fixture.public().exists(),
+                removal_phase == HookPhase::Before
+            );
+            match &*refused.disposition {
+                Disposition::PublicHalfRemovalFailed {
+                    public,
+                    private_removed,
+                    detail,
+                } => {
+                    assert_eq!(public, &fixture.public());
+                    assert!(private_removed.is_none(), "no private removal completed");
+                    assert!(
+                        detail.contains(RunDirSite::RemovePublicHusk.name()),
+                        "{detail}"
+                    );
+                }
+                other => panic!("public cleanup failure became {other:?}"),
+            }
+            assert!(!refused.disposition.removed_anything());
+            assert!(!refused.disposition.removed_the_private_half());
+            assert!(!refused.disposition.may_have_removed_the_private_half());
+            let sentence = refused.into_error().to_string();
+            assert!(
+                sentence.contains("cleanup of the public run directory"),
+                "{sentence}"
+            );
+            assert!(sentence.contains("did not report completion"), "{sentence}");
+            assert!(
+                !sentence.contains("the public run directory was reclaimed"),
+                "{sentence}"
             );
         }
     }
@@ -2630,7 +2708,7 @@ fn committed_run_with_stale_marker_listed_and_repaired_by_resume() {
         crate::rundir::RunDirClass::Committed
     );
     assert_eq!(
-        crate::rundir::list_runs(&fixture.repo),
+        crate::rundir::list_runs(&fixture.repo).expect("run directories list"),
         vec![RUN_ID.to_owned()],
         "a reader must not hide a committed run because of a marker"
     );
@@ -2646,7 +2724,7 @@ fn committed_run_with_stale_marker_listed_and_repaired_by_resume() {
         crate::rundir::RunDirClass::Committed
     );
     assert_eq!(
-        crate::rundir::list_runs(&fixture.repo),
+        crate::rundir::list_runs(&fixture.repo).expect("run directories list"),
         vec![RUN_ID.to_owned()]
     );
 }
@@ -3001,7 +3079,7 @@ fn kill_at_each_prefix_p0_to_p8_converges() {
                     "`{which}`: the marker is present at P6 and gone from P7"
                 );
                 assert_eq!(
-                    crate::rundir::list_runs(&fixture.repo),
+                    crate::rundir::list_runs(&fixture.repo).expect("run directories list"),
                     vec![RUN_ID.to_owned()],
                     "`{which}`: a reader must return it, marker or no marker"
                 );

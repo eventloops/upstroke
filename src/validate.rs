@@ -316,8 +316,16 @@ fn latest_run_observations(
     if !has_pools {
         return none();
     }
-    let Some(run_id) = crate::rundir::latest_run(repo_root) else {
-        return none();
+    let run_id = match crate::rundir::latest_run(repo_root) {
+        Ok(Some(run_id)) => run_id,
+        Ok(None) => return none(),
+        Err(error) => {
+            warnings.push(format!(
+                "could not discover runs for self-metered spend ({error}); the capacity block \
+                 below rests on rate-limit signals alone"
+            ));
+            return none();
+        }
     };
     let events_path = crate::rundir::public_dir(repo_root, &run_id).join("events.jsonl");
     let mut ignored = Vec::new();
@@ -363,6 +371,42 @@ mod tests {
     use super::*;
     use std::env;
     use std::sync::OnceLock;
+
+    #[test]
+    fn unreadable_run_discovery_warns_when_capacity_observations_are_requested() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&env::temp_dir(), "validate-discovery-error")
+                .expect("a unique scratch tree");
+        let repo = tree.path().join("repo");
+        let runs = crate::rundir::runs_root(&repo);
+        fs::create_dir_all(runs.parent().expect("runs has a parent")).expect("ops directory");
+        fs::write(&runs, b"not a directory").expect("unreadable runs root");
+        let mut warnings = Vec::new();
+        let (observations, run_id) = latest_run_observations(&repo, true, &mut warnings);
+        assert!(run_id.is_none());
+        assert!(observations.self_spend.is_empty());
+        assert_eq!(warnings.len(), 1);
+        let warning = warnings
+            .first()
+            .expect("the failed observation is reported");
+        assert!(warning.contains("could not discover runs"), "{warning}");
+        assert!(warning.contains(&runs.display().to_string()), "{warning}");
+
+        warnings.clear();
+        let (_, run_id) = latest_run_observations(&repo, false, &mut warnings);
+        assert!(run_id.is_none());
+        assert!(
+            warnings.is_empty(),
+            "without pools the observation is not requested"
+        );
+        fs::remove_file(&runs).expect("restore actual absence");
+        let (_, run_id) = latest_run_observations(&repo, true, &mut warnings);
+        assert!(run_id.is_none());
+        assert!(
+            warnings.is_empty(),
+            "actual absence is not a failed observation"
+        );
+    }
 
     fn opts(plan: &str) -> ValidateOptions {
         let hermetic_root =

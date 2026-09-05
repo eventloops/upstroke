@@ -1816,8 +1816,8 @@ fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     // afterwards a husk that had preceded this run in the walk is gone and the
     // same assertion passes vacuously.
     assert_eq!(
-        rundir::run_dir_names(&fixture.repo_root),
-        vec![RUN_ID.to_owned()],
+        rundir::run_dir_names(&fixture.repo_root).expect("run directories list"),
+        vec![std::ffi::OsString::from(RUN_ID)],
         "the anchor is the census's first effect only while this run's \
          directory is the only one in the tree"
     );

@@ -807,7 +807,7 @@ pub fn report(
     // (§17), so a listing outside a repo is still worth having — it just cannot
     // say what has been drawn. Reporting that beats refusing to run.
     let (observations, run_id) = match crate::rundir::latest_run(&opts.repo_root) {
-        Some(run_id) => {
+        Ok(Some(run_id)) => {
             let path = crate::rundir::public_dir(&opts.repo_root, &run_id).join("events.jsonl");
             match crate::events::read_all(&path, &mut warnings) {
                 Ok(events) => (observe(&events), Some(run_id)),
@@ -820,9 +820,17 @@ pub fn report(
                 }
             }
         }
-        None => (Observations::default(), None),
+        Ok(None) => (Observations::default(), None),
+        Err(error) => {
+            warnings.push(format!(
+                "could not discover runs for self-metered spend ({error}); showing signals only"
+            ));
+            (Observations::default(), None)
+        }
     };
 
+    // The report owns both the pool configuration and these per-agent rows,
+    // so each row takes an independent copy of the pool's agent identifier.
     let mut agents: Vec<AgentStatus> = Vec::new();
     for pool in &config.pools {
         if agents.iter().any(|a| a.agent == pool.agent) {
@@ -848,7 +856,7 @@ pub fn report(
         match adapter.probe(&runner).and_then(|caps| {
             adapter
                 .discover(&runner, &caps)
-                .map(|discovery| (caps.version.clone(), discovery))
+                .map(|discovery| (caps.version, discovery))
         }) {
             Ok((version, discovery)) => {
                 // D1's cross-check: where the CLI can actually list its models,
@@ -890,7 +898,7 @@ pub fn report(
         pools: config.pools,
         estimates,
         agents,
-        strategy: config.strategy.mode.clone(),
+        strategy: config.strategy.mode,
         run_id,
         warnings,
     })

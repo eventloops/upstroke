@@ -79,11 +79,14 @@ impl RunStatus {
 /// is the refusal, carrying which of the three kinds of husk this is, its
 /// reason and its private locator. The authorized private root is the default
 /// one, which is the root a read-only command is configured with.
-fn husk_answer(repo_root: &Path, wanted: &str) -> Option<UpstrokeError> {
-    let husk_id = rundir::list_husks(repo_root)
+fn husk_answer(repo_root: &Path, wanted: &str) -> Result<Option<UpstrokeError>, UpstrokeError> {
+    let Some(husk_id) = rundir::list_husks(repo_root)?
         .into_iter()
-        .find(|id| id.eq_ignore_ascii_case(wanted))?;
-    let repo_key = rundir::RepoKey::for_repo(repo_root).ok()?;
+        .find(|id| id.eq_ignore_ascii_case(wanted))
+    else {
+        return Ok(None);
+    };
+    let repo_key = rundir::RepoKey::for_repo(repo_root)?;
     let report = rundir::husk_report(
         repo_root,
         &husk_id,
@@ -94,12 +97,12 @@ fn husk_answer(repo_root: &Path, wanted: &str) -> Option<UpstrokeError> {
         || " It records no private locator.".to_owned(),
         |path| format!(" Its private locator is {}.", path.display()),
     );
-    Some(UpstrokeError::Refused {
+    Ok(Some(UpstrokeError::Refused {
         message: format!(
             "run `{husk_id}` never recorded a committed run_started: it is {}.{locator}",
             report.disposition.describe()
         ),
-    })
+    }))
 }
 
 /// Load a run: the newest one, or any unambiguous id prefix.
@@ -112,9 +115,12 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
             // the next write command reclaims, a retained husk with its reason
             // and locator, or a possibly committed run whose public log has no
             // valid committed first line".
-            Err(error) => return Err(husk_answer(repo_root, wanted).unwrap_or(error)),
+            Err(error @ UpstrokeError::Refused { .. }) => {
+                return Err(husk_answer(repo_root, wanted)?.unwrap_or(error));
+            }
+            Err(error) => return Err(error),
         },
-        None => rundir::latest_run(repo_root).ok_or_else(|| UpstrokeError::Refused {
+        None => rundir::latest_run(repo_root)?.ok_or_else(|| UpstrokeError::Refused {
             message: format!(
                 "no runs found under {} — nothing has run in this repository yet",
                 rundir::runs_root(repo_root).display()
@@ -133,20 +139,22 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
     let mut warnings = Vec::new();
     warnings.extend(parsed.torn_tail_warning);
     let events = parsed.events;
-    let started = events::started_of(&events, &events_path)?.clone();
-    let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
+    let started = events::started_of(&events, &events_path)?;
+    let effective_schema = events::ensure_supported_schema(started, &events, &events_path)?;
     if started.run_id != run_id {
         return Err(UpstrokeError::EventLog {
-            path: events_path.clone(),
+            path: events_path,
             message: format!(
                 "run_started id `{}` does not match directory `{run_id}`",
                 started.run_id
             ),
         });
     }
-    let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
+    let paths = RunPaths::from_parts(public, PathBuf::from(&started.private_dir));
 
     let plan_path = paths.plan_json();
+    // Errors own path snapshots; successful reads keep these paths for the
+    // remaining plan checks and event replay.
     let plan_bytes = std::fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
         path: plan_path.clone(),
         source,
@@ -162,7 +170,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
         let actual = events::normalized_plan_digest(&plan_bytes);
         if actual != recorded {
             return Err(UpstrokeError::EventLog {
-                path: plan_path.clone(),
+                path: plan_path,
                 message: format!(
                     "normalized plan digest `{actual}` does not match recorded digest `{recorded}`"
                 ),
@@ -174,7 +182,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, Upstrok
     })?;
     if plan.source.hash != started.plan_hash {
         return Err(UpstrokeError::EventLog {
-            path: plan_path.clone(),
+            path: plan_path,
             message: format!(
                 "frozen plan hash `{}` does not match run-start hash `{}`",
                 plan.source.hash, started.plan_hash
