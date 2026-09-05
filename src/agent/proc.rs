@@ -468,16 +468,29 @@ fn run_with_timeout_and_limit(
     if stdin_thread.is_finished() {
         let _ = stdin_thread.join();
     }
-    let (stdout, stdout_limited) = stdout_drain
-        .map(|drain| drain.collect(grace))
-        .transpose()
-        .map_err(output_error)?
-        .unwrap_or_default();
-    let (stderr, stderr_limited) = stderr_drain
-        .map(|drain| drain.collect(grace))
-        .transpose()
-        .map_err(output_error)?
-        .unwrap_or_default();
+    // `ended` is not carried into `ProcessOutput`, deliberately and not for
+    // want of a field: a capture taken at the grace with the reader still in
+    // a `read` is the orphan case the grace exists for -- a descendant that
+    // inherited the handle and outlived the child -- and the bytes that had
+    // arrived are the child's output, as they have been since v0.1. What is
+    // decided here is only that a reader's *failure* is the run's failure,
+    // above; whether a caller should also learn that the capture was taken at
+    // the grace is `ProcessOutput`'s shape, row 51's, and a public one.
+    let collect = |drain: Option<Drain>| -> Result<(String, bool), UpstrokeError> {
+        match drain {
+            Some(drain) => {
+                let Captured {
+                    text,
+                    limited,
+                    ended: _,
+                } = drain.collect(grace).map_err(output_error)?;
+                Ok((text, limited))
+            }
+            None => Ok((String::new(), false)),
+        }
+    };
+    let (stdout, stdout_limited) = collect(stdout_drain)?;
+    let (stderr, stderr_limited) = collect(stderr_drain)?;
     output_limited |= stdout_limited || stderr_limited;
 
     Ok(ProcessOutput {
@@ -494,7 +507,7 @@ fn run_with_timeout_and_limit(
 /// supervisor asks it for. Both are visible in `proc` and its descendants,
 /// exactly as they were when they were private items of this file.
 mod drain;
-use self::drain::{Drain, DrainError, Stream, drain_limit_exceeded};
+use self::drain::{Captured, Drain, DrainError, Stream, drain_limit_exceeded};
 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep

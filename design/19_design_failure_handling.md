@@ -4,7 +4,7 @@
 |---|---|---|
 | Agent binary missing / probe failure | pre-flight | refuse to start |
 | Agent spawn error | engine | halt run (environment, not task) |
-| Agent output stream read fails rather than ends, or the host refuses its reader thread | process funnel | the tree is terminated and the invocation returns the error, as an agent spawn error; a transcript cut short by a failed read is never handed over as complete, and an interrupted read is retried a bounded number of times |
+| Agent output stream read fails rather than ends, or the host refuses its reader thread | process funnel | the tree is terminated and the invocation returns the error, as an agent spawn error; a transcript cut short by a failed read is never handed over as complete, and an interrupted read is retried a bounded number of times. A reader still in a `read` when the post-exit grace expires — a descendant holding the inherited handle — is released, and the bytes that had arrived are the child's output, as they have been since v0.1; a failure that reader meets afterwards belongs to no transcript |
 | Agent non-zero / timeout | adapter | attempt failure; feedback = stderr/transcript tail |
 | Rate-limited | adapter signal | pool marked exhausted; task deferred to reset or demoted per strategy (never below min) |
 | Gate failure | gate runner | attempt failure; feedback = log tail |

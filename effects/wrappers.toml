@@ -1136,6 +1136,9 @@ effect_free = [
     # Whether either stream hit the capture allowance; the supervisor asks
     # before it decides to terminate the tree.
     "drain_limit_exceeded",
+    # `Drop for Release`: sets the release flag, so a dropped `Drain` lets
+    # its reader thread go. A store into a process-local atomic; no effect.
+    "drop",
     # `Display for Stream`: the two stream labels, for diagnostics.
     "fmt",
     "limit_exceeded",
