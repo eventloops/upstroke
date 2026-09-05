@@ -206,7 +206,12 @@ pub fn run_with<'a>(
     // `--force`, the flag that discards hand edits.
     let outcome = match &existing {
         Some(existing) if !settings_match(existing, &content) && !opts.force => Wrote::Refused,
-        Some(existing) if stable_content(existing) == stable_content(&content) => Wrote::Unchanged,
+        Some(existing)
+            if toml::from_str::<toml::Table>(existing).is_ok()
+                && stable_content(existing) == stable_content(&content) =>
+        {
+            Wrote::Unchanged
+        }
         _ => {
             // The write boundary already names the operation and failed path.
             write_pools(&path, &content)?;
@@ -565,6 +570,42 @@ mod tests {
                 renamed
             );
         }
+    }
+
+    #[test]
+    fn review_168_force_replaces_a_malformed_generated_header() {
+        let tree = crate::rundir::scratch_tree::acquire(
+            &std::env::temp_dir(),
+            "review-168-malformed-header",
+        )
+        .expect("acquire isolated review fixture");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        let (header, rest) = first
+            .content
+            .split_once('\n')
+            .expect("generated file has a first header line");
+        let malformed = format!("{header}\u{1}\n{rest}");
+        assert!(toml::from_str::<toml::Table>(&malformed).is_err());
+        fs::write(&path, &malformed).expect("corrupt only the generated header");
+        assert_eq!(connect(&path, false).outcome, Wrote::Refused);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read refusal bytes"),
+            malformed
+        );
+
+        let forced = connect(&path, true);
+        let persisted = fs::read_to_string(&path).expect("read forced result");
+        let mut warnings = Vec::new();
+        let loaded = crate::config::load(None, tree.path(), Some(&path), &mut warnings);
+        assert_eq!(
+            forced.outcome,
+            Wrote::Written,
+            "--force must repair malformed TOML; original bytes retained: {}; config reader: {loaded:?}",
+            persisted == malformed,
+        );
+        assert!(loaded.is_ok(), "the repaired file must load: {loaded:?}");
+        assert_ne!(persisted, malformed);
     }
 
     #[test]
