@@ -8,14 +8,14 @@ reviewed_sha: 807b6057bcfa5c6772b3969edd82881c47232277
 location: src/topology/fold/apply.rs:499
 provenance: pre_existing
 first_bad:
-guard: `src/topology/fold/apply.rs`, queue row 29 of `standards/SWEEP.md`; whoever takes that row inherits this, and the remedy is `OpenQuestion` recording the state a bare question parked its task from
+guard: PR #152 owns answer return and durable backoff repair; keep this finding until integrated checked-log and replay tests establish the correct queued and deferred return states
 ---
 
 ## Failure sequence
 
 A bare `question_raised` is accepted against a `Pending`, `Deferred` or queued `AwaitingMerge`
-task with no open generation and no transaction open on it, and its answer returns the task to
-`Pending` whatever state it was parked from. `apply_answer` derives the return state from the
+task outside a repair lineage, with no open generation and no transaction open on it. Its answer
+returns the task to `Pending` whatever state it was parked from. `apply_answer` derives the return state from the
 question's origin alone — `VerificationPark` returns to `AwaitingMerge`, everything else to
 `Pending` — and a bare question has no origin of its own. The live case is `AwaitingMerge`:
 
@@ -44,18 +44,23 @@ this file said otherwise and was wrong.
 
 ## What #153 closes, and what it does not
 
-#153 refuses a bare `question_raised` against a task that is not at rest — `Merged`, `Failed`,
-`AwaitingInput`, `AwaitingRepair`, any open generation, or the candidate under integration — and
-refuses a dispatch of a task whose candidate is queued. It does not change what an answer returns
-a bare question's task to, which is `apply.rs` (queue row 29) and is being fixed in #152:
-`apply_answer` restores a derived `OpenQuestion.parked_from`, and `design/12` gains the sentence
-stating the return. When that fix is on master this file is deleted on the #153 branch, citing
-#152's commit; if #152 does not land, this file stays and says so.
+#153 refuses a bare `question_raised` against `Merged`, `Failed`, `AwaitingInput`,
+`AwaitingRepair`, any repair-lineage member, any task with an open generation, or the candidate
+under integration. It also refuses a dispatch of a task whose candidate is queued.
+It does not change what an answer returns
+a bare question's task to. PR #152 owns the application repair, including answer return and
+durable backoff. A previous revision prescribed `OpenQuestion.parked_from` and spoke of a future
+fix as settled. That mechanism is not evidence that this candidate is repaired. Keep this file
+until the integrated candidate passes regressions for queued and deferred returns, including a
+backoff elapsed while its task is parked. Cite the actual integrated commit when closing it.
 
 ## What the change that takes this up should do
 
-Give `OpenQuestion` the state its task was parked from, for a bare question, and have
-`apply_answer` return the task there — which is #152's fix. The `check_end.rs` alternative,
-refusing the bare event against every state but `Pending`, would refuse the shape
-`engine/topology/select/tests.rs` uses to park a queued candidate's task, and `DESIGN.md` §12 has
-questions raised eagerly while unrelated work proceeds, so it was not taken.
+Derive the resumed state from the work still pending and the remaining questions. Keep queued
+work `AwaitingMerge`, preserve a pending backoff, and record a wake that occurs while questions
+hide `Deferred`. Distinct questions must keep the affected work parked until their answers permit
+it to resume. Exercise both answer orders and compare the live result with replay.
+
+The reproduced contract deviation remains a dependency under the owner's witness rule despite
+its historical P3 label. The `deferred` field records that #152 is repairing it; it does not waive
+the repair for merge.

@@ -137,21 +137,22 @@ transaction, not a second task terminal state. The run state changes from its
 fixed plan-aligned vectors to an ordered task registry so replay can append
 synthetic tasks without pretending they were in `plan.normalized.json`.
 
-A bare `question_raised` parks a task at rest, because its answer returns one.
-It applies to a `Pending`, `Deferred` or queued `AwaitingMerge` task that holds
-no open generation in any class and whose candidate is not the open integration
-transaction, and to nothing else: a question that arises from an attempt is
-carried by that attempt's settlement (§15), an admission question by its
-`task_spawned` or `merge_rejected`, and a verification park by
-`merge_verification_unavailable`, and each of those leaves its task at rest
-too. A `question_answered` applies only to a task that is still `AwaitingInput`
-with no open generation. A log that raises or answers a question against any
-other state is refused by the fold rather than folded on a guess — a decline
-recorded under an in-flight generation would leave a failed task whose
-generation no event could close without contradicting the decision. A task
-whose candidate is queued is not dispatched again while it is: its work is
-`AwaitingMerge` until integration or repair (§14), and `task_dispatched` is
-refused for it on the queue position, not on the state (decided 2026-09-05).
+A bare `question_raised` currently applies only to a `Pending`, `Deferred` or
+queued `AwaitingMerge` task outside a repair lineage. The task must hold no open
+generation in any class, and its candidate must not be the open integration
+transaction. `Merged`, `Failed`, `AwaitingInput` and `AwaitingRepair` are refused.
+A question from an attempt is carried by its settlement (§15), an admission
+question by `task_spawned` or `merge_rejected`, and a verification park by
+`merge_verification_unavailable`.
+
+A `question_answered` applies only to a task still `AwaitingInput` with no open
+generation. A decline under an in-flight generation would leave a failed task
+whose generation cannot close without fabricating a settlement or changing that
+decision. `OpenNoAttempt` and `RetainedIdle` can close without moving task state,
+but an attempt could start before the answer, so bare questions are also refused
+in those classes. A task with a queued candidate cannot be dispatched again:
+successful work remains `AwaitingMerge` until integration or repair (§14), and
+the dispatch check enforces that restriction from its queue position.
 
 Schema 3 records at least:
 

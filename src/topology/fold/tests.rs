@@ -7154,6 +7154,7 @@ fn alpha_open_in_every_class() -> Vec<(&'static str, Vec<TopologyEvent>)> {
     let dispatched = dispatch(ALPHA, 0, &base);
     apply(&mut fold, &dispatched);
     let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    // Each case owns its log prefix so it can be replayed independently.
     vec![
         ("open with no attempt", vec![dispatched.clone()]),
         ("in flight", vec![dispatched.clone(), start.clone()]),
@@ -7200,6 +7201,7 @@ fn refused_live_and_on_replay(
     log: &[TopologyEvent],
     event: &TopologyEvent,
 ) -> FoldError {
+    // Keep an owned state snapshot and replay log to compare independent paths.
     let before = fold.state().cloned();
     let live = refuse(fold, event);
     assert_eq!(fold.state().cloned(), before);
@@ -7222,26 +7224,12 @@ fn refused_live_and_on_replay(
 
 #[test]
 fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
-    // **What the pre-repair fold answered for every one of these inputs:
-    // accepted.** The bare `question_raised` set the task `AwaitingInput`
-    // and left the generation exactly as it was, and the decline that
-    // answered it then set the task `Failed` with generation 0 still open
-    // and its predicted lease still held, from which `derived_outcome` read
-    // `NotEnding` for the rest of the log. That log is the one in
-    // `the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_ends_the_run`,
-    // where the same history is written the way the fold can end it.
-    //
-    // **What this asserts, and what it does not.** It asserts the rule the
-    // door states — a bare question parks a task at rest, and an open
-    // generation in any class is not at rest — and that the refusal is the
-    // same live and on replay. It does not claim a decline is unrecoverable
-    // from every class: `generation_closed` can close `OpenNoAttempt` and
-    // `RetainedIdle` after a decline. What those two classes share with
-    // `InFlight` and `Promoting` is that `attempt_started` asks nothing about
-    // the task's state, so an attempt can start under the open question and
-    // the decline then lands on `InFlight`; the constructed states in
-    // `an_answer_applies_only_to_a_task_still_parked_with_nothing_open` are
-    // what that ordering produces, and show the answer refused there.
+    // The pre-repair fold accepted each raise below. This test proves the
+    // four-class refusal and equality of the live and replay errors.
+    // It does not execute a decline or prove all four classes irrecoverable.
+    // `generation_closed` can close `OpenNoAttempt` and `RetainedIdle` after
+    // a decline; those classes are excluded because an attempt could start
+    // before the answer and leave `InFlight` work under a failed task.
     for (class, events) in alpha_open_in_every_class() {
         let (fold, log) = folded(&events);
         let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
@@ -7333,8 +7321,8 @@ fn the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_end
 fn a_bare_question_is_refused_on_a_task_that_is_not_at_rest() {
     // **Pre-repair: accepted** against a merged or a failed task, and an
     // answer then returned it to `Pending`, where `ready` would dispatch it
-    // again. The three states below are the ones another event would move
-    // before the answer arrived; each is named with the event that moves it.
+    // again. The four cases below exercise the current state exclusions;
+    // the awaiting-input and awaiting-repair cases cover earlier review traces.
     let base = sha("base");
     let mut merged_log = Vec::new();
     {
@@ -10395,7 +10383,8 @@ fn a_bare_question_is_refused_on_a_lineage_member() {
     };
     assert_eq!(kind, "question_raised");
     assert!(detail.contains("rooted at 1"), "{detail}");
-    // The run this leaves is one that can still end: the repair is runnable.
+    // The refusal leaves the repair runnable. This test does not decline an
+    // admission question or establish that such a decline terminates the lineage.
     assert!(fold.ready(TaskKey(3)), "the repair carries the lineage");
     assert_eq!(fold.derived_outcome(), DerivedOutcome::NotEnding);
 }

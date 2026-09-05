@@ -37,10 +37,10 @@ impl RunState {
         // one.** `apply_answer` states exactly two effects for a bare question
         // — an answer returns the task to `Pending`; a decline sets it `Failed`
         // and releases its candidate and lineage holdings — and both are
-        // written against the state the question parked. So the three doors
-        // here admit only a task that no other event will move before the
-        // answer arrives. What could move it is read off the fold's own
-        // transition table, and each door names its rows.
+        // written against the state the question parked. After the lineage
+        // refusal above, the three checks below cover task state, an open
+        // generation and this task's open integration transaction. They do
+        // not repair the admission-decline defect recorded above.
         //
         // The state first. A bare question is raised against `Pending`,
         // `AwaitingMerge` or `Deferred`, and against nothing else:
