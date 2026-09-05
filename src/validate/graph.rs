@@ -154,16 +154,13 @@ fn find_cycle(plan: &Plan, index: &BTreeMap<&str, &Task>) -> Option<Vec<String>>
 /// The plan is frozen (§5), so this warns rather than inventing edges.
 ///
 /// A task that needs an artifact whose recorded producer is the task itself
-/// is not warned about. `plan.artifacts` records one producer per artifact,
-/// and the markdown adapter records the first task that declares `out=`; a
-/// second declaration survives only in that task's `artifacts_out`. So a plan
-/// in which an earlier task the needing task depends on also declares the
-/// artifact reaches this check with the same recorded producer as a plan in
-/// which nothing else declares it, and what that second declaration means —
-/// an update, a conflict, an error — `design/09` does not say. The check
-/// cannot tell the two apart from the record and stays silent on both rather
-/// than guess (`SWEEP-GRAPH-004`, behind the adapter's open question
-/// `SWEEP-GRAPH-009`), which is what the base did.
+/// is not warned about, as `design/09` specifies. `plan.artifacts` records one
+/// producer per artifact, and the markdown adapter records the first task
+/// that declares `out=`. Every declaration remains available in the tasks'
+/// `artifacts_out`, including declarations by dependencies of the needing
+/// task. The design gives multiple declarations no update, conflict or error
+/// semantics. This check uses the recorded producer without assigning such
+/// semantics to the other declarations.
 ///
 /// An artifact no task produces is not in `plan.artifacts` at all — the
 /// markdown adapter warns about it while assembling the plan — and one whose
