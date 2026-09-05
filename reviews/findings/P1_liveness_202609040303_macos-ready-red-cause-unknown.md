@@ -65,8 +65,8 @@ an atomic close-on-exec open), and the parent's READY wait was `poll(2)`. `poll`
 reports data and never the last writer's close: XNU routes a FIFO's `EVFILT_READ` knote through
 the generic vnode filter, whose readable test is the queued byte count (`fifo_charcount`), and the
 writer's `fifo_close` wakes the read socket's selinfo, not the vnode's knotes. So a helper that
-ended before READY was invisible to the wait, which ran to its budget — two seconds on master, ten
-at PR #125's head — and then reported the exit status of a child that had been dead the whole time.
+ended before READY was invisible to the wait, which ran to its budget (two seconds on master, ten
+at PR #125's head) and then reported the exit status of a child that had been dead the whole time.
 Measured on macOS 26.5.2 / xnu-12377.121.10 (run 33989444028 and 33989492728 on branch
 `scratch/darwin-fifo-eof-experiment`, `exp/fifo_eof.c`): with the channel built exactly as the
 crate builds it and a forked child that closes its end and exits, `poll` returned 0 after the full
@@ -80,7 +80,7 @@ now ends when the helper ends; `a_helper_that_has_already_exited_ends_the_acknow
 fails on the tree before it on macOS and passes after.
 
 **What the helper's exit means, and what still has to be learned.** Every recorded occurrence with
-the PR #134 diagnostic in place — #154 at `d7e0c5d`, #156 at `20f0665`, #171 at `dea50f9` —
+the PR #134 diagnostic in place (#154 at `d7e0c5d`, #156 at `20f0665`, #171 at `dea50f9`)
 collected the reaper "having already exited with status 1". Status 1 is reached only through the
 reaper's own `_exit(1)` sites before READY: installing its signal dispositions, `setpgid(0, 0)`,
 opening a cleanup lease, or taking the shared `flock` on one. Which of the four, and with what
@@ -94,7 +94,7 @@ reported waits (2.0005–2.008 s against a 2 s budget) are the wait ending at it
 child taking that long, since a child still running when the parent gave up would have been
 collected "killed by signal 9"; and within one test process the launch barrier serialises reaper
 spawns against agent spawns, so a sibling fork holding the pipe's write end is not what kept the
-wait from ending — the wait could not see the end at all.
+wait from ending. The wait could not see the end at all.
 
 **A candidate the code shows, not yet observed.** `rundir::cleanup::is_held` probes the cleanup
 lease with `flock(LOCK_EX | LOCK_NB)` and releases it; a reaper whose `LOCK_SH | LOCK_NB` lands

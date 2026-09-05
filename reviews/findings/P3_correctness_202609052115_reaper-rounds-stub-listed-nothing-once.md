@@ -24,8 +24,8 @@ stashed, on the unchanged tree: passes in 0.27 s. PR #172 does not touch `reclai
 ## What the change that takes this up should do
 
 Establish a rate before a cause: run the test under the same parallel `--lib` filter on the box and
-in CI's Linux leg and count. If it recurs, read the stub's `argv.log` from the failing run — the
+in CI's Linux leg and count. If it recurs, read the stub's `argv.log` from the failing run (the
 fixture keeps the directory only on success, so the change that takes this up first makes the
-failure path keep it — and look at whether `ps` was listed at all (a `read_bounded` that saw no
+failure path keep it) and look at whether `ps` was listed at all (a `read_bounded` that saw no
 byte within `REAPER_DOCKER_TICKS`, or an `execv` of the stub that failed under load). If it does
 not recur across that count, delete this file.

@@ -657,10 +657,10 @@ still running and silent; a helper that has ended is seen at once.
 
 The first byte of a helper's setup-failure report, distinct from every
 READY, OK, FAIL and guard command byte. A helper that cannot finish its
-setup writes one `SETUP_FAILURE_FRAME_LEN`-byte frame — this marker, the
-`SetupStep` that failed, the position of the lease it was working on,
-and the errno the call left — on the acknowledgement pipe it already
-owns, then ends with status 1 as it always did. The frame is one
+setup writes one `SETUP_FAILURE_FRAME_LEN`-byte frame on the
+acknowledgement pipe it already owns, then ends with status 1 as it
+always did. The frame is this marker, the `SetupStep` that failed, the
+position of the lease it was working on, and the errno the call left. The frame is one
 `write` of fewer than `PIPE_BUF` bytes, so it arrives whole or not at
 all, and it is data: a reader that cannot see the pipe close (Darwin,
 below) still wakes for it.
@@ -1006,7 +1006,7 @@ The child side of the report. One `write` of the frame, then
 `_exit(1)`: the exit status the parent has always seen from a helper
 that failed its own setup is unchanged, and the frame is what names
 the step. The write is best-effort because nothing better exists at
-that point — the process is ending either way — and its failure is
+that point, the process is ending either way, and its failure is
 observable: the parent reads the pipe closing with no report and says
 so, which is the shape the `UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY`
 seam drives and `helper_ready_failure_helper` pins. Async-signal-safe:
@@ -1072,7 +1072,7 @@ the exit-before-READY test four seconds on every macOS run.
 Why `select`, and why this symbol. `select` is the one wait primitive
 Darwin gives a FIFO that reports hangup. Its `fd_set` is fixed at
 `FD_SETSIZE` (1024) descriptors, and a descriptor number in a process
-that has opened many files — the test binary routinely — exceeds it;
+that has opened many files exceeds it (the test binary does routinely);
 the plain `select` symbol refuses such an `nfds` with `EINVAL`. Darwin
 provides the same call without that limit under the symbol the header
 binds when `_DARWIN_UNLIMITED_SELECT` (or the default `_DARWIN_C_SOURCE`)
@@ -1812,8 +1812,8 @@ milliseconds.
 The regression test for the Darwin wait, and the one that fails on the
 tree before it: `read_guard_ack` answered `TimedOut` after the whole
 budget for a writer that had been collected before the wait began.
-Deterministic by construction — the child is reaped first, so its
-descriptors are closed before the parent looks — which is the shape
+Deterministic by construction: the child is reaped first, so its
+descriptors are closed before the parent looks, which is the shape
 row `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS` asks for. On Linux it
 passes before and after; the platform the defect is on is the one that
 evaluates it (§11).

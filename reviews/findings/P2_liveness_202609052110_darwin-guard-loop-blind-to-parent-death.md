@@ -24,8 +24,8 @@ signals it (reasoned from the measured `poll` behaviour and the loop as written;
 
 ## What the change that takes this up should do
 
-Bound the guard's idle wait as the reaper's is bounded — a slice and a `getppid` check on every
-timeout, or a `select` through `wait_readable`'s Darwin path extended to two descriptors — and add
+Bound the guard's idle wait as the reaper's is bounded, with a slice and a `getppid` check on every
+timeout, or with a `select` through `wait_readable`'s Darwin path extended to two descriptors, and add
 a test on the macOS leg that a guard whose parent has exited ends within a bound the test observes
 by reaping it, not by a wall-clock assertion on the guard's own work. Nothing in PR #172 changed
 the guard's loop: that pull request bounded the parent's READY wait and left the child's loops as
