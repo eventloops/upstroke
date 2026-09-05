@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/policy.rs`](../../../../src/effects/tests/policy.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -56,7 +56,7 @@ what that file records, and this module takes none.
 The prologue text on the ten lines above the attribute, from the original
 source — comments included, because the marker *is* a comment.
 
-## `pub(super) fn marker_before(source: &str, line: usize, inne…` › `let start = if inner { 0 } else { line.saturating_sub(13) };`
+## `pub(super) fn marker_before(source: &str, line: usize, inner: bool) -> String {` › `let start = if inner { 0 } else { line.saturating_sub(13) };`
 
 A file-level inner attribute is preceded by the module's whole prologue,
 and lane A's `# LEGACY-EFFECT` sections are doc-comment headings sixteen

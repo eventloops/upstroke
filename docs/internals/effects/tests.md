@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests.rs`](../../../src/effects/tests.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -185,9 +185,9 @@ each of the six call sites carries its own
 `-D warnings` the gate runs with, the compiler owns the count in both
 directions: a seventh denied call is an error, and a site that stops
 reaching a denied path is `unfulfilled_lint_expectations`. What is left for
-a test is **documentation synchronisation** — that the file's prologue, the
-six annotations and the `effects/allowlist.toml` row still say the same
-thing — and that is all this does. The arithmetic census upstream keeps
+a test is documentation synchronisation. The written readiness contract,
+the six annotations and the `effects/allowlist.toml` row must still say the
+same thing. That is all this does. The arithmetic census upstream keeps
 its own job, which is now a second, independent reading of the same tree
 rather than the only one.
 
@@ -197,18 +197,18 @@ was two controls that searched for byte sequences spanning a line, which are
 span a line ending cannot have that bug, so the records are written to keep
 their phrases on one line rather than being folded back together here.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `const SPELLED: [&str; 8] = [`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `const SPELLED: [&str; 8] = [`
 
 The records are prose and spell the count as a word. The two are bound
 rather than restated: changing `SITES` without changing the word fails
 here instead of quietly searching for a phrase no record contains.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `for lint in USED_GOVERNED_LINTS {`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `for lint in USED_GOVERNED_LINTS {`
 
 (1) **All three governed lints are denied at file scope, and none is
 allowed there.** The deny is what makes an expectation a narrowing.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `let found = governed_allows(&source);`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `let found = governed_allows(&source);`
 
 (2) **Exactly six per-site expectations, each of them an `expect` of that
 one lint, below module level, with a reason that names which site it is.**
@@ -216,23 +216,23 @@ The indices are asserted as a set: six annotations that all said "site 1
 of 6" would satisfy a count and would mean the file had been copied
 rather than read.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `let indices: BTreeSet<usize> = (1..=SITES)`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `let indices: BTreeSet<usize> = (1..=SITES)`
 
 The reasons are read out of the source rather than out of the attribute
 scan, because the scan blanks string literals — which is what keeps a
 fixture in a doc comment invisible, and what means the reason's text has
 to be read from the file itself.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `let list = allowlist();`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `let list = allowlist();`
 
 (3) **The row records the same lint and the same count**, and names the
 decision that admits a per-site expectation at all.
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `let phrase = format!("five distinct denied paths across {sites_in_words} sites");`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `let phrase = format!("five distinct denied paths across {sites_in_words} sites");`
 
 (4) **The prose in both records states the count, on one line each.**
 
-## `fn the_readiness_expectations_are_per_site_and_both_records…` › `assert!(`
+## `fn the_readiness_expectations_are_per_site_and_both_records_say_so() {` › `assert!(`
 
 (5) **The decision exists.** A record cited by two files and absent from
 the tree is a citation nobody can follow.
@@ -246,7 +246,7 @@ module tree, which is what a per-site expectation has to be narrowing.
 `bare` because a row records `clippy::disallowed_methods` and a prologue may
 write either spelling; the reader normalises both.
 
-## `fn every_allow_of_a_governed_lint_is_module_level_and_in_th…` › `if !allow.module_level`
+## `fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {` › `if !allow.module_level`
 
 **The one shape permitted below module level**, and every clause
 of it is load-bearing. `decisions/2026-08-30-readiness-lint-\
@@ -257,18 +257,18 @@ its own reason, in a file that DENIES the lint at module level so
 the expectation narrows a denial instead of decorating an
 inheritance, and counted in a row a reviewer read.
 
-## `fn every_allow_of_a_governed_lint_is_module_level_and_in_th…` › `for (path, (entry, _)) in &recorded {`
+## `fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {` › `for (path, (entry, _)) in &recorded {`
 
 A row recording per-site expectations for a file the scan never reached
 is a row nothing checks. The count above only runs for files the scan
 found an attribute in.
 
-## `fn every_allow_of_a_governed_lint_is_module_level_and_in_th…` › `for (path, (entry, _)) in &recorded {`
+## `fn every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist() {` › `for (path, (entry, _)) in &recorded {`
 
 A file listed with a non-empty `allows` and no attribute is a stale entry;
 a scan that found nothing is a scan that proves nothing.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disgu…`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {`
 
 The scan refuses what it is for — driven with input that breaks each rule.
 
@@ -277,52 +277,52 @@ seen refuse anything. Every case here is synthetic and every one asserts a
 *different* discriminator, so a scan that collapsed to "returns true" would
 fail on the counts rather than pass on the cases.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let on_a_function = "#[allow(clippy::disallowed_methods)]\nfn go() {}\n";`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let on_a_function = "#[allow(clippy::disallowed_methods)]\nfn go() {}\n";`
 
 (1) A function-level allow is found and is not module-level.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let on_a_statement = "fn go() {\n    #[allow(clippy::disallowed_methods)]\n    let _ = 1;…`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let on_a_statement = "fn go() {\n    #[allow(clippy::disallowed_methods)]\n    let _ = 1;\n}\n";`
 
 (2) A statement-level allow, likewise.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let on_a_module = "#[allow(clippy::disallowed_methods)]\nmod inner { }\n";`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let on_a_module = "#[allow(clippy::disallowed_methods)]\nmod inner { }\n";`
 
 (3) An outer allow on an inner `mod` IS module-level — the rule permits
     module-level attributes, not only file-level ones.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let inner = "//! doc\n#![allow(clippy::disallowed_types)]\nfn go() {}\n";`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let inner = "//! doc\n#![allow(clippy::disallowed_types)]\nfn go() {}\n";`
 
 (4) An inner attribute in the prologue is module-level.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let late = "fn go() {}\n#![allow(clippy::disallowed_types)]\n";`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let late = "fn go() {}\n#![allow(clippy::disallowed_types)]\n";`
 
 (5) An inner attribute after an item is not in the prologue.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let expected = "#![expect(clippy::disallowed_macros)]\n";`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let expected = "#![expect(clippy::disallowed_macros)]\n";`
 
 (6) `expect` counts too; the sentence says "allow/expect".
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `assert!(governed_allows("#![allow(clippy::too_many_arguments)]\n").is_empty());`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `assert!(governed_allows("#![allow(clippy::too_many_arguments)]\n").is_empty());`
 
 (7) An ungoverned lint is not reported at all.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let disguised = concat!(`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let disguised = concat!(`
 
 (8) THE DISGUISES. An attribute inside a comment or a string is not an
     attribute. `PR4-CENSUS-COMMENT-ORACLE` is in the ledger because a
     census counted a doc comment, and this module's own fixtures are
     attributes written inside string literals.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let blanked = blank_comments_and_strings(disguised);`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let blanked = blank_comments_and_strings(disguised);`
 
 ... and the blanking that makes that true actually ran.
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let mixed = format!("{disguised}#![allow(clippy::disallowed_macros)]\n");`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let mixed = format!("{disguised}#![allow(clippy::disallowed_macros)]\n");`
 
 (9) A real attribute in a file that also carries disguised ones is still
     found — the blanking must not be a blunt "delete everything".
 
-## `fn the_placement_scan_refuses_an_allow_that_is_not_module_l…` › `let mechanisms = 9;`
+## `fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through_no_disguise() {` › `let mechanisms = 9;`
 
 The hostility is a count over *mechanisms*, not over strings: nine cases,
 and the placement answers partition 4 / 3 (module-level / not) with two
@@ -349,7 +349,7 @@ And the three that ARE used are exactly the three recorded.
 
 `mechanism` (2) scans `Cargo.toml [lints]` too, so this is that half.
 
-## `fn cargo_toml_declares_no_lint_table_that_could_allow_a_gov…` › `return;` (trailing)
+## `fn cargo_toml_declares_no_lint_table_that_could_allow_a_governed_lint() {` › `return;` (trailing)
 
 No table at all is the strongest form of the answer.
 
@@ -419,7 +419,7 @@ funnel section, and they are there.
 Every legacy entry carries the justification the packet asks for, and every
 funnel entry carries its review clause.
 
-## `fn every_allowlist_entry_carries_its_justification_and_name…` › `assert_eq!(absent, Vec::<&str>::new(), "the absent set moved");`
+## `fn every_allowlist_entry_carries_its_justification_and_names_a_real_file() {` › `assert_eq!(absent, Vec::<&str>::new(), "the absent set moved");`
 
 **Empty since PR6.** It held exactly one entry — `src/runner/container.rs`,
 the file `FunnelGroup::Container.module()` names and PR5 did not have —
@@ -433,17 +433,17 @@ allowlist had started describing a tree that does not exist.
 (1) The denylist
 ---------------------------------------------------------------------------
 
-## `fn the_denylist_names_every_primitive_the_packet_enumerates…` › `assert!(!denied.disallowed_methods.is_empty());`
+## `fn the_denylist_names_every_primitive_the_packet_enumerates() {` › `assert!(!denied.disallowed_methods.is_empty());`
 
 The three lists exist and none is vacuous. An empty `disallowed-macros`
 would satisfy "clippy.toml has three lists" and enforce nothing.
 
-## `fn the_denylist_names_every_primitive_the_packet_enumerates…` › `for entry in denied.all() {`
+## `fn the_denylist_names_every_primitive_the_packet_enumerates() {` › `for entry in denied.all() {`
 
 Every entry says why. A denial without a reason is a denial the next
 author deletes.
 
-## `fn the_denylist_names_every_primitive_the_packet_enumerates…` › `const NAMES_A_CONTAINER_RUNTIME: &[(&str, &str)] = &[`
+## `fn the_denylist_names_every_primitive_the_packet_enumerates() {` › `const NAMES_A_CONTAINER_RUNTIME: &[(&str, &str)] = &[`
 
 "docker invocation helpers". PR6 adds them, so this is no longer an
 absence claim: exactly one production file may name a container runtime,
@@ -463,7 +463,7 @@ The **set** of files is the claim, in the idiom of
 naming a container runtime is the finding, and every file in the set has
 a reason.
 
-## `fn the_denylist_names_every_primitive_the_packet_enumerates…` › `let production = blank_comments(&production_region(&source));`
+## `fn the_denylist_names_every_primitive_the_packet_enumerates() {` › `let production = blank_comments(&production_region(&source));`
 
 Comments blanked and **strings kept**: the needle lives inside a
 string literal, so the sibling blanker would remove the very bytes
@@ -471,7 +471,7 @@ this looks for. Comments are blanked because a doc comment quoting
 the packet's "docker ps" is prose, and a census that counted it would
 be the fifth `PR4-CENSUS-COMMENT-ORACLE`.
 
-## `fn the_denylist_names_every_primitive_the_packet_enumerates…` › `for helper in [`
+## `fn the_denylist_names_every_primitive_the_packet_enumerates() {` › `for helper in [`
 
 And the helpers themselves are denied by name, which is the packet's
 actual requirement: the six effectful operations of the two seams the
@@ -566,13 +566,13 @@ cannot give:
   that resolution defeats renaming;
 * the shapes are counted, so a deleted fixture is loud.
 
-## `fn every_declared_effect_denial_refuses_for_the_reason_it_d…` › `let (ok, diagnostics) = lint_fixture(&scratch, "control", DENIAL_CONTROL);`
+## `fn every_declared_effect_denial_refuses_for_the_reason_it_declares() {` › `let (ok, diagnostics) = lint_fixture(&scratch, "control", DENIAL_CONTROL);`
 
 The control first. If this does not compile clean, nothing below means
 anything -- `PR5-C-DOCTEST-FIXTURES-NEVER-RAN` is the ledger entry for
 fixtures that were green having never executed.
 
-## `fn every_declared_effect_denial_refuses_for_the_reason_it_d…` › `assert_eq!(shapes.len(), 7, "{shapes:?}");`
+## `fn every_declared_effect_denial_refuses_for_the_reason_it_declares() {` › `assert_eq!(shapes.len(), 7, "{shapes:?}");`
 
 `mechanism` (1) names five resolution shapes -- "aliases, re-exports,
 function values, method calls, and macro-expanded code" -- and
@@ -635,12 +635,12 @@ Executed rather than believed. A silent change in either -- a dependency
 bump, a feature flag -- weakens every equality in this section, so it fails
 here first.
 
-## `fn the_workflow_parser_rejects_duplicate_keys_and_reads_on_…` › `let clean = "jobs:\n  lint:\n    runs-on: ubuntu-latest\n";`
+## `fn the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string() {` › `let clean = "jobs:\n  lint:\n    runs-on: ubuntu-latest\n";`
 
 The control: the same shape without the duplicate parses, so "refused"
 below is not "refuses everything".
 
-## `fn the_workflow_parser_rejects_duplicate_keys_and_reads_on_…` › `let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);`
+## `fn the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string() {` › `let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);`
 
 YAML 1.1 resolves the bare word `on` to the boolean `true`, which would
 put the workflow's trigger block under a key no reader looks for. A 1.2
@@ -656,7 +656,7 @@ on conforming input is one nobody has seen refuse anything -- the rule this
 file states in its own header and the reason `PR5-C-DOCTEST-FIXTURES-NEVER-RAN`
 exists.
 
-## `fn the_workflow_shape_oracle_refuses_every_escape_the_ledge…` › `let doc = parse_workflow(&text).expect(CI_WORKFLOW);`
+## `fn the_workflow_shape_oracle_refuses_every_escape_the_ledger_names() {` › `let doc = parse_workflow(&text).expect(CI_WORKFLOW);`
 
 The negative control first: the real document has no complaint, so a
 refusal below is the mutation and not a contract that refuses everything.
@@ -776,16 +776,16 @@ The refusals are executed in [`WORKFLOW_ESCAPES`] -- every row named
 `MUT-MSRV-*` -- so this test passing is not the claim that the contract
 refuses nothing.
 
-## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_…` › `assert_eq!(three_component("1.85"), "1.85.0");`
+## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_every_platform() {` › `assert_eq!(three_component("1.85"), "1.85.0");`
 
 The derivation, with its controls, before anything is asserted with it.
 
-## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_…` › `let installed: Vec<&str> = field(&doc, "jobs")`
+## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_every_platform() {` › `let installed: Vec<&str> = field(&doc, "jobs")`
 
 The toolchain claim once more as a bare equality, so its failure names the
 manifest and the workflow rather than only the complaint between them.
 
-## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_…` › `let steps = field(&doc, "jobs")`
+## `fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_every_platform() {` › `let steps = field(&doc, "jobs")`
 
 The order, as the indices themselves. `MUT-MSRV-CHECK-BEFORE-TOOLCHAIN`
 executes the refusal; this is the positive control beside it, and it fails
@@ -808,19 +808,19 @@ The positive controls come first, in both halves: the real workflow satisfies
 the contract, and so does the minimal conforming probe. Without them a
 refusal below would be evidence of nothing.
 
-## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_e…` › `fn probe(header: &str, job_body: &str) -> String {`
+## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {` › `fn probe(header: &str, job_body: &str) -> String {`
 
 A workflow carrying one job the rest of this section does not model.
 
-## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_e…` › `const PLAIN: &str = "    runs-on: ubuntu-latest\n    steps:\n      - run: cargo check\n";`
+## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {` › `const PLAIN: &str = "    runs-on: ubuntu-latest\n    steps:\n      - run: cargo check\n";`
 
 A job that binds nothing of its own.
 
-## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_e…` › `const PINNED: &str = "env:\n  RUSTFLAGS: -D warnings\n";`
+## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {` › `const PINNED: &str = "env:\n  RUSTFLAGS: -D warnings\n";`
 
 The pinned workflow-scope binding, written as the real document writes it.
 
-## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_e…` › `for (shape, document) in [`
+## `fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {` › `for (shape, document) in [`
 
 The other half of a scan that matches whole names case-insensitively: it
 must not fire on names that merely resemble the guarded ones. Each of these
@@ -884,26 +884,26 @@ length. Nothing else here is reachable from outside this directory.
 The cfg census reads effective predicates, decides them, and knows which
 forms gate.
 
-## `fn the_cfg_census_evaluates_effective_predicates_against_th…` › `let unmodelled = parse_cfg("feature = \"unshipped\"", false).expect("a parseable predicat…`
+## `fn the_cfg_census_evaluates_effective_predicates_against_the_valuations_ci_sets() {` › `let unmodelled = parse_cfg("feature = \"unshipped\"", false).expect("a parseable predicate");`
 
 An unmodelled name is a hard failure, not an optimistic guess. This is the
 review's fourth finding as a control: the version this replaces answered
 `Unknown` here and the caller read `Unknown` as "every runner compiles it".
 
-## `fn the_cfg_census_evaluates_effective_predicates_against_th…` › `let mut domain = scanned_sources();`
+## `fn the_cfg_census_evaluates_effective_predicates_against_the_valuations_ci_sets() {` › `let mut domain = scanned_sources();`
 
 The control rides along with the whole domain, so finding it proves the
 scan reaches injected content in the presence of every real file rather
 than in a fixture read on its own.
 
-## `fn the_cfg_census_evaluates_effective_predicates_against_th…` › `let by_form: BTreeMap<CfgForm, Vec<&str>> =`
+## `fn the_cfg_census_evaluates_effective_predicates_against_the_valuations_ci_sets() {` › `let by_form: BTreeMap<CfgForm, Vec<&str>> =`
 
 The two non-gating forms are RECORDED and not counted. Recording them is
 what makes their exclusion measurable: `target_os = "plan9"` and
 `target_os = "haiku"` are compiled by no runner, so if either were read as
 a gate the census below would report an uncovered predicate.
 
-## `fn the_cfg_census_evaluates_effective_predicates_against_th…` › `let stacked = injected`
+## `fn the_cfg_census_evaluates_effective_predicates_against_the_valuations_ci_sets() {` › `let stacked = injected`
 
 Two of the gates exist only because a guard was conjoined from somewhere
 other than the attribute itself.
@@ -925,18 +925,18 @@ apart, because the Windows repair was written as an instance rather than a
 class. A derived domain makes the next platform's omission a failure here
 rather than a third finding.
 
-## `fn every_platform_this_crate_configures_for_has_a_clippy_ga…` › `assert!(`
+## `fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requires() {` › `assert!(`
 
 A boundary, not a count: the tree carries nested, negated predicates and a
 census that only reads flat ones would pass every other assertion here.
 
-## `fn every_platform_this_crate_configures_for_has_a_clippy_ga…` › `let under_a_file_guard: BTreeSet<&str> = gates`
+## `fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requires() {` › `let under_a_file_guard: BTreeSet<&str> = gates`
 
 The whole-file guards are the other boundary. Every predicate in those
 files is `all(test, …)`, and a census that resolved none of them would
 read them all as unconditional.
 
-## `fn every_platform_this_crate_configures_for_has_a_clippy_ga…` › `for target in &CI_TARGETS {`
+## `fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requires() {` › `for target in &CI_TARGETS {`
 
 Each leg is load-bearing, with a witness. A runner no body needs is a job
 this contract would keep demanding for no reason; a body only one runner
@@ -993,7 +993,7 @@ same reason, that left the effectful build helpers out of `policy.rs`.
 `outputs`: "effect_sites.json (from the enums) … generated from the enums by
 a test and attached to gate reports".
 
-## `fn the_checked_in_effect_sites_json_is_what_the_enums_gener…` › `assert_eq!(effect_sites().len(), EffectSiteId::all().len());`
+## `fn the_checked_in_effect_sites_json_is_what_the_enums_generate() {` › `assert_eq!(effect_sites().len(), EffectSiteId::all().len());`
 
 It really is the whole inventory, not a corner of it.
 
@@ -1019,7 +1019,7 @@ down together, for every site rather than for the three that disagree, so a
 fourth disagreement appearing later is a change to this file rather than a
 silence.
 
-## `fn the_checked_in_funnel_module_record_states_where_the_bod…` › `["Answer.StageWrite", "Answer.PublishRename", "Answer.Ingest"],`
+## `fn the_checked_in_funnel_module_record_states_where_the_bodies_are() {` › `["Answer.StageWrite", "Answer.PublishRename", "Answer.Ingest"],`
 
 In `EffectSiteId::all()` order, which is the frozen enum's, so a site
 moving within the inventory is a change here too.
@@ -1034,7 +1034,7 @@ the enums so it cannot omit a *site*; what it can do is name a module that
 implements none of them, which reads identically to a module that implements
 all of them.
 
-## `fn every_site_the_inventory_declares_has_a_funnel_that_name…` › `let mut sources: BTreeMap<String, String> = BTreeMap::new();`
+## `fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent() {` › `let mut sources: BTreeMap<String, String> = BTreeMap::new();`
 
 Per site: does a funnel name it?
 
@@ -1051,12 +1051,12 @@ one would report the other's whole group as unimplemented:
 Recorded per group by `funnel_mechanism` so a group that stopped doing
 either is loud rather than silently "still covered by the other".
 
-## `fn every_site_the_inventory_declares_has_a_funnel_that_name…` › `let distinct: BTreeSet<&str> = mechanisms.values().copied().collect();`
+## `fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent() {` › `let distinct: BTreeSet<&str> = mechanisms.values().copied().collect();`
 
 Both mechanisms are in use. If one disappeared, every group would have to
 be re-measured against the other rather than inheriting a pass.
 
-## `fn every_site_the_inventory_declares_has_a_funnel_that_name…` › `let expected: BTreeSet<String> = SITES_WITHOUT_A_FUNNEL`
+## `fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent() {` › `let expected: BTreeSet<String> = SITES_WITHOUT_A_FUNNEL`
 
 The expected set, written out rather than counted, because *which* sites
 have no funnel is the finding and a count would hide a swap.
@@ -1076,7 +1076,7 @@ funnel and APIs that *consume* a Command remain permitted.
 `outputs`: "the residue-class evidence record (per element: constructed,
 classified, recovered; per site: sampling N and observed-class histogram)".
 
-## `fn the_checked_in_residue_class_record_is_what_the_enums_ge…` › `let harness = fs::read_to_string(repo_root().join("src/workspace_manager/tests.rs"))`
+## `fn the_checked_in_residue_class_record_is_what_the_enums_generate() {` › `let harness = fs::read_to_string(repo_root().join("src/workspace_manager/tests.rs"))`
 
 The sampling N the record freezes is the N the harness runs.
 `command_internal_sub_effects` says "N frozen per site in the registry";
@@ -1116,11 +1116,11 @@ syscall.
 ff0490a:src/events.rs` kept verbatim as the independent oracle for
 byte-identical legacy behaviour, and its whole value is that it is unchanged.
 
-## `fn every_file_durability_barrier_in_a_funnel_module_goes_th…` › `const BARRIERS: &[(&str, &str, usize)] = &[`
+## `fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {` › `const BARRIERS: &[(&str, &str, usize)] = &[`
 
 The two functions that may name the primitive, and how many times each.
 
-## `fn every_file_durability_barrier_in_a_funnel_module_goes_th…` › `let util = artifact_content(`
+## `fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {` › `let util = artifact_content(`
 
 Line endings normalized before any structural search: the guest checks this
 tree out with CRLF, and `find("\n}\n")` does not match `\r\n}\r\n`. Measured —
@@ -1128,18 +1128,18 @@ this census passed on Linux and panicked "the function ends" on Windows
 Server 2025, which is the platform half of the same lesson the rest of this
 round is about. `artifact_content` exists for exactly this reason.
 
-## `fn every_file_durability_barrier_in_a_funnel_module_goes_th…` › `const FUNNELS: &[&str] = &[`
+## `fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {` › `const FUNNELS: &[&str] = &[`
 
 And nowhere else in the funnel modules, so a caller cannot quietly grow a
 second barrier the counter and this census both miss.
 
-## `fn every_file_durability_barrier_in_a_funnel_module_goes_th…` › `"src/runner/container.rs",`
+## `fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {` › `"src/runner/container.rs",`
 
 PR6's Container funnel writes the intent record durably and reaches
 the barrier through `util::fsync_file`/`util::fsync_dir` like every
 other funnel, so it belongs in the "and nowhere else" half.
 
-## `fn every_file_durability_barrier_in_a_funnel_module_goes_th…` › `let log = fs::read_to_string(repo_root().join("src/events/log.rs")).expect("src/events/lo…`
+## `fn every_file_durability_barrier_in_a_funnel_module_goes_through_one_call() {` › `let log = fs::read_to_string(repo_root().join("src/events/log.rs")).expect("src/events/log.rs");`
 
 The Event funnel's own primitive is `sync_data`, a different call with its
 own census next door, and it is named here so this test's silence about it
@@ -1297,11 +1297,11 @@ positives and fails on every one of the negatives beside them.
 The scan reads a file's **module structure**: inline ancestry, visibility
 qualifiers, and the predicates that compose down the tree.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let plain = only("#[cfg(test)]\nmod tests;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let plain = only("#[cfg(test)]\nmod tests;\n");`
 
 (1) The plain form the text rule found, still found.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for written in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for written in [`
 
 (2) **Visibility qualifiers.** The text rule read `mod ` immediately
 after the attribute, so every one of these was invisible to it and the
@@ -1310,39 +1310,39 @@ because `pub(in path)` carries a `::` and `pub(crate)` carries a paren,
 and a scan that stepped over one shape and not the others would pass on
 whichever the tree happens to use today.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `assert!(!only("pub(crate) mod helpers;\n").test_only);`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `assert!(!only("pub(crate) mod helpers;\n").test_only);`
 
 And the qualifier is not what makes it test-only: removed guard, same
 qualifier, decided the other way.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let inherited =`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let inherited =`
 
 (3) **Inline ancestry**, which is the shape `agent/proc.rs` uses and the
 one no text rule reaches at all: the declaration carries no attribute.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let ungated = only("pub(crate) mod test_support {\n    pub(crate) mod readiness;\n}\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let ungated = only("pub(crate) mod test_support {\n    pub(crate) mod readiness;\n}\n");`
 
 The mutation: the same file with the ancestor's guard deleted. The
 declaration is byte-identical and the answer flips, which is what says
 the ancestry is being read rather than the name.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let deep =`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let deep =`
 
 (4) **Nested inline modules**, with the guard on the middle one — so
 neither "the outermost" nor "the declaration's own" is the rule.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let both = scan("#[cfg(test)]\nmod inner {\n    mod under;\n}\nmod beside;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let both = scan("#[cfg(test)]\nmod inner {\n    mod under;\n}\nmod beside;\n");`
 
 (5) **The scope closes.** A declaration written after the guarded block
 ends does not inherit it, which is the whole of what brace depth is for.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let after_a_function = scan("#[cfg(test)]\nfn helper() {}\nmod plain;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let after_a_function = scan("#[cfg(test)]\nfn helper() {}\nmod plain;\n");`
 
 (6) **An attribute belongs to the item it precedes.** A `#[cfg(test)]`
 on a function does not carry to the next `mod`, and a brace-bodied module
 is not a declaration of a file at all.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for (written, expected) in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for (written, expected) in [`
 
 (7) **The predicate is decided, never assumed.** `any` is the case that
 matters: a Unix build with `test` off compiles the file, so the census
@@ -1350,43 +1350,43 @@ must keep it. Deciding it "test-only" would remove a production file from
 every census below, silently, which is the failure direction this whole
 derivation is shaped against.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for written in ["test", "all(test, unix)", "not(any(not(test), unix))"] {`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for written in ["test", "all(test, unix)", "not(any(not(test), unix))"] {`
 
 (8) The entailment itself, driven on predicates rather than on sources.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for prose in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for prose in [`
 
 (9) **Comments and string literals are not code.** `PR4-CENSUS-COMMENT-
 ORACLE` is the standing entry, and this derivation is the one it was
 filed against: a `//` line carrying a declaration once derived a skip for
 a real production module and removed it from every census below.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let after_a_brace_char = only("const C: char = '{';\n#[cfg(test)]\nmod real;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let after_a_brace_char = only("const C: char = '{';\n#[cfg(test)]\nmod real;\n");`
 
 A char literal holding a brace must not move the depth the ancestry is
 measured in — `PR7-R2C-CHAR-LITERAL-DESYNC`'s class, one instrument over.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `assert!(scan("fn models() {}\nstruct modest;\n").is_empty());`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `assert!(scan("fn models() {}\nstruct modest;\n").is_empty());`
 
 (10) **The word, not a prefix of one.** `models` is not `mod els`.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let past_a_macro = only("thread_local! {\n    static X: u8 = 0;\n}\n#[cfg(test)]\nmod rea…`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let past_a_macro = only("thread_local! {\n    static X: u8 = 0;\n}\n#[cfg(test)]\nmod real;\n");`
 
 (11) **A macro body is discarded, not walked.** Its tokens are only
 *shaped* like items, so anything read out of one is invented. The
 discard has to be verified from both sides: nothing inside is derived,
 and everything outside still is.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let after_attributed_macro = only("#[cfg(test)]\nlazy! [ a, b ]\nmod plain;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let after_attributed_macro = only("#[cfg(test)]\nlazy! [ a, b ]\nmod plain;\n");`
 
 Delimiters inside a macro body do not move the depth the ancestry is
 measured in, and an attribute above a macro belongs to the macro.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let past_a_negation = only("fn f() { let _ = a != b; }\n#[cfg(test)]\nmod real;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let past_a_negation = only("fn f() { let _ = a != b; }\n#[cfg(test)]\nmod real;\n");`
 
 `a != b` is not a macro: the token after `!` opens nothing.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for tokens in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for tokens in [`
 
 **The discard is load-bearing, not decoration.** `mod` is an ordinary
 token inside a macro, and a matcher may capture it — but a scanner
@@ -1394,23 +1394,23 @@ reading the body as *items* sees a `mod` with no name after it and
 refuses the whole file. So these are legal Rust that a body-walking scan
 cannot read, and the discard is what makes them silent.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let beside_a_macro = only(`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let beside_a_macro = only(`
 
 And a file holding both still derives exactly the real one.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for spaced in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for spaced in [`
 
 (12) **A spaced or commented `!` is still a macro**, and the discard has
 to survive the widening: these bodies hold nothing module-shaped, so they
 are dropped in silence and the declaration after them is unaffected.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `"macro_rules ! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod rea…`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `"macro_rules ! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod real;\n",`
 
 Discriminating: a matcher capturing the `mod` keyword. Recognised as
 a macro it is discarded; missed because the `!` is not the very next
 byte, its body is walked and the bare `mod` refuses the whole file.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let inside_a_negated_block = only(`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let inside_a_negated_block = only(`
 
 **`if !condition { … }` is not an invocation of `if`.** Allowing a gap
 before the `!` is what makes that shape reachable -- identifier, `!`,
@@ -1419,7 +1419,7 @@ block. Only `macro_rules` carries a name between its `!` and its body, so
 the block below is walked as a block: the declaration inside it is still
 derived, with the ancestry it actually has.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let inside_a_negated_block = only(`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let inside_a_negated_block = only(`
 
 And the block a negated condition guards is **walked**, not skipped. An
 empty block cannot tell the two apart — skipping a balanced group and
@@ -1427,7 +1427,7 @@ walking it leave the same depth — so the discriminating shape is a
 declaration inside it. Read as a macro body this is module-shaped and the
 whole file is refused; read as a block it is the declaration it is.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for negated_group in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for negated_group in [`
 
 (13) **A negated grouped expression is not a macro body.** `if !(…)` is
 identifier, `!`, delimited group — the same three tokens as `foo!(…)` —
@@ -1436,24 +1436,24 @@ Read as a macro the group is module-shaped and the whole file is refused;
 read as the negation it is, the module is the module it is. A keyword
 cannot be a macro's path segment, which is what separates them.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let through_a_negated_group = only(`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let through_a_negated_group = only(`
 
 And the same shape with a real out-of-line declaration inside the group,
 so the walk is shown to reach it rather than merely not to refuse.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for (written, expected) in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for (written, expected) in [`
 
 (14) **Raw identifiers are one token, and their name may be a keyword.**
 `mod r#type;` declares a module called `type` and resolves to `type.rs`;
 a reader that stopped at the `#` saw `mod r` with no terminator after it
 and refused the file.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `assert!(scan("struct r#mod;\nfn f() { let raw = 1; }\n").is_empty());`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `assert!(scan("struct r#mod;\nfn f() { let raw = 1; }\n").is_empty());`
 
 A raw `r#mod` is an identifier named `mod`, not the keyword, so it opens
 nothing; and `raw` is an ordinary identifier that merely starts with `r`.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let raw_binding = "fn f() { let r#mod = 1; }\n#[cfg(test)]\nmod tests;\n";`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let raw_binding = "fn f() { let r#mod = 1; }\n#[cfg(test)]\nmod tests;\n";`
 
 **The token the fallback steps over is the whole token.**
 `PR72-RESOLVER-003`. Everything above reads `word`s; the "anything else"
@@ -1472,31 +1472,31 @@ declaration is decided by the byte after the embedded name, and neither
 outcome is one this scan may have; the repair is that the inside of a
 token is never read as one.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let raw_in_a_use = "#[cfg(test)]\nmod harness {\n    use std::r#mod as tests;\n}\n";`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let raw_in_a_use = "#[cfg(test)]\nmod harness {\n    use std::r#mod as tests;\n}\n";`
 
 The second shape, inside a `#[cfg(test)]` module so that anything the
 rescan derived would be test-only — a skip, for a file the crate never
 declared. It declares no module at all.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for source in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for source in [`
 
 And the token boundary itself, in both spellings and both directions: a
 raw identifier is one token, an ordinary identifier that merely begins
 with `r` is another, and a bare `r` is a third.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `let past_a_raw_macro = only("r#if! { let _ = 1; }\n#[cfg(test)]\nmod real;\n");`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `let past_a_raw_macro = only("r#if! { let _ = 1; }\n#[cfg(test)]\nmod real;\n");`
 
 (15) **A raw macro name is still a macro.** `r#if!(…)` is a macro called
 `if`, so the keyword rule above must read the raw spelling as an
 identifier rather than as the keyword it names.
 
-## `fn the_module_scan_reads_ancestry_and_visibility_rather_tha…` › `for fixture in [`
+## `fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {` › `for fixture in [`
 
 (16) **CRLF.** The guest checks this tree out with CRLF, and every
 structural answer above has to be the same there. Driven by converting
 each fixture rather than by trusting that nothing here reads a line.
 
-## `fn is_the_literal_mod_tests_form(name: &str, inline_path: &[String], guard: &str) -> bool…`
+## `fn is_the_literal_mod_tests_form(name: &str, inline_path: &[String], guard: &str) -> bool {`
 
 Whether a declaration is the literal `#[cfg(test)] mod tests;` form: that
 name, at its parent's own top level, under **that** guard rather than one
@@ -1556,17 +1556,17 @@ empty inline path, the resolved file stem, and `test_only` — so a rule that
 does not read the guard cannot tell them apart, and nothing else in this
 crate would have said so.
 
-## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal…` › `let plain = only("#[cfg(test)]\nmod tests;\n");`
+## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form() {` › `let plain = only("#[cfg(test)]\nmod tests;\n");`
 
 The positive: the form the `tests.rs` half of the census domain is a list
 of, and the one a `file_stem == "tests"` census may skip.
 
-## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal…` › `for narrowed in [`
+## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form() {` › `for narrowed in [`
 
 The negatives, written both ways a narrowing reaches the declaration: one
 attribute carrying a conjunction, and two attributes conjoined.
 
-## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal…` › `let inherited = only("#[cfg(test)]\nmod test_support {\n    pub(crate) mod readiness;\n}\…`
+## `fn a_narrowed_cfg_guard_is_test_only_but_is_not_the_literal_mod_tests_form() {` › `let inherited = only("#[cfg(test)]\nmod test_support {\n    pub(crate) mod readiness;\n}\n");`
 
 The other two ways out of the subset, so the guard is not the only thing
 this rule reads: the inline ancestry `readiness.rs` is reached through,
@@ -1585,35 +1585,35 @@ and every refusal below is driven — none of them is reachable from this
 tree, which is exactly why they would otherwise be code nobody has watched
 work.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert_eq!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert_eq!(`
 
 (1) Malformed input the scan cannot tokenise.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for unreadable in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for unreadable in [`
 
 (2) A predicate the entailment grammar cannot read. Unresolved is
 refused, not treated as "not test" — because "not test" is the answer
 that keeps a file in a census's domain, and a scan that cannot read a
 guard does not know which direction is safe.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for unreadable in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for unreadable in [`
 
 The parser's own refusals, driven directly.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for pathed in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for pathed in [`
 
 (3) `#[path]`, which is the one construct that can point a declaration
 outside its own directory — and therefore the one that could build the
 cycle asserted against below. Refused rather than resolved, in both the
 direct and the `cfg_attr` forms.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert!(`
 
 And it is refused **because it reaches a module**: the same attribute on
 something else is not this derivation's business, and refusing it would
 be a scan that fails on files it has no claim about.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for shaped in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for shaped in [`
 
 (3b) **A macro body holding a module-shaped sequence.** A macro invoked
 at item position can expand to a module, and nothing here can tell which
@@ -1623,12 +1623,12 @@ names) or silently dropped (which loses a real one). Every delimiter,
 and the `macro_rules!` definition form, which carries a name between the
 `!` and its body.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `"macro_rules! r#mod {\n    () => {\n        mod x;\n    };\n}\n",`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `"macro_rules! r#mod {\n    () => {\n        mod x;\n    };\n}\n",`
 
 Raw identifiers, on both halves: a macro defined with a keyword for a
 name, and a module-shaped body whose module is named with one.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for spaced in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for spaced in [`
 
 **The `!` need not touch the name.** Whitespace and comments between a
 macro's name and its `!` are valid Rust, and `#[rustfmt::skip]` keeps
@@ -1636,24 +1636,24 @@ whatever spelling a file was written with -- so a guard keyed on the very
 next byte missed exactly the macros somebody had spaced out. Every
 spelling below is a real one a formatter would otherwise close up.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `for ordinary in [`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `for ordinary in [`
 
 And a macro body with nothing module-shaped in it is discarded in
 silence, which is what stops the refusal from being a tax on every
 `vec!`, `assert!` and `format!` in the tree.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert!(matches!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert!(matches!(`
 
 (4) An inner `#![cfg(…)]` gates the module it is written in, which this
 derivation does not model. There are none in this tree; one arriving
 fails loudly rather than being read as ungated.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert!(matches!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert!(matches!(`
 
 (5) Duplicates, and the control that says the check is per parent module
 rather than per file — two modules may each declare an `x`.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let roots = crate::effects::tests::crate_roots();`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let roots = crate::effects::tests::crate_roots();`
 
 (6) **Candidate paths, the flattening mutation, and the crate roots.**
 The inline path is part of the directory. A resolver that dropped it
@@ -1661,7 +1661,7 @@ looks in `agent/proc/readiness.rs`, which does not exist — so the failure
 is a zero-candidate refusal if you are lucky, and the wrong file if a
 module of that name is ever added beside it.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert_eq!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert_eq!(`
 
 **A crate root owns its directory; an ordinary module does not**, and
 which files are roots is read from this package's manifest rather than
@@ -1669,7 +1669,7 @@ from their names — `PR72-TARGETS-001`. `mod.rs` is the first case
 wherever it sits; everything else is the first case exactly when the
 manifest names it.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert!(`
 
 **The live instance the stem rule got wrong in this tree.**
 `examples/probe.rs` is an `example` target, so it is a crate root and its
@@ -1678,7 +1678,7 @@ out-of-line children live in `examples/` — and `scanned_sources` walks
 hypothetical. A stem rule answers `examples/probe/`, which is a directory
 Cargo does not compile out of.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert_eq!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert_eq!(`
 
 **The competing production sibling, decided rather than refused.** A
 nested `src/a/lib.rs` this manifest never names is the ordinary module
@@ -1690,38 +1690,38 @@ no `src/a/lib/tests.rs` present that wrong reading resolves rather than
 refusing. The old derivation could not tell the two apart and refused
 both; the manifest tells them apart.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert_eq!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert_eq!(`
 
 The sibling the wrong reading would have claimed, named so the two
 readings are visible side by side rather than asserted apart.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let elsewhere = std::env::temp_dir().join("upstroke-not-this-package/src/lib.rs");`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let elsewhere = std::env::temp_dir().join("upstroke-not-this-package/src/lib.rs");`
 
 **Outside the package is refused, not resolved.** An inventory is a
 statement about one package; a file that is not inside it is one the
 inventory says nothing about, and answering anyway would be the guess
 this repair removed.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let pair = named("src/a.rs", &[], "b").expect("an ordinary module");`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let pair = named("src/a.rs", &[], "b").expect("an ordinary module");`
 
 (7) **Zero and two candidates.** Two is `x.rs` and `x/mod.rs` both
 present — a competing `mod.rs` that Rust itself refuses to compile and
 that a resolver taking the first match would silently pick a side in.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let base = Path::new("src/agent");`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let base = Path::new("src/agent");`
 
 (8) **Path escape.** A candidate must descend from the declaring file's
 directory through plain components. This holds by construction while
 `#[path]` is refused, and the two are one control with two halves.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let edge = |from: &str, to: &str| (PathBuf::from(from), PathBuf::from(to));`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let edge = |from: &str, to: &str| (PathBuf::from(from), PathBuf::from(to));`
 
 (9) **Cycles.** The derivation reads every guard from the file above, so
 a cycle means a guard attributed to a file that does not inherit it. Not
 reachable while directory-derived candidates descend, which is the reason
 to drive it here rather than a reason to leave it unchecked.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let branching = vec![`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let branching = vec![`
 
 **A branching graph, with the cycle on the second edge out of a node.**
 The first version walked `edges.iter().find(…)` — one outgoing edge per
@@ -1730,12 +1730,12 @@ graph acyclic while `a -> c -> a` sat beside it. Every node here has an
 outgoing edge, so a detector that merely *terminates* still passes; what
 separates them is which edges get walked.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `assert_eq!(`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `assert_eq!(`
 
 The same shape without the back edge is a tree, so the branching itself
 is not what the detector is reacting to.
 
-## `fn the_module_resolver_refuses_every_shape_it_cannot_resolv…` › `let deferred = vec![`
+## `fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {` › `let deferred = vec![`
 
 A cycle reachable only through a node whose *first* edge leads away from
 it: the depth-first walk has to come back and take the second.
@@ -1767,17 +1767,17 @@ second copy retired, and this is the control that says so, because the tree
 declares no `mod` inside `examples/probe.rs` today and a census that only
 ran over the tree would not notice either reading.
 
-## `fn the_cfg_census_resolves_module_directories_through_the_t…` › `("src/lib.rs", "src"),`
+## `fn the_cfg_census_resolves_module_directories_through_the_target_inventory() {` › `("src/lib.rs", "src"),`
 
 A crate root owns its own directory. All three of this package's
 targets, so the answer is read from the manifest rather than from two
 stems that happen to agree with it.
 
-## `fn the_cfg_census_resolves_module_directories_through_the_t…` › `("src/engine/mod.rs", "src/engine"),`
+## `fn the_cfg_census_resolves_module_directories_through_the_target_inventory() {` › `("src/engine/mod.rs", "src/engine"),`
 
 `mod.rs` is a crate root's shape wherever it sits.
 
-## `fn the_cfg_census_resolves_module_directories_through_the_t…` › `("src/effects.rs", "src/effects"),`
+## `fn the_cfg_census_resolves_module_directories_through_the_target_inventory() {` › `("src/effects.rs", "src/effects"),`
 
 And an ordinary module owns a directory named after it — including
 one whose stem is `lib`, which the retired rule read as a root.
@@ -1804,48 +1804,48 @@ not a membership test, and the stem rule this replaces is written out beside
 it and shown to disagree — a control that both readings pass is a control
 that measures neither.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `fn by_stem(file: &Path) -> PathBuf {`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `fn by_stem(file: &Path) -> PathBuf {`
 
 The rule this replaces, written out so the disagreement is measured
 rather than asserted. `mod` is common ground; the roots are not.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `for (file, owns, stem_says) in [`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `for (file, owns, stem_says) in [`
 
 Each of the three cases, and the stem rule's answer beside it.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `("src/tools/odd.rs", "src/tools", "src/tools/odd"),`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `("src/tools/odd.rs", "src/tools", "src/tools/odd"),`
 
 An arbitrary bin path is a crate root: its children live beside it.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `("src/deep/nest/main.rs", "src/deep/nest", "src/deep/nest"),`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `("src/deep/nest/main.rs", "src/deep/nest", "src/deep/nest"),`
 
 So is a `main.rs` that is not at the source root, because this
 manifest says so — the case the old derivation refused outright.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `("src/a/lib.rs", "src/a/lib", "src/a"),`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `("src/a/lib.rs", "src/a/lib", "src/a"),`
 
 And a `lib.rs` the manifest never names is an ordinary module, which
 the old derivation also refused.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `let disagreements = ["src/tools/odd.rs", "src/a/lib.rs"]`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `let disagreements = ["src/tools/odd.rs", "src/a/lib.rs"]`
 
 Two of the three disagree, and the two that do are the ones no rule about
 file names can get right. The third is common ground and is here so the
 comparison is not silently vacuous.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `let missing = scratch.join("no-such-package");`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `let missing = scratch.join("no-such-package");`
 
 **Fail closed.** Every refusal is driven, because none is reachable from
 this tree and an unreachable arm is one nobody has watched work.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `"{\"packages\":[{\"manifest_path\":\"/somewhere/else/Cargo.toml\",\"targets\":[{\"src_pat…`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `"{\"packages\":[{\"manifest_path\":\"/somewhere/else/Cargo.toml\",\"targets\":[{\"src_path\":\"/somewhere/else/src/lib.rs\"}]}]}",`
 
 A package that is not this one. Falling back to \"the first package\"
 here is the fail-open shape: an inventory for somebody else's targets
 reads as an inventory, and every module directory below is resolved
 against it.
 
-## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_…` › `let live = crate::effects::tests::crate_roots();`
+## `fn the_crate_roots_come_from_the_manifest_and_an_arbitrary_bin_path_is_one() {` › `let live = crate::effects::tests::crate_roots();`
 
 And the real package's inventory is the one the census resolves against,
 read through the same reader.
@@ -1866,7 +1866,7 @@ Asserted over the region rather than by eye, and in both directions: the
 name is absent from the production region and present in the file, so a
 typo in the needle fails the second half instead of passing the first.
 
-## `fn the_file_level_lint_reader_is_a_census_instrument_and_no…` › `fn absent_from_production(source: &str) -> Vec<String> {`
+## `fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {` › `fn absent_from_production(source: &str) -> Vec<String> {`
 
 The two claims, over one spelling of the file.
 
@@ -1879,16 +1879,16 @@ the item is **removed by** [`crate::effects::production_code`], which is
 what `#[cfg(test)]` means to every census in this crate — and that is
 read from the region, not from a byte sequence spanning a line.
 
-## `fn the_file_level_lint_reader_is_a_census_instrument_and_no…` › `let crlf = source.replace('\n', "\r\n");`
+## `fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {` › `let crlf = source.replace('\n', "\r\n");`
 
 The same file with the line endings the Windows guest gives it.
 
-## `fn the_file_level_lint_reader_is_a_census_instrument_and_no…` › `assert!(`
+## `fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {` › `assert!(`
 
 The visibility is narrow as well as gated, and that fits on one line in
 either spelling.
 
-## `fn the_file_level_lint_reader_is_a_census_instrument_and_no…` › `for prologue in [`
+## `fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {` › `for prologue in [`
 
 The instrument still answers where it is used, so narrowing it did not
 narrow it out of existence — under both spellings of a line ending.
@@ -1922,7 +1922,7 @@ The rows include the two shapes that are the whole reason for the repair —
 which is `E0453` and not a level at all — and the decoys the blanking exists
 for.
 
-## `fn the_file_level_lint_reader_answers_what_rustc_does()` › `const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\…`
+## `fn the_file_level_lint_reader_answers_what_rustc_does()` › `const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";`
 
 A body that reaches a denied path exactly once, so a `disallowed_methods`
 diagnostic is produced by every level that does not suppress one.
@@ -1940,7 +1940,7 @@ What the compiler must have done, if the reader's answer is right.
 The one hand-written sentence in this test, and every arm of it is
 reached by a row below.
 
-## `fn predict(resolution: Resolution) -> (bool, Vec<&'static s…` › `return (false, Vec::new(), true);`
+## `fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {` › `return (false, Vec::new(), true);`
 
 Not a level: the prologue is rejected and the lint never runs.
 

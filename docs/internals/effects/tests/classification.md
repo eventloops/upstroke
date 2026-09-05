@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/classification.rs`](../../../../src/effects/tests/classification.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -91,7 +91,7 @@ one of them fails this test until somebody decides what it is. That is the
 only half of `mechanism` (3) a test can hold — the classification itself is
 a review — and it is the half that omission attacks.
 
-## `pub(in crate::effects::tests) fn reachable_fns_are_classifi…` › `let classified: Vec<&str> = module`
+## `pub(in crate::effects::tests) fn reachable_fns_are_classified() {` › `let classified: Vec<&str> = module`
 
 A row may carry its receiver (`Workspace::branch_exists`) so the
 denied path can name it; the domain is over bare fn names.
@@ -100,12 +100,12 @@ denied path can name it; the domain is over bare fn names.
 
 "effectful wrappers are added to the disallowed list themselves".
 
-## `pub(in crate::effects::tests) fn effectful_wrappers_are_den…` › `let path = format!("{}::{name}", module.crate_path);`
+## `pub(in crate::effects::tests) fn effectful_wrappers_are_denied() {` › `let path = format!("{}::{name}", module.crate_path);`
 
 `Type::method` is recorded as written, so an inherent method keeps
 its receiver in the path clippy has to resolve.
 
-## `pub(in crate::effects::tests) fn effectful_wrappers_are_den…` › `let classified: BTreeSet<String> = record`
+## `pub(in crate::effects::tests) fn effectful_wrappers_are_denied() {` › `let classified: BTreeSet<String> = record`
 
 The other direction: every crate-internal denial is a row somebody
 classified. A `upstroke::…` entry nobody classified is a denial with no
@@ -129,7 +129,7 @@ every one classified an effect is denied.
 than transcribed from the sentence's `fork/kill/setpgid/setsid/flock/fcntl/
 exec*` — which is six names out of the twenty-four this crate actually calls.
 
-## `pub(in crate::effects::tests) fn libc_items_are_classified_…` › `let effects: BTreeSet<&str> = record.libc.effect.iter().map(String::as_str).collect();`
+## `pub(in crate::effects::tests) fn libc_items_are_classified_and_denied() {` › `let effects: BTreeSet<&str> = record.libc.effect.iter().map(String::as_str).collect();`
 
 The other direction, or a reclassification would be free: moving an item
 from `effect` to `not_an_effect` would leave its denial in place with

@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/contract_mappings.rs`](../../../../src/effects/tests/contract_mappings.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -188,13 +188,13 @@ name and the file. The controls at the end vary the other way — one body
 shape at a time, name held fixed — so the predicate is shown refusing a
 comment, a string and a plain `fn`, and accepting a real test.
 
-## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_…` › `let unique: BTreeSet<&str> = T_CONTAINER_TESTS.iter().copied().collect();`
+## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_test_in_the_tree() {` › `let unique: BTreeSet<&str> = T_CONTAINER_TESTS.iter().copied().collect();`
 
 The transcription itself is checked for the two ways a hand-written list
 decays: a duplicate (which would let a missing name hide behind a present
 one and keep the count at nineteen) and a name that is not an identifier.
 
-## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_…` › `assert!(`
+## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_test_in_the_tree() {` › `assert!(`
 
 POSITIVE CONTROL. A census that can only say yes reports success from a
 predicate that matched nothing -- `PR5-DOCKER-CENSUS-CANNOT-FAIL`, where a
@@ -202,7 +202,7 @@ needle that lived inside a string made the search unfalsifiable. Drive the
 same predicate over a name that is not in the tree and require it to say
 so, so a `defining_test_sites` that returned a constant fails here.
 
-## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_…` › `let (_, container) = scanned_sources()`
+## `pub(in crate::effects::tests) fn every_fault_row_name_is_a_test_in_the_tree() {` › `let (_, container) = scanned_sources()`
 
 And it must be reading a tree. `scanned_sources` asserts its own walk
 found files; this asserts the *blanking* left code behind, because a
@@ -217,11 +217,11 @@ Separated from the gate above so a failure says which half broke: the tree,
 or the thing that reads it. Each source varies exactly one property against
 the accepted shape and holds the name fixed.
 
-## `pub(in crate::effects::tests) fn the_presence_predicate_ref…` › `let accepted = format!("#[test]\nfn {name}() {{ assert!(true); }}\n");`
+## `pub(in crate::effects::tests) fn the_presence_predicate_refuses_a_non_test_shape() {` › `let accepted = format!("#[test]\nfn {name}() {{ assert!(true); }}\n");`
 
 Accepted: a real test.
 
-## `pub(in crate::effects::tests) fn the_presence_predicate_ref…` › `for (label, source) in [`
+## `pub(in crate::effects::tests) fn the_presence_predicate_refuses_a_non_test_shape() {` › `for (label, source) in [`
 
 Refused, one property changed at a time.
 
@@ -292,28 +292,28 @@ states it: that the named test holds the clause. This is a *mapping* gate.
 The evidence that the clauses hold is the mutation witnessing recorded in
 the repair reports.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `assert_eq!(PR6_REFUSALS.len(), 9, "the contract states nine refusals");`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `assert_eq!(PR6_REFUSALS.len(), 9, "the contract states nine refusals");`
 
 (1) The nine refusals, with distinct clauses and distinct orderings.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `assert_eq!(ST16_VARIANTS.len(), 12);`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `assert_eq!(ST16_VARIANTS.len(), 12);`
 
 (2) The twelve ST-16 variants, (a)-(l), each present exactly once.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `let deferred: Vec<&str> = PR6_CLAUSES`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `let deferred: Vec<&str> = PR6_CLAUSES`
 
 (3) The clause decomposition, with deferrals owned by a named slice.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `let named: Vec<&str> = PR6_REFUSALS`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `let named: Vec<&str> = PR6_REFUSALS`
 
 Every name that is not a deferral is a `#[test]` in this tree.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `for (letter, _, test) in &ST16_VARIANTS {`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `for (letter, _, test) in &ST16_VARIANTS {`
 
 And the ST-16 mapping is consistent with the packet's own `test:` field:
 every variant's test that appears there appears under the same name.
 
-## `pub(in crate::effects::tests) fn every_promised_mapping_nam…` › `assert!(`
+## `pub(in crate::effects::tests) fn every_promised_mapping_names_a_test_or_an_owner() {` › `assert!(`
 
 A variant carried by a test the `test:` field does not name is
 allowed and must be visible, not silent.

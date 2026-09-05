@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/ci_model.rs`](../../../../src/effects/tests/ci_model.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -26,7 +26,7 @@ and performs no effect at all, so the allowance has no business reaching it.
 
 The workflow every claim in this section is about.
 
-## `pub(super) const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features -- -D war…`
+## `pub(super) const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features -- -D warnings";`
 
 The command a platform's Clippy leg must run, character for character.
 
@@ -67,7 +67,7 @@ covered on `master` either; `release.yml` builds the shipped artifact with
 `--release`, and that build failing is a red release, not a green CI over a
 broken tree.
 
-## `pub(super) const GIT_IDENTITY_SCRIPT: &str = "git config --global user.email \"ci@upstrok…`
+## `pub(super) const GIT_IDENTITY_SCRIPT: &str = "git config --global user.email \"ci@upstroke.local\"\ngit config --global user.name \"upstroke CI\"\n";`
 
 The script the test jobs run before the suite, character for character:
 an identity for the commits several tests make.
@@ -82,7 +82,7 @@ Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED` and `MUT-TEST-RUN-RETARGETED`.
 
 Every script a test job may run: the identity script and the suite.
 
-## `pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, WINDOWS_TEST_WIT…`
+## `pub(super) const TEST_WINDOWS_SCRIPTS: [&str; 2] = [GIT_IDENTITY_SCRIPT, WINDOWS_TEST_WITNESS];`
 
 The scripts the self-hosted leg runs: the identity script, and the suite
 with the witness that it executed.
@@ -98,7 +98,7 @@ ordinary churn does not touch it and narrow enough that a suite which
 silently stopped running cannot clear it. Dropping this many Windows tests
 is a deliberate act, and it edits this number in the same change.
 
-## `pub(super) const WINDOWS_TEST_WITNESS: &str = "cargo test --all-targets --all-features | …`
+## `pub(super) const WINDOWS_TEST_WITNESS: &str`
 
 The self-hosted leg's suite step, character for character: the pinned test
 command, its exit status, and a count of what libtest reported.
@@ -259,7 +259,7 @@ and a pin refuses it outright. The pin is not its own oracle: the loop's gate
 list is re-derived from `needs:` below and compared, so this literal being a
 faithful copy is itself checked against the job graph.
 
-## `pub(super) const GATE_JOB_FIELDS: [&str; 4] = ["name", "runs-on", "steps", "timeout-minut…`
+## `pub(super) const GATE_JOB_FIELDS: [&str; 4] = ["name", "runs-on", "steps", "timeout-minutes"];`
 
 The fields a platform Clippy job may declare -- an equality, not a denylist.
 
@@ -402,7 +402,7 @@ and a build script emitting a bad link directive only on newer rustc goes
 green. The MSRV leg pins its own floor separately, from the manifest.
 Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
 
-## `pub(super) const KNOWN_SHELLS: [&str; 6] = ["bash", "cmd", "powershell", "pwsh", "python"…`
+## `pub(super) const KNOWN_SHELLS: [&str; 6] = ["bash", "cmd", "powershell", "pwsh", "python", "sh"];`
 
 The shell keywords GitHub resolves to an interpreter it defines.
 

@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/cfg.rs`](../../../../src/effects/tests/cfg.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -263,17 +263,17 @@ has cost this repository time before:
     rather than blanking them, so it does not preserve the positions this
     scan is built on.
 
-## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> …` › `let mut declared: Vec<(String, String, CfgPred)> = Vec::new();`
+## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> (Vec<CfgSite>, Vec<String>) {` › `let mut declared: Vec<(String, String, CfgPred)> = Vec::new();`
 
 Pass one: which file each `#[cfg(P)] mod name;` governs.
 
-## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> …` › `let mut guards: BTreeMap<String, CfgPred> = BTreeMap::new();`
+## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> (Vec<CfgSite>, Vec<String>) {` › `let mut guards: BTreeMap<String, CfgPred> = BTreeMap::new();`
 
 A guarded file may itself declare a guarded module, so the guards compose.
 Bounded rather than recursive, and the bound is checked: a cycle here
 would otherwise be an infinite loop inside a test.
 
-## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> …` › `let mut sites = Vec::new();`
+## `pub(super) fn cfg_regions(sources: &[(String, String)]) -> (Vec<CfgSite>, Vec<String>) {` › `let mut sites = Vec::new();`
 
 Pass two: every occurrence, under the guard its file inherited.
 
@@ -354,7 +354,7 @@ here, which is the check the predecessor could not make at all: it collected
 `target_os` names, `not(any(unix, windows))` carries none, and five
 production regions the denylist has never examined were invisible to it.
 
-## `pub(super) const CFG_CENSUS_CONTROL: &str = r##"//! A control fixture. It is not compiled…`
+## `pub(super) const CFG_CENSUS_CONTROL: &str = r##"//! A control fixture. It is not compiled; it is scanned.`
 
 The census's permanent positive control.
 

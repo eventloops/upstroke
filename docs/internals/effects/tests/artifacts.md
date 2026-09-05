@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/artifacts.rs`](../../../../src/effects/tests/artifacts.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -122,7 +122,7 @@ Every one is a row in `reconciliation-D.md`'s site inventory with the packet
 key that defers it. They are written out rather than counted because *which*
 site is missing is the finding: a count would survive a swap.
 
-## `"Report.Write",`
+## `pub(super) const SITES_WITHOUT_A_FUNNEL` › `"Report.Write"`
 
 The **Container group is no longer here.** PR5 recorded all eight as
 unimplemented because `FunnelGroup::Container.module()` names

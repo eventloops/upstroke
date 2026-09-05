@@ -2,17 +2,23 @@
 
 Extended notes for [`src/effects.rs`](../../src/effects.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
 The compile-time enforcement layer: the effect denylist, the allowlist, the
 wrapper classification, and the generated inventories.
 
-`decisions.effect_site_inventory.mechanism` is the whole of this module's
-specification, in four numbered parts:
+The retired `decisions.effect_site_inventory.mechanism` packet described
+this module in the four parts below. They record its original rationale.
+[DESIGN.md](../../DESIGN.md) is the living authority for product design;
+the implementation rules are in [standards §2](../../standards/02_standards_automated_baseline.md)
+for lint placement and the effects census, [§3](../../standards/03_standards_design_principles.md)
+for effect boundaries, and [§15](../../standards/15_standards_dependencies_and_features.md)
+for dependency review. Packet quotations here preserve history and do not
+override those rules.
 
 1. **The denylist is rustc-resolved, not lexical.** `clippy.toml`'s
    `disallowed-methods` / `disallowed-types` / `disallowed-macros` name every
@@ -27,25 +33,27 @@ specification, in four numbered parts:
 3. **Wrapper classification.** Every externally reachable `fn` of a legacy or
    shared module is classified; the effectful ones join the denylist, "so a
    topology module cannot reach an effect through a legacy wrapper".
-4. **Dependency review** — a new dependency performing filesystem, process,
+4. **Dependency review.** A new dependency performing filesystem, process,
    lock or container effects has its API added to the denylist or is confined
    to a funnel module.
 
 ### This module performs no effect
 
-Everything above the `#[cfg(test)]` line is a pure function over `&str`: the
-parsers, the classifiers, the frozen lists. Reading `clippy.toml`, writing
-`effect_sites.json` and compiling fixtures all happen in the test region,
-which is where `outputs` puts them anyway ("effect_sites.json (from the
-enums) … generated from the enums **by a test**"). That is why this file is
+The non-test portion contains parsers, classifiers and frozen lists that
+compute from supplied values. Reading `clippy.toml`, writing
+`effect_sites.json` and compiling fixtures all happen in the test region.
+The retired packet's `outputs` key also described inventory generation
+by a test. That is why this file is
 in the funnel section of the allowlist while claiming something stronger than
 any other entry there.
 
-### The reading trap
+### Reading the historical references
 
-Every sentence quoted here is from `decisions.*`. `*_verification_dispositions`,
-`finding_dispositions[].rationale` and the `v4_`..`v15_` keys are the packet's
-disposition history and are quoted nowhere.
+References to `decisions.*`, `mechanism` and `outputs` below name keys in
+the retired packet. They explain provenance; the current design and
+standards remain authoritative. `*_verification_dispositions`,
+`finding_dispositions[].rationale` and the `v4_`..`v15_` keys belong to the
+packet's disposition history and are not reproduced here.
 
 ## `use std::collections::BTreeSet;`
 
@@ -329,13 +337,13 @@ literals. Only the adjacency was missing.
 in `&'static str`. All three are refused by one rule — the byte after the
 scalar is not a quote — rather than by a list.
 
-## `fn char_literal_end(bytes: &[u8], from: usize) -> Option<us…` › `at += 2;`
+## `fn char_literal_end(bytes: &[u8], from: usize) -> Option<usize> {` › `at += 2;`
 
 An escape. The longest Rust spells is `\u{10FFFF}`, which closes at
 `from + 11`, so the window is bounded and a runaway scan over the rest
 of the file cannot happen.
 
-## `fn char_literal_end(bytes: &[u8], from: usize) -> Option<us…` › `let width = match *bytes.get(at)? {`
+## `fn char_literal_end(bytes: &[u8], from: usize) -> Option<usize> {` › `let width = match *bytes.get(at)? {`
 
 One UTF-8 scalar, whose width its lead byte states. A continuation or an
 otherwise invalid lead cannot begin one, and `source` is a `&str`, so the
@@ -453,11 +461,11 @@ module; a `#[allow(…)] mod inner { … }` governs that module; an attribute on
 a function, a statement or an expression governs neither and is what the rule
 exists to refuse.
 
-## `fn is_module_level(blanked: &str, hash: usize, close: usize…` › `let mut prefix = &blanked[..hash];`
+## `fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> bool {` › `let mut prefix = &blanked[..hash];`
 
 Nothing but whitespace and other attributes may precede it.
 
-## `fn is_module_level(blanked: &str, hash: usize, close: usize…` › `let mut rest = &blanked[close + 1..];`
+## `fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> bool {` › `let mut rest = &blanked[close + 1..];`
 
 Outer: skip further attributes and whitespace, then require `mod`.
 
@@ -822,15 +830,15 @@ keeps `crate::a::b::expected_refs(` — `:` is not one — and rejects
 closed the same class: that census's needle is a constant it could choose,
 this one's is eleven names the packet chose.
 
-## `pub(crate) fn production_calls(code: &str, name: &str, form…` › `.filter(|(at, _)| {`
+## `pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {` › `.filter(|(at, _)| {`
 
 Not the tail of a longer identifier.
 
-## `pub(crate) fn production_calls(code: &str, name: &str, form…` › `.filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))`
+## `pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {` › `.filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))`
 
 Calls, not definitions.
 
-## `pub(crate) fn production_calls(code: &str, name: &str, form…` › `.filter(|(at, _)| {`
+## `pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {` › `.filter(|(at, _)| {`
 
 And the form the clause is written in, which is what tells three
 items of one name apart.
@@ -920,12 +928,12 @@ Pure and separately driven, because the real tree cannot produce one: a
 census control that is only ever exercised on input that satisfies it is
 a control nobody has seen refuse anything.
 
-## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)…` › `enum Colour {`
+## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {` › `enum Colour {`
 
 Depth-first search state. `Grey` is "on the path being walked", and
 reaching a `Grey` node is what a back edge *is*.
 
-## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)…` › `let mut adjacency: BTreeMap<&PathBuf, Vec<&PathBuf>> = BTreeMap::new();`
+## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {` › `let mut adjacency: BTreeMap<&PathBuf, Vec<&PathBuf>> = BTreeMap::new();`
 
 **The full adjacency, not the first edge out of each node.** The
 first version followed `edges.iter().find(…)`, which walks one
@@ -933,7 +941,7 @@ outgoing edge per node — so a node with two children whose *second*
 child closes the loop reported no cycle. `a -> b`, `a -> c`,
 `c -> a` was the shape, and it read as acyclic.
 
-## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)…` › `let mut stack: Vec<(&PathBuf, usize)> = vec![(start, 0)];`
+## `pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {` › `let mut stack: Vec<(&PathBuf, usize)> = vec![(start, 0)];`
 
 (node, how many of its outgoing edges have been taken). The stack
 IS the current path, which is what makes the cycle reportable.
@@ -973,7 +981,7 @@ manifest holds, and the previous derivation held it as a rule about file
 stems instead. A rule cannot be wrong quietly the way a stem test can:
 when the authority is unavailable the census stops.
 
-## `pub(crate) enum InventoryRefusal` › `NotRun { manifest: PathBuf, why: String },`
+## `pub(crate) enum InventoryRefusal` › `NotRun {`
 
 `cargo metadata` could not be started at all.
 
@@ -981,15 +989,15 @@ when the authority is unavailable the census stops.
 
 It ran and exited non-zero.
 
-## `pub(crate) enum InventoryRefusal` › `Unreadable { manifest: PathBuf, why: String },`
+## `pub(crate) enum InventoryRefusal` › `Unreadable {`
 
 Its output is not the JSON document this reads.
 
-## `pub(crate) enum InventoryRefusal` › `NoPackage { manifest: PathBuf },`
+## `pub(crate) enum InventoryRefusal` › `NoPackage {`
 
 No package in the document has that manifest path.
 
-## `pub(crate) enum InventoryRefusal` › `NoTargets { manifest: PathBuf },`
+## `pub(crate) enum InventoryRefusal` › `NoTargets {`
 
 The package has no targets, so nothing is a crate root.
 
@@ -1272,15 +1280,15 @@ what a file declares must not answer, because both wrong answers are
 silent — a missing skip reports a fixture as an offender, and a spurious
 one removes a production file from every census below.
 
-## `pub(crate) enum ScanRefusal` › `UnclosedAttribute { line: usize },`
+## `pub(crate) enum ScanRefusal` › `UnclosedAttribute {`
 
 `#[…` with no `]`.
 
-## `pub(crate) enum ScanRefusal` › `UnbalancedBraces { line: usize },`
+## `pub(crate) enum ScanRefusal` › `UnbalancedBraces {`
 
 A `}` with no `{`.
 
-## `pub(crate) enum ScanRefusal` › `MalformedDeclaration { line: usize },`
+## `pub(crate) enum ScanRefusal` › `MalformedDeclaration {`
 
 `mod` with no name, or a name followed by neither `;` nor `{`.
 
@@ -1288,19 +1296,19 @@ A `}` with no `{`.
 
 A `cfg` predicate the entailment grammar cannot read.
 
-## `pub(crate) enum ScanRefusal` › `UnsupportedPathAttribute { line: usize, name: String },`
+## `pub(crate) enum ScanRefusal` › `UnsupportedPathAttribute {`
 
 `#[path = "…"]`, or a `cfg_attr` that could apply one.
 
-## `pub(crate) enum ScanRefusal` › `UnsupportedInnerCfg { line: usize },`
+## `pub(crate) enum ScanRefusal` › `UnsupportedInnerCfg {`
 
 An inner `#![cfg(…)]`, which gates the module it is written in.
 
-## `pub(crate) enum ScanRefusal` › `DuplicateDeclaration { line: usize, name: String },`
+## `pub(crate) enum ScanRefusal` › `DuplicateDeclaration {`
 
 One module name declared twice in one module.
 
-## `pub(crate) enum ScanRefusal` › `ModuleShapedMacroBody { line: usize, macro_name: String },`
+## `pub(crate) enum ScanRefusal` › `ModuleShapedMacroBody {`
 
 A macro body holding a module-shaped token sequence.
 
@@ -1414,7 +1422,7 @@ comes `=`, which opens nothing. Requiring the second identifier only
 after `macro_rules` is what keeps `if !condition { … }` out, which
 otherwise reads as an invocation of `if` whose body is the block.
 
-## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocat…` › `if !name.raw && is_keyword(name.text) {`
+## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {` › `if !name.raw && is_keyword(name.text) {`
 
 **A keyword before a `!` is unary negation, not a macro name.**
 `if !(cond)`, `while !(cond)`, `return !(x)` are identifier, `!`,
@@ -1425,7 +1433,7 @@ a module-shaped macro body and refuses the whole file. A macro's path
 segment cannot be a keyword unless it is written raw, and `r#if!(…)`
 is a macro called `if`, so the test is on the plain spelling only.
 
-## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocat…` › `let bang = whitespace(bytes, after_name);`
+## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {` › `let bang = whitespace(bytes, after_name);`
 
 **Whitespace and comments may sit between the name and its `!`.**
 `macro_rules ! m { … }` and `quote /* why */ ! { … }` are both valid
@@ -1435,7 +1443,7 @@ exactly the macros somebody had gone out of their way to space out.
 Comments are already spaces in the view this reads, so one skip
 covers both.
 
-## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocat…` › `if !name.raw && name.text == b"macro_rules" {`
+## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {` › `if !name.raw && name.text == b"macro_rules" {`
 
 `macro_rules! name { … }` is the **only** form carrying a name
 between the `!` and the body, and reading one for every macro is
@@ -1443,7 +1451,7 @@ what would make `if !condition { … }` an invocation of `if` once the
 gap above is allowed: identifier, `!`, identifier, delimiter — and
 the whole block would be skipped. Keyed on the one name that has it.
 
-## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocat…` › `let defined = word(bytes, cursor);`
+## `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {` › `let defined = word(bytes, cursor);`
 
 The defined name may itself be raw -- `macro_rules! r#mod { … }`
 is how a macro takes a keyword for a name.
@@ -1456,7 +1464,7 @@ Where a module-shaped token sequence starts inside `from..to`, if any.
 three tokens [`module_at`] reads, minus the visibility prefix, because
 what matters here is only whether the body *could* expand to a module.
 
-## `fn module_shaped_between(bytes: &[u8], from: usize, to: usi…` › `let declared = word(bytes, name_at);`
+## `fn module_shaped_between(bytes: &[u8], from: usize, to: usize) -> Option<usize> {` › `let declared = word(bytes, name_at);`
 
 The name may be raw: `mod r#type;` inside a macro body is
 as module-shaped as `mod tests;` is.
@@ -1606,7 +1614,7 @@ unix)` entails; `any(test, unix)` does not, because a Unix build without
 
 `predicate` with `test = false` and every other atom unknown.
 
-## `fn decide_without_test(predicate: &Predicate) -> Option<boo…` › `Predicate::All(parts) => {`
+## `fn decide_without_test(predicate: &Predicate) -> Option<bool> {` › `Predicate::All(parts) => {`
 
 Short-circuiting, and the `None` arms are the point: one
 undecidable conjunct does not make a conjunction undecidable if
@@ -1623,7 +1631,7 @@ The grammar is `all(…)`, `any(…)`, `not(P)`, and an atom — a bare name
 or `name = "value"`. Anything else is refused: an unknown combinator, an
 unbalanced paren, `not` with other than one argument, an empty atom.
 
-## `pub(crate) fn parse_predicate(written: &str) -> Result<Pred…` › `if name.is_empty() {`
+## `pub(crate) fn parse_predicate(written: &str) -> Result<Predicate, String> {` › `if name.is_empty() {`
 
 An atom: `test`, `unix`, or `key = "value"`.
 
@@ -1718,16 +1726,16 @@ this crate's effect fixtures are written as exactly those two shapes.
 `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
 [`super::normalize_lint`] is the bridge, as it is everywhere else here.
 
-## `pub(crate) fn file_level_lint_resolution(source: &str, lint…` › `if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {`
+## `pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {` › `if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {`
 
 The prologue ends at the first token that is not an inner attribute.
 
-## `pub(crate) fn file_level_lint_resolution(source: &str, lint…` › `let Some(list) = rest`
+## `pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {` › `let Some(list) = rest`
 
 `allowance(…)` strips to `ance(…)`, which opens nothing: the
 parenthesis is what makes the prefix an exact attribute name.
 
-## `pub(crate) fn file_level_lint_resolution(source: &str, lint…` › `if resolution.level == Some("forbid") {`
+## `pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {` › `if resolution.level == Some("forbid") {`
 
 Ordered, and `forbid` is sticky. A weaker level after a
 `forbid` is `E0453`, which is the file not compiling rather

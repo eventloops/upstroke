@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/workflow.rs`](../../../../src/effects/tests/workflow.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -76,7 +76,7 @@ The environment variable the aggregate's loop reads for `job`.
 Every field the contract requires but the node does not declare, and every
 field it declares that the contract does not know about.
 
-## `fn defaults_shell<'a>(node: &'a Yaml, where_: &str, out: &mut Vec<String>) -> Option<&'a …`
+## `fn defaults_shell<'a>(node: &'a Yaml, where_: &str, out: &mut Vec<String>) -> Option<&'a str> {`
 
 The `shell:` a `defaults:` mapping sets, and every way its shape is wrong.
 
@@ -126,37 +126,37 @@ mutation that fails for an unrelated reason does not count as refused.
 
 Only `run:` steps have a shell; a `uses:` step runs an action.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<Str…`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {`
 
 Every way the aggregate fails to make each gate a required one.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names:…` › `let mut expected_needs: BTreeSet<String> = job_names.clone();`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {` › `let mut expected_needs: BTreeSet<String> = job_names.clone();`
 
 The `needs` set is DERIVED: every job but the aggregate itself. A job that
 is not needed cannot fail the aggregate, so adding one and forgetting to
 wire it is the same defect as dropping one, and this equality refuses both.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names:…` › `let collisions = stem_collisions(&expected_needs);`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {` › `let collisions = stem_collisions(&expected_needs);`
 
 Before ANY collection is derived from the stems. Two job ids that
 normalise to one variable name collapse every set and map built below, and
 a collapsed expectation compares equal to a collapsed reality.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names:…` › `let on_ubuntu = CI_TARGETS`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {` › `let on_ubuntu = CI_TARGETS`
 
 The aggregate runs on `ubuntu-latest`, and its script is bash. The check
 is on the RESOLVED shell, not on the declaration: a workflow-level
 `defaults.run.shell` reaches this step too, and a custom shell would let
 the required check pass without reading a single gate result.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names:…` › `let env = field(step, "env").and_then(scalar_map);`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {` › `let env = field(step, "env").and_then(scalar_map);`
 
 The binding, not its existence. `LINT_MACOS_RESULT: ${{ needs.lint-windows
 .result }}` is a copy-paste that satisfies any existence check, reads a
 passing sibling, and reports the required context green over a red leaf.
 Measured: an earlier version of this assertion accepted exactly that.
 
-## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names:…` › `let expected_stems: BTreeSet<String> = wired.iter().map(|job| gate_stem(job)).collect();`
+## `fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {` › `let expected_stems: BTreeSet<String> = wired.iter().map(|job| gate_stem(job)).collect();`
 
 Re-derived from `needs`, so the pin above is checked against the job graph
 rather than trusted as a copy. `for gate in LINT LINT_WINDOWS MSRV TEST; do
@@ -176,21 +176,21 @@ command runs this?". A parsed document has no comments in it at all, so that
 class is gone by construction rather than by a strip whose bite had to be
 asserted.
 
-## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<Str…` › `if scalar(step, "run").is_some() {`
+## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {` › `if scalar(step, "run").is_some() {`
 
 This job is a matrix, so each `run:` step resolves a shell once per
 hosted runner. Each must be the platform default: a workflow-level
 default swaps every one of them at once, which is the mutation the
 step-only reading could not see.
 
-## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<Str…` › `let expected_runners: BTreeSet<String> = CI_TARGETS`
+## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {` › `let expected_runners: BTreeSet<String> = CI_TARGETS`
 
 The matrix is the platform half of the same claim, and it is compared
 against the same derived runner set the Clippy legs are, less the one
 platform whose suite runs self-hosted: a fixture that runs on one
 platform proves nothing about the other.
 
-## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<Str…` › `match field(job, "strategy") {`
+## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {` › `match field(job, "strategy") {`
 
 The WHOLE strategy mapping, not just `matrix.os`. `exclude:` removes
 combinations that `os:` still lists, so a job that names three platforms
@@ -200,7 +200,7 @@ of what a strategy may say. An equality over the field set refuses all of
 them, including the ones GitHub adds next. Measured,
 `MUT-TEST-MATRIX-EXCLUDED`.
 
-## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<Str…` › `let toolchains: Vec<&Yaml> = steps_of(job)`
+## `pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {` › `let toolchains: Vec<&Yaml> = steps_of(job)`
 
 `clippy` is a TEST dependency of this job, not only a lint one:
 `every_declared_effect_denial_refuses_for_the_reason_it_declares` drives
@@ -228,7 +228,7 @@ No toolchain step is required: the guest's image carries `clippy-driver`
 for the fixtures, and the decision record binds re-curation to that claim,
 which a document parser cannot check.
 
-## `pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) ->…` › `for (index, step) in steps_of(job).iter().enumerate() {`
+## `pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {` › `for (index, step) in steps_of(job).iter().enumerate() {`
 
 The image carries the compiler this leg runs, and re-curation is how it
 moves. So an install step here is not a convenience: it selects a
@@ -239,7 +239,7 @@ about the jobs that install and this one does not. The action and its
 step-pin check alone accepted it. Zero installs, as an equality.
 Measured, `MUT-TEST-WINDOWS-TOOLCHAIN-INSTALLED`.
 
-## `pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) ->…` › `let running = steps_of(job)`
+## `pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {` › `let running = steps_of(job)`
 
 The whole step, not the command inside it. The command says which suite
 Cargo was asked for; the lines after it are what say the suite ran, and
@@ -260,7 +260,7 @@ admits `with:` because the toolchain and cache actions need it; on a
 checkout step it is refused whole. Measured, `MUT-TEST-WINDOWS-CHECKOUT-REF`
 and `MUT-TEST-CHECKOUT-REF`.
 
-## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<Stri…`
+## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<String> {`
 
 Every way a step of a modelled job is something this contract did not pin.
 
@@ -274,14 +274,14 @@ of its own. Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED`,
 `MUT-TEST-RUN-RETARGETED`, `MUT-GATE-RUN-RETARGETED`,
 `MUT-MSRV-RUN-RETARGETED` and `MUT-STEP-USES-UNPINNED`.
 
-## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str,…` › `let Some((_, allowed)) = ACTION_INPUTS`
+## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<String> {` › `let Some((_, allowed)) = ACTION_INPUTS`
 
 The commit says which code runs; the inputs say what it is told to
 do. `rust-cache`'s `cmd-format` wraps the commands it runs, so one
 input on an allowlisted action at a pinned commit is enough to put
 `git checkout` in front of every gate in the job.
 
-## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str,…` › `if uses.starts_with(TOOLCHAIN_ACTION) {`
+## `fn step_pin_complaints(job: &Yaml, named: &str, code: &str, scripts: &[&str]) -> Vec<String> {` › `if uses.starts_with(TOOLCHAIN_ACTION) {`
 
 The values, not only the key names. The toolchain action builds shell
 text from `components` and interpolates it into a Bash line, so an
@@ -349,7 +349,7 @@ none. It lives in the Windows Clippy gate's job, whose field set and shells
 the gate contract pins; this pins the command, exactly once, on exactly one
 hosted Windows job. Measured, `MUT-WINDOWS-BUILD-WITNESS-*`.
 
-## `pub(super) fn ci_windows_build_witness_complaints(doc: &Yam…` › `if !steps_of(job)`
+## `pub(super) fn ci_windows_build_witness_complaints(doc: &Yaml) -> Vec<String> {` › `if !steps_of(job)`
 
 The carrier must be the Windows Clippy gate's job: that job's fields,
 shells, scripts and checkout are pinned by the gate contract, so the
@@ -407,23 +407,23 @@ come back as an equality -- the same trade the rest of this section made, and
 the reason `MUT-CI-CARGO-TEST-STEP-SKIPPED` is already a kill here rather
 than history.
 
-## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<Str…` › `if scalar(step, "run").is_some() {`
+## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {` › `if scalar(step, "run").is_some() {`
 
 A matrix job, so each `run:` step resolves a shell once per runner, and
 a workflow-level default reaches all three of them at once.
 
-## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<Str…` › `out.extend(toolchain_complaints(job, MSRV_JOB, "msrv-toolchain", None));`
+## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {` › `out.extend(toolchain_complaints(job, MSRV_JOB, "msrv-toolchain", None));`
 
 Position only: this leg installs the manifest's floor, not `stable`, and
 the value is checked against `Cargo.toml` above.
 
-## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<Str…` › `let expected_runners: BTreeSet<String> = CI_TARGETS`
+## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {` › `let expected_runners: BTreeSet<String> = CI_TARGETS`
 
 The platform half, compared against the same derived runner set the Clippy
 legs and the `test` matrix are. A floor is a per-platform fact: a
 dependency that raises its MSRV behind a `cfg` fails on that target only.
 
-## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<Str…` › `let install_at = steps_of(job).iter().position(|step| {`
+## `pub(super) fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {` › `let install_at = steps_of(job).iter().position(|step| {`
 
 Order, not merely presence. `dtolnay/rust-toolchain` selects the toolchain
 for the steps that FOLLOW it, so a check above it compiles on whatever the
@@ -458,7 +458,7 @@ refused by this scan on its own, which is what
 `the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override`
 measures on documents the rest of the contract does not reach.
 
-## `pub(super) fn rustflags_complaints(doc: &Yaml) -> Vec<Strin…` › `for key in field_names(env) {`
+## `pub(super) fn rustflags_complaints(doc: &Yaml) -> Vec<String> {` › `for key in field_names(env) {`
 
 Every other guarded binding at workflow scope, case-insensitively.
 Two distinct defects share this arm: `CARGO_ENCODED_RUSTFLAGS`,

@@ -2,9 +2,9 @@
 
 Extended notes for [`src/effects/tests/source_oracles.rs`](../../../../src/effects/tests/source_oracles.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+The code is the authority for what it does. These notes started as the module's source prose.
+Each code fragment in a heading is an exact source substring. When a heading names an enclosing
+item before `›`, find that item first, then the following fragment within it.
 
 ## Module
 
@@ -132,7 +132,7 @@ from the fact that it exists:
   to one census. Opposite direction, so the precedent's reason not to does
   not apply.
 
-## `pub(super) mod oracles` › `fn declared_children(declared_in: &Path, source: &str) -> Vec<(String, [PathBuf; 2], bool…`
+## `pub(super) mod oracles` › `fn declared_children(declared_in: &Path, source: &str) -> Vec<(String, [PathBuf; 2], bool)> {`
 
 Every `mod <name>;` the file writes, production and test-only alike, with
 the two files the name can resolve to and which kind it is.
@@ -265,9 +265,10 @@ descending into test code to account for them.
 ## `pub(super) fn walk(root: &Path) -> Self` › `assert!(`
 
 **The control that binds every caller**, placed here rather
-than at each of them, for the reason
-`census_domain::whole_file_test_modules` gives at
-`src/effects.rs:1392`. A walk that found nothing but the file
+than at each of them, for the reason the
+`census_domain::declared_whole_file_test_modules` and
+`census_domain::whole_file_test_modules` notes give in
+[`docs/internals/effects.md`](../../effects.md). A walk that found nothing but the file
 it was handed is a domain that has stopped meaning anything,
 and no caller can hold a `ProductionModule` without having
 come through this line.
@@ -353,7 +354,7 @@ is a macro at brace depth 0 and is **not** an item, so the character
 before the name decides. `;`, `}` and `]` (an attribute) precede an
 item; anything else is an expression context.
 
-## `fn item_position_macros(blanked: &str) -> Vec<(usize, Strin…` › `let mut after = at + 1;`
+## `fn item_position_macros(blanked: &str) -> Vec<(usize, String)> {` › `let mut after = at + 1;`
 
 A delimiter after the `!` is what makes this an
 invocation rather than `macro_rules! name {` or `!=`.
@@ -540,7 +541,7 @@ of paths and leaves this body innocent. A set difference does not care
 what the body says: a helper scanning yesterday's eight files while the
 walk produces nine fails on the ninth path.
 
-## `pub(in crate::effects::tests) fn site_row_mappings_have_no_…` › `let scanned: Vec<PathBuf> = scan.paths();`
+## `pub(in crate::effects::tests) fn site_row_mappings_have_no_wildcard_arm() {` › `let scanned: Vec<PathBuf> = scan.paths();`
 
 THE DOMAIN, ASSERTED OVER VALUES: what was read equals what the walk
 produced. Not "the body of this function names no reader" — that is a
@@ -560,30 +561,30 @@ drives the membership rule itself, and it writes nothing: this module
 restores the three effect denials (`#![deny]` above), so a fixture tree on
 disk is not available to it and is not needed.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let synthetic =`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let synthetic =`
 
 (1) DECLARED, NOT ENUMERATED, and both out-of-line layouts are named.
 The declaring file is the real one — only the text is synthetic — so
 the directory the candidates are resolved in is the real one too.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let lib = repo_root().join("src/lib.rs");`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let lib = repo_root().join("src/lib.rs");`
 
 (2) AND THE `mod.rs` CANDIDATE IS THE ONE THAT RESOLVES when it is the
 one on disk. Measured on a real directory-layout module of this crate:
 `src/topology.rs` does not exist and `src/topology/mod.rs` does.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let module = ProductionModule::walk(&effects);`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let module = ProductionModule::walk(&effects);`
 
 (3) THE REAL DOMAIN, named file by file — and `tests.rs` is outside it
 because its declaration carries `#[cfg(test)]`, not because of its stem.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `expected.sort();`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `expected.sort();`
 
 Sorted the same way the walk sorts, so the assertion is about the set
 and not about the order these eight were typed in: `PathBuf` orders by
 component, so `effects` precedes `effects.rs`.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let refusal = panic_message(|| {`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let refusal = panic_message(|| {`
 
 (4) A DECLARATION THE SCAN CANNOT CLASSIFY STOPS THE WALK.
 
@@ -594,13 +595,13 @@ reach of the census, and `refuse_unclassifiable_cfg_attr` is what keeps
 it out. Driven here rather than argued, because a refusal nothing
 exercises is the same silence it exists to break.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `assert_eq!(`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `assert_eq!(`
 
 The control: the refusal is the attribute, not the declaration under
 it. Without the `cfg_attr` the same `mod hidden;` classifies as
 production and the walk carries on.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let scan = module.row_mapping_wildcards();`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let scan = module.row_mapping_wildcards();`
 
 (5) AND THE CENSUS'S DOMAIN IS A CLAIM ABOUT VALUES.
 
@@ -629,7 +630,7 @@ census's equality would fail on the honest tree. That is also the
 stale-helper shape exactly: a helper reports the set it looked at, and
 the set it looked at is the wrong one.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let owned: BTreeSet<PathBuf> = [repo_root().join("src/topology/effects/tests")]`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let owned: BTreeSet<PathBuf> = [repo_root().join("src/topology/effects/tests")]`
 
 (7) AND A FILE NO DECLARATION ACCOUNTS FOR STOPS THE WALK.
 
@@ -653,25 +654,25 @@ Driven with the real module and no fixture tree, because this module
 restores the three effect denials and writes nothing. The accounting
 is the input, so both directions are reachable by varying it.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `refuse_unaccounted_files(&effects, &accounted, &owned);`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `refuse_unaccounted_files(&effects, &accounted, &owned);`
 
 The honest accounting refuses nothing — the control, and it is what
 says the refusal below is about the missing entry rather than about
 the directory being unreadable or the pruning being wrong.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let mut short = accounted.clone();`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let mut short = accounted.clone();`
 
 Drop one file from the accounting and it is named. That is exactly
 the shape a macro-declared child presents: on disk, in no declaration.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let mut without_tests = accounted.clone();`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let mut without_tests = accounted.clone();`
 
 And the test-only prune is load-bearing, not decoration: without it
 `tests.rs` is a `.rs` file under the directory that the PRODUCTION
 accounting does not hold, so the reconciliation would refuse the one
 file every split of this shape is required to leave behind.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let hidden = repo_root().join("src/topology/effects.rs");`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let hidden = repo_root().join("src/topology/effects.rs");`
 
 (8) AND A MACRO THE WALK CANNOT READ STOPS IT TOO.
 
@@ -690,26 +691,26 @@ one defined anywhere else cannot be ruled out from here. Synthetic
 sources, because the input is a list of (path, source) pairs and both
 directions are reachable by varying it.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `refuse_macro_declared_modules(&[`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `refuse_macro_declared_modules(&[`
 
 THE CONTROL THAT MAKES IT THE DEFINITION'S LOCATION AND NOT THE MACRO:
 the same invocation passes once the definition is in the walked set,
 because then the scan reads the body and refuses a module-shaped one
 itself.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `refuse_macro_declared_modules(&[(hidden, "const _: () = assert!(true);\n".to_owned())]);`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `refuse_macro_declared_modules(&[(hidden, "const _: () = assert!(true);\n".to_owned())]);`
 
 And an expression-position macro is not an item: this is what keeps
 the refusal's cost at zero on a module that writes
 `const _: () = assert!(...)`.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `refuse_macro_declared_modules(&module.sources_for_witness());`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `refuse_macro_declared_modules(&module.sources_for_witness());`
 
 The real module refuses nothing — measured, not assumed. Its one
 item-position invocation is `const_identity_walk!`, defined in the
 same file.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let this_file = fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"…`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let this_file = fs::read_to_string(repo_root().join("src/effects/tests/source_oracles.rs"))`
 
 (6) BELT AND BRACES: THE CENSUS'S OWN BODY NAMES NO READER.
 
@@ -731,14 +732,14 @@ the scan is a method on it, so a census that keeps the call, binds it
 to `_` and scans a hard-coded list has nothing to call the scan on and
 does not compile.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `assert!(`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `assert!(`
 
 Non-vacuity, both directions: `offenders` is code inside the census,
 and `sole_present` is code inside the walk and inside part (2) above,
 so its absence is what says the extractor stopped at the census's own
 closing brace instead of running on through the file.
 
-## `pub(in crate::effects::tests) fn the_row_mapping_census_dom…` › `let own = item_body(`
+## `pub(in crate::effects::tests) fn the_row_mapping_census_domain_is_the_declared_module() {` › `let own = item_body(`
 
 And the needle set can fire at all: this witness's own body reads a
 file, and the same extractor over the same needles finds it. Without
@@ -755,13 +756,13 @@ carries its own control: the test region of `src/topology/registry.rs` DOES
 name a funnel, so a census whose region split had collapsed to the empty
 string would fail here rather than report "nobody calls anything".
 
-## `pub(in crate::effects::tests) fn topology_production_names_…` › `if !is_topology || !path.starts_with("src/topology/") {`
+## `pub(in crate::effects::tests) fn topology_production_names_no_funnel() {` › `if !is_topology || !path.starts_with("src/topology/") {`
 
 `src/workspace_manager.rs` and `src/runner/**` are in
 `TOPOLOGY_MODULES` because the legacy section may not contain them;
 they are the funnels themselves and naturally name funnels.
 
-## `pub(in crate::effects::tests) fn topology_production_names_…` › `let registry = fs::read_to_string(repo_root().join("src/topology/registry.rs"))`
+## `pub(in crate::effects::tests) fn topology_production_names_no_funnel() {` › `let registry = fs::read_to_string(repo_root().join("src/topology/registry.rs"))`
 
 The control.
 
@@ -774,7 +775,7 @@ that quietly saw half the tree would make [`every_externally_reachable_fn_of_a_l
 pass against a domain nobody drew — the omission failure this project's
 reconciliation table exists for, one level down.
 
-## `pub(in crate::effects::tests) fn the_reachable_fn_parser_fi…` › `assert!(!found.contains(&"private".to_owned()));`
+## `pub(in crate::effects::tests) fn the_reachable_fn_parser_finds_every_shape() {` › `assert!(!found.contains(&"private".to_owned()));`
 
 Eight shapes accepted, five refused, and the five are refused for five
 different reasons: private, private-in-an-inherent-impl, test region, a
@@ -782,7 +783,7 @@ trait method DECLARATION (no body to classify — its implementations are
 reached by the `impl … for …` shape), and a default body in a trait that
 is not itself visible.
 
-## `pub(in crate::effects::tests) fn the_reachable_fn_parser_fi…` › `let exploit = concat!(`
+## `pub(in crate::effects::tests) fn the_reachable_fn_parser_finds_every_shape() {` › `let exploit = concat!(`
 
 `PR6-LANEF-007`, stated as the reviewer's own exploit: a default body on a
 public trait that reaches an effect. The parser used to answer
@@ -809,21 +810,21 @@ The two axes: {construct} × {is a later literal on the same line still
 visible}. Every row keeps a real comment invisible, so this cannot pass by
 the blanker having stopped blanking.
 
-## `pub(in crate::effects::tests) fn the_comment_blanker_models…` › `let exploit = r####"const A: &str = r#"x" //"#; const B: &str = "docker";"####;`
+## `pub(in crate::effects::tests) fn the_comment_blanker_models_raw_strings() {` › `let exploit = r####"const A: &str = r#"x" //"#; const B: &str = "docker";"####;`
 
 The reviewer's shape: a raw string whose body contains a quote and a `//`,
 with a real literal after it on the same line.
 
-## `pub(in crate::effects::tests) fn the_comment_blanker_models…` › `for (label, source) in [`
+## `pub(in crate::effects::tests) fn the_comment_blanker_models_raw_strings() {` › `for (label, source) in [`
 
 Every other literal shape, each with a live needle after it.
 
-## `pub(in crate::effects::tests) fn the_comment_blanker_models…` › `for source in [`
+## `pub(in crate::effects::tests) fn the_comment_blanker_models_raw_strings() {` › `for source in [`
 
 And a real comment is still removed — in both flavours, and a doc comment
 quoting a needle is still invisible, which is `PR4-CENSUS-COMMENT-ORACLE`.
 
-## `pub(in crate::effects::tests) fn the_comment_blanker_models…` › `let counted = "// one\n/* two\nthree */\nlet b = 1;\n";`
+## `pub(in crate::effects::tests) fn the_comment_blanker_models_raw_strings() {` › `let counted = "// one\n/* two\nthree */\nlet b = 1;\n";`
 
 Line breaks survive, because callers report line numbers.
 
@@ -863,17 +864,17 @@ Two axes: {scalar width} × {what follows the literal}. The controls are the
 lifetime rows — a blanker that treated every `'` as a literal would pass the
 leak rows and fail those.
 
-## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_…` › `for (label, source, leaked) in [`
+## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {` › `for (label, source, leaked) in [`
 
 1. The tokeniser. Nothing inside a char literal reaches the blanked text.
 
-## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_…` › `for lifetime in [`
+## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {` › `for lifetime in [`
 
 The controls. A lifetime is not a char literal, and a blanker that said
 "yes" to every `'` would blank from the tick to the next one — taking the
 signature with it.
 
-## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_…` › `let kept = "const P: (char, char) = ('é','{');\nlet q = '😀';\nlet r = '—';\n";`
+## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {` › `let kept = "const P: (char, char) = ('é','{');\nlet q = '😀';\nlet r = '—';\n";`
 
 And its sibling, which KEEPS literals instead of blanking them, is driven
 over the same shapes. Its failure mode is the opposite one — it can only
@@ -882,7 +883,7 @@ still remove the comment after a multi-byte literal. Measured over all 92
 source files, its output is byte-identical before and after this repair;
 both blankers consult one scanner, which is what keeps it that way.
 
-## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_…` › `let attacked = "fn above() {}\n\`
+## `pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {` › `let attacked = "fn above() {}\n\`
 
 2. The same defect through `production_code`, end to end. Production
    above, an inline test module holding the pair, production below — the
@@ -908,15 +909,15 @@ Neither path is reachable from this tree as it stands — measured, zero
 occurrences over all 92 source files — so this drives them with input that
 does reach them, which is the only way a give-up path is ever seen.
 
-## `pub(in crate::effects::tests) fn an_unfindable_item_end_bla…` › `let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests {\nfn below() {}\n");`
+## `pub(in crate::effects::tests) fn an_unfindable_item_end_blanks_the_attribute() {` › `let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests {\nfn below() {}\n");`
 
 An unbalanced brace: `mod tests {` never closes.
 
-## `pub(in crate::effects::tests) fn an_unfindable_item_end_bla…` › `let region = production_code("fn above() {}\n#[cfg(test)]\nuse a::b\n");`
+## `pub(in crate::effects::tests) fn an_unfindable_item_end_blanks_the_attribute() {` › `let region = production_code("fn above() {}\n#[cfg(test)]\nuse a::b\n");`
 
 An item with no terminator before end of file.
 
-## `pub(in crate::effects::tests) fn an_unfindable_item_end_bla…` › `let region =`
+## `pub(in crate::effects::tests) fn an_unfindable_item_end_blanks_the_attribute() {` › `let region =`
 
 The control: when the item *does* close, it is still removed in full.
 
@@ -956,7 +957,7 @@ derivations, and a declaration form the resolver cannot see is missing
 from all of them at once. The comment on the second half of the body
 says which is which and names the form this scan misses.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `fn relative<'a>(root: &std::path::Path, path: &'a std::path::Path) -> &'a std::path::Path…`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `fn relative<'a>(root: &std::path::Path, path: &'a std::path::Path) -> &'a std::path::Path {`
 
 **Identity is a `Path`, never a string.** `CODING_STANDARDS.md` §8:
 a lossy display string is for diagnostics only, never identity.
@@ -970,7 +971,7 @@ native path with no conversion at all. The one lossy rendering left
 below is `declaring`, which is interpolated into a message and
 compared with nothing; do not fold the two back together.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `fn sorted(mut paths: Vec<&std::path::Path>) -> Vec<&std::path::Path> {`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `fn sorted(mut paths: Vec<&std::path::Path>) -> Vec<&std::path::Path> {`
 
 Both sides of every comparison are sorted the same way, so no
 comparison depends on the order the list happens to be written in and
@@ -982,7 +983,7 @@ slice adding one that did would otherwise fail here on ordering while
 the set was right. A `Vec` rather than a set, so a duplicated entry
 fails instead of being absorbed.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `let expected = sorted(`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `let expected = sorted(`
 
 The expected value, and the two halves of it the rules below
 partition into. `WHOLE_FILE_TEST_MODULES` holds `PathBuf`s relative
@@ -990,7 +991,7 @@ to `src`, which is what `relative` produces, so this borrows them as
 paths and converts nothing. Filtering a sorted list keeps it sorted,
 so the halves need no second sort.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `let declarations =`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `let declarations =`
 
 **The two halves of `WHOLE_FILE_TEST_MODULES`, separated.** The
 comparison above is satisfied by any derivation that reaches this
@@ -1041,14 +1042,14 @@ derivation and close no blind spot, and it would restore what PR
 37 times across ten files, so one slice adding a module falsified
 every one of them at once while the `>=` floor stayed green.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `fn declared_file<'a>(`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `fn declared_file<'a>(`
 
 Each declaration named by the file it resolves to, through the shared
 resolver rather than a second copy of the rule
 (`PR5D-VISIBILITY-CHECK-DUPLICATED`), so this comparison is in the
 same terms as the list.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `let is_literal = |declaration: &crate::effects::census_domain::TestModuleDeclaration| {`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `let is_literal = |declaration: &crate::effects::census_domain::TestModuleDeclaration| {`
 
 **Membership is the declaration form, guard included.** This read
 only the name and the inline path until PR #101's second pass, which
@@ -1060,13 +1061,13 @@ while Windows compiled no such module at all. The rule is
 it over synthetic input, because a second copy here is the defect
 `PR5D-VISIBILITY-CHECK-DUPLICATED` names.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `let declaring: Vec<String> = declarations`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `let declaring: Vec<String> = declarations`
 
 Diagnostics, not identity: this names the files those declarations
 were *written in*, for the failure message, and is compared with
 nothing. §8 allows a lossy rendering here and only here.
 
-## `pub(in crate::effects::tests) fn the_whole_file_modules_are…` › `let inherited: Vec<(&std::path::Path, String, Vec<String>, String)> = declarations`
+## `pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {` › `let inherited: Vec<(&std::path::Path, String, Vec<String>, String)> = declarations`
 
 And the one that is reached only through an inline ancestor, named
 with the ancestry it was reached through. This is the whole of what
@@ -1082,36 +1083,36 @@ truncating region loses production code. The censuses that use this helper
 count over the whole tree, so a shape it mishandles is a hole nobody would
 see: the count would simply be lower.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests;\nfn below() {}\n");`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests;\nfn below() {}\n");`
 
 A `mod tests;` declaration. The files that declare a whole-file
 test module named `tests` — the `tests.rs` entries of
 `WHOLE_FILE_TEST_MODULES` — end with one, and everything below it
 used to be outside every region that truncates.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code(`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code(`
 
 A `mod tests { … }` block, brace-matched rather than indentation-matched.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code("use a::b;\n#[cfg(test)]\nuse c::d;\nfn below() {}\n");`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code("use a::b;\n#[cfg(test)]\nuse c::d;\nfn below() {}\n");`
 
 A `#[cfg(test)] use`, which truncates `production_region` and is the
 shape `src/engine/coordinator.rs` carries on line 36 of 1599.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code("#[cfg(test)]\nuse a::{b, c};\nfn below() {}\n");`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code("#[cfg(test)]\nuse a::{b, c};\nfn below() {}\n");`
 
 A braced `use`, whose item ends at `}` and takes the `;` with it.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code(`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code(`
 
 A test-only `const` whose value is a string, and a test-only `fn`.
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region = production_code(`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region = production_code(`
 
 A struct field, which ends at its comma rather than at the struct's brace
 (`src/engine/options.rs` has three).
 
-## `pub(in crate::effects::tests) fn the_configured_item_is_rem…` › `let region =`
+## `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {` › `let region =`
 
 Attributes stacked on one item belong to that item.
 
@@ -1124,7 +1125,7 @@ measured against the barrier census: with either one planted as line 1 of a
 production file, a second `TopologyFold::parse_log` route in the same file
 became invisible and the census passed.
 
-## `pub(in crate::effects::tests) fn a_configured_attribute_in_…` › `let region = production_code(`
+## `pub(in crate::effects::tests) fn a_configured_attribute_in_prose_is_inert() {` › `let region = production_code(`
 
 And a real attribute beside prose that quotes one is still found.
 
@@ -1183,7 +1184,7 @@ not stable under editing: a doc comment written *here* naming
 prose. Under the region this test is about it adds nothing at all, which is
 the whole of why the blanking moved into the region.
 
-## `pub(in crate::effects::tests) fn the_whole_region_contains_…` › `assert!(`
+## `pub(in crate::effects::tests) fn the_whole_region_contains_the_truncated_one() {` › `assert!(`
 
 And it is a *strict* superset somewhere, or the two regions are the same
 function and the comparison above proves nothing. Eleven files gain today,
@@ -1193,7 +1194,7 @@ that still have code under the cut, plus the three test files carrying a
 `#[cfg(test)] mod this_file_is_test_only {}` marker whose whole purpose
 was to zero the truncating region.
 
-## `pub(in crate::effects::tests) fn the_whole_region_contains_…` › `const SENTINEL: &str = "\npub fn sentinel_below_every_configured_item() {}\n";`
+## `pub(in crate::effects::tests) fn the_whole_region_contains_the_truncated_one() {` › `const SENTINEL: &str = "\npub fn sentinel_below_every_configured_item() {}\n";`
 
 The assertion that can fail, and the property the truncating region does
 not have: an item appended below everything a file declares is still in
@@ -1270,7 +1271,7 @@ does is make the shrink **counted**: an eleventh file joining this set fails
 by name rather than quietly removing itself from every census that uses the
 `effects.rs` region.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `fn cut_shape(source: &str) -> Option<String> {`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `fn cut_shape(source: &str) -> Option<String> {`
 
 What the first `#[cfg(test)]` in `source` attaches to, or `None` when the
 file has none. Read out of the **blanked** text, exactly as
@@ -1278,23 +1279,23 @@ file has none. Read out of the **blanked** text, exactly as
 comment neither cuts nor is classified — `src/runner/container.rs`
 carries such a comment, its own warning about this hazard.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `fn is_module(shape: &str) -> bool {`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `fn is_module(shape: &str) -> bool {`
 
 Whether the cut is at a module — `mod tests {`, `mod fake;`,
 `pub(crate) mod fixtures`, `mod this_file_is_test_only {}`. A test module
 is what the region is *for*, so cutting at one loses nothing.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `assert!(is_module("mod tests {"));`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `assert!(is_module("mod tests {"));`
 
 CONTROLS, both directions. A classifier that answered one thing always
 would produce this same set by luck on a tree with ten offenders.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `assert!(`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `assert!(`
 
 And the domain really was walked: far more files cut at a module than not,
 so an empty or near-empty scan cannot produce the expected set.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `let definitions: usize = scanned_sources()`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `let definitions: usize = scanned_sources()`
 
 Both surviving implementations are still there, and no third has been
 added. If one is deleted, unified or duplicated, this table is stale and
@@ -1302,7 +1303,7 @@ the doc comment above is a lie — which is the failure
 `PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE` is about, one level out.
 Counted in code, not asserted from prose.
 
-## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_m…` › `let shared: usize = scanned_sources()`
+## `pub(in crate::effects::tests) fn every_early_stop_is_at_a_module() {` › `let shared: usize = scanned_sources()`
 
 And the shared prohibition region has exactly one definition, which is
 the whole point of having removed the third `production_region`.
