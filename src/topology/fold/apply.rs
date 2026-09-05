@@ -36,11 +36,10 @@ impl RunState {
     /// Total by construction: every lookup here was proved to succeed by the
     /// check that produced the delta, so no lookup misses on a path this fold
     /// takes. The safety is that the miss is unreachable, not that each miss is
-    /// inert — most lookups leave the state alone on a miss, but three do not:
+    /// inert — most lookups leave the state alone on a miss, but two do not:
     /// `apply_candidate_created` falls back to the conservative
-    /// `PathSet::RepoWide` and still enqueues, `apply_verification_started`
-    /// advances `next_sequence` before its queue lookup, and `open_question`'s
-    /// task lookup defaults to `Pending` and inserts the question regardless.
+    /// `PathSet::RepoWide` and still enqueues, and `apply_verification_started`
+    /// advances `next_sequence` before its queue lookup.
     /// Nothing in this function decides anything — a decision made here would be
     /// one the live path and the replay path could reach differently, which
     /// INV-02 forbids.
@@ -550,22 +549,7 @@ impl RunState {
     }
 
     pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, origin: QuestionOrigin) {
-        let parked_from = self
-            .questions
-            .remove(&answered.question)
-            .map(|open| open.parked_from);
-        // `origin` is superseded by `parked_from` for the answer-return, and the
-        // `VerificationPark => AwaitingMerge` cross-check that read it was
-        // withdrawn under pass-3 review: a bare question can park a task before a
-        // verification park raises its own on the same task, so a
-        // `VerificationPark` question's parked-from state can be `AwaitingInput`,
-        // not `AwaitingMerge` — the assertion was reachable from a checked log
-        // and would panic every replay of it. `origin` is kept threaded only
-        // because removing it reaches `Derived::Answer` in `start.rs` (row 38)
-        // and `check_end.rs`'s return (row 32, merged from #153) — a second
-        // branch in files this sweep must not open; the removal is
-        // `SWEEP-FOLD-APPLY-ORIGIN-SUPERSEDED`.
-        let _ = origin;
+        self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
                 binding_override, ..
@@ -573,55 +557,38 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                // Return the task to the state it was parked from — but only
-                // when this answer closes the *last* open question for the task
-                // *and* the task is still parked. Both conjuncts are
-                // load-bearing, and each was a separate pass's finding when it
-                // stood alone:
+                // A verification park returns to awaiting merge to be re-verified
+                // under a new sequence; every other origin — a bare
+                // `question_raised`, a parked settlement, a gated admission —
+                // returns to `Pending`. Exhaustive over `QuestionOrigin`, so a new
+                // origin is a compile error rather than a silent `Pending`: this
+                // is master's `_ => Pending` catch-all made §5-clean.
                 //
-                // - **Still `AwaitingInput`.** `check_end.rs` at this head does
-                //   not refuse a `task_merged` on a task whose question is open
-                //   (that admission is `SWEEP-FOLD-APPLY-DECLINE-LINEAGE`), so a
-                //   task can reach `Merged` while parked; restoring its
-                //   `parked_from` then un-merges it and makes `derived_outcome`
-                //   a `FoldError`.
-                // - **Last open question.** A task can hold two open questions —
-                //   `check_new_question` forbids only an incomplete or duplicate
-                //   one. Restoring while another is open un-parks the task with a
-                //   question outstanding, and integration then verifies and
-                //   merges it. A non-final answer only closes its question.
-                //
-                // `parked_from` is the state of the parking *episode*, not of
-                // this one question (see its doc), so the restore returns the
-                // task there whichever of its questions is answered last.
-                if let Some(state) = parked_from {
-                    let still_parked = self
-                        .tasks
-                        .get(answered.key.index())
-                        .is_some_and(|task| task.state == TaskState::AwaitingInput);
-                    let last_open_question = !self
-                        .questions
-                        .values()
-                        .any(|open| open.question.key == answered.key);
-                    if still_parked && last_open_question {
-                        self.set_state(answered.key, state);
-                    }
-                }
+                // This pull request tried to return each task to the *exact* state
+                // it was parked from (a recorded `OpenQuestion.parked_from`) and
+                // withdrew it on evidence. A state snapshotted at raise time goes
+                // stale through events that never touch the question — the task can
+                // merge, defer or move while parked — so no guard over the snapshot
+                // is sound; the return state has to be *derived* from the fold's
+                // current facts instead. See `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`.
+                let state = match origin {
+                    QuestionOrigin::VerificationPark => TaskState::AwaitingMerge,
+                    QuestionOrigin::Admission => TaskState::Pending,
+                };
+                self.set_state(answered.key, state);
             }
             Answer4::Declined { decline_halts_run } => {
-                // `design/26` — "Declining fails the lineage." — requires a
-                // decline to fail the whole lineage, not just the answered task,
-                // and this arm does not: it is master's behaviour, left in place
-                // deliberately. The complete fix cannot land in this file. A
-                // decline that fails the lineage must also clear the integration
-                // transaction, which `release_holdings_of` does not touch, and
-                // the question a repair is declined through is admitted on a task
-                // with a live transaction by `check_end.rs`'s `check_question_raised`
-                // (row 32) — so the transaction survives and `apply_task_merged`
-                // can still turn the declined lineage back to `Merged`, publishing
-                // declined work. Fixing it needs both files. Filed as
-                // `SWEEP-FOLD-APPLY-DECLINE-LINEAGE` for a successor that can hold
-                // both once #152 and #153 have landed.
+                // Master's behaviour, untouched: fail the answered task and
+                // release its holdings. `design/26` — "Declining fails the
+                // lineage." — requires more, and the complete fix needs a second
+                // file. `release_holdings_of` does not clear `self.transaction`,
+                // and `check_end.rs`'s `check_question_raised` (row 32) admits the
+                // question on a task with a live transaction, so the transaction
+                // survives a decline and `check_task_merged` — which validates the
+                // transaction, not task state — lets `apply_task_merged` mark the
+                // declined lineage `Merged`, publishing declined work. That is
+                // live on master, not introduced here. Filed as
+                // `SWEEP-FOLD-APPLY-DECLINE-LINEAGE`.
                 self.set_state(answered.key, TaskState::Failed);
                 self.release_holdings_of(answered.key);
                 if *decline_halts_run {
@@ -674,34 +641,12 @@ impl RunState {
         origin: QuestionOrigin,
         binding: Option<Vec<String>>,
     ) {
-        // The state the question parks the task in, read before the caller sets
-        // `AwaitingInput`. When the task is *already* parked by an earlier open
-        // question, this one did not move it, so inherit that question's
-        // `parked_from` — the state the parking *episode* began in — rather than
-        // record the `AwaitingInput` the task is already sitting in. Recording it
-        // per-question would make the answer-return depend on which question is
-        // answered last, and this fold's state must be a function of the log, not
-        // of answer order. A missing task is impossible here — the check
-        // registered it — and defaults to `Pending`.
-        let current = self
-            .tasks
-            .get(question.key.index())
-            .map_or(TaskState::Pending, |task| task.state);
-        let parked_from = if current == TaskState::AwaitingInput {
-            self.questions
-                .values()
-                .find(|open| open.question.key == question.key)
-                .map_or(current, |open| open.parked_from)
-        } else {
-            current
-        };
         self.seen_questions.insert(question.id.clone());
         self.questions.insert(
             question.id.clone(),
             OpenQuestion {
                 question: question.clone(),
                 origin,
-                parked_from,
                 binding,
             },
         );

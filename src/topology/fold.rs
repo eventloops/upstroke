@@ -557,52 +557,10 @@ pub enum QuestionOrigin {
 }
 
 /// An open question and what raised it.
-///
-/// `#[non_exhaustive]`, and read by callers through
-/// [`TopologyFold::open_questions`]. Every field is `pub`, so a struct literal
-/// is a public constructor and an exhaustive pattern is legal — which means the
-/// `parked_from` this pull request adds is a **breaking change now**: any
-/// external literal or exhaustive match of `OpenQuestion` stops compiling.
-/// `#[non_exhaustive]` does not undo that break — it only binds consumers
-/// compiled after this release — it prevents the *next* field addition from
-/// causing one, by requiring outside code to use `..` from here on. Inside the
-/// crate the compiler caught the one construction site,
-/// [`RunState::open_question`], which was updated; there is no internal
-/// exhaustive match. The pull request's §5 assessment records the break; it is
-/// admitted because the crate is pre-1.0.
-///
-/// This is the opposite decision from #150's on an enum, and for the same
-/// principle. There, a `#[non_exhaustive]` enum would let a downstream wildcard
-/// swallow a new variant silently, so the compile break is *wanted*; here, the
-/// attribute stops a future field addition from silently breaking a downstream
-/// literal. Both put the breakage where a human decides, not where a wildcard
-/// hides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct OpenQuestion {
     pub question: FrozenQuestion,
     pub origin: QuestionOrigin,
-    /// The state the task's parking *episode* began in — the state its answer
-    /// returns the task to when the last of its open questions is answered.
-    ///
-    /// **Per episode, not per question.** A task can hold more than one open
-    /// question at once; a second question raised while the task is already
-    /// `AwaitingInput` inherits this value rather than recording that
-    /// `AwaitingInput` (see [`RunState::open_question`]), so every open question
-    /// of a task carries the same `parked_from` and the answer-return does not
-    /// depend on which of them is answered last.
-    ///
-    /// **Fold state, not a wire field.** `OpenQuestion` lives in
-    /// `RunState.questions` and is rebuilt by replaying the log, so recording
-    /// this costs nothing and adds no schema surface: an old log has no such
-    /// field to be missing, because a replay derives it from the same
-    /// transitions that opened the question. It is what makes an answer return
-    /// the task to *where it was* rather than to a fixed `Pending` — which is
-    /// right only for the `Pending` a spawn admission or a parked settlement
-    /// leaves, and wrong for the `AwaitingMerge` or `Deferred` a bare
-    /// `question_raised` can park. See [`RunState::apply_answer`]; it subsumes
-    /// [`Self::origin`]'s only role, the return.
-    pub parked_from: TaskState,
     /// The frozen binding options this question's admission authorized, for a
     /// `HumanBinding` admission and for nothing else.
     ///

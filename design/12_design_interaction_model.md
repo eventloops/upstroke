@@ -1,6 +1,6 @@
 ## 12. Interaction model (P8)
 
-- **Questions are events**, scoped to `affected_tasks`. Exactly those park in `AwaitingInput`; the scheduler keeps draining everything else — in v0.1's sequential mode by skipping ahead to the next ready independent task, in v0.2 across parallel worktrees. **An answer returns each parked task to the state it was parked from** — runnable stays runnable, a queued candidate under verification returns to awaiting merge — so a park is transparent to the work it interrupted, and only a decline changes a task's fate.
+- **Questions are events**, scoped to `affected_tasks`. Exactly those park in `AwaitingInput`; the scheduler keeps draining everything else — in v0.1's sequential mode by skipping ahead to the next ready independent task, in v0.2 across parallel worktrees.
 - **Raised eagerly** — at detection, not at attempt: the designer resolves most at design time; at runtime a worker can flag uncertainty in its outcome and the reviewer can emit a `needs-human` verdict, both of which raise the question immediately while unrelated work proceeds.
 - **Pre-filtered by the architect**: question + decisions record → frontier profile → "already answered?" Only novel questions reach a human, and every one that does is logged as a `design_defect`.
 - **Hard block has a precise definition**: the runnable frontier is empty and every remaining task transitively depends on an open question. Anything less keeps running.
