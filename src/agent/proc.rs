@@ -965,9 +965,9 @@ mod windows_job {
 
     /// Whether `pid` is a member of this process's ambient job.
     ///
-    /// `None` when no ambient job has been established, or the process cannot
-    /// be opened. The kernel answers, so this is an oracle independent of the
-    /// spawn path it checks.
+    /// `None` when no ambient job has been established, the process cannot be
+    /// opened, or `IsProcessInJob` itself fails. The kernel answers, so this is
+    /// an oracle independent of the spawn path it checks.
     pub(super) fn ambient_contains(pid: u32) -> Option<bool> {
         let Some(Ok(job)) = AMBIENT.get() else {
             return None;
