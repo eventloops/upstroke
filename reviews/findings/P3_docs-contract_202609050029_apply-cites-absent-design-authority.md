@@ -3,7 +3,7 @@ id: SWEEP-FOLD-APPLY-DESIGN-AUTHORITY
 severity: P3
 disposition: deferred
 category: docs-contract
-pr: 151
+pr: 152
 reviewed_sha: 943ae61dc61c579a3b03744c8994a1ce81a9acf8
 location: src/topology/fold/apply.rs:1
 provenance: pre_existing
