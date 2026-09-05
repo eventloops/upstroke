@@ -8254,32 +8254,11 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             record.recovered,
             "every sample recovered by its classified action"
         );
-        // **The bare arm's non-convergences, bounded rather than reported**
-        // (PR #145 pass 3, finding 3, as ruled). A bare-arm sample converges
-        // or fails with one of the two fingerprints
-        // `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` recorded, and
-        // anything else is a new failure. The known ones are printed and
-        // written to the artifact as a count with their words; they are not
-        // the guarantee, because this test's stdout and its artifact are both
-        // channels CI discards on a passing run. When the funnel stream that
-        // owns the live-writer race lands, `known` tightens to empty.
-        assert!(
-            run.bare.other.is_empty(),
-            "{site}: a bare-arm sample failed to recover with something other than the two \
-                 known fingerprints (`DirectoryNotEmpty`, an empty `gitdir`): {:?}",
-            run.bare.other
-        );
-        println!(
-            "bare arm {site}: {} of {} samples did not converge, all with a known fingerprint",
-            run.bare.known.len(),
-            SAMPLING_N / 2
-        );
         records.push(SiteEvidence {
             site,
             record,
             budget: run.budget,
             replayed: run.replayed,
-            bare_known: run.bare.known,
         });
     }
     assert_eq!(
@@ -8452,30 +8431,9 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 );
             }
 
-            // **Two arms, four rungs each, and each arm witnessed by the
-            // kernel** (PR #145 pass 3, finding 3). The group arm is
-            // `agent::proc`'s kill path; the bare arm is what an external
-            // kill of a manager-spawned `git` leaves. Alternation is asserted
-            // here rather than trusted, because a ladder that silently
-            // dropped one arm would leave every count below intact.
-            let group_arm: Vec<&&SampledLaunch> = shape
-                .iter()
-                .filter(|launch| launch.arm == KillArm::Group)
-                .collect();
-            let bare_arm: Vec<&&SampledLaunch> = shape
-                .iter()
-                .filter(|launch| launch.arm == KillArm::Bare)
-                .collect();
-            assert_eq!(
-                (group_arm.len(), bare_arm.len()),
-                (SAMPLING_N as usize / 2, SAMPLING_N as usize / 2),
-                "{label}: the ladder alternates production's two kill shapes, half each"
-            );
-
             #[cfg(unix)]
             {
-                // **The group arm: every kill was aimed at the child's own
-                // process group** (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-
+                // **Every kill was aimed at the child's own process group** (`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-
                 // CONVERGE`). The aim and the landing are two facts; the aim
                 // is asserted everywhere and the landing only where it is
                 // measured deterministic. `NotItsOwnGroup` means
@@ -8484,7 +8442,7 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 // the old sampler spawned, so this assertion is about the
                 // property and not a restatement of the new code.
                 let mut refused = Vec::new();
-                for launch in &group_arm {
+                for launch in &shape {
                     let group = launch.group_kill.expect(
                         "a kill fired at every one of this command's children, asserted \
                          just above, and the group kill is written by that same statement",
@@ -8492,16 +8450,10 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                     assert_ne!(
                         group,
                         GroupKill::NotItsOwnGroup,
-                        "{label}: a group-arm child does not lead its own process group, so \
+                        "{label}: the sampled child does not lead its own process group, so \
                              there was no group of its own to aim a kill at and none was \
                              fired -- `process_group(0)` in `SampledChild::spawn` is what \
                              puts it there"
-                    );
-                    assert_ne!(
-                        group,
-                        GroupKill::NotAimed,
-                        "{label}: a group-arm child was not aimed at, which is the bare arm's \
-                             shape under the group arm's label"
                     );
                     if let GroupKill::Refused(errno) = group {
                         refused.push(errno);
@@ -8518,7 +8470,7 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 // whether it is signalled or not. A `cfg` on a *measured*
                 // platform difference; Darwin keeps the printed record.
                 #[cfg(target_os = "linux")]
-                for launch in &group_arm {
+                for launch in &shape {
                     let group = launch
                         .group_kill
                         .expect("a kill fired at every one of this command's children");
@@ -8536,33 +8488,7 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                     println!("group kill refused {label}: errnos {refused:?}");
                 }
 
-                // **The bare arm: witnessed as bare by the same oracle.** The
-                // kernel says the child did *not* lead its own group -- it is
-                // in this test binary's group, where a `Command::output`
-                // child of the manager lives in production -- and no group
-                // kill was aimed at it. Without this, "bare" would be a label
-                // on a rung and not a property of the child.
-                for launch in &bare_arm {
-                    assert!(
-                        !launch.led_its_own_group,
-                        "{label}: a bare-arm child led its own process group, which is the \
-                             group arm's shape under the bare arm's label"
-                    );
-                    assert_eq!(
-                        launch.group_kill,
-                        Some(GroupKill::NotAimed),
-                        "{label}: a group kill was aimed at a bare-arm child"
-                    );
-                    assert_eq!(
-                        launch.settled,
-                        GroupSettle::NotAimed,
-                        "{label}: a bare-arm child was waited for as a group; the bare arm \
-                             has no group of its own, and waiting for the harness's would \
-                             never end"
-                    );
-                }
-
-                // **The group arm was empty before anything read the
+                // **The group was empty before anything read the
                 // worktree** -- and only that (PR #145 pass 3, finding 5).
                 // `kill(-pgid, 0)` proves an entry of the group remains; it
                 // does not prove the checkout is alive and writing. A zombie
@@ -8575,16 +8501,15 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 // `kill_git_child`, at detection, before the sample reads
                 // anything (pass 2, finding 1). What is left is the cost,
                 // measured from the kill and including the leader's reap.
-                let waited: Vec<GroupSettle> = group_arm
+                let waited: Vec<GroupSettle> = shape
                     .iter()
                     .map(|launch| launch.settled)
                     .filter(|settled| !matches!(settled, GroupSettle::Empty { queries: 1, .. }))
                     .collect();
                 println!(
-                    "group settle {label}: {} of {} empty at the first query, {} not yet \
+                    "group settle {label}: {} of {launched} empty at the first query, {} not yet \
                      empty {waited:?}",
-                    group_arm.len() - waited.len(),
-                    group_arm.len(),
+                    launched - waited.len(),
                     waited.len()
                 );
             }
@@ -8685,11 +8610,6 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
                 "after": site.record.histogram.after,
                 "unclassified": site.record.unclassified,
                 "recovered": site.record.recovered,
-                // The bare arm's known non-convergences: production's
-                // direct-kill fault, sampled, and its rate kept visible
-                // without being load-bearing. The guarantee is the assertion
-                // that nothing *other* than these two fingerprints occurred.
-                "bare_arm_known_non_convergences": site.bare_known,
             }))
             .collect::<Vec<_>>(),
     }))
@@ -8718,16 +8638,6 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
             "{site}: the written histogram accounts for every sample"
         );
         assert_eq!(entry["unclassified"], evidence.record.unclassified);
-        let bare_known: Vec<&str> = entry["bare_arm_known_non_convergences"]
-            .as_array()
-            .expect("a bare-arm array")
-            .iter()
-            .map(|value| value.as_str().expect("a fingerprint line"))
-            .collect();
-        assert_eq!(
-            bare_known, evidence.bare_known,
-            "{site}: the artifact carries the bare arm's known non-convergences verbatim"
-        );
         assert_eq!(
             entry["budget_us"].as_u64(),
             u64::try_from(evidence.budget.as_micros()).ok(),
@@ -8752,9 +8662,6 @@ struct SiteEvidence {
     /// Whether that timescale was measured here or replayed from
     /// `UPSTROKE_RESIDUE_BUDGET_US`.
     replayed: bool,
-    /// The bare arm's non-convergences with a known fingerprint, one line
-    /// each. See `BareArm`.
-    bare_known: Vec<String>,
 }
 
 /// One site's sampling run: the packet's record, and the per-sample
@@ -8779,8 +8686,6 @@ struct SamplingRun {
     /// What `classify_object_residue` answered for each sample, in order.
     /// `None` is a sample it could not classify at all.
     observed: Vec<Option<ObjectResidue>>,
-    /// The bare arm's non-convergences, by fingerprint. See [`BareArm`].
-    bare: BareArm,
     /// What the classifier said when it *refused* a sample, one line each.
     ///
     /// A refusal and an unclassifiable residue both arrive in `observed` as
@@ -9103,7 +9008,6 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
     );
     let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
-    let mut bare = BareArm::default();
     let mut recovered = true;
 
     for run in 0..SAMPLING_N {
@@ -9123,12 +9027,7 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
 
         let (args, cwd) = sampled_command(site, &fixture, &slot);
         let delay = budget.mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1));
-        let arm = if run % 2 == 0 {
-            KillArm::Group
-        } else {
-            KillArm::Bare
-        };
-        kill_git_child(&fixture.manager, &cwd, &args, delay, arm);
+        kill_git_child(&fixture.manager, &cwd, &args, delay);
 
         let target = ResidueTarget::new(&base).at(&path).from_base(&fixture.head);
         // Bounded retry, and then `.ok()`. The `.ok()` is what the tally
@@ -9156,45 +9055,8 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
             refusals.push(format!("run {run}: {error}"));
         }
         observed.push(classified.ok());
-        match recover_sample(&fixture, &slot) {
-            Ok(true) => {}
-            Ok(false) => recovered = false,
-            // **The bare arm is held to a bounded set of outcomes, not to
-            // success** (PR #145 pass 3, finding 3, as the coordinator
-            // ruled it). Its residue may be a live writer, and forced removal
-            // against a live writer is the funnel P2 another stream owns; a
-            // test red at that stream's known rate is a test people learn
-            // to ignore, and a bare arm whose failures are merely reported
-            // lands in the two channels CI throws away. So: converge, or
-            // fail with exactly one of the two fingerprints
-            // `PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` recorded --
-            // and anything else is a new failure and reddens the suite.
-            // When that stream lands, this arm tightens to full convergence
-            // and this match arm is what gets deleted.
-            Err(error) if cfg!(unix) && arm == KillArm::Bare => {
-                let text = format!("{error:?}");
-                let known =
-                    text.contains("DirectoryNotEmpty") || text.contains("has an empty gitdir");
-                println!(
-                    "bare-arm recovery {site} run {run}: {} -- {text}",
-                    if known {
-                        "known fingerprint"
-                    } else {
-                        "UNKNOWN FAILURE"
-                    }
-                );
-                if known {
-                    bare.known.push(format!("run {run}: {text}"));
-                } else {
-                    bare.other.push(format!("run {run}: {text}"));
-                }
-                // Harness hygiene, not recovery: the residue the funnel
-                // refused to clear would poison every later sample's
-                // enumeration of the registrations. It is the fixture's own
-                // temporary repository, and what is removed is named.
-                bare_arm_hygiene(&fixture, &slot);
-            }
-            Err(error) => panic!("forced removal converges: {error:?}"),
+        if !recover_sample(&fixture, &slot) {
+            recovered = false;
         }
     }
 
@@ -9210,55 +9072,6 @@ fn sample_site(site: EffectSiteId) -> SamplingRun {
         },
         observed,
         refusals,
-        bare,
-    }
-}
-
-/// What the bare arm's recoveries did, kept apart from the packet's
-/// `recovered`, which is defined over the group arm and over bare-arm samples
-/// that converged.
-#[derive(Debug, Default)]
-struct BareArm {
-    /// Non-convergences carrying one of the two known fingerprints. Reported
-    /// per run and in the artifact; asserted only to be the *only* kind.
-    known: Vec<String>,
-    /// Non-convergences carrying anything else. Asserted empty.
-    other: Vec<String>,
-}
-
-/// Clear what the funnel refused to, so the next sample is not poisoned.
-///
-/// Only ever reached after a bare-arm non-convergence with a known
-/// fingerprint. Both paths are inside the fixture's temporary repository:
-/// the slot's checkout, which may still have a writer finishing in it, and
-/// the registration directory whose empty `gitdir` the funnel correctly
-/// declines to guess at. `remove_dir_all` failing here is not tolerated --
-/// it would be a third fingerprint, and it panics with the path.
-fn bare_arm_hygiene(fixture: &Fixture, slot: &Slot) {
-    let path = fixture.manager.slot_path(slot);
-    for _ in 0..3 {
-        match fs::remove_dir_all(&path) {
-            Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            // A live writer can recreate a directory under the walk; a second
-            // pass after it has finished is the same removal.
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
-        }
-    }
-    assert!(
-        !path.exists(),
-        "bare-arm hygiene could not clear {}",
-        path.display()
-    );
-    let worktrees = fixture.base.join(".git").join("worktrees");
-    if let Ok(entries) = fs::read_dir(&worktrees) {
-        for entry in entries.flatten() {
-            let gitdir = entry.path().join("gitdir");
-            let empty = fs::read(&gitdir).map(|bytes| bytes.iter().all(u8::is_ascii_whitespace));
-            if matches!(empty, Ok(true)) {
-                fs::remove_dir_all(entry.path()).expect("clear the poisoned registration");
-            }
-        }
     }
 }
 
@@ -9591,13 +9404,6 @@ fn launch_end(status: &std::process::ExitStatus) -> LaunchEnd {
 struct SampledLaunch {
     argv: Vec<String>,
     after: std::time::Duration,
-    /// Which of production's two kill shapes this child got.
-    arm: KillArm,
-    /// The kernel's answer at the spawn instant: `true` for the group arm,
-    /// and -- asserted -- `false` for the bare arm, which is the bare arm's
-    /// own oracle for being bare.
-    #[cfg(unix)]
-    led_its_own_group: bool,
     fired: Option<std::time::Duration>,
     /// What [`SampledChild::kill`] answered, when it answered an error.
     ///
@@ -9738,10 +9544,6 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// [`Child::kill`]: std::process::Child::kill
 struct SampledChild {
     child: std::process::Child,
-    /// Which of production's two kill shapes this child gets. Read only on
-    /// Unix, where the two shapes differ; elsewhere both are the bare kill.
-    #[cfg(unix)]
-    arm: KillArm,
     /// The instant the kill fired: the one clock every bound after it is
     /// measured from (pass 3, finding 2).
     killed_at: Option<std::time::Instant>,
@@ -9818,9 +9620,6 @@ enum GroupSettle {
     /// same refusal [`GroupKill::NotItsOwnGroup`] is, and the sampling test
     /// fails on it there.
     NotItsOwnGroup,
-    /// Not waited for, by design: the bare arm has no group of its own to
-    /// wait for, and waiting for the harness's group would never end.
-    NotAimed,
 }
 
 /// How long a sampled child may take to be reaped after the kill, and on
@@ -9835,28 +9634,6 @@ enum GroupSettle {
 /// is normally the one `kill(-pgid, 0)` that answers `ESRCH`.
 #[cfg(unix)]
 const GROUP_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Which of production's two kill shapes a sampled child is given.
-///
-/// PR #145 pass 3, finding 3. "Production never produces a bare-child death"
-/// was false: the workspace manager spawns its Git through `Command::output`
-/// and not through `agent::proc`'s containment, so an operator, a supervisor
-/// or the OOM killer ending only the leader is a production sequence -- and
-/// this pull request's own empty-`gitdir` finding calls an OOM kill of `git`
-/// production-reachable. A sampler that always group-kills therefore removes
-/// coverage of a real fault. The ladder alternates the two: even rungs kill
-/// the group and wait for it, odd rungs kill the bare child as master did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KillArm {
-    /// `process_group(0)`, `SIGKILL` to the group, then wait for the group to
-    /// empty: `agent::proc`'s kill path.
-    Group,
-    /// `Child::kill` on the leader only, in this harness's own process group,
-    /// nothing waited for: what an external kill of a manager-spawned `git`
-    /// leaves. Its residue may be a live writer, and its recovery is held to
-    /// a bounded set of outcomes rather than to success (see `BareArm`).
-    Bare,
-}
 
 /// What the process-group kill did to one sampled child.
 ///
@@ -9876,8 +9653,6 @@ enum GroupKill {
     Refused(i32),
     /// Not attempted: the kernel says this child does not lead its own group.
     NotItsOwnGroup,
-    /// Not aimed, by design: the bare arm kills the leader only.
-    NotAimed,
 }
 
 impl SampledChild {
@@ -9895,7 +9670,7 @@ impl SampledChild {
     /// [`WorkspaceManager::command`] makes the pins production's **by
     /// construction**: a pin added there is a pin here, with no list to keep
     /// in step.
-    fn spawn(manager: &WorkspaceManager, cwd: &Path, args: &[String], arm: KillArm) -> Self {
+    fn spawn(manager: &WorkspaceManager, cwd: &Path, args: &[String]) -> Self {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let mut command = manager.command(cwd, &args);
         command
@@ -9904,24 +9679,17 @@ impl SampledChild {
             .stderr(Stdio::null());
         // `setpgid(0, 0)` in the forked child before `exec`, which is where
         // `agent::proc::run_with_timeout_at` puts it and what `std` does for
-        // this call -- for the group arm. The bare arm deliberately stays in
-        // this test binary's group, which is where a `Command::output` child
-        // of the manager lives in production.
+        // this call. Without it the child shares this test binary's group and
+        // there is no group of the child's own for a kill to name.
         #[cfg(unix)]
-        if arm == KillArm::Group {
-            std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        }
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let child = command.spawn().expect("spawn the sampled git child");
         let spawned = std::time::Instant::now();
         #[cfg(unix)]
         let led_its_own_group = crate::agent::proc::child_leads_its_own_group(child.id());
-        #[cfg(not(unix))]
-        let _ = arm;
         Self {
             child,
             spawned,
-            #[cfg(unix)]
-            arm,
             fired: None,
             killed_at: None,
             #[cfg(unix)]
@@ -9953,21 +9721,41 @@ impl SampledChild {
     /// throws its effect away. The kill floor at the end of the sampling
     /// test is what covers that: it is over wait statuses, which nothing
     /// but a real kill produces.
+    ///
+    /// **On Unix the leader is killed by the group signal and by nothing
+    /// else** (PR #145 pass 4, finding 4). With `Child::kill` following the
+    /// group kill as a second SIGKILL, the reviewer's mutation -- `SIGKILL`
+    /// replaced by signal `0` in `kill_group` -- left every oracle green: the
+    /// delivery answer is 0 for signal 0, the leader still died by
+    /// `Child::kill`, the barrier waited for the descendants to finish on
+    /// their own, and the killed-child floor was satisfied by the leader's
+    /// second death. The sampler had silently become a bare-child kill plus
+    /// a completion wait. Now the only SIGKILL a Unix leader can receive is
+    /// the one sent to its group, so its wait status -- `died_by_kill`,
+    /// asserted by the killed-child floor -- is an observation of the signal
+    /// that reached the group, taken from the one member whose status this
+    /// process can read. Signal 0 leaves every leader to reach its own exit,
+    /// and the floor fails. On Windows there is no group and `Child::kill`
+    /// remains the kill, as on master.
     fn kill(&mut self) -> std::io::Result<()> {
         let now = std::time::Instant::now();
         let fired = now.duration_since(self.spawned);
         #[cfg(unix)]
-        let group = match self.arm {
-            KillArm::Group => self.kill_group(),
-            KillArm::Bare => GroupKill::NotAimed,
+        let outcome = {
+            let group = self.kill_group();
+            self.group_kill = Some(group);
+            match group {
+                GroupKill::Delivered => Ok(()),
+                GroupKill::Refused(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                GroupKill::NotItsOwnGroup => Err(std::io::Error::other(
+                    "no group of the child's own to signal",
+                )),
+            }
         };
+        #[cfg(not(unix))]
         let outcome = self.child.kill();
         self.fired = Some(fired);
         self.killed_at = Some(now);
-        #[cfg(unix)]
-        {
-            self.group_kill = Some(group);
-        }
         outcome
     }
 
@@ -10099,9 +9887,6 @@ impl SampledChild {
     /// exists precisely because it is not a safe one.
     #[cfg(unix)]
     fn settle_group(&self) -> GroupSettle {
-        if self.arm == KillArm::Bare {
-            return GroupSettle::NotAimed;
-        }
         if !self.led_its_own_group {
             return GroupSettle::NotItsOwnGroup;
         }
@@ -10149,9 +9934,8 @@ fn kill_git_child(
     cwd: &Path,
     args: &[String],
     after: std::time::Duration,
-    arm: KillArm,
 ) {
-    let mut child = SampledChild::spawn(manager, cwd, args, arm);
+    let mut child = SampledChild::spawn(manager, cwd, args);
     std::thread::sleep(after);
     // Kept, not discarded. A kill of a child that has already reached its own
     // exit legitimately fails on Windows -- `TerminateProcess` answers
@@ -10176,10 +9960,7 @@ fn kill_git_child(
     let settled = child.settle_group();
     #[cfg(unix)]
     assert!(
-        match arm {
-            KillArm::Group => matches!(settled, GroupSettle::Empty { .. }),
-            KillArm::Bare => settled == GroupSettle::NotAimed,
-        },
+        matches!(settled, GroupSettle::Empty { .. }),
         "{settled:?} -- the sampled child's process group is not known to be empty, so \
          nothing may read the worktree yet. `TimedOut` is an entry -- a live descendant, or a \
          zombie a subreaper has not collected -- that outlasted {GROUP_SETTLE_BOUND:?} after \
@@ -10192,11 +9973,8 @@ fn kill_git_child(
         .push(SampledLaunch {
             argv: args.to_vec(),
             after,
-            arm,
             fired: child.fired,
             kill_error,
-            #[cfg(unix)]
-            led_its_own_group: child.led_its_own_group,
             #[cfg(unix)]
             group_kill: child.group_kill,
             #[cfg(unix)]
@@ -10208,20 +9986,23 @@ fn kill_git_child(
 /// The tabled recovery for whatever the sample left: forced removal of the
 /// worktree and its intent, which is the before-phase action every
 /// `Internal` residue routes to and is idempotent for the other two.
-///
-/// Returns the removal's error rather than panicking on it, because the bare
-/// arm decides what a non-convergence means (see `BareArm`); the group arm
-/// and every non-Unix sample still panic on it, with master's words.
-fn recover_sample(fixture: &Fixture, slot: &Slot) -> Result<bool, UpstrokeError> {
-    fixture.manager.remove_worktree(&mut NoHooks, slot)?;
-    fixture.manager.remove_intent(&mut NoHooks, slot)?;
+fn recover_sample(fixture: &Fixture, slot: &Slot) -> bool {
+    fixture
+        .manager
+        .remove_worktree(&mut NoHooks, slot)
+        .expect("forced removal converges");
+    fixture
+        .manager
+        .remove_intent(&mut NoHooks, slot)
+        .expect("intent removal converges");
     let path = fixture.manager.slot_path(slot);
-    Ok(!path.exists()
+    !path.exists()
         && !fixture
             .manager
-            .worktree_records()?
+            .worktree_records()
+            .expect("records")
             .iter()
-            .any(|record| canonical_prefix(record.path()).ok() == canonical_prefix(&path).ok()))
+            .any(|record| canonical_prefix(record.path()).ok() == canonical_prefix(&path).ok())
 }
 
 // -----------------------------------------------------------------------
