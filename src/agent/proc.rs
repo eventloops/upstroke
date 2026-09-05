@@ -1442,6 +1442,7 @@ mod termination {
     const REAPER_OK: u8 = 0x84;
     const REAPER_FAIL: u8 = 0x85;
     const REAPER_CANCEL: u8 = 0x86;
+    const REAPER_STARTUP_FAILED: u8 = 0x87;
     // The job-control guard briefly continues only Upstroke every 250 ms while
     // probing for a PID-directed termination. The cleanup reaper must not
     // mistake that internal pulse for an operator resume and continue agents.
@@ -2364,10 +2365,355 @@ mod termination {
         }
     }
 
+    mod reaper_startup {
+        use std::fmt;
+        use std::time::{Duration, Instant};
+
+        use super::{REAPER_READY, REAPER_STARTUP_FAILED, last_errno};
+
+        const RECORD_LEN: usize = 14;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) enum Stage {
+            DispositionScrub,
+            SigchldMask,
+            SigchldAction,
+            IgnoreSignal,
+            EmptyMask,
+            SetMask,
+            ProcessGroup,
+            LeaseOpen,
+            LeaseLock,
+            ReadyWrite,
+        }
+
+        impl Stage {
+            fn wire(self) -> u8 {
+                match self {
+                    Self::DispositionScrub => 1,
+                    Self::SigchldMask => 2,
+                    Self::SigchldAction => 3,
+                    Self::IgnoreSignal => 4,
+                    Self::EmptyMask => 5,
+                    Self::SetMask => 6,
+                    Self::ProcessGroup => 7,
+                    Self::LeaseOpen => 8,
+                    Self::LeaseLock => 9,
+                    Self::ReadyWrite => 10,
+                }
+            }
+
+            fn from_wire(byte: u8) -> Option<Self> {
+                match byte {
+                    1 => Some(Self::DispositionScrub),
+                    2 => Some(Self::SigchldMask),
+                    3 => Some(Self::SigchldAction),
+                    4 => Some(Self::IgnoreSignal),
+                    5 => Some(Self::EmptyMask),
+                    6 => Some(Self::SetMask),
+                    7 => Some(Self::ProcessGroup),
+                    8 => Some(Self::LeaseOpen),
+                    9 => Some(Self::LeaseLock),
+                    10 => Some(Self::ReadyWrite),
+                    _ => None,
+                }
+            }
+
+            fn name(self) -> &'static str {
+                match self {
+                    Self::DispositionScrub => "disposition scrub",
+                    Self::SigchldMask => "SIGCHLD mask initialization",
+                    Self::SigchldAction => "SIGCHLD disposition",
+                    Self::IgnoreSignal => "signal ignore",
+                    Self::EmptyMask => "signal mask initialization",
+                    Self::SetMask => "signal mask reset",
+                    Self::ProcessGroup => "process group isolation",
+                    Self::LeaseOpen => "cleanup lease open",
+                    Self::LeaseLock => "cleanup lease shared lock",
+                    Self::ReadyWrite => "READY write",
+                }
+            }
+        }
+
+        /// A fixed value captured at the failing syscall, before cleanup or
+        /// reporting can replace errno. Only the parent formats this value.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) struct Failure {
+            pub(super) stage: Stage,
+            pub(super) errno: libc::c_int,
+            pub(super) detail: u64,
+        }
+
+        impl Failure {
+            pub(super) fn capture(stage: Stage, detail: u64) -> Self {
+                Self {
+                    stage,
+                    errno: last_errno(),
+                    detail,
+                }
+            }
+
+            /// Private parent/fork protocol: tag, stage, little-endian errno
+            /// and an eight-byte signal number or zero-based lease ordinal.
+            pub(super) fn encode(self) -> [u8; RECORD_LEN] {
+                let [e0, e1, e2, e3] = self.errno.to_le_bytes();
+                let [d0, d1, d2, d3, d4, d5, d6, d7] = self.detail.to_le_bytes();
+                [
+                    REAPER_STARTUP_FAILED,
+                    self.stage.wire(),
+                    e0,
+                    e1,
+                    e2,
+                    e3,
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    d4,
+                    d5,
+                    d6,
+                    d7,
+                ]
+            }
+
+            fn decode(record: [u8; RECORD_LEN]) -> Option<Self> {
+                let [tag, stage, e0, e1, e2, e3, d0, d1, d2, d3, d4, d5, d6, d7] = record;
+                if tag != REAPER_STARTUP_FAILED {
+                    return None;
+                }
+                Stage::from_wire(stage).map(|stage| Self {
+                    stage,
+                    errno: i32::from_le_bytes([e0, e1, e2, e3]),
+                    detail: u64::from_le_bytes([d0, d1, d2, d3, d4, d5, d6, d7]),
+                })
+            }
+        }
+
+        impl fmt::Display for Failure {
+            fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Formatter failures have no additional operation context;
+                // they are returned unchanged to the caller formatting us.
+                write!(output, "{}; ", self.stage.name())?;
+                if self.errno == 0 {
+                    output.write_str("no syscall errno")?;
+                } else {
+                    write!(output, "errno {}", self.errno)?;
+                }
+                match self.stage {
+                    Stage::IgnoreSignal => write!(output, "; signal {}", self.detail),
+                    Stage::LeaseOpen | Stage::LeaseLock => {
+                        write!(output, "; lease ordinal {}", self.detail)
+                    }
+                    Stage::DispositionScrub
+                    | Stage::SigchldMask
+                    | Stage::SigchldAction
+                    | Stage::EmptyMask
+                    | Stage::SetMask
+                    | Stage::ProcessGroup
+                    | Stage::ReadyWrite => Ok(()),
+                }
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub(super) enum Reply {
+            Ready,
+            Failed(Failure),
+            Timeout { received: usize },
+            Eof,
+            Truncated { received: usize },
+            PollError { errno: i32, received: usize },
+            ReadError { errno: i32, received: usize },
+            Malformed,
+        }
+
+        impl fmt::Display for Reply {
+            fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Ready => output.write_str("READY received"),
+                    Self::Failed(failure) => write!(output, "child failure at {failure}"),
+                    Self::Timeout { received } => {
+                        write!(
+                            output,
+                            "unknown child stage; timeout after {received} record bytes"
+                        )
+                    }
+                    Self::Eof => output.write_str("unknown child stage; EOF before READY"),
+                    Self::Truncated { received } => {
+                        write!(
+                            output,
+                            "unknown child stage; truncated record of {received} bytes"
+                        )
+                    }
+                    Self::PollError { errno, received } => write!(
+                        output,
+                        "unknown child stage; poll errno {errno} after {received} record bytes"
+                    ),
+                    Self::ReadError { errno, received } => write!(
+                        output,
+                        "unknown child stage; read errno {errno} after {received} record bytes"
+                    ),
+                    Self::Malformed => {
+                        output.write_str("unknown child stage; malformed startup record")
+                    }
+                }
+            }
+        }
+
+        /// Clock and channel operations are injected together so tests can
+        /// advance time across EINTR and partial frames without sleeping.
+        pub(super) trait Channel {
+            fn now(&mut self) -> Instant;
+            fn poll(&mut self, timeout_ms: i32) -> Result<bool, i32>;
+            fn read(&mut self) -> Result<Option<u8>, i32>;
+        }
+
+        struct Descriptor(libc::c_int);
+
+        impl Channel for Descriptor {
+            fn now(&mut self) -> Instant {
+                Instant::now()
+            }
+
+            fn poll(&mut self, timeout_ms: i32) -> Result<bool, i32> {
+                let mut descriptor = libc::pollfd {
+                    fd: self.0,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                };
+                // SAFETY: one writable pollfd, with the remaining startup
+                // budget supplied by the one-deadline reader below.
+                let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+                if result < 0 {
+                    Err(last_errno())
+                } else {
+                    Ok(result > 0)
+                }
+            }
+
+            fn read(&mut self) -> Result<Option<u8>, i32> {
+                let mut byte = 0_u8;
+                // SAFETY: the parent owns this startup channel's only
+                // reader, poll reported readiness, and byte is writable.
+                let result = unsafe { libc::read(self.0, (&mut byte as *mut u8).cast(), 1) };
+                match result {
+                    1 => Ok(Some(byte)),
+                    0 => Ok(None),
+                    _ => Err(last_errno()),
+                }
+            }
+        }
+
+        pub(super) fn read(fd: libc::c_int, budget: Duration) -> Reply {
+            read_from(&mut Descriptor(fd), budget)
+        }
+
+        /// Publish the existing one-byte READY response. Unlike write_raw,
+        /// keep a zero-progress write separate from a failing syscall, which
+        /// alone supplies errno. This runs after the child ignores SIGPIPE.
+        pub(super) fn write_ready(fd: libc::c_int) -> Result<(), Failure> {
+            let ready = REAPER_READY;
+            loop {
+                // SAFETY: ready is one initialized byte, and fd belongs to
+                // this private child. write is async-signal-safe after fork.
+                let written = unsafe { libc::write(fd, (&ready as *const u8).cast(), 1) };
+                if written == 1 {
+                    return Ok(());
+                }
+                let failure = if written < 0 {
+                    Failure::capture(Stage::ReadyWrite, 0)
+                } else {
+                    Failure {
+                        stage: Stage::ReadyWrite,
+                        errno: 0,
+                        detail: 0,
+                    }
+                };
+                if failure.errno != libc::EINTR {
+                    return Err(failure);
+                }
+            }
+        }
+
+        pub(super) fn read_from(channel: &mut impl Channel, budget: Duration) -> Reply {
+            let began = channel.now();
+            let mut record = [0_u8; RECORD_LEN];
+            for (received, destination) in record.iter_mut().enumerate() {
+                loop {
+                    let remaining =
+                        budget.saturating_sub(channel.now().saturating_duration_since(began));
+                    if remaining.is_zero() {
+                        return Reply::Timeout { received };
+                    }
+                    // poll takes signed milliseconds. Clamp before the
+                    // conversion; a sub-millisecond remainder gets
+                    // one millisecond, as the existing helper reader does.
+                    let millis = remaining.as_millis().clamp(1, i32::MAX as u128);
+                    // The clamp above proves 1 <= millis <= i32::MAX.
+                    let timeout_ms = millis as i32;
+                    match channel.poll(timeout_ms) {
+                        Ok(false) => return Reply::Timeout { received },
+                        Err(libc::EINTR) => continue,
+                        Err(errno) => return Reply::PollError { errno, received },
+                        Ok(true) => {}
+                    }
+                    // Readiness itself may arrive after a descheduled poll
+                    // has exhausted the deadline. Do not restart the budget.
+                    if channel.now().saturating_duration_since(began) >= budget {
+                        return Reply::Timeout { received };
+                    }
+                    let read = channel.read();
+                    if channel.now().saturating_duration_since(began) >= budget {
+                        return Reply::Timeout { received };
+                    }
+                    match read {
+                        Err(libc::EINTR) => continue,
+                        Err(errno) => return Reply::ReadError { errno, received },
+                        Ok(None) if received == 0 => return Reply::Eof,
+                        Ok(None) => return Reply::Truncated { received },
+                        Ok(Some(byte)) => {
+                            if received == 0 {
+                                match byte {
+                                    REAPER_READY => return Reply::Ready,
+                                    REAPER_STARTUP_FAILED => {}
+                                    _ => return Reply::Malformed,
+                                }
+                            }
+                            *destination = byte;
+                            break;
+                        }
+                    }
+                }
+            }
+            match Failure::decode(record) {
+                Some(failure) => Reply::Failed(failure),
+                None => Reply::Malformed,
+            }
+        }
+    }
+
+    /// Best-effort evidence from a fork-only child. Keep the original errno
+    /// in fixed storage, suppress SIGPIPE before reporting, and retain exit 1
+    /// even when the parent has already closed the diagnostic transport.
+    fn fail_reaper_startup(ack_fd: libc::c_int, failure: reaper_startup::Failure) -> ! {
+        // SAFETY: this private child exits below and runs no inherited host
+        // callbacks. No allocation or lock is taken by signal/write/_exit.
+        unsafe {
+            if libc::signal(libc::SIGPIPE, libc::SIG_IGN) != libc::SIG_ERR {
+                let _ = write_raw(ack_fd, &failure.encode());
+            }
+            libc::_exit(1);
+        }
+    }
+
     fn spawn_reaper() -> Result<Reaper, String> {
+        use reaper_startup::{Failure, Reply, Stage};
         use std::os::unix::ffi::OsStrExt;
 
+        // Scanner and path-conversion errors already identify the failed
+        // operation; propagate those pre-fork refusals unchanged.
         verify_group_scanner()?;
+        // SAFETY: getpid has no pointer or lifetime requirements.
         let parent = unsafe { libc::getpid() };
         let cleanup_paths = crate::rundir::active_cleanup_lease_paths()
             .into_iter()
@@ -2406,6 +2752,7 @@ mod termination {
             .and_then(|value| value.parse::<libc::c_int>().ok());
         #[cfg(not(test))]
         let exit_before_ready: Option<libc::c_int> = None;
+        // SAFETY: _SC_OPEN_MAX is a supported query, with no pointer input.
         let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         if open_max <= 0 {
             return Err("reading the Unix open-file descriptor ceiling".to_owned());
@@ -2417,13 +2764,13 @@ mod termination {
         // every run today — nothing selects a container Runner until PR12 — and
         // costs the reaper nothing at all.
         let containers = container_scope_for_a_new_reaper();
-        let command = create_cloexec_pipe()
+        let [command_read, command_write] = create_cloexec_pipe()
             .map_err(|error| format!("creating Unix cleanup-reaper command pipe: {error}"))?;
-        let ack = match create_cloexec_pipe() {
+        let [ack_read, ack_write] = match create_cloexec_pipe() {
             Ok(pipe) => pipe,
             Err(error) => {
-                close_fd(command[0]);
-                close_fd(command[1]);
+                close_fd(command_read);
+                close_fd(command_write);
                 return Err(format!(
                     "creating Unix cleanup-reaper acknowledgement pipe: {error}"
                 ));
@@ -2433,7 +2780,7 @@ mod termination {
         // loop. It never returns to the multithreaded Rust runtime.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            for fd in [command[0], command[1], ack[0], ack[1]] {
+            for fd in [command_read, command_write, ack_read, ack_write] {
                 close_fd(fd);
             }
             return Err(format!(
@@ -2442,20 +2789,21 @@ mod termination {
             ));
         }
         if pid == 0 {
-            if !install_reaper_dispositions() {
-                unsafe { libc::_exit(1) };
+            if let Err(failure) = install_reaper_dispositions() {
+                fail_reaper_startup(ack_write, failure);
             }
-            close_fd(command[1]);
-            close_fd(ack[0]);
+            close_fd(command_write);
+            close_fd(ack_read);
             // A separate process group is the crucial boundary: an
             // uncatchable kill of Upstroke's foreground job must not also kill
             // the process that owns its final agent cleanup.
+            // SAFETY: this fork-only child establishes its own group.
             if unsafe { libc::setpgid(0, 0) } != 0 {
-                unsafe { libc::_exit(1) };
+                fail_reaper_startup(ack_write, Failure::capture(Stage::ProcessGroup, 0));
             }
-            close_inherited_fds(&[command[0], ack[1]], open_max);
-            if !lock_cleanup_paths(&cleanup_paths) {
-                unsafe { libc::_exit(1) };
+            close_inherited_fds(&[command_read, ack_write], open_max);
+            if let Err(failure) = lock_cleanup_paths(&cleanup_paths) {
+                fail_reaper_startup(ack_write, failure);
             }
             // Test subprocesses can hold READY back past the parent's deadline
             // so the late-reaper path is driven deterministically.
@@ -2465,12 +2813,13 @@ mod termination {
                 delay_left = delay_left.saturating_sub(10);
             }
             if let Some(code) = exit_before_ready {
+                // SAFETY: this private test child exits without destructors.
                 unsafe { libc::_exit(code) };
             }
             reaper_loop(
                 parent,
-                command[0],
-                ack[1],
+                command_read,
+                ack_write,
                 open_max,
                 cleanup_delay_ms,
                 containers.as_ref(),
@@ -2479,12 +2828,17 @@ mod termination {
 
         // Close the parent's race with the child-side setpgid. Either call may
         // win; both establish the same private group before any agent exists.
+        // SAFETY: pid is the direct child just forked; this repeats the
+        // child-side group isolation while it has not executed another image.
         if unsafe { libc::setpgid(pid, pid) } != 0 {
             let error = last_errno();
             if error != libc::EACCES && error != libc::EPERM {
-                for fd in [command[0], command[1], ack[0], ack[1]] {
+                for fd in [command_read, command_write, ack_read, ack_write] {
                     close_fd(fd);
                 }
+                // SAFETY: this is the existing failed-fork cleanup for the
+                // direct child. waitpid accepts a null status pointer. Its
+                // blocking wait and host-waiter identity limits are unchanged.
                 unsafe {
                     let _ = libc::kill(pid, libc::SIGKILL);
                     let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
@@ -2495,15 +2849,16 @@ mod termination {
                 ));
             }
         }
-        close_fd(ack[1]);
+        close_fd(ack_write);
         let reaper = Reaper {
-            command_fd: command[1],
-            ack_fd: ack[0],
-            _command_keepalive_fd: command[0],
+            command_fd: command_write,
+            ack_fd: ack_read,
+            _command_keepalive_fd: command_read,
             pid,
         };
         let ready_wait_began = std::time::Instant::now();
-        if read_guard_ack(ack[0], HELPER_READY_BUDGET) != Some(REAPER_READY) {
+        let startup = reaper_startup::read(ack_read, HELPER_READY_BUDGET);
+        if startup != Reply::Ready {
             let waited = ready_wait_began.elapsed();
             // The teardown is master's, unchanged and in master's order; what
             // it answered becomes the diagnostic. Nothing is asked of the pid
@@ -2513,7 +2868,8 @@ mod termination {
             let end = describe_helper_end(reaper.abandon());
             return Err(format!(
                 "Unix cleanup reaper did not initialize; waited {waited:?} of \
-                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}"
+                 {HELPER_READY_BUDGET:?}; descriptor ceiling {open_max}; ending it: {end}; \
+                 startup: {startup}"
             ));
         }
         #[cfg(test)]
@@ -2529,14 +2885,19 @@ mod termination {
         Ok(reaper)
     }
 
-    fn install_reaper_dispositions() -> bool {
+    fn install_reaper_dispositions() -> Result<(), reaper_startup::Failure> {
+        use reaper_startup::{Failure, Stage};
+
+        // SAFETY: this runs in the private fork-only child. Signal actions
+        // and masks use initialized stack storage, and no callback or Rust
+        // allocation is invoked before the child exits or enters its loop.
         unsafe {
             // This child never executes embedding-host code. Remove every
             // inherited callback before clearing its signal mask; SIGCHLD is
             // restored to default immediately below because the reaper owns
             // the stopped anchor's wait lifecycle.
             if !scrub_private_helper_dispositions() {
-                return false;
+                return Err(Failure::capture(Stage::DispositionScrub, 0));
             }
             // A library host may own SIGCHLD and reap children from its
             // handler. The private reaper must not inherit that callback (or
@@ -2545,10 +2906,11 @@ mod termination {
             let mut child_action: libc::sigaction = std::mem::zeroed();
             child_action.sa_sigaction = libc::SIG_DFL;
             child_action.sa_flags = 0;
-            if libc::sigemptyset(&mut child_action.sa_mask) != 0
-                || libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) != 0
-            {
-                return false;
+            if libc::sigemptyset(&mut child_action.sa_mask) != 0 {
+                return Err(Failure::capture(Stage::SigchldMask, 0));
+            }
+            if libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) != 0 {
+                return Err(Failure::capture(Stage::SigchldAction, 0));
             }
             for signal in [
                 libc::SIGINT,
@@ -2560,32 +2922,44 @@ mod termination {
                 libc::SIGPIPE,
             ] {
                 if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
-                    return false;
+                    // Every signal above is a positive platform constant.
+                    return Err(Failure::capture(Stage::IgnoreSignal, signal as u64));
                 }
             }
             let mut empty: libc::sigset_t = std::mem::zeroed();
-            if libc::sigemptyset(&mut empty) != 0
-                || libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0
-            {
-                return false;
+            if libc::sigemptyset(&mut empty) != 0 {
+                return Err(Failure::capture(Stage::EmptyMask, 0));
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0 {
+                return Err(Failure::capture(Stage::SetMask, 0));
             }
         }
-        true
+        Ok(())
     }
 
-    fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> bool {
-        for path in paths {
+    fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> Result<(), reaper_startup::Failure> {
+        use reaper_startup::{Failure, Stage};
+
+        for (ordinal, path) in paths.iter().enumerate() {
+            // All supported Unix targets have at most 64-bit usize. The
+            // ordinal is only diagnostic data; it never addresses a slice.
+            let ordinal = ordinal as u64;
+            // SAFETY: path is NUL terminated and open borrows it for the
+            // duration of this syscall. The child owns any returned fd.
             let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 || unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-                if fd >= 0 {
-                    close_fd(fd);
-                }
-                return false;
+            if fd < 0 {
+                return Err(Failure::capture(Stage::LeaseOpen, ordinal));
+            }
+            // SAFETY: fd is the live descriptor this child just opened.
+            if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                let failure = Failure::capture(Stage::LeaseLock, ordinal);
+                close_fd(fd);
+                return Err(failure);
             }
             // Deliberately leave this independently opened descriptor live.
             // Process exit releases its shared lease after cleanup completes.
         }
-        true
+        Ok(())
     }
 
     fn reaper_loop(
@@ -2600,8 +2974,8 @@ mod termination {
         let mut anchor = 0_i32;
         let mut mirrored_parent_stop = false;
         let mut parent_running_polls = 0_u8;
-        if !write_raw(ack_fd, &[REAPER_READY]) {
-            unsafe { libc::_exit(1) };
+        if let Err(failure) = reaper_startup::write_ready(ack_fd) {
+            fail_reaper_startup(ack_fd, failure);
         }
         loop {
             let mut command = libc::pollfd {
@@ -2613,30 +2987,37 @@ mod termination {
             // retain a FIFO writer until it exits, so EOF is not a trustworthy
             // parent-liveness signal on Darwin. Reparenting is authoritative
             // and lets this fork-only helper settle independently.
+            // SAFETY: command is one initialized writable pollfd.
             let polled = unsafe { libc::poll(&mut command, 1, 10) };
             if polled < 0 {
                 if last_errno_is_interrupted() {
                     continue;
                 }
                 settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
+                // SAFETY: this private fork-only child runs no destructors.
                 unsafe { libc::_exit(0) };
             }
+            // SAFETY: getppid has no pointer or lifetime requirements.
             if unsafe { libc::getppid() } != parent {
                 settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
+                // SAFETY: this private fork-only child runs no destructors.
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
+                // SAFETY: this private fork-only child runs no destructors.
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 let mut frame = [0_u8; 5];
                 if !read_raw_exact(command_fd, &mut frame) {
                     settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
+                    // SAFETY: this private fork-only child runs no destructors.
                     unsafe { libc::_exit(0) };
                 }
-                let requested = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
-                let accepted = match frame[0] {
+                let [kind, b0, b1, b2, b3] = frame;
+                let requested = i32::from_ne_bytes([b0, b1, b2, b3]);
+                let accepted = match kind {
                     REAPER_REGISTER if pgid == 0 && requested > 0 => {
                         let created = spawn_group_anchor(requested, open_max);
                         if created <= 0 {
@@ -2650,6 +3031,7 @@ mod termination {
                     REAPER_CLEANUP if requested == pgid && pgid > 0 => {
                         cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
                         let _ = write_raw(ack_fd, &[REAPER_OK]);
+                        // SAFETY: this private fork-only child runs no destructors.
                         unsafe { libc::_exit(0) };
                     }
                     REAPER_CANCEL if requested == 0 => {
@@ -2657,12 +3039,14 @@ mod termination {
                             cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
                         }
                         let _ = write_raw(ack_fd, &[REAPER_OK]);
+                        // SAFETY: this private fork-only child runs no destructors.
                         unsafe { libc::_exit(0) };
                     }
                     _ => false,
                 };
                 if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
                     settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
+                    // SAFETY: this private fork-only child runs no destructors.
                     unsafe { libc::_exit(0) };
                 }
             }
@@ -2670,12 +3054,16 @@ mod termination {
             if pgid > 0 {
                 match process_is_stopped(parent) {
                     Some(true) if !mirrored_parent_stop => {
+                        // SAFETY: pgid is the registered group retained by
+                        // the stopped anchor; the negative PID addresses it.
                         mirrored_parent_stop = unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0;
                         parent_running_polls = 0;
                     }
                     Some(true) => parent_running_polls = 0,
                     state @ Some(false) if mirrored_parent_stop => {
                         if parent_has_stably_resumed(state, &mut parent_running_polls) {
+                            // SAFETY: the same anchor retains this group
+                            // while the parent resumes its registered members.
                             let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
                             mirrored_parent_stop = false;
                             parent_running_polls = 0;
@@ -4545,6 +4933,398 @@ mod termination {
         use std::process::{Command, Stdio};
         use std::time::Instant;
 
+        mod reaper_startup {
+            use super::super::reaper_startup::{
+                Channel, Failure, Reply, Stage, read, read_from, write_ready,
+            };
+            use super::super::{
+                close_fd, create_cloexec_pipe, fail_reaper_startup, last_errno, lock_cleanup_paths,
+            };
+            use std::collections::VecDeque;
+            use std::time::{Duration, Instant};
+
+            enum Step {
+                Poll(u64, Result<bool, i32>),
+                Read(u64, Result<Option<u8>, i32>),
+            }
+
+            struct ScriptedChannel {
+                now: Instant,
+                steps: VecDeque<Step>,
+                timeouts: Vec<i32>,
+            }
+
+            impl ScriptedChannel {
+                fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+                    Self {
+                        now: Instant::now(),
+                        steps: steps.into_iter().collect(),
+                        timeouts: Vec::new(),
+                    }
+                }
+
+                fn bytes(bytes: impl IntoIterator<Item = u8>) -> Self {
+                    Self::new(
+                        bytes
+                            .into_iter()
+                            .flat_map(|byte| {
+                                [Step::Poll(0, Ok(true)), Step::Read(0, Ok(Some(byte)))]
+                            })
+                            .chain([Step::Poll(0, Ok(true)), Step::Read(0, Ok(None))]),
+                    )
+                }
+            }
+
+            impl Channel for ScriptedChannel {
+                fn now(&mut self) -> Instant {
+                    self.now
+                }
+
+                fn poll(&mut self, timeout_ms: i32) -> Result<bool, i32> {
+                    self.timeouts.push(timeout_ms);
+                    match self.steps.pop_front().expect("a scripted poll remains") {
+                        Step::Poll(elapsed, result) => {
+                            self.now += Duration::from_millis(elapsed);
+                            result
+                        }
+                        Step::Read(..) => panic!("polled when the script expected a read"),
+                    }
+                }
+
+                fn read(&mut self) -> Result<Option<u8>, i32> {
+                    match self.steps.pop_front().expect("a scripted read remains") {
+                        Step::Read(elapsed, result) => {
+                            self.now += Duration::from_millis(elapsed);
+                            result
+                        }
+                        Step::Poll(..) => panic!("read when the script expected a poll"),
+                    }
+                }
+            }
+
+            #[test]
+            fn reaper_startup_keeps_the_existing_ready_byte() {
+                let mut channel = ScriptedChannel::bytes([0x81]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::Ready
+                );
+                assert_eq!(channel.timeouts, [2000]);
+            }
+
+            #[test]
+            fn reaper_startup_partial_records_never_claim_a_child_stage() {
+                let failure = Failure {
+                    stage: Stage::LeaseLock,
+                    errno: libc::EACCES,
+                    detail: 9,
+                };
+                for received in 1..failure.encode().len() {
+                    let mut channel =
+                        ScriptedChannel::bytes(failure.encode().into_iter().take(received));
+                    let reply = read_from(&mut channel, Duration::from_secs(2));
+                    assert_eq!(reply, Reply::Truncated { received });
+                    assert!(reply.to_string().contains("unknown child stage"));
+                }
+                let mut channel = ScriptedChannel::bytes([]);
+                assert_eq!(read_from(&mut channel, Duration::from_secs(2)), Reply::Eof);
+            }
+
+            #[test]
+            fn reaper_startup_rejects_unknown_tags_and_stages() {
+                let mut channel = ScriptedChannel::bytes([0xff]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::Malformed
+                );
+                let mut channel =
+                    ScriptedChannel::bytes([0x87, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::Malformed
+                );
+            }
+
+            #[test]
+            fn reaper_startup_transport_errors_preserve_errno_and_partial_length() {
+                let mut channel = ScriptedChannel::new([
+                    Step::Poll(0, Ok(true)),
+                    Step::Read(0, Ok(Some(0x87))),
+                    Step::Poll(0, Err(libc::EBADF)),
+                ]);
+                let reply = read_from(&mut channel, Duration::from_secs(2));
+                assert_eq!(
+                    reply,
+                    Reply::PollError {
+                        errno: libc::EBADF,
+                        received: 1
+                    }
+                );
+                assert!(reply.to_string().contains("unknown child stage"));
+
+                let mut channel =
+                    ScriptedChannel::new([Step::Poll(0, Ok(true)), Step::Read(0, Err(libc::EIO))]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::ReadError {
+                        errno: libc::EIO,
+                        received: 0
+                    }
+                );
+            }
+
+            #[test]
+            fn reaper_startup_partial_records_share_one_deadline() {
+                let mut channel = ScriptedChannel::new([
+                    Step::Poll(1500, Ok(true)),
+                    Step::Read(0, Ok(Some(0x87))),
+                    Step::Poll(500, Ok(true)),
+                ]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::Timeout { received: 1 }
+                );
+                assert_eq!(channel.timeouts, [2000, 500]);
+                assert!(channel.steps.is_empty());
+            }
+
+            #[test]
+            fn reaper_startup_interruptions_do_not_restart_the_deadline() {
+                let mut channel = ScriptedChannel::new([
+                    Step::Poll(900, Err(libc::EINTR)),
+                    Step::Poll(700, Ok(true)),
+                    Step::Read(100, Err(libc::EINTR)),
+                    Step::Poll(300, Ok(false)),
+                ]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::from_secs(2)),
+                    Reply::Timeout { received: 0 }
+                );
+                assert_eq!(channel.timeouts, [2000, 1100, 300]);
+
+                let mut channel = ScriptedChannel::new([]);
+                assert_eq!(
+                    read_from(&mut channel, Duration::ZERO),
+                    Reply::Timeout { received: 0 }
+                );
+                assert!(channel.timeouts.is_empty());
+            }
+
+            enum ChildAction<'a> {
+                Fail(Failure),
+                ClosedTransport(Failure),
+                Ready,
+                Cleanup(&'a [std::ffi::CString]),
+                BadReadyDescriptor,
+            }
+
+            /// A child sends at most 14 bytes into a new empty pipe. Collecting its exit
+            /// before reading makes these transport tests independent of startup speed.
+            /// The child executes only fixed-storage protocol code and safe post-fork
+            /// syscalls; construction, assertions and allocation stay in the parent.
+            fn child_reply(action: ChildAction<'_>) -> (Reply, i32) {
+                let [reader, writer] =
+                    create_cloexec_pipe().expect("create a startup test channel");
+                // SAFETY: the child only calls the fixed-storage operations below and
+                // exits with _exit; it never returns to the multithreaded test runtime.
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    close_fd(reader);
+                    close_fd(writer);
+                    panic!("fork the startup test child");
+                }
+                if pid == 0 {
+                    close_fd(reader);
+                    let failure = match action {
+                        ChildAction::Fail(failure) => Some(failure),
+                        ChildAction::ClosedTransport(failure) => {
+                            close_fd(writer);
+                            Some(failure)
+                        }
+                        ChildAction::Ready => write_ready(writer).err(),
+                        ChildAction::Cleanup(paths) => lock_cleanup_paths(paths).err(),
+                        ChildAction::BadReadyDescriptor => write_ready(-1).err(),
+                    };
+                    if let Some(failure) = failure {
+                        fail_reaper_startup(writer, failure);
+                    }
+                    // SAFETY: no Rust destructor or inherited callback runs in the child.
+                    unsafe { libc::_exit(0) };
+                }
+                close_fd(writer);
+                let collected = collect_test_child(pid);
+                if let Err(error) = collected {
+                    // SAFETY: this test owns this direct child and has not collected it.
+                    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let cleanup = collect_test_child(pid);
+                    close_fd(reader);
+                    panic!("startup child wait: {error}; kill {killed}; cleanup {cleanup:?}");
+                }
+                let reply = read(reader, Duration::from_secs(60));
+                close_fd(reader);
+                let status = collected.expect("the child was collected above");
+                assert!(
+                    libc::WIFEXITED(status),
+                    "child terminated without an exit code: {status}"
+                );
+                (reply, libc::WEXITSTATUS(status))
+            }
+
+            fn collect_test_child(pid: libc::pid_t) -> Result<i32, String> {
+                let began = Instant::now();
+                loop {
+                    let mut status = 0;
+                    // SAFETY: pid is this test's direct child, status is writable, and
+                    // this test has no other waiter for it. WNOHANG bounds each query.
+                    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if waited == pid {
+                        return Ok(status);
+                    }
+                    if waited < 0 && last_errno() != libc::EINTR {
+                        return Err(format!("waitpid errno {}", last_errno()));
+                    }
+                    if began.elapsed() >= Duration::from_secs(60) {
+                        return Err("child did not exit within the test's hang bound".to_owned());
+                    }
+                    // The kernel's terminal status is the oracle. Yield only lets the
+                    // producer run while the test keeps a generous wedged-child bound.
+                    std::thread::yield_now();
+                }
+            }
+
+            #[test]
+            fn reaper_startup_child_reports_reach_the_parent_with_stage_errno_and_detail() {
+                for stage in [
+                    Stage::DispositionScrub,
+                    Stage::SigchldMask,
+                    Stage::SigchldAction,
+                    Stage::IgnoreSignal,
+                    Stage::EmptyMask,
+                    Stage::SetMask,
+                    Stage::ProcessGroup,
+                    Stage::LeaseOpen,
+                    Stage::LeaseLock,
+                    Stage::ReadyWrite,
+                ] {
+                    let failure = Failure {
+                        stage,
+                        errno: libc::EACCES,
+                        detail: 19,
+                    };
+                    assert_eq!(
+                        child_reply(ChildAction::Fail(failure)),
+                        (Reply::Failed(failure), 1)
+                    );
+                }
+                assert_eq!(child_reply(ChildAction::Ready), (Reply::Ready, 0));
+            }
+
+            #[test]
+            fn reaper_startup_failed_transport_keeps_exit_one_and_unknown_stage() {
+                let failure = Failure {
+                    stage: Stage::ProcessGroup,
+                    errno: libc::EPERM,
+                    detail: 0,
+                };
+                assert_eq!(
+                    child_reply(ChildAction::ClosedTransport(failure)),
+                    (Reply::Eof, 1)
+                );
+            }
+
+            #[test]
+            fn reaper_startup_captures_the_failing_ready_write_errno() {
+                let failure = Failure {
+                    stage: Stage::ReadyWrite,
+                    errno: libc::EBADF,
+                    detail: 0,
+                };
+                assert_eq!(
+                    child_reply(ChildAction::BadReadyDescriptor),
+                    (Reply::Failed(failure), 1)
+                );
+                let no_errno = Failure {
+                    stage: Stage::ReadyWrite,
+                    errno: 0,
+                    detail: 0,
+                };
+                assert_eq!(
+                    child_reply(ChildAction::Fail(no_errno)),
+                    (Reply::Failed(no_errno), 1)
+                );
+                assert_eq!(no_errno.to_string(), "READY write; no syscall errno");
+            }
+
+            #[test]
+            fn reaper_startup_cleanup_failures_preserve_the_lease_ordinal_and_errno() {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::ffi::OsStrExt;
+
+                let root = CleanupFixture(std::env::temp_dir().join(format!(
+                    "upstroke-reaper-startup-{}-{}",
+                    std::process::id(),
+                    crate::ulid::ulid()
+                )));
+                std::fs::create_dir(&root.0).expect("create a startup cleanup fixture");
+                let shared = root.0.join("shared.lock");
+                std::fs::write(&shared, b"").expect("create a shareable lease");
+                let unavailable = root.0.join("unavailable.lock");
+                let locked =
+                    std::fs::File::create(&unavailable).expect("create an exclusive lease");
+                // SAFETY: locked owns this live fd through both child observations.
+                assert_eq!(
+                    unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                let paths = [shared, unavailable, root.0.join("missing.lock")].map(|path| {
+                    std::ffi::CString::new(path.as_os_str().as_bytes())
+                        .expect("NUL-free fixture path")
+                });
+                let [shared, unavailable, missing] = paths;
+                // Each child borrows its own two-path input. Retain the first path for
+                // the second observation while the first input owns a copy of its bytes.
+                let (locked_reply, locked_exit) =
+                    child_reply(ChildAction::Cleanup(&[shared.clone(), unavailable]));
+                let (missing_reply, missing_exit) =
+                    child_reply(ChildAction::Cleanup(&[shared, missing]));
+                drop(locked);
+
+                assert_eq!(locked_exit, 1);
+                match locked_reply {
+                    Reply::Failed(Failure {
+                        stage: Stage::LeaseLock,
+                        errno,
+                        detail: 1,
+                    }) => {
+                        assert!(
+                            errno == libc::EWOULDBLOCK || errno == libc::EAGAIN,
+                            "lock errno {errno}"
+                        );
+                    }
+                    reply => panic!("expected second lease's lock failure, received {reply:?}"),
+                }
+                assert_eq!(missing_exit, 1);
+                assert_eq!(
+                    missing_reply,
+                    Reply::Failed(Failure {
+                        stage: Stage::LeaseOpen,
+                        errno: libc::ENOENT,
+                        detail: 1
+                    })
+                );
+            }
+
+            struct CleanupFixture(std::path::PathBuf);
+
+            impl Drop for CleanupFixture {
+                fn drop(&mut self) {
+                    // Also runs if a parent assertion fails; children have their own
+                    // copy after fork and deliberately call _exit without destructors.
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+        }
+
         static REAPED_CHILD_STOP: AtomicBool = AtomicBool::new(false);
 
         /// R28 is a **shared** hold, and one run has more than one reaper.
@@ -4577,11 +5357,11 @@ mod termination {
             let held = std::slice::from_ref(&target);
 
             assert!(
-                lock_cleanup_paths(held),
+                lock_cleanup_paths(held).is_ok(),
                 "the first invocation's reaper could not take R28 at all"
             );
             assert!(
-                lock_cleanup_paths(held),
+                lock_cleanup_paths(held).is_ok(),
                 "a second overlapping invocation's reaper was refused the shared hold: \
                  R28 is `one per reaper`, not one per run"
             );
