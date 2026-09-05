@@ -1166,7 +1166,7 @@ not read back from any code.
 
 And the module names no volume operation at all.
 
-## `fn r26_is_released_in_four_outcomes_and_the_census_is_the_mechanism_for_no_run_finished()…`
+## `fn r26_is_released_in_four_outcomes_and_the_census_is_the_mechanism_for_no_run_finished() {`
 
 R26 is `released` in `Complete`, `Parked`, `Halted` and `BudgetExceeded`, and
 the census is the mechanism for the fifth cell.

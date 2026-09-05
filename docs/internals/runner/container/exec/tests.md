@@ -451,7 +451,7 @@ A registered invocation: the intent named it, and the record carried
 the runner digest. The intent is gone now, so the evidence is the
 container the runtime saw.
 
-## `fn failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_con…`
+## `fn failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers() {`
 
 T-CONTAINER (17), PR6 half: a failing pre-flight probe refuses and its
 probe containers are reclaimed.
@@ -951,7 +951,7 @@ declares.
 (3) The R20 row is the only one with no disposer, and that is the
 whole of `enforcement_domains.operator_owned`.
 
-## `fn every_physical_resource_of_a_container_invocation_maps_t…` › `let site_names: BTreeSet<&str> = ContainerSite::ALL.iter().map(|site| site.name()).collec…`
+## `fn every_physical_resource_of_a_container_invocation_maps_t…` › `let site_names: BTreeSet<&str> = ContainerSite::ALL.iter().map(|site| site.name()).collect();`
 
 (4) Every disposer that names a site names one of the frozen eight,
 so a resource cannot be disposed of by something outside the funnel.
@@ -1127,7 +1127,7 @@ worktrees inside it. Each of the run's three real worktrees plans,
 for each worktree role — a container receives *one* worktree, and
 which one is the engine's decision, not this runner's.
 
-## `fn every_role_writes_and_syncs_its_own_six_field_intent_before_its_container_is_created()…`
+## `fn every_role_writes_and_syncs_its_own_six_field_intent_before_its_container_is_created() {`
 
 Every role — **both probe kinds included** — writes and syncs its own
 six-field intent record, and it is on disk before its container is
@@ -1404,7 +1404,7 @@ What a Docker-gated test does when the runtime holds no usable image.
 Loud under the same variable as a missing runtime: a machine with Docker
 and no image would otherwise pass these tests without touching it.
 
-## `fn discover(docker: &dyn ContainerRuntime, preferred: &[&str]) -> Result<(String, String)…`
+## `fn discover(docker: &dyn ContainerRuntime, preferred: &[&str]) -> Result<(String, String), String> {`
 
 A reference the runtime holds, with its id, or the reason there is none.
 

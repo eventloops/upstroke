@@ -238,7 +238,7 @@ A host path, bound at `target`.
 A named volume — R20, operator-owned, "never created or pruned by a
 run".
 
-## `pub enum Mount` › `Tmpfs { target: String },`
+## `pub enum Mount` › `Tmpfs {`
 
 An ephemeral in-memory scratch surface, with no host source and no
 name.
@@ -417,7 +417,7 @@ Can the runtime be reached at all?
 [`RuntimeError::Unreachable`] when it cannot. A caller may **not** treat
 `Ok(())` as a promise about any later operation; see the module docs.
 
-## `pub trait ContainerRuntime: Send + Sync` › `fn image_by_reference(&self, reference: &str) -> Result<Option<ImageInspection>, RuntimeE…`
+## `pub trait ContainerRuntime: Send + Sync` › `fn image_by_reference(&self, reference: &str) -> Result<Option<ImageInspection>, RuntimeError>;`
 
 Resolve a reference. `Ok(None)` means the reference is not present —
 which is a refusal, not a pull. `non_goals[1]` is "implicit image pull".
@@ -599,15 +599,15 @@ One thing that happened, in order.
 
 A funnel reached a hook phase of a site.
 
-## `pub enum TraceEntry` › `Runtime { op: RuntimeOp, target: String },`
+## `pub enum TraceEntry` › `Runtime {`
 
 A runtime operation was issued.
 
-## `pub enum TraceEntry` › `Durable { step: DurableStep, path: PathBuf },`
+## `pub enum TraceEntry` › `Durable {`
 
 A durability step of a record write.
 
-## `pub enum TraceEntry` › `View { action: ViewAction, path: PathBuf },`
+## `pub enum TraceEntry` › `View {`
 
 A Git view was materialised or discarded (R19).
 
@@ -638,6 +638,10 @@ and for the same reason: the funnel holds `&mut dyn ContainerHooks` across
 its body, so the body cannot borrow the observer again. Both the funnel and
 the runtime take a clone of one handle, which is what puts their entries in
 one order.
+
+The source retains the mutex protocol beside `ContainerTrace` under the
+concurrency exception in §§10 and 13. It states the shared log's lifetime,
+operation ordering, critical-section limits, and poison/guard cleanup behavior.
 
 ## `impl ContainerTrace` › `pub fn off() -> Self {`
 

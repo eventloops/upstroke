@@ -378,7 +378,7 @@ that agent: the run's `RunnerPolicy.credential_volumes` is
 what says which volumes exist, and pointing a CLI at a
 directory nothing mounts is worse than saying nothing.
 
-## `impl ContainerEnvironment` › `pub fn withheld_credential_locations(&self, scope: &RoleScope<'_>) -> Vec<(String, String…`
+## `impl ContainerEnvironment` › `pub fn withheld_credential_locations(&self, scope: &RoleScope<'_>) -> Vec<(String, String)> {`
 
 The credential-location keys this scope is **not** given, each with the
 value that says so at the boundary.

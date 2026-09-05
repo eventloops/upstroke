@@ -141,7 +141,7 @@ One per credential volume, in the map's sorted order.
 
 The volumes are asked about by name, and both of them are.
 
-## `fn a_runtime_reporting_no_digest_and_one_reporting_an_empty_string_both_resolve_to_none()…`
+## `fn a_runtime_reporting_no_digest_and_one_reporting_an_empty_string_both_resolve_to_none() {`
 
 A digest the runtime does not report, and one it reports as an empty string,
 both resolve to `None` — and the *record* still separates them.
@@ -202,7 +202,7 @@ the command, not a step in it.
 The *other* volume was asked about and answered yes, so this
 cell is about one absent volume and not about volumes at all.
 
-## `fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_refuses()…`
+## `fn the_pre_lock_sequence_reaches_no_lock_no_marker_and_no_probe_when_resolution_refuses() {`
 
 "Before any lock or effect", as one ordered sequence.
 
@@ -449,7 +449,7 @@ the reference and not the recorded id.
 The control for every `warnings.is_empty()` below: this same
 `today` warns when the rebuild gets that far.
 
-## `fn a_failing_preflight_probe_refuses_after_every_inspection_and_only_a_spawn_observes_it(…`
+## `fn a_failing_preflight_probe_refuses_after_every_inspection_and_only_a_spawn_observes_it() {`
 
 The fourth behaviour: a shell or CLI that fails inside the recorded image is
 observed **only** by a spawn, and refuses on the other side of the split.

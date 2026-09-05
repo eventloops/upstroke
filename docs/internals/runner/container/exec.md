@@ -737,7 +737,7 @@ never reached `Runner::run`.
 
 [`UpstrokeError::Refused`] naming every step that could not be completed.
 
-## `impl ContainerRunner` › `fn supervise(&self, name: &ContainerName, deadline: Instant) -> Result<bool, UpstrokeErro…`
+## `impl ContainerRunner` › `fn supervise(&self, name: &ContainerName, deadline: Instant) -> Result<bool, UpstrokeError> {`
 
 Wait for the container, bounded by the request's own timeout.
 
@@ -798,7 +798,7 @@ Both outcomes, so a grid over phases is a grid over all of them.
 
 Which outcome this invocation's mismatch has.
 
-## `impl ImageIdMismatch` › `pub fn error(self, name: &ContainerName, reported: &str, recorded: &str) -> UpstrokeError…`
+## `impl ImageIdMismatch` › `pub fn error(self, name: &ContainerName, reported: &str, recorded: &str) -> UpstrokeError {`
 
 The error a caller settles from.
 

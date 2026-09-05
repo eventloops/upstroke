@@ -353,7 +353,7 @@ An empty volume map, for a record whose `credential_volumes` is `None`.
 `completeness()` refuses that record before this is reached; the binding
 exists so the refusal is the one that reports, rather than a panic.
 
-## `fn configured_difference(record: &RunnerPolicy, today: &RunnerSelection) -> Option<Runner…`
+## `fn configured_difference(record: &RunnerPolicy, today: &RunnerSelection) -> Option<RunnerField> {`
 
 Which field of the recorded runner today's `[runner]` config disagrees with,
 if any.

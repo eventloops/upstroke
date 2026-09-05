@@ -376,6 +376,12 @@ impl TraceEntry {
     }
 }
 
+// Recording handles in the funnel, runtime, and views share one log, which
+// lives until its last handle drops. Its sole mutex serializes append, snapshot, and clear;
+// each operation takes effect under that guard, with no nested lock or callback.
+// Concurrent appends follow mutex acquisition order; snapshots and clear see
+// the entries at their turn. Poison recovery uses the guarded log, and guards
+// release on return or unwinding.
 #[derive(Debug, Clone, Default)]
 pub struct ContainerTrace(Option<Arc<Mutex<Vec<TraceEntry>>>>);
 

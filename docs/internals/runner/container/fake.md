@@ -367,7 +367,7 @@ A value rather than a comment, so a skipping test *reads* the reason and a
 skip that had stopped saying anything is a compile-time unused value rather
 than a silence.
 
-## `pub(crate) fn docker_gate(test: &str, trace: ContainerTrace) -> Result<Box<DockerCli>, St…`
+## `pub(crate) fn docker_gate(test: &str, trace: ContainerTrace) -> Result<Box<DockerCli>, String> {`
 
 Ask whether the Docker-gated half of this suite can run.
 

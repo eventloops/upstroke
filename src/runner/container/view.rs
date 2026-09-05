@@ -261,6 +261,13 @@ impl GitView for RoleGitView {
     }
 
     fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {
+        // Concurrent reclaimers arbitrate through remove_dir_all: removal and
+        // NotFound both let the caller proceed. racing_removal retries other
+        // errors, including Windows delete-pending PermissionDenied, up to
+        // RACING_ACCESS_ATTEMPTS; persistent failure returns the last error.
+        // A protected view must refuse cleanup so its intent remains available
+        // for recovery. Every successful call records Discarded, including one
+        // that found the view already gone.
         super::racing_removal(path, || fs::remove_dir_all(path))?;
         self.trace.view(ViewAction::Discarded, path);
         Ok(())

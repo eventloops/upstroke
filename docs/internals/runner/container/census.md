@@ -449,7 +449,7 @@ A container carrying `upstroke.private_root` with no record.
 
 Both halves agree it exists.
 
-## `impl DiscoveredBy` › `pub const ALL: &'static [Self] = &[Self::IntentOnly, Self::LabelOnly, Self::IntentAndLabe…`
+## `impl DiscoveredBy` › `pub const ALL: &'static [Self] = &[Self::IntentOnly, Self::LabelOnly, Self::IntentAndLabel];`
 
 Every cell of the grid.
 
@@ -619,7 +619,7 @@ dead and leaves it alone. That owner's own next write-command start
 classifies it under arm (i) and removes it; until then it is reported
 here rather than being silent residue.
 
-## `impl StagedDisposition` › `pub const ALL: &'static [Self] = &[Self::Adopted, Self::Removed, Self::RetainedForeignOwn…`
+## `impl StagedDisposition` › `pub const ALL: &'static [Self] = &[Self::Adopted, Self::Removed, Self::RetainedForeignOwner];`
 
 Every disposition, written out.
 

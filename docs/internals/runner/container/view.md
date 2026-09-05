@@ -311,6 +311,10 @@ about exactly these.
 
 ## `impl GitView for RoleGitView` › `fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {`
 
+The source retains the concurrent-removal protocol at this operation under
+the concurrency exception in §§10 and 13. A successful call records
+`Discarded` even when another reclaimer already removed the view.
+
 **Through the one racing removal** (`PR6-CORRECTNESS-009`).
 
 `crash_reconstruction` requires "every step idempotent and tolerant of
@@ -373,7 +377,7 @@ No engine refs: the two directories Git requires, both empty, and no
 
 The overlay itself: what `<workspace>/.git` becomes.
 
-## `fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, UpstrokeError>…`
+## `fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, UpstrokeError> {`
 
 Copy every `sharedindex.*` beside the source index into the view, and answer
 which names were copied.
