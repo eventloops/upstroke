@@ -3,7 +3,7 @@ id: RESIDUE-LOCKED-INVALID-REGISTRATION-OUTLIVES-FORCED-CLEANUP
 severity: P3
 disposition: accepted-risk
 category: crash-consistency
-pr:
+pr: 148
 reviewed_sha: 88c41a32a70c0464ba7e8dad413710a49df30d3d
 location: src/workspace_manager.rs:3099
 provenance: pre_existing
