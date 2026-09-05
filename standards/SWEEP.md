@@ -127,7 +127,8 @@ engine's census, and both `list_runs` and `list_husks` in `src/rundir/discovery.
 — three production call sites in three files and thirty-six call sites in all, which is past any
 reading of a sweep's own-file bound. Listing the file here would activate §6 and §7 over it in
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
-takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
+takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56, and
+the ones still open are files in `reviews/findings/`.
 
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a

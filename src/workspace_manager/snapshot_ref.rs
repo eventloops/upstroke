@@ -49,8 +49,9 @@
 //! into the runner's environment and the read-only path, which is product-wide
 //! behaviour for any repository with rewritten history and needs a `design/`
 //! sentence saying whether an exact snapshot is defined against raw or
-//! replacement objects; it is a deferred row in `reviews/FINDINGS.md` §50
-//! awaiting the owner's design ruling.
+//! replacement objects; it is a deferred finding in `reviews/findings/`
+//! (`id: PR130-REVIEW3-REPLACEMENT-ISOLATION-STOPS-AT-THE-MANAGER`) awaiting
+//! the owner's design ruling.
 //!
 //! **What a [`Snapshot`] holds together** (§5, §6): its fields are private
 //! and it has one constructor, [`Snapshot::new`], visible to the parent only.
