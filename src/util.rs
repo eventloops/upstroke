@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::UpstrokeError;
 
+pub(crate) mod terminal;
+
 pub fn tail(text: &str, max: usize) -> String {
     let trimmed = text.trim();
     if trimmed.len() <= max {

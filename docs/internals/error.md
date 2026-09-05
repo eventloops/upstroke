@@ -2,32 +2,68 @@
 
 Extended notes for [`src/error.rs`](../../src/error.rs).
 
-The code is the authority for what it does; this file is the whole of its prose, moved out of
-the source verbatim. Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
+These notes preserve the module comments after the annotation repairs. Item headings quote source lines for navigation.
 
-## `pub struct ValidationErrors(pub Vec<String>);`
+## `#[derive(Debug)]`
 
 Structural problems found in a parsed plan, collected so a single run
 surfaces every issue at once instead of failing on the first.
 
-## `pub enum UpstrokeError` › `Filesystem {`
+## `#[derive(Debug)]`
+
+An operation's refusal together with warnings gathered before it failed.
+The original typed error remains available for callers that classify it.
+
+## `pub error: Box<UpstrokeError>,`
+
+The unchanged refusal, including its original error category.
+
+## `pub warnings: Vec<String>,`
+
+Diagnostics in the order they were gathered before the refusal.
+
+## `write!(f, "{}", self.error)?;`
+
+These errors belong to the formatter; no operation context can be
+added when its destination refuses a write.
+
+## `std::error::Error::source(self.error.as_ref())`
+
+Display already includes the original error, so forwarding its
+source avoids repeating it when the CLI renders the error chain.
+
+## `#[derive(Debug, Error)]`
+
+Library failures classified by the operation or refusal a caller can handle.
+A failure with earlier diagnostics retains its category inside
+[`Self::WithWarnings`].
+
+## `#[error("failed to {operation} {}: {source}", .path.display())]`
 
 A filesystem operation on a path the engine owns failed. Named for
 the operation, because a removal, a write or a rename that fails did
 not fail to read (§7's operation-context rule); `Io` stays the
 variant for reads.
 
-## `pub enum UpstrokeError` › `Resume { run_id: String, message: String },`
+## ``#[error("cannot resume run `{run_id}`: {message}")]``
 
 A resume precondition failed (§15). Always carries what to do about it:
 refusing to continue is only useful if the operator can tell which of
 the four things moved — the run, the plan, the config, or the branch.
 
-## `pub enum UpstrokeError` › `Refused { message: String },`
+## `#[error("{message}")]`
 
 A request we could not act on — an id that matches nothing or too many
 things, a question already answered, an option that does not exist.
 Carries its own whole sentence, because prefixing these with a
 command's name (`cannot resume …` on a `status` lookup) misdescribes
 what the operator was actually doing.
+
+## `#[error(transparent)]`
+
+Non-fatal diagnostics do not replace or hide the operation's refusal.
+
+## `pub(crate) fn with_warnings(self, mut warnings: Vec<String>) -> Self {`
+
+Carry earlier warnings through a refusal without changing a clean
+error's variant. An existing diagnostic bundle is flattened in order.

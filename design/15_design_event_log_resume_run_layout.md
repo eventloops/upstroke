@@ -74,6 +74,12 @@ A declined `question_answered` likewise freezes the contemporaneous
 `on_task_failure` decision, so resume can append a missing task settlement
 without reinterpreting the human's already-durable answer through edited config.
 
+Schema-3 success validation uses `AttemptRecord::is_successful`: no failure record and every
+review pass approved. A non-passing review without a failure record is inconsistent and is
+refused before replay. It cannot authorize a prepared commit or the following `task_committed`.
+Normal review failures retain their recorded failure and ladder or parking decision. This
+checks the existing settlement contract without adding fields or changing the schema number.
+
 The v0.2 execution topology consequently begins at event schema 4 because its
 task states and transactions change execution meaning. Fresh topology runs write
 schema 4 in `run_started`; older binaries reject them before folding. Existing

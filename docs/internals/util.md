@@ -2,14 +2,7 @@
 
 Extended notes for [`src/util.rs`](../../src/util.rs).
 
-The code is the authority for what it does. This file preserves the migrated prose. Each section
-names the source item and, where needed, the line its comment described. Each code snippet in a
-heading is a literal source lookup string.
-
-The source retains the allowlist-placement marker above its governed lint allowance. In
-`windows_fsync_dir`, it also retains the read/write/delete sharing protocol and the three
-`SAFETY:` comments for opening, flushing and closing the directory handle. Lint reason strings
-stay in their attributes.
+These notes preserve the module comments after the status repairs. Item headings quote source lines for navigation.
 
 ## Module
 
@@ -17,18 +10,12 @@ Small shared helpers used across the engine, gates, adapters, and
 reporting: text truncation, filename sanitizing, PATH program resolution,
 run-artifact writes, and event timestamps.
 
-## `#![allow(clippy::disallowed_methods)]`
-
-Allowlist placement: the **funnel section** of `effects/allowlist.toml`, which
-carries this module's review clause -- effects only inside site-taking APIs,
-no writable handle returned. `decisions.effect_site_inventory.mechanism` (2).
-
 ## `pub fn tail(text: &str, max: usize) -> String {`
 
 Last `max` bytes of trimmed text, cut on a char boundary, with an ellipsis
 marker when truncated.
 
-## `pub fn tail(text: &str, max: usize) -> String` › `let start = (start..trimmed.len())`
+## `let start = (start..trimmed.len())`
 
 No boundary in range (possible only for a tiny `max` landing inside the
 final multibyte char) means the whole tail is unusable — keep nothing.
@@ -83,7 +70,7 @@ Resolve a bare program name against PATH. Empty PATH segments are skipped:
 they mean "current directory" to some shells, and resolving a program
 against the repo under automation would execute repo-controlled code.
 
-## `pub enum DurableStep {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]`
 
 One durability primitive, as a funnel actually performed it.
 
@@ -103,39 +90,39 @@ The rename is in the ledger beside the two syncs because the claims are
 **fsync the directory**" — and an ordering is not expressible over a trace
 that holds only one of the three things being ordered.
 
-## `pub enum DurableStep` › `Wrote,`
+## `Wrote,`
 
 A `write_all` of `len` bytes was performed.
 
-## `pub enum DurableStep` › `Flushed,`
+## `Flushed,`
 
 A `flush` was performed.
 
-## `pub enum DurableStep` › `SyncedData,`
+## `SyncedData,`
 
 A `sync_data` was performed — the append's own durability barrier, as
 distinct from [`Self::SyncedFile`]'s `sync_all`.
 
-## `pub enum DurableStep` › `Truncated,`
+## `Truncated,`
 
 A file was truncated to `len` bytes.
 
-## `pub enum DurableStep` › `SyncedFile,`
+## `SyncedFile,`
 
 A staged file's own bytes were made durable (`fsync` / `FlushFileBuffers`).
 
-## `pub enum DurableStep` › `Renamed,`
+## `Renamed,`
 
 A staged file was renamed onto its published name.
 
-## `pub enum DurableStep` › `SyncedDirectory,`
+## `SyncedDirectory,`
 
 A directory entry was made durable. Unix only: `sync_dir` is a
 documented no-op on Windows, so a Windows trace has the file syncs and
 the renames and no directory syncs, and a reader of the evidence can
 see which platform produced it.
 
-## `pub struct DurableRecord {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 One entry in a [`DurabilityLedger`].
 
@@ -145,15 +132,15 @@ makes about an entered append (`invariants[1]`), and a ledger that recorded
 only successes could not distinguish one attempt from a retry that failed
 twice.
 
-## `pub struct DurableRecord` › `pub step: DurableStep,`
+## `pub step: DurableStep,`
 
 What was done.
 
-## `pub struct DurableRecord` › `pub path: PathBuf,`
+## `pub path: PathBuf,`
 
 What it was done to.
 
-## `pub struct DurableRecord` › `pub len: u64,`
+## `pub len: u64,`
 
 How much of it. For a sync or a truncation this is the **filesystem's
 own answer** rather than a number the funnel carried along — a ledger
@@ -163,7 +150,7 @@ number of bytes handed to `write_all`, which is the quantity the claim
 "one `write_all` containing both the JSON and its LF commit marker" is
 about. Zero when the path has no length to report.
 
-## `pub struct DurabilityLedger(Option<std::sync::Arc<std::sync::Mutex<Vec<DurableRecord>>>>);`
+## `#[derive(Debug, Clone, Default)]`
 
 An ordered record of the durability primitives a funnel performed.
 
@@ -172,35 +159,35 @@ still read what the body recorded. Production never constructs a recording
 one: [`Self::off`] holds no allocation and every `record` call on it is a
 discriminant test.
 
-## `impl DurabilityLedger` › `pub fn off() -> Self {`
+## `#[must_use]`
 
 A ledger that records nothing. What production passes.
 
-## `impl DurabilityLedger` › `pub fn recording() -> Self {`
+## `#[must_use]`
 
 A ledger that records. What a test passes.
 
-## `impl DurabilityLedger` › `pub fn is_recording(&self) -> bool {`
+## `#[must_use]`
 
 Whether this ledger records at all.
 
-## `impl DurabilityLedger` › `pub fn record(&self, step: DurableStep, path: &Path, len: u64) {`
+## `pub fn record(&self, step: DurableStep, path: &Path, len: u64) {`
 
 Append one entry.
 
-## `impl DurabilityLedger` › `pub fn records(&self) -> Vec<DurableRecord> {`
+## `#[must_use]`
 
 Everything recorded so far, in order.
 
-## `impl DurabilityLedger` › `pub fn records_for(&self, path: &Path) -> Vec<DurableRecord> {`
+## `#[must_use]`
 
 Everything recorded so far about `path`, in order.
 
-## `impl DurabilityLedger` › `pub fn steps(&self) -> Vec<DurableStep> {`
+## `#[must_use]`
 
 The steps recorded so far, in order, with their paths discarded.
 
-## `impl DurabilityLedger` › `pub fn clear(&self) {`
+## `pub fn clear(&self) {`
 
 Forget everything recorded so far, so a later sequence can be read on
 its own rather than as a suffix of a cumulative log.
@@ -234,7 +221,7 @@ What it does **not** defend: `File::open` on a fifo with no writer blocks in
 the kernel before this function sees a handle. That is `std::fs::read`'s
 behaviour too and is unchanged here; a run directory holds regular files.
 
-### Errors
+# Errors
 
 [`std::io::Error`] from `open`, `fstat` or `read`, verbatim, so a caller can
 still distinguish `NotFound` from a real failure.
@@ -263,7 +250,7 @@ file would truncate the **production region** every source census in
 is a census reading half a module and reporting clean, which is the exact
 failure this project has a reconciliation table for.
 
-## `pub(crate) fn barriers_performed() -> u64 {`
+## `#[cfg_attr(not(test), allow(dead_code))]`
 
 How many times [`fsync_file`] or [`fsync_dir`] has been entered.
 
@@ -281,7 +268,7 @@ The *counter* stays unconditional; see [`BARRIERS`] for why a
 `#[cfg(test)]` item here would truncate every source census's production
 region.
 
-## `pub struct BarrierCounts {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]`
 
 The same two counts, **per thread and per half**.
 
@@ -299,15 +286,15 @@ are two independently droppable predicates — "write `<name>.tmp`, fsync,
 rename, **fsync the directory**" — and one counter cannot tell which of them
 went away.
 
-## `pub struct BarrierCounts` › `pub file: u64,`
+## `pub file: u64,`
 
 Entries into [`fsync_file`].
 
-## `pub struct BarrierCounts` › `pub directory: u64,`
+## `pub directory: u64,`
 
 Entries into [`fsync_dir`].
 
-## `pub(crate) fn barriers_on_this_thread() -> BarrierCounts {`
+## `#[cfg_attr(not(test), allow(dead_code))]`
 
 What this **thread** has entered so far, file half and directory half.
 
@@ -316,7 +303,7 @@ counters themselves are unconditional; see [`BARRIERS`] for why a
 `#[cfg(test)]` item in this file would truncate every source census's
 production region.
 
-## `enum BarrierHalf {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`
 
 Which half of the barrier was entered.
 
@@ -328,7 +315,7 @@ One call, shared by every funnel that stages a file before publishing it, so
 that "the durability step is still here" is a property a source census can
 check rather than a line each caller is trusted to keep.
 
-### Errors
+# Errors
 
 [`std::io::Error`] from `fsync`, verbatim.
 
@@ -354,12 +341,12 @@ the flag that makes `CreateFileW` return a *directory* handle at all. So the
 documented boundary was a platform fact rather than a preference, and the
 way through it is the Win32 call std does not expose.
 
-### Errors
+# Errors
 
 [`std::io::Error`] from the open or from the flush, verbatim, so a caller can
 still tell a missing directory from a refused barrier.
 
-## `const WINDOWS_DIRECTORY_ACCESS: u32 =`
+## `#[cfg(windows)]`
 
 The access mask [`fsync_dir`] opens a directory with on Windows.
 
@@ -370,11 +357,11 @@ Named rather than inlined so that
 [`the_directory_barrier_needs_exactly_the_access_it_asks_for`] can drive the
 same code path with a mask that is *not* enough and show which half refuses.
 
-## `fn windows_fsync_dir(dir: &Path, access: u32) -> std::io::Result<()> {`
+## `#[cfg(windows)]`
 
 [`fsync_dir`]'s Windows body, over any access mask.
 
-## `fn windows_fsync_dir(dir: &Path, access: u32) -> std::io::Result<()> {` › `let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();`
+## `let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();`
 
 `CreateFileW` takes a NUL-terminated UTF-16 string, and an interior NUL
 would silently truncate the path — so it is refused rather than trimmed.
@@ -405,12 +392,12 @@ Civil date from a day count since 1970-01-01 (Howard Hinnant's
 lands at the end of a cycle, which is what lets the month and day fall out
 of integer arithmetic instead of a lookup table.
 
-## `fn civil_from_days(days: i64) -> (i64, i64, i64)` › `let month = if shifted_month < 10 {`
+## `let month = if shifted_month < 10 {`
 
 March is month 0 in the shifted era; roll January and February into the
 following calendar year.
 
-## `pub(crate) fn same_path(left: &Path, right: &Path) -> bool {`
+## `#[cfg(test)]`
 
 Whether `left` and `right` name the same directory or file on disk.
 
@@ -440,41 +427,41 @@ A path that does not resolve is not the same object as one that does, so
 exactly one failure answers `false` — which keeps the negative form
 (`!same_path(…)`) honest for a workspace the run has already cleaned up.
 
-### Panics
+# Panics
 
 When *neither* side resolves. Nothing can be concluded from comparing two
 absent paths, and answering `false` there would be the same silent pass
 this helper exists to remove.
 
-## `fn tail_never_slices_mid_char_for_tiny_limits()` › `assert_eq!(tail("é", 1), "…");`
+## `assert_eq!(tail("é", 1), "…");`
 
 Cut lands inside the trailing multibyte char: keep nothing rather
 than panic on a non-boundary index.
 
-## `fn timestamps_are_rfc3339_utc()` › `assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");`
+## `assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");`
 
 Both leap rules: 2024 by the /4 rule, 2000 by the /400 exception.
 
-## `fn timestamps_are_rfc3339_utc()` › `assert_eq!(rfc3339_utc(86_399), "1970-01-01T23:59:59Z");`
+## `assert_eq!(rfc3339_utc(86_399), "1970-01-01T23:59:59Z");`
 
 A day boundary and the last second before one.
 
-## `fn timestamps_sort_chronologically_as_strings()` › `let mut stamps = [`
+## `let mut stamps = [`
 
 The log is read back with a plain string compare in places; the
 zero-padded fixed-width form is what makes that legitimate.
 
-## `fn probe_extensions_never_resolves_a_bare_relative_name()` › `let dir = std::env::temp_dir().join(format!("upstroke-util-path-{}", std::process::id()));`
+## `let dir = std::env::temp_dir().join(format!("upstroke-util-path-{}", std::process::id()));`
 
 The empty-PATH-segment guard in find_program rests on this: a bare
 name must not resolve against the process CWD. Verified by probing
 a file that exists in a scratch dir under its bare name.
 
-## `fn probe_extensions_never_resolves_a_bare_relative_name()` › `assert!(find_program("bait.txt").is_none());`
+## `assert!(find_program("bait.txt").is_none());`
 
 find_program must not consult any directory-less candidate.
 
-## `mod tests` › `fn same_path_compares_directories_rather_than_spellings() {`
+## `#[test]`
 
 Two spellings of one directory are one directory, and two directories
 are not.
@@ -487,7 +474,7 @@ this helper exists for cannot be built on demand anywhere else. It is
 the same mechanism either way: `canonicalize` resolves the path to the
 object, and the object is what the assertion means.
 
-## `mod tests` › `fn the_directory_barrier_runs_on_this_platform() {`
+## `#[test]`
 
 The directory barrier runs, and runs on **this** platform
 (`PR5-CONF-013`).
@@ -505,18 +492,18 @@ call — so this drives the primitive directly, and drives it against a
 directory that has just changed, which is the only state the barrier is
 ever asked about.
 
-## `fn the_directory_barrier_runs_on_this_platform()` › `let staged = root.join("record.tmp");`
+## `let staged = root.join("record.tmp");`
 
 A directory entry that was just created, then just renamed: the two
 changes `run_creation` asks to be made durable.
 
-## `fn the_directory_barrier_runs_on_this_platform()` › `let absent = fsync_dir(&root.join("absent"));`
+## `let absent = fsync_dir(&root.join("absent"));`
 
 A directory that is not there is an error rather than a silent
 success, so a caller cannot be told a name is durable when nothing
 was opened at all — which is exactly what the non-unix arm used to do.
 
-## `mod tests` › `fn the_directory_barrier_needs_exactly_the_access_it_asks_for() {`
+## `#[cfg(windows)]`
 
 The Windows access mask is the one the barrier actually needs, and a
 weaker one is refused (`PR5-CONF-013`).
