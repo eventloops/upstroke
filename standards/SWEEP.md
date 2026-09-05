@@ -134,6 +134,10 @@ takes the folds with the call sites they force. The findings are `reviews/FINDIN
 **Row 29 (`src/topology/fold/apply.rs`) remains open pending review of PR #152's
 complete repair.** All six legacy frontier verdicts were `CHANGES_REQUIRED`.
 The canonical PR ledger preserves each finding and the failed repair sequences.
+The independent review of `4975a0a` also returned `CHANGES_REQUIRED`: first-attempt
+continuation selection bypassed the lineage question rule. A separate fold
+eligibility reader now checks that continuation while recovery keeps its
+accounting accessor. Review of this correction is still pending.
 The owner expanded the repair scope to include the required checks and callers;
 the prior claim that those files were beyond this PR's reach is superseded.
 

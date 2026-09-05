@@ -99,10 +99,9 @@ impl TopologyFold {
     // more — each delegates to the private predicate it names and adds no
     // logic of its own.
     //
-    // Each returns the value that is true of a run which has not recorded its
-    // `run_started` yet, rather than an `Option`: no task of an unstarted run
-    // is ready, and such a run holds no entitlement. Those are statements, not
-    // defaults.
+    // An unstarted run offers no work: readiness predicates return false,
+    // and the continuation reader returns no generation. Such a run holds no
+    // entitlement either.
     //
     // **A poisoned fold authorises nothing.** `plan_transition` refuses with
     // `FoldError::Poisoned` once an append has returned an error, and INV-20
@@ -140,6 +139,24 @@ impl TopologyFold {
     #[must_use]
     pub fn ready_retry(&self, key: TaskKey) -> bool {
         !self.poisoned && self.run.as_ref().is_some_and(|run| run.ready_retry(key))
+    }
+
+    /// The open generation whose first attempt is structurally eligible.
+    ///
+    /// Unlike `open_no_attempt`, this authorizes selection. It returns `None`
+    /// for an unstarted, poisoned or ending run, an absent task or generation,
+    /// a generation that already started, or a lineage with an open question.
+    /// The generation already holds its pipeline entitlement, so continuation
+    /// does not require another free slot. Event-specific binding and
+    /// materialization facts are still checked when the attempt is recorded.
+    #[must_use]
+    pub(crate) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {
+        if self.poisoned {
+            return None;
+        }
+        self.run
+            .as_ref()
+            .and_then(|run| run.eligible_continuation(key))
     }
 
     /// The pipeline entitlement currently held, derived from the fold.
@@ -277,6 +294,8 @@ impl TopologyFold {
     /// consulted for the same reason the other statement accessors do not — a
     /// poisoned fold of a run with an open generation still has one, and `None`
     /// here would be a false statement rather than a refusal.
+    /// A lineage question likewise leaves the generation visible to recovery;
+    /// selection uses the separate continuation eligibility reader.
     #[must_use]
     pub fn open_no_attempt(&self, key: TaskKey) -> Option<GenerationId> {
         self.task(key)?

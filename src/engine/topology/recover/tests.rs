@@ -7005,7 +7005,8 @@ fn the_driver_spends_the_allowance_the_log_records() {
 /// pipeline entitlement held by a generation nothing could drive, and the loop
 /// fell through to a closure it refuses.
 ///
-/// `fold::open_no_attempt` is the predicate that makes it selectable, and
+/// `fold::open_no_attempt` identifies the generation for recovery. Selection
+/// now uses `fold::eligible_continuation` to check whether it may start, and
 /// `resume_open_no_attempt` — which had no production caller — is what reuses
 /// the ground.
 #[test]

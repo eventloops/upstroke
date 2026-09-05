@@ -269,7 +269,11 @@ embed a question while a sibling generation or verification is still active.
 
 An open question blocks new dispatch, attempt starts and integration throughout
 its lineage. Unrelated work stays eligible. Candidate selection and integration
-admission use the same question rule. `merge_prepared` checks again before
+admission use the same question rule. Selection of the first attempt in an
+already dispatched generation also applies that rule. The blocked generation
+keeps its existing pipeline entitlement and remains visible to recovery;
+answering the question can make its continuation eligible again without a new
+dispatch. `merge_prepared` checks again before
 authorizing publication because a sibling may have parked after verification
 started.
 

@@ -583,6 +583,106 @@ fn an_embedded_question_blocks_a_retained_siblings_retry_until_answered_or_decli
     }
 }
 
+fn open_continuation_prefix() -> (Trace, TopologyEvent) {
+    let mut trace = Trace::started();
+    trace.queue(ALPHA);
+    let mut rejection = reject_into_question(ALPHA, TaskKey(3), "unused");
+    if let TopologyEventBody::MergeRejected { data } = &mut rejection.body {
+        data.repair.admission = SpawnAdmission::Runnable;
+    }
+    trace.record(rejection);
+    trace.record(spawn_event(runnable_repair(TaskKey(4))));
+    assert!(trace.fold.ready(TaskKey(3)));
+    let mut dispatched = dispatch(TaskKey(3), 0, &sha("base"));
+    if let TopologyEventBody::TaskDispatched { data } = &mut dispatched.body {
+        data.lease = LeaseGrant::InheritedLineage { root: ALPHA };
+        data.source_candidate = Some(candidate_of(ALPHA, 0));
+    }
+    trace.record(dispatched);
+    assert!(trace.fold.ready(TaskKey(4)));
+    start_repair(&mut trace, TaskKey(4));
+    let mut continuation = attempt_started(&trace.fold, TaskKey(3), 0, 1, 0);
+    if let TopologyEventBody::AttemptStarted { data } = &mut continuation.body {
+        data.materialization_observed = Some(Materialization::Conflict);
+    }
+    accepts(&trace.fold, &continuation);
+    trace.replay();
+    (trace, continuation)
+}
+
+#[test]
+fn open_continuation_controls_before_and_after_a_lineage_answer() {
+    use crate::engine::topology::select::{Ceiling, Spend, Step, select};
+
+    let (mut trace, continuation) = open_continuation_prefix();
+    assert!(matches!(
+        select(&trace.fold, &Ceiling::unlimited(), &Spend::new()),
+        Step::Dispatch {
+            key: TaskKey(3),
+            generation: GenerationId(0),
+            continuing: true,
+        }
+    ));
+    trace.record(park_sibling());
+    refuse(&trace.fold, &continuation);
+    trace.replay();
+    trace.record(answer(TaskKey(4), "sibling"));
+    accepts(&trace.fold, &continuation);
+    assert!(matches!(
+        select(&trace.fold, &Ceiling::unlimited(), &Spend::new()),
+        Step::Dispatch {
+            key: TaskKey(3),
+            generation: GenerationId(0),
+            continuing: true,
+        }
+    ));
+    trace.record(continuation);
+    trace.replay();
+}
+
+#[test]
+fn an_open_continuation_waits_for_its_lineage_question() {
+    use crate::engine::topology::select::{Ceiling, Spend, Step, select};
+
+    let (mut trace, continuation) = open_continuation_prefix();
+    trace.record(park_sibling());
+    refuse(&trace.fold, &continuation);
+    trace.replay();
+    assert_eq!(
+        trace.fold.open_no_attempt(TaskKey(3)),
+        Some(GenerationId(0)),
+        "recovery must still see the generation while its attempt is blocked"
+    );
+    let selected = select(&trace.fold, &Ceiling::unlimited(), &Spend::new());
+    assert!(
+        matches!(selected, Step::HardBlock { .. }),
+        "the unanswered lineage question refuses this attempt, but selection returned {selected:?}"
+    );
+}
+
+#[test]
+fn an_open_continuation_remains_eligible_with_an_unrelated_question() {
+    use crate::engine::topology::select::{Ceiling, Spend, Step, select};
+
+    let mut trace = Trace::wide_started();
+    assert!(trace.fold.ready(ZETA));
+    trace.record(dispatch(ZETA, 0, &sha("base")));
+    trace.record(raised("unrelated", ALPHA));
+    let continuation = attempt_started(&trace.fold, ZETA, 0, 1, 0);
+    accepts(&trace.fold, &continuation);
+    assert!(matches!(
+        select(&trace.fold, &Ceiling::unlimited(), &Spend::new()),
+        Step::Dispatch {
+            key: ZETA,
+            generation: GenerationId(0),
+            continuing: true,
+        }
+    ));
+    trace.replay();
+    trace.record(continuation);
+    trace.replay();
+}
+
 #[test]
 fn declining_one_of_two_embedded_questions_closes_the_whole_lineages_questions() {
     let mut trace = sibling_attempts();

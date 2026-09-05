@@ -26,7 +26,9 @@
 //! [`crate::topology::fold::TopologyFold`] exposes `ready`, `ready_retry`,
 //! `pipeline_reservable`, `structurally_admissible` and
 //! `integration_admissible`, and every one of them is false once the fold is
-//! poisoned. It exposes `run_is_ending`, `backoff_pending` and
+//! poisoned. Its `eligible_continuation` reader returns no generation once
+//! poisoned, and excludes lineages with unanswered questions. It exposes
+//! `run_is_ending`, `backoff_pending` and
 //! `questions_open` beside them — statements about the run rather than
 //! authorisations, which is why those three survive a poisoning and why
 //! `derived_outcome` reads the same three. Nothing here re-derives any of
@@ -392,16 +394,12 @@ pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {
     // **proceeds to closure**", and a halted run is the same shape one cause
     // over. `run_is_ending()` is `halted_at.is_some() || budget_stop_is_current()`.
     //
-    // **One guard, at the top, rather than one per arm** — and that placement is
-    // the repair rather than an implementation detail. Three of the eligibility
-    // predicates already embed `!run_is_ending()` inside themselves
-    // (`ready`, `ready_retry`, `integration_admissible`) and the fourth,
-    // `open_no_attempt`, does not: it is a *statement* accessor whose doc
-    // correctly declines to consult run state, and recovery step (g) depends on
-    // that — (g) runs before `run_resumed` increments the epoch, so a
-    // budget-stopped run whose reader refused would silently skip rebuilding its
-    // worktrees. Patching the one arm would leave the next arm to be written in
-    // the same position as `open_no_attempt` was.
+    // The fold's eligibility readers also refuse ending runs, including the
+    // continuation reader. This top guard keeps closure ahead of every branch,
+    // including the question branch, whose accounting reader survives a stop.
+    // Continuation originally used `open_no_attempt` directly. Recovery still
+    // needs that accounting accessor before `run_resumed`, when a budget stop
+    // must not hide the worktrees it needs to rebuild.
     //
     // Found by round 3's `loop` lens, measured end to end: five consecutive
     // `step()` calls each returned `Progress::BudgetExceeded` and appended a
@@ -559,7 +557,9 @@ fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, Atte
     })
 }
 
-/// The lowest-keyed `ready` task and the generation its dispatch opens.
+/// The lowest-keyed eligible continuation or fresh dispatch.
+/// No selection if no registered task can continue or open a representable
+/// generation; a missing task has no dispatch to offer.
 fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {
     keys(fold).find_map(|key| {
         // **A continuation first, and it cannot compete with a fresh dispatch.**
@@ -575,7 +575,7 @@ fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {
         // and a continuation is not a *new* dispatch. Reported as a candidate
         // erratum rather than chosen here: at a wider pipeline the two can
         // coexist and the packet will have to say which wins.
-        if let Some(generation) = fold.open_no_attempt(key) {
+        if let Some(generation) = fold.eligible_continuation(key) {
             return Some((key, generation, true));
         }
         if !fold.ready(key) {
@@ -584,7 +584,10 @@ fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {
         // refusals[10]: generations are dense per task, so the next one is the
         // count of the ones recorded.
         let task = fold.task(key)?;
-        let generation = u32::try_from(task.generations.len()).ok()?;
+        let Ok(generation) = u32::try_from(task.generations.len()) else {
+            // This task cannot name another generation in the event format.
+            return None;
+        };
         Some((key, GenerationId(generation), false))
     })
 }

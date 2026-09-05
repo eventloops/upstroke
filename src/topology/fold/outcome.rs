@@ -119,6 +119,19 @@ impl RunState {
             && !self.run_is_ending()
     }
 
+    /// No eligible continuation when the run is ending, its lineage is
+    /// waiting on a question, or the task has no generation awaiting attempt 1.
+    pub(super) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {
+        if self.run_is_ending() || self.lineage_has_question(key) {
+            return None;
+        }
+        self.tasks
+            .get(key.index())
+            .and_then(TaskFold::open)
+            .filter(|generation| generation.class == GenerationClass::OpenNoAttempt)
+            .map(|generation| generation.id)
+    }
+
     pub(super) fn pipeline_reservable(&self) -> bool {
         self.pipeline_held()
             < usize::try_from(self.started.limits.max_parallel).unwrap_or(usize::MAX)
