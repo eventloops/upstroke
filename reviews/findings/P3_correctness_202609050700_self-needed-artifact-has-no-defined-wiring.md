@@ -36,7 +36,8 @@ input the adapter accepts:
 <!-- upstroke: id=d2 depends= out=contract -->
 ```
 
-Here `d2` produces `contract` first and `d1` updates it, a valid order; but `plan.artifacts` holds
+Here `d2` declares `contract` and `d1`, which depends on it, needs and declares it too — accepted input
+whose meaning `design/09` leaves undefined (an update, a conflict, an error); but `plan.artifacts` holds
 one producer per artifact and the adapter records the first declaration (`d1`), keeping `d2`'s only
 in `d2.artifacts_out` (`SWEEP-GRAPH-009`). From the recorded producer alone the two plans are
 indistinguishable, so the check cannot warn on the first without lying on the second. The graph
@@ -44,7 +45,7 @@ check *could* scan `plan.tasks[*].artifacts_out` for other producers, but what a
 means is undefined in `design/09`, and a check that guesses the meaning is the shape pass 1
 refused. Pinned at the head by
 `a_task_that_needs_what_it_is_recorded_as_producing_is_not_warned_about` and
-`a_task_updating_what_an_earlier_producer_made_is_not_warned_about_through_the_adapter`, which
+`a_task_needing_and_declaring_what_an_earlier_task_also_declares_is_not_warned_about_through_the_adapter`, which
 would both fail on a warning.
 
 ## What the change that takes this up should do
