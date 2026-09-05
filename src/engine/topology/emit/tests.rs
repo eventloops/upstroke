@@ -2320,8 +2320,9 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// recycled — collided on a path; a fixture that resolved the collision by
 /// removing what it found deleted a tree it had no claim on.
 ///
-/// Both halves are measured. **Distinct roots**: a cached or otherwise
-/// predictable root fails `assert_ne!`. **Nothing pre-cleaned**: the first tree
+/// Both halves are measured. **Distinct roots**: a cached root fails
+/// `assert_ne!`; two draws in one process differ by nonce, which is
+/// distinctness and not unpredictability (PR #149). **Nothing pre-cleaned**: the first tree
 /// is still live and still populated when the second acquisition runs, so a
 /// removal that made room for the second would take the first's run directories
 /// with it, and every later assertion here would fail.

@@ -4,29 +4,41 @@ severity: P3
 disposition: accepted-risk
 category: correctness
 pr: 149
-reviewed_sha: 86369700d519aef8918fdb25be40695840da89e5
-location: src/engine/topology/settle/tests.rs:1569
+reviewed_sha: 8a24eba08afff4b94b27af7fe4b59cf23695de30
+location: src/engine/topology/settle/tests.rs:1557
 provenance: introduced_by_feature
 first_bad: 54ef9d5
-guard: `scratch` in src/engine/topology/settle/tests.rs; a later pass labelling this P1 or P2 escalates to the owner, because the remedy would be a retry in the fixture or a change to `crate::ulid`, and the second is outside every session's reach
+guard: `scratch_with` in src/engine/topology/settle/tests.rs draws again on `Occupied` up to `SCRATCH_DRAWS`; a later pass labelling this P1 or P2 escalates to the owner, because the remedy past the bound is a different seed in `crate::ulid`, which is outside every session's reach
 ---
 
 ## Failure sequence
 
 `scratch(label)` in the settle kill tests acquires `%TEMP%\upstroke-scratch-pr7h-<label>-<ULID>`
-through `rundir::scratch_tree::acquire`, one exclusive `create_dir`. The ULID is not unpredictable:
+through `rundir::scratch_tree::acquire`, one exclusive `create_dir`, and draws again on `Occupied`
+up to `SCRATCH_DRAWS` (3) times. The ULID is not unpredictable and not unique across processes:
 `crate::ulid` is a millisecond timestamp and eighty bits of `splitmix64` seeded as
-`now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, nothing cryptographic. A launcher that knows the
-pid it is about to `exec` the harness with and the nonce of the fixture's first draw can compute
-the names of a future millisecond window, precreate them, and `exec` the harness into that window:
-`create_dir` returns `AlreadyExists`, `acquire` returns `Occupied`, and `scratch(...).expect(...)`
-panics before the settlement is tested — a red that names the root and is unrelated to the product.
+`now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, nothing cryptographic.
 
-Reproduced on Linux, 2026-09-05, at `8636970`'s harness: a Python mirror of `crate::ulid`'s
-construction reproduces the harness's first draw exactly (in a PID namespace the harness is pid 4
-and the fixture's first draw is nonce 0: `ulid(1788573379703, 4, 0)` is the observed
-`01M1QMFV3Q21R096DW2XZXBSDA`). Precreating `upstroke-scratch-pr7h-reclaimed-<ULID(ms, 4, 0)>` for
-every millisecond of a five-second window (5,001 names) and `exec`ing the witness into the window:
+**Unarranged.** Two live harnesses draw one name when they draw the same tag in one millisecond
+with seeds that coincide, which needs `pid_a ^ pid_b == (nonce_a ^ nonce_b) << 15` — so a nonce
+of at least 2^15 in one of the two, the nonce being the per-process count of ULIDs minted so far.
+`(pid 100, nonce 32768)` and `(pid 101, nonce 0)` is the smallest such pair. The first draw is
+refused; the retry draws again at the next nonce, which meets the same partner only if it too drew
+again in the same millisecond at the matching nonce. Past three draws the fixture panics naming
+every refused root. Whether a full harness reaches nonce 2^15 at all: @@NONCE@@
+
+**Arranged.** A launcher that knows the pid it is about to `exec` the harness with and the nonce
+of the fixture's first draw computes the names of a future millisecond window for the nonces the
+retry will draw, precreates them, and `exec`s the harness into the window: every draw is
+`Occupied`, and the fixture panics before the settlement is tested — a red that names each root
+and is unrelated to the product.
+
+Reproduced on Linux, 2026-09-05, at `8636970`'s harness (before the retry): a Python mirror of
+`crate::ulid`'s construction reproduces the harness's first draw exactly (in a PID namespace the
+harness is pid 4 and the fixture's first draw is nonce 0: `ulid(1788573379703, 4, 0)` is the
+observed `01M1QMFV3Q21R096DW2XZXBSDA`). Precreating
+`upstroke-scratch-pr7h-reclaimed-<ULID(ms, 4, 0)>` for every millisecond of a five-second window
+(5,001 names) and `exec`ing the witness into the window:
 
 ```
 test engine::topology::settle::tests::a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops ... FAILED
@@ -34,37 +46,30 @@ thread '...' (5) panicked at src/engine/topology/settle/tests.rs:1570:76:
 a scratch tree: Occupied { root: ".../upstroke-scratch-pr7h-reclaimed-01M1QMTYV2C73CF2J59HX1WYHM" }
 ```
 
-The same window computed for nonce 1 instead: `ok`. The red names the root and the refusal; it
-never reads a leftover's content and never adopts a neighbour's directory.
+The same window computed for nonce 1 instead: `ok`. Against the retry, at the head this finding
+was recorded at: @@K2RETRY@@
 
-## Why it is accepted rather than fixed
+## Why the residual is accepted rather than fixed
 
-The refusal needs the arranged name, and the argument for that is not a platform's. **The ULID's
-first component is the absolute epoch millisecond of the draw, so a directory left by any earlier
-run carries an earlier millisecond and cannot be redrawn — on any platform, whatever the pid,
-however the operating system recycles pids, and whether or not the winguest image carries
-leftovers.** The pid-keyed fixture this replaced collided across runs *because* its name had no
-time in it; this one's name has the time in it first. The one cross-run path left is a clock that
-revisits a past millisecond with the same pid and nonce; the CI guest takes its clock from the
-host. Within a run, two draws differ by nonce; across two live harnesses, a collision needs one
-millisecond and one of the seed-equal pid-and-nonce pairs.
+The retry closes the unarranged case to the depth of coincidence it can reach: a second draw meets
+the same partner only through a second same-millisecond, seed-equal draw, and the bound reports
+rather than spins. What remains is a launcher that precreates every nonce the retry will draw, or a
+coincidence three deep, and either is a red that names its own cause — the pid-keyed fixture this
+replaced reused a leftover silently and failed two layers away. Closing it entirely means a
+different seed in `crate::ulid`, which is a production change outside this pull request and every
+sweep session; the production consequence of the same arithmetic is recorded separately as
+`PR149-ULID-SEED-COLLIDES-ACROSS-CONCURRENT-PROCESSES`.
 
-A Linux check that the implementation matches the argument, not the argument itself: with the pid
-pinned by a PID namespace and the nonce sequence identical run to run, the millisecond was the only
-input that moved, and 100 serial runs of the witness and both kill tests drew 300 roots with 300
-distinct names, 100 distinct milliseconds per label, and 0 refusals, `strace` at the exclusive
-`mkdir` recording every draw. A leftover of this family is only an aborted parent's — the guard
-reclaims on return and on unwind.
-
-A bounded retry on `Occupied` would guard the arranged case only. It cannot be witnessed from this
-file — the name's parts are the process's own and `acquire_named` is private — and the arranged
-case is a red that says what happened, which is the shape a refusal should have. The pid-keyed
-fixture this replaced reused a leftover silently and failed two layers away; the trade is a silent
-false result for a loud, arrangeable one.
+What this family leaves behind, which is the population a collision needs: a tree whose parent
+aborted and ran no `Drop`, or a tree whose removal the filesystem refused — on the normal path
+that refusal is a panic and the tree stays, while unwinding it is reported and the tree stays. A
+leftover can be drawn again only by a process at the same pid and nonce in the millisecond it was
+made in, which is a clock revisit; between two *live* processes the millisecond is not the only
+input that moves, and the arithmetic above is the whole condition.
 
 ## What the change that takes this up should do
 
-If a later pass labels this P1 or P2, escalate to the owner rather than re-defer: the remedy is
-either a retry in the fixture, which would be added machinery guarding a case no run reaches on
-its own, or a different ULID seed in `crate::ulid`, which no sweep session may change. Whoever
-takes it up should first re-run the pinned-pid measurement above against the head of the day.
+If a later pass labels this P1 or P2, escalate to the owner rather than re-defer. The fixture's
+side is bounded and witnessed (`an_occupied_draw_is_drawn_again`,
+`the_draws_are_bounded_and_every_refused_root_is_named`,
+`an_undecidable_refusal_is_not_drawn_again`); what is left is the seed.

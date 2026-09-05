@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -14,7 +15,7 @@ use crate::ir::{
 use crate::ladder::Next;
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::review::{PassBinding, ReviewPlan};
-use crate::rundir::scratch_tree::{self, ScratchTree};
+use crate::rundir::scratch_tree::{self, ScratchAcquireRefusal, ScratchTree};
 use crate::rundir::{self, RunPaths};
 use crate::runner::host::{HostEnvironment, HostRunner, KeyCase};
 use crate::runner::{CommandSpec, Runner, gate_request};
@@ -1533,6 +1534,23 @@ fn only_a_retained_generation_is_retried_in_place() {
 // on disk*. An early `return` would unwind and prove something weaker.
 // =======================================================================
 
+/// How a scratch tree is acquired: [`scratch_tree::acquire`] in every test,
+/// and a double in the witnesses of [`scratch_with`]'s own policy.
+type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;
+
+/// How many names [`scratch_with`] draws before it gives up.
+///
+/// Two live harnesses draw one name when they draw in one millisecond with
+/// seeds that coincide, which `crate::ulid`'s construction allows: a seed is
+/// `now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, so pids 100 and 101 at
+/// nonces 32768 and 0 seed identically, and in general the pids' XOR must
+/// equal the nonces' XOR shifted left by fifteen, which needs a nonce of at
+/// least 2^15 in one of the two. Each draw advances this process's nonce, so
+/// a second draw meets the same partner only if the partner drew again in
+/// the same millisecond at the matching nonce; three draws is two such
+/// coincidences deep, and past it the refusal names every root it met.
+const SCRATCH_DRAWS: u32 = 3;
+
 /// A scratch tree for one kill test: [`scratch_tree::acquire`]'s exclusive,
 /// ULID-named root, reclaimed when the guard drops.
 ///
@@ -1549,32 +1567,134 @@ fn only_a_retained_generation_is_retried_in_place() {
 /// replays` expectations, with every earlier assertion passing.
 ///
 /// What the allocator guarantees, and what it does not. The root is created
-/// with one exclusive `create_dir`, so a leftover is never **reused**: a
-/// name that is already there is refused, and the refusal is a panic naming
-/// the root, never a second run appended to a dead child's log. The name is
-/// a tag and a ULID, and the ULID is not unguessable: it is a millisecond
-/// timestamp and eighty bits from a `splitmix64` stream seeded by that
-/// timestamp, the pid and a per-process nonce, so two harnesses can draw one
-/// name in one millisecond for particular pid-and-nonce pairs, and a dead
-/// harness's name can recur after a clock rollback with the same pid and
-/// nonce. Either is an `Occupied` refusal and a red that names the root.
-/// The name is not unpredictable: anything that knows the clock, the pid
-/// and the nonce can compute it, and a launcher that precreates the names
-/// of a future millisecond window arranges that refusal at will. This
-/// fixture does not draw again on it. Without such a launcher no run
-/// reaches it — the same pid and nonce draw a new name every millisecond,
-/// and the clock does not revisit one — so a retry would guard only the
-/// arranged case, which is a red that says what happened; PR #149's
-/// finding file records the measurement. And the guard reclaims the tree on
-/// return and
-/// on unwind: the **child** still dies without cleanup, which is the claim
-/// the kill tests make, and the **parent** removes what it left once the
-/// assertions have read it. A removal the filesystem refuses during an
-/// unwind is reported and the tree leaks, and a parent that aborts runs no
-/// `Drop` at all, so "reclaimed" is the normal path's word and not every
-/// path's.
+/// with one exclusive `create_dir`, so a leftover is never **reused** and a
+/// neighbour's tree is never **adopted**: a name that is already there is
+/// refused. The name is a tag and a ULID, and the ULID is not unpredictable
+/// and not unique across processes: it is a millisecond timestamp and
+/// eighty bits from a `splitmix64` stream seeded by that timestamp, the pid
+/// and a per-process nonce, so two harnesses can draw one name in one
+/// millisecond for seed-equal pid-and-nonce pairs ([`SCRATCH_DRAWS`] gives
+/// the arithmetic), a dead harness's name can recur after a clock rollback
+/// with the same pid and nonce, and a launcher that computes the names of a
+/// future window arranges a refusal at will. [`scratch_with`] draws again
+/// on `Occupied`, up to [`SCRATCH_DRAWS`] times, and never on
+/// `Undecidable`, which is not a collision.
+///
+/// The guard reclaims the tree on return and on unwind: the **child** still
+/// dies without cleanup, which is the claim the kill tests make, and the
+/// **parent** removes what it left once the assertions have read it. What
+/// this family leaves behind is an aborted parent's tree, which ran no
+/// `Drop`, or a tree whose removal the filesystem refused — a panic on the
+/// normal path, a report while unwinding, and the tree stays either way.
 fn scratch(label: &str) -> ScratchTree {
-    scratch_tree::acquire(&std::env::temp_dir(), &format!("pr7h-{label}")).expect("a scratch tree")
+    scratch_with(scratch_tree::acquire, label)
+}
+
+/// [`scratch`] over an injectable acquisition, which is what lets the
+/// policy below be witnessed without arranging a real collision: the double
+/// supplies the refusal, and the assertion is about what this function does
+/// with it. The real refusal is the allocator's, witnessed where it lives
+/// and by the launcher reproduction PR #149 records.
+fn scratch_with(acquire: Acquire, label: &str) -> ScratchTree {
+    let parent = std::env::temp_dir();
+    let tag = format!("pr7h-{label}");
+    let mut occupied = Vec::new();
+    for _ in 0..SCRATCH_DRAWS {
+        match acquire(&parent, &tag) {
+            Ok(tree) => return tree,
+            Err(refusal @ ScratchAcquireRefusal::Occupied { .. }) => occupied.push(refusal),
+            Err(refusal) => panic!("a scratch tree for `{label}`: {refusal:?}"),
+        }
+    }
+    panic!("a scratch tree for `{label}`: {SCRATCH_DRAWS} draws refused as occupied: {occupied:?}");
+}
+
+/// The payload of a caught panic, as a string.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Whether [`refuse_once_then_acquire`] has refused yet.
+static REFUSED_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// An acquisition that answers `Occupied` to its first call and is the real
+/// allocator after that.
+fn refuse_once_then_acquire(
+    parent: &Path,
+    tag: &str,
+) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    if REFUSED_ONCE.swap(true, Ordering::SeqCst) {
+        scratch_tree::acquire(parent, tag)
+    } else {
+        Err(ScratchAcquireRefusal::Occupied {
+            root: parent.join(tag),
+        })
+    }
+}
+
+/// An acquisition that answers `Occupied` to every call.
+fn always_occupied(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    Err(ScratchAcquireRefusal::Occupied {
+        root: parent.join(tag),
+    })
+}
+
+/// An acquisition whose answer is not a collision.
+fn undecidable(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    Err(ScratchAcquireRefusal::Undecidable {
+        root: parent.join(tag),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    })
+}
+
+/// An occupied name is drawn again, and the second draw is a live tree.
+#[test]
+fn an_occupied_draw_is_drawn_again() {
+    REFUSED_ONCE.store(false, Ordering::SeqCst);
+    let tree = scratch_with(refuse_once_then_acquire, "drawn-again");
+    assert!(
+        REFUSED_ONCE.load(Ordering::SeqCst),
+        "the double never refused"
+    );
+    assert!(
+        tree.path().is_dir(),
+        "the second draw is not a tree: {}",
+        tree.path().display()
+    );
+}
+
+/// The draws are bounded, and the refusal past the bound names every root
+/// it met — so a collision that is not a coincidence reads as what it is.
+#[test]
+fn the_draws_are_bounded_and_every_refused_root_is_named() {
+    let outcome = std::panic::catch_unwind(|| scratch_with(always_occupied, "bounded"));
+    let message = panic_message(&outcome.expect_err("every draw was refused"));
+    assert!(
+        message.contains("3 draws refused as occupied"),
+        "the bound is not reported: {message}"
+    );
+    assert_eq!(
+        message.matches("pr7h-bounded").count(),
+        3,
+        "not every refused root is named: {message}"
+    );
+}
+
+/// `Undecidable` is not a collision and is not drawn again.
+#[test]
+fn an_undecidable_refusal_is_not_drawn_again() {
+    let outcome = std::panic::catch_unwind(|| scratch_with(undecidable, "undecidable"));
+    let message = panic_message(&outcome.expect_err("the refusal is raised"));
+    assert!(message.contains("Undecidable"), "{message}");
+    assert!(
+        !message.contains("draws refused"),
+        "an undecidable answer was drawn again: {message}"
+    );
 }
 
 /// The fixture hands back the guard, and the guard reclaims: nothing is at

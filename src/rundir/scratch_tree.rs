@@ -230,11 +230,19 @@ fn report_to_stderr(message: &str) -> io::Result<()> {
 /// therefore decided by the kernel's own exclusive create rather than by a
 /// stat this code could lose a race to, and every other answer refuses.
 ///
-/// **No predictable root.** The name carries `tag` so that a human reading
-/// a leftover tree can tell what left it, and a fresh ULID because a tag is
-/// not enough: two processes, or two runs of one process, collide on a
-/// tag-and-pid name, and colliding on a path somebody else is using is
-/// precisely what made the old pre-clean destructive.
+/// **No shared root, and no adopted one.** The name carries `tag` so that a
+/// human reading a leftover tree can tell what left it, and a fresh ULID
+/// because a tag is not enough: two processes, or two runs of one process,
+/// collide on a tag-and-pid name, and colliding on a path somebody else is
+/// using is precisely what made the old pre-clean destructive. The ULID is
+/// distinct against this process's own draws and, by its millisecond,
+/// against every earlier run's; it is **not unpredictable**, and not unique
+/// across processes: `crate::ulid` is arithmetic over the clock, the pid
+/// and a per-process nonce, so two processes can draw one value in one
+/// millisecond for seed-equal pid-and-nonce pairs, and anything that knows
+/// those three can compute the next name (PR #149 measured both). What the
+/// exclusive create guarantees is that a shared name is refused, never
+/// adopted.
 ///
 /// # Errors
 ///
@@ -253,7 +261,7 @@ pub(crate) fn acquire(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAc
 /// **Private to this module, deliberately.** A caller that chose the name
 /// could choose one somebody else owns, which is the whole hazard the ULID
 /// closes; the crate's tests reach only [`acquire`]. It exists because the
-/// one shape a fresh ULID makes unreachable is the shape the occupied-root
+/// one shape a fresh ULID makes unreachable from inside this process is the shape the occupied-root
 /// witness has to arrange — a root that is already there.
 fn acquire_named(parent: &Path, name: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
     let root = parent.join(name);
