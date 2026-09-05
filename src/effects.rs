@@ -1072,6 +1072,9 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // memo, `windows_job` and `termination` stayed in `src/agent/proc.rs`.
     "src/agent/proc/ambient.rs",
     "src/agent/proc/drain.rs",
+    "src/agent/proc/input.rs",
+    "src/agent/proc/pipe_io.rs",
+    "src/agent/proc/worker.rs",
     "src/agent/proc/hooks.rs",
     "src/agent/bin.rs",
     "src/agent/claude.rs",

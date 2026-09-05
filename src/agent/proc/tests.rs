@@ -19,8 +19,9 @@
     clippy::disallowed_macros
 )]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::mpsc;
 
 // Reached through `use super::*;` while `apply` lived in the parent; the split
@@ -505,6 +506,54 @@ fn stdin_reaches_the_child() {
     let out = run_with_timeout(shell(script), "ping pong\n", Duration::from_secs(30))
         .expect("spawn shell");
     assert!(out.stdout.contains("ping"), "stdout: {}", out.stdout);
+}
+
+#[test]
+fn a_child_can_exit_without_consuming_its_input() {
+    let input = "x".repeat(1 << 20);
+    let out = run_with_timeout(shell("exit 0"), &input, Duration::from_secs(30))
+        .expect("the child may decline the remaining input");
+    assert_eq!(out.code, Some(0));
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn nonblocking_pipe_large_input_helper() {
+    if std::env::var_os("UPSTROKE_NONBLOCKING_INPUT_HELPER").is_none() {
+        return;
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .expect("read through stdin EOF");
+    assert_eq!(bytes.len(), 1024 * 1024);
+    assert!(bytes.iter().all(|byte| *byte == b'x'));
+    std::io::stdout()
+        .write_all(&bytes)
+        .expect("echo the complete large input");
+    std::io::stdout().flush().expect("flush echoed input");
+}
+
+#[test]
+fn nonblocking_pipes_deliver_input_larger_than_pipe_capacity() {
+    let input = "x".repeat(1024 * 1024);
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args([
+            "agent::proc::tests::nonblocking_pipe_large_input_helper",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("UPSTROKE_NONBLOCKING_INPUT_HELPER", "1");
+    let output = run_with_timeout(command, &input, Duration::from_secs(30))
+        .expect("nonblocking pipe supervision");
+    assert_eq!(output.code, Some(0), "{}", output.stderr);
+    assert!(!output.timed_out && !output.output_limited);
+    assert!(
+        output.stdout.contains(&input),
+        "every input byte reached the reading child and returned"
+    );
 }
 
 #[test]

@@ -216,6 +216,19 @@ The Process supervision primitives. Spawn enters through an API taking \
 combined funnel."""
 
 [[funnel]]
+path = "src/agent/proc/pipe_io.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
+packet = "effect_site_inventory.mechanism (2), by attachment to the private Process funnel in src/agent/proc.rs"
+review = """
+Private parent-side pipe preparation and nonblocking I/O for the Process funnel. \
+The methods allowance covers the Unix owned-file write; the types allowance \
+covers Command configuration. Reader and Writer cannot leave the private proc \
+module. Spawn remains in the existing site-taking Process API. Windows creates \
+synchronous anonymous pipe pairs and uses the same owned endpoint boundary. \
+No file or process handle is returned outside the combined funnel. The module \
+denies governed macros instead of inheriting the parent's allowance."""
+
+[[funnel]]
 path = "src/agent/proc/tests.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
 packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/agent/proc.rs"
