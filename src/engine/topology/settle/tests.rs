@@ -1557,9 +1557,16 @@ fn only_a_retained_generation_is_retried_in_place() {
 /// timestamp, the pid and a per-process nonce, so two harnesses can draw one
 /// name in one millisecond for particular pid-and-nonce pairs, and a dead
 /// harness's name can recur after a clock rollback with the same pid and
-/// nonce. Either is an `Occupied` refusal and a red that says so; this
-/// fixture does not draw again, because a refusal it cannot arrange is a
-/// refusal it cannot witness. And the guard reclaims the tree on return and
+/// nonce. Either is an `Occupied` refusal and a red that names the root.
+/// The name is not unpredictable: anything that knows the clock, the pid
+/// and the nonce can compute it, and a launcher that precreates the names
+/// of a future millisecond window arranges that refusal at will. This
+/// fixture does not draw again on it. Without such a launcher no run
+/// reaches it — the same pid and nonce draw a new name every millisecond,
+/// and the clock does not revisit one — so a retry would guard only the
+/// arranged case, which is a red that says what happened; PR #149's
+/// finding file records the measurement. And the guard reclaims the tree on
+/// return and
 /// on unwind: the **child** still dies without cleanup, which is the claim
 /// the kill tests make, and the **parent** removes what it left once the
 /// assertions have read it. A removal the filesystem refuses during an
