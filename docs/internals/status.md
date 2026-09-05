@@ -78,7 +78,7 @@ one, which is the root a read-only command is configured with.
 
 Load a run: the newest one, or any unambiguous id prefix.
 
-## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Resu…` › `Err(error) => return Err(husk_answer(repo_root, wanted).unwrap_or(error)),`
+## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, UpstrokeError> {` › `Err(error) => return Err(husk_answer(repo_root, wanted).unwrap_or(error)),`
 
 `startup_census`: "status is read-only: it ignores husks and,
 asked explicitly for a husk id, reports an unstarted husk that
@@ -86,7 +86,7 @@ the next write command reclaims, a retained husk with its reason
 and locator, or a possibly committed run whose public log has no
 valid committed first line".
 
-## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Resu…` › `let running = held && replayed.state.finished.is_none();`
+## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, UpstrokeError> {` › `let running = held && replayed.state.finished.is_none();`
 
 Two questions, not one. The lock says whether a process has claimed this
 run; the log says whether the run still has anywhere to go. `running`
@@ -97,7 +97,7 @@ alone made those seconds render as `run in progress`, dropping the stop
 reason, the parked list, and the `resume --budget` line the operator is
 there to find.
 
-## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Resu…` › `let interrupted = if running {`
+## `pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, UpstrokeError> {` › `let interrupted = if running {`
 
 Settled in memory only: status is a pure read and must not write to a
 run it is merely looking at. A resume records the same settlement as
@@ -124,6 +124,8 @@ Delegates to the private `render` child, beside the view it belongs with:
 both turn a fold of the log into text and neither touches anything.
 
 ## `pub fn follow(`
+
+The source retains the lock and resume ordering protocol required by §10.
 
 Stream a run's events, from the beginning and then as they arrive.
 
@@ -159,6 +161,8 @@ for the marker rather than treating historical terminal state as the
 current process's result.
 
 ## `fn stable_event_bytes_with(`
+
+The source retains the sampling protocol required by §10.
 
 Pair event bytes with a stable liveness observation. A dead snapshot is
 trusted only after an identical second read and a second dead probe; this

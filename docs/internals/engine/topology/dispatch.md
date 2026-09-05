@@ -135,7 +135,7 @@ makes the crossing unrepresentable instead of refused one layer later.
 An ordinary task, taking a predicted lease over the region its plan
 hints imply.
 
-## `pub enum DispatchKind` › `paths: PathSet,`
+## `pub enum DispatchKind` › `paths: PathSet`
 
 The predicted region.
 
@@ -148,7 +148,7 @@ candidate that was rejected.
 
 The lineage root whose lease this generation executes inside.
 
-## `pub enum DispatchKind` › `source: CandidateRef,`
+## `pub enum DispatchKind` › `source: CandidateRef`
 
 The protected candidate the worktree is materialized from.
 
@@ -470,7 +470,7 @@ It did not, and was removed with force and rebuilt. Carries the failure
 so a caller — and a test — can say *why* it was not reusable, rather
 than only that it was not.
 
-## `pub enum Reuse` › `failure: VerifyFailure,`
+## `pub enum Reuse` › `failure: VerifyFailure`
 
 What `Worktree.Verify` refused it for.
 

@@ -91,6 +91,9 @@ pub fn answer_path(dir: &Path, id: &QuestionId) -> PathBuf {
     dir.join(format!("{}.json", util::filename_component(id.as_str())))
 }
 
+// The answer writer stages complete JSON before publishing it by rename; engine
+// readers may poll concurrently and must never see a partial payload. Failed
+// staging or publication can leave writer-owned .partial residue, which readers ignore.
 pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), UpstrokeError> {
     let component = util::filename_component(id.as_str());
     let hooks = &mut crate::rundir::NoHooks;

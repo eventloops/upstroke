@@ -505,6 +505,9 @@ impl AttemptContext<'_> {
         self.discard_residue(dispatched)
     }
 
+    // Called between synchronous Runner invocations, after their children exit.
+    // This context cancels remaining registrations and releases the held slot pair
+    // before appending the terminal event and reclaiming the attempt's residue.
     pub fn cancel_in_flight(
         &mut self,
         dispatched: &Dispatched,
@@ -528,6 +531,11 @@ impl AttemptContext<'_> {
         dispatch::scrub(self.manager, self.hooks, &dispatched.slot)
     }
 
+    // This sequential context owns the invocation ledger and slot assertion.
+    // Register before acquiring the atomic agent/pool pair; a refused acquisition
+    // cancels that registration. Runner::run returns before the pair is released,
+    // then each registered invocation is completed or cancelled exactly once.
+    // Keep settlement here so a run_registered error cannot leave a Running entry.
     fn execute(
         &mut self,
         request: &RunnerRequest,

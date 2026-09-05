@@ -751,12 +751,12 @@ ever justified.
 The integration ref is absent because it lives under `refs/heads/`, outside
 this namespace.
 
-## `pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> …` › `expected.push(names.candidate_ref.0);`
+## `pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {` › `expected.push(names.candidate_ref.0);`
 
 Created after `candidate_prepared` is durable, and never
 pruned while the run can resume.
 
-## `pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> …` › `expected.push(names.prepared_ref.0);`
+## `pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {` › `expected.push(names.prepared_ref.0);`
 
 Written before any record of it, and pruned after promotion or
 as an orphan.

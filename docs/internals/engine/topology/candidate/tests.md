@@ -89,7 +89,7 @@ content no gate ran against. Built by staging a second blob before
 writing the tree, so the difference is real rather than a relabelled
 sha.
 
-## `fn divergent_tree_commit(&self, hooks: &mut Hooks) -> (Comm…` › `let worktree = self.manager.slot_path(&self.task);`
+## `fn divergent_tree_commit(&self, hooks: &mut Hooks) -> (CommitSha, CommitSha) {` › `let worktree = self.manager.slot_path(&self.task);`
 
 A second entry behind the same index. The blob's bytes do not
 matter; the *path* is what moves the tree, and moving the tree is
@@ -300,7 +300,7 @@ three things: the object is **present**, it is **unreachable** per
 deletion), and the resume settles the attempt interrupted with nothing
 to delete.
 
-## `fn kill_after_commit_tree_before_pin_leaves_gc_owned_object…` › `let journal = fixture.journal(&Hooks::new());`
+## `fn kill_after_commit_tree_before_pin_leaves_gc_owned_object_and_settles_interrupted() {` › `let journal = fixture.journal(&Hooks::new());`
 
 The resume: `settle attempt interrupted`, and nothing to delete.
 
@@ -346,13 +346,13 @@ And the run namespace is entitled to no *candidates* ref: nothing
 durable names a candidate, so a ref that appeared for one would be
 exactly the unexpected-ref refusal.
 
-## `fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) -> CommitSh…`
+## `fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) -> CommitSha {`
 
 =======================================================================
 T-CAND-REF — the authoritative ref, the queue position, and the pin
 =======================================================================
 
-## `fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) -> CommitSh…`
+## `fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) -> CommitSha {`
 
 The whole sequence from the pin onwards, on a live run.
 
@@ -384,31 +384,31 @@ things: it refuses, it names both shas so the substitution is legible
 from the error alone, and **nothing was appended, created or deleted** —
 the pin is still at the substituted object for a person to look at.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `let unpinned = write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judge…`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `let unpinned = write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judged())`
 
 Reach the boundary honestly: commit, pin, `candidate_prepared`.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `let impostor = fixture.sibling_commit(&mut hooks);`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `let impostor = fixture.sibling_commit(&mut hooks);`
 
 The substitution: the pin is moved to a real sibling commit on the
 same base. A different *tree* is not needed — the point is that the
 pin no longer names the recorded commit, and this must be caught by
 the pin's own binding rather than by the tree check.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `let refused = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `let refused = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)`
 
 (1) Recovery refuses, before any effect.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `let text = refused.to_string();`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `let text = refused.to_string();`
 
 (2) The refusal names both, so the substitution is legible from it.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `assert_eq!(`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `assert_eq!(`
 
 (3) The evidence is intact: the pin is still at the impostor, the
     candidates ref was never created, and nothing was appended.
 
-## `fn a_substituted_prepared_pin_refuses_and_leaves_the_eviden…` › `let referenced = create_candidates_ref(&fixture.manager, &mut hooks, promoting)`
+## `fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {` › `let referenced = create_candidates_ref(&fixture.manager, &mut hooks, promoting)`
 
 And the reclaim half refuses the same substitution rather than
 deleting it, for a caller that reached it another way.
@@ -425,12 +425,12 @@ wrote, not a count of calls: the fold refuses a second
 closure procedure that did not read that would append a line the fold
 then refuses on the next replay — a log that cannot be resumed.
 
-## `fn kill_after_candidate_prepared_appends_candidate_created_…` › `let mut hooks = Hooks::new();`
+## `fn kill_after_candidate_prepared_appends_candidate_created_once() {` › `let mut hooks = Hooks::new();`
 
 The durable state of the boundary: the prepare landed, the queue
 position did not, the pin is still holding the commit.
 
-## `fn kill_after_candidate_prepared_appends_candidate_created_…` › `assert_eq!(`
+## `fn kill_after_candidate_prepared_appends_candidate_created_once() {` › `assert_eq!(`
 
 **The tree came off the fold, and it is the tree the event recorded.**
 `promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged`
@@ -447,13 +447,13 @@ where the number has been through a serialization, a replay and an
 `apply`. Only the second can be wrong, and only the second is
 asserted here.
 
-## `fn kill_after_candidate_prepared_appends_candidate_created_…` › `assert!(`
+## `fn kill_after_candidate_prepared_appends_candidate_created_once() {` › `assert!(`
 
 "the closure procedure performs the same steps at any run end": run
 it again. Every step reads the world first, so the second run appends
 nothing, refuses nothing, and leaves the same refs.
 
-## `fn kill_after_candidate_prepared_appends_candidate_created_…` › `let sibling = fixture.sibling_commit(&mut hooks);`
+## `fn kill_after_candidate_prepared_appends_candidate_created_once() {` › `let sibling = fixture.sibling_commit(&mut hooks);`
 
 And the refusal the same sentence names: a ref present at another
 SHA is not accepted as "already created".
@@ -669,25 +669,25 @@ Raised by the frontier re-review of `c2c0294` as finding B and carried
 before that as `PR7-CANDIDATE-TREE-UNVERIFIED`. The repair is
 `PreparedCandidate::tree_sha`, per-instance Class B approval 2026-08-26.
 
-## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_ne…` › `assert!(`
+## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {` › `assert!(`
 
 Both of the checks that existed pass, stated rather than assumed —
 otherwise this test could be green because an *earlier* refusal fired.
 
-## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_ne…` › `tree: fixture.tree_sha.clone(),`
+## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {` › `tree: fixture.tree_sha.clone(),`
 
 The durable record's tree — what the fold now retains.
 
-## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_ne…` › `assert_eq!(`
+## `fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {` › `assert_eq!(`
 
 And nothing was appended or created on the way to refusing.
 
-## `fn promotion_refuses_an_object_that_is_not_the_judged_candi…` › `let impostor = if present {`
+## `fn promotion_refuses_an_object_that_is_not_the_judged_candidate() {` › `let impostor = if present {`
 
 Two real objects of the fixture's own repository. The tree is not
 a commit; the base is a commit whose parent is not the base.
 
-## `fn promotion_refuses_an_object_that_is_not_the_judged_candi…` › `assert!(`
+## `fn promotion_refuses_an_object_that_is_not_the_judged_candidate() {` › `assert!(`
 
 The **production** presence predicate, not the fixture's: the
 residue classifier asks `cat-file -e <sha>^{}`, which resolves any
@@ -722,17 +722,17 @@ a reachability phase in the frozen registry rather than a declared fault
 coordinate; the module-local double injects there to reach the prefix,
 which is scaffolding, not a claim about the registry.
 
-## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_…` › `assert_eq!(journal.count("task_candidate_created"), 1);`
+## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {` › `assert_eq!(journal.count("task_candidate_created"), 1);`
 
 The prefix: the queue position is durable, the generation is closed,
 and the pin is still there.
 
-## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_…` › `fixture`
+## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {` › `fixture`
 
 …and the namespace does not refuse it, which is what lets the next
 process act at all.
 
-## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_…` › `let recovery = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA).expect("clas…`
+## `fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {` › `let recovery = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA).expect("classify");`
 
 The closure procedure finishes it, appending nothing.
 

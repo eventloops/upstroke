@@ -240,12 +240,12 @@ Establish containment for `command`, or refuse it.
 On Unix the join is a no-op that returns `Ok`: containment there is the
 per-invocation reaper and the isolated process group.
 
-## `fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<ValidateOpt…`
+## `fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<ValidateOptions> {`
 
 One construction point so `validate` and `run --dry-run` can never drift
 into previewing different things.
 
-## `fn validate_options(plan: PathBuf, config: Option<PathBuf>)…` › `engine_limits: upstroke::config::EngineLimits::Fresh,`
+## `fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<ValidateOptions> {` › `engine_limits: upstroke::config::EngineLimits::Fresh,`
 
 Both callers are previewing a run that does not exist yet, so both
 want the reading a fresh run gets — including its refusals.
@@ -294,23 +294,23 @@ Establish containment, then execute. The ambient join is a parameter so a
 test can drive a failure that no machine here can produce, and so the
 ordering between the two is testable rather than merely written down.
 
-## `fn execute(command: Command, _contained: Contained) -> anyh…` › `if report.refused() {`
+## `fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> {` › `if report.refused() {`
 
 A refusal to clobber is not something a retry fixes, and a script
 that cannot tell it from success would go on to run against a
 pools file that says something else entirely.
 
-## `fn execute(command: Command, _contained: Contained) -> anyh…` › `status::follow(`
+## `fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> {` › `status::follow(`
 
 History first, then live events: dropping a reader into the
 middle of a run tells them less than showing how it got here.
 
-## `fn execute(command: Command, _contained: Contained) -> anyh…` › `let settled = status::load(&repo_root, Some(&run.run_id))?;`
+## `fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> {` › `let settled = status::load(&repo_root, Some(&run.run_id))?;`
 
 Re-read: the run has moved since the summary would have been
 computed, and the closing summary is the useful one.
 
-## `fn execute(command: Command, _contained: Contained) -> anyh…` › `(None, None, false) => Reply::Text(prompt_for_answer(&repo_root, &question_id)?),`
+## `fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> {` › `(None, None, false) => Reply::Text(prompt_for_answer(&repo_root, &question_id)?),`
 
 Nothing given: show the question and read one line, so the
 common case is `upstroke answer <id>` and then just type.
@@ -323,29 +323,29 @@ for as long as an agent turn takes, so this budget is not a limit on
 silence — it starts only once the lock is gone, and exists so a terminal
 attached to a dead engine does not hang.
 
-## `fn finish(report: &engine::RunReport) -> anyhow::Result<Exi…` › `RunOutcome::Parked => Ok(ExitCode::from(EXIT_PARKED)),`
+## `fn finish(report: &engine::RunReport) -> anyhow::Result<ExitCode> {` › `RunOutcome::Parked => Ok(ExitCode::from(EXIT_PARKED)),`
 
 §12: parked is neither clean nor broken. Distinguishable so CI can
 gate on it without parsing prose.
 
-## `fn finish(report: &engine::RunReport) -> anyhow::Result<Exi…` › `RunOutcome::BudgetExceeded => Ok(ExitCode::from(EXIT_BUDGET)),`
+## `fn finish(report: &engine::RunReport) -> anyhow::Result<ExitCode> {` › `RunOutcome::BudgetExceeded => Ok(ExitCode::from(EXIT_BUDGET)),`
 
 §13: nor is a budget stop. It is not an error — the run did exactly
 what the ceiling asked — so it does not `bail`, and the report above
 already printed the resume command that continues it.
 
-## `fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::Result<St…`
+## `fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::Result<String> {`
 
 Show the question, then take the operator's answer.
 
-## `fn prompt_for_answer(repo_root: &std::path::Path, question_…` › `eprint!("answer (a number picks an option, empty aborts): ");`
+## `fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::Result<String> {` › `eprint!("answer (a number picks an option, empty aborts): ");`
 
 Enter submits — what the legend promises, and the only thing a
 person typing at a prompt will try. Reading to end here would wait
 for EOF instead (Ctrl+D, or Ctrl+Z then Enter on Windows), so
 pressing Enter would leave the command sitting there saying nothing.
 
-## `fn prompt_for_answer(repo_root: &std::path::Path, question_…` › `stdin`
+## `fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::Result<String> {` › `stdin`
 
 Piped: read to end so an answer can span lines. The interpreter
 trims and treats the whole thing as the operator's words.
@@ -383,7 +383,8 @@ the widening cannot become invisible.
 
 The two commands that spawn a host child outside a run, counted so the
 boundary cannot grow in silence. `connect` and `capacity` both probe the
-installed agent CLIs (`connect.rs:133`, `capacity.rs:840`); neither
+installed agent CLIs through the adapter probes in `connect::run_with` and
+`capacity::report`; neither
 drives a run, so neither is the "coordinator" whose ambient job INV-18
 names.
 
@@ -419,11 +420,11 @@ every row of [`DISPATCH`] plus the dry-run preview, and asserts the
 because it is the mutation site and because running the wet arms would
 execute a run.
 
-## `fn every_write_command_establishes_containment_and_no_read_…` › `argvs.push((`
+## `fn every_write_command_establishes_containment_and_no_read_only_one_does() {` › `argvs.push((`
 
 The preview shares its arm's class, and the arm is what joins.
 
-## `fn every_write_command_establishes_containment_and_no_read_…` › `let command = Cli::try_parse_from(argv).expect("parse").command;`
+## `fn every_write_command_establishes_containment_and_no_read_only_one_does() {` › `let command = Cli::try_parse_from(argv).expect("parse").command;`
 
 And the refusal is per command, not per class: a write command
 whose join fails refuses, a read-only one cannot fail because it
@@ -472,7 +473,7 @@ a no-op on Unix that never consults the observer, deliberately, so a
 Linux cell cannot claim this coverage — the same boundary
 `PR4-CONF-005` records for `contain_write_command`.
 
-## `fn a_cli_write_command_refuses_when_the_real_containment_st…` › `for fragment in ["ambient", "INV-18", "No process was spawned"] {`
+## `fn a_cli_write_command_refuses_when_the_real_containment_step_refuses() {` › `for fragment in ["ambient", "INV-18", "No process was spawned"] {`
 
 The same three fragments `runner::host::tests::the_production_
 containment_mint_propagates_a_join_refusal_and_mints_nothing` reads,

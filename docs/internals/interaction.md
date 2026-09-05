@@ -76,7 +76,9 @@ raise. The engine ingests the file and emits the `question_answered` event
 itself, so the log still records every answer — the file is transport, the
 event is the record.
 
-## `pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), UpstrokeE…`
+## `pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), UpstrokeError> {`
+
+The source retains the publication protocol required by §10.
 
 Write an answer atomically.
 
@@ -115,7 +117,7 @@ Announces a question on stderr as soon as it is raised (§12: eagerly, at
 detection). One line — the full text belongs in the prompt at the hard
 block and in the question file, not repeated in the middle of a run.
 
-## `pub fn notifiers_for(ids: &[String], warnings: &mut Vec<String>) -> Vec<&'static dyn Noti…`
+## `pub fn notifiers_for(ids: &[String], warnings: &mut Vec<String>) -> Vec<&'static dyn Notifier> {`
 
 Resolve `[interaction] notify = [...]` to delivery channels. An id that
 resolves to nothing warns rather than silently dropping notifications —
@@ -142,7 +144,7 @@ run's exit status reports it (§12).
 not a terminal, so a run piped from a file or a service manager parks
 instead of hanging on a read that will never return.
 
-## `fn resolve(&self, question: &Question) -> Result<Answer, Up…` › `Ok(0) => Ok(Answer::Unanswered),`
+## `fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError> {` › `Ok(0) => Ok(Answer::Unanswered),`
 
 EOF: the terminal went away mid-run. Park, do not fail.
 
@@ -245,7 +247,7 @@ a prompt, but it gives up immediately.
 
 Nothing partial is left behind for the engine to trip over.
 
-## `fn a_detached_run_waits_for_an_answer_file_then_gives_up()` › `let dir = std::env::temp_dir().join(format!("upstroke-answer-wait-{}", std::process::id()…`
+## `fn a_detached_run_waits_for_an_answer_file_then_gives_up()` › `let dir = std::env::temp_dir().join(format!("upstroke-answer-wait-{}", std::process::id()));`
 
 §19's "hard block (interactive)" for a run with no terminal: it
 waits for `upstroke answer` rather than degrading to CI behaviour.

@@ -46,22 +46,22 @@ Where an answer landed, for the caller to report.
 
 Whether a live engine is expected to pick this up on its own.
 
-## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeE…`
+## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {`
 
 Record an answer to a question, found by id or unambiguous prefix.
 
-## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply)…` › `if let Some(existing) = &record.answer {`
+## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {` › `if let Some(existing) = &record.answer {`
 
 Answering twice is a mistake worth catching rather than a last-write-
 wins race: the first answer may already have driven a retry, and the
 second would look like it had an effect it cannot have.
 
-## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply)…` › `format!("1-{}", record.question.options.len())`
+## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {` › `format!("1-{}", record.question.options.len())`
 
 Not `1..N`: every operator of this tool reads
 Rust, where that is the range that excludes N.
 
-## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply)…` › `if answer == Answer::Unanswered {`
+## `pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {` › `if answer == Answer::Unanswered {`
 
 An empty reply means "leave it parked" at a prompt (§12), and typing
 nothing into this command almost certainly means the same — but here it

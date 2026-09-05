@@ -142,27 +142,27 @@ execute unasserted, and a reviewer path that wrote its intent before its
 commit would pass. The count check above the loop is what makes the loop
 exhaustive rather than merely repeated.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `let review_inputs = run.review_inputs();`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `let review_inputs = run.review_inputs();`
 
 Built before the context borrows `run` mutably.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `let assessed = context!(run, process)`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `let assessed = context!(run, process)`
 
 Through the production phase, over the same diff the reviewers are
 shown: a fixture-built `Assessment` could show the judge a diff the
 cheap rungs never saw.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `&|pass| crate::review::ReviewInvocations {`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `&|pass| crate::review::ReviewInvocations {`
 
 Caller-supplied, ordinal included: nothing pass-shaped is
 minted inside `judge`, so PR8's merge verification can
 supply its `SequenceIdentities` here without a redesign.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `let stage = run.must_order_of(STAGE, HookPhase::Before);`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `let stage = run.must_order_of(STAGE, HookPhase::Before);`
 
 O25: both capture sites, in order, before any snapshot effect.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `let snapshots = 1 + plan.reviewers.len();`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `let snapshots = 1 + plan.reviewers.len();`
 
 O26, once per snapshot rather than once per test. Three snapshots are
 created here — one for the gate set and one per reviewer — and comparing
@@ -172,11 +172,11 @@ that triple untouched and pass. Each iteration takes its fence past the
 previous snapshot's add, so the three positions it compares are that
 snapshot's own.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `assert!(judgement.accepted());`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `assert!(judgement.accepted());`
 
 O27: everything judged, and nothing here is a commit-tree.
 
-## `fn capture_precedes_the_snapshots_and_every_snapshot_commit…` › `assert_eq!(`
+## `fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {` › `assert_eq!(`
 
 The tree the capture produced is the tree the snapshots were taken of.
 
@@ -196,23 +196,23 @@ merely producing a snapshot nobody used.
 snapshot adds: three adds that all returned one path would pass a count of
 adds and fail this.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `let review_inputs = run.review_inputs();`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `let review_inputs = run.review_inputs();`
 
 Built before the context borrows `run` mutably.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `let assessed = context!(run, process)`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `let assessed = context!(run, process)`
 
 Through the production phase, over the same diff the reviewers are
 shown: a fixture-built `Assessment` could show the judge a diff the
 cheap rungs never saw.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `&|pass| crate::review::ReviewInvocations {`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `&|pass| crate::review::ReviewInvocations {`
 
 Caller-supplied, ordinal included: nothing pass-shaped is
 minted inside `judge`, so PR8's merge verification can
 supply its `SequenceIdentities` here without a redesign.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `let workspaces: Vec<PathBuf> = run`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `let workspaces: Vec<PathBuf> = run`
 
 **Where the processes actually ran, not where the judgement says they
 ran.** This used to read `Verdict::workspace` from both lists, and
@@ -222,11 +222,11 @@ better evidence anyway: it observes the request each process was spawned
 with, so a `judge` that reported one workspace and spawned in another
 fails here, and the old assertion could not have seen that.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `let distinct: std::collections::BTreeSet<&PathBuf> = workspaces.iter().collect();`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `let distinct: std::collections::BTreeSet<&PathBuf> = workspaces.iter().collect();`
 
 One shared snapshot for the gate set; one fresh per reviewer.
 
-## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_nev…` › `assert!(`
+## `fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktree() {` › `assert!(`
 
 Cleaned on completion: nothing survives the judgement.
 
@@ -385,21 +385,21 @@ The residue planted is `index.lock`, which is exactly what the interrupted
 Git command in the failure sequence leaves, and it is the cheapest way into
 a failing verify that does not itself disturb the thing being protected.
 
-## `fn a_retry_whose_retained_worktree_fails_verification_close…` › `let lock = git_dir(&dispatched.worktree).join("index.lock");`
+## `fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothing() {` › `let lock = git_dir(&dispatched.worktree).join("index.lock");`
 
 An interrupted Git command, which is the case `Worktree.Verify` exists
 for and the one the failure sequence describes.
 
-## `fn a_retry_whose_retained_worktree_fails_verification_close…` › `assert_eq!(`
+## `fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothing() {` › `assert_eq!(`
 
 It looked, which is what stops every assertion below being about a
 function that returned without doing anything.
 
-## `fn a_retry_whose_retained_worktree_fails_verification_close…` › `run.emitter`
+## `fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothing() {` › `run.emitter`
 
 The recovery itself, through the fold that has to accept it.
 
-## `fn a_retry_whose_retained_worktree_fails_verification_close…` › `assert!(`
+## `fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothing() {` › `assert!(`
 
 The work itself. The lock is what `Worktree.Verify` refused for, so it
 comes off before the index can be written out — removing it is this
@@ -428,12 +428,12 @@ The held pair is deliberately **not** registered in the ledger, so the
 ledger's own balance is a statement about the worker alone: after the
 refusal nothing is running, one entry is cancelled, and none is completed.
 
-## `fn a_refused_slot_acquisition_settles_the_registration_it_t…` › `let squatter = AttemptIdentities::new(ALPHA, GenerationId(9), AttemptNumber(9)).worker();`
+## `fn a_refused_slot_acquisition_settles_the_registration_it_took() {` › `let squatter = AttemptIdentities::new(ALPHA, GenerationId(9), AttemptNumber(9)).worker();`
 
 Something else holds the one pair. `cancel_all_running` is not involved:
 this invocation is in the slot table and not in the ledger.
 
-## `fn a_refused_slot_acquisition_settles_the_registration_it_t…` › `assert_eq!(`
+## `fn a_refused_slot_acquisition_settles_the_registration_it_took() {` › `assert_eq!(`
 
 What actually happened, so the assertions above are about the state this
 test claims to have driven: O23's append is durable and no process was
@@ -521,7 +521,7 @@ the one that matters most — "later dispatch **new generation** (spend may
 repeat)" — because a recovery that reused the generation would silently
 claim the dead coordinator's unknown spend as its own.
 
-## `fn kill_during_attempt_settles_interrupted_and_redispatches…` › `let next = run.dispatch(ALPHA, 1);`
+## `fn kill_during_attempt_settles_interrupted_and_redispatches_new_generation() {` › `let next = run.dispatch(ALPHA, 1);`
 
 The redispatch: a new generation, at the same base, and the fold accepts
 it — which it would not if the old generation were still open.
@@ -569,7 +569,7 @@ the child's own `unreachable!`: nothing else in that path is armed, so a
 point that was never consulted would let `judge` finish and the child would
 fail rather than die.
 
-## `fn kill_at_snapshot_commit_id_unread_point_leaves_gc_owned_…` › `let refusal = run`
+## `fn kill_at_snapshot_commit_id_unread_point_leaves_gc_owned_object() {` › `let refusal = run`
 
 The point supports one mode, and arming the other is refused rather than
 silently ignored — which is what stops a suite claiming coverage of an
@@ -670,13 +670,13 @@ object directory, which is why they survive the scrub below while the
 index lock does not. That difference is the point of planting them
 separately rather than as one blob of "residue".
 
-## `fn plant_stage_residue(base: &Path, worktree: &Path, elemen…` › `write_file(`
+## `fn plant_stage_residue(base: &Path, worktree: &Path, element: ResidueElement) {` › `write_file(`
 
 An orphan blob: written into the store and referenced by nothing.
 Untracked on purpose — the index must not hold it, or it would be
 reachable and the classifier would be right to ignore it.
 
-## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_conver…`
+## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_converges() {`
 
 **`T-ATTEMPT`, sub-prefix (b'), evidence (i).** Every residue element a
 killed `git add` can leave, constructed, classified `Internal`, and
@@ -694,22 +694,22 @@ temporary object file are R27 and stay, because "objects left unreferenced
 by any of these prunings … are Git's" and an engine that pruned them would
 be establishing authority over the object store, which `cleanup` forbids.
 
-## `fn synthetic_git_add_residue_unreferenced_objects_and_index…` › `let target = ResidueTarget::new(&fixture.base).at(&worktree);`
+## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_converges() {` › `let target = ResidueTarget::new(&fixture.base).at(&worktree);`
 
 Two controls, and the pair is what makes the `Internal` below mean
 something. A classifier that answered `Internal` unconditionally
 fails the first; one that ignored its element list and read only the
 after-phase reference fails the second.
 
-## `fn synthetic_git_add_residue_unreferenced_objects_and_index…` › `manager`
+## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_converges() {` › `manager`
 
 The tabled recovery: forced removal of the worktree, then its intent.
 
-## `fn synthetic_git_add_residue_unreferenced_objects_and_index…` › `manager`
+## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_converges() {` › `manager`
 
 Idempotent, which `cleanup` requires of every reclaim.
 
-## `fn synthetic_git_add_residue_unreferenced_objects_and_index…` › `let fixture = Fixture::created("synthetic-stage-all");`
+## `fn synthetic_git_add_residue_unreferenced_objects_and_index_lock_then_forced_scrub_converges() {` › `let fixture = Fixture::created("synthetic-stage-all");`
 
 And all three at once, which is the state a killed `git add` leaves.
 
@@ -812,11 +812,11 @@ taken. The median rather than the mean because the failure mode is a single
 outlier, and a mean carries an outlier's weight into the schedule that a
 median discards.
 
-## `fn measure_budget(site: EffectSiteId, fixture: &Fixture) ->…` › `const PROBE_SLOTS: [u32; 4] = [9_996, 9_997, 9_998, 9_999];`
+## `fn measure_budget(site: EffectSiteId, fixture: &Fixture) -> std::time::Duration {` › `const PROBE_SLOTS: [u32; 4] = [9_996, 9_997, 9_998, 9_999];`
 
 Slots the probes use, distinct from every sampled run's.
 
-## `fn measure_budget(site: EffectSiteId, fixture: &Fixture) ->…` › `median(&measured[1..])`
+## `fn measure_budget(site: EffectSiteId, fixture: &Fixture) -> std::time::Duration {` › `median(&measured[1..])`
 
 Discard the warm-up, then the median of what is left.
 
@@ -842,7 +842,7 @@ report. The caller's vacuity refusal is what reports it, and nothing here
 weakens that assertion — this only removes the case where it fires for an
 environment rather than for a bug.
 
-## `fn sample(site: EffectSiteId) -> Vec<Sample>` › `let observed: Vec<std::time::Duration> = first.iter().filter_map(|sample| sample.ran).col…`
+## `fn sample(site: EffectSiteId) -> Vec<Sample>` › `let observed: Vec<std::time::Duration> = first.iter().filter_map(|sample| sample.ran).collect();`
 
 Premise failed: no kill landed mid-run. Every run therefore completed, so
 every `ran` is a full duration and their median is the budget the probe
@@ -920,36 +920,36 @@ scaled to — and a per-command floor would stand on a margin of one sample
 and be red on the next machine. The per-command counts are recorded in the
 evidence file so the margin stays visible without being load-bearing.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `let counted = |wanted: ObjectResidue| -> u32 {`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `let counted = |wanted: ObjectResidue| -> u32 {`
 
 The classifier's answers, tallied here rather than by the code under
 test: a histogram that counted a class under the wrong name agrees
 with itself, and only a second expression over the same list can see
 it.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `let failed: Vec<Option<i32>> = samples.iter().filter_map(|s| s.failed.map(Some)).collect(…`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `let failed: Vec<Option<i32>> = samples.iter().filter_map(|s| s.failed.map(Some)).collect();`
 
 The premise of every count below: a child that failed on its own left
 the fixture's residue rather than the kill's.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `let shape: Vec<&Sample> = samples`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `let shape: Vec<&Sample> = samples`
 
 The ladder, per command shape rather than per site label: the
 contract names two *commands*, and two sites that sampled one shape
 would leave two records intact.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `for sample in &shape {`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `for sample in &shape {`
 
 A kill fired at every child, and no earlier than the rung it was
 aimed at. `fired` is the clock read inside the kill, so deleting the
 wait moves it and deleting the kill removes it.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `let landed: usize = per_site`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `let landed: usize = per_site`
 
 The kill itself, over the sampling as a whole. Nothing else in this
 harness changes when `KillableGitChild::kill` stops killing.
 
-## `fn sampled_git_add_and_write_tree_child_kills_every_residue…` › `let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(HISTOGRAM);`
+## `fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered() {` › `let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(HISTOGRAM);`
 
 The evidence file `outputs` asks for, written and read back.
 
@@ -963,23 +963,23 @@ test here would stay green — all of them drive a runner whose processes
 succeed. The cleanup half matters as much: `snapshots` says they are
 "cleaned on completion", and a completion is not the same thing as a pass.
 
-## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is…` › `let review_inputs = run.review_inputs();`
+## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {` › `let review_inputs = run.review_inputs();`
 
 Built before the context borrows `run` mutably.
 
-## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is…` › `let assessed = context!(run, process)`
+## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {` › `let assessed = context!(run, process)`
 
 Through the production phase, over the same diff the reviewers are
 shown: a fixture-built `Assessment` could show the judge a diff the
 cheap rungs never saw.
 
-## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is…` › `&|pass| crate::review::ReviewInvocations {`
+## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {` › `&|pass| crate::review::ReviewInvocations {`
 
 Caller-supplied, ordinal included: nothing pass-shaped is
 minted inside `judge`, so PR8's merge verification can
 supply its `SequenceIdentities` here without a redesign.
 
-## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is…` › `assert!(`
+## `fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {` › `assert!(`
 
 **The reviewers do not run, and that is a deliberate change.** This test
 used to assert that they ran after the failing gate and passed, because

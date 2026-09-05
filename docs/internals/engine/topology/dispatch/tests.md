@@ -92,7 +92,7 @@ with or without the pre-check. What the pre-check decides is **which side of
 the append** it fires on, and that is the whole of what is asserted: the
 durable log is unchanged and no append ran after the mark.
 
-## `fn a_containment_condition_that_fails_mid_run_refuses_befor…` › `git(`
+## `fn a_containment_condition_that_fails_mid_run_refuses_before_the_append() {` › `git(`
 
 The control: with the foreign worktree gone the same dispatch is
 accepted, so the refusal above is about containment and not about the
@@ -248,7 +248,7 @@ must refuse **before the append**, which is what the durable-log assertion
 after each one is for — a refusal raised after `task_dispatched` would leave
 an open generation whose worktree can never be built.
 
-## `fn a_repair_whose_source_candidate_is_missing_is_refused_be…` › `let request = DispatchRequest {`
+## `fn a_repair_whose_source_candidate_is_missing_is_refused_before_any_append() {` › `let request = DispatchRequest {`
 
 The control: the same dispatch with the real candidate is accepted, so
 the three refusals above are about the candidate rather than about the

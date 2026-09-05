@@ -172,6 +172,9 @@ pub fn describe(event: &Event) -> String {
     render::describe(event)
 }
 
+// The conductor owns the run lock before appending RunResumed. A historical
+// RunFinished is terminal for this follower only once the lock is free; while
+// held, keep polling for the new epoch and do not spend the dead-engine budget.
 pub fn follow(
     status: &RunStatus,
     sleeper: &dyn Sleeper,
@@ -216,6 +219,11 @@ pub fn follow(
     }
 }
 
+// The conductor appends settlement before releasing its run lock; status only
+// observes. Changed lock probes force a retry. A dead observation also needs an
+// identical second event read and another free-lock probe, or settlement followed
+// by release could pair a stale attempt_started prefix with a free lock and invent
+// interruption. Retries are bounded, and refusal leaves the run untouched.
 fn stable_event_bytes_with(
     path: &Path,
     mut read: impl FnMut() -> Result<Vec<u8>, UpstrokeError>,

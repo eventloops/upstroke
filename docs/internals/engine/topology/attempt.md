@@ -747,7 +747,7 @@ not hold the ledger. This one does — it is the same ledger every Runner
 process of the attempt registers in — so the obligation is discharged
 here and the attempt half keeps returning [`UpstrokeError`].
 
-## `fn emit(&mut self, body: TopologyEventBody) -> Result<(), U…` › `self.emitter`
+## `fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {` › `self.emitter`
 
 Three disjoint field borrows, which is why the hooks are taken from
 `self` here rather than passed in: a caller writing
@@ -1017,6 +1017,8 @@ Whatever the emitter returns, or a Git or I/O error from the reclaim.
 
 ## `impl AttemptContext<'_>` › `pub fn cancel_in_flight(`
 
+The source retains the cancellation ordering protocol required by §10.
+
 The cancellation half of `T-ATTEMPT`: "at Halted the same terminal is
 appended by cancellation".
 
@@ -1048,6 +1050,8 @@ process end with nothing to say so.
 Snapshots reclaimed, then the task worktree scrubbed with force.
 
 ## `impl AttemptContext<'_>` › `fn execute(`
+
+The source retains the registration, slot and settlement protocol required by §10.
 
 Register, take the slot pair if the identity is slotted, run, release,
 complete.

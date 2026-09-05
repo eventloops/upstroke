@@ -172,7 +172,7 @@ current, so it belongs in the comparison that decides whether to rewrite.
 One pool per (agent × discovered account) — today exactly one per agent,
 because nothing enumerates credential profiles (see the module docs).
 
-## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Po…` › `let kind = discovery.shape.unwrap_or(match agent {`
+## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {` › `let kind = discovery.shape.unwrap_or(match agent {`
 
 §13's default where the CLI could not say: Copilot's post-Jun-2026
 billing is credits, and everything else that reports nothing is treated
@@ -181,7 +181,7 @@ conservative of the two. The rendered file carries a comment saying so,
 because a default the operator cannot see is a guess wearing a fact's
 clothes.
 
-## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Po…` › `Pool::discovered(`
+## `fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {` › `Pool::discovered(`
 
 §13's trust order, minus the sources v0.1 does not read: writing
 `local-logs` into a fresh file would promise interactive-usage awareness
@@ -244,7 +244,7 @@ installed at all.
 
 Installed nowhere: the normal single-vendor machine.
 
-## `fn what_connect_writes_parses_back_into_the_pools_it_descri…` › `let path = scratch("roundtrip");`
+## `fn what_connect_writes_parses_back_into_the_pools_it_describes() {` › `let path = scratch("roundtrip");`
 
 The round trip is the whole contract: a file this command writes must
 be one `config::load` accepts, or `upstroke capacity` reports on
@@ -263,7 +263,7 @@ of §13's multi-account seam and discovery cannot supply it, so a
 replacement that dropped it would silently delete the one setting
 the refusal above existed to protect.
 
-## `fn re_connecting_an_unchanged_machine_reports_unchanged_rat…` › `let path = scratch("idempotent");`
+## `fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {` › `let path = scratch("idempotent");`
 
 The header names the write date, so a byte comparison would call
 every second run a conflict — and the only way past a conflict is
@@ -271,7 +271,7 @@ every second run a conflict — and the only way past a conflict is
 is trained to bypass protects nothing, so the comparison is over
 settings, not bytes.
 
-## `fn re_connecting_an_unchanged_machine_reports_unchanged_rat…` › `fs::write(&path, format!("# my own note\n{first}")).expect("annotate");`
+## `fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {` › `fs::write(&path, format!("# my own note\n{first}")).expect("annotate");`
 
 A comment-only difference is never a *conflict* — settings are what
 may not be clobbered — but it is a rewrite, because the comments are
@@ -287,13 +287,13 @@ Auth state is rendered only as a comment, so a settings-only
 comparison reported `unchanged` and left the file telling an operator
 who had just logged in that they were not signed in.
 
-## `fn a_cli_that_lists_models_is_cross_checked_against_the_cat…` › `let machine = Machine {`
+## `fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {` › `let machine = Machine {`
 
 D1's guard. It cannot fire against a real CLI today — neither
 enumerates models — so it is driven through a scripted discovery
 that does, which is the shape the check exists for.
 
-## `fn a_cli_that_lists_models_is_cross_checked_against_the_cat…` › `models: [`
+## `fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {` › `models: [`
 
 A roster that has moved on without the catalog.
 Overlaps the roster — zero overlap is a format
