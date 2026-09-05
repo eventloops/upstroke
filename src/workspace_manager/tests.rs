@@ -4871,14 +4871,14 @@ fn malformed_gitdir_refuses_before_removal() {
 }
 
 /// What `git worktree add` leaves when it is killed before it writes `gitdir`,
-/// and what this module makes of it. Measured under strace on git 2.43, the
+/// and what this module makes of it. Measured under strace on git 2.43.0, the
 /// add writes in this order: the admin directory, `locked` (`initializing`),
 /// the checkout directory, `gitdir`, the checkout's `.git` pointer, `HEAD`,
-/// `commondir`, then the checkout; `locked` is unlinked as the last syscall,
-/// on success only, and a failed add removes its whole admin directory. A kill
-/// between opening `gitdir` -- which creates it, zero-length -- and writing it
-/// therefore leaves exactly an admin directory holding `locked` and a
-/// zero-length `gitdir`, and an empty checkout directory with no pointer.
+/// `commondir`, then the checkout through child processes; on the run
+/// measured, `locked` was unlinked as the last syscall. A kill between opening
+/// `gitdir` -- which creates it, zero-length -- and writing it therefore
+/// leaves exactly an admin directory holding `locked` and a zero-length
+/// `gitdir`, and an empty checkout directory with no pointer.
 ///
 /// Three facts, each asserted because each was believed otherwise once. The
 /// state is **not** `registered_unpopulated_worktree`: Git's enumerator skips
@@ -4886,16 +4886,23 @@ fn malformed_gitdir_refuses_before_removal() {
 /// the classifier answers `None`, and the element list is empty -- the
 /// contract's `recovery_proven` label for that element was measured against
 /// this and is not what fails here. Forced cleanup **refuses before
-/// mutation**, with the sampler's exact fingerprint, and the checkout and the
-/// admin directory are both still there afterwards: the refusal is
-/// deliberate, because on disk this state is indistinguishable from an add in
-/// flight in the same window -- `locked` is present in both -- and a skip
-/// here was measured to delete the checkout beneath a live writer's
-/// registration (PR #151 pass 1). And the residue blocks every removal in the
-/// repository, not only this slot's, until something unlocks and prunes it.
+/// mutation**, with a diagnostic naming this admin directory and nothing
+/// else, and every byte the refusal could have touched is compared after it:
+/// the residue is unchanged and an unrelated slot's checkout is unchanged.
+/// And the residue blocks every removal in the repository, not only this
+/// slot's, until something unlocks and prunes it.
+///
+/// The refusal is asserted as what the funnel does today, not as what it
+/// should do. On disk this state is indistinguishable from an add in flight
+/// in the same window -- `locked` is present in both -- and a skip here was
+/// measured to delete the checkout beneath a live writer's registration
+/// (PR #151 pass 1). What recovery should do with an abandoned add is a
+/// design decision that is the owner's:
 /// `RESIDUE-EMPTY-GITDIR-REGISTRATION-BLOCKS-EVERY-REMOVAL` is the open
-/// finding; the change that takes it up flips the refusal assertions here and
-/// keeps the first three.
+/// finding and states both branches. If the design keeps the refusal, this
+/// test stands as it is; if it chooses reclaim under a liveness argument, the
+/// two refusal blocks below become convergence assertions and the first three
+/// facts stay.
 #[test]
 fn an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup() {
     let fixture = Fixture::created("add-killed-before-gitdir");
@@ -4914,6 +4921,10 @@ fn an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup()
     fs::write(stale.join("locked"), "initializing\n").expect("the lock the add writes next");
     fs::write(stale.join("gitdir"), []).expect("the gitdir the add opened and never wrote");
     fs::create_dir_all(&path).expect("the checkout directory the add made, still empty");
+    let expected = format!(
+        "worktree registration {} has an empty gitdir",
+        stale.display()
+    );
 
     // Not the registered element: Git does not list it.
     let site = EffectSiteId::Worktree(WorktreeSite::Add);
@@ -4931,33 +4942,69 @@ fn an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup()
         "an admin directory Git does not enumerate is no registered element"
     );
 
-    // Forced cleanup refuses before mutation, for this slot ...
+    // Forced cleanup refuses before mutation, for this slot: the diagnostic
+    // names this admin directory and nothing else, and every byte the
+    // refusal could have touched is unchanged.
+    let refused = |error: &UpstrokeError| match error {
+        UpstrokeError::Git { message } => message == &expected,
+        _ => false,
+    };
     let error = fixture
         .manager
         .remove_worktree(&mut NoHooks, &slot)
         .expect_err("a registration that names nothing refuses");
-    assert!(
-        matches!(&error, UpstrokeError::Git { message } if message.contains("has an empty gitdir")),
-        "the sampler's fingerprint: {error}"
+    assert!(refused(&error), "expected `{expected}`, got: {error}");
+    assert_eq!(
+        fs::read_dir(&path)
+            .expect("the checkout directory is still there")
+            .count(),
+        0,
+        "refusal precedes checkout deletion, and nothing was written into it"
     );
-    assert!(path.exists(), "refusal precedes checkout deletion");
-    assert!(
-        stale.join("locked").exists() && stale.join("gitdir").exists(),
+    assert_eq!(
+        fs::read(stale.join("locked")).expect("the lock is still there"),
+        b"initializing\n",
         "refusal precedes registration deletion"
+    );
+    assert_eq!(
+        fs::read(stale.join("gitdir")).expect("the gitdir is still there"),
+        Vec::<u8>::new()
     );
 
     // ... and for every other slot in the repository, which is what makes
-    // the residue a finding rather than a stuck sample.
+    // the residue a finding rather than a stuck sample. The unrelated
+    // checkout is compared byte for byte, not by the existence of its
+    // directory: a removal that deleted its contents and left the directory
+    // would otherwise pass.
     let other = fixture.add_task(&mut NoHooks, "beta", 1);
+    let other_path = fixture.manager.slot_path(&other);
+    fs::write(other_path.join("witness.txt"), "unrelated slot\n").expect("plant a file");
+    let pointer = fs::read(other_path.join(".git")).expect("the unrelated slot's pointer");
     let error = fixture
         .manager
         .remove_worktree(&mut NoHooks, &other)
         .expect_err("identification enumerates every registration");
     assert!(
-        matches!(&error, UpstrokeError::Git { message } if message.contains("has an empty gitdir")),
-        "the same fingerprint for an unrelated slot: {error}"
+        refused(&error),
+        "the same diagnostic, naming the stale directory, for an unrelated slot: {error}"
     );
-    assert!(fixture.manager.slot_path(&other).exists());
+    assert_eq!(
+        fs::read(other_path.join("witness.txt")).expect("the planted file survives"),
+        b"unrelated slot\n"
+    );
+    assert_eq!(
+        fs::read(other_path.join(".git")).expect("the pointer survives"),
+        pointer
+    );
+    assert!(
+        fixture
+            .manager
+            .worktree_records()
+            .expect("records")
+            .iter()
+            .any(|record| record.path().ends_with("kbeta-g1")),
+        "the unrelated slot is still registered"
+    );
 }
 
 #[test]
