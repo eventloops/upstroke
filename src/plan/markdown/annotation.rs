@@ -10,11 +10,18 @@
 //! of a CRLF line ending is skipped, a container's prefix (`> `, a list item's
 //! indentation) is never emitted, and indentation a tab straddles comes back
 //! as a zero-width `Text` event between two `Html` events of the same block.
-//! Inline HTML arrives as one `InlineHtml` event per construct, however many
-//! lines it spans — and that one event is the raw source, so inside a
+//! The adapter normalizes lone CR to LF for every parser walk, preserving
+//! byte offsets into the original text. This is needed because 0.13.4's
+//! HTML-block scanner advances only at LF. Inline comments arrive as one
+//! `InlineHtml` event per construct, however many lines they span. That
+//! event retains the parser input, so inside a
 //! blockquote its continuation lines still carry the quote's `>` markers
-//! (measured: `<!-- upstroke: id=a\n>min=frontier -->`), which the grammar
-//! below strips as container syntax. An inline `<!--` with no `-->` is not
+//! (measured: `<!-- upstroke: id=a\n>min=frontier -->`). The accumulator
+//! removes only container prefixes that each continuation line actually
+//! carries, accounting for list indentation and partially consumed tabs.
+//! Its first line and any extra or lazy-continuation `>` remain literal content;
+//! HTML-block events have already shed their prefixes and are left alone.
+//! An inline `<!--` with no `-->` is not
 //! HTML at all but text. [`HtmlAccumulator`] joins the lines of one block, keeps the source
 //! range of every piece, and maps a comment found in the joined text back to
 //! the source through those pieces, so the span it reports is the comment's
@@ -36,21 +43,23 @@
 //! | `id=` | empty id | an id derived from the title |
 //! | `kind=wat` | unknown kind; heuristics | the title-keyword heuristic |
 //! | `tier=wat` | unknown tier; no suggestion | routing's own choice |
-//! | `min=wat` | unknown min tier; **no floor** | routing's own choice, below what the author required |
+//! | `min=wat` | unknown min tier; **no floor** | routing's own choice; no valid floor was supplied |
 //! | `kind=fix kind=docs` | repeated; the last applies | the last value, parseable or not; the earlier one is not parsed |
 //!
 //! A value's warning is about the value that applies: `min=wat min=frontier`
 //! warns that `min` is repeated and binds `frontier`, and never says no floor
-//! binds. When the plan parses, every warning lands in `Parsed::warnings`,
-//! which `upstroke validate` prints under `warnings:` and a run copies into
-//! its report as `warning:` lines; a plan the adapter refuses outright (no
-//! tasks found) reports the refusal alone, and the warnings gathered before
-//! it are dropped with the parse — recorded as SWEEP-ANNOTATION-017 against
-//! the parent. Nothing here errors: `DESIGN.md` §9 has unknown attributes warn and never
+//! binds. A successful parse returns warnings in `Parsed::warnings`.
+//! The adapter's no-tasks refusal and validation's configuration, graph and
+//! review-planning refusals retain warnings already gathered in a typed
+//! `UpstrokeError::WithWarnings`. A successful `upstroke validate` prints
+//! them under `warnings:`; a run that completes preflight copies them into
+//! its report as `warning:` lines. Later execution-preflight refusals do not
+//! promise a report. `sections` also warns when an unescaped heading text
+//! run contains an unclosed upstroke comment, leaving the extracted title unchanged.
+//! Nothing in the attribute grammar errors: `DESIGN.md` §9 has unknown attributes warn and never
 //! error, and this module takes the same posture for values it cannot parse.
-//! For `min=` that posture removes a binding floor on a typo, which no later
-//! stage restores; whether that should refuse instead is the owner's call and
-//! is recorded as a finding rather than decided here.
+//! An unparseable `min=` supplies no valid binding floor. Adopting a refusal
+//! policy instead would require a separate change to that design contract.
 //!
 //! A source of the DAG, not a sink: nothing here reads a section, a draft or a
 //! hint.
@@ -133,6 +142,15 @@ pub(super) fn comments_in(html: &str) -> Vec<HtmlComment<'_>> {
     scan_comments(html).comments
 }
 
+/// A literal text run can contain an opener that the Markdown parser could
+/// not turn into inline HTML. Reuse the comment scanner so an author's
+/// unfinished non-upstroke comment does not expose a nested marker as ours.
+pub(super) fn has_unterminated_annotation(text: &str) -> bool {
+    scan_comments(text)
+        .unterminated
+        .is_some_and(|comment| upstroke_body(comment.inner).is_some())
+}
+
 /// A comment found in the event stream, placed in the source.
 pub(super) struct FoundComment {
     /// Source bytes of the comment, delimiters included. For an unterminated
@@ -164,13 +182,32 @@ pub(super) struct HtmlAccumulator {
     text: String,
     pieces: Vec<Piece>,
     in_block: bool,
+    /// Active containers and their measured opening prefixes. An unavailable
+    /// prefix prevents normalization rather than guessing at author text.
+    containers: Vec<Option<Container>>,
 }
 
 impl HtmlAccumulator {
     /// Feeds one event with its source range. Returns the comments that event
     /// completed, which is nothing for most events.
-    pub(super) fn observe(&mut self, event: &Event<'_>, range: &Range<usize>) -> Vec<FoundComment> {
+    pub(super) fn observe(
+        &mut self,
+        event: &Event<'_>,
+        range: &Range<usize>,
+        source: &str,
+    ) -> Vec<FoundComment> {
         match event {
+            Event::Start(Tag::BlockQuote(_)) | Event::Start(Tag::Item) => {
+                let quote = matches!(event, Event::Start(Tag::BlockQuote(_)));
+                let container = Container::open(source, range.start, quote, &self.containers);
+                self.containers.push(container);
+                self.close()
+            }
+            Event::End(TagEnd::BlockQuote(_)) | Event::End(TagEnd::Item) => {
+                self.containers
+                    .truncate(self.containers.len().saturating_sub(1));
+                self.close()
+            }
             Event::Start(Tag::HtmlBlock) => {
                 let pending = self.close();
                 self.in_block = true;
@@ -190,6 +227,12 @@ impl HtmlAccumulator {
                     Vec::new()
                 } else {
                     self.close()
+                        .into_iter()
+                        .map(|comment| FoundComment {
+                            inner: unquote_inline_comment(comment.inner, &self.containers),
+                            ..comment
+                        })
+                        .collect()
                 }
             }
             // Inside a block the only other event is the zero-width text
@@ -273,6 +316,216 @@ impl HtmlAccumulator {
     }
 }
 
+/// A parser-reported container. The opening position lets another container
+/// on the same line begin after its parent's actual marker, while later lines
+/// use the parent's continuation rule. Positions copy only byte/column counts.
+struct Container {
+    kind: ContainerKind,
+    line_start: usize,
+    opening: PrefixPosition,
+}
+
+enum ContainerKind {
+    Quote,
+    Item(usize),
+}
+
+impl Container {
+    /// Checked ranges and prefix recognition can be absent only if the supplied
+    /// event does not describe this source. Propagate that absence to disable
+    /// normalization; a guessed prefix could turn an unknown key into a binding.
+    fn open(source: &str, start: usize, quote: bool, parents: &[Option<Self>]) -> Option<Self> {
+        let before = source.get(..start)?;
+        let line_start = before.rfind(['\r', '\n']).map_or(0, |end| end + 1);
+        let line = source.get(line_start..)?;
+        let mut prefix = LinePrefix::new(line);
+        if let Some(parent) = parents.last() {
+            let parent = parent.as_ref()?;
+            if parent.line_start == line_start {
+                prefix = LinePrefix::at(line, parent.opening)?;
+            } else {
+                for parent in parents {
+                    if !prefix.continue_container(&parent.as_ref()?.kind) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let initial_column = prefix.position.column;
+        prefix.spaces(3);
+        let kind = if quote {
+            if !prefix.marker('>') {
+                return None;
+            }
+            prefix.spaces(1);
+            ContainerKind::Quote
+        } else {
+            if !(prefix.marker('-') || prefix.marker('+') || prefix.marker('*')) {
+                let mut digits = 0;
+                while digits < 9 {
+                    let Some(digit) = prefix.rest.chars().next().filter(char::is_ascii_digit)
+                    else {
+                        break;
+                    };
+                    prefix.marker(digit);
+                    digits += 1;
+                }
+                if digits == 0 || !(prefix.marker('.') || prefix.marker(')')) {
+                    return None;
+                }
+            }
+            // The parser gives list markers one to four padding columns;
+            // five or more, or an empty item, uses the one-column default.
+            let after_marker = prefix;
+            let padding = prefix.spaces(5);
+            let default_padding = padding == 5 || prefix.at_end_of_line();
+            let indent = if default_padding {
+                prefix = after_marker;
+                prefix.spaces(1);
+                after_marker.position.column - initial_column + 1
+            } else if padding == 0 {
+                return None;
+            } else {
+                prefix.position.column - initial_column
+            };
+            ContainerKind::Item(indent)
+        };
+        Some(Self {
+            kind,
+            line_start,
+            opening: prefix.position,
+        })
+    }
+}
+
+/// A small, borrowed cursor over a line's container prefix. Copying it is a
+/// rollback of scalar offsets and a borrowed suffix, not shared ownership.
+#[derive(Clone, Copy, Default)]
+struct PrefixPosition {
+    bytes: usize,
+    column: usize,
+    tab_remaining: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LinePrefix<'a> {
+    rest: &'a str,
+    position: PrefixPosition,
+}
+
+impl<'a> LinePrefix<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            rest: line,
+            position: PrefixPosition::default(),
+        }
+    }
+
+    fn at(line: &'a str, position: PrefixPosition) -> Option<Self> {
+        line.get(position.bytes..)
+            .map(|rest| Self { rest, position })
+    }
+
+    fn spaces(&mut self, limit: usize) -> usize {
+        let mut consumed = self.position.tab_remaining.min(limit);
+        self.position.tab_remaining -= consumed;
+        self.position.column += consumed;
+        while consumed < limit {
+            if let Some(rest) = self.rest.strip_prefix(' ') {
+                self.rest = rest;
+                self.position.bytes += 1;
+                self.position.column += 1;
+                consumed += 1;
+            } else if let Some(rest) = self.rest.strip_prefix('\t') {
+                self.rest = rest;
+                self.position.bytes += 1;
+                let width = 4 - self.position.column % 4;
+                let taken = width.min(limit - consumed);
+                self.position.column += taken;
+                self.position.tab_remaining = width - taken;
+                consumed += taken;
+            } else {
+                break;
+            }
+        }
+        consumed
+    }
+
+    fn marker(&mut self, marker: char) -> bool {
+        let Some(rest) = self.rest.strip_prefix(marker) else {
+            return false;
+        };
+        self.rest = rest;
+        self.position.bytes += marker.len_utf8();
+        self.position.column += 1;
+        true
+    }
+
+    fn at_end_of_line(&self) -> bool {
+        self.rest.is_empty() || self.rest.starts_with(['\r', '\n'])
+    }
+
+    fn continue_container(&mut self, kind: &ContainerKind) -> bool {
+        let saved = *self;
+        let matched = match kind {
+            ContainerKind::Quote => {
+                self.spaces(3);
+                // Match pulldown-cmark 0.13.4: the marker may follow a
+                // partially consumed tab; its optional space consumes the
+                // remaining virtual column before any following source byte.
+                if self.marker('>') {
+                    self.spaces(1);
+                    true
+                } else {
+                    false
+                }
+            }
+            ContainerKind::Item(indent) => self.spaces(*indent) == *indent || self.at_end_of_line(),
+        };
+        if !matched {
+            *self = saved;
+        }
+        matched
+    }
+}
+
+/// Inline comments retain raw continuation prefixes in pulldown-cmark 0.13.4.
+/// Consume only the active containers that each line actually continues.
+/// A missing prefix ends that scan, leaving an indented literal `>` intact.
+/// The opener's line has no prefix; block HTML has already shed its prefixes.
+fn unquote_inline_comment(inner: String, containers: &[Option<Container>]) -> String {
+    if !containers.iter().any(|container| {
+        matches!(
+            container,
+            Some(Container {
+                kind: ContainerKind::Quote,
+                ..
+            })
+        )
+    }) || containers.iter().any(Option::is_none)
+        || !inner.contains(['\r', '\n'])
+    {
+        return inner;
+    }
+    let mut normalized = String::with_capacity(inner.len());
+    // Splitting inclusively preserves each original line ending. A CRLF has
+    // an empty-content LF piece, which has no quote marker to remove.
+    let mut lines = inner.split_inclusive(['\r', '\n']);
+    if let Some(first) = lines.next() {
+        normalized.push_str(first);
+    }
+    for line in lines {
+        let mut prefix = LinePrefix::new(line);
+        for container in containers.iter().flatten() {
+            if !prefix.continue_container(&container.kind) {
+                break;
+            }
+        }
+        normalized.push_str(prefix.rest);
+    }
+    normalized
+}
+
 /// `slice` with `spans` cut out. The spans are byte ranges of `slice`, in
 /// ascending order of start; overlapping spans are merged. `None` when a span
 /// does not lie within `slice` on character boundaries: the caller keeps the
@@ -349,6 +602,8 @@ impl AnnotationSink {
 /// the comment sets it, and `assemble` fills what is absent from the
 /// heuristics: a slug for the id, the title keywords for the kind, document
 /// order for the dependencies.
+/// Clone supports the unchanged `Draft::annotation` callers in `assemble`;
+/// removing those copies belongs to their separate ownership cleanup.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct Annotation {
     /// `id=`: reserved before any slug is derived. An empty value is absent.
@@ -420,37 +675,28 @@ impl Key {
 fn parse_annotation(body: &str, ctx: &str, warnings: &mut Vec<String>) -> Annotation {
     // The last value of each attribute, in first-seen order.
     let mut values: Vec<(Key, &str)> = Vec::new();
-    for line in body.lines() {
-        // An inline comment spanning lines inside a blockquote carries the
-        // quote's `>` markers at the start of its continuation lines
-        // (measured, module doc); they are container syntax, not attributes.
-        // Only the line's leading run is shed: no name in `Key` begins with
-        // `>`, so a line never legitimately starts with one, and a value
-        // that contains or begins with `>` sits after its `key=` and is kept.
-        let line = line.trim_start_matches(['>', ' ', '\t']);
-        for token in line.split_whitespace() {
-            let Some((name, value)) = token.split_once('=') else {
+    for token in body.split_whitespace() {
+        let Some((name, value)) = token.split_once('=') else {
+            warnings.push(format!(
+                "malformed annotation attribute `{token}` in {ctx} (expected key=value); ignored"
+            ));
+            continue;
+        };
+        let Some(key) = Key::parse(name) else {
+            warnings.push(format!(
+                "unknown annotation attribute `{name}` in {ctx}; ignored"
+            ));
+            continue;
+        };
+        match values.iter_mut().find(|(seen, _)| *seen == key) {
+            Some(slot) => {
                 warnings.push(format!(
-                    "malformed annotation attribute `{token}` in {ctx} (expected key=value); ignored"
+                    "annotation attribute `{}` repeated in {ctx}; the last one applies",
+                    key.name()
                 ));
-                continue;
-            };
-            let Some(key) = Key::parse(name) else {
-                warnings.push(format!(
-                    "unknown annotation attribute `{name}` in {ctx}; ignored"
-                ));
-                continue;
-            };
-            match values.iter_mut().find(|(seen, _)| *seen == key) {
-                Some(slot) => {
-                    warnings.push(format!(
-                        "annotation attribute `{}` repeated in {ctx}; the last one applies",
-                        key.name()
-                    ));
-                    slot.1 = value;
-                }
-                None => values.push((key, value)),
+                slot.1 = value;
             }
+            None => values.push((key, value)),
         }
     }
     let mut ann = Annotation::default();
@@ -925,6 +1171,232 @@ mod tests {
     }
 
     #[test]
+    fn inline_and_block_annotations_keep_their_floor_in_each_container_and_line_ending() {
+        for source in [
+            "## Fix bug\nContext <!-- upstroke: id=a\nmin=frontier --> more.\n",
+            "## Fix bug\n> Context <!-- upstroke: id=a\n>min=frontier --> more.\n",
+            "## Fix bug\n> Context <!-- upstroke: id=a\n> min=frontier --> more.\n",
+            "## Fix bug\n>> Context <!-- upstroke: id=a\n>>min=frontier --> more.\n",
+            "## Fix bug\n> > Context <!-- upstroke: id=a\n> > min=frontier --> more.\n",
+            "## Fix bug\n- > Context <!-- upstroke: id=a\n  > min=frontier --> more.\n",
+            "## Fix bug\n> - Context <!-- upstroke: id=a\n>   min=frontier --> more.\n",
+            "## Fix bug\n> Context <!-- upstroke: id=a\nmin=frontier --> more.\n",
+            "## Fix bug\n<!-- upstroke: id=a\nmin=frontier -->\nmore.\n",
+            "## Fix bug\n> <!-- upstroke: id=a\n>min=frontier -->\n\nmore.\n",
+            "## Fix bug\n> > <!-- upstroke: id=a\n> > min=frontier -->\n\nmore.\n",
+            "- [ ] Fix bug\n  > Context <!-- upstroke: id=a\n  > min=frontier --> more.\n",
+            "- [ ] Fix bug\n  <!-- upstroke: id=a\n  min=frontier -->\n\n  more.\n",
+            "- [ ] Fix bug\n  > <!-- upstroke: id=a\n  >min=frontier -->\n\n  more.\n",
+        ] {
+            for ending in ["\n", "\r\n", "\r"] {
+                let raw = source.replace('\n', ending);
+                let parsed = parse(&raw);
+                let t = task(&parsed, 0);
+                assert_eq!(t.id.as_str(), "a", "{raw:?}");
+                assert_eq!(t.min_tier, Some(Tier::Frontier), "{raw:?}");
+                assert!(parsed.warnings.is_empty(), "{raw:?}: {:?}", parsed.warnings);
+                assert!(!t.body.contains("upstroke"), "{raw:?}: {}", t.body);
+                assert!(
+                    t.body.contains("more.") || t.title.contains("more."),
+                    "{raw:?}: title={:?}, body={:?}",
+                    t.title,
+                    t.body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quote_containers_leave_literal_quote_markers_in_attribute_names_and_values() {
+        for source in [
+            "## Fix bug\n<!-- upstroke: >id=wrong paths=>keep -->\n",
+            "## Fix bug\nContext <!-- upstroke: >id=wrong paths=>keep --> more.\n",
+            "## Fix bug\n<!-- upstroke:\n>id=wrong paths=>keep -->\n",
+            "## Fix bug\n> Context <!-- upstroke: >id=wrong paths=>keep --> more.\n",
+            "## Fix bug\n> Context <!-- upstroke:\n>     >id=wrong paths=>keep --> more.\n",
+            "## Fix bug\n>> Context <!-- upstroke:\n>>     >id=wrong paths=>keep --> more.\n",
+            "## Fix bug\n> <!-- upstroke:\n> >id=wrong paths=>keep -->\n",
+            "## Fix bug\n> > <!-- upstroke:\n> > >id=wrong paths=>keep -->\n",
+        ] {
+            for ending in ["\n", "\r\n", "\r"] {
+                let raw = source.replace('\n', ending);
+                let parsed = parse(&raw);
+                let t = task(&parsed, 0);
+                assert_eq!(t.id.as_str(), "fix-bug", "{raw:?}");
+                assert_eq!(t.path_hints, [">keep"], "{raw:?}");
+                assert_eq!(
+                    warnings_mentioning(&parsed, "unknown annotation attribute `>id`").len(),
+                    1,
+                    "{raw:?}: {:?}",
+                    parsed.warnings
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_quote_container_interrupts_an_unclosed_inline_comment() {
+        use pulldown_cmark::Parser;
+
+        for (raw, quote_count) in [
+            (
+                "## Fix bug\nContext <!-- upstroke:\n>id=wrong paths=>keep --> more.\n",
+                1,
+            ),
+            (
+                "## Fix bug\n> Context <!-- upstroke:\n> >id=wrong paths=>keep --> more.\n",
+                2,
+            ),
+        ] {
+            let events: Vec<_> = Parser::new_ext(raw, super::super::md_options()).collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Start(Tag::BlockQuote(_))))
+                    .count(),
+                quote_count,
+                "{raw:?}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event, Event::InlineHtml(text) | Event::Html(text) if text.contains("upstroke:")
+                )),
+                "the interrupted opener is text, not an HTML comment: {events:?}"
+            );
+            let parsed = parse(raw);
+            assert_eq!(task(&parsed, 0).id.as_str(), "fix-bug");
+            assert!(task(&parsed, 0).path_hints.is_empty());
+        }
+    }
+
+    #[test]
+    fn indented_lazy_quote_continuations_keep_literal_attribute_markers() {
+        use pulldown_cmark::Parser;
+
+        let mut failures = Vec::new();
+        for (label, opener, continuation, literal) in [
+            ("zero spaces", "> Context ", ">", false),
+            ("one space", "> Context ", " >", false),
+            ("two spaces", "> Context ", "  >", false),
+            ("three spaces", "> Context ", "   >", false),
+            ("four spaces", "> Context ", "    >", true),
+            ("tab to column four", "> Context ", "\t>", false),
+            ("space and tab", "> Context ", " \t>", false),
+            ("two spaces and tab", "> Context ", "  \t>", false),
+            ("three spaces and tab", "> Context ", "   \t>", true),
+            ("nested quote marker", ">> Context ", ">    >", false),
+            ("nested lazy literal", ">> Context ", ">     >", true),
+            ("nested tab marker", ">> Context ", "> \t>", false),
+            (
+                "nested indented tab literal",
+                ">> Context ",
+                ">    \t>",
+                true,
+            ),
+            ("list quote marker", "- item\n  > Context ", "    >", false),
+            ("list lazy literal", "- item\n  > Context ", "      >", true),
+            ("list tab marker", "- item\n  > Context ", "  \t>", false),
+            (
+                "nested list quote marker",
+                "- item\n  - nested\n    > Context ",
+                "    >",
+                false,
+            ),
+            ("same-line list quote", "- > Context ", "  >", false),
+            (
+                "same-line nested containers",
+                "- > - > Context ",
+                "  >   >",
+                false,
+            ),
+            (
+                "wide ordered item",
+                "123456789. > Context ",
+                "           >",
+                false,
+            ),
+            ("empty item quote", "-\n  > Context ", "  >", false),
+            ("quote after a blank item", "-\n\n> Context ", ">", false),
+        ] {
+            let raw = format!(
+                "## Fix bug\n{opener}<!-- upstroke:\n{continuation}id=wrong paths=>keep --> more.\n"
+            );
+            // Removing only the comment delimiters exposes the same paragraph
+            // continuation as ordinary text. Its events distinguish a literal
+            // `>id` from a container marker independently of our normalization.
+            let plain = raw
+                .replace("<!-- upstroke:", "upstroke:")
+                .replace("-->", "");
+            let plain_events: Vec<_> = Parser::new_ext(&plain, super::super::md_options())
+                .into_offset_iter()
+                .collect();
+            let plain_text: String = plain_events
+                .iter()
+                .filter_map(|(event, _)| match event {
+                    Event::Text(text) => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            let measured_literal = plain_text.contains(">id=wrong");
+            if measured_literal != literal {
+                failures.push(format!(
+                    "{label}: control expected literal={literal}, measured literal={measured_literal}; events {plain_events:?}"
+                ));
+            }
+            let events: Vec<_> = Parser::new_ext(&raw, super::super::md_options())
+                .into_offset_iter()
+                .collect();
+            assert!(
+                events.iter().any(|(event, _)| matches!(event, Event::InlineHtml(text) if text.contains("upstroke:"))),
+                "{label} must remain an inline comment: {events:?}"
+            );
+            let parsed = parse(&raw);
+            let t = task(&parsed, 0);
+            let expected_id = if measured_literal { "fix-bug" } else { "wrong" };
+            let expected_warnings = usize::from(measured_literal);
+            if t.id.as_str() != expected_id
+                || warnings_mentioning(&parsed, "unknown annotation attribute `>id`").len()
+                    != expected_warnings
+                || t.path_hints != [">keep"]
+            {
+                failures.push(format!(
+                    "{label}: input {raw:?}; expected id {expected_id} and {expected_warnings} unknown-key warnings; task {t:?}; warnings {:?}; events {events:?}; control events {plain_events:?}",
+                    parsed.warnings
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn an_unterminated_checklist_comment_keeps_its_original_line_endings_and_container_text() {
+        for (source, body) in [
+            (
+                "- [ ] Deploy\n  <!-- upstroke: id=deploy\n  Do not deploy before é.\n",
+                "<!-- upstroke: id=deploy\n  Do not deploy before é.",
+            ),
+            (
+                "- [ ] Deploy\n  > <!-- upstroke: id=deploy\n  > Do not deploy before é.\n",
+                "<!-- upstroke: id=deploy\n  > Do not deploy before é.",
+            ),
+        ] {
+            for ending in ["\n", "\r\n", "\r"] {
+                let raw = source.replace('\n', ending);
+                let parsed = parse(&raw);
+                let t = task(&parsed, 0);
+                assert_eq!(t.title, "Deploy");
+                assert_eq!(t.body, body.replace('\n', ending), "{raw:?}");
+                assert_eq!(
+                    warnings_mentioning(&parsed, "unterminated upstroke annotation").len(),
+                    1,
+                    "{raw:?}: {:?}",
+                    parsed.warnings
+                );
+            }
+        }
+    }
+
+    #[test]
     fn two_inline_heading_annotations_warn_and_the_first_wins() {
         // Pass 1 finding 4: both comments sit on the heading line, so the
         // second reaches the sink through `split_sections`, not the body walk.
@@ -1013,7 +1485,7 @@ mod tests {
         let mut html = HtmlAccumulator::default();
         let mut found = Vec::new();
         for (event, range) in Parser::new_ext(raw, super::super::md_options()).into_offset_iter() {
-            found.extend(html.observe(&event, &range));
+            found.extend(html.observe(&event, &range, raw));
         }
         found.extend(html.finish());
         let seen: Vec<(Range<usize>, &str, bool)> = found
@@ -1035,7 +1507,7 @@ mod tests {
         let mut html = HtmlAccumulator::default();
         let mut found = Vec::new();
         for (event, range) in Parser::new_ext(raw, super::super::md_options()).into_offset_iter() {
-            found.extend(html.observe(&event, &range));
+            found.extend(html.observe(&event, &range, raw));
         }
         found.extend(html.finish());
         let seen: Vec<(Range<usize>, &str)> = found

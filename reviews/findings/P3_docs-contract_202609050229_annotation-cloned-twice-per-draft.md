@@ -1,28 +1,24 @@
 ---
 id: SWEEP-ANNOTATION-002
 severity: P3
-disposition: deferred     # the sites are in drafts.rs (row 65) and assemble.rs (row 64)
+disposition: deferred
 category: docs-contract
 pr: 169
 reviewed_sha: 323beb0b1b3ebc2ab645bf10f1cfde81d2b7250b
 location: src/plan/markdown/drafts.rs:35
 provenance: pre_existing
 first_bad:
-guard: `Draft::annotation` and the two `annotation()` calls in `assemble`
+guard: `Draft::annotation` and the two `annotation()` calls in `assemble`; the activation rule in `standards/SWEEP.md`
 ---
 
 ## Failure sequence
 
-`Draft` holds `ann: Option<Annotation>` and `Draft::annotation` returns
-`self.ann.clone().unwrap_or_default()`. `assemble` calls it once per draft to reserve explicit
-ids and once more per draft to build the task, so every annotation — six `String` vectors — is
-cloned twice, and the clone exists to satisfy the borrow checker: `assemble` needs `ann` while
-it moves `draft.title`, `draft.body` and `draft.acceptance` out of the draft. §6 names that
-clone as the exception to justify, not the default.
+`Draft::annotation` clones its owned annotation, and `assemble` calls it once to reserve explicit IDs and again to construct each task. The calls duplicate annotation strings and vectors so assembly can retain the annotation while moving other draft fields. The clone is an ownership shortcut that a later refactor can remove.
+
+## Current triage
+
+Re-triaged on 2026-09-05 during PR #169's second repair. The bodies of `Draft::annotation` and `assemble` are unchanged and their files remain unswept; the current edits to other functions in drafts.rs do not activate those bodies under standards/SWEEP.md. This is deferred ownership cleanup, with no failing behavior test or activated MUST breach asserted. The decision does not rely on a historical restriction against editing caller files.
 
 ## What the change that takes this up should do
 
-Hold `Annotation` (whose `Default` is "absent") rather than `Option<Annotation>` in `Draft`,
-return `&Annotation` from `annotation`, and destructure the draft in `assemble` so the fields
-move and the annotation is borrowed or moved with them. `Annotation` keeps `Clone` until then;
-`annotation.rs` is swept and the derive is documented.
+Borrow the annotation while reserving IDs and move it when assembling the task, destructuring the draft to move its other fields. Holding an empty Annotation directly rather than Option<Annotation> is one possible representation. Keep observable ID reservation and task assembly behavior covered while removing the duplicate copies. The Annotation Clone derive remains necessary until its existing callers change.

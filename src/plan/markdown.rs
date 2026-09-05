@@ -17,15 +17,17 @@
 //! `drafts`; `drafts` and `hints` feed `assemble`; every child feeds this
 //! module and none of them is reachable from outside it.
 //!
-//! The one thing that flows the other way is `md_options`, the single
-//! `pulldown_cmark::Options` value every child parses with — it stays here so
-//! that the three parse sites cannot drift apart.
+//! `md_options` supplies the same parser options to every child. `parser_source`
+//! makes lone-CR line boundaries visible to the parser without moving source
+//! byte offsets. Both stay here so the three walks use the same input rules.
 
 mod annotation;
 mod assemble;
 mod drafts;
 mod hints;
 mod sections;
+
+use std::borrow::Cow;
 
 use pulldown_cmark::Options;
 
@@ -55,7 +57,7 @@ impl PlanAdapter for MarkdownPlanAdapter {
 
     fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, UpstrokeError> {
         let mut warnings = Vec::new();
-        let sections = split_sections(raw);
+        let sections = split_sections(raw, &mut warnings);
         let drafts: Vec<Draft> = if sections.is_empty() {
             checklist_drafts(raw, &mut warnings)
         } else {
@@ -69,7 +71,8 @@ impl PlanAdapter for MarkdownPlanAdapter {
                 message: "no tasks found: expected `##`/`###` sections, a top-level checklist, \
                           or numbered steps"
                     .to_owned(),
-            });
+            }
+            .with_warnings(warnings));
         }
         let mut tasks = assemble(drafts);
         let artifacts = collect_artifacts(&mut tasks, &mut warnings);
@@ -91,6 +94,33 @@ fn md_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TASKLISTS);
     options
+}
+
+/// pulldown-cmark 0.13.4's HTML-block scanner advances only at LF, although
+/// its paragraph scanner also recognizes lone CR. Give every walk the same
+/// line boundaries. Replacing a lone ASCII CR by LF keeps byte ranges valid
+/// against the original source used for bodies and the input hash. CRLF is
+/// already supported and stays unchanged. The owned copy exists only when
+/// this parser boundary needs normalization.
+fn parser_source(raw: &str) -> Cow<'_, str> {
+    let has_lone_cr = raw.ends_with('\r')
+        || raw
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, [b'\r', next] if *next != b'\n'));
+    if !has_lone_cr {
+        return Cow::Borrowed(raw);
+    }
+    let mut normalized = String::with_capacity(raw.len());
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() != Some(&'\n') {
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 /// `1. step` / `1) step` — Claude Code plan mode often writes numbered steps.
@@ -202,6 +232,65 @@ mod tests {
             "warnings: {:?}",
             parsed.warnings
         );
+    }
+
+    #[test]
+    fn a_no_tasks_refusal_keeps_the_orphan_annotation_warning() {
+        let error = MarkdownPlanAdapter
+            .parse_with_warnings("# Plan\n<!-- upstroke: id=orphan -->\n\n- plain bullet\n")
+            .expect_err("plain bullets do not become tasks");
+        let rendered = error.to_string();
+        assert!(rendered.contains("no tasks found"), "{rendered}");
+        assert!(
+            rendered.contains("outside any checklist item"),
+            "{rendered}"
+        );
+        assert!(matches!(error, UpstrokeError::WithWarnings(_)));
+    }
+
+    #[test]
+    fn an_unclosed_heading_annotation_warns_without_rewriting_the_title() {
+        let parsed = parse("## Title <!-- upstroke: id=a\nkind=fix -->\nBody.\n");
+        let task = &parsed.plan.tasks[0];
+        assert_eq!(task.title, "Title <!-- upstroke: id=a");
+        assert_eq!(task.kind, TaskKind::Implement);
+        assert!(task.body.contains("kind=fix -->"));
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert!(parsed.warnings[0].contains("unterminated upstroke annotation in heading"));
+        assert!(parsed.warnings[0].contains("title is unchanged"));
+    }
+
+    #[test]
+    fn code_escaped_and_author_comment_examples_in_headings_are_not_annotations() {
+        for raw in [
+            "## Title `<!-- upstroke: id=a`\nBody.\n",
+            "## Title \\<!-- upstroke: id=a\nBody.\n",
+            "## Title &lt;!-- upstroke: id=a\nBody.\n",
+            "## Title <!-- note <!-- upstroke: id=a\nBody.\n",
+            "## Title <!-- note -->\nBody.\n",
+        ] {
+            let parsed = parse(raw);
+            assert!(parsed.warnings.is_empty(), "{raw:?}: {:?}", parsed.warnings);
+        }
+    }
+
+    #[test]
+    fn lone_cr_parser_normalization_preserves_offsets_bodies_and_the_original_input_hash() {
+        for raw in ["plain\ntext", "plain\r\ntext", "", "é\r\n"] {
+            assert!(matches!(parser_source(raw), Cow::Borrowed(_)), "{raw:?}");
+        }
+        let raw = "é\rβ\r\nγ\r";
+        let normalized = parser_source(raw);
+        assert_eq!(normalized, "é\nβ\r\nγ\n");
+        assert_eq!(normalized.len(), raw.len());
+
+        let raw = "## First\r<!-- upstroke: id=a -->\ré\rβ\r\r## Second\rBody.\r";
+        let parsed = parse(raw);
+        assert_eq!(parsed.plan.tasks.len(), 2);
+        assert_eq!(parsed.plan.tasks[0].body, "é\rβ");
+        assert_eq!(parsed.plan.tasks[1].body, "Body.");
+        assert_eq!(parsed.plan.source.hash, content_hash(raw.as_bytes()));
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 
     #[test]

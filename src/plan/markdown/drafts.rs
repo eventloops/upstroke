@@ -20,8 +20,8 @@ use super::annotation::{
     Annotation, AnnotationSink, HtmlAccumulator, OPEN, strip_spans, upstroke_body,
 };
 use super::hints::{collect_code_hint, collect_text_hints};
-use super::md_options;
 use super::sections::{Section, is_acceptance_header, strip_trailing_colon};
+use super::{md_options, parser_source};
 
 #[derive(Default)]
 pub(super) struct Draft {
@@ -73,10 +73,11 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     // nested sub-list keeps both its own text and the children, in order.
     let mut item_slots: Vec<usize> = Vec::new();
 
-    for (event, range) in Parser::new_ext(slice, md_options()).into_offset_iter() {
+    let normalized = parser_source(slice);
+    for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
         // The accumulator sees every event and hands a comment back once the
         // HTML block or inline construct holding it is complete.
-        for comment in html.observe(&event, &range) {
+        for comment in html.observe(&event, &range, &normalized) {
             if let Some(span) = sink.take(&comment, &ctx, warnings) {
                 annotation_spans.push(span);
             }
@@ -217,19 +218,29 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
     let mut top_list_ordered = false;
     let mut html = HtmlAccumulator::default();
 
-    for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
-        for comment in html.observe(&event, &range) {
+    let normalized = parser_source(raw);
+    for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
+        for comment in html.observe(&event, &range, &normalized) {
             match current.as_mut() {
                 // The body is built from the text events, which an HTML
                 // block never produces, so the span the sink returns has
                 // nothing to cut here — and the prose an unterminated
-                // comment swallowed is put back by hand, as the block held
-                // it, which is what the sink's warning promises.
+                // comment swallowed is put back from the original source,
+                // preserving its line endings and container prefixes too.
                 Some((draft, sink)) => {
                     sink.take(&comment, "checklist item", warnings);
                     if !comment.terminated && upstroke_body(&comment.inner).is_some() {
-                        draft.body.push_str(OPEN);
-                        draft.body.push_str(&comment.inner);
+                        match raw.get(comment.span.clone()) {
+                            Some(original) => draft.body.push_str(original),
+                            None => {
+                                warnings.push(
+                                    "internal error: an unterminated annotation span is outside the plan; \
+                                     the checklist body keeps the parser's recovered text".to_owned(),
+                                );
+                                draft.body.push_str(OPEN);
+                                draft.body.push_str(&comment.inner);
+                            }
+                        }
                         draft.body.push(' ');
                     }
                 }
