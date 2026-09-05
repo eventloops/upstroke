@@ -52,7 +52,7 @@ pub enum Wrote {
     /// The file did not exist, or `--force` replaced one that differed.
     Written,
     /// Configures exactly what is already there, and says exactly the same
-    /// thing about it — compared over [`settings_of`] and [`stable_content`]
+    /// thing about it — compared over [`settings_match`] and [`stable_content`]
     /// rather than over bytes.
     Unchanged,
     /// An existing file differs and `--force` was not given.
@@ -93,12 +93,19 @@ pub fn run(opts: &ConnectOptions) -> Result<ConnectReport, UpstrokeError> {
 /// The injectable form: `adapters` supplies the implementations and `ids` the
 /// registry order, so a test can drive scripted discovery with no CLI on the
 /// machine at all.
+///
+/// # Errors
+///
+/// Returns a refusal when no destination can be determined, an I/O error
+/// when the existing file cannot be read, or a filesystem error naming a
+/// failed directory creation or file write.
 pub fn run_with<'a>(
     opts: &ConnectOptions,
     adapters: &dyn AdapterSource,
     ids: impl IntoIterator<Item = &'a str>,
 ) -> Result<ConnectReport, UpstrokeError> {
     let path = match &opts.pools_path {
+        // The returned report owns its path independently of these options.
         Some(path) => path.clone(),
         None => util::user_upstroke_dir()
             .map(|dir| dir.join("pools.toml"))
@@ -112,8 +119,12 @@ pub fn run_with<'a>(
 
     // Read before anything is written: `--force` must not silently discard the
     // keys only an operator can supply.
-    let existing_text = fs::read_to_string(&path).ok();
-    let carried = existing_text
+    let existing_text = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => return Err(UpstrokeError::Io { path, source }),
+    };
+    let mut carried = existing_text
         .as_deref()
         .map(operator_keys)
         .unwrap_or_default();
@@ -160,8 +171,10 @@ pub fn run_with<'a>(
                     ));
                 }
                 let mut pool = pool_for_agent(id, &discovery);
-                if let Some(kept) = carried.get(&pool.name) {
-                    kept.apply(&mut pool);
+                if let Some(kept) = carried.remove(&pool.name) {
+                    if let Err(error) = kept.apply(&mut pool) {
+                        warnings.push(format!("pool `{}`: {error}; using auto", pool.name));
+                    }
                 }
                 agents.push(AgentReport {
                     agent: id.to_owned(),
@@ -170,7 +183,6 @@ pub fn run_with<'a>(
                 });
             }
             Err(error) => {
-                warnings.push(format!("{id}: no pool written — {error}"));
                 agents.push(AgentReport {
                     agent: id.to_owned(),
                     outcome: Err(error.to_string()),
@@ -193,18 +205,11 @@ pub fn run_with<'a>(
     // the other way made every re-connect a conflict resolvable only by
     // `--force`, the flag that discards hand edits.
     let outcome = match &existing {
-        Some(existing) if settings_of(existing) != settings_of(&content) && !opts.force => {
-            Wrote::Refused
-        }
+        Some(existing) if !settings_match(existing, &content) && !opts.force => Wrote::Refused,
         Some(existing) if stable_content(existing) == stable_content(&content) => Wrote::Unchanged,
         _ => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            util::write_text(&path, &content)?;
+            // The write boundary already names the operation and failed path.
+            write_pools(&path, &content)?;
             Wrote::Written
         }
     };
@@ -218,71 +223,45 @@ pub fn run_with<'a>(
     })
 }
 
-/// The settings a pools file actually carries — comments and blank lines
-/// dropped.
-///
-/// "Differs" has to mean *differs in what it configures*, not "differs in
-/// bytes". The header names the write date, so a byte comparison would make
-/// two runs a second apart look like a conflict: every re-`connect` would
-/// refuse, and the only way past it would be `--force`, which is exactly the
-/// flag that discards hand edits. A refusal an operator is trained to bypass
-/// protects nothing.
-///
-/// The other direction holds too: an operator who edits only a comment has
-/// changed no setting, and being told their file conflicts would be noise.
-fn settings_of(text: &str) -> Vec<String> {
-    text.lines()
-        .map(strip_comment)
-        .filter(|line| !line.is_empty())
-        .collect()
+/// Replace the file after the caller has decided that replacement is allowed.
+/// This reports creation and write failures separately; it provides no atomic
+/// publication or durability guarantee beyond the underlying filesystem calls.
+fn write_pools(path: &std::path::Path, content: &str) -> Result<(), UpstrokeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
+            operation: "create directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(path, content).map_err(|source| UpstrokeError::Filesystem {
+        operation: "write pools file",
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
-/// A line with any comment removed, whole-line or trailing.
+/// Compare complete TOML documents, preserving the values of every key.
 ///
-/// Trailing matters because `connect` writes one: `render::pool_section` decorates
-/// `reserve` with `# headroom kept for your own interactive sessions`, so the
-/// single line an operator is most likely to tidy is the one a whole-line-only
-/// filter would treat as a changed setting. `#` inside a quoted value is not a
-/// comment, so TOML's two string forms are tracked: inside a basic string a
-/// backslash escapes the next character, so `\"` does not close it, and a
-/// literal string runs to the next `'` with no escapes at all.
+/// Parsing handles quoted keys, escapes, multiline strings, and comments with
+/// one grammar. The previous line scanner collapsed whitespace inside strings
+/// and could overwrite an operator's renamed pool. Formatting and table order
+/// do not change parsed settings; integer and float values remain distinct so
+/// comparison never rounds an integer into a different value.
 ///
-/// Treating every `"` as a boundary made `\"` close the string, so two table
-/// headers that differ after it — `[pools."x\"#A"]` and `[pools."x\"#B"]` —
-/// stripped to the same prefix, compared equal as settings, and the operator's
-/// rename was written over without `--force` (PR #168, pass 1). The renderer
-/// writes escapes for exactly the names and values that need them, so this is
-/// the reader that has to understand them.
-fn strip_comment(line: &str) -> String {
-    enum In {
-        Text,
-        Basic,
-        Literal,
+/// A parse failure means there is no evidence that replacement preserves the
+/// settings. The caller reports Refused unless the operator supplied --force.
+fn settings_match(existing: &str, proposed: &str) -> bool {
+    match (
+        toml::from_str::<toml::Table>(existing),
+        toml::from_str::<toml::Table>(proposed),
+    ) {
+        (Ok(existing), Ok(proposed)) => existing == proposed,
+        (Err(_), _) | (_, Err(_)) => false,
     }
-    let mut state = In::Text;
-    let mut out = String::new();
-    let mut chars = line.chars();
-    while let Some(ch) = chars.next() {
-        match (&state, ch) {
-            (In::Text, '"') => state = In::Basic,
-            (In::Text, '\'') => state = In::Literal,
-            (In::Text, '#') => break,
-            (In::Basic, '\\') => {
-                out.push(ch);
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-                continue;
-            }
-            (In::Basic, '"') | (In::Literal, '\'') => state = In::Text,
-            _ => {}
-        }
-        out.push(ch);
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Everything except the one line that moves on its own.
+/// Everything except the first line when it is the generated timestamp header.
 ///
 /// The header records when `connect` ran, so comparing whole bytes would call
 /// two runs a second apart different. Everything else — including every
@@ -290,7 +269,9 @@ fn strip_comment(line: &str) -> String {
 /// current, so it belongs in the comparison that decides whether to rewrite.
 fn stable_content(text: &str) -> Vec<&str> {
     text.lines()
-        .filter(|line| !line.starts_with("# Written by `upstroke connect`"))
+        .enumerate()
+        .filter(|(index, line)| *index != 0 || !line.starts_with(render::WRITTEN_BY))
+        .map(|(_, line)| line)
         .collect()
 }
 
@@ -329,7 +310,7 @@ fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {
 /// particular is the entire point of §13's multi-account seam, and
 /// `monthly_allowance` is the only thing that makes a self-metered estimate
 /// possible at all (`Auto` yields `Unknown`).
-#[derive(Debug, Default, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Default, PartialEq, serde::Deserialize)]
 struct OperatorKeys {
     profile: Option<String>,
     monthly_allowance: Option<toml::Value>,
@@ -337,16 +318,22 @@ struct OperatorKeys {
 }
 
 impl OperatorKeys {
-    fn apply(&self, pool: &mut Pool) {
-        if let Some(profile) = &self.profile {
-            pool.profile = Some(profile.clone());
+    /// Move the operator's valid keys into the new pool. An invalid allowance
+    /// leaves the discovered Auto default and reports why to the caller, which
+    /// adds the pool name to the visible warning.
+    fn apply(self, pool: &mut Pool) -> Result<(), InvalidAllowance> {
+        if let Some(profile) = self.profile {
+            pool.profile = Some(profile);
         }
-        if let Some(endpoint) = &self.endpoint {
-            pool.endpoint = Some(endpoint.clone());
+        if let Some(endpoint) = self.endpoint {
+            pool.endpoint = Some(endpoint);
         }
-        if let Some(units) = self.monthly_allowance.as_ref().and_then(allowance_of) {
-            pool.monthly_allowance = units;
+        if let Some(value) = self.monthly_allowance {
+            // The error identifies this setting; run_with supplies the pool
+            // context and decides how to report the rejected value.
+            pool.monthly_allowance = allowance_of(&value)?;
         }
+        Ok(())
     }
 
     fn any(&self) -> bool {
@@ -354,14 +341,24 @@ impl OperatorKeys {
     }
 }
 
-fn allowance_of(value: &toml::Value) -> Option<crate::capacity::Allowance> {
+#[derive(Debug, thiserror::Error)]
+#[error("monthly_allowance must be a positive finite number or the string \"auto\"")]
+struct InvalidAllowance;
+
+fn allowance_of(value: &toml::Value) -> Result<crate::capacity::Allowance, InvalidAllowance> {
     match value {
         toml::Value::String(text) if text.trim().eq_ignore_ascii_case("auto") => {
-            Some(crate::capacity::Allowance::Auto)
+            Ok(crate::capacity::Allowance::Auto)
         }
-        toml::Value::Integer(units) => Some(crate::capacity::Allowance::Units(*units as f64)),
-        toml::Value::Float(units) => Some(crate::capacity::Allowance::Units(*units)),
-        _ => None,
+        toml::Value::Integer(units) if *units > 0 => {
+            // Every positive i64 fits the finite f64 range. Conversion uses
+            // the same capacity representation as config::read.
+            Ok(crate::capacity::Allowance::Units(*units as f64))
+        }
+        toml::Value::Float(units) if units.is_finite() && *units > 0.0 => {
+            Ok(crate::capacity::Allowance::Units(*units))
+        }
+        _ => Err(InvalidAllowance),
     }
 }
 
@@ -526,6 +523,360 @@ mod tests {
     }
 
     #[test]
+    fn quoted_pool_renames_preserve_every_string_byte_without_force() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-quoted")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let machine = Machine {
+            adapters: vec![FakeAdapter {
+                id: "x y",
+                discovery: Some(Discovery {
+                    auth: AuthState::Authenticated,
+                    models: Vec::new(),
+                    shape: Some(PoolKind::Credits),
+                    notes: Vec::new(),
+                }),
+            }],
+        };
+        let options = ConnectOptions {
+            pools_path: Some(path.clone()),
+            force: false,
+        };
+        let first = run_with(&options, &machine, ["x y"]).expect("generate a quoted pool key");
+        assert_eq!(first.outcome, Wrote::Written);
+        for header in [
+            "[pools.\"x  y\"]",
+            "[pools.\"x\ty\"]",
+            "[pools.\"x\u{a0}y\"]",
+            "[pools.'x  y']",
+            "[pools.'x\ty']",
+            "[pools.\" x y\"]",
+            "[pools.\"x y \"]",
+        ] {
+            let renamed = first.content.replace("[pools.\"x y\"]", header);
+            assert_ne!(renamed, first.content, "the header replacement must apply");
+            let parsed: toml::Table = toml::from_str(&renamed).expect("a valid TOML rename");
+            assert!(parsed.get("pools").is_some(), "the renamed pool exists");
+            fs::write(&path, &renamed).expect("write the operator's rename");
+            let next = run_with(&options, &machine, ["x y"]).expect("compare the renamed pool");
+            assert_eq!(next.outcome, Wrote::Refused, "header {header:?}");
+            assert_eq!(
+                fs::read_to_string(&path).expect("read after refusal"),
+                renamed
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_toml_spellings_refresh_without_force() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-spelling")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        for (from, to) in [
+            ("reserve = 0.20", "reserve = 0.2"),
+            ("[pools.claude-code]", "[pools.'claude-code']"),
+            ("[\"signals\", \"self\"]", "[ 'signals' ,\n 'self',\n]"),
+            ("agent = \"claude-code\"", "agent = '''claude-code'''"),
+        ] {
+            let edited = first.content.replace(from, to);
+            assert_ne!(edited, first.content, "the spelling change must apply");
+            fs::write(&path, edited).expect("write an equivalent TOML spelling");
+            assert_eq!(connect(&path, false).outcome, Wrote::Written, "{to}");
+            assert_eq!(connect(&path, false).outcome, Wrote::Unchanged, "{to}");
+        }
+    }
+
+    #[test]
+    fn a_changed_multiline_string_is_refused_without_force() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-multiline")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        for spelling in ["'''claude-\ncode'''", "\"\"\"claude-\ncode\"\"\""] {
+            let edited = first
+                .content
+                .replace("agent = \"claude-code\"", &format!("agent = {spelling}"));
+            assert_ne!(edited, first.content, "the multiline change must apply");
+            toml::from_str::<toml::Table>(&edited).expect("valid multiline TOML string");
+            fs::write(&path, &edited).expect("write a changed multiline string");
+            assert_eq!(connect(&path, false).outcome, Wrote::Refused);
+            assert_eq!(
+                fs::read_to_string(&path).expect("read after refusal"),
+                edited
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_integer_allowance_requires_force_once_when_the_writer_uses_a_float() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-integer")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        // The previous renderer used f64 Display, which spells 1e16 as this
+        // valid i64. TOML integers and floats remain distinct in comparison.
+        let old = first.content.replace(
+            "agent = \"claude-code\"",
+            "agent = \"claude-code\"\nmonthly_allowance = 10000000000000000",
+        );
+        assert_ne!(old, first.content, "insert the previous allowance spelling");
+        fs::write(&path, &old).expect("write the old renderer's integer spelling");
+        assert_eq!(connect(&path, false).outcome, Wrote::Refused);
+        assert_eq!(fs::read_to_string(&path).expect("read after refusal"), old);
+        assert_eq!(connect(&path, true).outcome, Wrote::Written);
+        let mut warnings = Vec::new();
+        let config = crate::config::load(None, tree.path(), Some(&path), &mut warnings)
+            .expect("the real config reader accepts the rewritten allowance");
+        assert_eq!(
+            config.pools.first().expect("one pool").monthly_allowance,
+            crate::capacity::Allowance::Units(1e16)
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(connect(&path, false).outcome, Wrote::Unchanged);
+    }
+
+    #[test]
+    fn force_rejects_invalid_allowances_and_preserves_other_operator_keys() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-allowance")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        for allowance in [
+            "nan", "inf", "-inf", "0", "-1", "0.0", "-0.0", "-1.5", "true", "'bad'",
+        ] {
+            let existing = format!(
+                "[pools.claude-code]\nkind = 'subscription-window'\nagent = 'claude-code'\n\
+                 profile = 'work'\nendpoint = 'http://host/#work'\nmonthly_allowance = {allowance}\n"
+            );
+            fs::write(&path, &existing).expect("write an invalid allowance with other valid keys");
+            let mut warnings = Vec::new();
+            assert!(
+                crate::config::load(None, tree.path(), Some(&path), &mut warnings).is_err(),
+                "the real reader rejects {allowance}"
+            );
+            assert_eq!(connect(&path, false).outcome, Wrote::Refused);
+            assert_eq!(
+                fs::read_to_string(&path).expect("read after refusal"),
+                existing
+            );
+            let forced = connect(&path, true);
+            assert_eq!(forced.outcome, Wrote::Written);
+            let mut warnings = Vec::new();
+            let config = crate::config::load(None, tree.path(), Some(&path), &mut warnings)
+                .expect("the real reader accepts what --force wrote");
+            let pool = config.pools.first().expect("one pool");
+            assert_eq!(pool.monthly_allowance, crate::capacity::Allowance::Auto);
+            assert_eq!(pool.profile.as_deref(), Some("work"));
+            assert_eq!(pool.endpoint.as_deref(), Some("http://host/#work"));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(
+                forced
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("monthly_allowance")),
+                "the rejection of {allowance} is visible: {:?}",
+                forced.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn force_keeps_positive_allowances_the_config_reader_accepts() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-valid-allowance")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        for (spelling, expected) in [
+            ("1e-300", 1e-300),
+            ("0.5", 0.5),
+            ("300", 300.0),
+            ("1e16", 1e16),
+            ("1e300", 1e300),
+        ] {
+            fs::write(
+                &path,
+                format!("[pools.claude-code]\nmonthly_allowance = {spelling}\n"),
+            )
+            .expect("write a valid allowance");
+            let report = connect(&path, true);
+            assert_eq!(report.outcome, Wrote::Written);
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            let mut warnings = Vec::new();
+            let config = crate::config::load(None, tree.path(), Some(&path), &mut warnings)
+                .expect("the real reader accepts the carried allowance");
+            assert_eq!(
+                config.pools.first().expect("one pool").monthly_allowance,
+                crate::capacity::Allowance::Units(expected),
+                "{spelling}"
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_toml_in_a_comment_is_refused_without_force() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-comment")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        let invalid = format!("# operator note with \u{1} control\n{}", first.content);
+        assert!(toml::from_str::<toml::Table>(&invalid).is_err());
+        fs::write(&path, &invalid).expect("write a malformed comment");
+        assert_eq!(connect(&path, false).outcome, Wrote::Refused);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read after refusal"),
+            invalid
+        );
+        assert_eq!(connect(&path, true).outcome, Wrote::Written);
+    }
+
+    #[test]
+    fn a_different_header_timestamp_is_unchanged_and_keeps_the_existing_bytes() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-timestamp")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        let old = render::pools_file_at(&first.agents, "1900-01-01T00:00:00Z");
+        assert_ne!(old, first.content, "the timestamp must differ");
+        fs::write(&path, &old).expect("write a controlled older timestamp");
+        assert_eq!(connect(&path, false).outcome, Wrote::Unchanged);
+        assert_eq!(fs::read_to_string(&path).expect("read unchanged file"), old);
+    }
+
+    #[test]
+    fn the_timestamp_prefix_on_a_later_comment_does_not_hide_a_content_change() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-later-prefix")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let first = connect(&path, false);
+        // The first line is the only generated timestamp header. A later
+        // comment using the same words remains part of the content comparison.
+        let annotated = format!("{}{} operator note\n", first.content, render::WRITTEN_BY);
+        fs::write(&path, annotated).expect("append a comment using the header prefix");
+        assert_eq!(connect(&path, false).outcome, Wrote::Written);
+    }
+
+    #[test]
+    fn an_unreadable_existing_file_is_an_error_even_with_force() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-read-error")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        fs::write(&path, [0xff, 0xfe]).expect("write a file that cannot be read as UTF-8");
+        for force in [false, true] {
+            let error = run_with(
+                &ConnectOptions {
+                    pools_path: Some(path.clone()),
+                    force,
+                },
+                &machine(),
+                ["claude-code"],
+            )
+            .expect_err("an unreadable file must not become absence");
+            assert!(
+                matches!(error, UpstrokeError::Io { path: ref failed, ref source }
+                if failed == &path && source.kind() == std::io::ErrorKind::InvalidData)
+            );
+            assert_eq!(fs::read(&path).expect("read original bytes"), [0xff, 0xfe]);
+        }
+    }
+
+    #[test]
+    fn pools_write_error_names_a_failed_parent_creation() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-create-error")
+                .expect("acquire an isolated pools directory");
+        let parent = tree.path().join("not-a-directory");
+        fs::write(&parent, "original").expect("block directory creation with a file");
+        let error = write_pools(&parent.join("pools.toml"), "proposal")
+            .expect_err("the parent path is a file");
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "create directory", path, .. }
+            if path == parent)
+        );
+        assert_eq!(
+            fs::read_to_string(&parent).expect("read the original file"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn pools_write_error_names_a_failed_file_write() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-write-error")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("is-a-directory");
+        fs::create_dir(&path).expect("block file writing with a directory");
+        let error = write_pools(&path, "proposal").expect_err("the file path is a directory");
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "write pools file", path: failed, .. }
+            if failed == path)
+        );
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn discovery_note_lines_cannot_impersonate_warning_records() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-note")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let machine = Machine {
+            adapters: vec![FakeAdapter {
+                id: "claude-code",
+                discovery: Some(Discovery {
+                    auth: AuthState::Authenticated,
+                    models: Vec::new(),
+                    shape: Some(PoolKind::Credits),
+                    notes: vec![
+                        "odd\nwarning: forged\r\n\u{1b}[2Kcontrol\rcarriage\u{85}next".to_owned(),
+                    ],
+                }),
+            }],
+        };
+        let report = run_with(
+            &ConnectOptions {
+                pools_path: Some(path),
+                force: false,
+            },
+            &machine,
+            ["claude-code"],
+        )
+        .expect("connect with an untrusted discovery note");
+        let output = render_report(&report);
+        assert!(output.contains("\n  odd\n  warning: forged\n"), "{output}");
+        assert!(
+            !output.lines().any(|line| line.starts_with("warning:")),
+            "{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .all(|line| !line.chars().any(char::is_control)),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_agent_is_reported_once() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-skipped")
+            .expect("acquire an isolated pools directory");
+        let report = connect(&tree.path().join("pools.toml"), false);
+        let output = render_report(&report);
+        assert_eq!(
+            output.matches("binary not found on PATH").count(),
+            1,
+            "{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("copilot: skipped")),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn a_missing_agent_skips_its_pool_without_taking_the_others_with_it() {
         let path = scratch("partial");
         let report = connect(&path, false);
@@ -541,7 +892,7 @@ mod tests {
             "and it says why: {written}"
         );
         assert!(
-            report.warnings.iter().any(|w| w.contains("copilot")),
+            report.warnings.is_empty(),
             "warnings: {:?}",
             report.warnings
         );

@@ -59,14 +59,9 @@ use super::{AgentReport, ConnectReport, Wrote};
 
 /// How every pools file `connect` writes begins, up to the version.
 ///
-/// The parent's `stable_content` drops exactly one line from the rewrite
-/// comparison, by this prefix, because the timestamp on that line moves on its
-/// own. The parent spells the prefix as its own literal, and **no test of the
-/// parent's fails when the two spellings part**: its `Unchanged` test runs two
-/// connects within one second, so the timestamp line is equal whatever the
-/// filter does (measured at the base: renaming the prefix failed nothing).
-/// `the_header_prefix_is_the_literal_the_parent_filters_by` pins this value
-/// from this side until the parent reads it here (`SWEEP-CONNECT-RENDER-011`).
+/// The parent's `stable_content` reads this same constant when deciding whether
+/// to omit the first line from the rewrite comparison. The controlled-timestamp
+/// test in the parent exercises that decision across distinct timestamps.
 pub(super) const WRITTEN_BY: &str = "# Written by `upstroke connect`";
 
 /// Render the pools file: §17's shape, plus a header saying who wrote it, when,
@@ -258,10 +253,8 @@ fn is_toml_control(c: char) -> bool {
 
 /// `text` as a TOML basic string, quotes included.
 ///
-/// Always the `"…"` form and never a literal `'…'` one: the parent's
-/// `strip_comment` tracks double quotes so that a `#` inside a value is not
-/// read as a comment, and the basic form is the one that comparator
-/// understands. The escapes are TOML's own — `\"`, `\\`, `\b`, `\t`, `\n`,
+/// Always the `"…"` form and never a literal `'…'` one, so all string values
+/// have one deterministic spelling. The escapes are TOML's own — `\"`, `\\`, `\b`, `\t`, `\n`,
 /// `\f`, `\r`, and `\uXXXX` for every other control character, U+007F
 /// included — so the reader gets back exactly the text it was given.
 fn toml_string(text: &str) -> String {
@@ -303,29 +296,19 @@ fn toml_key(name: &str) -> String {
     }
 }
 
-/// `units` as a TOML number that parses back to the same `f64`.
+/// A positive, finite allowance as TOML that parses back to the same `f64`.
 ///
 /// A whole number is written as an integer, which is how the operator wrote
 /// `300` and what `Display` gives for `300.0`; `Display` never uses an
 /// exponent, though, so `1e300` would become three hundred digits and read as
 /// an integer too large to hold — a syntax error for the whole file. So
 /// anything else takes `Debug`'s shortest round-trip form, which switches to
-/// an exponent where the magnitude needs one, and the non-finite values take
-/// TOML's own spellings, so that `config::read` refuses them by name instead
-/// of the parser refusing the file. Whole numbers are bounded at 2^53, below
+/// an exponent where the magnitude needs one. The parent rejects invalid
+/// allowances before building the rendered pool. Whole numbers are bounded at 2^53, below
 /// which every one of them is exact in an `f64` and inside an `i64`.
 fn toml_number(units: f64) -> String {
     const EXACT_INTEGERS: f64 = 9_007_199_254_740_992.0; // 2^53
-    if units.is_nan() {
-        "nan".to_owned()
-    } else if units.is_infinite() {
-        if units.is_sign_positive() {
-            "inf"
-        } else {
-            "-inf"
-        }
-        .to_owned()
-    } else if units.fract() == 0.0 && units.abs() < EXACT_INTEGERS {
+    if units.fract() == 0.0 && units < EXACT_INTEGERS {
         format!("{units}")
     } else {
         format!("{units:?}")
@@ -334,7 +317,9 @@ fn toml_number(units: f64) -> String {
 
 /// What the CLI prints.
 ///
-/// Every agent gets exactly one line, usable or not, so that "no change" and
+/// Every agent gets a summary line, usable or not, followed by indented lines
+/// for its discovery notes. Each physical note line is prefixed separately and
+/// control characters are replaced with spaces. Thus "no change" and
 /// "could not tell" read differently: the first is the `unchanged:` line at the
 /// end, the second is an agent's auth state on its own line, and a pool whose
 /// kind is a default says so on the same line the file does under the pool.
@@ -354,7 +339,13 @@ pub(super) fn report(report: &ConnectReport) -> String {
                     agent.agent, discovery.auth, pool.name, pool.kind
                 );
                 for note in &discovery.notes {
-                    let _ = writeln!(out, "  {note}");
+                    let mut lines = note.lines();
+                    let first = lines.next().unwrap_or("");
+                    for line in std::iter::once(first).chain(lines) {
+                        out.push_str("  ");
+                        out.extend(line.chars().map(|c| if c.is_control() { ' ' } else { c }));
+                        out.push('\n');
+                    }
                 }
             }
             Err(reason) => {
@@ -454,7 +445,7 @@ mod tests {
         // in this module's; a Windows path in `profile` is the documented use
         // (§13 calls it a config-directory path) and it holds backslashes,
         // which are TOML escapes when written raw. `#` inside a value is the
-        // parent's `strip_comment` case, and the rest are the characters TOML
+        // TOML comment-boundary case, and the rest are the characters TOML
         // requires escaped in a basic string.
         let nasty = [
             r"C:\Users\me\.claude-work",
@@ -582,12 +573,11 @@ mod tests {
         // large — a syntax error for the file, over a value `config::read`
         // accepts (finite, positive). The whole numbers keep the operator's
         // integer spelling, which the parent's test reads back by text.
-        let cases: [(f64, &str, toml::Value); 5] = [
+        let cases: [(f64, &str, toml::Value); 4] = [
             (300.0, "300", toml::Value::Integer(300)),
             (300.5, "300.5", toml::Value::Float(300.5)),
             (1e300, "1e300", toml::Value::Float(1e300)),
             (1e16, "1e16", toml::Value::Float(1e16)),
-            (f64::INFINITY, "inf", toml::Value::Float(f64::INFINITY)),
         ];
         for (units, spelled, value) in cases {
             assert_eq!(toml_number(units), spelled);
@@ -604,9 +594,6 @@ mod tests {
             let parsed = parsed_pool(&file, "copilot");
             assert_eq!(parsed.get("monthly_allowance"), Some(&value), "{file}");
         }
-        // `nan` parses as a float TOML admits, so the reader refuses it by
-        // name (`is_finite`) rather than the parser refusing the file.
-        assert_eq!(toml_number(f64::NAN), "nan");
         let auto = Pool::discovered("copilot", PoolKind::Credits, "copilot", Vec::new());
         let file = pools_file_at(
             &[usable_agent(
@@ -655,17 +642,9 @@ mod tests {
     }
 
     #[test]
-    fn the_header_prefix_is_the_literal_the_parent_filters_by() {
-        // `stable_content` in `src/connect.rs` spells this prefix as its own
-        // literal, and the parent's test of the `Unchanged` answer runs two
-        // connects within one second, so the same timestamp makes them equal
-        // whatever the prefix says — measured at the base: renaming the
-        // prefix failed no test in the suite. Until the parent reads
-        // `WRITTEN_BY` (SWEEP-CONNECT-RENDER-011), this literal is the guard.
-        assert_eq!(WRITTEN_BY, "# Written by `upstroke connect`");
+    fn the_header_starts_with_the_shared_timestamp_prefix() {
         assert!(
-            pools_file_at(&[], "2026-09-05T00:00:00Z")
-                .starts_with("# Written by `upstroke connect` v"),
+            pools_file_at(&[], "2026-09-05T00:00:00Z").starts_with(&format!("{WRITTEN_BY} v")),
             "the prefix is the first thing in the file"
         );
     }
