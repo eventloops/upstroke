@@ -70,11 +70,26 @@ struct RawRunnerMount {
     read_only: Option<bool>,
 }
 
+/// One `[[gates]]` entry as written. An unknown key is collected rather than
+/// dropped, and `parse::parse_gates` decides what it means: an **error** on a
+/// fresh run, as in `[runner]` — the entry has three keys, the one that is
+/// optional decides when a running gate is killed and reported failed, and a
+/// typo there is a timeout the operator asked for and did not get — and a
+/// **warning** on a sequential run's resume, where the recorded gates are what
+/// executes (`design/15`: gates are taken from the record and not refused over).
 #[derive(Debug, Deserialize)]
 struct RawGate {
-    name: String,
-    cmd: String,
+    /// Required, and optional at the wire so that a missing one is refused by
+    /// `parse::parse_gates` beside whatever unknown key replaced it — `nmae`
+    /// is named as the likely misspelling rather than lost behind serde's
+    /// "missing field".
+    name: Option<String>,
+    /// As `name`.
+    cmd: Option<String>,
     timeout_secs: Option<u64>,
+    /// Everything else, so a typo is named instead of vanishing.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,12 +103,18 @@ struct RawEngine {
     /// Per-agent and per-pool concurrency slots; both default to `max_parallel`.
     max_per_agent: Option<u32>,
     max_per_pool: Option<u32>,
-    /// Everything else, so a typo warns by name instead of vanishing.
+    /// Everything else, so a typo is refused by name instead of vanishing —
+    /// see `parse::parse_engine`.
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
 
+/// `[interaction]` as written. An unknown key is an **error**, as in
+/// `[runner]`: `mode` and `ask_before` each decide whether a person is asked,
+/// and `ask_befor = { … }` is a spend approval that no longer exists — see
+/// `parse::parse_interaction`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawInteraction {
     mode: Option<String>,
     notify: Option<Vec<String>>,
@@ -382,9 +403,12 @@ pub const DEFAULT_MAX_MERGE_REPAIRS: u32 = 2;
 /// this one. See [`EngineLimits`].
 pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 
-/// Which reading of the `[engine]` ceilings a load is performing.
+/// Which reading of the `[engine]` ceilings a load is performing — and, since
+/// 2026-09-05, which reading of today's `[[gates]]` section: the one that
+/// governs the run, or one that is only compared with the gates the run
+/// recorded.
 ///
-/// The same four keys mean two different things depending on what is about to
+/// The same keys mean two different things depending on what is about to
 /// happen, and the difference is not cosmetic — it is the difference between a
 /// refusal and a warning.
 ///
@@ -403,13 +427,35 @@ pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineLimits {
     /// A run about to be created, or a preview of one (`upstroke validate`).
+    /// Today's config is the whole truth: every section governs.
     Fresh,
-    /// A resume of a run a sequential engine recorded.
+    /// A resume of a run a sequential engine recorded, whose log predates the
+    /// gate record (`run_started.gate_cmds` absent and no earlier resume
+    /// established one) — or any caller that passes this variant to a load
+    /// directly. The ceilings warn as above, but today's `[[gates]]`
+    /// **governs**: this resume settles the run's gates from it and records
+    /// them on `run_resumed`, so it is read exactly as a fresh run reads it
+    /// and refuses what a fresh run refuses. That is the gate reading this
+    /// variant has always had; a 2026-09-05 draft gave it the compare-only
+    /// reading below instead, which silently changed what a direct caller
+    /// got, and the reading moved to a variant of its own.
     SequentialResume,
+    /// A resume of a run a sequential engine recorded, whose log records its
+    /// gates. The ceilings warn (above). Today's `[[gates]]` is **compared**
+    /// with the record and never refused over — `design/15`: gates are taken
+    /// from the record, not re-derived, and not refused over — so every shape
+    /// a fresh run refuses there is a warning naming the recorded gates as
+    /// what runs. Chosen only by [`EngineLimits::for_resume`] from the log's
+    /// own record; a caller that has not read the log has no business passing
+    /// it.
+    SequentialResumeWithRecordedGates,
 }
 
 impl EngineLimits {
-    /// The reading that applies to a resume of a run at `effective_schema`.
+    /// The reading that applies to a resume of a run at `effective_schema`
+    /// whose log does (`gates_recorded`) or does not record its gates —
+    /// `events::recorded_gates(..).is_some()`, which reads `run_started` and
+    /// any earlier resume that established them.
     ///
     /// Anything past [`LAST_SEQUENTIAL_SCHEMA`] is not a sequential run's
     /// resume, so it gets the ordinary reading rather than the legacy one.
@@ -417,11 +463,13 @@ impl EngineLimits {
     /// should do once one does is the activation question, which is not this
     /// slice's to answer.
     #[must_use]
-    pub fn for_resume(effective_schema: u32) -> Self {
-        if effective_schema <= LAST_SEQUENTIAL_SCHEMA {
-            Self::SequentialResume
-        } else {
+    pub fn for_resume(effective_schema: u32, gates_recorded: bool) -> Self {
+        if effective_schema > LAST_SEQUENTIAL_SCHEMA {
             Self::Fresh
+        } else if gates_recorded {
+            Self::SequentialResumeWithRecordedGates
+        } else {
+            Self::SequentialResume
         }
     }
 }
@@ -677,9 +725,11 @@ pub fn load(
 
 /// [`load`] for a caller that is not creating a run.
 ///
-/// Only `[engine]`'s ceilings read `limits`, and only to decide whether a value
-/// this engine cannot honour refuses or warns — see [`EngineLimits`]. Every
-/// other key means the same thing either way.
+/// Only `[engine]`'s ceilings and the `[[gates]]` section read `limits`, and
+/// only to decide whether refusing or warning is the answer: a ceiling this
+/// engine cannot honour, and a `[[gates]]` section that a resume compares
+/// with the gates its run recorded rather than runs — see [`EngineLimits`].
+/// Every other key means the same thing either way.
 pub fn load_limits(
     repo_config: Option<&Path>,
     discover_in: &Path,
@@ -1003,7 +1053,7 @@ pub fn load_captured_with(
         });
     }
 
-    let gates = parse_gates(raw.gates, &repo_path)?;
+    let gates = parse_gates(raw.gates, &repo_path, limits, warnings)?;
     let runner = parse_runner(raw.runner, &repo_path, limits)?;
     let engine = parse_engine(raw.engine, &repo_path, limits, warnings)?;
     let interaction = parse_interaction(raw.interaction, &repo_path)?;
@@ -2319,6 +2369,81 @@ pool_fraction = 0.5
         }
     }
 
+    /// The `[[gates]]` twin of the ceiling rule above, witnessed at the level
+    /// the property lives at: a *load*. `design/15`: "gates are taken from the
+    /// record, not re-derived — and not refused over", so on the resume of a
+    /// run whose log records its gates, today's section is compared and never
+    /// refused over — every shape a fresh run refuses there is a warning and
+    /// the load succeeds — while the same bytes refuse a run being created
+    /// now, and a resume of a log with **no** gate record (`SequentialResume`,
+    /// the reading a direct caller has always had), which settles its gates
+    /// from today's file. The engine's own composition (which reading
+    /// `resume.rs` chooses, and that the record is what then runs) is
+    /// witnessed in `engine::tests`, not here.
+    #[test]
+    fn a_sequential_resume_announces_gate_shapes_a_fresh_run_refuses() {
+        let path = scratch(
+            "resumegates.toml",
+            "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\ntimeout_sec = 900\n\
+             [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
+        );
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            let mut strict_warnings = Vec::new();
+            let error = load_limits(
+                Some(&path),
+                &hermetic(),
+                Some(&missing()),
+                limits,
+                &mut strict_warnings,
+            )
+            .expect_err("a run whose gates come from this file refuses it");
+            assert!(
+                error.to_string().contains("[[gates]] entry 1"),
+                "{limits:?}: the first refusal is the unknown key, in entry order: {error}"
+            );
+            assert!(
+                strict_warnings.is_empty(),
+                "{limits:?}: {strict_warnings:?}"
+            );
+        }
+
+        let mut warnings = Vec::new();
+        let cfg = load_limits(
+            Some(&path),
+            &hermetic(),
+            Some(&missing()),
+            EngineLimits::SequentialResumeWithRecordedGates,
+            &mut warnings,
+        )
+        .expect("a recorded run stays reachable through the same file");
+        let gates = cfg.gates.expect("the section was present");
+        assert_eq!(
+            gates
+                .iter()
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["check", "Check"],
+            "both entries are kept, so the record can be compared with them"
+        );
+        assert_eq!(
+            gates.first().map(|gate| gate.timeout),
+            Some(DEFAULT_GATE_TIMEOUT),
+            "the misspelled timeout bought nothing"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`timeout_sec`") && w.contains("recorded")),
+            "the unknown key is named and the recorded gates are named as what runs: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("entry 2 repeats the name `Check`") && w.contains("recorded")),
+            "the repeated name is named the same way: {warnings:?}"
+        );
+    }
+
     #[test]
     fn the_engine_limit_reading_follows_the_schema_the_run_recorded() {
         // Sequential forever, by the topology design: a run recorded at schema
@@ -2329,15 +2454,25 @@ pool_fraction = 0.5
         // may raise its own ceiling is the activation question, not this one.
         for schema in 1..=LAST_SEQUENTIAL_SCHEMA {
             assert_eq!(
-                EngineLimits::for_resume(schema),
+                EngineLimits::for_resume(schema, true),
+                EngineLimits::SequentialResumeWithRecordedGates,
+                "schema {schema} with a gate record compares today's section with it"
+            );
+            // The same run with no gate record: its gates are settled from
+            // today's config on this resume, so that section governs — the
+            // reading `SequentialResume` has always given a direct caller.
+            assert_eq!(
+                EngineLimits::for_resume(schema, false),
                 EngineLimits::SequentialResume,
-                "schema {schema} was written by a sequential engine"
+                "schema {schema} without a gate record settles its gates from today's file"
             );
         }
-        assert_eq!(
-            EngineLimits::for_resume(LAST_SEQUENTIAL_SCHEMA + 1),
-            EngineLimits::Fresh
-        );
+        for gates_recorded in [true, false] {
+            assert_eq!(
+                EngineLimits::for_resume(LAST_SEQUENTIAL_SCHEMA + 1, gates_recorded),
+                EngineLimits::Fresh
+            );
+        }
     }
 
     #[test]
@@ -2383,30 +2518,48 @@ pool_fraction = 0.5
     }
 
     #[test]
-    fn an_unknown_engine_key_warns_by_name_instead_of_vanishing() {
-        // `[engine]` used to drop every key it did not know, so a misspelled
-        // ceiling was indistinguishable from no ceiling at all. The typo below
-        // is the realistic one, and the operator has to be able to see it.
+    fn an_unknown_engine_key_is_refused_by_name_instead_of_vanishing() {
+        // `[engine]` used to drop every key it did not know, then (from
+        // 2026-09-04) to warn by name and carry on. Neither survives
+        // `on_task_failur = "continue"`: the key the operator wrote decides
+        // whether a failed task stops the run, and a warning beside a run
+        // that then halts is a deleted control with a footnote. So an unknown
+        // key here is refused, every one of them named, on every reading —
+        // a misspelled key governs no run, recorded or not.
         let path = scratch(
             "unknownengine.toml",
-            "[engine]\nmax_paralel = 4\nbogus = \"x\"\n",
+            "[engine]\nmax_paralel = 4\non_task_failur = \"continue\"\n",
         );
-        let mut warnings = Vec::new();
-        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
-        assert!(
-            warnings.iter().any(|w| w.contains("max_paralel")),
-            "the misspelling is named: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("bogus")),
-            "every unknown key is named: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().all(|w| w.contains("[engine]")),
-            "and located: {warnings:?}"
-        );
-        // The typo bought nothing, which is exactly what the warning says.
-        assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
+        ] {
+            let mut warnings = Vec::new();
+            let error = load_limits(
+                Some(&path),
+                &hermetic(),
+                Some(&missing()),
+                limits,
+                &mut warnings,
+            )
+            .expect_err("an unknown [engine] key must refuse the load");
+            let message = error.to_string();
+            assert!(message.contains("`max_paralel`"), "{limits:?}: {message}");
+            assert!(
+                message.contains("`on_task_failur`"),
+                "{limits:?}: every unknown key is named: {message}"
+            );
+            assert!(
+                message.contains("[engine]"),
+                "{limits:?}: located: {message}"
+            );
+            assert!(
+                message.contains("`on_task_failure`"),
+                "{limits:?}: the accepted keys are listed: {message}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
     }
 
     #[test]
@@ -2830,7 +2983,11 @@ credential_volumes = { claude-code = "creds-cc" }
     /// witnessed kill.
     #[test]
     fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {
-        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
+        ] {
             let container = RunnerSelection {
                 kind: RunnerKind::Container,
                 image: Some("upstroke/ci:3.2".to_owned()),
@@ -2865,7 +3022,10 @@ credential_volumes = { claude-code = "creds-cc" }
             // refused fresh run from a refused resume.
             let expected = match limits {
                 EngineLimits::Fresh => "is being created by the schema-1..3 engine",
-                EngineLimits::SequentialResume => "keeps the boundary it started with",
+                EngineLimits::SequentialResume
+                | EngineLimits::SequentialResumeWithRecordedGates => {
+                    "keeps the boundary it started with"
+                }
             };
             assert!(message.contains(expected), "{limits:?}: {message}");
             refuse_legacy_container_selection(&host, Path::new("upstroke.toml"), limits)
