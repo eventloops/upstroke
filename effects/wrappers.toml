@@ -1136,6 +1136,8 @@ effect_free = [
     # Whether either stream hit the capture allowance; the supervisor asks
     # before it decides to terminate the tree.
     "drain_limit_exceeded",
+    # `Display for Stream`: the two stream labels, for diagnostics.
+    "fmt",
     "limit_exceeded",
     # Hands the reader to a thread. `thread::spawn` is not
     # `std::process::Command::spawn`, and this module's own `start` is not a

@@ -193,7 +193,9 @@ impl DerefMut for ProcessTree {
 ///
 /// # Errors
 ///
-/// Spawn failure, supervision failure, or a fault the observer injected.
+/// Spawn failure, supervision failure -- among them a reader thread the OS
+/// refused and a stream whose read failed rather than ended, which
+/// `drain::DrainError` names -- or a fault the observer injected.
 pub fn run_with_timeout_at(
     spawn_site: ProcessSite,
     terminate_site: ProcessSite,
@@ -335,14 +337,37 @@ fn run_with_timeout_and_limit(
         }
     });
 
+    let output_error = |error: DrainError| UpstrokeError::Agent {
+        message: format!("supervising agent output: {error}"),
+    };
     let stdout_drain = child
         .stdout
         .take()
-        .map(|pipe| Drain::start(pipe, output_limit));
+        .map(|pipe| Drain::start(Stream::Stdout, pipe, output_limit))
+        .transpose();
     let stderr_drain = child
         .stderr
         .take()
-        .map(|pipe| Drain::start(pipe, output_limit));
+        .map(|pipe| Drain::start(Stream::Stderr, pipe, output_limit))
+        .transpose();
+    let (stdout_drain, stderr_drain) = match (stdout_drain, stderr_drain) {
+        (Ok(stdout_drain), Ok(stderr_drain)) => (stdout_drain, stderr_drain),
+        (Err(error), _) | (_, Err(error)) => {
+            // A child nobody reads blocks on its first full pipe, so a reader
+            // the OS refused is a supervision failure and the tree is
+            // terminated as on every other one.
+            #[cfg(unix)]
+            {
+                let cleanup = termination.finish();
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup?;
+            }
+            #[cfg(not(unix))]
+            kill_tree(terminate_site, &mut child)?;
+            return Err(output_error(error));
+        }
+    };
 
     let mut timed_out = false;
     let mut output_limited = false;
@@ -443,8 +468,16 @@ fn run_with_timeout_and_limit(
     if stdin_thread.is_finished() {
         let _ = stdin_thread.join();
     }
-    let (stdout, stdout_limited) = stdout_drain.map(|d| d.collect(grace)).unwrap_or_default();
-    let (stderr, stderr_limited) = stderr_drain.map(|d| d.collect(grace)).unwrap_or_default();
+    let (stdout, stdout_limited) = stdout_drain
+        .map(|drain| drain.collect(grace))
+        .transpose()
+        .map_err(output_error)?
+        .unwrap_or_default();
+    let (stderr, stderr_limited) = stderr_drain
+        .map(|drain| drain.collect(grace))
+        .transpose()
+        .map_err(output_error)?
+        .unwrap_or_default();
     output_limited |= stdout_limited || stderr_limited;
 
     Ok(ProcessOutput {
@@ -461,7 +494,7 @@ fn run_with_timeout_and_limit(
 /// supervisor asks it for. Both are visible in `proc` and its descendants,
 /// exactly as they were when they were private items of this file.
 mod drain;
-use self::drain::{Drain, drain_limit_exceeded};
+use self::drain::{Drain, DrainError, Stream, drain_limit_exceeded};
 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep
