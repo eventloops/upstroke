@@ -333,9 +333,11 @@ genuinely protected — an open handle inside it on Windows, a read-only
 parent on Unix — would then be reported discarded, the census would go on
 to remove the intent, and admission would proceed over R19 residue that
 nothing will ever reclaim, because the record naming it is gone.
-[`super::racing_removal`] retries and then **fails**, which is the
-fail-closed shape: a delete-pending name disappears within a few
-attempts, and a protected one still refuses after all of them.
+`super::racing_removal` retries and then fails if every attempt still reports
+an error. It gives a delete-pending name another chance to disappear without
+treating access denial as success. The fixed attempt bound can still expire
+before a transient refusal clears; [reviews/FINDINGS.md §43](../../../../reviews/FINDINGS.md)
+records the Windows case. A protected view remains an error.
 
 ## `fn project(`
 
