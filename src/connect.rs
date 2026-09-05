@@ -243,19 +243,41 @@ fn settings_of(text: &str) -> Vec<String> {
 /// `reserve` with `# headroom kept for your own interactive sessions`, so the
 /// single line an operator is most likely to tidy is the one a whole-line-only
 /// filter would treat as a changed setting. `#` inside a quoted value is not a
-/// comment, so quotes are tracked.
+/// comment, so TOML's two string forms are tracked: inside a basic string a
+/// backslash escapes the next character, so `\"` does not close it, and a
+/// literal string runs to the next `'` with no escapes at all.
+///
+/// Treating every `"` as a boundary made `\"` close the string, so two table
+/// headers that differ after it — `[pools."x\"#A"]` and `[pools."x\"#B"]` —
+/// stripped to the same prefix, compared equal as settings, and the operator's
+/// rename was written over without `--force` (PR #168, pass 1). The renderer
+/// writes escapes for exactly the names and values that need them, so this is
+/// the reader that has to understand them.
 fn strip_comment(line: &str) -> String {
-    let mut quoted = false;
+    enum In {
+        Text,
+        Basic,
+        Literal,
+    }
+    let mut state = In::Text;
     let mut out = String::new();
-    for ch in line.chars() {
-        match ch {
-            '"' => {
-                quoted = !quoted;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        match (&state, ch) {
+            (In::Text, '"') => state = In::Basic,
+            (In::Text, '\'') => state = In::Literal,
+            (In::Text, '#') => break,
+            (In::Basic, '\\') => {
                 out.push(ch);
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+                continue;
             }
-            '#' if !quoted => break,
-            _ => out.push(ch),
+            (In::Basic, '"') | (In::Literal, '\'') => state = In::Text,
+            _ => {}
         }
+        out.push(ch);
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -627,6 +649,89 @@ mod tests {
                 .contains("profile = \"C:\\\\Users\\\\me\\\\.claude-work\""),
             "{}",
             again.content
+        );
+    }
+
+    #[test]
+    fn a_renamed_pool_whose_key_carries_an_escaped_quote_is_refused_not_overwritten() {
+        // Pass 1 of PR #168: `run_with` is public and takes any adapter id, and
+        // the renderer now quotes a name that is not a bare key, so an id
+        // holding `"` followed by `#` writes `[pools."x\"#A"]`. A `strip_comment`
+        // that read `\"` as the closing quote cut both that header and the
+        // operator's renamed `[pools."x\"#B"]` down to `[pools."x\"`, called
+        // the settings equal, and — since the text differed — rewrote the file,
+        // undoing the rename without `--force`.
+        let machine = Machine {
+            adapters: vec![FakeAdapter {
+                id: "x\"#A",
+                discovery: Some(Discovery {
+                    auth: AuthState::Authenticated,
+                    models: Vec::new(),
+                    shape: Some(PoolKind::Credits),
+                    notes: Vec::new(),
+                }),
+            }],
+        };
+        let path = scratch("escaped-key");
+        let opts = ConnectOptions {
+            pools_path: Some(path.clone()),
+            force: false,
+        };
+        let first = run_with(&opts, &machine, ["x\"#A"]).expect("first connect");
+        assert_eq!(first.outcome, Wrote::Written);
+        let written = fs::read_to_string(&path).expect("file");
+        assert!(
+            written.contains("[pools.\"x\\\"#A\"]"),
+            "the key is quoted and escaped: {written}"
+        );
+
+        let renamed = written.replace("[pools.\"x\\\"#A\"]", "[pools.\"x\\\"#B\"]");
+        assert_ne!(renamed, written, "the rename changed the file");
+        fs::write(&path, &renamed).expect("renamed by hand");
+        let second = run_with(&opts, &machine, ["x\"#A"]).expect("second connect");
+        assert_eq!(
+            second.outcome,
+            Wrote::Refused,
+            "a renamed pool is a settings difference"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("file"),
+            renamed,
+            "the operator's rename is untouched"
+        );
+    }
+
+    #[test]
+    fn a_file_connect_cannot_parse_carries_nothing_and_the_refusal_does_not_claim_otherwise() {
+        // `operator_keys` reads the existing file leniently: one it cannot
+        // parse carries no keys at all. The refusal must therefore not tell the
+        // operator their keys "are carried" — pass 1 of PR #168 found that it
+        // did — but send them to the proposed text, which is what `--force`
+        // writes, and say when carrying happens.
+        let path = scratch("unparseable");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
+                    profile = \"work\"\nthis line is not toml\n";
+        fs::write(&path, mine).expect("hand-written file");
+        let report = connect(&path, false);
+        assert_eq!(report.outcome, Wrote::Refused);
+        assert!(
+            !report.content.contains("profile = "),
+            "nothing was carried out of a file that does not parse:\n{}",
+            report.content
+        );
+        let rendered = render_report(&report);
+        assert!(
+            !rendered.contains("profile = \"work\""),
+            "the proposed text shows the profile is gone: {rendered}"
+        );
+        assert!(
+            rendered.contains("only when it can parse the existing file"),
+            "the refusal says when keys are carried, not that they were: {rendered}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("file"),
+            mine,
+            "and nothing was written"
         );
     }
 

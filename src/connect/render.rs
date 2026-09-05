@@ -61,9 +61,12 @@ use super::{AgentReport, ConnectReport, Wrote};
 ///
 /// The parent's `stable_content` drops exactly one line from the rewrite
 /// comparison, by this prefix, because the timestamp on that line moves on its
-/// own; the parent spells the prefix as its own literal, and
-/// `re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict`
-/// is what fails when the two spellings part.
+/// own. The parent spells the prefix as its own literal, and **no test of the
+/// parent's fails when the two spellings part**: its `Unchanged` test runs two
+/// connects within one second, so the timestamp line is equal whatever the
+/// filter does (measured at the base: renaming the prefix failed nothing).
+/// `the_header_prefix_is_the_literal_the_parent_filters_by` pins this value
+/// from this side until the parent reads it here (`SWEEP-CONNECT-RENDER-011`).
 pub(super) const WRITTEN_BY: &str = "# Written by `upstroke connect`";
 
 /// Render the pools file: §17's shape, plus a header saying who wrote it, when,
@@ -371,20 +374,21 @@ pub(super) fn report(report: &ConnectReport) -> String {
         }
         Wrote::Refused => {
             // The proposed text is the whole answer to "what would --force
-            // do": it is what the parent would write, the operator's
-            // `profile`, `monthly_allowance` and `endpoint` already carried
-            // into it from the pools of the same name. Saying so sends the
-            // operator to the one place they can check what survives, rather
-            // than to a promise this module cannot see the truth of — the
-            // parent reads the existing file leniently, and keys in a file it
-            // could not parse are not in the text below.
+            // do": it is what the parent would write. Whether the operator's
+            // `profile`, `monthly_allowance` and `endpoint` are in it is not
+            // this module's to promise — the parent reads the existing file
+            // leniently and a file it cannot parse carries nothing — so the
+            // refusal names the keys, says when they are carried, and sends
+            // the operator to the text to check, rather than asserting that
+            // they were (pass 1 of PR #168 caught the earlier wording doing so).
             let _ = writeln!(
                 out,
                 "{} already exists and differs from what connect would write. That file is \
                  hand-editable (§17), so it is not overwritten silently.\n\nWhat connect would \
-                 write:\n{}\nRe-run with --force to replace it with the text above. Your \
-                 `profile`, `monthly_allowance` and `endpoint` are carried into that text from \
-                 the pools of the same name; anything of yours that is not in it is lost.",
+                 write:\n{}\nRe-run with --force to replace it with the text above. Check that \
+                 text for your own keys first — `profile`, `monthly_allowance` and `endpoint` — \
+                 because connect carries them from pools of the same name only when it can parse \
+                 the existing file, and anything of yours that is not in the text above is lost.",
                 report.path.display(),
                 indent(&report.content)
             );
@@ -808,6 +812,11 @@ mod tests {
         for key in ["`profile`", "`monthly_allowance`", "`endpoint`"] {
             assert!(summary.contains(key), "{key} named: {summary}");
         }
+        assert!(
+            summary.contains("only when it can parse the existing file"),
+            "carrying is stated as a condition, not a promise: {summary}"
+        );
+        assert!(!summary.contains("are carried into"), "{summary}");
         for line in content.lines() {
             assert!(
                 summary.contains(&format!("\n  {line}\n")),
