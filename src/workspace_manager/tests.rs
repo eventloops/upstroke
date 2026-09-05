@@ -9706,9 +9706,12 @@ static SAMPLED_LAUNCHES: std::sync::Mutex<Vec<SampledLaunch>> = std::sync::Mutex
 /// `gitdir` -- a registration naming nothing, which `revalidate_removal`
 /// deliberately refuses rather than removes -- and that residue races nothing,
 /// so no kill shape reaches it. Measured 0/50 against 1/50, which is one
-/// event and is what it should be: both arms sample the same rate. It is
-/// `SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR`, and it is why
-/// this repair does not make this test green.
+/// event and is what it should be: both arms sample the same rate. It was
+/// diagnosed here as a contract defect and that diagnosis was measured wrong
+/// by PR #151, which fixed it: `git worktree list` skips a zero-length
+/// `gitdir` silently, so the classifier answers `None`, and the repair is a
+/// one-condition skip in `revalidate_removal`. Until #151 merges it remains a
+/// fingerprint this test can meet, and the bare arm names it as a known one.
 ///
 /// So the sampled child is spawned with `process_group(0)` and the kill goes
 /// to `-pgid`, which is what production does. What the sampling test asserts

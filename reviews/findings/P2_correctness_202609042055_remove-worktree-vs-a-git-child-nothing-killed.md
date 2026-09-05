@@ -8,7 +8,7 @@ reviewed_sha: ead3573882c931f9c7eaf0846a81be3bffd404a8
 location: src/workspace_manager.rs:1868
 provenance: pre_existing
 first_bad:
-guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence, which holds this and `SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR` together because a shape chosen for either constrains the other; escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
+guard: the stream the coordinator spawned on 2026-09-05 for `remove_worktree` convergence (PR #151 is its first result); escalates to the owner if a later pass labels it P1 or P2 rather than accepting the deferral
 ---
 
 ## Why this file exists at all
@@ -24,67 +24,15 @@ stop being open because the entry carrying it was resolved. It is here, alone, s
 first one does not close this one by accident — and so that nobody re-runs the sampler comparison
 believing it answers this.
 
-## Related, and how to tell the two apart
+## Related, and what turned out not to be related
 
-`SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR` is the other half of the same parent
-entry's two error codes, and it is **not** this one. That one is a residue lying still on disk that
-forced removal refuses by design; it needs no live writer and it is observed. This one is a live
-writer with nothing to kill it, and it is a sequence nothing here has produced. They share a parent
-and an assertion and nothing else, and a repair for either leaves the other exactly where it was.
+The parent entry recorded a second error code under the same assertion — a `git worktree add`
+interrupted with a zero-length `gitdir` on disk, which `remove_worktree` refused. On this branch it
+was diagnosed as a contract defect (`recovery_proven` promised for a residue the funnel correctly
+declined) and filed; **that diagnosis was measured wrong by PR #151**, which fixed it: on git 2.43
+`git worktree list` skips a zero-length `gitdir` silently, the classifier answers `None`, and the
+repair is a one-condition skip in `revalidate_removal`. That fingerprint is inert residue and is
+fixed; this one is a live writer nothing killed, and is open. They share a parent and an assertion
+and nothing else. `SAMPLER-SIBLING-KILLS-A-BARE-CHILD` is a third thing again and belongs to the
+harness rather than the funnel.
 
-## Failure sequence
-
-The engine dies — a crash, a `SIGKILL` — while `WorkspaceManager::add_worktree` has a
-`git worktree add` in flight. (Not a host reset: that ends the descendants with everything else and
-can leave only inert residue, which is the other finding's subject.) Nothing kills that child: the engine's own Git children are never
-killed, and there is no coordinator left to kill them. Its descendants (`git checkout` and what
-that spawns) are reparented and **keep writing into the new worktree**. On the next run, recovery
-takes the tabled before-phase action for the residue it finds, which is forced removal of the
-worktree and its intent -> `remove_worktree` walks a directory a live writer is still populating ->
-the removal fails, `Filesystem { operation: "remove", … DirectoryNotEmpty }`, and recovery does not
-converge.
-
-**What has and has not been observed.** The first version of this file said nothing in the tree had been seen to produce this sequence.
-**That was too strong, and it is corrected here rather than left.** The sampler's bare-child arm —
-`git worktree add` killed while its checkout descendant runs on as an orphan writer — is exactly
-the state this sequence ends in, and it produced `Filesystem { operation: "remove", …
-DirectoryNotEmpty }` 7 times in 100 runs across two independent measurements (5/50 on the
-pre-repair tree, 2/50 at PR #145's head, alternating under load). What remains unmeasured is only
-the *path* to that state named in the title — the engine's own death — not the state or the
-non-convergence. `remove_worktree` racing a live writer is reproduced; whether an engine crash
-leaves one is not.
-
-Under the owner's rule that a P2 is fixed or rejected with a measurement: this one is reproduced,
-so it is not rejected, and its remedy is a funnel change — `remove_worktree` converging against a
-live writer — outside a harness change's scope. **If a later pass labels this P1 or P2 rather than
-accepting the deferral, it escalates to the owner rather than re-defers.**
-
-## What was measured, and exactly what it does not answer
-
-Fifty runs per arm, one machine, one load, one commit: the sampler killing the bare child failed
-5/50, and killing the child's process group failed 0/50. That experiment discriminates between two
-readings of a red suite — "`remove_worktree` is not convergent" against "the sampler manufactured a
-state production's kill path does not" — and it fell to the second.
-
-**It says nothing about the sequence above.** It shows that *this harness* was producing a live
-writer that production's kill path does not produce. It does not show that no other path produces
-one, and the engine's own death is precisely such a path: it orphans Git children the same way, and
-nothing in this tree measures it. Reading the 5/50 -> 0/50 as evidence that `remove_worktree` is
-convergent is reading a control as a proof.
-
-## What the change that takes this up should do
-
-Model the engine's death rather than a killed child. The sampler cannot do it as it stands: it
-kills the Git child, which is the fault it exists to sample, and it now kills the whole group, which
-is the fault production produces. What this question needs is the other shape — a `git worktree add`
-whose descendants are **left running** while the process that started them goes away — and then
-either a measured convergence rate for `remove_worktree` against it, or a repair that makes the
-removal converge (a bounded retry against `DirectoryNotEmpty`, an exclusion pass, or a refusal that
-names the live writer rather than a removal that quietly does not finish).
-
-Two things to keep whichever way it goes. The **fingerprint** is by assertion and error code, and
-`PR136-SAMPLER-FORCED-REMOVAL-DOES-NOT-CONVERGE` recorded two error codes under one assertion — the
-`DirectoryNotEmpty` above and `Git { message: "worktree registration … has an empty gitdir" }`.
-They are the same assertion and not the same failure. And a repair here is a change to a **funnel**,
-not to a test: it belongs to `src/workspace_manager.rs`, under §4's invariants, not to the harness
-that found it.
