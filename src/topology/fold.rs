@@ -561,6 +561,20 @@ pub enum QuestionOrigin {
 pub struct OpenQuestion {
     pub question: FrozenQuestion,
     pub origin: QuestionOrigin,
+    /// The task state the question parked, and the state its answer returns the
+    /// task to.
+    ///
+    /// **Fold state, not a wire field.** `OpenQuestion` lives in
+    /// `RunState.questions` and is rebuilt by replaying the log, so recording
+    /// this costs nothing and adds no schema surface: an old log has no such
+    /// field to be missing, because a replay derives it from the same
+    /// transitions that opened the question. It is what makes an answer return
+    /// the task to *where it was* rather than to a fixed `Pending` — which is
+    /// right only for the `Pending` a spawn admission or a parked settlement
+    /// leaves, and wrong for the `AwaitingMerge` or `Deferred` a bare
+    /// `question_raised` can park. See [`RunState::apply_answer`]; it subsumes
+    /// [`Self::origin`]'s only role, the return.
+    pub parked_from: TaskState,
     /// The frozen binding options this question's admission authorized, for a
     /// `HumanBinding` admission and for nothing else.
     ///

@@ -131,43 +131,45 @@ reading of a sweep's own-file bound. Listing the file here would activate §6 an
 full, and recording a violation does not satisfy a standard, so the row stays open and a successor
 takes the folds with the call sites they force. The findings are `reviews/FINDINGS.md` §56.
 
-**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass and is not swept.** The pass and
-its repairs landed two §5 fixes: `apply_verification_unavailable` dispatched a closed two-variant
-`UnavailableOutcome` through two separate `if let`s, and `apply_answer` returned every answered
-question through `_ => TaskState::Pending`, a catch-all over `Derived` that swallowed
-`Answer(Admission)`. Both are now exhaustive matches — `apply_answer` takes the resolved
-`QuestionOrigin` and matches its two variants — and the module doc states the file's replay purity
-and ownership model, re-derived by reading. `apply` was otherwise found sound: a pure function of
+**Row 29 (`src/topology/fold/apply.rs`) has had a frontier pass, two repair rounds, and is not
+swept.** The pass and repairs landed the file's §5, §6 and §7 work. Five catch-alls over closed
+enums were made exhaustive, so a new variant is a compile error rather than a silent default:
+`apply_verification_unavailable` over `UnavailableOutcome`, and the guards in `apply_merge_prepared`
+(`PreparedDisposition`), `apply_merge_rejected` (`RejectionDisposition`) and `close_generation`
+(`GenerationLease`) that decided a `next_sequence` increment or a lease release from one variant. The
+module doc's replay-purity and ownership claims were corrected against the source. And one
+correctness fix landed: an answered question now returns its task to the state it was parked from — a
+derived `OpenQuestion.parked_from`, restored in `apply_answer` — rather than to a fixed `Pending`,
+which was right only for a spawn admission or a parked settlement and lost an `AwaitingMerge` or
+`Deferred` bare-question park. `apply` was otherwise found sound: a pure function of
 `(state, event, derived)` with no clock, environment, randomness or I/O; transitions total over the
-closed 24-variant vocabulary; every lookup a no-op on a miss; §7 clean.
+closed 24-variant vocabulary; §7 clean.
 
-The row is held pending one owner ruling. Each item below is labelled by its stage, so the group is
-not read as handled:
+The row stays in the queue, and the items found during the pass are labelled by stage:
 
-- **The wedge — FIXED, in #153.** A fold-legal `question_raised` then `Declined { decline_halts_run }`
-  on an *in-flight* task left it `Failed` with an open generation and wedged the run so
-  `derived_outcome` could never end it. Found during this pass, ruled a check-layer behaviour change,
-  and fixed in `src/topology/fold/check_end.rs` (row 32) on its own stream, not here.
-- **`apply_answer` returns any bare-question task to `Pending` — OPEN, and *not* closed by #153's
-  fix.** #153 refuses `question_raised` on an *open generation* or a *terminal* task; `AwaitingRepair`,
-  `AwaitingMerge` and `Deferred` are non-terminal with no open generation, and `check_question_raised`
-  admits them **on purpose** — `src/engine/topology/select/tests.rs`'s
-  `selection_takes_the_first_eligible_candidate_and_not_the_head` parks a *queued* candidate's task
-  with exactly that event. So an answer on such a task returns it to `Pending`, and the fold's
-  accepted-log set then holds a re-dispatch of the original that `ready` never selects. Recorded as
-  `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`.
-- **The design question — ESCALATED and UNANSWERED.** *Is a bare `question_raised` on a non-`Pending`
-  task valid input the fold must handle, or invalid input it must refuse?* A question about the
-  accepted domain of the replay spec; the two fixes it admits — the check refuses the event, or
-  `apply_answer` records the parked-from state and restores it — are a design choice for the owner. It
-  joins the `#108` topology design escalation.
-- **The design-authority claim — WITHDRAWN on evidence.** An earlier draft held this row open because
+- **The in-flight wedge — FIXED in #153.** A fold-legal `question_raised` then `Declined` on a task
+  whose attempt was in flight wedged the run so `derived_outcome` could never end it. Ruled a
+  check-layer behaviour change and fixed in `src/topology/fold/check_end.rs` (row 32) on its own
+  stream, `fix/declined-halt-wedge` at `7a6b23b`. What bears on row 29 is that its two doors —
+  raise-time and answer-time — let `apply_answer` be written against a task that is still parked.
+  This record does not restate #153's guard, which has moved across its heads; read it at that sha.
+- **`apply_answer` returning a parked task to a fixed `Pending` — FIXED here.** The correctness fix
+  above: `apply_answer` restores the parked-from state, right by construction for whatever admitted
+  state the question was raised against, rather than by which states another door happens to admit.
+  Closes `PR153-FOLD-ANSWER-RETURNS-TO-PENDING`; #153 deletes that finding file in its next head
+  movement, citing this fix.
+- **The answer-return rule — now in the design.** That a bare question on a non-`Pending` task is
+  valid input was already settled by `design/12` and by `select/tests.rs`; what the design did not
+  state was the answer-return, and `design/12` now does — an answered question returns the task to
+  the state it was parked from. No longer an open question.
+- **The design-authority claim — WITHDRAWN on evidence.** An earlier draft held the row open because
   the contracts `apply.rs` states the effect of (INV-02, ST-06, `transaction_fault_matrix[T-ATTEMPT]`,
-  the retired `decisions/2026-08-12` record) name no `DESIGN.md` section. That was wrong: `DESIGN.md`'s
-  row for `decisions/2026-08-12` maps it to §26, whose first paragraph carries that decision's verdict
-  and durable protocol **verbatim**, summarised in §7, §14 and §15. Absence of a private label name is
-  not evidence that its substance is absent. The finding is deleted; the hold is the design question
-  above, not a contract-authority gap.
+  the retired `decisions/2026-08-12` record) name no `DESIGN.md` section. Wrong: `DESIGN.md`'s row for
+  `decisions/2026-08-12` maps it to §26, which carries that decision verbatim. The finding is deleted.
+- **Owed before the row is swept.** `QuestionOrigin`'s only role, deciding the answer-return, is now
+  subsumed by `parked_from`; removing the type reaches `check_end.rs` (row 32, open in #153) and
+  `start.rs` (row 38, the `Derived::Answer` construction), so it is recorded as
+  `SWEEP-FOLD-APPLY-ORIGIN-SUPERSEDED` for those rows rather than done here.
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a
 contract. "Family" is the pull request whose split defines the family the file belongs to, and

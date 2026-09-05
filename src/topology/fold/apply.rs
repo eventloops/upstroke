@@ -14,12 +14,15 @@
 //! carried by [`super::Derived`], decided by the check and therefore identical
 //! on replay.
 //!
-//! **The state owns snapshots of what the log records.** Every `.clone()` in
-//! this module copies a value into durable fold state: a `TaskEntry` into the
-//! registry, a region into the lease table or the queue, a session, base or
-//! candidate identity into a generation. That is the owned-snapshot semantics
-//! §6 blesses, never a borrow-checker workaround — the fold outlives every
-//! event it folded.
+//! **The state owns snapshots of what the log records.** Almost every `.clone()`
+//! in this module copies a value into durable fold state — a `TaskEntry` into
+//! the registry, a region into the lease table or the queue, a session, base or
+//! candidate identity into a generation — the owned-snapshot semantics §6
+//! blesses, since the fold outlives every event it folded. The one exception is
+//! in `apply_merge_rejected`, which clones a held candidate region into a local
+//! so the borrow of `self.tasks` is released before `self.leases` is widened: a
+//! small owned value taken to unborrow, named here rather than claimed a
+//! snapshot.
 
 use super::*;
 
@@ -31,11 +34,14 @@ impl RunState {
     /// Apply a transition the check accepted.
     ///
     /// Total by construction: every lookup here was proved to succeed by the
-    /// check that produced the delta, and each one is written so that a miss
-    /// leaves the state alone rather than panicking. Nothing in this function
-    /// decides anything — a decision made here would be a decision the live
-    /// path and the replay path could reach differently, which is the one thing
-    /// INV-02 forbids.
+    /// check that produced the delta, so no lookup misses on a path this fold
+    /// takes. The safety is that the miss is unreachable, not that each miss is
+    /// inert — most lookups leave the state alone on a miss, but two do not:
+    /// `apply_candidate_created` falls back to the conservative
+    /// `PathSet::RepoWide` and still enqueues, and `apply_verification_started`
+    /// advances `next_sequence` before its queue lookup. Nothing in this
+    /// function decides anything — a decision made here would be one the live
+    /// path and the replay path could reach differently, which INV-02 forbids.
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
@@ -453,8 +459,17 @@ impl RunState {
     }
 
     pub(super) fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
-        if prepared.disposition == PreparedDisposition::Fast {
-            self.next_sequence = self.next_sequence.saturating_add(1);
+        // Exhaustive over the disposition, so a new self-opening
+        // `PreparedDisposition` is a compile error here rather than one that
+        // silently skips the increment: a fast publication opens and closes its
+        // own transaction and consumes a sequence, while a stale-clean or
+        // already-present one was opened by its `merge_verification_started`,
+        // which already advanced `next_sequence`.
+        match prepared.disposition {
+            PreparedDisposition::Fast => {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+            PreparedDisposition::StaleClean | PreparedDisposition::AlreadyPresent => {}
         }
         self.transaction = Some(Transaction {
             sequence: prepared.sequence,
@@ -467,8 +482,16 @@ impl RunState {
     }
 
     pub(super) fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
-        if matches!(rejected.disposition, RejectionDisposition::Conflict { .. }) {
-            self.next_sequence = self.next_sequence.saturating_add(1);
+        // Exhaustive over the disposition, same reason as `apply_merge_prepared`:
+        // a conflict is decided at the cherry-pick and opens and closes its own
+        // transaction, consuming a sequence, while a code rejection was opened
+        // by its `merge_verification_started`, which already advanced
+        // `next_sequence`.
+        match rejected.disposition {
+            RejectionDisposition::Conflict { .. } => {
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+            RejectionDisposition::CodeRejected { .. } => {}
         }
         self.transaction = None;
         let candidate = &rejected.candidate;
@@ -527,6 +550,10 @@ impl RunState {
     }
 
     pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4, origin: QuestionOrigin) {
+        let parked_from = self
+            .questions
+            .get(&answered.question)
+            .map(|open| open.parked_from);
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -535,21 +562,37 @@ impl RunState {
                 if let Some(binding) = binding_override {
                     self.overrides.insert(answered.key, binding.clone());
                 }
-                // Exhaustive over the origin, so a new `QuestionOrigin` is a
-                // compile error here rather than a silent fall-through to
-                // pending: a verification park re-enters the queue at awaiting
-                // merge, and every other origin — a spawn admission, a parked
-                // settlement, a bare `question_raised` — returns the task to
-                // pending. That a bare `question_raised` also carries
-                // `Admission`, so one raised on a task already in
-                // awaiting-repair, awaiting-merge or deferred returns it to
-                // pending as well, is an open design question escalated with the
-                // `#108` topology design, not this arm's to decide.
-                let state = match origin {
-                    QuestionOrigin::VerificationPark => TaskState::AwaitingMerge,
-                    QuestionOrigin::Admission => TaskState::Pending,
-                };
-                self.set_state(answered.key, state);
+                // An answered question returns the task to the state it was
+                // parked from. `check_question_answered` refuses the answer
+                // unless the task is still `AwaitingInput` with nothing open —
+                // whatever the log did between the question and its answer — so
+                // this returns it to exactly where it was, for whatever admitted
+                // state that was: a spawn admission or a parked settlement parks
+                // a `Pending` task, a verification park an `AwaitingMerge` one, a
+                // bare `question_raised` a task in any admitted state. Returning
+                // to a fixed `Pending` was right only for the first and coincided
+                // for the rest by which states another door happens to admit;
+                // this is right by construction.
+                if let Some(state) = parked_from {
+                    // The wire-carried `origin` and `parked_from` agree on one
+                    // point that is an invariant, not a coincidence: a
+                    // verification park is only ever raised on an awaiting-merge
+                    // task. Asserting the direction that holds keeps `origin` a
+                    // check on the fold rather than a discarded parameter now
+                    // that `parked_from` decides the return. (An `Admission`
+                    // origin spans a spawn admission, a parked settlement and a
+                    // bare question — `Pending`, `AwaitingMerge` or `Deferred` —
+                    // so it constrains nothing.) `origin` is otherwise
+                    // superseded; removing it reaches `check_end.rs` (row 32,
+                    // open in #153) and `start.rs` (row 38), so it is left here
+                    // and recorded against those rows.
+                    debug_assert!(
+                        origin != QuestionOrigin::VerificationPark
+                            || state == TaskState::AwaitingMerge,
+                        "a verification-park question parks an awaiting-merge task, not {state:?}"
+                    );
+                    self.set_state(answered.key, state);
+                }
             }
             Answer4::Declined { decline_halts_run } => {
                 self.set_state(answered.key, TaskState::Failed);
@@ -604,12 +647,21 @@ impl RunState {
         origin: QuestionOrigin,
         binding: Option<Vec<String>>,
     ) {
+        // The state the question parks the task in, read before the caller sets
+        // `AwaitingInput`: every caller opens the question while the task is
+        // still in the state its answer should return it to. A missing task is
+        // impossible here — the check registered it — and defaults to `Pending`.
+        let parked_from = self
+            .tasks
+            .get(question.key.index())
+            .map_or(TaskState::Pending, |task| task.state);
         self.seen_questions.insert(question.id.clone());
         self.questions.insert(
             question.id.clone(),
             OpenQuestion {
                 question: question.clone(),
                 origin,
+                parked_from,
                 binding,
             },
         );
@@ -642,9 +694,17 @@ impl RunState {
             return;
         };
         let id = generation.id;
-        let own = generation.lease == GenerationLease::Own;
+        // Exhaustive over the lease, so a new `GenerationLease` is a compile
+        // error here rather than one that silently keeps its region held: an
+        // own generation holds its predicted region and releases it when it
+        // closes, and an inherited-lineage generation took none of its own and
+        // releases nothing.
+        let releases_own_region = match generation.lease {
+            GenerationLease::Own => true,
+            GenerationLease::InheritedLineage { .. } => false,
+        };
         generation.class = GenerationClass::Closed;
-        if own {
+        if releases_own_region {
             self.leases.release(LeaseOwner::Generation {
                 key,
                 generation: id,

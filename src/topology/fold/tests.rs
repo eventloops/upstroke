@@ -6986,6 +6986,37 @@ fn raised(id: &str, key: TaskKey) -> TopologyEvent {
 }
 
 #[test]
+fn an_answered_bare_question_returns_its_task_to_the_state_it_was_parked_from() {
+    // A bare `question_raised` parks a task in whatever state it was in, and its
+    // answer returns it *there*, not to a fixed `Pending`. `MID` is
+    // `AwaitingMerge` — its candidate is queued — so a question parks it at
+    // `AwaitingInput` and the answer restores `AwaitingMerge`, where returning
+    // to `Pending` would have left a queued candidate's task re-dispatchable.
+    let mut fold = two_queued();
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingMerge));
+
+    apply(&mut fold, &raised("q-return-Ünicode", MID));
+    assert_eq!(fold.task_state(MID), Some(TaskState::AwaitingInput));
+
+    apply(
+        &mut fold,
+        &answered(
+            MID,
+            "q-return-Ünicode",
+            Answer4::Answered {
+                option_index: 0,
+                binding_override: None,
+            },
+        ),
+    );
+    assert_eq!(
+        fold.task_state(MID),
+        Some(TaskState::AwaitingMerge),
+        "the answer returns the task to the state the question parked it from"
+    );
+}
+
+#[test]
 fn an_answer_names_an_open_question_of_that_task_and_an_option_it_offered() {
     // refusals[13]. A1's half — the override must name the same question,
     // task and option as the answer carrying it — is wired in; this adds
