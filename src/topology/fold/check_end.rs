@@ -9,6 +9,49 @@ impl RunState {
     pub(super) fn check_question_raised(&self, question: &FrozenQuestion) -> Result<(), FoldError> {
         const KIND: &str = "question_raised";
         self.entry(KIND, question.key)?;
+        let task = self.task(KIND, question.key)?;
+        // **The task the answer will return to has to be one it can return
+        // to.** `apply_answer` states exactly two effects for a bare question:
+        // an answer puts the task back to `Pending`, and a decline sets it
+        // `Failed` and releases its candidate and lineage holdings. Neither
+        // touches a generation, and neither can — nothing an answer carries
+        // says what became of a running attempt. So the two doors here admit
+        // only the tasks those effects are consistent for, in the same shape
+        // `check_dispatched` uses one event earlier.
+        //
+        // A terminal task first. `Merged` and `Failed` are terminal by the
+        // fold's own vocabulary (`TaskState::is_terminal`), and an answer's
+        // `Pending` would un-merge or un-fail one.
+        if task.state.is_terminal() {
+            return Err(FoldError::WrongTaskState {
+                kind: KIND,
+                key: question.key.0,
+                state: task.state.name(),
+                expected: "not terminal",
+            });
+        }
+        // Then an open generation, in any class. This was the door that was
+        // missing: a bare `question_raised` against a task whose generation
+        // was in flight was accepted, and the decline that answered it left
+        // the task `Failed` with that generation still open and its predicted
+        // lease still held. `common()` then read the open generation as "not
+        // ending" for the rest of the log — `run_finished` refused, and no
+        // event could close the generation without either fabricating a
+        // settlement for an attempt nobody judged or un-failing the task. Every
+        // other path that opens a question already has no open generation to
+        // leave behind: a parking settlement closes its generation on the same
+        // event, an admission question is asked at registration, and a
+        // verification park is asked of a candidate whose generation closed
+        // when the candidate was created. This makes the bare event hold to
+        // the same shape.
+        if let Some(open) = task.open() {
+            return Err(FoldError::GenerationOpen {
+                kind: KIND,
+                key: question.key.0,
+                generation: open.id.0,
+                class: open.class.name(),
+            });
+        }
         self.check_new_question(KIND, question, question.key)
     }
 

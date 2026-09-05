@@ -7145,6 +7145,244 @@ fn a_decline_fails_its_task_and_halts_only_when_its_recorded_policy_says_so() {
     assert_eq!(halting.halted_at(), Some(ZETA));
 }
 
+/// ALPHA with generation 0 open in each class a generation can be open in,
+/// as the log that puts it there — the fewest events that reach the class,
+/// after `run_started`.
+fn alpha_open_in_every_class() -> Vec<(&'static str, Vec<TopologyEvent>)> {
+    let base = sha("base");
+    let mut fold = started();
+    let dispatched = dispatch(ALPHA, 0, &base);
+    apply(&mut fold, &dispatched);
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    vec![
+        ("open with no attempt", vec![dispatched.clone()]),
+        ("in flight", vec![dispatched.clone(), start.clone()]),
+        (
+            "retained idle",
+            vec![
+                dispatched.clone(),
+                start.clone(),
+                settle(
+                    ALPHA,
+                    0,
+                    1,
+                    AttemptSettlement::Retained {
+                        retained_session: SessionId("sess-ÜNI-0042".to_owned()),
+                        retained_incarnation: Epoch(0),
+                    },
+                ),
+            ],
+        ),
+        (
+            "promoting",
+            vec![dispatched, start, candidate_prepared(ALPHA, 0, &base)],
+        ),
+    ]
+}
+
+/// Fold `events` after `run_started`, live, and return the fold and the
+/// whole log including the `run_started`.
+fn folded(events: &[TopologyEvent]) -> (TopologyFold, Vec<TopologyEvent>) {
+    let mut fold = started();
+    let mut log = vec![run_started_event()];
+    for event in events {
+        apply(&mut fold, event);
+        log.push(event.clone());
+    }
+    (fold, log)
+}
+
+/// `event` is refused live, the refusal leaves the state alone, and a replay
+/// of the same log plus `event` stops with the same refusal (INV-02).
+#[track_caller]
+fn refused_live_and_on_replay(
+    fold: &TopologyFold,
+    log: &[TopologyEvent],
+    event: &TopologyEvent,
+) -> FoldError {
+    let before = fold.state().cloned();
+    let live = refuse(fold, event);
+    assert_eq!(fold.state().cloned(), before);
+    let mut replayed = log.to_vec();
+    replayed.push(event.clone());
+    let on_replay = TopologyFold::replay(inputs(), &replayed)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a replay of the log plus `{}` must refuse",
+                event.body.kind()
+            )
+        });
+    assert_eq!(
+        live, on_replay,
+        "the live path and the replay refuse differently"
+    );
+    live
+}
+
+#[test]
+fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
+    // **What the pre-repair fold answered for every one of these inputs:
+    // accepted.** The bare `question_raised` set the task `AwaitingInput`
+    // and left the generation exactly as it was — and the decline that
+    // answered it then set the task `Failed` with generation 0 still open
+    // and its predicted lease still held, from which `derived_outcome` read
+    // `NotEnding` for the rest of the log. That log is the one in
+    // `the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_ends_the_run`,
+    // where the same history is written the way the fold can end it.
+    //
+    // Every class, not only `InFlight`: `common()` counts any generation
+    // that is not `Closed` as blocking the end of the run, so a decline
+    // wedges the run from each of the four, and a guard that read only the
+    // in-flight class would leave three doors open.
+    for (class, events) in alpha_open_in_every_class() {
+        let (fold, log) = folded(&events);
+        let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+        assert_eq!(
+            error,
+            FoldError::GenerationOpen {
+                kind: "question_raised",
+                key: 1,
+                generation: 0,
+                class,
+            },
+            "a generation that is {class} is an open generation"
+        );
+        // The refusal is about *this* task's generation. A question about a
+        // task with no generation is still asked, and the id it did not
+        // consume is still free.
+        let mut parked = fold.clone();
+        apply(&mut parked, &raised("q-park-Ünicode", MID));
+        assert_eq!(parked.task_state(MID), Some(TaskState::AwaitingInput));
+    }
+}
+
+#[test]
+fn the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_ends_the_run() {
+    // The history the refused log was trying to record — an attempt of ALPHA
+    // ran, asked, and a person declined — written as the fold accepts it: the
+    // question is the attempt's parking settlement, which closes the
+    // generation and releases its region on the same event, so the decline
+    // finds nothing open and the run can end.
+    let base = sha("base");
+    let mut fold = started();
+    apply(&mut fold, &dispatch(ALPHA, 0, &base));
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    apply(&mut fold, &start);
+    let lease = LeaseOwner::Generation {
+        key: ALPHA,
+        generation: GenerationId(0),
+    };
+    assert!(fold.leases().is_some_and(|leases| leases.holds(lease)));
+    assert!(matches!(
+        refuse(&fold, &raised("q-park-Ünicode", ALPHA)),
+        FoldError::GenerationOpen { .. }
+    ));
+
+    apply(
+        &mut fold,
+        &settle(
+            ALPHA,
+            0,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Parked {
+                    question: question("q-park-Ünicode", ALPHA),
+                },
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        ),
+    );
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingInput));
+    assert!(fold.task(ALPHA).is_some_and(|task| task.open().is_none()));
+    assert!(fold.leases().is_some_and(|leases| !leases.holds(lease)));
+
+    apply(
+        &mut fold,
+        &answered(
+            ALPHA,
+            "q-park-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: true,
+            },
+        ),
+    );
+    // The three facts the wedge inverted, in the order it inverted them:
+    // the decision is kept, nothing is open, and the run ends.
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::Failed));
+    assert_eq!(fold.halted_at(), Some(ALPHA));
+    assert!(fold.task(ALPHA).is_some_and(|task| task.open().is_none()));
+    assert!(fold.leases().is_some_and(|leases| !leases.holds(lease)));
+    // Bounded: `derived_outcome` is a pure function of the state, so the
+    // wrong answer here is a value, never a wait.
+    assert_eq!(
+        fold.derived_outcome(),
+        DerivedOutcome::Ending(RunOutcome::Halted)
+    );
+    accepts(&fold, &run_finished(RunOutcome::Halted, Some(ALPHA)));
+}
+
+#[test]
+fn a_bare_question_is_refused_on_a_terminal_task() {
+    // **Pre-repair: accepted**, and an answer then returned a merged or a
+    // failed task to `Pending`, where `ready` would dispatch it again.
+    let base = sha("base");
+    let mut merged_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            fast_publication(ALPHA, 0, 0, &base, vec![ALPHA]),
+            merged(ALPHA, 0, 0, vec![ALPHA]),
+        ] {
+            apply(&mut fold, &event);
+            merged_log.push(event);
+        }
+    }
+    let mut failed_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Failed {
+                        halts_run: false,
+                        reason: "  the fixture's terminal failure  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut fold, &event);
+            failed_log.push(event);
+        }
+    }
+    for (state, events) in [("merged", merged_log), ("failed", failed_log)] {
+        let (fold, log) = folded(&events);
+        assert_eq!(fold.task_state(ALPHA).map(TaskState::name), Some(state));
+        let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+        assert_eq!(
+            error,
+            FoldError::WrongTaskState {
+                kind: "question_raised",
+                key: 1,
+                state,
+                expected: "not terminal",
+            }
+        );
+    }
+}
+
 #[test]
 fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_the_same_epoch() {
     // refusals[20], and the epoch scope that makes a resume the way back:
