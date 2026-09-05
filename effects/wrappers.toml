@@ -151,7 +151,10 @@ crate_path = "upstroke::rundir::discovery"
 funnel = []
 effectful = []
 effectful_unnameable = []
+# These enumeration helpers observe directory entries and metadata and return
+# names or contextual errors. They perform no write or process operation.
 effect_free = [
+    "collect_run_directories",
     "describe",
     "find_question",
     "husk_report",
@@ -160,6 +163,7 @@ effect_free = [
     "list_runs",
     "resolve_run_id",
     "run_dir_names",
+    "run_ids",
 ]
 
 [[module]]
