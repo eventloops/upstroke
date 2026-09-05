@@ -8,8 +8,31 @@ impl RunState {
 
     pub(super) fn check_question_raised(&self, question: &FrozenQuestion) -> Result<(), FoldError> {
         const KIND: &str = "question_raised";
-        self.entry(KIND, question.key)?;
+        let entry = self.entry(KIND, question.key)?;
         let task = self.task(KIND, question.key)?;
+        // **A lineage member is not parked by a bare question.** §26: a
+        // rejection registers its repair with its own admission, and
+        // "declining fails the lineage". A bare question's answer settles one
+        // task: `apply_answer`'s decline fails the answered task and releases
+        // the lineage lease, and nothing moves the rejected original, which
+        // stays `AwaitingRepair` with no repair carrying it — `derived_outcome`
+        // is then `FoldError` and no `run_finished` is accepted. The pass-3
+        // review of `671949e` reproduced that with a non-halting decline on a
+        // `Pending` repair. The lineage's questions arrive with the repair's
+        // admission on `merge_rejected`; this door keeps the bare event off
+        // its members. (The admission route reaches the same decline arm and
+        // is `PR153-APPLY-DECLINE-FAILS-ONE-MEMBER`, `apply.rs`'s.)
+        if let Some(lineage) = entry.lineage {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "it parks task {}, a repair in the lineage rooted at {}; a lineage's \
+                     questions arrive with its repair's admission, and a decline fails the \
+                     lineage, which a bare question's answer cannot do",
+                    question.key.0, lineage.root.0
+                ),
+            });
+        }
         // **A bare question parks a task at rest, because its answer returns
         // one.** `apply_answer` states exactly two effects for a bare question
         // — an answer returns the task to `Pending`; a decline sets it `Failed`

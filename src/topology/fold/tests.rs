@@ -10340,3 +10340,62 @@ fn a_failure_blocks_the_whole_dependency_closure_and_not_only_its_neighbours() {
     assert_eq!(prefix.task_state(CEE), Some(TaskState::Pending));
     assert_eq!(prefix.derived_outcome(), DerivedOutcome::NotEnding);
 }
+
+#[test]
+fn a_bare_question_is_refused_on_a_lineage_member() {
+    // **Pre-repair: accepted**, and the pass-3 review of `671949e` proved
+    // the consequence with a unit test at that head: the repair, declined
+    // without halting, went `Failed` and released the lineage lease, the
+    // rejected original stayed `AwaitingRepair` with nothing carrying it,
+    // `derived_outcome` read `FoldError`, and every `run_finished` was
+    // refused — a run that cannot end. §26: "Declining fails the lineage";
+    // a bare question's answer settles one task.
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(0),
+            candidate: candidate_of(ALPHA, 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+            lease_effect: RejectionLeaseEffect::CreatesLineage {
+                root: ALPHA,
+                paths: region(ALPHA),
+            },
+        };
+        rejected.repair.entry.deps = Vec::new();
+        rejected.repair.entry.display_deps = Vec::new();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+            ev(TopologyEventBody::MergeRejected {
+                data: Box::new(rejected),
+            }),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+    assert_eq!(fold.task_state(TaskKey(3)), Some(TaskState::Pending));
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingRepair));
+    let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", TaskKey(3)));
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("a question on a lineage member is refused as one: {error}");
+    };
+    assert_eq!(kind, "question_raised");
+    assert!(detail.contains("rooted at 1"), "{detail}");
+    // The run this leaves is one that can still end: the repair is runnable.
+    assert!(fold.ready(TaskKey(3)), "the repair carries the lineage");
+    assert_eq!(fold.derived_outcome(), DerivedOutcome::NotEnding);
+}
