@@ -1,9 +1,13 @@
 # `src/runner/host.rs` — the host runner, `host-v1`
 
-Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs). The code is the authority
-for what it does; this file is the whole of its prose. The module carries no rustdoc and no inline
-comments — only a pointer to this file — so *Item contracts* below is the API documentation and the
-sections after it are the rationale, history and worked examples.
+Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs).
+
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/host.rs).
+
+The host runner implements `host-v1`. The code is the authority for what it does.
+The source retains its pointer and the lock protocol beside `HostRunner`, as
+required by standards §§6, 10 and 13. Item contracts below are the API
+documentation; the following sections record rationale, history and examples.
 
 Section headings are the item names as they are spelled in the source, so a heading is the grep
 string that finds the code.
@@ -64,11 +68,13 @@ The `Host` / `host-v1` `Runner`.
 | `shell_probe(shell, workspace, invocation)` | The `RunnerPreflight` shell probe, executed through this runner. **Errors:** `UpstrokeError::Refused` when the recorded shell cannot be spawned, is killed by the probe timeout, or does not exit 0. |
 | `program_for(program, composed)` | Which file `program` is, at **this** boundary — decided once and then remembered, at most once per `ProgramQuestion` per runner. Increments `program_resolutions` on entry; `program_searches` moves only when the filesystem is reached. **Errors:** `UpstrokeError::Refused` — `resolve_program`'s, first-hand or replayed. |
 
-**Fields.** `hooks` is held for the whole of one `run`, so one `HostRunner` supervises one process at
-a time — not a limitation while `Runner::run` is synchronous and the substrate is sequential.
-`resolved` is what this runner has already decided a program name is (`PR6-LANED-001`); its lock is
-held across one get-or-insert and released before the spawn, so the memo is per-runner state and not
-a resource with a lifecycle.
+**Fields.** The source keeps the lock protocol beside `HostRunner`. The runner
+owns both locks and never nests them. `resolved` serializes each lookup and caches
+its success or error before another caller can read it. Its guard is released
+before `hooks` is acquired. The hooks guard covers startup or an entire supervised
+run, so a shared runner supervises one process at a time even when its callers are
+concurrent. Guards release on return or unwind; a poisoned lock retains its inner
+state. The process funnel's RAII owners handle child cleanup.
 
 ### `ProgramQuestion`
 
@@ -398,9 +404,10 @@ platform trusts.
 
 ## `CREDENTIAL_LOCATIONS`
 
-`src/capacity.rs:36-37` names two of the three as the vendors' own profile mechanism: "`COPILOT_HOME`
-(documented) and `CLAUDE_CONFIG_DIR` (works, undocumented as of Aug 2026)"; `CODEX_HOME` is
-codex-cli's equivalent.
+The [credential profiles passage in the capacity notes](../capacity.md#credential-profiles)
+names two of the three variables, `COPILOT_HOME` and `CLAUDE_CONFIG_DIR`, and
+records their status as of August 2026. `CODEX_HOME` is the Codex CLI equivalent;
+the capacity passage does not supply that third entry.
 
 They are reserved for **every** request rather than only for the agent a request binds: the narrower
 rule would let a gate — repository-controlled code, the one thing on the host that no agent

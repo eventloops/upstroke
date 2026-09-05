@@ -1,10 +1,10 @@
+//! Extended notes: `docs/internals/error.md`
+
 use std::fmt;
 use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Structural problems found in a parsed plan, collected so a single run
-/// surfaces every issue at once instead of failing on the first.
 #[derive(Debug)]
 pub struct ValidationErrors(pub Vec<String>);
 
@@ -27,10 +27,6 @@ pub enum UpstrokeError {
         source: std::io::Error,
     },
 
-    /// A filesystem operation on a path the engine owns failed. Named for
-    /// the operation, because a removal, a write or a rename that fails did
-    /// not fail to read (§7's operation-context rule); `Io` stays the
-    /// variant for reads.
     #[error("failed to {operation} {}: {source}", .path.display())]
     Filesystem {
         operation: &'static str,
@@ -68,17 +64,9 @@ pub enum UpstrokeError {
     #[error("event log {}: {message}", .path.display())]
     EventLog { path: PathBuf, message: String },
 
-    /// A resume precondition failed (§15). Always carries what to do about it:
-    /// refusing to continue is only useful if the operator can tell which of
-    /// the four things moved — the run, the plan, the config, or the branch.
     #[error("cannot resume run `{run_id}`: {message}")]
     Resume { run_id: String, message: String },
 
-    /// A request we could not act on — an id that matches nothing or too many
-    /// things, a question already answered, an option that does not exist.
-    /// Carries its own whole sentence, because prefixing these with a
-    /// command's name (`cannot resume …` on a `status` lookup) misdescribes
-    /// what the operator was actually doing.
     #[error("{message}")]
     Refused { message: String },
 

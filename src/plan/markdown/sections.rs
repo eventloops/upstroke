@@ -1,13 +1,4 @@
-//! Where a task begins: the `##`/`###` headings that delimit sections.
-//!
-//! Only container-free headings are boundaries — one nested in a blockquote or
-//! a list item is quoted material, not plan structure — and an `Acceptance` /
-//! `Done when` / `Success criteria` heading labels the section above rather
-//! than opening a new one, so the recognizer for those lives here too and
-//! [`super::drafts`] reuses it when it arms criterion collection.
-//!
-//! Upstream of `drafts`; reads `<!-- upstroke: ... -->` comments off a heading
-//! line through [`super::annotation`] and parses with [`super::md_options`].
+//! Extended notes: `docs/internals/plan/markdown/sections.md`
 
 use std::ops::Range;
 
@@ -18,15 +9,10 @@ use super::md_options;
 
 pub(super) struct Section {
     pub(super) title: String,
-    /// Byte range of the section body in the original text: from the end of
-    /// the heading block to the start of the next `##`/`###` heading.
     pub(super) content: Range<usize>,
-    /// Annotation written inline on the heading line itself.
     pub(super) inline_annotation: Option<String>,
 }
 
-/// Heading state while scanning: accumulated title text, the heading block
-/// span, and any inline annotation found on the heading line.
 struct HeadingScan {
     title: String,
     span: Range<usize>,
@@ -36,8 +22,6 @@ struct HeadingScan {
 pub(super) fn split_sections(raw: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut in_heading: Option<HeadingScan> = None;
-    // Headings nested in blockquotes or list items are quoted material, not
-    // plan structure — only container-free headings delimit tasks.
     let mut container_depth = 0usize;
 
     for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
@@ -59,9 +43,6 @@ pub(super) fn split_sections(raw: &str) -> Vec<Section> {
             Event::End(TagEnd::Heading(HeadingLevel::H2 | HeadingLevel::H3)) => {
                 if let Some(scan) = in_heading.take() {
                     let title = scan.title.trim().to_owned();
-                    // `### Acceptance` and friends label the criteria of the
-                    // section above, so they are not task boundaries; the
-                    // section body flows through and section_draft arms on it.
                     if is_acceptance_header(strip_trailing_colon(&title)) {
                         continue;
                     }

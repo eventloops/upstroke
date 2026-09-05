@@ -1,16 +1,4 @@
-//! Drafts: one per task-to-be, before ids and dependencies are finalized.
-//!
-//! Two intake shapes, one output type. [`section_draft`] walks the body of a
-//! `##`/`###` section, splitting off its title, its acceptance criteria —
-//! armed by an `Acceptance:` paragraph or heading and collected through nested
-//! sub-lists — its path hints, and its annotation, whose comment spans are
-//! then cut out of the body text. [`checklist_drafts`] is the fallback for a
-//! plan with no sections: top-level `- [ ]` items and ordered `1.` steps
-//! become tasks, plain prose bullets do not.
-//!
-//! The confluence of the DAG: [`super::sections`], [`super::annotation`] and
-//! [`super::hints`] all feed it, and [`super::assemble`] consumes what it
-//! produces.
+//! Extended notes: `docs/internals/plan/markdown/drafts.md`
 
 use std::ops::Range;
 
@@ -47,7 +35,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     if let Some(inline) = &section.inline_annotation {
         sink.accept(inline, &ctx, warnings);
     }
-    // Spans of upstroke annotation comments (slice-relative), removed from body.
     let mut annotation_spans: Vec<Range<usize>> = Vec::new();
     let mut html = HtmlAccumulator::default();
 
@@ -55,15 +42,11 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     let mut in_para = false;
     let mut heading_text = String::new();
     let mut in_heading = false;
-    // An `Acceptance:` paragraph or heading arms the next list.
     let mut armed = false;
     let mut acceptance_list_depth = 0usize;
-    // Slots in `draft.acceptance`, one per open item, so a criterion with a
-    // nested sub-list keeps both its own text and the children, in order.
     let mut item_slots: Vec<usize> = Vec::new();
 
     for (event, range) in Parser::new_ext(slice, md_options()).into_offset_iter() {
-        // HTML accumulates across events; everything else flushes it first.
         if let Event::Html(t) | Event::InlineHtml(t) = &event {
             html.push(t, &range);
         } else {
@@ -97,9 +80,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                     armed = true;
                 }
             }
-            // Blocks that end an acceptance run; HTML comments and headings
-            // deliberately do not, so an invisible annotation between the
-            // header and its list cannot silently disarm collection.
             Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,
             Event::Start(Tag::List(_)) => {
                 if armed || acceptance_list_depth > 0 {
@@ -176,10 +156,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     draft
 }
 
-/// Fallback when a plan has no `##`/`###` sections: top-level checklist items
-/// (`- [ ]` / `- [x]`) and ordered-list steps (`1.` — the common Claude Code
-/// plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
-/// would false-positive. Nested content joins the body.
 pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
     let mut drafts = Vec::new();
     let mut list_depth = 0usize;
@@ -246,7 +222,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                     collect_text_hints(&t, &mut draft.hints);
                 }
             }
-            // A wrapped title must not run its words together.
             Event::SoftBreak | Event::HardBreak => {
                 if let Some((draft, _)) = current.as_mut() {
                     if list_depth == 1 && item_depth == 1 {

@@ -21,6 +21,12 @@ for themselves rather than through the constant or through `RunPaths` — five o
 `src/rundir/names.rs`'s module doc and the pull request body quote it in the
 same words.
 
+The locations below are historical evidence at the `reviewed_sha` above,
+`7724ed1d628070b35948819095a68a38cd0c5d0a`. They are not current line numbers.
+For navigation in a later checkout, search the named module for the exact
+expression in the Spelling column. The internals comment migration moved
+these lines without changing those expressions or resolving this finding.
+
 | Site | Spelling |
 |---|---|
 | `src/export.rs:140` | `public.join("events.jsonl")` |
