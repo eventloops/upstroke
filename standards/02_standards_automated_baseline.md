@@ -11,9 +11,10 @@ bash .github/scripts/test-release-record.sh
 bash .github/scripts/test-pr-policy.sh
 bash .github/scripts/test-pr-ledger-evidence.sh
 bash .github/scripts/test-docs-consistency.sh
+bash .github/scripts/test-internals-notes.sh
 ```
 
-CI splits the eight across jobs: `lint` runs rustfmt, Clippy and the four Bash gates; `test` runs
+CI splits the nine across jobs: `lint` runs rustfmt, Clippy and the five Bash gates; `test` runs
 the suite on Linux and macOS, and `test (winguest)` runs it on Windows on a self-hosted ephemeral
 runner; `msrv` runs the locked check on all three; `lint (windows)` runs Clippy natively and builds
 every target as the hosted Windows compile witness; `lint (macos)` runs Clippy natively;
@@ -40,4 +41,4 @@ Lints:
   misspelt control. A per-site `#[expect]` of a governed lint may stand below module level only in
   a file whose `effects/allowlist.toml` row records the lint and the exact annotation count.
 
-Enforced by: the eight commands; `[lints]`; `clippy.toml` with the effects census.
+Enforced by: the nine commands; `[lints]`; `clippy.toml` with the effects census.

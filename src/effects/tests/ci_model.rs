@@ -117,21 +117,22 @@ pub(super) const WINDOWS_TEST_FLOOR: u32 = 1700;
 /// `MUT-WINDOWS-WITNESS-COUNT-DROPPED`.
 pub(super) const WINDOWS_TEST_WITNESS: &str = "cargo test --all-targets --all-features | Tee-Object -Variable log\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n$passed = [int](($log | Select-String -Pattern '^test result: ok\\. (\\d+) passed' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum)\nif ($passed -lt 1700) { throw \"the suite reported $passed passing tests, below the floor of 1700: Cargo compiled the harnesses and executed almost none of them\" }\n";
 
-/// The formatter gate and the four shell gates the `lint` job runs from the
+/// The formatter gate and the five shell gates the `lint` job runs from the
 /// repository root, character for character.
 pub(super) const FMT_GATE: &str = "cargo fmt --check";
-pub(super) const SHELL_GATES: [&str; 4] = [
+pub(super) const SHELL_GATES: [&str; 5] = [
     "bash .github/scripts/test-release-record.sh",
     "bash .github/scripts/test-pr-policy.sh",
     "bash .github/scripts/test-pr-ledger-evidence.sh",
     "bash .github/scripts/test-docs-consistency.sh",
+    "bash .github/scripts/test-internals-notes.sh",
 ];
 
 /// Every script a gate job may run. A union across the three gate jobs rather
 /// than a set per job: `lint (macos)` running the formatter would be
 /// redundant, not an escape, and the one command that must sit on exactly one
 /// job, the Windows build witness, is pinned to its carrier separately.
-pub(super) const GATE_SCRIPTS: [&str; 7] = [
+pub(super) const GATE_SCRIPTS: [&str; 8] = [
     CLIPPY_GATE,
     WINDOWS_BUILD_WITNESS,
     FMT_GATE,
@@ -139,6 +140,7 @@ pub(super) const GATE_SCRIPTS: [&str; 7] = [
     SHELL_GATES[1],
     SHELL_GATES[2],
     SHELL_GATES[3],
+    SHELL_GATES[4],
 ];
 
 /// The actions a step may `uses:`, each pinned to the commit it was reviewed
