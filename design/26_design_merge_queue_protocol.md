@@ -137,6 +137,22 @@ transaction, not a second task terminal state. The run state changes from its
 fixed plan-aligned vectors to an ordered task registry so replay can append
 synthetic tasks without pretending they were in `plan.normalized.json`.
 
+A bare `question_raised` parks a task at rest, because its answer returns one.
+It applies to a `Pending`, `Deferred` or queued `AwaitingMerge` task that holds
+no open generation in any class and whose candidate is not the open integration
+transaction, and to nothing else: a question that arises from an attempt is
+carried by that attempt's settlement (§15), an admission question by its
+`task_spawned` or `merge_rejected`, and a verification park by
+`merge_verification_unavailable`, and each of those leaves its task at rest
+too. A `question_answered` applies only to a task that is still `AwaitingInput`
+with no open generation. A log that raises or answers a question against any
+other state is refused by the fold rather than folded on a guess — a decline
+recorded under an in-flight generation would leave a failed task whose
+generation no event could close without contradicting the decision. A task
+whose candidate is queued is not dispatched again while it is: its work is
+`AwaitingMerge` until integration or repair (§14), and `task_dispatched` is
+refused for it on the queue position, not on the state (decided 2026-09-05).
+
 Schema 3 records at least:
 
 - `task_spawned`: a reusable frozen-spawn payload containing the complete

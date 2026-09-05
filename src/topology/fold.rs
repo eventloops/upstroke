@@ -190,6 +190,19 @@ pub enum FoldError {
     },
 
     #[error(
+        "`{kind}` names task {key} while its generation {generation} is {class}; a question parks \
+         a task at rest and its answer returns one, and nothing orders the answer against what \
+         starts or settles in an open generation meanwhile, so the answer could apply to a state \
+         the question was not asked about"
+    )]
+    GenerationOpen {
+        kind: &'static str,
+        key: u32,
+        generation: u32,
+        class: &'static str,
+    },
+
+    #[error(
         "attempt {attempt} of task {key} resumes a session this incarnation may not resume: \
          {detail}. A session belongs to the process that retained it."
     )]
