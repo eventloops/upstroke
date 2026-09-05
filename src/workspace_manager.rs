@@ -3012,20 +3012,9 @@ impl WorkspaceManager {
     /// A zero-length `commondir` makes `git worktree list` fail before it emits
     /// any records. The registration's `gitdir` is still sufficient evidence
     /// when read byte-for-byte: it names the checkout's `.git`, whose parent
-    /// must canonical-prefix to the exact slot target. Any unreadable or
-    /// partial `gitdir` refuses. A **zero-length** one is skipped, exactly as
-    /// an absent one is: it is what `git worktree add` leaves when killed
-    /// between opening `gitdir` and writing it, it names no checkout, and
-    /// Git's own enumerator reads it as no registration at all — measured on
-    /// git 2.43, `git worktree list` skips it silently and `git worktree prune`
-    /// removes it as an "invalid gitdir file" once it is unlocked. Refusing on
-    /// it made every removal in the repository refuse until a human deleted
-    /// the directory (the sampler's `forced removal converges: Git { message:
-    /// "worktree registration … has an empty gitdir" }`). Neither the skip nor
-    /// the refusal binds anything from the admin directory's basename:
-    /// guessing from it would authorize deletion from a Git-generated,
-    /// collision-suffixed name. A skipped registration is left to the trailing
-    /// `git worktree prune`, which honours its `locked` marker as this does.
+    /// must canonical-prefix to the exact slot target. Any unreadable, empty or
+    /// partial `gitdir` refuses; guessing from the admin directory's basename
+    /// would authorize deletion from a Git-generated, collision-suffixed name.
     fn revalidate_removal(&self, target: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
         self.revalidate_chain(&self.execution_root)?;
         let root = canonical_prefix(&self.execution_root)?;
@@ -3091,14 +3080,6 @@ impl WorkspaceManager {
                     });
                 }
             };
-            // Only the zero-length file is skipped. A whitespace-only `gitdir`
-            // Git *does* list, as a registration of an empty path, and
-            // `registration_checkout` refuses it with the rest of its table.
-            // The checkout below is deleted under containment, never under a
-            // registration, so skipping binds nothing.
-            if bytes.is_empty() {
-                continue;
-            }
             let checkout = registration_checkout(&admin, &bytes)?;
             let worktree = canonical_prefix(&checkout)?;
             if is_at_or_inside(&worktree, &root) {

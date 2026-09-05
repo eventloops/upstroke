@@ -4845,18 +4845,9 @@ fn a_failed_worktree_list_is_an_error_not_an_absent_registration() {
     .expect_err("the classifier propagates the failure and does not answer for Git");
 }
 
-/// The refusing rows of `registration_checkout`'s table, at the removal.
-/// Partial bytes are a registration Git lists and this cannot bind; a
-/// whitespace-only `gitdir` is one Git lists as a registration of an empty
-/// path (measured on git 2.43). Both refuse before anything is deleted. The
-/// zero-length row is deliberately not here: Git's own enumerator skips it,
-/// and so does identification -- the two tests below.
 #[test]
 fn malformed_gitdir_refuses_before_removal() {
-    for (case, bytes) in [
-        ("partial", &b"not-a-dot-git-path"[..]),
-        ("whitespace", &b"\n"[..]),
-    ] {
+    for (case, bytes) in [("empty", &b""[..]), ("partial", &b"not-a-dot-git-path"[..])] {
         let fixture = Fixture::created(&format!("bad-gitdir-{case}"));
         let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
         let path = fixture.manager.slot_path(&slot);
@@ -4879,85 +4870,34 @@ fn malformed_gitdir_refuses_before_removal() {
     }
 }
 
-/// A zero-length `gitdir` is the one row of `registration_checkout`'s table
-/// that identification does not refuse on. Git's own enumerator reads it as
-/// no registration -- `git worktree list` skips it, exit 0 -- and
-/// `git worktree prune` removes it as an "invalid gitdir file" once it is
-/// unlocked, measured on git 2.43. `revalidate_removal` skips it as it skips
-/// an absent one: it names no checkout, so it cannot be the target's and
-/// cannot veto a removal, and nothing is bound from its basename. The checkout
-/// goes under containment and the unlocked admin directory goes with the
-/// trailing prune. Witnessed refusing with `has an empty gitdir` before the
-/// skip existed.
-#[test]
-fn a_zero_length_gitdir_on_a_finished_registration_is_pruned_by_forced_cleanup() {
-    let fixture = Fixture::created("zero-gitdir-unlocked");
-    let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
-    let path = fixture.manager.slot_path(&slot);
-    let admin = fixture
-        .manager
-        .revalidate_removal(&path)
-        .expect("admin dir")
-        .expect("registered");
-    fs::write(admin.join("gitdir"), []).expect("truncate gitdir");
-    assert_eq!(
-        fixture
-            .manager
-            .revalidate_removal(&path)
-            .expect("identification skips a registration that names nothing"),
-        None,
-        "a zero-length gitdir binds no checkout, so it is nobody's"
-    );
-
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, &slot)
-        .expect("forced cleanup converges past a registration that names nothing");
-    assert!(!path.exists(), "the exact contained checkout is reclaimed");
-    assert!(
-        !admin.exists(),
-        "the unlocked, invalid registration went with Git's own prune"
-    );
-    assert!(
-        !fixture
-            .manager
-            .worktree_records()
-            .expect("records")
-            .iter()
-            .any(|record| record.path().ends_with("kalpha-g1"))
-    );
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, &slot)
-        .expect("and is idempotent");
-}
-
-/// The residue `git worktree add` leaves when it is killed before it writes
-/// `gitdir`. Measured under strace on git 2.43, the add writes in this order:
-/// the admin directory, `locked` (`initializing`), the checkout directory,
-/// `gitdir`, the checkout's `.git` pointer, `HEAD`, `commondir`, then the
-/// checkout itself. A kill between opening `gitdir` -- which creates it,
-/// zero-length -- and writing it leaves exactly an admin directory holding
-/// `locked` and a zero-length `gitdir`, and an empty checkout directory with
-/// no pointer.
+/// What `git worktree add` leaves when it is killed before it writes `gitdir`,
+/// and what this module makes of it. Measured under strace on git 2.43, the
+/// add writes in this order: the admin directory, `locked` (`initializing`),
+/// the checkout directory, `gitdir`, the checkout's `.git` pointer, `HEAD`,
+/// `commondir`, then the checkout; `locked` is unlinked as the last syscall,
+/// on success only, and a failed add removes its whole admin directory. A kill
+/// between opening `gitdir` -- which creates it, zero-length -- and writing it
+/// therefore leaves exactly an admin directory holding `locked` and a
+/// zero-length `gitdir`, and an empty checkout directory with no pointer.
 ///
-/// That state is **not** `registered_unpopulated_worktree`, so the element's
-/// `recovery_proven` label is not what the sampler was failing on: Git's
-/// enumerator skips a registration it reads zero bytes from, so `record_for`
-/// answers `None`, the classifier answers `None`, and the element list is
-/// empty. What failed was `remove_worktree` refusing on a registration that
-/// names nothing (`SAMPLER-RECOVERY-PROVEN-IS-NOT-PROVEN-FOR-AN-EMPTY-GITDIR`:
-/// `forced removal converges: Git { message: "worktree registration … has an
-/// empty gitdir" }`), which no kill discipline can reach because nothing is
-/// running. Forced cleanup now converges past it, binds nothing from its
-/// basename, and honours its `locked` marker as Git does: the stale directory
-/// stays until it is unlocked, the next add for the slot gets a Git-generated
-/// suffixed name and is bound through its own `gitdir`, and Git's prune
-/// clears the stale one the moment it is unlocked. Witnessed refusing with
-/// `has an empty gitdir` at the first `remove_worktree` before the skip
-/// existed.
+/// Three facts, each asserted because each was believed otherwise once. The
+/// state is **not** `registered_unpopulated_worktree`: Git's enumerator skips
+/// a registration it reads zero bytes from, so `record_for` answers `None`,
+/// the classifier answers `None`, and the element list is empty -- the
+/// contract's `recovery_proven` label for that element was measured against
+/// this and is not what fails here. Forced cleanup **refuses before
+/// mutation**, with the sampler's exact fingerprint, and the checkout and the
+/// admin directory are both still there afterwards: the refusal is
+/// deliberate, because on disk this state is indistinguishable from an add in
+/// flight in the same window -- `locked` is present in both -- and a skip
+/// here was measured to delete the checkout beneath a live writer's
+/// registration (PR #151 pass 1). And the residue blocks every removal in the
+/// repository, not only this slot's, until something unlocks and prunes it.
+/// `RESIDUE-EMPTY-GITDIR-REGISTRATION-BLOCKS-EVERY-REMOVAL` is the open
+/// finding; the change that takes it up flips the refusal assertions here and
+/// keeps the first three.
 #[test]
-fn an_add_killed_before_it_wrote_gitdir_does_not_block_forced_cleanup() {
+fn an_add_killed_before_it_wrote_gitdir_is_unlisted_and_refuses_forced_cleanup() {
     let fixture = Fixture::created("add-killed-before-gitdir");
     let slot = fixture.task("alpha", 1);
     fixture
@@ -4991,73 +4931,33 @@ fn an_add_killed_before_it_wrote_gitdir_does_not_block_forced_cleanup() {
         "an admin directory Git does not enumerate is no registered element"
     );
 
-    // Identification skips it, and forced cleanup converges.
-    assert_eq!(
-        fixture
-            .manager
-            .revalidate_removal(&path)
-            .expect("skipped, not refused"),
-        None
-    );
-    fixture
+    // Forced cleanup refuses before mutation, for this slot ...
+    let error = fixture
         .manager
         .remove_worktree(&mut NoHooks, &slot)
-        .expect("forced cleanup converges past an add killed before it wrote gitdir");
+        .expect_err("a registration that names nothing refuses");
     assert!(
-        !path.exists(),
-        "the empty checkout directory is reclaimed under containment"
+        matches!(&error, UpstrokeError::Git { message } if message.contains("has an empty gitdir")),
+        "the sampler's fingerprint: {error}"
     );
+    assert!(path.exists(), "refusal precedes checkout deletion");
     assert!(
         stale.join("locked").exists() && stale.join("gitdir").exists(),
-        "the lock is honoured: Git's prune skips a locked entry, and so does this"
+        "refusal precedes registration deletion"
     );
 
-    // The next add for the slot is bound through its own gitdir, under a name
-    // Git suffixed past the stale one.
-    fixture
+    // ... and for every other slot in the repository, which is what makes
+    // the residue a finding rather than a stuck sample.
+    let other = fixture.add_task(&mut NoHooks, "beta", 1);
+    let error = fixture
         .manager
-        .add_worktree(&mut NoHooks, &slot, &fixture.head)
-        .expect("the slot is added again");
-    let bound = fixture
-        .manager
-        .revalidate_removal(&path)
-        .expect("bound")
-        .expect("registered");
-    assert_ne!(
-        bound, stale,
-        "Git generated a collision-suffixed admin name, which is why the stale one's \
-         basename proves nothing"
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .worktree_records()
-            .expect("records")
-            .iter()
-            .filter(|record| record.path().ends_with("kalpha-g1"))
-            .count(),
-        1,
-        "one registration names the slot"
-    );
-    assert_eq!(classify(site, &target), ObjectResidue::After);
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, &slot)
-        .expect("the re-added worktree is removed");
-    assert!(!bound.exists(), "the bound registration went");
-    assert!(stale.exists(), "the locked stale one stays");
-
-    // What clears the stale one is Git's own prune, once it is unlocked --
-    // here the trailing prune of an idempotent forced cleanup.
-    fs::remove_file(stale.join("locked")).expect("unlock");
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, &slot)
-        .expect("idempotent");
+        .remove_worktree(&mut NoHooks, &other)
+        .expect_err("identification enumerates every registration");
     assert!(
-        !stale.exists(),
-        "an unlocked registration Git reads nothing from is Git's to prune, and it was"
+        matches!(&error, UpstrokeError::Git { message } if message.contains("has an empty gitdir")),
+        "the same fingerprint for an unrelated slot: {error}"
     );
+    assert!(fixture.manager.slot_path(&other).exists());
 }
 
 #[test]
