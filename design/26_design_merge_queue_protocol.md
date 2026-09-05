@@ -385,3 +385,62 @@ by the combined unknown cost of admitted processes. The ledger must state that
 bound honestly; operators requiring the narrowest stop use `max_parallel = 1`
 until providers expose pre-authorizable envelopes. Concurrency must not turn the
 existing reported-spend ceiling into a falsely exact guarantee.
+
+#### Verification contract: the effect-site bijection
+
+Added 2026-09-05 (PR #146) under §13's same-change rule; not part of the verbatim record above.
+It records what `src/topology/effects` enforces, so that the checker has a design sentence to be
+held to rather than a code comment.
+
+**The inventory is closed and typed.** Every external-effect site a schema-4 run has is a
+variant of `EffectSiteId` (grouped by funnel: worktree, snapshot, ref, object, run directory,
+event, answer, lock, report, process, container). A site that is not a variant does not exist, and
+a registry entry naming one is refused at the wire format. Each site carries, by construction,
+its resource row, its fault-matrix row, its scope (topology, shared or legacy), its parent-side
+sub-effect points and their injection modes and platform, its command-internal residue classes
+and the residue elements each must construct, and at most one observable order — which of the
+effect and its event append is durable first, fixed by the site's adjacency.
+
+**The fault-injection registry is a document of entries keyed (site, phase, order)**, where a
+phase is the before hook, the after hook, one sub-effect point in one injection mode, one residue
+class, or the no-execution record below. An entry's expected residue and resume action are the
+site's own semantics, not the entry's opinion of them; the format refuses an entry that disagrees,
+that carries executed-hook evidence for a residue class (no parent hook can observe a
+command-internal prefix), or that carries recovery-proven evidence for a hook.
+
+**The bijection check** (`check_bijection`) takes an inventory, a hook harness, the entries as a
+bare slice, and a host, and returns every way the following fails; an empty answer is the claim
+holding **over that inventory and that host** and nothing wider. For every claimed site in the
+inventory: the harness observed both hook phases and, in every injection mode it supports, every
+sub-effect point the host requires; an entry exists at every observable order for each of those
+phases and carries passing evidence; and each residue class has a recovery-proven entry whose
+synthetic records construct, recover and classify every element the class lists, and whose
+sampling record is non-zero, classifies every sample, and accounts for exactly `n` samples. An
+entry for a site outside the inventory, a duplicate key, and an entry the format would refuse
+are each reported. Legacy-scoped sites are inventoried and carry no requirement.
+
+**The fast-path no-execution record.** Item 4 above fixes that an integration whose base is still
+the head publishes the exact candidate: no staging worktree is added, nothing is cherry-picked, and
+no prepared pin is taken. The three sites those effects belong to therefore carry a fifth kind of
+entry, the no-execution record, naming every fast sequence the suite exercised. The check holds
+the record to the harness: it fails when the suite exercised no fast sequence at all (an empty
+harness is not evidence), when the record names a sequence the harness never exercised, when the
+record says nothing about an exercised sequence (reporting beside the gap whether the harness
+observed a hook of the site in it), and when the record names a sequence in which the harness
+did observe a hook of the site — a contradiction between record and observation. The record is
+additional to, never instead of, the site's ordinary coverage: the same three sites execute on
+the stale path and are held to every requirement above.
+
+**What the harness can witness, and what the check therefore cannot say.** The harness records
+an execution only when a funnel calls its hook, and a sub-effect point only when its armed
+injection fired. So an absence of observation is not evidence of non-execution: a path that
+performs an effect without its hook is invisible to the harness, and the check's report of "no
+hook observed" inside a sequence is exactly that and no more. That is why the record's own names
+are the claim and the observations are what the claim is held to, and why a registry's sampling
+count `n` is checked for self-consistency and not against any authority: the number is the
+registry's, and whether it held across runs is a property no single document can show.
+
+**Diagnostics are typed.** A failure names its site as `EffectSiteId` and its phase as the hook
+phase or entry phase it is about; the only free text a failure carries is a resume action in the
+fault matrix's own words and the name a suite gave a fast sequence. An entry the format refuses
+is reported with the format's own error value.
