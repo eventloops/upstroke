@@ -26,6 +26,54 @@ agent = "aider"
 endpoint = "http://homeserver:11434/v1"
 ```
 
+**What `connect` writes.** The file above is an operator's. The one `upstroke connect` writes is a
+persisted format with two readers — `config`, for every `run`, `validate` and `capacity` that loads
+pools, and `connect` itself on its next run — and it has this shape:
+
+- One `[pools.<name>]` table per agent whose CLI probed and answered discovery, in registry order,
+  **named after the agent** (`claude-code`, `copilot`, `codex`) rather than after a plan: discovery
+  does not establish a tier, and the pool is the operator's to rename. An agent that is not usable
+  on the machine gets a comment saying so and no table.
+- The keys: `kind` and `agent` always; `window = "5h"` and `weekly = true` for a
+  `subscription-window` pool; `sources = ["signals", "self"]`, the two sources v0.1 reads, never
+  `local-logs` or `provider-endpoint`; `safety_margin = 0.15` and `reserve = 0.20`, §13's defaults.
+  Then the operator's own keys, written only when the existing file held them under the same pool
+  name: `profile`, `monthly_allowance` as a number (`"auto"` is the reader's default and is not
+  written) and `endpoint`. `connect` invents none of the three. An allowance must be a positive,
+  finite number or the string `"auto"`. An invalid allowance produces a warning and leaves the
+  discovered `auto` default; valid `profile` and `endpoint` values are still carried.
+- Comments carry what discovery found: a header naming the version, the write time (RFC 3339, UTC)
+  and where the model roster came from; per agent, the auth state — one of *signed in*, *NOT signed
+  in* and *could not be determined*, never the second for the third — each discovery note on its
+  own line, and a sentence saying the `kind` is a default where the CLI could not say.
+- Strings and table keys are TOML-encoded to preserve their values. Finite positive allowances
+  are written as numbers the configuration reader accepts. Every comment payload is written one
+  line per line with forbidden control characters replaced, so a discovery note cannot become a
+  setting or make the file malformed.
+
+**When it is rewritten.** Two comparisons against the file already there, because two questions
+are asked. *May* it be replaced: only if both complete TOML documents parse to equal tables, or
+`--force` is given; otherwise `connect` refuses, prints the file it would have written, and exits
+non-zero. Quoted values retain their whitespace and escapes; equivalent string spellings,
+formatting and table order do not cause a conflict. Integer and float values remain distinct.
+For example, an older writer's integer allowance `10000000000000000` differs from this writer's
+float `1e16` and requires `--force` once. No universal cross-version `Unchanged` behavior is
+promised. Malformed TOML, including malformed comments, requires `--force`. A read error other
+than a missing file is reported even with `--force`.
+
+*Should* it be rewritten: if anything but the first generated write-time header differs,
+comments included, so a login between two runs updates the auth comment while an
+unchanged machine leaves the file, and the date on it, alone. `--force` carries `profile`,
+`monthly_allowance` and `endpoint` over from the pools of the same name in the existing file and
+replaces everything else; a file that does not parse carries nothing. Invalid allowances are
+omitted with the warning described above. Repeated connects using the same writer leave an
+unchanged machine's file alone once its settings and nonvolatile content match.
+
+**Not decided here:** whether the keys above and the default pool name are frozen across versions.
+Today the reader warns on an unknown key and refuses an unknown value, no key or name has been
+renamed, and nothing migrates one; a renamed default pool name would stop the carrying by name.
+That rule is owed and is the owner's to state.
+
 Repo-level `upstroke.toml` — overrides only; everything below has a derived default:
 
 ```toml
