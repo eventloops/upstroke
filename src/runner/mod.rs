@@ -1537,6 +1537,16 @@ mod tests {
                 3,
                 "reads outcomes to export them. A reader",
             ),
+            (
+                "src/status/render.rs",
+                0,
+                3,
+                "reads an outcome to say, in a `--follow` line, whether a \
+                 review pass rejected the code or never reached a verdict. A \
+                 reader, like `export.rs`: this changes display text, not \
+                 run state. Schema-3 and schema-4 success validation use \
+                 `is_successful`; this reader renders the supplied record",
+            ),
         ];
 
         let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();

@@ -1,5 +1,4 @@
 //! Extended notes: `docs/internals/engine/report.md`
-
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -418,14 +417,16 @@ pub fn topo_order(plan: &Plan) -> Vec<usize> {
 
 impl RunReport {
     pub fn render(&self) -> String {
-        let mut out = String::new();
-        let _ = writeln!(out, "run: {}", self.run_id);
-        let _ = writeln!(out, "branch: {} (return with: git switch -)", self.branch);
+        let mut out = util::terminal::TerminalLines::default();
+        out.push(format_args!("run: {}", self.run_id));
+        out.push(format_args!(
+            "branch: {} (return with: git switch -)",
+            self.branch
+        ));
         if self.gates.is_empty() {
-            let _ = writeln!(out, "gates: none");
+            out.push(format_args!("gates: none"));
         } else {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "gates: {} [{}]",
                 self.gates.join(", "),
                 if self.gates_from_config {
@@ -433,10 +434,10 @@ impl RunReport {
                 } else {
                     "derived"
                 }
-            );
+            ));
         }
         for warning in &self.warnings {
-            let _ = writeln!(out, "warning: {warning}");
+            out.push(format_args!("warning: {warning}"));
         }
         for task in &self.tasks {
             match &task.status {
@@ -453,29 +454,31 @@ impl RunReport {
                         Some(cost) => format!("${cost:.4}"),
                         None => "$?".to_owned(),
                     };
-                    let _ = writeln!(
-                        out,
+                    out.push(format_args!(
                         "  {}: committed {sha} — {} [{}] ({:.1}s, {} {worker}{review})",
                         task.id,
                         task.title,
                         task.trail(),
                         task.duration.as_secs_f64(),
                         task.model,
-                    );
+                    ));
                 }
                 TaskRunStatus::Failed { reason, .. } => {
-                    let _ = writeln!(out, "  {}: FAILED [{}] — {reason}", task.id, task.trail());
+                    out.push(format_args!(
+                        "  {}: FAILED [{}] — {reason}",
+                        task.id,
+                        task.trail()
+                    ));
                 }
                 TaskRunStatus::Parked { question, reason } => {
-                    let _ = writeln!(
-                        out,
+                    out.push(format_args!(
                         "  {}: PARKED on {question} [{}] — {reason}",
                         task.id,
                         task.trail()
-                    );
+                    ));
                 }
                 TaskRunStatus::Blocked { by } => {
-                    let _ = writeln!(out, "  {}: blocked by `{by}`", task.id);
+                    out.push(format_args!("  {}: blocked by `{by}`", task.id));
                 }
                 TaskRunStatus::Skipped => {
                     let ending = if self.interrupted {
@@ -483,37 +486,34 @@ impl RunReport {
                     } else {
                         "run halted"
                     };
-                    let _ = writeln!(out, "  {}: skipped ({ending})", task.id);
+                    out.push(format_args!("  {}: skipped ({ending})", task.id));
                 }
                 TaskRunStatus::Running {
                     attempt,
                     tier,
                     model,
                 } => {
-                    let _ = writeln!(
-                        out,
+                    out.push(format_args!(
                         "  {}: running now — attempt {attempt} on {tier} ({model})",
                         task.id
-                    );
+                    ));
                 }
                 TaskRunStatus::Queued => {
-                    let _ = writeln!(out, "  {}: queued", task.id);
+                    out.push(format_args!("  {}: queued", task.id));
                 }
                 TaskRunStatus::Unknown => {
-                    let _ = writeln!(
-                        out,
+                    out.push(format_args!(
                         "  {}: status not recognised by this version of upstroke",
                         task.id
-                    );
+                    ));
                 }
             }
         }
         let open: Vec<&QuestionRecord> = self.questions.iter().filter(|q| q.is_open()).collect();
         if !open.is_empty() {
-            let _ = writeln!(out, "open questions ({}):", open.len());
+            out.push(format_args!("open questions ({}):", open.len()));
             for record in open {
-                let _ = writeln!(
-                    out,
+                out.push(format_args!(
                     "  {} [{}] — {}",
                     record.question.id,
                     record.question.kind,
@@ -526,50 +526,45 @@ impl RunReport {
                             .unwrap_or("(no context)"),
                         120
                     )
-                );
+                ));
             }
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "  payloads: {}",
                 std::path::Path::new(".upstroke")
                     .join("runs")
                     .join(&self.run_id)
                     .join("questions")
                     .display()
-            );
+            ));
         }
-        let _ = writeln!(
-            out,
+        out.push(format_args!(
             "total: ${:.4}{} (api-equivalent)",
             self.total_cost_usd,
             if self.total_is_floor() { "?" } else { "" }
-        );
+        ));
         if self.running {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "run in progress: {} task(s) committed so far on {}",
                 self.committed_count(),
                 self.branch
-            );
-            return out;
+            ));
+            return out.into_string();
         }
         if self.interrupted {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "run interrupted: {} task(s) committed so far on {}",
                 self.committed_count(),
                 self.branch
-            );
-            return out;
+            ));
+            return out.into_string();
         }
         match self.outcome() {
             RunOutcome::Halted => {
-                let _ = writeln!(
-                    out,
+                out.push(format_args!(
                     "run halted at `{}`; completed tasks are committed on {}",
                     self.halted_at.as_deref().unwrap_or("?"),
                     self.branch
-                );
+                ));
             }
             RunOutcome::BudgetExceeded => {
                 let stopped = self.budget_stop.as_ref().map_or_else(
@@ -582,35 +577,35 @@ impl RunReport {
                         )
                     },
                 );
-                let _ = writeln!(
-                    out,
-                    "{stopped}. Committed tasks are on {}; raise the ceiling and continue \
-                     with:\n    upstroke resume {} --budget <usd>",
-                    self.branch, self.run_id
-                );
+                out.push(format_args!(
+                    "{stopped}. Committed tasks are on {}; raise the ceiling and continue with:",
+                    self.branch
+                ));
+                out.push(format_args!(
+                    "    upstroke resume {} --budget <usd>",
+                    self.run_id
+                ));
             }
             RunOutcome::Parked => {
-                let _ = writeln!(
-                    out,
+                out.push(format_args!(
                     "run ended with {} task(s) parked on unanswered questions: {}",
                     self.parked_tasks().len(),
                     self.parked_tasks().join(", ")
-                );
+                ));
             }
             RunOutcome::Complete => {
                 let committed = self.committed_count();
-                let _ = writeln!(
-                    out,
+                out.push(format_args!(
                     "run complete: {committed} task(s) committed on {}",
                     self.branch
-                );
+                ));
             }
         }
-        out
+        out.into_string()
     }
 
     pub fn render_ledger(&self) -> String {
-        let mut out = String::new();
+        let mut out = util::terminal::TerminalLines::default();
         let money = |value: Option<f64>| match value {
             Some(amount) => format!("${amount:.4}"),
             None => "—".to_owned(),
@@ -641,22 +636,20 @@ impl RunReport {
                         task.cost_incomplete() || task.review_cost_incomplete,
                     ),
                 ]
+                .map(util::terminal::one_line)
             })
             .collect();
         let headers = ["task", "attempts", "trail", "worker", "review", "total"];
-        let widths: Vec<usize> = (0..headers.len())
-            .map(|column| {
-                rows.iter()
-                    .map(|row| row[column].chars().count())
-                    .chain(std::iter::once(headers[column].chars().count()))
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
-        let line = |cells: &[String]| {
+        let mut widths = headers.map(|header| header.chars().count());
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let line = |cells: &[String; 6]| {
             let mut rendered = String::from("  ");
-            for (index, cell) in cells.iter().enumerate() {
-                let pad = widths[index].saturating_sub(cell.chars().count());
+            for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
+                let pad = width.saturating_sub(cell.chars().count());
                 let _ = write!(rendered, "{cell}{:pad$}", "", pad = pad);
                 if index + 1 < cells.len() {
                     rendered.push_str("  ");
@@ -665,52 +658,50 @@ impl RunReport {
             rendered.trim_end().to_owned()
         };
 
-        let _ = writeln!(out, "ledger:");
-        let _ = writeln!(out, "{}", line(&headers.map(str::to_owned)));
+        out.push(format_args!("ledger:"));
+        out.push(format_args!("{}", line(&headers.map(str::to_owned))));
         for row in &rows {
-            let _ = writeln!(out, "{}", line(row));
+            out.push(format_args!("{}", line(row)));
         }
-        let _ = writeln!(
-            out,
+        out.push(format_args!(
             "  total ${:.4}{} (api-equivalent; subscription spend is notional — §13)",
             self.total_cost_usd,
             if self.total_is_floor() { "?" } else { "" }
-        );
+        ));
         if self.total_is_floor() {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "  `?` marks a figure missing an attempt whose route reports no spend, or one \
                  the engine was killed inside — a floor, not a total (§13)"
-            );
+            ));
         }
         if self.pool_drain.is_empty() {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "  per-pool drain: no pool is connected for the agents this run used — run \
                  `upstroke connect`"
-            );
+            ));
         } else {
-            let _ = writeln!(out, "  per-pool drain:");
+            out.push(format_args!("  per-pool drain:"));
             for row in &self.pool_drain {
                 let spend = match row.cost_usd {
                     Some(cost) if row.unpriced > 0 => format!("${cost:.4}?"),
                     Some(cost) => format!("${cost:.4}"),
                     None => "— (this route reports no spend)".to_owned(),
                 };
-                let _ = writeln!(
-                    out,
+                out.push(format_args!(
                     "    {}: {} attempt(s), {spend}",
                     row.pool, row.attempts
-                );
+                ));
             }
         }
         if let Some(stop) = &self.budget_stop {
-            let _ = writeln!(
-                out,
+            out.push(format_args!(
                 "  stopped by [budgets] {} = ${:.4} before `{}` (§13)",
                 stop.budget, stop.limit_usd, stop.task
-            );
+            ));
         }
-        out
+        out.into_string()
     }
 }
+
+#[cfg(test)]
+mod tests;

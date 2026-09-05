@@ -2,9 +2,7 @@
 
 Extended notes for [`src/events/mod.rs`](../../../src/events/mod.rs).
 
-The source defines behavior; these notes hold the module's contracts and rationale.
-Each code span in a section heading is an exact source fragment. Search it as a fixed string
-in the linked module, using the enclosing item to distinguish repeated lines.
+These notes preserve the module comments after the status repairs. Item headings quote source lines for navigation.
 
 ## Module
 
@@ -28,12 +26,6 @@ a session id and a `resume_next` flag describe a conversation that believed
 it had left edits in the working tree. After a crash that tree is rolled
 back, so the belief is false and §14's pairing of session-resume with
 tree-retention is broken. `run_resumed` clears both.
-
-## `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`
-
-LEGACY-EFFECT: this module is in the **frozen legacy section** of
-`effects/allowlist.toml`, which carries its justification and the condition
-under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 
 ## `pub use log::{EventLog, LogTail, read_all};`
 
@@ -61,13 +53,13 @@ Fresh runs therefore say `3` in `run_started`; when this binary resumes an
 older run it appends `run_schema_upgraded` before another attempt, so older
 binaries refuse the changed verification standard rather than misread it.
 
-## `pub struct Event {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 ---------------------------------------------------------------------------
 Envelope
 ---------------------------------------------------------------------------
 
-## `pub struct Event {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 One line of `events.jsonl`, in §15's shape:
 `{ts, event, task?, attempt?, rung?, profile?, data}`.
@@ -76,15 +68,15 @@ One line of `events.jsonl`, in §15's shape:
 raw file greppable — `rung` and `profile` in particular answer "what ran
 where" without a JSON parser.
 
-## `impl Event` › `pub fn now(body: EventBody) -> Self {`
+## `pub fn now(body: EventBody) -> Self {`
 
 Stamp a body with the current time.
 
-## `impl Event` › `pub fn task(&self) -> Option<&str> {`
+## `pub fn task(&self) -> Option<&str> {`
 
 The task this event concerns, if any.
 
-## `pub enum EventBody {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 Every transition the engine records.
 
@@ -100,34 +92,34 @@ fight. And **an unreachable answer channel** is process-local — a question
 nobody could answer at 2am is exactly the one the operator answers when they
 come back, so `resume` must be free to ask again.
 
-## `pub enum EventBody` › `RunSchemaUpgraded {`
+## `RunSchemaUpgraded {`
 
 Append-only downgrade barrier for a run whose `run_started` cannot be
 rewritten from an older schema. Schema-1 binaries fail on the unknown
 event tag; schema-2 binaries understand the tag but reject a transition
 to schema 3 before they can apply the old partial-review contract.
 
-## `pub enum EventBody` › `parking: Option<Box<AttemptParking>>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 A policy refusal that must finish the paid attempt and park the
 task atomically. Without this, a crash between `attempt_finished`
 and the separate question/parking events can replay the task as
 pending and pay for the same known-unreviewable attempt again.
 
-## `pub enum EventBody` › `transition: Option<Box<AttemptTransition>>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 The ladder decision caused by this failed attempt. It is part of
 the same durable append as the attempt record: a crash must not
 replay a known failure as pending work on its old rung.
 
-## `pub enum EventBody` › `prepared_commit: Option<Box<PreparedCommit>>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 The exact commit object prepared from the reviewed index for a
 successful attempt. Creating the object does not move a ref; the
 event is therefore durable before the branch advances, and resume
 can finish either side of that CAS without re-running paid work.
 
-## `pub enum EventBody` › `AttemptInterrupted {`
+## `AttemptInterrupted {`
 
 The `attempt_finished` a dead process never got to write.
 
@@ -136,28 +128,28 @@ merely derived in memory: a settlement that lives only in a reader's
 head is lost the moment the log is replayed by someone else, taking the
 ledger line *and* the rung's refunded allowance with it.
 
-## `pub enum EventBody` › `LadderRetry {`
+## `LadderRetry {`
 
 §11.4: feed the failure back and try the same rung again.
 
-## `pub enum EventBody` › `LadderEscalated {`
+## `LadderEscalated {`
 
 §11.4: next rung, fresh session, accumulated feedback.
 
-## `pub enum EventBody` › `TaskDeferred {`
+## `TaskDeferred {`
 
 §19: an outage, so the attempt is given back rather than spent.
 
-## `pub enum EventBody` › `DeferWaitElapsed {`
+## `DeferWaitElapsed {`
 
 The scheduler waited out a deferral and made that work runnable again.
 
-## `pub enum EventBody` › `DesignDefect {`
+## `DesignDefect {`
 
 §5: every question that reaches a human at runtime is a design-phase
 defect, logged as one so the designer prompt can learn from it.
 
-## `pub enum EventBody` › `CapacitySnapshot {`
+## `CapacitySnapshot {`
 
 §14's pre-flight capacity snapshot, taken again after every `run_resumed`
 because a resume re-establishes everything a fresh run does (§15).
@@ -167,7 +159,7 @@ read-only (§13), so nothing routes on it and recording it as state would
 imply otherwise. It is in the log because "what did the pools look like
 when this run made its choices" is unanswerable afterwards.
 
-## `pub enum EventBody` › `PoolExhausted {`
+## `PoolExhausted {`
 
 §15: a rate-limit signal attributed to a pool — §13's source 1, and the
 only thing in v0.1 that can say a pool is empty rather than unmeasured.
@@ -177,7 +169,7 @@ different facts with different lifetimes: the deferral is about one
 task's next move, while this is about a subscription, and a later fold
 reads it back as ground truth for every pool estimate ([`crate::capacity::observe`]).
 
-## `pub enum EventBody` › `BudgetExceeded {`
+## `BudgetExceeded {`
 
 §13's budget ceiling stopped the run before an attempt was spawned.
 
@@ -187,37 +179,37 @@ budget-stopped log fails on an unknown variant — a loud refusal naming
 the log, never a silent misread. That is the trade the version contract
 is written around.
 
-## `impl EventBody` › `pub fn kind(&self) -> &'static str {`
+## `pub fn kind(&self) -> &'static str {`
 
 The `event` tag as it appears in the log — for status rendering.
 
-## `pub struct RunStarted {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 ---------------------------------------------------------------------------
 Payloads
 ---------------------------------------------------------------------------
 
-## `pub struct RunStarted {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 Everything `resume` needs to decide whether continuing is still safe, plus
 enough context that the log explains itself without the repo beside it.
 
-## `pub struct RunStarted` › `pub base_sha: String,`
+## `pub base_sha: String,`
 
 Full sha of the commit the run branched from — the expected HEAD until
 the first task commits.
 
-## `pub struct RunStarted` › `pub plan_path: String,`
+## `pub plan_path: String,`
 
 Plan path as given, relative to the repo root where possible so the
 record survives the repo moving.
 
-## `pub struct RunStarted` › `pub plan_hash: String,`
+## `pub plan_hash: String,`
 
 Content hash of the plan text (`ir::content_hash`). A run is bound to
 the plan it froze; a different hash means the task graph moved under it.
 
-## `pub struct RunStarted` › `pub normalized_plan_digest: Option<String>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 Digest of the exact bytes written to `plan.normalized.json`.
 
@@ -227,17 +219,17 @@ itself. Fresh schema-3 runs record this independent byte digest; legacy
 runs establish it on their first schema-3 resume after comparing the
 old snapshot with a canonical serialization of the validated source.
 
-## `pub struct RunStarted` › `pub private_dir: String,`
+## `pub private_dir: String,`
 
 Where the agent-authored half of this run lives (§15 split).
 
-## `pub struct RunStarted` › `pub chains: Vec<ChainSummary>,`
+## `pub chains: Vec<ChainSummary>,`
 
 The resolved chain per task, in plan order. Recorded so resume can tell
 that config moved: `Progress.rung` is an index into this chain, and
 re-resolving a different one would silently point it at another tier.
 
-## `pub struct RunStarted` › `pub effort_policy: Option<ResolvedEffortPolicy>,`
+## `#[serde(default)]`
 
 The concrete effort standard this run resolved at pre-flight.
 
@@ -247,7 +239,7 @@ of a resumed run think harder or less hard than the front half. `None`
 means a legacy log predating this record; its first resume re-derives,
 warns, and establishes the value in [`RunResumed::effort_policy`].
 
-## `pub struct RunStarted` › `pub gate_cmds: Option<Vec<GateSummary>>,`
+## `#[serde(default)]`
 
 The effective gates in full, as the run resolved them at pre-flight —
 **the gates a resume runs**, not merely a fingerprint it compares.
@@ -274,7 +266,7 @@ exactly as an absent `reviews` does. Pure addition otherwise:
 `#[serde(default)]` folds an old log to the state it always had, so
 `SCHEMA_VERSION` does not move.
 
-## `pub struct RunStarted` › `pub reviews: Option<crate::review::ReviewPlan>,`
+## `#[serde(default)]`
 
 Who judges this run's code (§11.2–§11.3), resolved at pre-flight.
 
@@ -291,23 +283,23 @@ default-constructed plan has no primary, and every reader treats that as
 finish the run with verification silently switched off (step-6 finding
 #10, from the other direction). Absent means re-derive and say so.
 
-## `pub struct ChainSummary {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 One task's resolved escalation chain, as it stood when the run started.
 
-## `pub struct ChainSummary` › `pub bindings: Option<Vec<BindingSummary>>,`
+## `#[serde(default)]`
 
 The exact binding each rung resolved to at pre-flight, aligned with
 `tiers`. `None` means a schema-1 log predating this snapshot; its first
 schema-2 resume re-derives once, warns, and records the result on
 [`RunResumed::chains`]. `Some([])` is a real empty chain list.
 
-## `pub struct BindingSummary {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 One rung's execution identity. `pinned` remains explicit so the event log
 preserves why the binding was fixed as well as which adapter/model ran it.
 
-## `pub struct GateSummary {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 One effective gate as it stood when the run started — everything needed to
 run it again, because a resume does exactly that.
@@ -325,22 +317,22 @@ machine whose shell it never had is already impossible for an unrelated
 reason — `run_started.private_dir` records an absolute host path — so the
 case the pair-only record was protecting does not exist.
 
-## `pub struct RunResumed` › `pub head_sha: String,`
+## `pub head_sha: String,`
 
 HEAD at the moment the run was picked up — the sha the continued work
 builds on.
 
-## `pub struct RunResumed` › `pub interrupted_attempts: u32,`
+## `pub interrupted_attempts: u32,`
 
 Attempts that were in flight when the previous process died.
 
-## `pub struct RunResumed` › `pub discarded: Vec<String>,`
+## `#[serde(default)]`
 
 Uncommitted paths this resume threw away: a dead agent's half-written
 edits (§14). Recorded rather than only warned about, so someone reading
 the run tomorrow can still see that work was discarded and what it was.
 
-## `pub struct RunResumed` › `pub gates: Option<Vec<GateSummary>>,`
+## `#[serde(default)]`
 
 The gates this resume **established**, for a run whose log had none.
 
@@ -363,7 +355,7 @@ worth warning about rather than a silent new standard.
 Folds to no state, like `capacity_snapshot`: its reader is the *next*
 resume, which takes it from the log directly ([`recorded_gates`]).
 
-## `pub struct RunResumed` › `pub effort_policy: Option<ResolvedEffortPolicy>,`
+## `#[serde(default)]`
 
 The effort policy established by the first resume of a legacy log.
 
@@ -371,7 +363,7 @@ Current runs record this on `run_started`, so ordinary resumes leave it
 `None`. Once an old log establishes a value here, later resumes use the
 first recorded value and never re-derive it again.
 
-## `pub struct RunResumed` › `pub reviews: Option<crate::review::ReviewPlan>,`
+## `#[serde(default)]`
 
 The review plan established by the first current-binary resume of a
 legacy log.
@@ -382,68 +374,68 @@ every later resume silently adopt a different reviewer or timeout.
 The first resume therefore appends the plan it established; later
 resumes read the first recorded value and leave this `None`.
 
-## `pub struct RunResumed` › `pub chains: Option<Vec<ChainSummary>>,`
+## `#[serde(default)]`
 
 The resolved chain bindings established by the first schema-2 resume of
 a schema-1 log. Current runs carry them on `run_started`; later resumes
 use the first recorded snapshot and leave this `None`.
 
-## `pub struct RunResumed` › `pub normalized_plan_digest: Option<String>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 Exact normalized-plan byte digest established by the first schema-3
 resume of a legacy run. Current runs carry it in `run_started`, and
 subsequent resumes leave this absent so the first authority wins.
 
-## `pub struct RunSchemaUpgraded {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 A schema transition appended to an old run without rewriting its beginning.
 
-## `pub struct AttemptStarted` › `pub adapter: Option<String>,`
+## `#[serde(default)]`
 
 Adapter id used for this attempt. `agent` remains for wire compatibility.
 
-## `pub struct AttemptStarted` › `pub preflight_cli_version: Option<String>,`
+## `#[serde(default)]`
 
 CLI version observed during pre-flight; this is not a per-attempt probe.
 
-## `pub struct AttemptStarted` › `pub effort: Option<Effort>,`
+## `#[serde(default)]`
 
 Resolved effort passed to the adapter.
 
-## `pub struct AttemptStarted` › `pub selection_origin: Option<SelectionOrigin>,`
+## `#[serde(default)]`
 
 Why this binding was selected. `None` means an old log did not record
 this fact; `unknown` deliberately is not a value writers can emit.
 
-## `pub struct AttemptStarted` › `pub pool: Option<String>,`
+## `#[serde(default)]`
 
 The capacity pool this attempt draws on (§13), recorded before the
 spawn so an attempt the engine died inside can still be attributed: it
 really ran and really drained a subscription, and the settlement record
 has no other way to know which.
 
-## `pub struct AttemptStarted` › `pub resume_session: Option<String>,`
+## `pub resume_session: Option<String>,`
 
 The session this attempt resumed, if any (§11.4).
 
-## `pub struct AttemptRecord {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 One attempt's ledger line: which rung it ran on, what it cost, and what
 went wrong. Shared by the log and `report.json` so the ledger has exactly
 one shape.
 
-## `pub struct AttemptRecord` › `pub pool: Option<String>,`
+## `#[serde(default)]`
 
 Which capacity pool this attempt drained (§13), where the pools file
 names one for its agent. Pure addition: `#[serde(default)]` means a log
 written before step 10 folds to exactly the same state it always did,
 which is why `SCHEMA_VERSION` did not move for it.
 
-## `pub struct AttemptRecord` › `pub resumed: bool,`
+## `pub resumed: bool,`
 
 Whether this attempt resumed the previous one's session (§11.4).
 
-## `pub struct AttemptRecord` › `pub reviews: Vec<ReviewRecord>,`
+## `#[serde(default)]`
 
 The review passes that actually ran, in order (§11.3). Empty when the
 gates failed first and nothing was reviewed.
@@ -454,7 +446,7 @@ second-opinion verdict has to be attributable to the model that gave it.
 Logs written before step 9 read back with this empty — their review
 spend does not replay, which is the price of the shape being right.
 
-## `pub struct AttemptRecord` › `pub usage: Option<crate::ir::Usage>,`
+## `#[serde(default)]`
 
 Token accounting as the CLI reported it, where it reports any.
 
@@ -480,23 +472,23 @@ Pure addition, like `pool` above: `#[serde(default)]` means a log
 written before this folds to exactly the state it always did, so
 `SCHEMA_VERSION` does not move.
 
-## `pub struct AttemptRecord` › `pub failure: Option<FailureRecord>,`
+## `pub failure: Option<FailureRecord>,`
 
 `None` when the attempt passed.
 
-## `pub struct PreparedCommit {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 A hook-free commit object prepared from the exact staged tree that gates
 and reviewers accepted. The event log records the owning full branch ref as
 well as every object identity because a subject, parent, and mutable HEAD do
 not distinguish an amended tree or the ref the run is authorized to move.
 
-## `pub struct PreparedCommit` › `pub pin_ref: String,`
+## `pub pin_ref: String,`
 
 Private ref that keeps the prepared object reachable until HEAD has
 advanced. Its target is CAS-created and CAS-deleted.
 
-## `pub enum AttemptTransition {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 The non-parking state transition settled by one failed attempt.
 
@@ -505,11 +497,11 @@ both move to the next rung and ask for spend approval atomically. Legacy
 standalone ladder events remain readable, but new attempts record their
 decision with the attempt they settle.
 
-## `impl AttemptRecord` › `pub fn is_successful(&self) -> bool {`
+## `#[must_use]`
 
 Whether this record says the attempt **succeeded**.
 
-**One definition, read by both of the fold's settlement doors.** "The
+**One definition, read by schema-3 and schema-4 settlement validation.** "The
 attempt succeeded" is not `failure.is_none()`: a record can carry no
 failure and still hold a review whose outcome is `Failed` or
 `Unavailable`, both of which are authoritative — §11.2 requires every
@@ -524,23 +516,24 @@ walked it. This is the same "one derivation, not two" that the rung
 allowance needed: the doors now ask one predicate rather than each
 deciding for itself.
 
-## `impl AttemptRecord` › `pub fn review_cost_usd(&self) -> Option<f64> {`
+## `pub fn review_cost_usd(&self) -> Option<f64> {`
 
 **There is deliberately no `is_failed`.** It was added as the complement
 of the predicate above and never acquired a caller anywhere in the tree.
 Every reader of this question is asking whether a record *claims success*
-— `check_candidate_prepared`, and both arms of `check_attempt_finished` —
+— the schema-3 boundary, `check_candidate_prepared`, and both arms of
+`check_attempt_finished` —
 and each asks [`Self::is_successful`] directly, which is the question it
 is actually asking. A named complement would put the same predicate under
 two spellings, which is how two readers of one rule begin to disagree.
 
-## `impl AttemptRecord` › `pub fn review_cost_usd(&self) -> Option<f64> {`
+## `pub fn review_cost_usd(&self) -> Option<f64> {`
 
 Total review spend for this attempt, or `None` when nothing reported any
 — which is not the same as nothing costing anything (§13: the Copilot
 route reports no spend at all).
 
-## `impl AttemptRecord` › `pub fn review_cost_incomplete(&self) -> bool {`
+## `pub fn review_cost_incomplete(&self) -> bool {`
 
 Whether any pass that ran reported nothing, making the total above a
 floor rather than a figure.
@@ -551,52 +544,52 @@ paths §11.3 covers, and the Copilot route reports no spend at all — so
 as the whole. `render_ledger`'s own contract is that a ledger which
 cannot tell free from unreported is worse than no ledger.
 
-## `impl AttemptRecord` › `pub fn review_models(&self) -> Vec<String> {`
+## `pub fn review_models(&self) -> Vec<String> {`
 
 The models that judged this attempt, in pass order.
 
-## `pub struct ReviewRecord {`
+## `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]`
 
 One review pass's ledger line (§11.2–§11.3).
 
-## `pub struct ReviewRecord` › `pub pass: String,`
+## `pub pass: String,`
 
 The lens that ran — `review` or `second-opinion`.
 
-## `pub struct ReviewRecord` › `pub adapter: Option<String>,`
+## `#[serde(default)]`
 
 Adapter id used for this pass. `agent` remains for wire compatibility.
 
-## `pub struct ReviewRecord` › `pub preflight_cli_version: Option<String>,`
+## `#[serde(default)]`
 
 CLI version observed during pre-flight; this is not a per-pass probe.
 
-## `pub struct ReviewRecord` › `pub effort: Option<Effort>,`
+## `#[serde(default)]`
 
 Resolved review effort passed to the adapter.
 
-## `pub struct ReviewRecord` › `pub pool: Option<String>,`
+## `#[serde(default)]`
 
 Which capacity pool this pass drained (§13). A cross-vendor second
 opinion draws on a *different* subscription than the implementer, so a
 per-pool ledger that read only the implementer's line would attribute
 the whole attempt to one pool that did not pay for all of it.
 
-## `pub struct ReviewRecord` › `pub cost_usd: Option<f64>,`
+## `pub cost_usd: Option<f64>,`
 
 `None` where the agent's route reports no spend.
 
-## `pub struct ReviewRecord` › `pub outcome: ReviewPassOutcome,`
+## `pub outcome: ReviewPassOutcome,`
 
 What this pass concluded. A later pass only exists because every earlier
 one approved, so at most the last entry is ever anything else.
 
-## `pub enum SelectionOrigin {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]`
 
 Where the worker binding came from. The latter two variants are reserved
 for future selectors and deliberately have no producer yet.
 
-## `pub enum ReviewPassOutcome {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]`
 
 How one review pass ended.
 
@@ -606,11 +599,11 @@ on that distinction. Recording it as a plain "did not pass" would put a
 rejection in the ledger against a model that never read the diff — and the
 ledger is what a person reads when deciding whether to trust a run.
 
-## `pub enum ReviewPassOutcome` › `Unavailable,`
+## `Unavailable,`
 
 Rate-limited, timed out, or otherwise never reached a verdict.
 
-## `pub struct FailureRecord` › `pub detail: Option<String>,`
+## `#[serde(default)]`
 
 What the next attempt is told, verbatim — §11.4's feedback.
 
@@ -647,7 +640,7 @@ sentence here that named one engine would be the §22c class again.
 `decisions/2026-08-26-durable-retry-feedback.md` is the Class C
 authorization for this field and states its bounds.
 
-## `impl FailureRecord` › `pub const fn shape(&self) -> crate::ladder::FailureShape {`
+## `#[must_use]`
 
 The two fields that decide what this failure cost.
 
@@ -655,68 +648,68 @@ The durable half of [`crate::ladder::FailureShape`]: a settlement holds
 a record rather than the live failure, and the allowance decision is
 the same decision either way.
 
-## `pub struct LadderRetry {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 What the next attempt is told. Carried on the ladder events rather than on
 the attempt record because this is the full text — a gate log tail runs to
 kilobytes, and `report.json` should not grow one per attempt.
 
-## `pub struct LadderRetry` › `pub resume: bool,`
+## `pub resume: bool,`
 
 §14: a resumed retry keeps the working tree, so the *cumulative* diff
 is what gets re-gated.
 
-## `pub struct LadderEscalated` › `pub to_rung: u32,`
+## `pub to_rung: u32,`
 
 The rung index being moved to. Recorded rather than derived as "+1" so
 replay lands where the run actually went.
 
-## `pub struct TaskDeferred` › `pub defers: u32,`
+## `pub defers: u32,`
 
 Deferrals this task has taken, after this one.
 
-## `pub struct TaskParked` › `pub refund_attempt: bool,`
+## `pub refund_attempt: bool,`
 
 Whether the rung's allowance is given back. A worker or reviewer that
 stopped to ask never had its code judged (§12), so it costs nothing.
 
-## `pub struct TaskCommitted` › `pub sha: String,`
+## `pub sha: String,`
 
 Full sha. `resume` compares this against HEAD, and `--short` length
 varies with `core.abbrev`.
 
-## `pub struct TaskFailed` › `pub halts_run: bool,`
+## `pub halts_run: bool,`
 
 Whether this failure halts the run (`[engine] on_task_failure`).
 Recorded rather than re-derived so a config edit between a run and its
 resume cannot rewrite which task the report blames.
 
-## `pub struct QuestionAnswered` › `pub decline_halts_run: Option<bool>,`
+## `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
 The halt policy frozen when a decline became durable. `None` is a
 legacy answer whose older writer did not record the policy.
 
-## `pub struct QuestionAnswered` › `pub via: String,`
+## `pub via: String,`
 
 Which channel produced it — a terminal, an out-of-band `upstroke answer`,
 or a resume picking up an answer written while the run was dead.
 
-## `pub struct DesignDefect` › `pub context: String,`
+## `pub context: String,`
 
 The decision execution had to stop for — review material for the
 designer prompt (§5).
 
-## `pub struct CapacitySnapshot {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 §14's pre-flight capacity snapshot: what every pool looked like at the
 moment the run made its choices.
 
-## `pub struct CapacitySnapshot` › `pub strategy: String,`
+## `pub strategy: String,`
 
 `[routing.strategy] mode`, echoed because what a snapshot *means*
 depends on which strategy was reading it.
 
-## `pub struct PoolSnapshot {`
+## `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]`
 
 One pool's line in a snapshot, already rendered.
 
@@ -724,154 +717,154 @@ Strings rather than the [`crate::capacity`] enums: this is a record of what
 a past run believed, and pinning it to today's variants would make a future
 rename either break old logs or silently re-interpret them.
 
-## `pub struct PoolExhausted` › `pub reset_at: Option<String>,`
+## `pub reset_at: Option<String>,`
 
 When the signal said the window reopens, where it said so at all.
 
-## `pub struct PoolExhausted` › `pub detail: String,`
+## `pub detail: String,`
 
 The CLI's own words, quoted — the evidence for calling the pool empty.
 
-## `pub enum BudgetKind {`
+## `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]`
 
 Which ceiling stopped the run (§17 `[budgets]`).
 
-## `pub struct BudgetExceeded` › `pub spent_usd: f64,`
+## `pub spent_usd: f64,`
 
 Reported spend to date. A floor where any attempt's route reports no
 spend at all (§13) — which is why the ceiling is checked against
 *reported* dollars and the report says so.
 
-## `pub struct BudgetExceeded` › `pub task: String,`
+## `pub task: String,`
 
 The task whose next attempt was refused. Not a failed task: nothing
 judged it, and nothing was spent on it.
 
-## `pub enum RunOutcome` › `BudgetExceeded,`
+## `BudgetExceeded,`
 
 §13's ceiling stopped the run. Distinct from `Halted` because `resume`
 means something different afterwards — raise the ceiling and continue —
 and CI needs to tell "your budget stopped it" from "a task failed".
 
-## `pub enum TaskState {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 ---------------------------------------------------------------------------
 Derived state
 ---------------------------------------------------------------------------
 
-## `pub enum TaskState {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 Scheduler state for one task. Readiness is derived (deps all `Done`), not
 stored, so it can never drift from the graph.
 
-## `pub enum TaskState` › `Pending,`
+## `Pending,`
 
 Runnable once its dependencies are done — the state a task returns to
 after an answer un-parks it.
 
-## `pub enum TaskState` › `Deferred,`
+## `Deferred,`
 
 A pool was busy. No attempt was spent; try again after a wait (§19).
 
-## `pub enum TaskState` › `AwaitingInput(QuestionId),`
+## `AwaitingInput(QuestionId),`
 
 Parked on a question (§12). Exactly this task, never its neighbours.
 
-## `pub enum TaskState` › `Blocked(String),`
+## `Blocked(String),`
 
 Settlement only: derived when a run ends, never applied from an event,
 because an answered question has to make these runnable again.
 
-## `pub enum TaskState` › `Skipped,`
+## `Skipped,`
 
 Settlement only: the run stopped before this task got its turn.
 
-## `pub struct InFlight {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 An attempt that started and never reported back — the shape a killed
 process leaves in the log.
 
-## `pub struct InterruptedAttempt {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 A dangling attempt, with the task it belongs to.
 
-## `impl InterruptedAttempt` › `pub fn event(&self) -> EventBody {`
+## `pub fn event(&self) -> EventBody {`
 
 The event that stands in for the `attempt_finished` never written.
 
-## `pub fn event(&self) -> EventBody` › `pool: self.flight.pool.clone(),`
+## `pool: self.flight.pool.clone(),`
 
 Its spend is unknown, but which subscription it drew on is
 not: the pool was recorded before the spawn precisely so this
 line does not have to shrug.
 
-## `pub fn event(&self) -> EventBody` › `reviews: Vec::new(),`
+## `reviews: Vec::new(),`
 
 Nothing judged the code, so nothing is attributed to a
 reviewer.
 
-## `pub fn event(&self) -> EventBody` › `usage: None,`
+## `usage: None,`
 
 Same reason as `cost_usd` above: the process died before the
 CLI reported anything, so the tokens it spent are as unknown
 as the dollars.
 
-## `pub fn event(&self) -> EventBody` › `detail: None,`
+## `detail: None,`
 
 Nothing produced feedback: the process died before any
 gate ran or any reviewer read the diff, which is the same
 reason `reviews` and `cost_usd` above are empty.
 
-## `pub struct Feedback {`
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 One thing the next attempt should know. `human` matters: an operator's
 answer is an instruction, while a gate log or a reviewer's demand is
 tool-authored text quoted back.
 
-## `pub struct Progress {`
+## `#[derive(Debug, Clone, Default, PartialEq)]`
 
 Everything one task accumulates across its attempts.
 
-## `pub struct Progress` › `pub rung: usize,`
+## `pub rung: usize,`
 
 Index into the resolved chain.
 
-## `pub struct Progress` › `pub attempts_on_rung: u32,`
+## `pub attempts_on_rung: u32,`
 
 Attempts spent on the current rung.
 
-## `pub struct Progress` › `pub attempts: u32,`
+## `pub attempts: u32,`
 
 Total attempts, which also numbers this task's run artifacts.
 
-## `pub struct Progress` › `pub session: Option<String>,`
+## `pub session: Option<String>,`
 
 Session id from the most recent attempt, for §11.4's resume.
 
-## `pub struct Progress` › `pub resume_next: bool,`
+## `pub resume_next: bool,`
 
 Whether the next attempt should resume `session`.
 
-## `pub struct Progress` › `pub in_flight: Option<InFlight>,`
+## `pub in_flight: Option<InFlight>,`
 
 Set while an attempt is running; a value that survives to the end of a
 replay is an attempt the engine died inside.
 
-## `pub struct RunState {`
+## `#[derive(Debug, Clone, PartialEq)]`
 
 The run state every reader derives and the engine mutates — the only thing
 [`apply`](RunState::apply) touches.
 
-## `pub struct RunState` › `pub task_ids: Vec<String>,`
+## `pub task_ids: Vec<String>,`
 
 Task ids in plan order; every other vector here is aligned to it.
 
-## `pub struct RunState` › `pub order: Vec<usize>,`
+## `pub order: Vec<usize>,`
 
 Task indices in the order they first ran, so a report reads as the run
 happened.
 
-## `pub struct RunState` › `pub budget_stop: Option<BudgetExceeded>,`
+## `pub budget_stop: Option<BudgetExceeded>,`
 
 The ceiling that stopped the run (§13), if one did. Folded from the
 event rather than recomputed by each reader, so a `status` looking at a
@@ -881,11 +874,11 @@ the reader has no config and could not recompute it anyway.
 First stop wins, like `halted_at`: the scheduler stops scheduling once
 this is set, so a second one would describe a spawn that never happened.
 
-## `impl RunState` › `pub fn new(task_ids: Vec<String>) -> Self {`
+## `pub fn new(task_ids: Vec<String>) -> Self {`
 
 A fresh state for a plan's tasks, before any event.
 
-## `impl RunState` › `pub fn apply(&mut self, event: &Event) {`
+## `pub fn apply(&mut self, event: &Event) {`
 
 Fold one event in.
 
@@ -894,9 +887,15 @@ calls it for every event in the file. Unknown tasks are skipped rather
 than panicking: a log paired with a plan that no longer contains the
 task is a resume refusal, caught before this is ever reached.
 
-## `pub fn apply(&mut self, event: &Event)` › `EventBody::RunStarted { .. }`
+## `EventBody::RunStarted { .. }`
 
 Metadata for the reader; contributes no task state.
+
+## `EventBody::RunStarted { .. }`
+
+
+
+## `EventBody::RunStarted { .. }`
 
 `capacity_snapshot` and `pool_exhausted` sit here for opposite
 reasons. The snapshot folds to nothing because nothing routes on
@@ -907,25 +906,25 @@ out of the log directly ([`crate::capacity::observe`]); the task
 consequence of the same rate limit rides on `task_deferred`,
 which is where the scheduler already looks.
 
-## `pub fn apply(&mut self, event: &Event)` › `EventBody::BudgetExceeded { data } => {`
+## `EventBody::BudgetExceeded { data } => {`
 
 §13: the run's ceiling refused the next attempt. It stops the
 drain but fails nothing — the task it names never ran, and the
 tasks behind it settle as skipped exactly as they do after a halt.
 
-## `pub fn apply(&mut self, event: &Event)` › `EventBody::RunResumed { .. } => {`
+## `EventBody::RunResumed { .. } => {`
 
 §14: a resumed run cannot trust a session that believed it left
 edits in a tree that has since been rolled back, and deferred
 work has by definition already waited.
 
-## `pub fn apply(&mut self, event: &Event)` › `self.finished = None;`
+## `self.finished = None;`
 
 `run_finished` describes the previous driver invocation, not
 an immutable terminal once a later resume is durable. Status,
 follow, and crash reporting must project the latest epoch.
 
-## `pub fn apply(&mut self, event: &Event)` › `self.budget_stop = None;`
+## `self.budget_stop = None;`
 
 A budget stop is cleared here for the same reason deferred
 work wakes: it describes a *ceiling a previous process was
@@ -936,14 +935,14 @@ nothing — the run would replay straight back into the stop it
 was resumed to get past. If the new ceiling is still too low,
 the very next `step_task` records a fresh stop and says so.
 
-## `pub fn apply(&mut self, event: &Event)` › `progress.session = data.resume_session.clone();`
+## `progress.session = data.resume_session.clone();`
 
 A fresh attempt has no conversation paired with its fresh
 tree. Replace, rather than preserve, the previous identity;
 otherwise a sessionless failure can resurrect a discarded
 session on the following retry.
 
-## `pub fn apply(&mut self, event: &Event)` › `EventBody::AttemptInterrupted { task, data, .. } => {`
+## `EventBody::AttemptInterrupted { task, data, .. } => {`
 
 The attempt nobody was alive to finish. Recorded — it really ran
 and really drained a pool, and a ledger that hides that is lying
@@ -951,49 +950,55 @@ and really drained a pool, and a ledger that hides that is lying
 judged the code. That is the rule §19 applies to an outage and
 step 7 applies to a worker that stopped to ask.
 
+## `EventBody::AttemptInterrupted { task, data, .. } => {`
+
+
+
+## `EventBody::AttemptInterrupted { task, data, .. } => {`
+
 `attempts` is deliberately not rolled back: it numbers this
 task's artifacts, and reusing the interrupted attempt's number
 would overwrite its transcript with the retry's.
 
-## `pub fn apply(&mut self, event: &Event)` › `progress.session = None;`
+## `progress.session = None;`
 
 §14: whatever session that attempt held described a working
 tree that has since been rolled back.
 
-## `pub fn apply(&mut self, event: &Event)` › `self.progress[index].session = None;`
+## `self.progress[index].session = None;`
 
 Parking discards the attempt's working tree. Its model
 session therefore describes edits that no longer exist
 and must not survive as a candidate for a later retry.
 
-## `fn apply_ladder_escalated(&mut self, task: &str, attempt: u32, data: &LadderEscalated) {` › `progress.session = None;`
+## `progress.session = None;`
 
 §11.4: a different model cannot inherit another's conversation; the
 accumulated feedback carries the history.
 
-## `fn apply_task_deferred(&mut self, task: &str, data: &TaskDeferred) {` › `progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);`
+## `progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);`
 
 No attempt was spent on the work itself (§19), and the discarded tree
 makes every session that described it invalid.
 
-## `fn apply_task_failed(&mut self, task: &str, data: &TaskFailed) {` › `self.halted_at.get_or_insert_with(|| task.to_owned());`
+## `self.halted_at.get_or_insert_with(|| task.to_owned());`
 
 First failure wins: `halted_at` is what the report and CLI name
 as the cause.
 
-## `impl RunState` › `fn answer_question(&mut self, data: &QuestionAnswered) {`
+## `fn answer_question(&mut self, data: &QuestionAnswered) {`
 
 Record an answer and un-park what it releases.
 
 A decline changes no task state here — the caller emits `task_failed`
 for that, so the halt policy lives in exactly one place.
 
-## `fn answer_question(&mut self, data: &QuestionAnswered)` › `if !self.questions[position].is_open() {`
+## `if !self.questions[position].is_open() {`
 
 An answer that arrives twice — a late file alongside a terminal
 reply — must not push the operator's words into the prompt twice.
 
-## `fn answer_question(&mut self, data: &QuestionAnswered)` › `let canned = self.questions[position]`
+## `let canned = self.questions[position]`
 
 An `ApproveSpend` answer is a yes/no about money, and its whole
 meaning was consumed by the un-park above. Pushing it as feedback
@@ -1002,6 +1007,12 @@ prompt under `feedback_section`'s human framing — "an instruction
 from a person, and it takes precedence over your earlier
 assumptions" — handing a coding agent a billing decision as task
 guidance.
+
+## `let canned = self.questions[position]`
+
+
+
+## `let canned = self.questions[position]`
 
 The same objection applies to any canned option, whatever the
 kind, and for a reason the first version of this missed: the
@@ -1015,28 +1026,34 @@ decision from a person… a change that departs from it is a defect
 however well argued". A judge grading a diff against meta-UI text
 can only reject it, every attempt, until the ladder runs out.
 
+## `let canned = self.questions[position]`
+
+
+
+## `let canned = self.questions[position]`
+
 An operator's own words are guidance. A label they picked off a
 list is the un-park, and nothing more.
 
-## `fn answer_question(&mut self, data: &QuestionAnswered)` › `if kind == crate::ir::QuestionKind::Unblock {`
+## `if kind == crate::ir::QuestionKind::Unblock {`
 
 The answer buys a fresh allowance on the rung the task is
 standing on, and clears the deferrals a pool outage racked up.
 It never moves the rung: if the chain exhausted, the task is
 already at the top of it.
 
-## `fn answer_question(&mut self, data: &QuestionAnswered)` › `progress.resume_next = false;`
+## `progress.resume_next = false;`
 
 Never resume out of a park, however warm the session looks:
 parking always discards the working tree, so the session's
 account of what it wrote no longer matches the repository (§14).
 
-## `impl RunState` › `pub fn interrupted_attempts(&self) -> Vec<InterruptedAttempt> {`
+## `pub fn interrupted_attempts(&self) -> Vec<InterruptedAttempt> {`
 
 Attempts this log ends mid-flight — one per process that died inside
 an attempt without a resume having settled it since.
 
-## `impl RunState` › `pub fn settle_interrupted(&mut self) -> u32 {`
+## `pub fn settle_interrupted(&mut self) -> u32 {`
 
 Settle dangling attempts *in memory*, for readers.
 
@@ -1046,11 +1063,11 @@ events instead, so the settlement lands in the log where the next
 reader will find it. Both go through [`RunState::apply`], so what a
 reader sees and what a resume records cannot disagree.
 
-## `impl RunState` › `pub fn open_questions(&self) -> Vec<&QuestionRecord> {`
+## `pub fn open_questions(&self) -> Vec<&QuestionRecord> {`
 
 Open questions, oldest first.
 
-## `pub struct Replay {`
+## `#[derive(Debug)]`
 
 The result of folding a log: the state, plus the run metadata a reader
 needs but that is not task state.
@@ -1059,7 +1076,7 @@ The state is **not** settled — attempts left mid-flight are still marked as
 such. Settling is the caller's decision, because a reader does it in memory
 and a resume records it (see [`RunState::settle_interrupted`]).
 
-## `pub struct Replay` › `pub resumes: u32,`
+## `pub resumes: u32,`
 
 How many times this run has been picked up again.
 
@@ -1145,7 +1162,17 @@ Apply the event-schema compatibility boundary shared by every whole-log
 interpretation. Additive fields are safe inside the current schema; a
 future schema is not something an older binary may silently project.
 
-## `pub(crate) struct LegacyUnsettledFailure {`
+# Errors
+Refuses unsupported schemas, incomplete verification identity, and
+inconsistent schema-3 settlements. A non-passing review must carry its
+failure record and decision; it cannot authorize a prepared commit.
+
+## `let mut pending_prepared: Option<(&str, &PreparedCommit)> = None;`
+
+Both identities remain owned by the immutable event slice throughout
+this validation walk, including the following-event comparison.
+
+## `#[derive(Debug, Clone, PartialEq, Eq)]`
 
 A failed attempt written before schema 3 was settled in two appends: first
 `attempt_finished`, then its ladder/parking decision. A process can die
@@ -1166,50 +1193,54 @@ These categories have policy-independent semantics. Accepting a generic
 retry/escalation here would turn a request for a person, an outage, or an
 unreviewable diff into spend the ladder explicitly forbids.
 
-## `fn the_envelope_matches_the_shape_the_spec_documents()` › `let event = Event::now(attempt_started("t1", 2, 1, "mid"));`
+## `let event = Event::now(attempt_started("t1", 2, 1, "mid"));`
 
 §15: {ts, event, task?, attempt?, rung?, profile?, data}. The
 routing fields are hoisted so the raw file is greppable.
 
-## `fn the_envelope_matches_the_shape_the_spec_documents()` › `let plain = Event::now(EventBody::DeferWaitElapsed {`
+## `let plain = Event::now(EventBody::DeferWaitElapsed {`
 
 An event with no task omits the field rather than nulling it.
 
-## `fn durations_are_milliseconds_not_a_struct()` › `let event = Event::now(attempt_finished("t1", 1, 0, "small"));`
+## `let event = Event::now(attempt_finished("t1", 1, 0, "small"));`
 
 Readability in the log, and it survives serde's internally-tagged
 buffering, which the default Duration shape does not reliably do.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let torn = format!("{good}\n{also_good}\n{{\"ts\":\"2026-01-0");`
+## `let torn = format!("{good}\n{also_good}\n{{\"ts\":\"2026-01-0");`
 
 A kill mid-write: the last line stops partway through.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let mut invalid_utf8_tail = format!("{good}\n").into_bytes();`
+## `let mut invalid_utf8_tail = format!("{good}\n").into_bytes();`
 
 `serde_json` may write Unicode from a recorded reason or path. A kill
 can split that code point, but bytes after the commit newline are no
 less recoverable merely because they are not yet valid UTF-8.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let corrupt = format!("{good}\nnot json at all\n{also_good}\n");`
+## `let corrupt = format!("{good}\nnot json at all\n{also_good}\n");`
 
 Damage anywhere else means the file was rewritten, not interrupted.
 
-## `fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {` › `let mut invalid: serde_json::Value =`
+## `let mut invalid: serde_json::Value =`
 
 Being last is not enough to make an event recoverable. This record is
 complete JSON and newline-terminated, but its domain value is invalid.
 
-## `fn appending_after_a_torn_line_discards_it_rather_than_splicing() {` › `let mut warnings = Vec::new();`
+## `let mut warnings = Vec::new();`
 
 Splicing would have lost both the fragment and the new event;
 newline-terminating the fragment would have left an unparseable
 line in the middle, which the reader must refuse outright.
 
-## `fn a_log_that_is_nothing_but_a_torn_line_opens_empty()` › `let dir = scratch("alltorn");`
+## `let dir = scratch("alltorn");`
 
 The pathological case: killed while writing the very first event.
 
-## `fn a_run_started_without_gate_commands_reads_as_unrecorded()` › `let EventBody::RunStarted { mut data } = started() else {`
+## `let committed = EventBody::TaskCommitted {`
+
+The subsequent event owns the exact identity being promoted.
+
+## `let EventBody::RunStarted { mut data } = started() else {`
 
 The shape every log written before the gate record has. `None`, not
 an empty list: "said nothing about the gates" and "said there were
@@ -1217,41 +1248,41 @@ none" must stay distinguishable — the same rule `reviews` follows for
 logs that predate step 9, and the difference between re-deriving with
 a warning and running a run with verification switched off.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `let EventBody::RunStarted { data } = started() else {`
+## `let EventBody::RunStarted { data } = started() else {`
 
 Resume rebuilds its gates from this record and executes them, so a
 field that does not round-trip is a gate that runs differently the
 second time. `shell` in particular: the same `cmd` is an always-pass
 builtin under one and not a program at all under another.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `assert_eq!(json["data"]["gate_cmds"][0]["timeout_ms"], 600_000);`
+## `assert_eq!(json["data"]["gate_cmds"][0]["timeout_ms"], 600_000);`
 
 Readable in the raw log, like every other duration in it.
 
-## `fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {` › `let recorded = read_back.gate_cmds.expect("gates");`
+## `let recorded = read_back.gate_cmds.expect("gates");`
 
 And the shell spells the same way in the log as in `upstroke.toml`, so
 an operator comparing the two is comparing like with like.
 
-## `fn an_interrupted_attempt_is_recorded_but_does_not_spend_the_rung() {` › `let events = vec![`
+## `let events = vec![`
 
 Decision 3, and the property a killed run depends on: the attempt
 shows up in the ledger, the allowance does not.
 
-## `fn resuming_drops_the_session_and_wakes_deferred_work()` › `let events = vec![`
+## `let events = vec![`
 
 §14's pairing: tree retention and session resume travel together, so
 a resume that discards the tree must also drop the session.
 
-## `fn an_answer_that_arrives_twice_is_applied_once()` › `let mut state = RunState::new(vec!["t1".to_owned()]);`
+## `let mut state = RunState::new(vec!["t1".to_owned()]);`
 
 A terminal reply racing an out-of-band answer file must not push the
 operator's words into the prompt twice.
 
-## `fn a_decline_leaves_the_task_to_the_failure_event()` › `let mut state = RunState::new(vec!["t1".to_owned()]);`
+## `let mut state = RunState::new(vec!["t1".to_owned()]);`
 
 The halt policy lives in exactly one place: task_failed.
 
-## `fn a_tail_never_yields_half_an_event()` › `let mut file = OpenOptions::new().append(true).open(&path).expect("open");`
+## `let mut file = OpenOptions::new().append(true).open(&path).expect("open");`
 
 A partial line is left for the next poll rather than parsed.
