@@ -1,0 +1,24 @@
+---
+id: CLASS-GATE-STATED-DOMAIN-EXCEEDS-COUNTED-DOMAIN
+severity: P2
+disposition: deferred
+category: correctness
+pr: 
+reviewed_sha:
+location: src/effects/tests/source_oracles.rs:401
+provenance: undetermined
+first_bad:
+guard: project owner
+---
+
+## Failure sequence
+
+**A gate whose stated domain is wider than the domain it counts, so it fails open in the passing direction.** Seven instances measured 2026-09-03, in four subsystems, each repaired on its own and none of them found by the repair of another. **(1)** `PR108-CENSUS-DEPTH-FAIL-OPEN` (#108): the `charge_allowance` census read `src/topology/fold/*.rs` and never descended, so a third charge in a grandchild behind a `mod debit;` would double-charge a retained failure at run time while the census still saw two calls and passed; the recheck that missed it was planted **inside** the scanned boundary. **(2)** `PR106-CENSUS-WITNESS-TEXT-DOMAIN` (#106, repaired at `6dc5987`): the witness for "the census cannot read a file the walk did not" extracted the census function's body and banned six reader names, so the assertion's domain was the census's **source text** while its claim was about the files the census reads. A sibling helper scanning a stale eight leaves that body innocent of every needle, and the positive control fires on the witness's own text either way. Implemented and run at both heads: both row tests green at `6d8cdda`, the census red at `6dc5987`. **(3) The repair of (2) reproduced the class one level down**, found by the frontier pass on `6dc5987` the same day: `RowMappingScan`'s fields are `pub(super)` (`src/effects/tests/source_oracles.rs:401`), so a sibling can construct one whose `scanned` is copied from `ProductionModule::files()` while it scans something else. The equality at `:529` then compares the walk against **self-reported metadata** rather than the files actually read, and both row tests stay green with a wildcard `row()` in an unscanned ninth child. **(4)** #116 at `111b045`, review finding 5b: `effects/allowlist.toml`, `src/agent/proc/test_support/readiness.rs` and `src/effects/tests.rs` cite standards §2 for content it does not contain, and the citation passes because the test only checks that both records **mention the new pathname**. **(5)** #106 pass-3 finding 2: the production-module walk's stated domain is the module, and its counted domain is the declarations `scan_module_declarations` can *read* — it inspects an item-position macro invocation's tokens, so a macro defined in a file the walk never reads expands to `mod twelfth;` and the child is never scanned. Reproduced at `62f4ac1`: both row-mapping tests green, no test file touched, the wildcard missed. **(6)** #106 round 3's prose sweep: stated scope "the prose the split falsified", counted scope *categorical* claims only, so a cross-reference — `ReportSite`'s "see this module's worker report" — was outside it and shipped. **(7) The repair of (5) reproduced the class again**, found by the sixth frontier pass on `27c8b2b`: the reconciliation's stated domain is the module, and its counted domain is the module's own DIRECTORY, so a macro expanding to `#[path = "effects_hidden.rs"] mod hidden;` lands the file beside the directory and no walk rooted at it looks there. Reproduced at `27c8b2b`: both row-mapping tests green, no test file touched, the wildcard missed.
+
+## What the change that takes this up should do
+
+Owner, as the ledger records it: project owner.
+
+Seven instances in four subsystems in one day, and the class is what they share rather than anything their subsystems do. **Two of them are repairs of earlier ones that reproduced the defect they were fixing** — (3) repairs (2), (7) repairs (5) — and (6) is the *sweep* for a sibling of (2) exhibiting it too. That is the evidence that per-instance repair does not converge here: three of the seven were introduced by the attempt to close another. #106 rounds 4 and 5 closed the instances at (2), (3), (5), (6) and (7), each with a two-sided proof; the class still has no check. What would close it is a stated rule with a check behind it: for any gate, name the domain the **claim** is about and the domain the **assertion** counts, and require them to be the same set of values rather than two descriptions that agree today. No such rule exists in the standards or in this file, and all seven were found by four separate reviews — #108's, #116's, and #106's fourth, fifth and sixth passes — rather than by anything looking for the shape. Filing this is not a disposition on any of the four; each keeps its own.
+
+Carried in `reviews/FINDINGS.md` §2, “Open — carried deliberately, with an owner”, and confirmed still carried by the full-ledger audit of 2026-08-31 (§39). The row carried no severity label; **P2** here is this migration's judgement from the consequence described above, not the reviewer's own word.

@@ -1,16 +1,4 @@
-//! Drafts: one per task-to-be, before ids and dependencies are finalized.
-//!
-//! Two intake shapes, one output type. [`section_draft`] walks the body of a
-//! `##`/`###` section, splitting off its title, its acceptance criteria —
-//! armed by an `Acceptance:` paragraph or heading and collected through nested
-//! sub-lists — its path hints, and its annotation, whose comment spans are
-//! then cut out of the body text. [`checklist_drafts`] is the fallback for a
-//! plan with no sections: top-level `- [ ]` items and ordered `1.` steps
-//! become tasks, plain prose bullets do not.
-//!
-//! The confluence of the DAG: [`super::sections`], [`super::annotation`] and
-//! [`super::hints`] all feed it, and [`super::assemble`] consumes what it
-//! produces.
+//! Extended notes: `docs/internals/plan/markdown/drafts.md`
 
 use std::ops::Range;
 
@@ -44,9 +32,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
         title: section.title.clone(),
         ..Draft::default()
     };
-    // The range came from `split_sections`' own walk of `raw`, so it lies on
-    // event boundaries of this text; answering its absence beats a panic on a
-    // plan file.
     let Some(slice) = raw.get(section.content.clone()) else {
         warnings.push(format!(
             "internal error: the body range {:?} of {ctx} is not within the plan text; the body is left empty",
@@ -58,7 +43,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     for inline in &section.inline_annotations {
         sink.accept(inline, &ctx, warnings);
     }
-    // Spans of upstroke annotation comments (slice-relative), removed from body.
     let mut annotation_spans: Vec<Range<usize>> = Vec::new();
     let mut html = HtmlAccumulator::default();
 
@@ -66,17 +50,12 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     let mut in_para = false;
     let mut heading_text = String::new();
     let mut in_heading = false;
-    // An `Acceptance:` paragraph or heading arms the next list.
     let mut armed = false;
     let mut acceptance_list_depth = 0usize;
-    // Slots in `draft.acceptance`, one per open item, so a criterion with a
-    // nested sub-list keeps both its own text and the children, in order.
     let mut item_slots: Vec<usize> = Vec::new();
 
     let normalized = parser_source(slice);
     for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
-        // The accumulator sees every event and hands a comment back once the
-        // HTML block or inline construct holding it is complete.
         for comment in html.observe(&event, &range, &normalized) {
             if let Some(span) = sink.take(&comment, &ctx, warnings) {
                 annotation_spans.push(span);
@@ -105,9 +84,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                     armed = true;
                 }
             }
-            // Blocks that end an acceptance run; HTML comments and headings
-            // deliberately do not, so an invisible annotation between the
-            // header and its list cannot silently disarm collection.
             Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,
             Event::Start(Tag::List(_)) => {
                 if armed || acceptance_list_depth > 0 {
@@ -179,9 +155,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
         .collect();
     draft.ann = sink.annotation;
     annotation_spans.sort_by_key(|s| s.start);
-    // The spans are the comments' own source bytes, mapped by the accumulator
-    // through the ranges the parser reported, so a refusal here is a defect in
-    // that mapping and not in the plan; the body is kept whole and says so.
     draft.body = match strip_spans(slice, &annotation_spans) {
         Some(body) => body.trim().to_owned(),
         None => {
@@ -195,9 +168,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     draft
 }
 
-/// The criterion the innermost open acceptance item is collecting into. The
-/// slots are indices pushed when the item opened, each beside the criterion
-/// it names, so the lookup cannot miss; answering absence keeps it total.
 fn open_criterion<'a>(
     item_slots: &[usize],
     acceptance: &'a mut [String],
@@ -205,10 +175,6 @@ fn open_criterion<'a>(
     acceptance.get_mut(*item_slots.last()?)
 }
 
-/// Fallback when a plan has no `##`/`###` sections: top-level checklist items
-/// (`- [ ]` / `- [x]`) and ordered-list steps (`1.` — the common Claude Code
-/// plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
-/// would false-positive. Nested content joins the body.
 pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
     let mut drafts = Vec::new();
     let mut list_depth = 0usize;
@@ -222,11 +188,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
     for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
         for comment in html.observe(&event, &range, &normalized) {
             match current.as_mut() {
-                // The body is built from the text events, which an HTML
-                // block never produces, so the span the sink returns has
-                // nothing to cut here — and the prose an unterminated
-                // comment swallowed is put back from the original source,
-                // preserving its line endings and container prefixes too.
                 Some((draft, sink)) => {
                     sink.take(&comment, "checklist item", warnings);
                     if !comment.terminated && upstroke_body(&comment.inner).is_some() {
@@ -244,8 +205,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                         draft.body.push(' ');
                     }
                 }
-                // Top-level HTML before, between or after the items belongs
-                // to no task; an annotation there would bind to nothing.
                 None => {
                     if upstroke_body(&comment.inner).is_some() {
                         warnings.push(
@@ -300,7 +259,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                     collect_text_hints(&t, &mut draft.hints);
                 }
             }
-            // A wrapped title must not run its words together.
             Event::SoftBreak | Event::HardBreak => {
                 if let Some((draft, _)) = current.as_mut() {
                     if list_depth == 1 && item_depth == 1 {
@@ -313,8 +271,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
             _ => {}
         }
     }
-    // Every block is closed by the parser; the contract is that nothing fed
-    // to the accumulator goes unreported.
     for comment in html.finish() {
         if upstroke_body(&comment.inner).is_some() {
             warnings.push("upstroke annotation outside any checklist item; ignored".to_owned());

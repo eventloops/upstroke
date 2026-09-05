@@ -1,25 +1,4 @@
-//! Markdown plan adapter (DESIGN.md §9).
-//!
-//! `##`/`###` sections become tasks (heading → title, prose → body). A plan
-//! with no such sections falls back to top-level checklist items or numbered
-//! plan-mode steps. The `<!-- upstroke: ... -->` annotation grammar overrides
-//! the heuristics;
-//! annotations are read from pulldown-cmark HTML events, never regexed out of
-//! raw text. Unknown annotation attributes warn and never error.
-//!
-//! # The concerns are private children; this module is their facade
-//!
-//! `sections` finds the heading boundaries, `annotation` extracts and parses
-//! the upstroke comments, `hints` harvests path mentions, `drafts` turns
-//! either intake shape into one draft per task-to-be, and `assemble` resolves
-//! ids, kinds, dependencies and artifacts into the IR. The dependency
-//! direction is one-way and acyclic: `annotation`, `hints` and `sections` feed
-//! `drafts`; `drafts` and `hints` feed `assemble`; every child feeds this
-//! module and none of them is reachable from outside it.
-//!
-//! `md_options` supplies the same parser options to every child. `parser_source`
-//! makes lone-CR line boundaries visible to the parser without moving source
-//! byte offsets. Both stay here so the three walks use the same input rules.
+//! Extended notes: `docs/internals/plan/markdown.md`
 
 mod annotation;
 mod assemble;
@@ -96,12 +75,6 @@ fn md_options() -> Options {
     options
 }
 
-/// pulldown-cmark 0.13.4's HTML-block scanner advances only at LF, although
-/// its paragraph scanner also recognizes lone CR. Give every walk the same
-/// line boundaries. Replacing a lone ASCII CR by LF keeps byte ranges valid
-/// against the original source used for bodies and the input hash. CRLF is
-/// already supported and stays unchanged. The owned copy exists only when
-/// this parser boundary needs normalization.
 fn parser_source(raw: &str) -> Cow<'_, str> {
     let has_lone_cr = raw.ends_with('\r')
         || raw
@@ -123,7 +96,6 @@ fn parser_source(raw: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-/// `1. step` / `1) step` — Claude Code plan mode often writes numbered steps.
 fn is_ordered_item(line: &str) -> bool {
     let digits = line.chars().take_while(char::is_ascii_digit).count();
     let rest = &line[digits..];
@@ -206,13 +178,11 @@ mod tests {
             ]
         );
 
-        // Document-order dependencies: task N depends on task N-1.
         assert!(tasks[0].depends_on.is_empty());
         for pair in tasks.windows(2) {
             assert_eq!(pair[1].depends_on, [pair[0].id.clone()]);
         }
 
-        // Bare plan with a Design task gets the default conventions brief.
         assert_eq!(parsed.plan.artifacts.len(), 1);
         assert_eq!(
             parsed.plan.artifacts[0].id,
@@ -300,7 +270,6 @@ mod tests {
         assert!(joined.contains("malformed annotation attribute `standalone`"));
         assert!(joined.contains("unknown tier `galactic`"));
         assert!(joined.contains("unknown kind `wat`"));
-        // Bad values fall back rather than erroring.
         assert_eq!(parsed.plan.tasks[0].suggested_tier, None);
     }
 
@@ -436,7 +405,6 @@ mod tests {
         assert_eq!(tasks[0].acceptance, ["Field list agreed"]);
         assert_eq!(tasks[1].title, "Next task");
 
-        // Deeper heading form inside a section arms too.
         let parsed = parse("## Task\n\n#### Done when\n- it works\n");
         assert_eq!(parsed.plan.tasks[0].acceptance, ["it works"]);
     }

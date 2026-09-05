@@ -1,27 +1,20 @@
+//! Extended notes: `docs/internals/error.md`
 use std::fmt;
 use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Structural problems found in a parsed plan, collected so a single run
-/// surfaces every issue at once instead of failing on the first.
 #[derive(Debug)]
 pub struct ValidationErrors(pub Vec<String>);
 
-/// An operation's refusal together with warnings gathered before it failed.
-/// The original typed error remains available for callers that classify it.
 #[derive(Debug)]
 pub struct WarnedError {
-    /// The unchanged refusal, including its original error category.
     pub error: Box<UpstrokeError>,
-    /// Diagnostics in the order they were gathered before the refusal.
     pub warnings: Vec<String>,
 }
 
 impl fmt::Display for WarnedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // These errors belong to the formatter; no operation context can be
-        // added when its destination refuses a write.
         write!(f, "{}", self.error)?;
         if !self.warnings.is_empty() {
             write!(f, "\nwarnings:")?;
@@ -35,8 +28,6 @@ impl fmt::Display for WarnedError {
 
 impl std::error::Error for WarnedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        // Display already includes the original error, so forwarding its
-        // source avoids repeating it when the CLI renders the error chain.
         std::error::Error::source(self.error.as_ref())
     }
 }
@@ -51,9 +42,6 @@ impl fmt::Display for ValidationErrors {
     }
 }
 
-/// Library failures classified by the operation or refusal a caller can handle.
-/// A failure with earlier diagnostics retains its category inside
-/// [`Self::WithWarnings`].
 #[derive(Debug, Error)]
 pub enum UpstrokeError {
     #[error("failed to read {}: {source}", .path.display())]
@@ -63,10 +51,6 @@ pub enum UpstrokeError {
         source: std::io::Error,
     },
 
-    /// A filesystem operation on a path the engine owns failed. Named for
-    /// the operation, because a removal, a write or a rename that fails did
-    /// not fail to read (§7's operation-context rule); `Io` stays the
-    /// variant for reads.
     #[error("failed to {operation} {}: {source}", .path.display())]
     Filesystem {
         operation: &'static str,
@@ -104,31 +88,20 @@ pub enum UpstrokeError {
     #[error("event log {}: {message}", .path.display())]
     EventLog { path: PathBuf, message: String },
 
-    /// A resume precondition failed (§15). Always carries what to do about it:
-    /// refusing to continue is only useful if the operator can tell which of
-    /// the four things moved — the run, the plan, the config, or the branch.
     #[error("cannot resume run `{run_id}`: {message}")]
     Resume { run_id: String, message: String },
 
-    /// A request we could not act on — an id that matches nothing or too many
-    /// things, a question already answered, an option that does not exist.
-    /// Carries its own whole sentence, because prefixing these with a
-    /// command's name (`cannot resume …` on a `status` lookup) misdescribes
-    /// what the operator was actually doing.
     #[error("{message}")]
     Refused { message: String },
 
     #[error("{0}")]
     Validation(ValidationErrors),
 
-    /// Non-fatal diagnostics do not replace or hide the operation's refusal.
     #[error(transparent)]
     WithWarnings(WarnedError),
 }
 
 impl UpstrokeError {
-    /// Carry earlier warnings through a refusal without changing a clean
-    /// error's variant. An existing diagnostic bundle is flattened in order.
     pub(crate) fn with_warnings(self, mut warnings: Vec<String>) -> Self {
         if warnings.is_empty() {
             return self;

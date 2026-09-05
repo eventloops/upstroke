@@ -1,13 +1,4 @@
-//! Where a task begins: the `##`/`###` headings that delimit sections.
-//!
-//! Only container-free headings are boundaries — one nested in a blockquote or
-//! a list item is quoted material, not plan structure — and an `Acceptance` /
-//! `Done when` / `Success criteria` heading labels the section above rather
-//! than opening a new one, so the recognizer for those lives here too and
-//! [`super::drafts`] reuses it when it arms criterion collection.
-//!
-//! Upstream of `drafts`; reads `<!-- upstroke: ... -->` comments off a heading
-//! line through [`super::annotation`] and parses with [`super::md_options`].
+//! Extended notes: `docs/internals/plan/markdown/sections.md`
 
 use std::ops::Range;
 
@@ -18,21 +9,14 @@ use super::{md_options, parser_source};
 
 pub(super) struct Section {
     pub(super) title: String,
-    /// Byte range of the section body in the original text: from the end of
-    /// the heading block to the start of the next `##`/`###` heading.
     pub(super) content: Range<usize>,
-    /// Every upstroke annotation written inline on the heading line itself,
-    /// in order; the sink takes the first and warns for the rest.
     pub(super) inline_annotations: Vec<String>,
 }
 
-/// Heading state while scanning: accumulated title text, the heading block
-/// span, and the inline annotations found on the heading line.
 struct HeadingScan {
     title: String,
     span: Range<usize>,
     annotations: Vec<String>,
-    /// Consecutive, unescaped text events, separate from code and HTML.
     plain_text: String,
     unterminated_annotation: bool,
 }
@@ -47,8 +31,6 @@ impl HeadingScan {
 pub(super) fn split_sections(raw: &str, warnings: &mut Vec<String>) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut in_heading: Option<HeadingScan> = None;
-    // Headings nested in blockquotes or list items are quoted material, not
-    // plan structure — only container-free headings delimit tasks.
     let mut container_depth = 0usize;
 
     let normalized = parser_source(raw);
@@ -80,9 +62,6 @@ pub(super) fn split_sections(raw: &str, warnings: &mut Vec<String>) -> Vec<Secti
                              (no `-->` on the heading line); ignored, and the title is unchanged"
                         ));
                     }
-                    // `### Acceptance` and friends label the criteria of the
-                    // section above, so they are not task boundaries; the
-                    // section body flows through and section_draft arms on it.
                     if is_acceptance_header(strip_trailing_colon(&title)) {
                         continue;
                     }
@@ -99,8 +78,6 @@ pub(super) fn split_sections(raw: &str, warnings: &mut Vec<String>) -> Vec<Secti
             Event::Text(t) => {
                 if let Some(scan) = in_heading.as_mut() {
                     scan.title.push_str(&t);
-                    // Text event ranges omit an escaping backslash, so
-                    // equality alone cannot distinguish `\<` from `<`.
                     let escaped = normalized.get(..range.start).is_some_and(|prefix| {
                         prefix
                             .bytes()
@@ -113,8 +90,6 @@ pub(super) fn split_sections(raw: &str, warnings: &mut Vec<String>) -> Vec<Secti
                     if !escaped && normalized.get(range) == Some(t.as_ref()) {
                         scan.plain_text.push_str(&t);
                     } else {
-                        // An escape or entity produces literal text rather
-                        // than an annotation opener in the source.
                         scan.finish_plain_text();
                     }
                 }
