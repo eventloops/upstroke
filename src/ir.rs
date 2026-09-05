@@ -1,5 +1,4 @@
-//! Core data model (DESIGN.md §7): the plan-side types `validate` consumes
-//! and the execution-side types the agent adapters produce.
+//! Extended notes: `docs/internals/ir.md`
 
 use std::fmt;
 use std::path::PathBuf;
@@ -7,7 +6,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Stable identifier for a task within a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub String);
@@ -30,8 +28,6 @@ impl From<&str> for TaskId {
     }
 }
 
-/// Identifier for one question raised during a run. Short enough to type at a
-/// prompt: `upstroke answer <id>` (step 8) accepts any unambiguous prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QuestionId(pub String);
@@ -54,7 +50,6 @@ impl From<&str> for QuestionId {
     }
 }
 
-/// Identifier for an artifact flowing between tasks (contracts, briefs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ArtifactId(pub String);
@@ -77,7 +72,6 @@ impl From<&str> for ArtifactId {
     }
 }
 
-/// Abstract capability tier. Ordering matters: `Small < Mid < Frontier`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
@@ -97,17 +91,6 @@ impl Tier {
     }
 }
 
-/// How hard the model should think, where the CLI exposes that axis.
-///
-/// Abstract for the same reason tiers are: the vocabularies differ per vendor
-/// and the engine should not learn one of them. The five built-in adapter CLIs
-/// now share these levels, so each adapter maps them explicitly rather than
-/// inheriting a vendor default.
-///
-/// Codex also exposes `ultra`, documented as "maximum reasoning with automatic
-/// task delegation". That remains deliberately unreachable: it changes what
-/// the agent *does*, not only how hard it thinks, and nothing in this design has
-/// audited an agent spawning its own subagents inside a upstroke attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -134,16 +117,6 @@ impl Effort {
 
     pub const KNOWN: &'static str = "low, medium, high, xhigh, max";
 
-    /// The tier's default effort — what makes a tier mean something on a CLI
-    /// that has this axis.
-    ///
-    /// Without it, a chain that escalates `small → mid → frontier` on one
-    /// vendor's models moves nothing at all on another's: codex reads the same
-    /// slug at whatever effort the vendor defaults to, which for `gpt-5.6-sol`
-    /// is `low`. Frontier maps to `high` rather than `max` because §23.2 prices
-    /// review per attempt and a reviewer binds at the review tier; `max` is a
-    /// deliberate opt-in through a pin, not the price of routing something to
-    /// the top rung.
     pub fn for_tier(tier: Tier) -> Self {
         match tier {
             Tier::Small => Self::Low,
@@ -165,12 +138,6 @@ impl fmt::Display for Effort {
     }
 }
 
-/// The concrete effort standard one run resolved before it spent anything.
-///
-/// The three tier fields apply to implementation attempts; `review` applies to
-/// every review pass. Keeping the values explicit rather than positional makes
-/// the event record readable and prevents a future tier-order change from
-/// silently reinterpreting an old run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedEffortPolicy {
     pub small: Effort,
@@ -250,16 +217,12 @@ impl fmt::Display for TaskKind {
     }
 }
 
-/// Where a plan came from: which adapter parsed it and a content hash of the
-/// original text, so a run can detect that its plan file changed underneath it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanSource {
     pub adapter: String,
     pub hash: String,
 }
 
-/// Artifact stub — full artifact handling (files on disk, injection into
-/// prompts) arrives with execution; validate only tracks identity and wiring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: ArtifactId,
@@ -288,8 +251,6 @@ pub struct Plan {
     pub artifacts: Vec<Artifact>,
 }
 
-/// What an agent subprocess may touch (§20). Edit profiles get file tools and
-/// the gate commands; reviewers are read-only. Neither gets network tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
@@ -297,24 +258,13 @@ pub enum PermissionMode {
     ReadOnly,
 }
 
-/// §7 `WorkerProfile` — v2.1: an optional PIN. Tiers bind late by default; a
-/// profile forces a fixed binding for one tier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerProfile {
     pub name: String,
-    /// Agent adapter id: `claude-code` | `copilot` | `aider`.
     pub agent: String,
     pub model: String,
-    /// Which capacity pool this profile drains (identity only until the
-    /// capacity engine lands).
     pub pool: String,
     pub permissions: PermissionMode,
-    /// Reasoning effort for adapters that have the axis (§16: codex does).
-    ///
-    /// `Some` on every profile the engine builds — the tier's default, or a
-    /// pin's override. `None` means "whatever the CLI defaults to", which is
-    /// the behaviour this field exists to end: it is reachable only from tests
-    /// that construct a profile by hand.
     #[serde(default)]
     pub effort: Option<Effort>,
     pub max_turns: Option<u32>,
@@ -330,8 +280,6 @@ pub enum OutcomeStatus {
     RateLimited,
 }
 
-/// Token accounting as reported by the agent CLI, parsed defensively — any
-/// field may be absent and absence never fails an attempt.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
@@ -339,47 +287,22 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
     pub num_turns: Option<u32>,
-    /// Output tokens spent thinking rather than answering, where a CLI
-    /// separates the two. Vendor-neutral in name because the concept is:
-    /// Codex reports `reasoning_output_tokens`, and it is a *subset* of
-    /// `output_tokens` rather than an addition to it, so summing the two would
-    /// double-count.
     #[serde(default)]
     pub reasoning_output_tokens: Option<u64>,
 }
 
-/// §7 `Outcome` — what one agent attempt produced. The adapter fills status,
-/// session, usage, and cost from process output; the engine owns `diff`
-/// (invariant 3: ground truth is the engine-captured diff) and
-/// `transcript_path`.
-///
-/// There is no per-attempt pool field here. §13's second currency is recorded
-/// where the attribution actually lives — `AttemptRecord.pool` and
-/// `ReviewRecord.pool`, set by the engine from the pools file — because an
-/// adapter has no idea which subscription the engine bound it to. A stub that
-/// every adapter filled with `None` and nothing ever read was a second,
-/// dead mechanism for a job the first one does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: OutcomeStatus,
     pub diff: String,
-    /// The agent's own account of what happened — its final message, or the
-    /// error text for a failure. Most CLI failures arrive through the JSON
-    /// body with an empty stderr, so without this a report has nothing to
-    /// show the user.
     pub detail: Option<String>,
     pub session_id: Option<String>,
     pub usage: Option<Usage>,
-    /// API-equivalent dollars as reported by the CLI (subscription spend is
-    /// notional — §13).
     pub cost_usd: Option<f64>,
     pub transcript_path: PathBuf,
     pub duration: Duration,
 }
 
-/// §7 `Verdict` — a reviewer's structured judgement of one diff. `pass` is
-/// the only thing the ladder branches on; `required_changes` becomes the
-/// retry feedback (§11.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     pub pass: bool,
@@ -387,26 +310,16 @@ pub struct Verdict {
     pub reasons: Vec<String>,
     #[serde(default)]
     pub required_changes: Vec<String>,
-    /// §12: the reviewer may decline to judge and ask for a human instead.
-    /// Defaulted so a verdict written before this field existed still parses,
-    /// and so silence means "I judged it" rather than "escalate".
     #[serde(default)]
     pub needs_human: bool,
 }
 
-/// §7 `Question` — why the run is asking, and exactly which tasks park for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionKind {
-    /// Nothing else can move this task forward: the chain is exhausted, or a
-    /// pool stayed down. The human is the top rung (§11.4).
     Unblock,
-    /// Spend crossed an `ask_before` threshold. Raised once budgets exist
-    /// (§12); the variant is here so the shape is settled.
     ApproveSpend,
-    /// Proceed / stop at a milestone.
     Continue,
-    /// A worker or reviewer hit a decision it should not make alone (§12).
     Clarify,
 }
 
@@ -421,22 +334,15 @@ impl fmt::Display for QuestionKind {
     }
 }
 
-/// §7 `Question`. `affected_tasks` is load-bearing, not descriptive: exactly
-/// those tasks park, and everything else keeps running (invariant 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub id: QuestionId,
     pub kind: QuestionKind,
     pub affected_tasks: Vec<TaskId>,
-    /// Human-facing framing. Any agent-authored text inside it is quoted and
-    /// labelled as such by whoever built the question.
     pub context: String,
     pub options: Vec<String>,
 }
 
-/// What came back — or did not. `Unanswered` is not a decline: it means no
-/// channel could reach a human at all (CI, detached terminal), which parks the
-/// task rather than failing it (§12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum Answer {
@@ -445,10 +351,6 @@ pub enum Answer {
     Unanswered,
 }
 
-/// FNV-1a 64-bit content hash. Dependency-free and stable across platforms and
-/// releases — identity only, nothing cryptographic. CR bytes are skipped so a
-/// plan checked out with CRLF hashes the same as the LF original (git's
-/// autocrlf would otherwise make the same plan look changed across machines).
 pub fn content_hash(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes.iter().filter(|b| **b != b'\r') {
@@ -486,8 +388,6 @@ mod tests {
 
     #[test]
     fn a_verdict_without_needs_human_is_a_judgement_not_an_escalation() {
-        // Silence must mean "I judged it". A verdict written before the field
-        // existed, or by a model that ignored it, must not park the task.
         let verdict: Verdict =
             serde_json::from_str(r#"{"pass": false, "reasons": ["no tests"]}"#).expect("parse");
         assert!(!verdict.needs_human);
@@ -496,8 +396,6 @@ mod tests {
 
     #[test]
     fn answers_round_trip_and_keep_declined_apart_from_unanswered() {
-        // The distinction decides whether a task Fails or parks (§12), so it
-        // has to survive serialization.
         for answer in [
             Answer::Answered {
                 text: "use the cursor format".to_owned(),
@@ -530,9 +428,6 @@ mod tests {
 
     #[test]
     fn task_kind_all_lists_every_variant_exactly_once_in_order() {
-        // The compile-time canary: no wildcard arm, so an eighth TaskKind
-        // variant refuses to build until it is placed in this chain — and
-        // the walk below then refuses to pass until `ALL` carries it too.
         fn successor(kind: TaskKind) -> Option<TaskKind> {
             match kind {
                 TaskKind::Design => Some(TaskKind::Implement),
@@ -549,7 +444,7 @@ mod tests {
         while let Some(next) = successor(*expected.last().expect("seeded non-empty")) {
             expected.push(next);
             if expected.len() > TaskKind::ALL.len() {
-                break; // a cycle in `successor` must fail the assert, not hang the test
+                break;
             }
         }
         assert_eq!(
@@ -558,8 +453,6 @@ mod tests {
             "TaskKind::ALL must list every variant, in declaration order"
         );
 
-        // The other hand-kept lists agree with the enum: Display -> parse
-        // round-trips, and serde's derived name is the string Display prints.
         for kind in TaskKind::ALL {
             assert_eq!(TaskKind::parse(&kind.to_string()), Some(kind));
             let json = serde_json::to_string(&kind).expect("serialize");

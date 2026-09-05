@@ -1,19 +1,5 @@
-//! What the preview looks like: the echo lines `run` fills a [`Report`] with,
-//! the per-task row, and the table [`Report::render`] delegates to.
-//!
-//! Split out of `super` unchanged. [`Report::render`] stays an inherent method
-//! on the parent — it is the rendering surface every caller and the wrapper
-//! census know — and its body is [`report`] here, which is the only thing that
-//! moved.
-//!
-//! **The denial is restored rather than inherited.** `super` carries
-//! `#![allow(clippy::disallowed_methods)]` because `write_normalized_json`
-//! writes the normalized plan with `fs::write`, and a module-level allow reaches
-//! every child of the module it sits in. Nothing here writes anything — every
-//! function returns a `String` and the sink is always one of its own — so that
-//! allowance has no business extending here, and this line is what stops it.
-//! That is also what keeps this file out of `effects/allowlist.toml`: an
-//! allowance is what that file records, and this module takes none.
+//! Extended notes: `docs/internals/validate/render.md`
+
 #![deny(clippy::disallowed_methods)]
 
 use crate::capacity;
@@ -24,14 +10,6 @@ use crate::route::ResolvedChain;
 
 use super::{Report, Row};
 
-/// Who judges the work (§11.2–§11.3), for the preview.
-///
-/// Resolved against the adapters this build ships, not against binaries found
-/// on PATH: `validate` and `--dry-run` execute nothing (§18), so they cannot
-/// probe. Pre-flight is where a named reviewer has to prove it can actually
-/// run — and where a missing one either warns or refuses. The line says so,
-/// because a preview that reads as a promise is worse than one that reads as a
-/// plan.
 pub(super) fn review_echo(plan: &ReviewPlan) -> String {
     let Some(primary) = &plan.primary else {
         return "review: disabled ([routing] review = { enabled = false })".to_owned();
@@ -63,16 +41,6 @@ pub(super) fn review_echo(plan: &ReviewPlan) -> String {
     line
 }
 
-/// §13's capacity block, for a command that executes nothing.
-///
-/// `validate` and `--dry-run` **do not probe** (§18): every figure here comes
-/// from files — the pools file, and the latest run's event log in this
-/// repository. That is a real distinction rather than a technicality, and the
-/// block says which side of it each line is on, because `upstroke capacity` shows
-/// strictly more by being allowed to spawn the vendors' CLIs.
-///
-/// The same reason the review line says "if installed": a preview that reads as
-/// a promise is worse than one that reads as a plan.
 pub(super) fn capacity_echo(
     cfg: &Config,
     obs: &capacity::Observations,
@@ -151,8 +119,6 @@ pub(super) fn to_row(
     for note in &resolved.notes {
         chain.push_str(&format!(" [{note}]"));
     }
-    // §11.3: a second reviewer is a per-task routing decision like any other,
-    // so it belongs in the column that shows what this task's paths bought it.
     if let Some(binding) = second_opinion {
         chain.push_str(&format!(" [second opinion: {}]", binding.describe()));
     }
@@ -196,7 +162,6 @@ pub(super) fn effort_echo(cfg: &Config) -> String {
     format!("effort: implementation={implementation}, review={review}")
 }
 
-/// The body of [`Report::render`].
 pub(super) fn report(report: &Report) -> String {
     let id_width = column_width("id", report.rows.iter().map(|r| r.id.as_str()));
     let kind_width = column_width("kind", report.rows.iter().map(|r| r.kind.as_str()));
