@@ -506,11 +506,13 @@ the role would be varying two fields and calling it one.
 
 The reserved set is **one** enumeration, and it is `host-v1`'s.
 
-Second field held constant: the role is `Implement` throughout, so what
-varies is only which key is offered. The expected list is written from
-DESIGN.md:260 ("role-scoped `HOME`, `PATH`, and credential locations")
-and `src/capacity.rs:36-37`'s naming of the three vendor variables — not
-read back from `reserved_keys()`, which is the function this pins.
+The expected table is written independently of `reserved_keys()`, so the
+comparison can detect changes to the host enumeration. [DESIGN.md §8](../../../../design/08_design_trait_surface.md)
+supplies the runner contract for role-scoped `HOME`, `PATH`, and credential
+locations. The credential-profile sketch in [src/capacity.rs](../../../../src/capacity.rs)
+names `COPILOT_HOME` and `CLAUDE_CONFIG_DIR`; follow that module's Extended
+notes pointer when present. The table has a separate `CODEX_HOME` entry for
+the Codex fixture.
 
 ## `fn the_reserved_key_enumeration_is_the_hosts_and_not_a_seco…` › `let environment = ContainerEnvironment::from_image(image_base());`
 
