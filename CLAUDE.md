@@ -110,6 +110,7 @@ body when it has been.
 | `CODING_STANDARDS.md`, `standards/` | Implementation standards, one section per file; `standards/SWEEP.md` |
 | `MAINTAINING.md` | Change lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
+| `docs/internals/` | Internal module notes, one file per module mirroring `src/`. A module with notes carries a single `Extended notes:` pointer in its header and no other prose (§13), held both ways by `test-internals-notes.sh`. `docs/` is also the GitHub Pages source for upstroke.rs, so anything added there is published |
 | `.github/scripts/` | The 5 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `reviews/` | `reviews/findings/`, the standing finding ledger, one file per finding; `reviews/FINDINGS.md`, the same ledger up to 2026-09-04, closed to new sections; historical review records moved to the private lab repository on 2026-09-04 |
 | `effects/` | The effect-governance allowlists the `src/effects/tests.rs` census enforces |
