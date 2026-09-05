@@ -1,0 +1,230 @@
+# `src/topology/paths.rs`
+
+Extended notes for [`src/topology/paths.rs`](../../../src/topology/paths.rs).
+
+The code is the authority for what it does; this file is the whole of its prose, moved out of
+the source verbatim. Each section is headed by the line of code the comment sat above, spelled
+as it is in the source, so the heading is the grep string that finds the code.
+
+## Module
+
+The path vocabulary a schema-4 run leases and rejects by.
+
+Two tasks may run in parallel exactly when the regions of the repository
+they touch do not overlap, so "which paths" is a fact the log has to record
+rather than recompute. It is recorded twice, deliberately: a **predicted**
+region taken from the plan's path hints when a task is dispatched, and an
+**actual** region taken from the diff when its candidate is prepared. The
+prediction is what admission can know; the actual set is what the merge
+queue is entitled to trust.
+
+Both are [`PathSet`]s, and both can be [`PathSet::RepoWide`] — the answer
+for a task that gave no usable hint, and the answer for a diff whose byte
+paths did not decode. Repo-wide overlaps everything, so an unparsable
+answer costs parallelism and never costs correctness. That asymmetry is the
+whole reason the variant exists rather than an empty set or an error.
+
+How the two are compared is the fold's business and arrives with it; what
+is here is the frozen record itself, including the [`PathPolicy`] the run
+resolved once and every later comparison must be read against.
+
+## `pub struct PathPolicy {`
+
+The comparison rules a run froze at pre-flight.
+
+Versioned because path comparison is execution identity in the same sense
+effort and reviewer bindings are: a run that admitted two tasks in parallel
+under one case-folding rule must not have its later half admitted under
+another because the machine changed.
+
+## `pub struct PathPolicy` › `pub case_fold: bool,`
+
+Whether two paths differing only in case name the same file. Resolved
+from the repository's filesystem, not guessed per comparison.
+
+## `pub struct PathPolicy` › `pub grammar: PathGrammar,`
+
+The syntax the plan's hints are written in.
+
+## `pub enum PathPolicyVersion {`
+
+Which generation of the comparison rules a record was written under.
+
+## `pub enum PathPolicyVersion` › `V1,`
+
+Component-wise equal/ancestor/descendant overlap, literal prefix taken
+before the first glob metacharacter, repo-wide for anything unsafe.
+
+## `pub enum PathGrammar {`
+
+The syntax a plan's path hints are interpreted in.
+
+## `pub struct GitPath(pub String);`
+
+One repository path as Git names it: forward slashes, relative to the repo
+root, and never a filesystem path on the machine reading it.
+
+Distinct from [`std::path::PathBuf`] on purpose. A recorded region has to
+mean the same thing on the Windows machine that resumes the run as on the
+Linux one that wrote it, and a platform path type would make that a
+question about separators. Paths that did not decode are never stored: the
+classification becomes [`PathSet::RepoWide`] instead, which is why this can
+be a `String` without losing the byte-safe answer.
+
+## `pub enum PathSet {`
+
+A region of the repository.
+
+## `pub enum PathSet` › `RepoWide,`
+
+Everything. The classification for an absent, unsafe, unparsable, or
+undecodable answer — and therefore the one that must never be produced
+by accident, because it serializes every task against every other.
+
+## `pub enum PathSet` › `Prefixes { paths: Vec<GitPath> },`
+
+The literal prefixes a region is bounded by.
+
+## `impl PathSet` › `pub fn is_repo_wide(&self) -> bool {`
+
+Whether this region is the everything region.
+
+## `impl PathSet` › `pub fn prefixes(&self) -> Option<&[GitPath]> {`
+
+The prefixes bounding this region, or `None` when it is unbounded.
+
+`Some(&[])` is a real and different answer from `None`: a task whose
+diff touched nothing has an empty region that overlaps nobody, while a
+task whose paths could not be read has an unbounded one that overlaps
+everybody.
+
+## `mod tests` › `fn hostile_prefixes() -> Vec<GitPath> {`
+
+Hostile prefixes: deranged against sorted order, mixed case, padded,
+multi-byte, and long enough that a truncating writer would show.
+
+## `fn hostile_policy() -> PathPolicy` › `case_fold: true,`
+
+Off-default: `bool::default()` is false, and a policy that lost
+this field would still deserialize to the common case.
+
+## `fn path_policy_round_trips_every_field_it_records()` › `assert!(json.contains(r#""version":"v1""#), "{json}");`
+
+Named fields, not positional: a record whose keys were renamed would
+still round-trip, and a resume reading a differently-named record
+would fall back to a default it must never fall back to.
+
+## `fn a_path_policy_refuses_an_unknown_field()` › `let json = r#"{"version":"v1","case_fold":true,"grammar":"globset","ordering":"lexical"}"…`
+
+The policy is execution identity; a field this binary does not
+understand means the record was written under rules it cannot apply.
+
+## `mod tests` › `let intruders: [(&str, &str, &str); 3] = [`
+
+A fixture that only ever *adds* an unknown key next to a complete
+record is satisfied by an alias: the record is refused as a
+duplicate, not as an unknown field. The replacement form is the one
+that distinguishes them — with the real key removed, an aliased
+spelling deserializes and the policy is silently accepted under a
+name the frozen shape does not define.
+
+Every hostile key is same-typed with the field it replaces, so a
+type error cannot stand in for the refusal either.
+
+## `mod tests` › `let mut replaced: serde_json::Value =`
+
+(a) in place of the required field: the record is incomplete and
+    the intruder is unknown, and both are refusals.
+
+## `mod tests` › `let mut added: serde_json::Value =`
+
+(b) in addition to it: still unknown, and refused for being so
+    rather than for a field that is missing.
+
+## `fn both_case_fold_values_survive_the_wire_exactly_as_writte…` › `let expectations = [`
+
+`case_fold` is an independent boolean that decides whether two paths
+differing only in case name the same file. Every fixture that sets
+it to one value permits a writer that hard-codes that value: replay
+would then turn a case-sensitive run into a case-folding one and
+change every overlap decision the merge queue made.
+
+The expected payloads are written out here rather than produced by
+the serializer, so the assertion is about the frozen encoding rather
+than about serde agreeing with itself.
+
+## `fn both_case_fold_values_survive_the_wire_exactly_as_writte…` › `assert_eq!(policy.case_fold, case_fold);`
+
+And the two encodings are different documents, so a serializer
+that emitted a constant would collide here.
+
+## `fn an_unsupported_policy_version_or_grammar_spelling_is_ref…` › `for version in ["v2", "V1", "v1 ", "", "v10", "v0"] {`
+
+The frozen authority defines exactly one version and one grammar. A
+record declaring another one was written under rules this binary
+does not implement, and reading it as v1/globset would apply the
+wrong comparison to every lease the run took.
+
+## `fn an_unsupported_policy_version_or_grammar_spelling_is_ref…` › `assert_eq!(`
+
+The canonical spellings, so the negatives above cannot be satisfied
+by refusing everything.
+
+## `fn a_path_policy_refuses_a_missing_field_rather_than_defaul…` › `for absent in ["version", "case_fold", "grammar"] {`
+
+Each field removed in turn: `case_fold` is the dangerous one, since
+a default would silently pick the case-sensitive comparison.
+
+## `fn the_three_regions_are_distinguishable_on_the_wire()` › `let repo_wide = PathSet::RepoWide;`
+
+Repo-wide, empty, and non-empty are three different answers and the
+most damaging confusion is between the first two: an unbounded
+region serialized as an empty one overlaps nobody and would admit
+every task in parallel against every other.
+
+## `fn prefixes_survive_in_the_order_and_bytes_they_were_record…` › `let bounded = PathSet::Prefixes {`
+
+Not sorted, not trimmed, not normalized: the recorded region is
+evidence about a past diff, and a writer that tidied it would make
+two different diffs indistinguishable.
+
+## `mod tests` › `const LONG_PREFIX_LITERAL: &str =`
+
+The longest hostile prefix, written out as a literal rather than
+produced by [`GitPath::from`]. An oracle built through the constructor
+is truncated by exactly the mutation it is supposed to catch.
+
+## `mod tests` › `const HOSTILE_REGION_JSON: &str = concat!(`
+
+The canonical encoding of the hostile region, written by hand. Not
+produced by the serializer, so it detects a change to the encoding
+rather than agreeing with whatever the encoding currently is.
+
+## `fn an_over_length_path_keeps_every_byte_it_was_given()` › `assert_eq!(LONG_PREFIX_LITERAL.len(), 88);`
+
+The oracle is the literal above, not a second call to the
+constructor: comparing `GitPath::from(x)` against `GitPath::from(x)`
+normalizes both sides identically, so a constructor that truncated,
+trimmed, or lower-cased its input would agree with itself and the
+recorded region would silently name a different part of the tree.
+
+## `fn an_over_length_path_keeps_every_byte_it_was_given()` › `assert_eq!(`
+
+Through the wire too, against a hand-written payload.
+
+## `fn an_over_length_path_keeps_every_byte_it_was_given()` › `let recorded = PathSet::Prefixes {`
+
+And in place: index 3 of the hostile set is the long one, and the
+earlier byte assertions in this module cover 0, 1 and 4 only.
+
+## `fn every_region_encodes_to_the_payload_written_out_here_and…` › `let cases: [(PathSet, &str); 3] = [`
+
+Round trips compare one serde implementation against itself, so a
+symmetric rename of `region`, `paths`, `repo_wide` or `prefixes`
+changes the durable format invisibly. These payloads are written by
+hand, so any such change fails here in both directions.
+
+## `fn a_git_path_is_transparent_on_the_wire()` › `let path = GitPath::from("src/Zebra/ÜBER.rs");`
+
+A bare string, so a recorded region reads as one in `jq` and in the
+file itself. A wrapper object here would change every recorded set.
