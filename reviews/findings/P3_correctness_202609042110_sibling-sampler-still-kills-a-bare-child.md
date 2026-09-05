@@ -22,8 +22,13 @@ races. The second still kills the bare child.
 **It is not a defect today**, which is why this is P3 and not the severity of the finding it
 mirrors. `KillableGitChild` is driven at `Object.CandidateStage` and `Object.CandidateWriteTree`
 only (`sampled_argv` panics on any other site), and in that fixture `git add -A` and
-`git write-tree` spawn no children: there are no clean or smudge filters configured, no hooks, and
-`core.fsmonitor=false` is passed on the command line. A kill with nothing to leak leaks nothing.
+`git write-tree` spawn no children **under production's pins** — an empty `core.hooksPath`,
+`core.fsmonitor=false`, `protocol.file.allow=never` and `GIT_NO_REPLACE_OBJECTS`. PR #145's third
+pass showed that claim is only true under those pins: with `core.fsmonitor=false` alone, a global
+attributes file with a clean filter makes `git add` spawn a child. `KillableGitChild::spawn`
+transcribes the one pin, so its "no children" premise holds only where the user's global Git
+configuration happens to be clean, which §12 forbids relying on. The four-command sampler takes
+its `Command` from `WorkspaceManager::command` for exactly this reason, and so should this one.
 
 `src/workspace_manager/fixture.rs` is PR #135's live subject and was under a frontier pass while
 this was written, so the repair is not made here on the coordinator's instruction rather than on a

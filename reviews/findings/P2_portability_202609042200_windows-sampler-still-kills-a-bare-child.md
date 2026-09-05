@@ -13,6 +13,12 @@ guard: the `#117` `agent/proc` family, whose live stream is on `ambient.rs` and 
 
 ## What is fixed and what is not
 
+Since PR #145's third pass the Unix sampler alternates production's two kill shapes — the group
+kill with a barrier, and a deliberate bare-child kill held to a bounded set of recovery outcomes —
+so the bare-child fault is *sampled* on Unix by design. On Windows every sample is the bare kill
+by omission, with no barrier and no bounded-outcome rule: master's full-convergence assertion,
+racing a live checkout. That is the gap this finding is about.
+
 The process-group repair is `#[cfg(unix)]` in both halves — `process_group(0)` in
 `SampledChild::spawn` and `kill_group` plus `settle_group` in `SampledChild::kill`. **On Windows the
 sampler still reaches only `Child::kill()`**, and `Child::kill` is `TerminateProcess` on the direct
