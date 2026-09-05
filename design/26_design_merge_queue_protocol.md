@@ -145,12 +145,13 @@ carried by that attempt's settlement (§15), an admission question by its
 `task_spawned` or `merge_rejected`, and a verification park by
 `merge_verification_unavailable`, and each of those leaves its task at rest
 too. A `question_answered` applies only to a task that is still `AwaitingInput`
-with no open generation; an answer returns the task to the state its question's
-origin names (`Pending`, or `AwaitingMerge` for a verification park) and a
-decline fails it. A log that raises or answers a question against any other
-state is refused by the fold rather than folded on a guess — a decline recorded
-under an in-flight generation would leave a failed task whose generation no
-event could close without contradicting the decision (decided 2026-09-05).
+with no open generation. A log that raises or answers a question against any
+other state is refused by the fold rather than folded on a guess — a decline
+recorded under an in-flight generation would leave a failed task whose
+generation no event could close without contradicting the decision. A task
+whose candidate is queued is not dispatched again while it is: its work is
+`AwaitingMerge` until integration or repair (§14), and `task_dispatched` is
+refused for it on the queue position, not on the state (decided 2026-09-05).
 
 Schema 3 records at least:
 
