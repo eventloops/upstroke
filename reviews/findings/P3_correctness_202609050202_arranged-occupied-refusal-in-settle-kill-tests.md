@@ -25,7 +25,7 @@ of at least 2^15 in one of the two, the nonce being the per-process count of ULI
 `(pid 100, nonce 32768)` and `(pid 101, nonce 0)` is the smallest such pair. The first draw is
 refused; the retry draws again at the next nonce, which meets the same partner only if it too drew
 again in the same millisecond at the matching nonce. Past three draws the fixture panics naming
-every refused root. Whether a full harness reaches nonce 2^15 at all: @@NONCE@@
+every refused root. One full run of the lib harness on Linux, every `ulid()` call printed by a measurement-only mutant, minted 6017 ULIDs and ended at nonce 6016, so a single harness does not reach the nonce the smallest pair needs; a long-lived conductor minting question and incarnation ids does.
 
 **Arranged.** A launcher that knows the pid it is about to `exec` the harness with and the nonce
 of the fixture's first draw computes the names of a future millisecond window for the nonces the
@@ -47,7 +47,7 @@ a scratch tree: Occupied { root: ".../upstroke-scratch-pr7h-reclaimed-01M1QMTYV2
 ```
 
 The same window computed for nonce 1 instead: `ok`. Against the retry, at the head this finding
-was recorded at: @@K2RETRY@@
+was recorded at: the same window precreated for nonce 0 alone is `ok` (the second draw is nonce 1), and precreated for nonces 0, 1 and 2 is the bound's panic, `3 draws refused as occupied`, naming all three roots; both runs are in the pull request body.
 
 ## Why the residual is accepted rather than fixed
 
