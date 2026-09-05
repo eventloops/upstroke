@@ -1587,7 +1587,7 @@ impl WorkspaceManager {
     /// #136's rows record. **It is not a guarantee that the sampled child runs
     /// the funnel's argv**, and this comment previously said it was. It does
     /// **not** make the kill go through the process funnel either — that is
-    /// `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` in `reviews/FINDINGS.md`, owned by
+    /// `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` in `reviews/findings/`, owned by
     /// PR6/PR7 with `src/runner/**` frozen — and this comment does not claim it
     /// does.
     pub(crate) const CANDIDATE_STAGE_ARGV: [&str; 4] = ["add", "-A", "--", "."];
@@ -2895,8 +2895,10 @@ impl WorkspaceManager {
     /// filesystem is the judged tree while a process inspecting it through Git
     /// may not see that tree, and this doc claims only the first. Closing the
     /// second is product-wide behaviour needing a `design/` sentence about
-    /// what an exact snapshot is defined against, and is a deferred row in
-    /// `reviews/FINDINGS.md` §50 awaiting the owner's design ruling.
+    /// what an exact snapshot is defined against, and is a deferred finding in
+    /// `reviews/findings/`
+    /// (`id: PR130-REVIEW3-REPLACEMENT-ISOLATION-STOPS-AT-THE-MANAGER`)
+    /// awaiting the owner's design ruling.
     fn command(&self, cwd: &Path, args: &[OsString]) -> Command {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(self.hooks_dir());

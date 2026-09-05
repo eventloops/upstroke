@@ -25,7 +25,7 @@
 //!
 //! **Measured rather than restated, and then decided.** The block is real
 //! (`SWEEP-CLASSIFY-003`, with the reproduction and its output in
-//! `reviews/FINDINGS.md`). The usual close on Unix — open with `O_NONBLOCK` and
+//! `reviews/findings/`). The usual close on Unix — open with `O_NONBLOCK` and
 //! take the file type from the descriptor — reaches a governed primitive:
 //! `clippy.toml` denies `std::fs::File::options` and the `std::fs::OpenOptions`
 //! it hands out, and `libc::open` and `libc::fcntl` beside them.
