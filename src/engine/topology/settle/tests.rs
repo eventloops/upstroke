@@ -1543,9 +1543,10 @@ type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;
 /// Two live harnesses draw one name when they draw in one millisecond with
 /// seeds that coincide, which `crate::ulid`'s construction allows: a seed is
 /// `now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, so pids 100 and 101 at
-/// nonces 32768 and 0 seed identically, and in general the pids' XOR must
-/// equal the nonces' XOR shifted left by fifteen, which needs a nonce of at
-/// least 2^15 in one of the two. Each draw advances this process's nonce, so
+/// nonces 32768 and 0 seed identically, and in general the nonces must
+/// agree modulo 2^15 and their XOR shifted right by fifteen must equal the
+/// pids' XOR (`(100, 65536)` and `(102, 0)` is the next pair), which needs
+/// a nonce of at least 2^15 in one of the two. Each draw advances this process's nonce, so
 /// a second draw meets the same partner only if the partner drew again in
 /// the same millisecond at the matching nonce; three draws is two such
 /// coincidences deep, and past it the refusal names every root it met.

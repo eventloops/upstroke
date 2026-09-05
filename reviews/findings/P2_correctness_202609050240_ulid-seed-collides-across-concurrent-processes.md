@@ -25,9 +25,14 @@ Split into words. The low word must match, and `rotate_left(17)` of a nonce belo
 the low word, so two processes at low nonces agree only at the same nonce and then need the same
 pid, which live processes never share. A nonce at or above 2^15 lands in the high word instead:
 `32768.rotate_left(17) == 1 << 32`, so pid 100 at nonce 32768 and pid 101 at nonce 0 seed
-identically. In general the seeds are equal when `pid_a ^ pid_b == (nonce_a ^ nonce_b) << 15`,
-which needs one of the two at a nonce of at least 2^15 — the nonce is the per-process count of
-ULIDs minted so far — and both drawing in the same millisecond. The eighty random bits are then
+identically. In general the seeds are equal when the nonces agree modulo 2^15 and their XOR
+shifted right by fifteen equals the pids' XOR — `nonce_a ≡ nonce_b (mod 2^15)` and
+`pid_a ^ pid_b == (nonce_a ^ nonce_b) >> 15` — which needs one of the two at a nonce of at least
+2^15 (the nonce is the per-process count of ULIDs minted so far) and both drawing in the same
+millisecond. `(100, 65536)` against `(102, 0)` is the next pair; a search over pid 100 against pids
+90 to 120 at nonces below 70,000 finds exactly those two, and a mirror of the construction confirms
+them. One full run of the lib test harness mints 6,017 ULIDs and ends at nonce 6,016, which is why
+the settle tests were the symptom and not the population: the harness alone cannot get there. The eighty random bits are then
 identical, the timestamp is identical, and the ULID is identical.
 
 The production call sites at `323beb0`:

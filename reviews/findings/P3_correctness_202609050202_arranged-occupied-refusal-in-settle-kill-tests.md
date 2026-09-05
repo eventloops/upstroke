@@ -20,9 +20,12 @@ up to `SCRATCH_DRAWS` (3) times. The ULID is not unpredictable and not unique ac
 `now_ms ^ (pid << 32) ^ nonce.rotate_left(17)`, nothing cryptographic.
 
 **Unarranged.** Two live harnesses draw one name when they draw the same tag in one millisecond
-with seeds that coincide, which needs `pid_a ^ pid_b == (nonce_a ^ nonce_b) << 15` — so a nonce
-of at least 2^15 in one of the two, the nonce being the per-process count of ULIDs minted so far.
-`(pid 100, nonce 32768)` and `(pid 101, nonce 0)` is the smallest such pair. The first draw is
+with seeds that coincide, which needs `nonce_a ≡ nonce_b (mod 2^15)` and
+`pid_a ^ pid_b == (nonce_a ^ nonce_b) >> 15` — so a nonce of at least 2^15 in one of the two, the
+nonce being the per-process count of ULIDs minted so far. `(pid 100, nonce 32768)` and
+`(pid 101, nonce 0)` is the smallest such pair and `(100, 65536)` with `(102, 0)` the next; a
+search over pid 100 against pids 90 to 120 at nonces below 70,000 finds exactly those, and a Python
+mirror of the construction confirms both collide and `(100, 32768)` against `(101, 1)` does not. The first draw is
 refused; the retry draws again at the next nonce, which meets the same partner only if it too drew
 again in the same millisecond at the matching nonce. Past three draws the fixture panics naming
 every refused root. One full run of the lib harness on Linux, every `ulid()` call printed by a measurement-only mutant, minted 6017 ULIDs and ended at nonce 6016, so a single harness does not reach the nonce the smallest pair needs; a long-lived conductor minting question and incarnation ids does.
