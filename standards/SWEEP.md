@@ -135,11 +135,15 @@ takes the folds with the call sites they force. The findings are `reviews/FINDIN
 in `src/topology/effects/bijection.rs` — typed failure coordinates in place of `String`, the
 execution-in-an-unnamed-fast-sequence report, the unreachable `.expect()` deleted, a saturating
 accounting sum that let `n = u32::MAX` pass, and §7's panic surface taken over the file after
-#142 — with the tests that witness each. It does **not** claim the file swept, on the frontier
+#142 — with a test for each behavioural change, and two shape changes (reading
+`ResidueClass::classified_as` rather than a written-in `ObjectResidue::Internal`, and one
+order-enumeration spelling for hook and residue phases) recorded in the pull request as
+unwitnessed at this head, since one residue class and at most one observable order per site
+leave nothing for a test to distinguish. It does **not** claim the file swept, on the frontier
 reviewer's finding that ST-07, `fault_injection_registry.completeness_rule` and `structure`, the
 contract this file enforces, occur nowhere in `DESIGN.md`, and that the binding contract must be
-there before the file can be marked swept. The same rule blocked #139 and #143 the same day; the
-decision is the owner's and is being put to the owner once for all three. The finding is
+there before the file can be marked swept. The same rule blocked other pull requests the same
+day; the decision is the owner's and is being put to the owner once for all of them. The finding is
 `SWEEP-BIJECTION-006` under `reviews/findings/`, and the row moves when the design section exists.
 
 Line counts are as of the family's split merge and are a guide to session sizing, not a

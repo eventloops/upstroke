@@ -165,14 +165,20 @@ pub enum BijectionFailure {
 
     #[error(
         "`{site}`'s no-execution record says nothing about the exercised fast sequence \
-         `{sequence}`; absence is proved inside each trace the suite ran, or it is not proved \
-         for that trace"
+         `{sequence}`, {}",
+        if *executed { "in which the site executed" } else { "in which the site did not execute" }
     )]
     UnwitnessedFastSequence {
         /// The site.
         site: EffectSiteId,
         /// The sequence it says nothing about.
         sequence: String,
+        /// Whether the harness saw the site execute inside that sequence.
+        /// A fact the report carries beside the gap, so a reader sees at once
+        /// which of the two the record would contradict if it named the
+        /// sequence; it asserts nothing about whether the execution is
+        /// allowed.
+        executed: bool,
     },
 
     #[error("`{site}`'s no-execution record names `{sequence}`, which the harness never exercised")]
@@ -183,14 +189,11 @@ pub enum BijectionFailure {
         sequence: String,
     },
 
-    #[error(
-        "`{site}` executed during the fast sequence `{sequence}`; no staging, cherry-pick or \
-         prepared-pin site executes for any fast sequence"
-    )]
+    #[error("`{site}` executed during the fast sequence `{sequence}` its record says it skipped")]
     ExecutedInFastSequence {
         /// The site.
         site: EffectSiteId,
-        /// The sequence it ran in.
+        /// The sequence its record names and it ran in.
         sequence: String,
     },
 
@@ -423,27 +426,31 @@ pub fn check_bijection(
                 .flatten()
                 .map(String::as_str)
                 .collect();
-            // Two independent questions about each exercised sequence, and not
-            // one question asked only when the other answered a particular
-            // way. Whether the site *ran* inside a sequence is ST-07's claim
-            // itself and is true or false whatever the record says; whether
-            // the record *names* the sequence is about the evidence. Asking
-            // the second first, and the first only in its `else`, reported a
-            // site that ran in an unnamed sequence as a gap in bookkeeping:
-            // the execution went unnamed, and the repair the report invites —
-            // add the sequence to the record — is the one that makes the real
-            // failure appear a round later.
+            // Two facts about each exercised sequence, both read from the
+            // inputs: whether the record names it, and whether the harness saw
+            // the site run in it. A named sequence the site ran in is a
+            // contradiction between the record and the observation, and is
+            // `ExecutedInFastSequence`. An unnamed sequence is a gap in the
+            // record whatever happened in it, and is `UnwitnessedFastSequence`
+            // — carrying whether the site ran, so a reader sees at once what
+            // the record would contradict if it named the sequence, instead of
+            // learning it a round later by naming it. Neither says whether the
+            // execution was allowed; nothing in `DESIGN.md` does, and this
+            // checker reports what it was handed.
             for sequence in harness.fast_sequences() {
-                if sequence.ran(site) {
-                    failures.push(BijectionFailure::ExecutedInFastSequence {
-                        site,
-                        sequence: sequence.name().to_owned(),
-                    });
-                }
-                if !claimed.contains(&sequence.name()) {
+                let executed = sequence.ran(site);
+                if claimed.contains(&sequence.name()) {
+                    if executed {
+                        failures.push(BijectionFailure::ExecutedInFastSequence {
+                            site,
+                            sequence: sequence.name().to_owned(),
+                        });
+                    }
+                } else {
                     failures.push(BijectionFailure::UnwitnessedFastSequence {
                         site,
                         sequence: sequence.name().to_owned(),
+                        executed,
                     });
                 }
             }

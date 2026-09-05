@@ -2488,7 +2488,7 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         assert!(
             failures.iter().any(|failure| matches!(
                 failure,
-                BijectionFailure::UnwitnessedFastSequence { site: named, sequence }
+                BijectionFailure::UnwitnessedFastSequence { site: named, sequence, executed: false }
                     if named == site && sequence == "fast/seq-2"
             )),
             "{site} said nothing about a fast sequence the suite ran: {failures:#?}"
@@ -2563,13 +2563,15 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
     }
 
     // (f) A site that ran inside an exercised fast sequence the record
-    // does not name. The execution is ST-07's claim broken and it is
-    // broken whether or not the record mentions that trace, so the report
-    // has to name the execution and not only the gap in the record. It
-    // reported the gap alone until this head: `ExecutedInFastSequence` sat
-    // in the `else` of "does the record name this sequence", so the one
-    // repair the report invited — add the sequence to the record — was the
-    // repair that made the real failure appear a round later.
+    // does not name. Two facts, both from the inputs: the record says nothing
+    // about `fast/seq-2`, and the harness saw the site run in it. The report
+    // carries both in one failure, so a reader learns the execution now
+    // rather than a round later by adding the sequence to the record and
+    // reading `ExecutedInFastSequence` then. Until `ffe26ca` the `else`
+    // placement reported the gap with `executed` unknowable; between
+    // `ffe26ca` and `c2b6b6c` the execution was reported as a failure of its
+    // own, which asserted that these sites never run in a fast sequence — a
+    // rule `DESIGN.md` does not contain (pass 3 on `c2b6b6c`, finding 1).
     let mut ran_unnamed = self_test_harness(host);
     ran_unnamed.begin_fast_sequence("fast/seq-2");
     drive(&mut ran_unnamed, cherry, host);
@@ -2578,21 +2580,21 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
     assert!(
         failures.iter().any(|failure| matches!(
             failure,
+            BijectionFailure::UnwitnessedFastSequence { site: named, sequence, executed: true }
+                if *named == cherry && sequence == "fast/seq-2"
+        )),
+        "a cherry-pick inside an unnamed fast sequence was reported as a gap with the \
+             execution unstated: {failures:#?}"
+    );
+    // And no contradiction is reported, because the record made no claim
+    // about `fast/seq-2` to contradict.
+    assert!(
+        !failures.iter().any(|failure| matches!(
+            failure,
             BijectionFailure::ExecutedInFastSequence { site: named, sequence }
                 if *named == cherry && sequence == "fast/seq-2"
         )),
-        "a cherry-pick inside an unnamed fast sequence was reported as bookkeeping alone: \
-             {failures:#?}"
-    );
-    // And the gap in the record is still reported: the two are independent
-    // facts about one sequence, not one fact with the other as its `else`.
-    assert!(
-        failures.iter().any(|failure| matches!(
-            failure,
-            BijectionFailure::UnwitnessedFastSequence { site: named, sequence }
-                if *named == cherry && sequence == "fast/seq-2"
-        )),
-        "{failures:#?}"
+        "an unnamed sequence was reported as a contradiction of the record: {failures:#?}"
     );
 
     // (g) The format refuses a record that names no sequence at all,
