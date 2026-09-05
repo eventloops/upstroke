@@ -1,17 +1,7 @@
-//! `upstroke answer <question-id>` — the cross-process answer channel (§12).
-//!
-//! A question is raised by one process and answered by a person who may be
-//! nowhere near it: at another terminal, hours later, or after the run has
-//! already ended. So the command does not talk to the engine at all. It writes
-//! the answer beside the question, and whichever engine is or will be driving
-//! that run picks it up — a live one on its next scheduler turn, or the next
-//! `upstroke resume`.
-//!
-//! That indirection is what makes §12's promise ("a run survives its
-//! notifier") true of answers as well as delivery.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/answer.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods)]
 
 use std::path::Path;
@@ -21,27 +11,21 @@ use crate::interaction::{self, QuestionRecord};
 use crate::ir::{Answer, QuestionId};
 use crate::rundir;
 
-/// What the operator said, before it is turned into an [`Answer`].
 #[derive(Debug, Clone)]
 pub enum Reply {
-    /// Pick option N, 1-indexed as the question renders them.
     Option(usize),
     Text(String),
-    /// Give up on the task; its dependents will be blocked (§19).
     Decline,
 }
 
-/// Where an answer landed, for the caller to report.
 #[derive(Debug)]
 pub struct Answered {
     pub run_id: String,
     pub question_id: String,
     pub answer: Answer,
-    /// Whether a live engine is expected to pick this up on its own.
     pub run_is_live: bool,
 }
 
-/// Record an answer to a question, found by id or unambiguous prefix.
 pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {
     let found = rundir::find_question(repo_root, wanted)?;
     let id = QuestionId(found.question_id.clone());
@@ -56,9 +40,6 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
         message: format!("{}: {e}", path.display()),
     })?;
 
-    // Answering twice is a mistake worth catching rather than a last-write-
-    // wins race: the first answer may already have driven a retry, and the
-    // second would look like it had an effect it cannot have.
     if let Some(existing) = &record.answer {
         return Err(UpstrokeError::Refused {
             message: format!(
@@ -73,28 +54,19 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     let answer = match reply {
         Reply::Decline => Answer::Declined,
         Reply::Text(text) => interaction::interpret(&record.question, &text),
-        Reply::Option(choice) => {
-            interaction::answer_for_option(&record.question, choice).ok_or_else(|| {
-                UpstrokeError::Refused {
-                    message: format!(
-                        "there is no option {choice} on this question; it offers {}",
-                        if record.question.options.is_empty() {
-                            "none (answer it in your own words instead)".to_owned()
-                        } else {
-                            // Not `1..N`: every operator of this tool reads
-                            // Rust, where that is the range that excludes N.
-                            format!("1-{}", record.question.options.len())
-                        }
-                    ),
-                }
-            })?
-        }
+        Reply::Option(choice) => interaction::answer_for_option(&record.question, choice)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "there is no option {choice} on this question; it offers {}",
+                    if record.question.options.is_empty() {
+                        "none (answer it in your own words instead)".to_owned()
+                    } else {
+                        format!("1-{}", record.question.options.len())
+                    }
+                ),
+            })?,
     };
 
-    // An empty reply means "leave it parked" at a prompt (§12), and typing
-    // nothing into this command almost certainly means the same — but here it
-    // would write a file the engine then ingests as an answer, which is not
-    // what the operator asked for.
     if answer == Answer::Unanswered {
         return Err(UpstrokeError::Refused {
             message: "an empty answer would leave the task exactly as it is; pass --text with \
@@ -119,7 +91,6 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     })
 }
 
-/// Render the question for an operator deciding what to say.
 pub fn show(repo_root: &Path, wanted: &str) -> Result<String, UpstrokeError> {
     let found = rundir::find_question(repo_root, wanted)?;
     let path = found
@@ -162,11 +133,6 @@ mod tests {
         let public = rundir::public_dir(repo, run);
         let questions = public.join("questions");
         std::fs::create_dir_all(&questions).expect("questions dir");
-        // A run only exists once its log records a committed `run_started`:
-        // `find_question` scans committed directories, so a fixture that wrote
-        // only a question would be answering a question in a husk. Written by
-        // hand rather than serialized, so the fixture pins the wire rather than
-        // agreeing with whatever the writer happens to produce.
         std::fs::write(
             public.join("events.jsonl"),
             format!(
@@ -219,8 +185,6 @@ mod tests {
         let recorded = answer(&repo, "q-1", Reply::Option(2)).expect("answer");
         assert_eq!(recorded.answer, Answer::Declined);
 
-        // Out of range is refused rather than silently clamped — the operator
-        // meant a specific option.
         seed(&repo, "02RUN", "q-2");
         let err = answer(&repo, "q-2", Reply::Option(9)).expect_err("no option 9");
         assert!(err.to_string().contains("1-2"), "got: {err}");
@@ -240,8 +204,6 @@ mod tests {
 
     #[test]
     fn an_empty_answer_is_refused_rather_than_written() {
-        // At a prompt, empty means "leave it parked". Written to a file it
-        // would instead be ingested as an answer that changes nothing.
         let repo = scratch("empty").join("repo");
         seed(&repo, "01RUN", "q-1");
         let err = answer(&repo, "q-1", Reply::Text("   ".to_owned())).expect_err("refused");
@@ -260,8 +222,6 @@ mod tests {
         let repo = scratch("twice").join("repo");
         seed(&repo, "01RUN", "q-1");
 
-        // Simulate the engine having ingested the first answer and rewritten
-        // the payload with it.
         let questions = rundir::public_dir(&repo, "01RUN").join("questions");
         let path = questions.join("q-1.json");
         let mut record: QuestionRecord =

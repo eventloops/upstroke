@@ -1,7 +1,8 @@
 //! Extended notes: `docs/internals/config.md`
 
-// LEGACY-EFFECT: this module is in the frozen legacy section of
-// `effects/allowlist.toml`, which carries its justification.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
@@ -26,6 +27,7 @@ use crate::util;
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
+
     gates: Option<toml::Value>,
     engine: Option<toml::Value>,
     interaction: Option<toml::Value>,
@@ -36,9 +38,13 @@ struct RawRepoConfig {
 #[derive(Debug, Deserialize)]
 struct RawRunner {
     kind: Option<String>,
+
     image: Option<String>,
+
     credential_volumes: Option<BTreeMap<String, String>>,
+
     mounts: Option<Vec<RawRunnerMount>>,
+
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -53,28 +59,39 @@ struct RawRunnerMount {
 
 #[derive(Debug, Deserialize)]
 struct RawGate {
-    name: String,
-    cmd: String,
+    name: Option<String>,
+
+    cmd: Option<String>,
     timeout_secs: Option<u64>,
+
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawEngine {
     shell: Option<String>,
     on_task_failure: Option<String>,
+
     max_parallel: Option<u32>,
+
     max_merge_repairs: Option<u32>,
+
     max_per_agent: Option<u32>,
     max_per_pool: Option<u32>,
+
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawInteraction {
     mode: Option<String>,
     notify: Option<Vec<String>>,
+
     wait_on_block_secs: Option<u64>,
+
     ask_before: Option<toml::Value>,
 }
 
@@ -92,7 +109,9 @@ impl AskBefore {
 struct RawRouting {
     strategy: Option<RawStrategy>,
     overrides: Option<Vec<RawOverride>>,
+
     effort: Option<toml::Value>,
+
     #[serde(flatten)]
     kinds: BTreeMap<String, toml::Value>,
 }
@@ -114,6 +133,7 @@ struct RawStrategy {
 #[serde(deny_unknown_fields)]
 struct RawOverride {
     paths: Vec<String>,
+
     start_at: Option<Tier>,
     second_opinion: Option<String>,
 }
@@ -124,6 +144,7 @@ struct RawPin {
     tier: Tier,
     agent: String,
     model: String,
+
     effort: Option<String>,
 }
 
@@ -133,7 +154,9 @@ struct RawKindRouting {
     chain: Option<Vec<Tier>>,
     tier: Option<Tier>,
     attempts_per: Option<u32>,
+
     timeout_secs: Option<u64>,
+
     enabled: Option<bool>,
 }
 
@@ -153,7 +176,9 @@ struct RawPool {
     reserve: Option<f64>,
     monthly_allowance: Option<toml::Value>,
     endpoint: Option<String>,
+
     profile: Option<String>,
+
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -207,6 +232,7 @@ impl SecondOpinion {
 #[derive(Debug)]
 pub struct CompiledOverride {
     pub raw_paths: Vec<String>,
+
     pub start_at: Option<Tier>,
     pub second_opinion: Option<SecondOpinion>,
     pub globs: GlobSet,
@@ -261,16 +287,21 @@ pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineLimits {
     Fresh,
+
     SequentialResume,
+
+    SequentialResumeWithRecordedGates,
 }
 
 impl EngineLimits {
     #[must_use]
-    pub fn for_resume(effective_schema: u32) -> Self {
-        if effective_schema <= LAST_SEQUENTIAL_SCHEMA {
-            Self::SequentialResume
-        } else {
+    pub fn for_resume(effective_schema: u32, gates_recorded: bool) -> Self {
+        if effective_schema > LAST_SEQUENTIAL_SCHEMA {
             Self::Fresh
+        } else if gates_recorded {
+            Self::SequentialResumeWithRecordedGates
+        } else {
+            Self::SequentialResume
         }
     }
 }
@@ -278,6 +309,7 @@ impl EngineLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerMount {
     pub source: PathBuf,
+
     pub target: String,
     pub read_only: bool,
 }
@@ -285,9 +317,13 @@ pub struct RunnerMount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerSelection {
     pub kind: RunnerKind,
+
     pub image: Option<String>,
+
     pub credential_volumes: BTreeMap<String, String>,
+
     pub mounts: Vec<RunnerMount>,
+
     pub from_config: bool,
 }
 
@@ -310,24 +346,41 @@ pub struct Config {
     pub overrides: Vec<CompiledOverride>,
     pub pins: Vec<Pin>,
     pub strategy: Strategy,
+
     pub pools: Vec<Pool>,
+
     pub budgets: Budgets,
+
     pub ask_before: AskBefore,
+
     pub gates: Option<Vec<GateConfig>>,
     pub shell: ShellKind,
+
     pub review_tier: Option<Tier>,
+
     pub review_enabled: bool,
+
     pub review_pass_timeout: Duration,
+
     implementation_effort_override: Option<Effort>,
     review_effort_override: Option<Effort>,
+
     pub on_task_failure: OnTaskFailure,
+
     pub max_parallel: u32,
+
     pub max_merge_repairs: u32,
+
     pub max_per_agent: u32,
+
     pub max_per_pool: u32,
+
     pub interaction_mode: InteractionMode,
+
     pub notify: Vec<String>,
+
     pub wait_on_block: Duration,
+
     pub runner: RunnerSelection,
 }
 
@@ -604,6 +657,7 @@ pub fn load_captured_with(
             .enumerate()
         {
             let n = index + 1;
+
             let second_opinion = match ov.second_opinion.as_deref() {
                 None => None,
                 Some(raw) => Some(SecondOpinion::parse(raw).ok_or_else(|| {
@@ -617,6 +671,7 @@ pub fn load_captured_with(
                     }
                 })?),
             };
+
             if ov.start_at.is_none() && second_opinion.is_none() {
                 return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
@@ -686,6 +741,7 @@ pub fn load_captured_with(
             ));
             continue;
         }
+
         let effort = match pin.effort.as_deref().map(Effort::parse) {
             Some(None) => {
                 return Err(UpstrokeError::Config {
@@ -709,7 +765,7 @@ pub fn load_captured_with(
         });
     }
 
-    let gates = parse_gates(raw.gates, &repo_path)?;
+    let gates = parse_gates(raw.gates, &repo_path, limits, warnings)?;
     let runner = parse_runner(raw.runner, &repo_path, limits)?;
     let engine = parse_engine(raw.engine, &repo_path, limits, warnings)?;
     let interaction = parse_interaction(raw.interaction, &repo_path)?;
@@ -779,7 +835,9 @@ fn pools_location(pools_file: Option<&Path>) -> Option<(PathBuf, bool)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
     path: PathBuf,
+
     required: bool,
+
     content: Result<Option<Vec<u8>>, (io::ErrorKind, String)>,
 }
 
@@ -824,6 +882,7 @@ pub fn snapshot_file(path: &Path, required: bool) -> FileSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedConfig {
     repo: FileSnapshot,
+
     pools: Option<FileSnapshot>,
 }
 
@@ -969,6 +1028,7 @@ model = "claude-opus-4-8"
         assert_eq!(cfg.pins.len(), 1);
         assert_eq!(cfg.strategy.mode, "value-max");
         assert_eq!(cfg.strategy.spend_down_after, Some(0.7));
+
         assert_eq!(cfg.review_tier, Some(Tier::Frontier));
         assert_eq!(cfg.review_pass_timeout, Duration::from_secs(7200));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
@@ -988,6 +1048,7 @@ model = "claude-opus-4-8"
             cfg.overrides[0].second_opinion,
             Some(SecondOpinion::DifferentVendor)
         );
+
         assert_eq!(
             cfg.chain_for(TaskKind::Fix).chain,
             vec![Tier::Small, Tier::Mid, Tier::Frontier]
@@ -1180,8 +1241,10 @@ model = "claude-opus-4-8"
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.effort_for(Tier::Small), Effort::Low);
         assert_eq!(cfg.effort_for(Tier::Mid), Effort::Medium);
+
         assert_eq!(cfg.effort_for(Tier::Frontier), Effort::Max);
         assert_eq!(cfg.implementation_effort(Tier::Frontier), Effort::Max);
+
         assert_eq!(cfg.review_effort(), Effort::Max);
     }
 
@@ -1634,6 +1697,7 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
         assert_eq!(cfg.notify, ["cli", "desktop"]);
         assert_eq!(cfg.wait_on_block, Duration::from_secs(120));
         assert_eq!(cfg.on_task_failure, OnTaskFailure::Continue);
+
         assert_eq!(cfg.ask_before.frontier_escalation_over_usd, Some(5.0));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
@@ -1873,18 +1937,90 @@ pool_fraction = 0.5
     }
 
     #[test]
+    fn a_sequential_resume_announces_gate_shapes_a_fresh_run_refuses() {
+        let path = scratch(
+            "resumegates.toml",
+            "[[gates]]\nname = \"check\"\ncmd = \"cargo check\"\ntimeout_sec = 900\n\
+             [[gates]]\nname = \"Check\"\ncmd = \"cargo clippy\"\n",
+        );
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            let mut strict_warnings = Vec::new();
+            let error = load_limits(
+                Some(&path),
+                &hermetic(),
+                Some(&missing()),
+                limits,
+                &mut strict_warnings,
+            )
+            .expect_err("a run whose gates come from this file refuses it");
+            assert!(
+                error.to_string().contains("[[gates]] entry 1"),
+                "{limits:?}: the first refusal is the unknown key, in entry order: {error}"
+            );
+            assert!(
+                strict_warnings.is_empty(),
+                "{limits:?}: {strict_warnings:?}"
+            );
+        }
+
+        let mut warnings = Vec::new();
+        let cfg = load_limits(
+            Some(&path),
+            &hermetic(),
+            Some(&missing()),
+            EngineLimits::SequentialResumeWithRecordedGates,
+            &mut warnings,
+        )
+        .expect("a recorded run stays reachable through the same file");
+        let gates = cfg.gates.expect("the section was present");
+        assert_eq!(
+            gates
+                .iter()
+                .map(|gate| gate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["check", "Check"],
+            "both entries are kept, so the record can be compared with them"
+        );
+        assert_eq!(
+            gates.first().map(|gate| gate.timeout),
+            Some(DEFAULT_GATE_TIMEOUT),
+            "the misspelled timeout bought nothing"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`timeout_sec`") && w.contains("recorded")),
+            "the unknown key is named and the recorded gates are named as what runs: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("entry 2 repeats the name `Check`") && w.contains("recorded")),
+            "the repeated name is named the same way: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn the_engine_limit_reading_follows_the_schema_the_run_recorded() {
         for schema in 1..=LAST_SEQUENTIAL_SCHEMA {
             assert_eq!(
-                EngineLimits::for_resume(schema),
+                EngineLimits::for_resume(schema, true),
+                EngineLimits::SequentialResumeWithRecordedGates,
+                "schema {schema} with a gate record compares today's section with it"
+            );
+
+            assert_eq!(
+                EngineLimits::for_resume(schema, false),
                 EngineLimits::SequentialResume,
-                "schema {schema} was written by a sequential engine"
+                "schema {schema} without a gate record settles its gates from today's file"
             );
         }
-        assert_eq!(
-            EngineLimits::for_resume(LAST_SEQUENTIAL_SCHEMA + 1),
-            EngineLimits::Fresh
-        );
+        for gates_recorded in [true, false] {
+            assert_eq!(
+                EngineLimits::for_resume(LAST_SEQUENTIAL_SCHEMA + 1, gates_recorded),
+                EngineLimits::Fresh
+            );
+        }
     }
 
     #[test]
@@ -1924,26 +2060,41 @@ pool_fraction = 0.5
     }
 
     #[test]
-    fn an_unknown_engine_key_warns_by_name_instead_of_vanishing() {
+    fn an_unknown_engine_key_is_refused_by_name_instead_of_vanishing() {
         let path = scratch(
             "unknownengine.toml",
-            "[engine]\nmax_paralel = 4\nbogus = \"x\"\n",
+            "[engine]\nmax_paralel = 4\non_task_failur = \"continue\"\n",
         );
-        let mut warnings = Vec::new();
-        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
-        assert!(
-            warnings.iter().any(|w| w.contains("max_paralel")),
-            "the misspelling is named: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("bogus")),
-            "every unknown key is named: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().all(|w| w.contains("[engine]")),
-            "and located: {warnings:?}"
-        );
-        assert_eq!(cfg.max_parallel, DEFAULT_MAX_PARALLEL);
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
+        ] {
+            let mut warnings = Vec::new();
+            let error = load_limits(
+                Some(&path),
+                &hermetic(),
+                Some(&missing()),
+                limits,
+                &mut warnings,
+            )
+            .expect_err("an unknown [engine] key must refuse the load");
+            let message = error.to_string();
+            assert!(message.contains("`max_paralel`"), "{limits:?}: {message}");
+            assert!(
+                message.contains("`on_task_failur`"),
+                "{limits:?}: every unknown key is named: {message}"
+            );
+            assert!(
+                message.contains("[engine]"),
+                "{limits:?}: located: {message}"
+            );
+            assert!(
+                message.contains("`on_task_failure`"),
+                "{limits:?}: the accepted keys are listed: {message}"
+            );
+            assert!(warnings.is_empty(), "{limits:?}: {warnings:?}");
+        }
     }
 
     #[test]
@@ -2127,6 +2278,7 @@ mounts = [
                 RunnerMount {
                     source: PathBuf::from("/opt/toolchain"),
                     target: "/opt/toolchain".to_owned(),
+
                     read_only: true,
                 },
                 RunnerMount {
@@ -2137,6 +2289,7 @@ mounts = [
             ]
         );
         assert!(selection.from_config);
+
         assert_eq!(
             selection
                 .mounts
@@ -2268,7 +2421,11 @@ credential_volumes = { claude-code = "creds-cc" }
 
     #[test]
     fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {
-        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+        for limits in [
+            EngineLimits::Fresh,
+            EngineLimits::SequentialResume,
+            EngineLimits::SequentialResumeWithRecordedGates,
+        ] {
             let container = RunnerSelection {
                 kind: RunnerKind::Container,
                 image: Some("upstroke/ci:3.2".to_owned()),
@@ -2280,6 +2437,7 @@ credential_volumes = { claude-code = "creds-cc" }
                 kind: RunnerKind::Host,
                 ..container.clone()
             };
+
             assert_eq!(
                 RunnerSelection {
                     kind: container.kind,
@@ -2298,9 +2456,13 @@ credential_volumes = { claude-code = "creds-cc" }
                 message.contains("[runner] `kind = \"container\"` is refused"),
                 "{limits:?}: {message}"
             );
+
             let expected = match limits {
                 EngineLimits::Fresh => "is being created by the schema-1..3 engine",
-                EngineLimits::SequentialResume => "keeps the boundary it started with",
+                EngineLimits::SequentialResume
+                | EngineLimits::SequentialResumeWithRecordedGates => {
+                    "keeps the boundary it started with"
+                }
             };
             assert!(message.contains(expected), "{limits:?}: {message}");
             refuse_legacy_container_selection(&host, Path::new("upstroke.toml"), limits)

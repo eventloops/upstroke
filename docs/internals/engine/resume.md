@@ -2,11 +2,6 @@
 
 Extended notes for [`src/engine/resume.rs`](../../../src/engine/resume.rs).
 
-The code is the authority for what it does. This file preserves the migrated prose;
-the concurrency protocol also remains at its source sites under standards §10 and §13.
-Each section is headed by the line of code the comment sat above, spelled
-as it is in the source, so the heading is the grep string that finds the code.
-
 ## `#![allow(clippy::disallowed_methods)]`
 
 LEGACY-EFFECT: this module is in the **frozen legacy section** of
@@ -24,10 +19,12 @@ the one no facade used to establish.
 
 Read-only, and before either lock. §14's refusals must reach the operator
 without a worktree lease and without a `run.lock` file behind them, and
-the config is one of them — so the two things deciding *how* to read
+the config is one of them — so the three things deciding *how* to read
 today's config have to be read first: the schema this run was recorded
 at, which chooses between refusing an impossible ceiling and warning
-about one, and where the run's config lives.
+about one; whether the log records its gates, which decides whether
+today's `[[gates]]` is compared with them or settles them; and where the
+run's config lives.
 
 Only that. The authoritative whole-log read is below, under the locks,
 and everything the resume actually acts on comes from there. This read
@@ -38,7 +35,7 @@ decides what to refuse before taking anything.
 The run knows its own plan and config; the CLI may override the config
 but never the plan, which is frozen (§5).
 
-## `let limits = config::EngineLimits::for_resume(header_schema);`
+## `let limits = config::EngineLimits::for_resume(`
 
 This run's ceilings were fixed when it started. Today's `[engine]` keys
 are read for the same reason today's gates are — the file is what is
@@ -99,7 +96,7 @@ changed": if the names have moved, that is proof rather than
 suspicion, and if they have not, the only undetectable edit left is a
 command behind an unchanged name.
 
-## (end of file)
+## `}`
 
 Both empty: the run recorded no gates and none resolve today, so
 there is nothing a command could have hidden behind. Saying "may have

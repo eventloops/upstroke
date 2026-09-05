@@ -81,7 +81,15 @@ pub(super) fn resume_harness_inner_on(
     run_opts.wait_on_block = opts.wait_on_block;
     let wait_on_block = opts.wait_on_block;
 
-    let limits = config::EngineLimits::for_resume(header_schema);
+    // This run's ceilings were fixed when it started. Today's `[engine]` keys
+    // are read for the same reason today's gates are — the file is what is
+    // here — but a value this engine cannot honour is a statement about some
+    // future run, not an instruction to this one, so it warns rather than
+    // stranding a run whose only fault is that someone edited a file it reads.
+    let limits = config::EngineLimits::for_resume(
+        header_schema,
+        events::recorded_gates(&header_events).is_some(),
+    );
     let validated = validate_inputs(&run_opts, limits)?;
 
     let workspace = Workspace::open(&opts.repo_root)?;
@@ -114,7 +122,10 @@ pub(super) fn resume_harness_inner_on(
     }
     let analysis = validated.confirm_under_lease(
         &run_opts,
-        config::EngineLimits::for_resume(effective_schema),
+        config::EngineLimits::for_resume(
+            effective_schema,
+            events::recorded_gates(&events).is_some(),
+        ),
     )?;
     let recorded_normalized_plan_digest =
         events::recorded_normalized_plan_digest(&events).map(str::to_owned);

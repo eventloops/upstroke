@@ -1,7 +1,7 @@
 //! Extended notes: `docs/internals/engine/tests.md`
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
 
-// LEGACY-EFFECT: this module is in the frozen legacy section of
-// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
@@ -37,18 +37,31 @@ use crate::workspace::Workspace;
 #[derive(Clone, Copy, PartialEq)]
 enum Effect {
     EditFile,
+
     EditTest,
+
     LargeEdit,
+
     OpaqueEdit,
+
     IgnoredGateInput,
+
     FrozenCandidate,
+
     JamCleanupAfterReview,
+
     LargeEditQuestionWriteFailure,
+
     NoEdit,
+
     SpawnError,
+
     Error,
+
     RateLimited,
+
     AskQuestion,
+
     Exit,
 }
 
@@ -58,9 +71,13 @@ const CRASH_EXIT_CODE: i32 = 42;
 enum ReviewBehavior {
     Pass,
     Fail,
+
     Unparseable,
+
     RateLimited,
+
     SpawnError,
+
     NeedsHuman,
 }
 
@@ -68,7 +85,9 @@ struct FakeAdapter {
     id: &'static str,
     effects: Vec<Effect>,
     reviews: Vec<ReviewBehavior>,
+
     probe_error: Option<&'static str>,
+
     reports_cost: bool,
     calls: Mutex<Calls>,
 }
@@ -296,6 +315,7 @@ impl AgentAdapter for FakeAdapter {
                     }
                 })?;
             }
+
             return Ok(shell_spec(&format!("echo {REVIEW_MARKER}")));
         }
         let index = {
@@ -437,6 +457,7 @@ impl AgentAdapter for FakeAdapter {
                 out.duration,
             ));
         }
+
         let index = self
             .calls
             .lock()
@@ -446,6 +467,7 @@ impl AgentAdapter for FakeAdapter {
         let status = match effect {
             Effect::Error => OutcomeStatus::AgentError,
             Effect::RateLimited => OutcomeStatus::RateLimited,
+
             Effect::EditFile
             | Effect::EditTest
             | Effect::LargeEdit
@@ -502,6 +524,7 @@ fn fake_outcome(
 
 struct FakeSource {
     adapter: FakeAdapter,
+
     copilot: Option<FakeAdapter>,
 }
 
@@ -691,6 +714,7 @@ fn options(repo: &Path) -> RunOptions {
     let mut opts = RunOptions::new(repo.join("plan.md"), repo.to_path_buf());
     opts.pools_path = Some(no_pools());
     opts.attempt_timeout = Duration::from_secs(60);
+
     opts.defer_backoff = Duration::ZERO;
     opts.wait_on_block = Some(Duration::ZERO);
     opts.private_root = Some(private_root_for(repo));
@@ -820,6 +844,7 @@ fn a_returned_legacy_append_error_still_leaves_the_partial_report() {
         .map(|entry| entry.path())
         .find(|path| path.join("events.jsonl").is_file())
         .expect("the failed run left its public directory and its log");
+
     let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");
     let complete = log.lines().filter(|line| line.ends_with('}')).count();
     assert!(
@@ -860,6 +885,7 @@ fn happy_path_commits_one_commit_per_task() {
             .all(|t| matches!(t.status, TaskRunStatus::Committed { .. })),
         "report: {report:?}"
     );
+
     assert!(
         (report.total_cost_usd - 0.12).abs() < 1e-9,
         "worker and reviewer spend both counted: {}",
@@ -1352,6 +1378,7 @@ fn test_task_adding_real_tests_passes_provenance() {
 #[test]
 fn gate_residue_is_scrubbed_not_committed() {
     let repo = temp_engine_repo("residue");
+
     seed(
         &repo,
         "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
@@ -1416,6 +1443,7 @@ fn review_can_be_switched_off_explicitly() {
 
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
     let report = run_with(&opts, &source).expect("run");
     assert_eq!(report.outcome(), RunOutcome::Complete, "report: {report:?}");
@@ -1477,6 +1505,7 @@ fn a_second_opinion_runs_a_second_family_and_leaves_the_primary_alone() {
     assert_eq!(t1.model, "claude-opus-5", "written by the frontier model");
     assert_eq!(source.adapter.reviews_run(), 1);
     assert_eq!(source.copilot().reviews_run(), 1);
+
     assert_eq!(t1.review_cost_usd, Some(0.10), "0.05 per pass");
     assert_eq!(t1.cost_usd, Some(0.01), "implementer's own");
     let rendered = report.render();
@@ -1541,6 +1570,7 @@ fn a_failing_first_pass_never_spends_the_second_reviewer() {
 fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_it() {
     let repo = temp_engine_repo("selfreview");
     seed(&repo, FRONTIER_AUTH_PLAN, Some(FRONTIER_ONLY_CONFIG));
+
     let source = cross_vendor(
         vec![Effect::EditFile],
         vec![ReviewBehavior::Fail],
@@ -1638,6 +1668,7 @@ fn an_unprobeable_cross_family_reviewer_downgrades_instead_of_halting() {
         "warnings: {:?}",
         report.warnings
     );
+
     assert!(
         report
             .warnings
@@ -2300,6 +2331,7 @@ fn the_gate_derivation_is_taken_under_the_lease_not_carried_over_it() {
     fs::write(opts.config_path.as_ref().expect("config path"), "").expect("an empty config");
 
     let validated = validate_inputs(&opts, config::EngineLimits::Fresh).expect("pre-lock check");
+
     fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("a rust repo now");
     let analysis = validated
         .confirm_under_lease(&opts, config::EngineLimits::Fresh)
@@ -2317,6 +2349,7 @@ fn the_gate_derivation_is_taken_under_the_lease_not_carried_over_it() {
 
 fn volatile_strings(repo: &Path, run_id: &str) -> Vec<String> {
     let mut volatile = vec![run_id.to_owned()];
+
     for path in [private_root_for(repo), repo.to_path_buf()] {
         let text = path.to_string_lossy().into_owned();
         volatile.push(text.replace('\\', "/"));
@@ -2417,13 +2450,17 @@ const LEGACY_RESUME_NO_LIMITS: &str = "\n# no [engine] ceilings in this arm\n";
 #[derive(Clone, Copy)]
 enum LegacyFixture {
     Parked,
+
     InterruptedAttempt,
 }
 
 struct LegacyArm {
     report: RunReport,
+
     trace: Vec<String>,
+
     projection: String,
+
     tree: String,
     events: Vec<events::Event>,
 }
@@ -2502,6 +2539,7 @@ fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {
         for event in &limits.events {
             match &event.body {
                 EventBody::AttemptStarted { .. } => open += 1,
+
                 EventBody::AttemptFinished { .. } | EventBody::AttemptInterrupted { .. } => {
                     open -= 1;
                 }
@@ -2736,6 +2774,7 @@ fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rejection() {
         ],
         "the second vendor was down, not unimpressed"
     );
+
     assert!(committed(&report, "t1"), "{report:?}");
 }
 
@@ -2831,6 +2870,7 @@ fn every_model_that_judged_a_task_is_listed_beside_the_cost_of_all_of_them() {
                  [routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n",
         ),
     );
+
     let source = cross_vendor(
         vec![Effect::EditFile],
         vec![ReviewBehavior::Fail, ReviewBehavior::Pass],
@@ -3161,6 +3201,7 @@ fn exhausting_a_rung_escalates_with_a_fresh_session_and_the_history() {
     assert_eq!(t1.trail(), "small failed → mid ok");
 
     let runs = source.adapter.runs();
+
     assert_eq!(runs[0].model, "claude-haiku-4-5");
     assert_eq!(runs[1].model, "claude-sonnet-5");
     assert_eq!(runs[1].resume, None, "fresh session");
@@ -3187,6 +3228,7 @@ fn a_parked_question_does_not_stop_the_runnable_frontier() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::NoEdit, Effect::EditFile],
         vec![ReviewBehavior::Pass],
@@ -3681,6 +3723,7 @@ fn a_worker_can_stop_and_ask_rather_than_guess() {
         "context: {}",
         record.question.context
     );
+
     assert!(committed(&report, "t3"));
     assert!(committed(&report, "t1"), "report: {report:?}");
     let t1 = task(&report, "t1");
@@ -3689,10 +3732,12 @@ fn a_worker_can_stop_and_ask_rather_than_guess() {
         2,
         "asking cost no attempt — only the retry after the answer"
     );
+
     assert!(
         !t1.attempts[1].resumed,
         "a parked task never resumes into a tree that was reverted underneath it"
     );
+
     let runs = source.adapter.runs();
     let retry = &runs[2];
     assert_eq!(retry.resume, None, "fresh session, not --resume");
@@ -3850,6 +3895,7 @@ fn an_unparseable_reviewer_fails_after_one_reask() {
         "reason: {}",
         failure.reason
     );
+
     let reviews = paths_of(&repo, &report.run_id).reviews();
     assert!(reviews.join("00-t1-1-review.json").is_file());
     assert!(
@@ -4114,6 +4160,7 @@ fn an_explicit_null_detail_survives_the_strict_door() {
         .get_mut("failure")
         .and_then(serde_json::Value::as_object_mut)
         .expect("a failed record carries a failure object");
+
     failure.insert("detail".to_owned(), serde_json::Value::Null);
 
     let mut value = serde_json::to_value(TopologyEvent::now(TopologyEventBody::AttemptFinished {
@@ -4207,6 +4254,7 @@ fn durable_detail(failure: &crate::ladder::AttemptFailure) -> Option<String> {
             outcome: &outcome,
             reviews: &[],
             failure: Some(failure),
+
             feedback: super::classify::FeedbackCarrier::AttemptRecord,
         },
     )
@@ -4221,6 +4269,7 @@ fn a_worker_question_is_read_from_the_marker_onward() {
         worker_question(Some("Did some work.\nUPSTROKE-QUESTION: opaque or signed?")).as_deref(),
         Some("opaque or signed?")
     );
+
     assert_eq!(
         worker_question(Some("UPSTROKE-QUESTION: which store?\nRedis or Postgres?")).as_deref(),
         Some("which store?\nRedis or Postgres?")
@@ -4288,10 +4337,12 @@ fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::AskQuestion, Effect::NoEdit],
         vec![ReviewBehavior::Pass],
     );
+
     let answers = ScriptedAnswers::new(vec![
         Answer::Declined,
         Answer::Answered {
@@ -4323,6 +4374,7 @@ fn a_halted_run_stops_asking_and_keeps_naming_the_real_cause() {
         Some("t1"),
         "halted_at names the task that actually caused the halt"
     );
+
     assert!(
         matches!(task(&report, "t2").status, TaskRunStatus::Parked { .. }),
         "t2 is never asked after the halt, so it stays parked rather than \
@@ -4355,9 +4407,11 @@ fn replay_of(repo: &Path, run_id: &str) -> crate::status::RunStatus {
 struct Scenario {
     name: &'static str,
     config: &'static str,
+
     plan: Option<&'static str>,
     effects: Vec<Effect>,
     reviews: Vec<ReviewBehavior>,
+
     second_opinion: Option<Vec<ReviewBehavior>>,
     answers: Vec<Answer>,
 }
@@ -4398,6 +4452,7 @@ fn assert_live_equals_replay(repo: &Path, live: &RunState, report: &RunReport) {
         &replayed.state, live,
         "replaying the log produced different state than the run that wrote it"
     );
+
     let strip = |report: &RunReport| {
         let mut value = serde_json::to_value(report).expect("serialize");
         if let Some(object) = value.as_object_mut() {
@@ -4527,6 +4582,7 @@ fn live_state_equals_replayed_state_across_every_ladder_path() {
             },
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
+
         if cross_vendor_scenario {
             let judged: Vec<&str> = report
                 .tasks
@@ -4555,6 +4611,7 @@ fn an_aborting_error_still_leaves_a_replayable_log() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
     opts.attempt_timeout = Duration::from_secs(60);
     let report = run_with(&opts, &source).expect("the run itself succeeds");
@@ -4651,6 +4708,7 @@ fn a_live_run_reads_as_running_rather_than_halted() {
     );
     let out = crate::status::render(&live);
     assert!(out.contains("t1: running now"), "{out}");
+
     assert!(out.contains("t2: queued"), "{out}");
     assert!(out.contains("t3: queued"), "{out}");
     assert!(out.contains("run in progress"), "{out}");
@@ -4815,6 +4873,7 @@ fn killing_a_run_mid_attempt_leaves_a_resumable_record() {
         !rendered.contains("run complete"),
         "a killed run claimed it completed:\n{rendered}"
     );
+
     assert!(rendered.contains("skipped (run interrupted)"), "{rendered}");
 
     let source = fake(Effect::EditFile);
@@ -4857,11 +4916,13 @@ fn crash_child_dies_inside_an_attempt() {
     let repo = PathBuf::from(repo);
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::EditFile, Effect::Exit],
         vec![ReviewBehavior::Pass],
     );
     let _ = run_with(&opts, &source);
+
     std::process::exit(0);
 }
 
@@ -4945,6 +5006,7 @@ fn an_answer_arriving_mid_run_unparks_without_a_hard_block() {
         vec![Effect::AskQuestion, Effect::EditFile],
         vec![ReviewBehavior::Pass],
     );
+
     let report = run_harness(
         &opts,
         &Harness {
@@ -5416,6 +5478,7 @@ fn resume_answering(repo: &Path, run_id: &str, effect: Effect) -> RunReport {
 #[test]
 fn resume_runs_the_gates_the_run_recorded_not_todays() {
     let (repo, run_id) = parked_run_with_gate("gaterecorded", "git --version");
+
     fs::write(
         repo.join("upstroke.toml"),
         gate_config("git frobnicate-not-a-command"),
@@ -5428,6 +5491,7 @@ fn resume_runs_the_gates_the_run_recorded_not_todays() {
         committed(&resumed, "t1"),
         "the recorded gate ran, not the one in today's config: {resumed:?}"
     );
+
     let warning = resumed
         .warnings
         .iter()
@@ -5444,12 +5508,95 @@ fn resume_runs_the_gates_the_run_recorded_not_todays() {
         warning.contains("Start a new run to adopt them"),
         "and what to do about it: {warning}"
     );
+
     assert_eq!(resumed.gates, ["check"]);
+}
+
+#[test]
+fn a_resume_with_a_gate_record_is_not_refused_over_todays_gates_section() {
+    let (repo, run_id) = parked_run_with_gate("gate_record_lenient", "git --version");
+    fs::write(
+        repo.join("upstroke.toml"),
+        format!(
+            "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"check\"\ncmd = \"git --version\"\n\
+             timeout_secs = 0\ntimeout_sec = 3600\n\
+             [[gates]]\nname = \"Check\"\ncmd = \"git frobnicate-not-a-command\"\n"
+        ),
+    )
+    .expect("edit config");
+
+    let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+    assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+    assert!(
+        committed(&resumed, "t1"),
+        "the recorded gate ran, not today's zero-timeout or failing one: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.gates,
+        ["check"],
+        "the report describes the recorded gate"
+    );
+    for shape in [
+        "timeout_secs must be at least 1",
+        "has unknown key `timeout_sec`",
+        "repeats the name `Check` of entry 1",
+    ] {
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains(shape) && w.contains("recorded")),
+            "each shape is announced, with the record named as what runs (`{shape}`): {:?}",
+            resumed.warnings
+        );
+    }
+}
+
+#[test]
+fn a_resume_with_no_gate_record_refuses_the_gate_shapes_a_fresh_run_refuses() {
+    let (repo, run_id) = parked_run_with_gate("gate_record_absent", "git --version");
+    let paths = paths_of(&repo, &run_id);
+    strip_event_data_field(&paths, "run_started", "gate_cmds");
+    let before = fs::read_to_string(paths.events()).expect("the log before");
+    assert!(
+        events::recorded_gates(&events_of(&repo, &run_id)).is_none(),
+        "the fixture must have no gate record left"
+    );
+    fs::write(
+        repo.join("upstroke.toml"),
+        format!(
+            "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"check\"\ncmd = \"git --version\"\n\
+             timeout_sec = 3600\n"
+        ),
+    )
+    .expect("edit config");
+
+    let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+    let error = resume_with(&resume_options(&repo, &run_id), &source)
+        .expect_err("a resume whose gates come from this file refuses it");
+    let message = error.to_string();
+    assert!(
+        message.contains("[[gates]] entry 1") && message.contains("`timeout_sec`"),
+        "names the entry and the key: {message}"
+    );
+
+    let after = fs::read_to_string(paths.events()).expect("the log after");
+    assert_eq!(after, before, "a refusal before the lock appends nothing");
+
+    fs::write(repo.join("upstroke.toml"), gate_config("git --version")).expect("edit config");
+    let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+    assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+    assert!(committed(&resumed, "t1"), "{resumed:?}");
+    assert!(
+        events::recorded_gates(&events_of(&repo, &run_id)).is_some(),
+        "the resume recorded the gates it settled on"
+    );
 }
 
 #[test]
 fn the_report_labels_gates_from_the_record_not_todays_config() {
     let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");
+
     fs::write(repo.join("upstroke.toml"), PARKED_RUN_CONFIG).expect("edit config");
 
     let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
@@ -5458,6 +5605,7 @@ fn the_report_labels_gates_from_the_record_not_todays_config() {
         resumed.gates_from_config,
         "and is labelled as the record has it, not as today's config would"
     );
+
     let replayed = replay_of(&repo, &run_id).report();
     assert_eq!(replayed.gates, resumed.gates);
     assert_eq!(replayed.gates_from_config, resumed.gates_from_config);
@@ -5556,6 +5704,7 @@ fn a_gate_difference_is_described_without_inventing_edits() {
 fn a_log_that_predates_the_gate_record_rederives_and_says_what_it_can() {
     let (repo, run_id) = parked_run_with_gate("oldgatelog", "git --version");
     strip_run_started_field(&paths_of(&repo, &run_id), "gate_cmds");
+
     fs::write(
         repo.join("upstroke.toml"),
         format!("{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"renamed\"\ncmd = \"git --version\"\n"),
@@ -5614,6 +5763,7 @@ fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {
         committed(&second, "t1"),
         "the established gate ran, not the weakened one: {second:?}"
     );
+
     assert!(
         second
             .warnings
@@ -5927,6 +6077,7 @@ fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let adapters = source(
         vec![Effect::NoEdit, Effect::EditFile],
         vec![ReviewBehavior::Pass],
@@ -5946,8 +6097,10 @@ fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {
             private.display()
         );
     }
+
     assert!(paths.events().starts_with(&repo));
     assert!(paths.questions().starts_with(&repo));
+
     let in_repo = repo.join(".upstroke").join("runs").join(&report.run_id);
     for leaked in ["transcripts", "reviews", "settings", "gates"] {
         assert!(
@@ -6558,6 +6711,7 @@ fn resume_writes_where_the_run_recorded_not_where_defaults_point() {
     let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
     let run_id = report.run_id.clone();
     let recorded = paths_of(&repo, &run_id);
+
     truncate_log_before(&recorded, "attempt_finished");
     git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
 
@@ -6638,6 +6792,7 @@ fn a_run_that_never_started_leaves_no_directory_behind() {
         "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
         Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
     );
+
     git_in(&repo, &["branch", "upstroke"]);
 
     let mut opts = options(&repo);
@@ -6704,6 +6859,7 @@ fn a_typed_answer_survives_another_question_being_answered_at_the_same_time() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::NoEdit, Effect::NoEdit, Effect::EditFile],
         vec![ReviewBehavior::Pass],
@@ -6812,6 +6968,7 @@ fn following_waits_out_a_silent_live_run_and_stops_once_it_dies() {
     let held = RunLock::acquire(&paths.public).expect("simulate a live engine");
     let sleeper = LockReleasingSleeper::new(held, 5);
     let mut out: Vec<u8> = Vec::new();
+
     crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");
 
     assert!(
@@ -6907,6 +7064,7 @@ fn a_task_budget_also_ends_the_run_and_says_which_ceiling_it_was() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::NoEdit, Effect::EditFile],
         vec![ReviewBehavior::Pass],
@@ -7337,6 +7495,7 @@ fn the_budget_flag_is_validated_like_the_config_key() {
             "--budget {bad}: {err}"
         );
     }
+
     let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(branch.trim(), "main", "refused before branching");
 }
@@ -7378,6 +7537,7 @@ fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_instruction() {
         "the approval reached the implementer as guidance:
 {frontier}"
     );
+
     assert!(
         !frontier.contains("instruction from a person"),
         "and no human-instruction framing at all:
@@ -7395,6 +7555,7 @@ fn picking_an_option_is_an_un_park_and_not_a_decision() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     let source = source(
         vec![Effect::AskQuestion, Effect::EditFile],
         vec![ReviewBehavior::Pass],
@@ -7428,6 +7589,7 @@ fn picking_an_option_is_an_un_park_and_not_a_decision() {
         !retry.contains("instruction from a person"),
         "and with no human-instruction framing at all:\n{retry}"
     );
+
     for review in runs
         .iter()
         .filter(|r| r.prompt.contains("DATA UNDER REVIEW"))
@@ -7451,6 +7613,7 @@ fn one_outage_records_one_signal_however_many_deferrals_it_causes() {
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
     opts.pools_path = Some(pools_file(&repo, CLAUDE_POOL));
+
     let source = source(
         vec![
             Effect::RateLimited,
@@ -7482,6 +7645,7 @@ fn a_budget_stop_hands_back_a_clean_tree() {
     );
     let mut opts = options(&repo);
     opts.config_path = Some(repo.join("upstroke.toml"));
+
     opts.budget_usd = Some(0.05);
     let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
     let stopped = run_with(&opts, &rejected).expect("run");
@@ -7566,6 +7730,7 @@ fn an_unpriced_worker_reads_as_unreported_rather_than_free() {
     task.status = TaskRunStatus::Committed {
         sha: "abc123".to_owned(),
     };
+
     task.attempts = vec![AttemptRecord {
         attempt: 1,
         tier: "frontier".to_owned(),
@@ -7594,6 +7759,7 @@ fn an_unpriced_worker_reads_as_unreported_rather_than_free() {
         !task_line.contains("$0.0000"),
         "unreported spend rendered as free: {task_line}"
     );
+
     assert!(
         report.total_is_floor(),
         "an unpriced worker makes it a floor"
@@ -7602,6 +7768,7 @@ fn an_unpriced_worker_reads_as_unreported_rather_than_free() {
     let ledger = report.render_ledger();
     assert!(ledger.contains("total $0.0000?"), "{ledger}");
     assert!(ledger.contains("a floor, not a total"), "{ledger}");
+
     let row = ledger
         .lines()
         .find(|l| l.trim_start().starts_with("t1"))
@@ -7648,6 +7815,7 @@ fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_report() {
     let report: RunReport =
         serde_json::from_str(text).expect("one unknown status must not sink the report");
     assert!(matches!(task(&report, "t1").status, TaskRunStatus::Unknown));
+
     assert!(
         matches!(&task(&report, "t2").status, TaskRunStatus::Committed { sha } if sha == "abc123")
     );
@@ -7757,6 +7925,7 @@ fn a_budget_stop_survives_a_git_that_cannot_clean_the_tree() {
         .as_ref()
         .expect("the ceiling is on the record even when the cleanup failed");
     assert_eq!(stop.budget, events::BudgetKind::Run);
+
     assert!(
         stopped
             .warnings
@@ -7795,6 +7964,7 @@ struct RoutedProcess {
     workspace: PathBuf,
     agent: Option<String>,
     slotted: bool,
+
     stdin: String,
 }
 
@@ -8084,6 +8254,7 @@ fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_pro
         ids.len(),
         "two processes of one run share an identity"
     );
+
     assert_eq!(
         source.adapter.reviews_run(),
         2,
@@ -8332,6 +8503,7 @@ fn every_public_write_coordinator_entry_point_establishes_containment() {
              (INV-18); a kill after CreateProcessW and before private-job assignment would leave \
              a suspended stub alive"
         );
+
         #[cfg(windows)]
         assert!(
             crate::agent::proc::ambient_job_established(),
@@ -8487,6 +8659,7 @@ fn a_facade_resume_refuses_before_any_effect_when_containment_fails() {
         })
     })
     .expect_err("a resume whose ambient job cannot be established must refuse");
+
     let looked_in = repo.display().to_string();
     let refused = refused.to_string();
     assert!(
