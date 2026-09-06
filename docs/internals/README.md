@@ -120,6 +120,12 @@ four Bash gates) and holds the two trees to each other in both directions:
   following an H1 and blank lines, and its relative target resolves to its module;
 - a module carries at most one marker, above its first line of code.
 
+The domain is Rust comments, not raw source text. The scan blanks string,
+byte-string, raw-string and character literals, and every other code byte,
+before it looks for the phrase, so an ordinary literal that happens to contain
+`Extended notes:` is source rather than a marker, and "its first line of code"
+is the first line carrying anything outside a comment.
+
 An absent `docs/internals/` is a failure, never "nothing to check": with markers in `src/` it is a
 deleted notes tree, and with none it is a gate measuring nothing. Each check has been broken on
 purpose and watched fail.
@@ -127,7 +133,8 @@ purpose and watched fail.
 The gate checks that opening format rather than parsing arbitrary Markdown.
 Hidden links, plain paths, code examples, and images do not satisfy it. Its
 isolated fixtures exercise valid depths and CRLF, malformed backlinks, missing
-files, and misplaced or duplicate markers.
+files, misplaced or duplicate markers, and the literals a raw-text scan reads
+as markers.
 
 The gate does not check section headings, arbitrary source prose, or whether a
 note remains true. Those are review duties under §13, including its site-required
