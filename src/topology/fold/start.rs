@@ -173,23 +173,19 @@ pub(super) fn check_ladder(key: TaskKey, ladder: &FrozenLadder) -> Result<(), Fo
             "it allows 0 attempts per rung, so no attempt is ever permitted".to_owned(),
         ));
     }
-    let mut previous: Option<Tier> = None;
-    for tier in &ladder.tiers {
-        if let Some(previous) = previous {
-            if *tier <= previous {
-                return Err(malformed(format!(
-                    "its tiers are recorded as `{}`, which does not escalate: `{tier}` does not \
-                     outrank `{previous}`",
-                    ladder
-                        .tiers
-                        .iter()
-                        .map(Tier::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
+    for (previous, tier) in ladder.tiers.iter().zip(ladder.tiers.iter().skip(1)) {
+        if tier <= previous {
+            return Err(malformed(format!(
+                "its tiers are recorded as `{}`, which does not escalate: `{tier}` does not \
+                 outrank `{previous}`",
+                ladder
+                    .tiers
+                    .iter()
+                    .map(Tier::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        previous = Some(*tier);
     }
     if ladder.ceiling != ladder.tiers.iter().copied().max() {
         return Err(malformed(format!(
