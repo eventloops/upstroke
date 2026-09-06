@@ -136,8 +136,16 @@ pub struct HookHarness {
     reached: Vec<Observation>,
     /// The fast integration sequences the suite exercised, in order.
     fast: Vec<FastSequence>,
-    /// The one being recorded, if a sequence is open.
-    open_fast: Option<usize>,
+    /// Whether the sequence begun last is still recording.
+    ///
+    /// The open sequence is always the last of `fast`: `begin_fast_sequence`
+    /// closes the previous one and then pushes, and nothing else adds to the
+    /// vector. A flag beside `last_mut()` says that structurally, where the
+    /// index this used to hold had to be *kept* true — and an index that went
+    /// stale would either record into the wrong sequence or be defended
+    /// against on every hook, which is a thing a reader has to check rather
+    /// than read.
+    recording: bool,
 }
 
 /// One exercised fast integration sequence, and every site its funnels ran.
@@ -167,6 +175,17 @@ impl FastSequence {
     /// Whether `site` ran during this sequence.
     pub fn ran(&self, site: EffectSiteId) -> bool {
         self.touched.contains(&site)
+    }
+
+    /// Record that `site`'s funnel ran inside this sequence.
+    ///
+    /// Once per site, in first-execution order: a sequence answers *whether* a
+    /// site ran in it ([`Self::ran`]), and how often it ran is the harness's
+    /// count, not the trace's.
+    fn touch(&mut self, site: EffectSiteId) {
+        if !self.touched.contains(&site) {
+            self.touched.push(site);
+        }
     }
 }
 
@@ -238,12 +257,8 @@ impl HookHarness {
     /// [`Self::reached`], which is recorded separately and is never what the
     /// bijection reads.
     pub fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-        if let Some(open) = self.open_fast {
-            if let Some(sequence) = self.fast.get_mut(open) {
-                if !sequence.touched.contains(&site) {
-                    sequence.touched.push(site);
-                }
-            }
+        if let Some(sequence) = self.open_sequence() {
+            sequence.touch(site);
         }
         let injection = match phase {
             HookPhase::Before | HookPhase::After => Injection::Proceed,
@@ -258,8 +273,11 @@ impl HookHarness {
                 }
             }
         };
-        if let HookPhase::Point { point, mode } = phase {
-            Self::record(&mut self.reached, site, HookPhase::Point { point, mode });
+        if matches!(phase, HookPhase::Point { .. }) {
+            // The phase as given, not one rebuilt from its own fields: a
+            // rebuild is a second spelling of the coordinate that can drift
+            // from the one the injection was decided by.
+            Self::record(&mut self.reached, site, phase);
             if injection == Injection::Proceed {
                 // Reached, and nothing was injected. Recorded as reachability
                 // and as nothing else.
@@ -268,6 +286,15 @@ impl HookHarness {
         }
         Self::record(&mut self.observed, site, phase);
         injection
+    }
+
+    /// The sequence still recording, if one is open.
+    fn open_sequence(&mut self) -> Option<&mut FastSequence> {
+        if self.recording {
+            self.fast.last_mut()
+        } else {
+            None
+        }
     }
 
     fn record(into: &mut Vec<Observation>, site: EffectSiteId, phase: HookPhase) {
@@ -289,18 +316,24 @@ impl HookHarness {
     /// Everything a funnel hooks until [`Self::end_fast_sequence`] is recorded
     /// as having run inside this sequence, which is what a no-execution entry
     /// is measured against. A second `begin` closes the first.
+    /// A name is a label the suite chose and not an identity: beginning one
+    /// twice records two sequences, so a second run under a name that saw
+    /// something is still held to having seen something of its own.
     pub fn begin_fast_sequence(&mut self, name: &str) {
         self.end_fast_sequence();
         self.fast.push(FastSequence {
             name: name.to_owned(),
             touched: Vec::new(),
         });
-        self.open_fast = Some(self.fast.len() - 1);
+        self.recording = true;
     }
 
     /// Stop recording the open fast sequence, keeping what it saw.
+    ///
+    /// A no-op when none is open, and it does not end the *run*: a later
+    /// [`Self::hook`] is recorded as coverage, in no sequence.
     pub fn end_fast_sequence(&mut self) {
-        self.open_fast = None;
+        self.recording = false;
     }
 
     /// Every fast sequence the suite exercised.
@@ -308,7 +341,14 @@ impl HookHarness {
         &self.fast
     }
 
-    /// The fast sequence of this name, if the suite exercised one.
+    /// The first fast sequence recorded under this name, if there is one.
+    ///
+    /// First, because a name is a label rather than an identity: a suite that
+    /// begins one twice has two sequences and this answers about the earlier.
+    /// Anything holding a claim *to* the traces reads [`Self::fast_sequences`]
+    /// and holds it to every one of them, which is what
+    /// [`check_bijection`](crate::topology::effects::check_bijection) does with
+    /// a no-execution record; this is for a caller that has one name in hand.
     pub fn fast_sequence(&self, name: &str) -> Option<&FastSequence> {
         self.fast.iter().find(|sequence| sequence.name == name)
     }
@@ -440,6 +480,82 @@ mod tests {
                 },
             ),
             Injection::Kill,
+        );
+    }
+
+    #[test]
+    fn the_open_sequence_is_the_one_begun_last_and_stops_at_the_end() {
+        let outside = EffectSiteId::Lock(LockSite::AcquireRun);
+        let mut harness = HookHarness::new();
+
+        harness.begin_fast_sequence("fast/one");
+        harness.hook(APPEND, HookPhase::Before);
+        // A second begin closes the first, and what follows belongs to the
+        // second alone.
+        harness.begin_fast_sequence("fast/two");
+        harness.hook(COMMIT_TREE, HookPhase::Before);
+        harness.end_fast_sequence();
+        // Ended: this one is coverage, recorded in no sequence at all.
+        harness.hook(outside, HookPhase::Before);
+
+        let names: Vec<&str> = harness
+            .fast_sequences()
+            .iter()
+            .map(FastSequence::name)
+            .collect();
+        assert_eq!(names, ["fast/one", "fast/two"]);
+
+        let one = harness
+            .fast_sequence("fast/one")
+            .expect("the first sequence");
+        assert_eq!(
+            one.touched(),
+            [APPEND],
+            "the second begin went on recording into the first",
+        );
+        assert!(!one.ran(COMMIT_TREE));
+
+        let two = harness
+            .fast_sequence("fast/two")
+            .expect("the second sequence");
+        assert_eq!(two.touched(), [COMMIT_TREE]);
+        assert!(
+            !two.ran(outside),
+            "a hook after `end_fast_sequence` joined the sequence it ended",
+        );
+        assert!(
+            harness.touched(outside),
+            "a hook outside every sequence is still an execution the harness saw",
+        );
+    }
+
+    #[test]
+    fn a_reused_sequence_name_is_a_second_sequence_and_not_a_return_to_the_first() {
+        let mut harness = HookHarness::new();
+        harness.begin_fast_sequence("fast");
+        harness.hook(APPEND, HookPhase::Before);
+        harness.begin_fast_sequence("fast");
+        harness.end_fast_sequence();
+
+        assert_eq!(
+            harness.fast_sequences().len(),
+            2,
+            "a reused name folded two traces into one, so the second is held to the first's \
+             observation",
+        );
+        let empty = harness
+            .fast_sequences()
+            .iter()
+            .filter(|sequence| sequence.touched().is_empty())
+            .count();
+        assert_eq!(
+            empty, 1,
+            "the second run under the name inherited an observation it did not make",
+        );
+        assert_eq!(
+            harness.fast_sequence("fast").map(FastSequence::touched),
+            Some(&[APPEND][..]),
+            "the accessor answered about a sequence other than the first of that name",
         );
     }
 }
