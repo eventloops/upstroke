@@ -61,17 +61,28 @@ append error". A predicate that kept answering `true` would let the
 coordinator select work from a state this process can no longer vouch
 for, and the append-error protocol's "no report, cleanup, or question
 payload is derived from the poisoned fold" would hold in the emit path
-and leak here. So every predicate below is false once poisoned.
+and leak here. So every predicate below that authorises work is false
+once poisoned. There are seven: `ready`, `ready_retry`,
+`pipeline_reservable`, `structurally_admissible`,
+`integration_admissible`, and the two selection readers documented at
+the end of this file, `eligible_continuation` and
+`eligible_integration_candidate`.
 
-The exceptions are the four that state what the run *is* rather than
-what it may do: `pipeline_held`, `run_is_ending`, `backoff_pending` and
-`questions_open`. They are accounting, not authorisation. A poisoned
-fold whose `halted_at` is set is still a halted run, and answering `0`
-or `false` there would be a false statement about durable state rather
-than a refusal. Their callers must not derive a report from them after a
-poisoned append either, but that is a rule about reports and it lives in
-the emit path — and nothing selects on them from a poisoned fold in any
-case, because selection refuses at the top on `is_poisoned`.
+The exceptions are the other seven readers below, which state what the
+run *is* rather than what it may do and answer the same before and after
+a `poison()`: `pipeline_held`, `run_is_ending`, `backoff_pending`,
+`questions_open`, `frozen_rung_binding`, `open_no_attempt` and
+`predicted_region`. An earlier version of this paragraph counted four,
+naming the first four of them only; the last three are readers rather
+than predicates and were left out of the count, while the code has
+always answered them from durable state. They are accounting, not
+authorisation. A poisoned fold whose `halted_at` is set is still a halted
+run, and answering `0` or `false` there would be a false statement about
+durable state rather than a refusal. Their callers must not derive a
+report from them after a poisoned append either, but that is a rule about
+reports and it lives in the emit path — and nothing selects on them from
+a poisoned fold in any case, because selection refuses at the top on
+`is_poisoned`.
 -----------------------------------------------------------------------
 
 ## `impl TopologyFold` › `pub fn ready(&self, key: TaskKey) -> bool {`
