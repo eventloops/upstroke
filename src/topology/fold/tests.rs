@@ -6806,7 +6806,6 @@ fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_reached() {
     }
 }
 
-
 #[test]
 fn a_wait_never_elapses_under_a_halt_or_a_budget_stop() {
     let base = sha("base");
