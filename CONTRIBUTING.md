@@ -14,7 +14,7 @@ candidate-controlled, so a fork's entire diff, workflow edits included, is revie
 
 ## Before you send a PR
 
-CI enforces all eight of these, verbatim, from the repository root:
+CI enforces all nine of these, verbatim, from the repository root:
 
 ```bash
 cargo fmt --check
@@ -25,6 +25,7 @@ bash .github/scripts/test-release-record.sh
 bash .github/scripts/test-pr-policy.sh
 bash .github/scripts/test-pr-ledger-evidence.sh
 bash .github/scripts/test-docs-consistency.sh
+bash .github/scripts/test-internals-notes.sh
 ```
 
 `CODING_STANDARDS.md` §2 is the normative statement of this baseline and says how CI splits it
@@ -38,7 +39,7 @@ merge commits are the only accepted merge method.
 sections a change touches before changing Rust. Among the hard requirements: edition 2024 with MSRV
 1.85, no `.unwrap()` or `.expect()` in production, `anyhow` only at the binary edge (libraries
 return typed `thiserror` errors), paths through `std::path` types, and no shared ownership, locks
-or clones without a stated reason. Windows, macOS and Linux are supported targets. The eight
+or clones without a stated reason. Windows, macOS and Linux are supported targets. The nine
 commands above are the automated baseline, not the whole standard.
 
 ## Contributor Licence Agreement

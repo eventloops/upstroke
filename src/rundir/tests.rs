@@ -72,6 +72,74 @@ fn commit_run(repo: &Path, run_id: &str) -> PathBuf {
 }
 
 #[test]
+fn fresh_runs_with_equal_ids_cannot_share_private_artifacts() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "equal-run-ids")
+        .expect("a root owned by this regression test");
+    let private_root = root.path().join("home");
+    let run_id = "01M191Y2PSVX78RNEP31D23K02";
+    let first = RunPaths::with_private_root(&root.path().join("repo-a"), run_id, &private_root);
+    let second = RunPaths::with_private_root(&root.path().join("repo-b"), run_id, &private_root);
+    assert_ne!(first.public, second.public);
+    assert_eq!(first.private, second.private);
+    first
+        .create_fresh()
+        .expect("the first run allocates both halves");
+    let transcript = first.transcripts().join("task-1.json");
+    fs::write(&transcript, b"first run transcript").expect("first run transcript is present");
+
+    let error = second
+        .create_fresh()
+        .expect_err("the occupied private half must refuse a fresh run");
+    assert!(error.to_string().contains("private"), "{error}");
+    assert_eq!(
+        fs::read(&transcript).expect("the first run's transcript survives"),
+        b"first run transcript"
+    );
+    assert!(
+        scratch_tree::proves_absent(&second.public),
+        "the refused run leaves no public husk"
+    );
+}
+
+#[test]
+fn an_occupied_public_root_is_preserved_and_its_private_reservation_is_removed() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "occupied-public-run")
+        .expect("a root owned by this regression test");
+    let paths = paths_in(root.path(), "OCCUPIED");
+    fs::create_dir_all(&paths.public).expect("an older public run exists");
+    fs::write(paths.events(), b"older event log").expect("the older run has content");
+
+    let error = paths
+        .create_fresh()
+        .expect_err("fresh creation refuses the old public root");
+    assert!(error.to_string().contains("public"), "{error}");
+    assert_eq!(
+        fs::read(paths.events()).expect("the old log survives"),
+        b"older event log"
+    );
+    assert!(
+        scratch_tree::proves_absent(&paths.private),
+        "the unused private reservation is removed"
+    );
+}
+
+#[test]
+fn ensuring_existing_run_directories_preserves_resume_contents() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "resume-run-dirs")
+        .expect("a root owned by this regression test");
+    let paths = paths_in(root.path(), "RESUME");
+    paths.create_fresh().expect("fresh creation succeeds");
+    fs::write(paths.events(), b"existing event log").expect("existing log");
+    paths
+        .create()
+        .expect("resume may ensure existing skeleton directories");
+    assert_eq!(
+        fs::read(paths.events()).expect("read resumed log"),
+        b"existing event log"
+    );
+}
+
+#[test]
 fn agent_authored_files_land_outside_the_workspace() {
     // The whole point of the split: a reviewer with read access to the
     // repo has no path to the implementer's transcript.
@@ -2404,6 +2472,38 @@ fn the_names_on_disk_are_the_names_the_packet_writes() {
             .expect("name"),
         "upstroke-worktree.lock"
     );
+}
+
+/// `RunPaths::events` and `RunPaths::plan_json` return the paths [`EVENT_LOG`]
+/// and [`PLAN`] name (`SWEEP-NAMES-001`).
+///
+/// **That is the whole sentence, and it is deliberately weaker than "the
+/// accessors use the constants".** Restore either accessor to its equal literal
+/// and this test still passes, because the path it returns is still the path
+/// the constant names. No assertion over values can do better: substituting a
+/// constant for a literal of equal value is behaviour-neutral by construction,
+/// and a test that could tell them apart would have to assert over source text,
+/// which a sibling helper satisfies. Pass 3 was right that the previous name
+/// claimed more than the body proves.
+///
+/// **What it does catch is an accessor drift** — an accessor spelling something
+/// other than what its constant names. `RunPaths::events` changed to
+/// `"events.json"` fails this test while
+/// `the_names_on_disk_are_the_names_the_packet_writes` passes, so the two are
+/// not redundant. A change to the *constant* does not fail it here: both sides
+/// of the assertion move together.
+///
+/// The repair this test accompanies is witnessed by a measurement rather than
+/// by an assertion. That measurement is stated once, in the pull request body's
+/// Validation section, and is not restated here.
+#[test]
+fn the_event_log_and_plan_accessors_return_the_paths_their_constants_name() {
+    // Lexical: `RunPaths` joins, it does not touch the filesystem, so this
+    // needs no scratch tree and leaves none.
+    let paths = paths_in(Path::new("names-through-consts"), BOUND_RUN);
+
+    assert_eq!(paths.events(), paths.public.join(EVENT_LOG));
+    assert_eq!(paths.plan_json(), paths.public.join(PLAN));
 }
 
 #[test]

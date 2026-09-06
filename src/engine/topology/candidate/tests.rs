@@ -1,3 +1,5 @@
+//! Extended notes: `docs/internals/engine/topology/candidate/tests.md`
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,61 +40,30 @@ const FIXED_TS: &str = "2026-08-23T11:22:33Z";
 const NORMALIZED_DIGEST: &str =
     "sha256:7777777777777777777777777777777777777777777777777777777777777777";
 
-/// The env keys a kill child reads. Named rather than spelled twice: the
-/// parent sets them and the child reads them, and a typo in either half is
-/// a child that panics for the wrong reason and a parent that reads a
-/// directory nothing wrote.
 const ENV_BASE: &str = "UPSTROKE_TEST_CAND_BASE";
 const ENV_PRIVATE: &str = "UPSTROKE_TEST_CAND_PRIVATE";
 const ENV_SITE: &str = "UPSTROKE_TEST_CAND_SITE";
 
-// -----------------------------------------------------------------------
-// Fixtures
-//
-// Every effect here goes through the funnel that owns its site, in tests
-// as in production: `src/engine/topology/**` carries no module-level allow
-// of a governed lint, so this module may not name `std::fs`'s writers or
-// `std::process::Command` at all. Git runs through the process funnel
-// (`crate::runner::container::view::fixtures`, which is where the crate
-// already keeps that helper), directories are made by the run-directory
-// funnel, and everything under the execution root is `WorkspaceManager`'s.
-// -----------------------------------------------------------------------
-
-/// A scratch directory tree, made through the run-directory funnel.
-///
-/// `rundir::create_public_dir` is `RunDir.CreatePublicDir` — the crate's
-/// directory-creation funnel — driven here with production's no-op
-/// observer so a fixture contributes nothing to the coverage evidence.
 fn make_dir(path: &Path) {
     crate::rundir::create_public_dir(path, &mut crate::rundir::NoHooks)
         .expect("the scratch directory");
 }
 
-/// Remove a fixture tree, through the funnel that owns tree removal.
 fn drop_dir(path: &Path) {
     let _ = crate::rundir::remove_public_husk(path, &mut crate::rundir::NoHooks);
 }
 
-/// A real repository, a real private root, a manager over both, and one
-/// task worktree carrying a staged edit.
 struct Fixture {
     root: PathBuf,
     base: PathBuf,
     private: PathBuf,
     manager: WorkspaceManager,
-    /// The commit the task worktree was created at.
     base_sha: CommitSha,
-    /// The task worktree's slot.
     task: Slot,
-    /// The tree the worker produced, staged behind that worktree's index.
     tree_sha: CommitSha,
 }
 
 impl Fixture {
-    /// Build the repository, the private root and the task worktree.
-    ///
-    /// `root` is created by the caller when it has to be predictable
-    /// across processes, and by this function otherwise.
     fn at(root: PathBuf) -> Self {
         let base = root.join("repo");
         let private = root.join("private");
@@ -116,11 +87,6 @@ impl Fixture {
             .add_worktree(&mut crate::workspace_manager::NoHooks, &task, &head)
             .expect("the task worktree");
 
-        // The worker's edit, written by `git` because this module may not
-        // write a file itself. `hash-object -w --stdin` puts the blob in
-        // the object store and `update-index --add --cacheinfo` puts it
-        // behind *this worktree's* index, which is exactly the R9 state
-        // `Object.CandidateStage` leaves.
         let blob = git_fixtures::git_ok(
             &worktree,
             &["hash-object", "-w", "--stdin", "--path", "worker.txt"],
@@ -149,12 +115,10 @@ impl Fixture {
         }
     }
 
-    /// A fixture under a fresh scratch root.
     fn new(tag: &str) -> Self {
         Self::at(git_fixtures::scratch(&format!("cand-{tag}")))
     }
 
-    /// What a judged tree hands the sequence, for this fixture.
     fn judged(&self) -> JudgedTree {
         JudgedTree {
             key: ALPHA,
@@ -168,17 +132,7 @@ impl Fixture {
         }
     }
 
-    /// A commit on the same base whose **tree is different**.
-    ///
-    /// The shape `verify_object`'s parent check cannot tell from the real
-    /// candidate: same parent, same everything the fold used to keep, and
-    /// content no gate ran against. Built by staging a second blob before
-    /// writing the tree, so the difference is real rather than a relabelled
-    /// sha.
     fn divergent_tree_commit(&self, hooks: &mut Hooks) -> (CommitSha, CommitSha) {
-        // A second entry behind the same index. The blob's bytes do not
-        // matter; the *path* is what moves the tree, and moving the tree is
-        // the whole point.
         let worktree = self.manager.slot_path(&self.task);
         let blob = git_fixtures::git_ok(
             &worktree,
@@ -214,12 +168,6 @@ impl Fixture {
         (commit, CommitSha(tree))
     }
 
-    /// A second commit on the same base, differing only in its message.
-    ///
-    /// A *sibling*: `verify_object` now checks the parent, so a test that
-    /// wants to reach a later refusal needs an object that passes the
-    /// identity check without being the recorded candidate. The base itself
-    /// no longer serves — its parent is not the base.
     fn sibling_commit(&self, hooks: &mut Hooks) -> CommitSha {
         let judged = JudgedTree {
             message: "alpha: a sibling of the judged tree".to_owned(),
@@ -231,17 +179,14 @@ impl Fixture {
             .clone()
     }
 
-    /// Every unreachable object in the repository, per `git fsck`.
     fn unreachable(&self) -> Vec<String> {
         unreachable_objects(&self.base).expect("fsck")
     }
 
-    /// Whether `object` is unreachable per `git fsck --unreachable`.
     fn is_unreachable(&self, object: &str) -> bool {
         self.unreachable().iter().any(|id| id == object)
     }
 
-    /// Every unreachable object that is a commit.
     fn unreachable_commits(&self) -> Vec<String> {
         self.unreachable()
             .into_iter()
@@ -251,7 +196,6 @@ impl Fixture {
             .collect()
     }
 
-    /// Whether `object` is in this repository at all.
     fn object_present(&self, object: &str) -> bool {
         git_fixtures::git(
             &self.base,
@@ -261,7 +205,6 @@ impl Fixture {
             == Some(0)
     }
 
-    /// Every ref under this run's namespace.
     fn run_refs(&self) -> Vec<(String, String)> {
         self.manager
             .refs_under(&run_namespace(RUN_ID))
@@ -272,8 +215,6 @@ impl Fixture {
         Journal::open(&self.private, self.base_sha.clone(), hooks)
     }
 
-    /// The git administrative directory of the task worktree — where an
-    /// interrupted command's `index.lock` lands.
     fn task_admin_dir(&self) -> PathBuf {
         self.manager
             .common_git_dir()
@@ -288,17 +229,6 @@ impl Drop for Fixture {
     }
 }
 
-// -----------------------------------------------------------------------
-// The journal: a real schema-4 log and the fold over it
-// -----------------------------------------------------------------------
-
-/// [`CandidateJournal`] over a real `events.jsonl` and a real fold.
-///
-/// Not a recording double. The claims this module makes are about durable
-/// bytes and about what the fold refuses, so a journal that recorded
-/// intentions would leave both untested — and the "once" of
-/// `kill_after_candidate_prepared_appends_candidate_created_once` is
-/// literally a count of lines in a file.
 struct Journal {
     log: EventLog,
     fold: TopologyFold,
@@ -307,14 +237,6 @@ struct Journal {
 }
 
 impl Journal {
-    /// A log carrying `run_started`, a dispatch and a started attempt —
-    /// and **not** its settlement.
-    ///
-    /// That is `transaction_fault_matrix[T-CAND-OBJ]`'s durable state
-    /// exactly ("attempt_started only"; "attempt unsettled"), which is the
-    /// state the commit-tree and the pin happen in.
-    /// The step after them is `candidate_prepared`, which is the
-    /// settlement — there is no separate one to append first.
     fn open(private: &Path, base_sha: CommitSha, hooks: &Hooks) -> Self {
         let path = private.join("events.jsonl");
         let mut warnings = Vec::new();
@@ -362,8 +284,6 @@ impl Journal {
         journal
     }
 
-    /// Reopen an existing log and replay it: `resume is
-    /// replay-then-continue, and there is no second path`.
     fn resume(private: &Path, hooks: &Hooks) -> Self {
         let path = private.join("events.jsonl");
         let bytes = std::fs::read(&path).expect("the log the dead run left");
@@ -387,7 +307,6 @@ impl Journal {
         RungBinding::from_frozen(frozen, entry.ladder.effort.implementation_for(frozen.tier))
     }
 
-    /// How many committed lines of `kind` the log carries.
     fn count(&self, kind: &str) -> usize {
         let bytes = std::fs::read(&self.path).expect("the log");
         TopologyFold::parse_log(&bytes)
@@ -429,18 +348,6 @@ impl CandidateJournal for Journal {
     }
 }
 
-// -----------------------------------------------------------------------
-// The hook bundle, with a phase this suite can arm
-// -----------------------------------------------------------------------
-
-/// The git funnels, recording into the shared [`HookHarness`] and
-/// answering an armed injection at a hook **phase**.
-///
-/// [`HookHarness::arm`] takes a [`SubEffectPoint`] and `hook()` answers
-/// `Proceed` to `Before` and `After` unconditionally, so a phase can only
-/// be armed by a double. The recording still goes to the shared harness —
-/// a double that kept its own log would take every site it touched out of
-/// the coverage evidence.
 #[derive(Debug, Clone)]
 struct ArmedEffects {
     inner: HarnessEffects,
@@ -462,19 +369,11 @@ impl EffectHooks for ArmedEffects {
         self.inner.durability_ledger()
     }
 
-    // Forwarded, so a poison the inner observer found is reported as poison
-    // and not as a fault this double armed.
     fn refusal_cause(&self) -> Option<String> {
         self.inner.refusal_cause()
     }
 }
 
-/// The order the funnels ran in, which is what an ordering clause is about.
-///
-/// The shared [`HookHarness`] counts executions and does not keep their
-/// order — deliberately, because coverage is a set question. O28 to O31 are
-/// order questions, so this records the sequence beside it rather than
-/// instead of it.
 #[derive(Debug, Clone, Default)]
 struct Trace(Arc<Mutex<Vec<String>>>);
 
@@ -489,12 +388,6 @@ impl Trace {
             .push(site.to_string());
     }
 
-    /// Forget everything recorded so far.
-    ///
-    /// The fixture's own appends — the dispatch and the attempt start —
-    /// are not part of any clause O28 to O31 states, and an ordering
-    /// assertion that carried them would be an assertion about the
-    /// fixture's prologue.
     fn reset(&self) {
         self.0
             .lock()
@@ -502,12 +395,6 @@ impl Trace {
             .clear();
     }
 
-    /// The recorded sequence, with everything not in `of_interest` dropped.
-    ///
-    /// Filtered rather than compared whole: a fixture that also creates an
-    /// execution root and writes an intent runs those funnels too, and an
-    /// assertion over the unfiltered list would be an assertion about the
-    /// fixture.
     fn order(&self, of_interest: &[EffectSiteId]) -> Vec<String> {
         let wanted: Vec<String> = of_interest.iter().map(ToString::to_string).collect();
         self.0
@@ -520,12 +407,6 @@ impl Trace {
     }
 }
 
-/// The append funnel, tracing into the same order and recording into the
-/// same harness.
-///
-/// Wrapped rather than reused directly because an ordering clause that
-/// mentions an append — O29, O30, O31 all do — cannot be checked from a
-/// trace that only sees the git funnels.
 #[derive(Debug, Clone)]
 struct TracedEvents {
     inner: crate::events::log::HarnessEventHooks,
@@ -539,8 +420,6 @@ impl crate::events::log::EventHooks for TracedEvents {
     }
 }
 
-/// The five-family bundle, with [`ArmedEffects`] in front of the git
-/// families and the shared harness behind all five.
 struct Hooks {
     effects: ArmedEffects,
     events: TracedEvents,
@@ -610,10 +489,6 @@ impl TopologyHooks for Hooks {
         self.rest.spawn()
     }
 }
-
-// -----------------------------------------------------------------------
-// The frozen inputs of the fold
-// -----------------------------------------------------------------------
 
 fn region() -> PathSet {
     PathSet::Prefixes {
@@ -710,10 +585,6 @@ fn run_started(base_sha: CommitSha) -> RunStarted4 {
             review: Effort::Medium,
         },
         reviews: ReviewPlan {
-            // Enabled: this fixture's `candidate_prepared` records carry a
-            // passed `review` pass, and a run that froze verification off
-            // obliges none — a combination `plan_for` cannot produce, since
-            // its disabled branch resolves no `primary` either.
             enabled: Some(true),
             alternative_available: Some(false),
             pass_timeout_secs: Some(97),
@@ -735,21 +606,6 @@ fn run_started(base_sha: CommitSha) -> RunStarted4 {
     }
 }
 
-// =======================================================================
-// T-CAND-OBJ — the object, the pin, and what a resume does with neither
-// =======================================================================
-
-/// The child of the three T-CAND-OBJ kill tests.
-///
-/// One child for three prefixes, because the setup up to the kill is the
-/// same in all three and a second child is a second thing to keep in step
-/// with this module.
-///
-/// `Injection::Kill` is `std::process::abort()` — a real process death,
-/// chosen because the claim is *what a coordinator that runs no cleanup
-/// leaves on disk*, and an early `return` would unwind and prove something
-/// weaker. The `unreachable!` below is what fails the test if an injection
-/// silently stops killing.
 #[test]
 #[ignore = "spawned as a subprocess by the T-CAND-OBJ kill tests"]
 fn candidate_kill_child() {
@@ -801,10 +657,6 @@ fn candidate_kill_child() {
             hooks.arm_phase(pin, HookPhase::After, Injection::Kill);
             let _ = pin_candidate(&manager, &mut hooks, unpinned);
         }
-        // T-CAND-REF: `candidate_prepared` durable, and the coordinator
-        // dies before the candidates ref exists. The whole point of this
-        // prefix is that the parent then resumes from the child's own
-        // durable log.
         "after-prepared" => {
             let mut journal = Journal::open(&private, judged.base_sha.clone(), &hooks);
             let unpinned =
@@ -824,11 +676,6 @@ fn candidate_kill_child() {
     unreachable!("the kill must have taken this process");
 }
 
-/// Run [`candidate_kill_child`] against `fixture` at `which`, and hand back
-/// what the dead child's process left.
-///
-/// The spawn goes through the process funnel — `Process.Spawn` is the site
-/// that owns starting a process, in a test as in production.
 fn spawn_kill_child(fixture: &Fixture, which: &str) -> ProcessOutput {
     let exe = std::env::current_exe().expect("the test binary");
     let spec = CommandSpec::new(exe.to_string_lossy().into_owned())
@@ -849,11 +696,6 @@ fn spawn_kill_child(fixture: &Fixture, which: &str) -> ProcessOutput {
         .expect("the child runs through the process funnel")
 }
 
-/// The child died where it was armed rather than panicking somewhere else.
-///
-/// `!success` alone does not say that: a child whose injection stopped
-/// firing reaches `unreachable!`, panics, and exits non-zero too. The panic
-/// message on stderr is what tells the two apart.
 fn assert_killed(output: &ProcessOutput, which: &str) {
     assert!(
         !output.stderr.contains("panicked at"),
@@ -867,20 +709,10 @@ fn assert_killed(output: &ProcessOutput, which: &str) {
     );
 }
 
-/// The commit `git cat-file` shows at `object`, as its raw header.
 fn commit_body(fixture: &Fixture, object: &str) -> String {
     git_fixtures::git_ok(&fixture.base, &["cat-file", "commit", object])
 }
 
-/// T-CAND-OBJ (a), reached by killing between the commit-tree funnel's
-/// return and the pin.
-///
-/// `durable_state` is "attempt_started only" and `authoritative_state` is
-/// "attempt unsettled; the object is Git/GC-owned residue", so this asserts
-/// three things: the object is **present**, it is **unreachable** per
-/// `git fsck --unreachable` (R27 is a claim about reachability, not about
-/// deletion), and the resume settles the attempt interrupted with nothing
-/// to delete.
 #[test]
 fn kill_after_commit_tree_before_pin_leaves_gc_owned_object_and_settles_interrupted() {
     let fixture = Fixture::new("kill-before-pin");
@@ -918,7 +750,6 @@ fn kill_after_commit_tree_before_pin_leaves_gc_owned_object_and_settles_interrup
         fixture.run_refs()
     );
 
-    // The resume: `settle attempt interrupted`, and nothing to delete.
     let journal = fixture.journal(&Hooks::new());
     let recovery = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA).expect("classify");
     assert!(
@@ -935,18 +766,6 @@ fn kill_after_commit_tree_before_pin_leaves_gc_owned_object_and_settles_interrup
     );
 }
 
-/// T-CAND-OBJ (a) again, at the coordinate the packet names: the
-/// parent-executed `IdUnread` point.
-///
-/// "the parent-executed IdUnread point lies between the child's exit and
-/// the coordinator recording the id". So the durable outcome is the same
-/// unreferenced object — and the *coordinator* never learned its id, which
-/// is why this test identifies the commit by its content rather than by a
-/// value anything recorded.
-///
-/// `IdUnread` supports `Kill` and nothing else
-/// (`SubEffectPoint::modes`), so there is no error-return sibling to this
-/// test and inventing one would invent a resume action nothing tables.
 #[test]
 fn kill_at_commit_tree_id_unread_point_leaves_gc_owned_object() {
     assert_eq!(
@@ -981,9 +800,6 @@ fn kill_at_commit_tree_id_unread_point_leaves_gc_owned_object() {
     );
 }
 
-/// T-CAND-OBJ (b): the pin exists and `candidate_prepared` does not, so the
-/// resume deletes the exact orphan pin expected-old and the object is again
-/// Git's.
 #[test]
 fn orphan_candidate_pin_removed_after_kill() {
     let fixture = Fixture::new("kill-after-pin");
@@ -1033,13 +849,6 @@ fn orphan_candidate_pin_removed_after_kill() {
     );
 }
 
-/// `resume_action` (a) is "nothing to delete: the unpinned object is left
-/// to Git (**never adopted**; decision:295)".
-///
-/// Adoption would be any of three things: a pin, a candidates ref, or a
-/// `candidate_prepared` naming the commit. None of them happens, and the
-/// object stays exactly where the interrupted run left it — present and
-/// unreachable — through a full recovery.
 #[test]
 fn unpinned_object_never_adopted_on_resume() {
     let fixture = Fixture::new("never-adopted");
@@ -1049,8 +858,6 @@ fn unpinned_object_never_adopted_on_resume() {
     let unpinned = write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judged())
         .expect("commit-tree");
     let object = unpinned.commit_sha().0.clone();
-    // The witness is dropped without being pinned: the tabled outcome, not
-    // a leak. Nothing else in this module can consume it.
     drop(unpinned);
 
     assert!(fixture.object_present(&object));
@@ -1067,9 +874,6 @@ fn unpinned_object_never_adopted_on_resume() {
         "the recovery names no object, so no later step has one to adopt"
     );
 
-    // And the run namespace is entitled to no *candidates* ref: nothing
-    // durable names a candidate, so a ref that appeared for one would be
-    // exactly the unexpected-ref refusal.
     assert_eq!(
         expected_refs(RUN_ID, journal.fold()),
         vec![candidate_pin_ref(RUN_ID, ALPHA, GENERATION).0],
@@ -1093,15 +897,6 @@ fn unpinned_object_never_adopted_on_resume() {
     );
 }
 
-// =======================================================================
-// T-CAND-REF — the authoritative ref, the queue position, and the pin
-// =======================================================================
-
-/// The whole sequence from the pin onwards, on a live run.
-///
-/// Returns the fixture's judged candidate plus the hooks and journal it
-/// ran through, so a test can assert on the order the funnels ran in and on
-/// what the log holds.
 fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) -> CommitSha {
     hooks.trace.reset();
     let unpinned = write_candidate_commit(&fixture.manager, hooks, RUN_ID, fixture.judged())
@@ -1112,34 +907,12 @@ fn run_to_queued(fixture: &Fixture, hooks: &mut Hooks, journal: &mut Journal) ->
     commit
 }
 
-/// **A substituted prepared pin is refused, and the evidence survives the
-/// refusal.**
-///
-/// `DESIGN.md` §15's extended exact-identity rule: *"Any substituted or
-/// symbolic pin, third branch SHA, changed branch identity, or mismatched
-/// commit object refuses while preserving evidence."*
-///
-/// `recovery_for` read the pin as `pin.is_some()` and never compared its
-/// target to the commit `candidate_prepared` recorded, and
-/// `reclaim_after_creation` re-read the target and deleted **that** value
-/// expected-old — a compare-and-swap comparing the ref to itself, which
-/// cannot fail. So a pin moved from the recorded `C` to some `X` after the
-/// settlement left a resume promoting `C`, appending
-/// `task_candidate_created`, and then removing the substituted pin on the
-/// way out: it succeeded, and it deleted the one ref that evidenced the
-/// substitution. The `bf927f3` review's second P1.
-///
-/// Three claims, because "refuses while preserving evidence" is three
-/// things: it refuses, it names both shas so the substitution is legible
-/// from the error alone, and **nothing was appended, created or deleted** —
-/// the pin is still at the substituted object for a person to look at.
 #[test]
 fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
     let fixture = Fixture::new("pin-substituted");
     let mut hooks = Hooks::new();
     let mut journal = fixture.journal(&hooks);
 
-    // Reach the boundary honestly: commit, pin, `candidate_prepared`.
     let unpinned = write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judged())
         .expect("commit-tree");
     let recorded = unpinned.commit_sha().clone();
@@ -1148,10 +921,6 @@ fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
     assert_eq!(journal.count("candidate_prepared"), 1);
     assert_eq!(journal.count("task_candidate_created"), 0);
 
-    // The substitution: the pin is moved to a real sibling commit on the
-    // same base. A different *tree* is not needed — the point is that the
-    // pin no longer names the recorded commit, and this must be caught by
-    // the pin's own binding rather than by the tree check.
     let impostor = fixture.sibling_commit(&mut hooks);
     assert_ne!(impostor, recorded);
     let names = CandidateNames::of(RUN_ID, ALPHA, GENERATION);
@@ -1160,19 +929,15 @@ fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
         &["update-ref", names.prepared_ref.as_str(), impostor.as_str()],
     );
 
-    // (1) Recovery refuses, before any effect.
     let refused = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)
         .expect_err("a pin that is not the recorded commit is a substitution");
 
-    // (2) The refusal names both, so the substitution is legible from it.
     let text = refused.to_string();
     assert!(
         text.contains(impostor.as_str()) && text.contains(recorded.as_str()),
         "the refusal must name what the pin points at and what the record says: {text}"
     );
 
-    // (3) The evidence is intact: the pin is still at the impostor, the
-    //     candidates ref was never created, and nothing was appended.
     assert_eq!(
         fixture
             .manager
@@ -1192,8 +957,6 @@ fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
     );
     assert_eq!(journal.count("task_candidate_created"), 0);
 
-    // And the reclaim half refuses the same substitution rather than
-    // deleting it, for a caller that reached it another way.
     let referenced = create_candidates_ref(&fixture.manager, &mut hooks, promoting)
         .expect("the recorded commit still verifies");
     let created =
@@ -1215,23 +978,12 @@ fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
     );
 }
 
-/// T-CAND-REF's boundary reached by a real kill, then its `resume_action`
-/// — and `task_candidate_created` lands **once**, however many times the
-/// closure procedure runs.
-///
-/// The "once" is a count of committed lines in the log the dead process
-/// wrote, not a count of calls: the fold refuses a second
-/// `task_candidate_created` for a generation it has already closed, and a
-/// closure procedure that did not read that would append a line the fold
-/// then refuses on the next replay — a log that cannot be resumed.
 #[test]
 fn kill_after_candidate_prepared_appends_candidate_created_once() {
     let fixture = Fixture::new("kill-after-prepared");
     let output = spawn_kill_child(&fixture, "after-prepared");
     assert_killed(&output, "after-prepared");
 
-    // The durable state of the boundary: the prepare landed, the queue
-    // position did not, the pin is still holding the commit.
     let mut hooks = Hooks::new();
     let mut journal = Journal::resume(&fixture.private, &hooks);
     assert_eq!(journal.count("candidate_prepared"), 1);
@@ -1251,20 +1003,6 @@ fn kill_after_candidate_prepared_appends_candidate_created_once() {
     let Some(promoting) = recovery.promotion else {
         panic!("a durable candidate_prepared is an unfinished promotion");
     };
-    // **The tree came off the fold, and it is the tree the event recorded.**
-    // `promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged`
-    // builds its `PromotingCandidate` by hand, so it proves the *check* and
-    // not the *value it checks against*: the fold retaining `base_sha` in
-    // that field left it green.
-    //
-    // **This is the resumed value, and it is the one that needed a witness.**
-    // Production builds a `PromotingCandidate` in two places: `promote`
-    // returns one carrying `judged.tree_sha` — the same value it has just
-    // written into the event, so the comparison there cannot fail and
-    // witnesses nothing — and `recovery_for` builds one from the fold,
-    // where the number has been through a serialization, a replay and an
-    // `apply`. Only the second can be wrong, and only the second is
-    // asserted here.
     assert_eq!(
         promoting.tree, fixture.tree_sha,
         "the recovered promotion carries {} where `candidate_prepared` recorded \
@@ -1283,9 +1021,6 @@ fn kill_after_candidate_prepared_appends_candidate_created_once() {
     .expect("the closure procedure finishes it");
     assert_eq!(journal.count("task_candidate_created"), 1);
 
-    // "the closure procedure performs the same steps at any run end": run
-    // it again. Every step reads the world first, so the second run appends
-    // nothing, refuses nothing, and leaves the same refs.
     assert!(
         recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)
             .expect("classify again")
@@ -1325,8 +1060,6 @@ fn kill_after_candidate_prepared_appends_candidate_created_once() {
         "the candidates ref alone, at the recorded commit"
     );
 
-    // And the refusal the same sentence names: a ref present at another
-    // SHA is not accepted as "already created".
     let sibling = fixture.sibling_commit(&mut hooks);
     assert_ne!(sibling, commit, "a different commit on the same base");
     let forged = PromotingCandidate {
@@ -1354,15 +1087,6 @@ fn kill_after_candidate_prepared_appends_candidate_created_once() {
     );
 }
 
-/// O31, and `cleanup`'s "candidate-prepared pins pruned right after
-/// promotion" — with the order the clauses give, observed rather than
-/// assumed.
-///
-/// The trace is the assertion. O28 puts the commit object before the pin,
-/// O29 the pin before `candidate_prepared`, O30 the candidates ref between
-/// the two appends, and O31 the pin's pruning and the scrub after
-/// `task_candidate_created` — which is one total order over six funnel
-/// sites, and this is it.
 #[test]
 fn pin_pruned_after_promotion() {
     let fixture = Fixture::new("pin-pruned");
@@ -1382,21 +1106,8 @@ fn pin_pruned_after_promotion() {
         vec![
             "Object.CandidateCommitTree".to_owned(),
             "Ref.PinCandidatePrepared".to_owned(),
-            // **candidate_prepared — the settlement itself, and there is
-            // one.** This list carried a second `Event.Append` above this
-            // one for an `attempt_finished(succeeded)` between the pin and
-            // the prepare, annotated "the settlement, which is not this
-            // module's". It was not the settlement and it should not have
-            // been appended: `candidate_prepared` is the sole successful
-            // settlement for a candidate-producing attempt, per
-            // `decisions/2026-08-12-merge-queue-execution-topology.md`, and
-            // the 2026-08-27 ruling conformed the code to it. **Three
-            // appends in this sequence, not four**, and the count is the
-            // assertion — a build that re-introduced the pair would put the
-            // fourth back and fail here.
             "Event.Append".to_owned(),
             "Ref.CreateCandidates".to_owned(),
-            // task_candidate_created.
             "Event.Append".to_owned(),
             "Ref.DeleteCandidatePin".to_owned(),
             "Worktree.Remove".to_owned(),
@@ -1405,7 +1116,6 @@ fn pin_pruned_after_promotion() {
          `candidate_prepared` is the sole successful settlement"
     );
 
-    // What is left: the authoritative ref, and nothing else.
     assert_eq!(
         fixture.run_refs(),
         vec![(
@@ -1419,9 +1129,6 @@ fn pin_pruned_after_promotion() {
         "the candidates ref (R11) is what accounts for the commit now"
     );
 
-    // `cleanup`: "candidates refs (R11) never pruned while the run can
-    // resume". Nothing in this module deletes one — the site exists for
-    // Complete finalization, and this sequence never reaches it.
     assert!(
         !hooks.observed(
             EffectSiteId::Ref(RefSite::DeleteCandidatesRef),
@@ -1429,8 +1136,6 @@ fn pin_pruned_after_promotion() {
         ),
         "promotion pruned the authoritative ref"
     );
-    // …and the expected-ref derivation says the same thing from the fold:
-    // the candidates ref is expected, the pin no longer is.
     assert_eq!(
         expected_refs(RUN_ID, journal.fold()),
         vec![
@@ -1448,13 +1153,6 @@ fn pin_pruned_after_promotion() {
         .expect("the namespace carries exactly what the fold accounts for");
 }
 
-/// ST-17: "a Promoting generation is always promoted before any
-/// `run_finished`."
-///
-/// Executed as the fold's own refusal rather than as a claim about this
-/// module: while the generation is `Promoting` the derived outcome is
-/// `NotEnding`, so `run_finished` cannot be appended at all; the closure
-/// procedure is what clears it.
 #[test]
 fn promoting_completed_at_run_end() {
     let fixture = Fixture::new("promoting-at-run-end");
@@ -1487,7 +1185,6 @@ fn promoting_completed_at_run_end() {
         "the fold refuses it for the reason ST-17 gives: {refused}"
     );
 
-    // The closure procedure, exactly as `resume_action` describes it.
     let Some(promoting_again) = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)
         .expect("classify")
         .promotion
@@ -1537,18 +1234,6 @@ fn promoting_completed_at_run_end() {
     );
 }
 
-// =======================================================================
-// T-SCRUB — the forced, contained, idempotent reclaim
-// =======================================================================
-
-/// `resume_action`: "idempotent contained forced removal of the worktree
-/// and intent".
-///
-/// Idempotent both ways round: the promotion already scrubbed, and a resume
-/// that re-runs the closure procedure scrubs again. Also `cleanup`'s "task
-/// worktree scrubbed **only after** `task_candidate_created` is durable" —
-/// asserted as an order, because a scrub that ran first would leave a
-/// promotion with no worktree to verify against.
 #[test]
 fn worktree_removal_idempotent_after_candidate_created() {
     let fixture = Fixture::new("scrub-idempotent");
@@ -1573,7 +1258,6 @@ fn worktree_removal_idempotent_after_candidate_created() {
         "and the row Git registered for it"
     );
 
-    // The order `cleanup` states, from the trace: the append first.
     let order = hooks.trace.order(&[
         EffectSiteId::Event(EventSite::Append),
         EffectSiteId::Worktree(WorktreeSite::Remove),
@@ -1584,7 +1268,6 @@ fn worktree_removal_idempotent_after_candidate_created() {
         "the scrub is after every append of the sequence: {order:?}"
     );
 
-    // Again, and again through the funnel rather than by inspection.
     for round in 1..=2 {
         fixture
             .manager
@@ -1597,11 +1280,6 @@ fn worktree_removal_idempotent_after_candidate_created() {
         assert!(!path.exists(), "round {round}");
     }
 
-    // Containment, which is what makes an idempotent forced removal safe:
-    // `refusal_condition` is "path outside execution root". Executed as a
-    // refusal rather than asserted as a property of the happy path, because
-    // an idempotent removal that had stopped checking would still pass
-    // every assertion above.
     let escaping = Slot::Task {
         key: "../../escape".to_owned(),
         generation: GENERATION.0,
@@ -1616,14 +1294,6 @@ fn worktree_removal_idempotent_after_candidate_created() {
     );
 }
 
-/// `cleanup`: removal is forced "so Git administrative residue left by an
-/// interrupted command (**index.lock**, …) never blocks reclaim — such
-/// residue belongs to the worktree's row and leaves with it".
-///
-/// The control half is the first assertion. An `index.lock` that did not
-/// actually block anything would make the rest of this test pass against a
-/// removal that was never forced, which is the shape of the Windows
-/// `File::open` test this project has already paid for.
 #[test]
 fn worktree_removal_succeeds_with_index_lock_present() {
     let fixture = Fixture::new("scrub-index-lock");
@@ -1631,10 +1301,6 @@ fn worktree_removal_succeeds_with_index_lock_present() {
     let lock = admin.join("index.lock");
     assert!(admin.is_dir(), "the worktree's row: {}", admin.display());
 
-    // Planted by `git config --file`, because this module may not write a
-    // file itself. What the residue *is* is a file at that name: nothing in
-    // the removal path reads its bytes, and Git's own index writer refuses
-    // on its existence alone — which the control below executes.
     git_fixtures::git_ok(
         &fixture.base,
         &[
@@ -1647,7 +1313,6 @@ fn worktree_removal_succeeds_with_index_lock_present() {
     );
     assert!(lock.is_file(), "the lock is planted");
 
-    // Control: the residue really does block an index write.
     let worktree = fixture.manager.slot_path(&fixture.task);
     let blocked = git_fixtures::git(&worktree, &["add", "-A"]);
     assert_ne!(
@@ -1661,7 +1326,6 @@ fn worktree_removal_succeeds_with_index_lock_present() {
         blocked.stderr
     );
 
-    // The claim.
     let mut hooks = Hooks::new();
     fixture
         .manager
@@ -1682,14 +1346,6 @@ fn worktree_removal_succeeds_with_index_lock_present() {
     );
 }
 
-/// `cleanup`: "snapshots pruned on completion and **reclaimed as
-/// residue**", and `T-SCRUB`'s "snapshot intents reclaimed".
-///
-/// Both halves, because they are two mechanisms: a live coordinator removes
-/// the snapshot it created, and a process that died holding one leaves an
-/// intent that the next process's reclaim finds. The ephemeral commit each
-/// snapshot created returns to R27 when its snapshot goes, which is the
-/// object half of the same sentence.
 #[test]
 fn snapshot_residue_reclaimed() {
     let fixture = Fixture::new("snapshot-residue");
@@ -1699,8 +1355,6 @@ fn snapshot_residue_reclaimed() {
         parent: ObjectId::new(fixture.base_sha.0.clone()).expect("the base is an object id"),
     };
 
-    // One snapshot for the gate set, one for the reviewer: `snapshots` says
-    // they are never reused across roles, so the reclaim has two rows.
     let gates = fixture
         .manager
         .add_snapshot(hooks.effects(), &SnapshotName::gates(0, 1), &input)
@@ -1720,7 +1374,6 @@ fn snapshot_residue_reclaimed() {
         "while a snapshot has it checked out it is R24, not R27"
     );
 
-    // Half one: the live removal.
     fixture
         .manager
         .remove_snapshot(hooks.effects(), &gates)
@@ -1728,8 +1381,6 @@ fn snapshot_residue_reclaimed() {
     assert!(!gates.path().exists());
     assert!(!fixture.manager.intent_path(gates.slot()).exists());
 
-    // Half two: the reviewer's snapshot is left as a dead process would
-    // leave it, and the next process's reclaim finds it by its intent.
     let reclaimed = fixture
         .manager
         .reclaim_intents(hooks.effects())
@@ -1744,8 +1395,6 @@ fn snapshot_residue_reclaimed() {
         "and so is its intent"
     );
 
-    // The object half: with no snapshot and no ref holding it, the
-    // ephemeral commit is Git's again.
     assert!(
         fixture.is_unreachable(ephemeral.as_str()),
         "the ephemeral snapshot commit returns to R27"
@@ -1766,14 +1415,6 @@ fn snapshot_residue_reclaimed() {
     );
 }
 
-// =======================================================================
-// The names, the refusals, and the window between the append and the prune
-// =======================================================================
-
-/// The two ref names are durable identity: they are written into
-/// `candidate_prepared` and a resume rebuilds them from the same inputs. So
-/// they are pinned against literals rather than against the function that
-/// builds them.
 #[test]
 fn the_candidate_refs_are_the_names_the_packet_gives() {
     let names = CandidateNames::of("01RUN", TaskKey(7), GenerationId(3));
@@ -1794,8 +1435,6 @@ fn the_candidate_refs_are_the_names_the_packet_gives() {
         candidates_ref("01RUN", TaskKey(7), GenerationId(3))
     );
 
-    // The namespace's trailing separator, which is what keeps run `01RUN`
-    // from owning run `01RUNNER`'s refs.
     assert_eq!(run_namespace("01RUN"), "refs/upstroke/runs/01RUN/");
     assert!(
         names
@@ -1811,12 +1450,6 @@ fn the_candidate_refs_are_the_names_the_packet_gives() {
     );
 }
 
-/// `T-CAND-REF`'s "object missing": the candidates ref is created only for
-/// a commit that is actually in the repository.
-///
-/// The refusal is what stops a resume from creating an authoritative ref
-/// out of a record whose object a `git gc` already collected — which is a
-/// reachable state precisely because the pin is what kept it alive.
 #[test]
 fn promotion_refuses_a_commit_that_is_not_in_the_repository() {
     let fixture = Fixture::new("object-missing");
@@ -1862,38 +1495,6 @@ fn promotion_refuses_a_commit_that_is_not_in_the_repository() {
     assert_eq!(journal.count("task_candidate_created"), 0);
 }
 
-/// **Present is not the same as *is the candidate*.**
-///
-/// DESIGN.md §15 has `candidate_prepared` record the complete
-/// attempt/base/commit/tree identity "so resume adopts only the judged
-/// object". A promotion that asks only whether *something* is at that SHA
-/// adopts whatever is there, and the two things that can be there are the
-/// two this asserts: an object that is not a commit at all, and a commit
-/// that is not on the generation's base. Both exist; neither is the judged
-/// candidate; both must refuse before the ref is created.
-///
-/// The tree is deliberately **not** asserted, and it is not an oversight:
-/// the fold keeps the candidate, the base and the paths, so a resume has no
-/// recorded tree to compare against. `PR7-CANDIDATE-TREE-UNVERIFIED` in
-/// `reviews/FINDINGS.md` §2 is that residue, recorded rather than papered
-/// over.
-/// **A commit on the recorded base, carrying a tree nobody judged, is refused.**
-///
-/// `DESIGN.md` §15: `candidate_prepared` records "exactly one complete
-/// attempt/base/commit/tree identity … so resume adopts only that exact shape".
-/// Recovery checked existence and parent. Both pass here — the impostor *is* a
-/// commit and its parent *is* the base — and its tree is a tree no gate ran
-/// against and no reviewer read. Adopting it would create the authoritative
-/// candidate ref at that object and append `task_candidate_created`, which is
-/// the whole of what the merge queue then trusts.
-///
-/// The sibling above refuses objects that are not commits, or commits that are
-/// not on the base. Neither reaches this: the difference here is **content**,
-/// and content is what the ladder judged.
-///
-/// Raised by the frontier re-review of `c2c0294` as finding B and carried
-/// before that as `PR7-CANDIDATE-TREE-UNVERIFIED`. The repair is
-/// `PreparedCandidate::tree_sha`, per-instance Class B approval 2026-08-26.
 #[test]
 fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {
     let fixture = Fixture::new("tree-never-judged");
@@ -1906,8 +1507,6 @@ fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {
         "the fixture built the judged tree again, so there is nothing to refuse"
     );
 
-    // Both of the checks that existed pass, stated rather than assumed —
-    // otherwise this test could be green because an *earlier* refusal fired.
     assert!(
         fixture
             .manager
@@ -1935,7 +1534,6 @@ fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {
         },
         prepared_ref: candidate_pin_ref(RUN_ID, ALPHA, GENERATION),
         base: fixture.base_sha.clone(),
-        // The durable record's tree — what the fold now retains.
         tree: fixture.tree_sha.clone(),
     };
     let Err(refused) = complete_promotion(
@@ -1956,7 +1554,6 @@ fn promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged() {
         "the refusal must name the object it refused: {refused}"
     );
 
-    // And nothing was appended or created on the way to refusing.
     assert_eq!(
         journal.count("task_candidate_created"),
         0,
@@ -1982,18 +1579,11 @@ fn promotion_refuses_an_object_that_is_not_the_judged_candidate() {
         let mut hooks = Hooks::new();
         let mut journal = fixture.journal(&hooks);
 
-        // Two real objects of the fixture's own repository. The tree is not
-        // a commit; the base is a commit whose parent is not the base.
         let impostor = if present {
             CommitSha(fixture.tree_sha.0.clone())
         } else {
             fixture.base_sha.clone()
         };
-        // The **production** presence predicate, not the fixture's: the
-        // residue classifier asks `cat-file -e <sha>^{}`, which resolves any
-        // object, so a tree answers "present" there. Asserting it here is
-        // what makes this a test of identity rather than of existence — the
-        // check being repaired would have passed both of these.
         assert!(
             fixture
                 .manager
@@ -2036,13 +1626,6 @@ fn promotion_refuses_an_object_that_is_not_the_judged_candidate() {
     }
 }
 
-/// `git commit-tree` printing something that is not a full object id is
-/// refused before any ref primitive sees it.
-///
-/// Reached directly because the real command cannot produce it: an id that
-/// `update-ref` would read as a *name to resolve* rather than as an error
-/// is the shape `workspace_manager::Refusal::MalformedObjectId` exists for,
-/// and this is the same guard one step earlier, where the value enters.
 #[test]
 fn a_commit_id_that_is_not_a_full_object_id_refuses() {
     for value in ["", "abc", "HEAD", "0123456789abcdef0123456789abcdef0123456"] {
@@ -2061,20 +1644,6 @@ fn a_commit_id_that_is_not_a_full_object_id_refuses() {
     .expect("forty hexadecimal characters is an object id");
 }
 
-/// The window O31 opens: `task_candidate_created` is durable and the pin it
-/// should have pruned is not yet pruned.
-///
-/// `cleanup` says pins are "pruned right after promotion (**or as
-/// orphans**)", so this state has to be recoverable — and it is the one
-/// state a classifier that only looked at the *open* generation would miss,
-/// because the append that reached it also closed the generation.
-///
-/// Reached by an error return rather than a kill: the claim is about what
-/// the next process finds, and both leave the same durable prefix, so the
-/// cheaper one is the honest choice. `Ref.DeleteCandidatePin`'s `Before` is
-/// a reachability phase in the frozen registry rather than a declared fault
-/// coordinate; the module-local double injects there to reach the prefix,
-/// which is scaffolding, not a claim about the registry.
 #[test]
 fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {
     let fixture = Fixture::new("pin-left-behind");
@@ -2099,8 +1668,6 @@ fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {
     )
     .expect_err("the prune was made to fail");
 
-    // The prefix: the queue position is durable, the generation is closed,
-    // and the pin is still there.
     assert_eq!(journal.count("task_candidate_created"), 1);
     assert_eq!(journal.generation_class(), Some(GenerationClass::Closed));
     let mut names: Vec<String> = fixture
@@ -2117,8 +1684,6 @@ fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {
         ],
         "the pin outlived the promotion"
     );
-    // …and the namespace does not refuse it, which is what lets the next
-    // process act at all.
     fixture
         .manager
         .refuse_unexpected_refs(
@@ -2127,7 +1692,6 @@ fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {
         )
         .expect("a pin the promotion has not pruned yet is not an unexpected ref");
 
-    // The closure procedure finishes it, appending nothing.
     let recovery = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA).expect("classify");
     assert!(
         !recovery.settles_interrupted && recovery.orphan_pin.is_none(),
@@ -2166,13 +1730,6 @@ fn a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure() {
     );
 }
 
-/// `T-CAND-OBJ`'s other `refusal_condition`: "**pin symbolic** or an
-/// unexpected ref under the run namespace".
-///
-/// Both the writer and the reader refuse it. That matters separately: a
-/// symbolic pin that only the writer refused would still be followed by the
-/// resume that reads it, and `INV-17`'s "every engine ref is direct" would
-/// hold on the way in and not on the way out.
 #[test]
 fn a_symbolic_pin_refuses_on_both_the_write_and_the_read() {
     let fixture = Fixture::new("symbolic-pin");
@@ -2199,16 +1756,6 @@ fn a_symbolic_pin_refuses_on_both_the_write_and_the_read() {
     assert!(read.to_string().contains("symbolic ref"), "{read}");
 }
 
-/// A ref under the run namespace that no durable record accounts for is
-/// refused — which is the half of `T-CAND-OBJ`'s refusal condition that
-/// needs [`expected_refs`] to have derived something.
-///
-/// Two shapes, because the derivation has two rules and one of them is
-/// tighter. A candidates ref for a generation that **exists and has
-/// prepared nothing** is the shape a derivation that expected both names
-/// for every generation would wave through; a candidates ref for a
-/// generation that does not exist at all is the shape any derivation
-/// catches. Only the first measures the rule.
 #[test]
 fn an_unexpected_ref_under_the_run_namespace_refuses() {
     let fixture = Fixture::new("unexpected-ref");
@@ -2217,8 +1764,6 @@ fn an_unexpected_ref_under_the_run_namespace_refuses() {
     let namespace = run_namespace(RUN_ID);
     let candidates = candidates_ref(RUN_ID, ALPHA, GENERATION);
 
-    // (1) The generation exists and has prepared no candidate, so it is
-    // entitled to a pin and to nothing else.
     assert_eq!(
         expected_refs(RUN_ID, journal.fold()),
         vec![candidate_pin_ref(RUN_ID, ALPHA, GENERATION).0],
@@ -2238,8 +1783,6 @@ fn an_unexpected_ref_under_the_run_namespace_refuses() {
     );
     git_fixtures::git_ok(&fixture.base, &["update-ref", "-d", candidates.as_str()]);
 
-    // (2) After the promotion the same name is accounted for, and the
-    // namespace holds exactly what the fold says it may.
     run_to_queued(&fixture, &mut hooks, &mut journal);
     let expected = expected_refs(RUN_ID, journal.fold());
     assert!(expected.contains(&candidates.0));
@@ -2248,7 +1791,6 @@ fn an_unexpected_ref_under_the_run_namespace_refuses() {
         .refuse_unexpected_refs(&namespace, &expected)
         .expect("what promotion left is what the fold accounts for");
 
-    // (3) …and a ref for a generation that never existed still refuses.
     let stowaway = candidates_ref(RUN_ID, ALPHA, GenerationId(9));
     git_fixtures::git_ok(
         &fixture.base,
@@ -2270,9 +1812,6 @@ fn attempt_record() -> AttemptRecord {
         resumed: false,
         duration: Duration::from_millis(1_234),
         cost_usd: Some(0.5),
-        // The primary pass §11.2 requires, present and passed. Empty
-        // `reviews` satisfies `is_successful` vacuously — the premise then
-        // exercises none of the clause it is the positive witness for.
         reviews: vec![ReviewRecord {
             pass: "review".to_owned(),
             agent: "claude-code".to_owned(),

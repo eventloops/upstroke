@@ -100,6 +100,64 @@ impl RunPaths {
         self.create_hooked(&mut NoHooks)
     }
 
+    /// Reserve both roots for a new sequential run, then create their skeletons.
+    ///
+    /// Each root uses an exclusive create. The private root is reserved first
+    /// because it is shared across repositories. Resume and schema-4 creation
+    /// use their existing directory protocols instead.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an occupied root without adopting its contents. If public
+    /// reservation fails, removes only the empty private root just created;
+    /// a failed removal reports both errors. Skeleton failures retain the
+    /// partial directories for inspection, as [`Self::create`] does.
+    pub fn create_fresh(&self) -> Result<(), UpstrokeError> {
+        self.create_fresh_hooked(&mut NoHooks)
+    }
+
+    /// Fresh sequential creation's sites. This is separate from the existing
+    /// idempotent skeleton API and the schema-4 marker protocol.
+    fn create_fresh_hooked(&self, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
+        funnel(
+            hooks,
+            EffectSiteId::RunDir(RunDirSite::CreatePrivateDir),
+            || create_fresh_root(&self.private, "reserve fresh private run directory"),
+        )?;
+        funnel(
+            hooks,
+            EffectSiteId::RunDir(RunDirSite::CreatePublicDir),
+            || {
+                if let Err(error) =
+                    create_fresh_root(&self.public, "reserve fresh public run directory")
+                {
+                    return match fs::remove_dir(&self.private) {
+                        Ok(()) => Err(error),
+                        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(error),
+                        Err(cleanup) => Err(UpstrokeError::Refused {
+                            message: format!(
+                                "{error}; could not remove the empty private reservation {}: {cleanup}",
+                                self.private.display()
+                            ),
+                        }),
+                    };
+                }
+                Ok(())
+            },
+        )?;
+        for name in PUBLIC_DIRS {
+            create_fresh_skeleton(&self.public.join(name), RunDirSite::CreatePublicDir, hooks)?;
+        }
+        for name in PRIVATE_DIRS {
+            create_fresh_skeleton(
+                &self.private.join(name),
+                RunDirSite::CreatePrivateDir,
+                hooks,
+            )?;
+        }
+        Ok(())
+    }
+
     /// The same creation, observed: `RunDir.CreatePublicDir` (P0) then
     /// `RunDir.CreatePrivateDir` (P2/P3), each followed by its skeleton.
     pub fn create_hooked(&self, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
@@ -116,12 +174,12 @@ impl RunPaths {
 
     /// The append-only source of truth (§15).
     pub fn events(&self) -> PathBuf {
-        self.public.join("events.jsonl")
+        self.public.join(EVENT_LOG)
     }
 
     /// The frozen plan this run is executing (§5).
     pub fn plan_json(&self) -> PathBuf {
-        self.public.join("plan.normalized.json")
+        self.public.join(PLAN)
     }
 
     /// A projection of the log for humans and tooling — derived, never read
@@ -576,6 +634,40 @@ fn create_dir(dir: &Path) -> Result<(), UpstrokeError> {
     fs::create_dir_all(dir).map_err(|source| UpstrokeError::Io {
         path: dir.to_path_buf(),
         source,
+    })
+}
+
+/// Reserve a fresh run root without accepting an existing directory or link.
+/// Only the parents are created recursively. The final component is exclusive.
+fn create_fresh_root(path: &Path, operation: &'static str) -> Result<(), UpstrokeError> {
+    let Some(parent) = path.parent() else {
+        return Err(UpstrokeError::Refused {
+            message: format!("cannot {operation} {} without a parent", path.display()),
+        });
+    };
+    fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
+        operation: "create fresh run directory parents",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    fs::create_dir(path).map_err(|source| UpstrokeError::Filesystem {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn create_fresh_skeleton(
+    path: &Path,
+    site: RunDirSite,
+    hooks: &mut dyn RunDirHooks,
+) -> Result<(), UpstrokeError> {
+    funnel(hooks, EffectSiteId::RunDir(site), || {
+        fs::create_dir_all(path).map_err(|source| UpstrokeError::Filesystem {
+            operation: "create fresh run skeleton directory",
+            path: path.to_path_buf(),
+            source,
+        })
     })
 }
 

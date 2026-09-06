@@ -1,3 +1,5 @@
+//! Extended notes: `docs/internals/topology/fold/tests/questions.md`
+
 use super::*;
 
 struct Trace {
@@ -38,7 +40,6 @@ impl Trace {
 
     fn replay(&self) {
         let parsed = TopologyFold::parse_log(&wire(&self.events)).expect("checked log parses");
-        // Replay owns an independent copy of the same frozen inputs.
         let replay =
             TopologyFold::replay(self.inputs.clone(), &parsed).expect("checked log replays");
         assert_eq!(self.fold.state(), replay.state());
@@ -476,8 +477,6 @@ fn a_lineage_question_blocks_related_work_and_decline_preserves_an_unrelated_tra
 fn a_new_bare_or_standalone_admission_question_cannot_enter_an_active_lineage_transaction() {
     let mut trace = sibling_attempts();
     queue_repair(&mut trace, TaskKey(3));
-    // Settle the sibling without a question so transaction ownership is the
-    // only reason the later questions must be refused.
     trace.record(settle(
         TaskKey(4),
         0,
@@ -758,7 +757,6 @@ fn bare_questions_and_active_generations_exclude_each_other_across_a_lineage() {
         trace.record(reject_into_question(ALPHA, TaskKey(3), "admission"));
         trace.record(answer(TaskKey(3), "admission"));
         trace.record(spawn_event(runnable_repair(TaskKey(4))));
-        // Question first: the affected lineage cannot acquire a generation.
         trace.record(raised("quiet", queried));
         assert!(!trace.fold.ready(TaskKey(3)));
         let mut dispatched = dispatch(TaskKey(3), 0, &sha("base"));
@@ -769,7 +767,6 @@ fn bare_questions_and_active_generations_exclude_each_other_across_a_lineage() {
         refuse(&trace.fold, &dispatched);
         trace.record(answer(queried, "quiet"));
         accepts(&trace.fold, &dispatched);
-        // Generation first: bare or standalone questions cannot enter it.
         trace.record(dispatched);
         refuse(&trace.fold, &raised("reserved", queried));
         let mut spawn = runnable_repair(TaskKey(5));

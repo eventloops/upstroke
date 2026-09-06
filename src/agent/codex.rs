@@ -1,94 +1,7 @@
-//! OpenAI Codex CLI adapter (DESIGN.md §16) — a second pool, and a reviewer
-//! from a different model family that costs nothing on the first one.
-//!
-//! §13's capacity engine is built around several subscriptions with independent
-//! windows, and until this adapter there was one that upstroke could actually
-//! drive on its own: Copilot reaches OpenAI models, but through GitHub's
-//! harness and GitHub's billing.
-//!
-//! **Implementing works where the sandbox is real, and only there.** This
-//! CLI's sandbox is an external helper, present on Linux and absent on
-//! Windows — so on Windows `exec` silently degrades to read-only and
-//! [`refuse_edit_profile`] turns an implementer away at build time rather than
-//! letting it spend attempts on empty diffs. On Linux the same flags write
-//! inside the workspace and are blocked outside it, which is what §20 asks
-//! for, so the implementer path is open. The evidence for both lives on that
-//! function.
-//!
-//! The judge's seat works everywhere: `read-only` is enforced on every
-//! platform, the family is genuinely different from Anthropic's (§11.3), and a
-//! review that spends nothing on the Claude window is worth having on its own —
-//! measured end to end on run `01KZRN48A4ZK3AEDST3RJ8HMA4`, where Sonnet
-//! implemented and this adapter judged.
-//!
-//! **Two command shapes, not one with a flag swapped.** `codex exec` and
-//! `codex exec resume` accept *different* flag sets: resume takes no `-s`, no
-//! `-C`, no `--profile`. That is not a gap to work around. The sandbox is a
-//! property of the session, fixed when it is created and inherited by every
-//! resumed turn — which is exactly upstroke's model, where a same-rung retry has
-//! the same profile by definition (§11.4). Observed 2026-08-11 against
-//! codex-cli 0.147.0: a resume with no sandbox flag ran under the policy its
-//! session recorded.
-//!
-//! **The prompt goes on stdin, as `-`.** Windows caps a command line at ~8,191
-//! characters and a review prompt carries up to
-//! [`crate::review::MAX_DIFF_BYTES`] of diff, so argv was never an option. The
-//! CLI also *waits* on stdin when it expects input ("Reading additional input
-//! from stdin…"), so the payload must always be written and the pipe always
-//! closed — [`super::proc`] does both, and an adapter that returned an empty
-//! payload here would hang every attempt until the wall-clock timeout.
-//!
-//! **stdout is JSONL, stderr is tracing.** `--json` emits one event per line —
-//! `thread.started`, `turn.started`, `item.started`, `item.completed`,
-//! `turn.completed` — while stderr carries `ERROR codex_api::…` log lines.
-//! Only stdout is parsed; stderr survives in the transcript for whoever is
-//! debugging.
-//!
-//! **What this route reports, and what it does not.** A session id worth
-//! resuming (`thread_id`), the final message, and token usage — but no
-//! dollars. Tokens are recorded on the attempt and `cost_reporting` stays
-//! false, so the ledger keeps saying `?` for these routes rather than
-//! inventing a price. Pricing them here would mean a rate table inside a
-//! published binary, going stale silently, to produce a figure that is
-//! notional twice over on subscription auth where the marginal dollar is zero.
-//! §13 already has the words: an estimate that flatters is worse than none.
-//!
-//! **Two of this CLI's own features are deliberately unused for model turns.**
-//!
-//! `codex review` runs a code review non-interactively, and adopting it would
-//! swap the standard. §11.3's second opinion is *the same standard, a
-//! different judge*: upstroke's review prompt carries the task's acceptance
-//! criteria, the anti-sycophancy framing, the `DATA UNDER REVIEW` fencing and
-//! the operator's decisions (§12). A verdict from OpenAI's own rubric applied
-//! to a bare diff is not comparable with one from the Claude reviewer, and a
-//! cross-family disagreement between them would be uninterpretable — the model
-//! disagreeing, or the rubric? Reviews therefore run through plain `exec` with
-//! `-s read-only`, like every other reviewer. This adapter cannot even tell it
-//! is reviewing; it sees [`PermissionMode::ReadOnly`] and nothing else, and
-//! that is the right amount to know.
-//!
-//! `--output-schema` would force the model's final message into a JSON shape,
-//! which is tempting for §7 verdicts — but it would make a third copy of the
-//! verdict shape (prompt, parser, schema) that can drift, hold two reviewers to
-//! two different contracts, and push the reviewer's prose into escaped strings
-//! where humans read it. The existing re-ask-on-unparseable path already covers
-//! the failure it would prevent, and nothing has yet measured that failure
-//! happening. Revisit if real runs show it firing more than rarely. Pre-flight
-//! does pass a deliberately missing schema path to the CLI's local parser; that
-//! is a zero-spend guard proving the exact reasoning key before any model turn,
-//! not an output contract for a turn.
-//!
-//! **Never passed:** `--dangerously-bypass-approvals-and-sandbox`,
-//! `--dangerously-bypass-hook-trust`, `-s danger-full-access`. §20 grants the
-//! narrowest surface that lets the work happen, and there is no task for which
-//! the answer is "turn the sandbox off". `--ephemeral` is also never passed —
-//! it would discard the session that §11.4's same-rung retry resumes.
-//!
-//! Surface captured from `codex --help`, `codex exec --help` and
-//! `codex exec resume --help` at 0.147.0, and verified by running it.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/agent/codex.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
@@ -112,54 +25,24 @@ use crate::util;
 
 pub const ADAPTER_ID: &str = "codex";
 
-/// Budget for one probe call. Generous for the same reason Copilot's is: §19
-/// makes a probe failure a refusal to START, so a slow machine that times out
-/// here loses a whole run rather than one attempt. Paid once per run.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The strict-config control must be rejected before the missing-schema guard.
-/// If it is not, a CLI has stopped enforcing the parser contract this probe
-/// relies on and an apparently successful effort-key check would mean nothing.
 const CONFIG_PROBE_UNKNOWN_KEY: &str = "upstroke_probe_deliberately_unknown";
 const CONFIG_PROBE_SCHEMA_FILE: &str = "upstroke-output-schema-must-not-exist.json";
 const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// Flags `exec` must still advertise, checked at pre-flight.
-///
-/// Every one is load-bearing rather than decorative: without `--json` there is
-/// no session id and no usage, and without `--sandbox` a reviewer could edit
-/// the code it is judging. A CLI that has dropped one of these must refuse the
-/// run up front, not fail attempts once it is already spending (§19).
 const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config"];
 const REQUIRED_RESUME_FLAGS: [&str; 4] = ["--json", "--model", "-c", "--config"];
 
-/// Which of this adapter's pre-flight processes each identity is.
-///
-/// Named rather than counted, for the reason [`super::probe_request`] gives —
-/// and this is the adapter that made the reason concrete. Binary resolution
-/// here used to *spawn*, once per PATH candidate, and to cache the answer, so
-/// the second `probe()` in one process performed none of those spawns; a
-/// counter would have renumbered every capability step on the second call, and
-/// two pre-flights of one machine would have minted different identities for
-/// the same work.
-///
-/// **That variable-length step is gone** — the adapter names its CLI and the
-/// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so every process
-/// this adapter starts is now a fixed, named step. The table below is
-/// therefore the whole domain, which is what
-/// `every_preflight_process_has_its_own_ordinal` asserts.
 mod probe_ordinal {
     pub const VERSION: u32 = 0;
     pub const EXEC_HELP: u32 = 1;
     pub const RESUME_HELP: u32 = 2;
-    /// The six strict-config parser probes: two surfaces x
-    /// {unknown-key control, xhigh, max}. `CONFIG_BASE + surface * 3 + step`.
     pub const CONFIG_BASE: u32 = 3;
     pub const CONFIG_PER_SURFACE: u32 = 3;
     pub const PROBE_MODELS: u32 = 9;
     pub const LOGIN_STATUS: u32 = 10;
     pub const DISCOVER_MODELS: u32 = 11;
-    /// Every fixed ordinal above, for the uniqueness assertion.
     #[cfg(test)]
     pub const ALL: [u32; 12] = [
         VERSION,
@@ -236,9 +119,6 @@ impl AgentAdapter for CodexAdapter {
         }
         let version = bin::extract_version(&out.stdout);
 
-        // Fresh and resumed attempts are different CLI surfaces. Both carry
-        // the reasoning override, so both must prove `--config` before spend;
-        // only fresh attempts carry the sandbox.
         let fresh_help = runner.run(&probe_request(
             ADAPTER_ID,
             invocation.spec(&["exec".to_owned(), "--help".to_owned()])?,
@@ -256,10 +136,6 @@ impl AgentAdapter for CodexAdapter {
         validate_probe_contract(&version, &fresh_help, &resume_help)?;
         validate_effort_config_key(runner, &invocation, &version)?;
 
-        // The strict local parser above proves the exact key and the two role
-        // policy values. The CLI's local catalog is separate zero-spend
-        // evidence for each model × effort pair, so require every known Codex
-        // model to expose every shared effort level before a run can start.
         let models = runner.run(&probe_request(
             ADAPTER_ID,
             invocation.spec(&["debug".to_owned(), "models".to_owned()])?,
@@ -272,21 +148,11 @@ impl AgentAdapter for CodexAdapter {
 
         Ok(Caps {
             version,
-            // Asked for and parsed, unlike Copilot's route where the flag's
-            // existence would promise an envelope no caller reads.
             json_output: true,
-            // `codex exec resume <id>` — proven to round-trip: the resumed turn
-            // returned the same `thread_id` and recalled the prior exchange.
             session_resume: true,
-            // Tokens, not dollars. See the module header — this is a decision
-            // about what upstroke is willing to claim, not a missing feature.
             cost_reporting: false,
             read_only_mode: true,
-            // The CLI has `mcp-server` and `app-server`, neither of which is
-            // ACP, and this adapter spawns a process per attempt either way.
             acp: false,
-            // `debug models` is a local catalog rather than a network query;
-            // probe validated it above and discovery exposes its slugs.
             model_list: true,
         })
     }
@@ -295,17 +161,6 @@ impl AgentAdapter for CodexAdapter {
         if let Some(refusal) = edit_refusal(&run.profile) {
             return Err(refusal);
         }
-        // The working root comes from the process, not from `-C`: `exec resume`
-        // has no `-C`, and one mechanism that works for both shapes beats two
-        // that have to agree. It is now the *runner's* cwd
-        // (`RunnerRequest.workspace`) rather than one this adapter set, which
-        // is DESIGN.md:118's split and changes nothing about the mechanism.
-        //
-        // `cli()` names the CLI and the runner decides which file that is, so
-        // `build` performs no lookup of any kind and sends exactly the program
-        // string `probe` certified. `build` being data-only used to force a
-        // second, non-spawning resolution path beside the probing one; there is
-        // now one path, and it is a function of its argument.
         cli().spec(&build_args(run))
     }
 
@@ -313,15 +168,6 @@ impl AgentAdapter for CodexAdapter {
         Ok(parse_output(out))
     }
 
-    /// The one thing this CLI does better than either incumbent: it answers
-    /// "am I signed in?" without spending anything.
-    ///
-    /// `codex login status` is non-interactive, exits 0 either way, and prints
-    /// `Logged in using ChatGPT` or `Not logged in` (observed 2026-08-11).
-    /// Copilot's adapter has to report [`AuthState::Unknown`] because GitHub
-    /// documents no such query; here the honest answer is a real one, so
-    /// `upstroke connect` writes a pool an operator can trust rather than a
-    /// shrug.
     fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
         let invocation = cli();
         let out = runner
@@ -351,11 +197,6 @@ impl AgentAdapter for CodexAdapter {
         ))
     }
 
-    /// Nothing to reference — permissions are argv here, as they are for
-    /// Copilot — but the audit file is still written, because §15 calls
-    /// `settings/<task>-<attempt>.json` the per-attempt permission surface and
-    /// a trail that exists for one agent and silently not another is worse than
-    /// none.
     fn materialize_permissions(
         &self,
         profile: &WorkerProfile,
@@ -461,8 +302,6 @@ impl ConfigProbeSurface {
         }
     }
 
-    /// Which surface this is, so its three parser probes get their own block
-    /// of invocation ordinals.
     const fn index(self) -> u32 {
         match self {
             Self::Fresh => 0,
@@ -471,9 +310,6 @@ impl ConfigProbeSurface {
     }
 }
 
-/// A unique empty directory whose child path is guaranteed not to exist.
-/// Codex validates `--output-schema` locally before starting a turn, making
-/// that absent child a deterministic, zero-spend stopping point.
 struct MissingOutputSchema {
     dir: PathBuf,
     path: PathBuf,
@@ -498,9 +334,6 @@ impl MissingOutputSchema {
 
 impl Drop for MissingOutputSchema {
     fn drop(&mut self) {
-        // The child is intentionally never created. Avoid recursive cleanup:
-        // if a surprising CLI did write anything, preserving it is safer than
-        // deleting an unexpected artifact.
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -523,10 +356,6 @@ fn validate_effort_config_key(
         )?;
         validate_unknown_config_control(version, surface, &control)?;
 
-        // These are the two policy values Upstroke promises for the roles this
-        // feature introduced. Model catalogs validate the remaining shared
-        // values separately; accepting either assignment here proves the exact
-        // key, while checking both catches a provider-side enum regression.
         for (step, effort) in [Effort::XHigh, Effort::Max].into_iter().enumerate() {
             let assignment = format!("model_reasoning_effort={}", effort_flag(effort));
             let output = run_config_parser_probe(
@@ -729,13 +558,6 @@ fn validate_model_efforts(version: &str, models: &DebugModels) -> Result<(), Ups
     Ok(())
 }
 
-/// This CLI's name for a tier-neutral effort level.
-///
-/// One-to-one today, and a function rather than a `Display` impl because that
-/// is the adapter's job: the mapping belongs on this side of the seam where a
-/// vendor can differ without the engine learning about it. Every value below
-/// is in the provider's validated enum (`low, medium, high, xhigh, max` plus
-/// `none` and `minimal`) — checked against the 400 it returns for anything else.
 fn effort_flag(effort: Effort) -> &'static str {
     match effort {
         Effort::Low => "low",
@@ -746,11 +568,6 @@ fn effort_flag(effort: Effort) -> &'static str {
     }
 }
 
-/// The sandbox this profile runs under (§20).
-///
-/// Two modes and no third: `danger-full-access` exists on this CLI and is
-/// never used. A reviewer may read and nothing else, because a reviewer that
-/// edits the code it is judging has invalidated its own verdict.
 fn sandbox_mode(profile: &WorkerProfile) -> &'static str {
     match profile.permissions {
         PermissionMode::Edit => "workspace-write",
@@ -758,48 +575,6 @@ fn sandbox_mode(profile: &WorkerProfile) -> &'static str {
     }
 }
 
-/// Why an implementer is refused **on Windows only**, and what was measured.
-///
-/// This CLI's sandbox is an external helper. `codex doctor` reports it as
-/// `linux helper: <path>` where one exists and `none` on Windows — where there
-/// is therefore nothing to enforce a boundary with. The consequence is a rule
-/// the binary states itself:
-///
-/// > `approval_policy = "never"` cannot be used because requirements do not
-/// > allow `sandbox_mode = "danger-full-access"`; Codex would fall back to
-/// > read-only permissions with approvals disabled.
-///
-/// `exec` is non-interactive, so it forces `never`. With no enforceable
-/// sandbox that degrades to read-only, and `--sandbox workspace-write` is
-/// *accepted and then ignored*: exit 0, no warning, no diff. The silence is the
-/// dangerous part — run `01KZRMHA28M5CM88VAXP613X9P` spent both attempts on
-/// empty diffs and parked asking for write access it had been granted.
-/// `-c approval_policy="on-request"` and `-c permission_profile="…"` were both
-/// tried; `exec` wins.
-///
-/// The only mode that writes there is `--approve-for-me`, which routes
-/// approvals through an automatic reviewer rather than a human — and it is not
-/// a sandbox. Asked to write outside the repository it did so, and
-/// `sandbox_workspace_write.writable_roots` did not constrain it. §20 grants
-/// permission by mechanism, not by asking an LLM nicely, and §14's rollback is
-/// `git clean -fd` *inside* the workspace: anything written outside it survives
-/// a failed attempt, which is the one thing the design rules out.
-///
-/// **On Linux the sandbox is real and none of this applies.** Same CLI, same
-/// flags, helper present: `--sandbox workspace-write` writes inside the
-/// workspace and is *blocked* outside it — both measured. So the refusal is
-/// scoped to the platform that cannot enforce it, and the implementer path is
-/// open everywhere else.
-///
-/// One trap worth recording for whoever containerises this: Docker's default
-/// seccomp profile blocks the syscalls the sandbox needs to initialise, and the
-/// failure is a *different* message ("the workspace sandbox failed to
-/// initialize") with the same empty-diff result. Granting
-/// `--security-opt seccomp=unconfined --cap-add SYS_ADMIN` let it initialise;
-/// which of the two is strictly required was not isolated.
-/// The platform gate, kept out of [`AgentAdapter::build`] so it is testable on
-/// a machine with no codex installed — the same reason [`build_args`] is its
-/// own function.
 fn edit_refusal(profile: &WorkerProfile) -> Option<UpstrokeError> {
     (cfg!(windows) && profile.permissions == PermissionMode::Edit)
         .then(|| refuse_edit_profile(profile))
@@ -822,12 +597,6 @@ fn refuse_edit_profile(profile: &WorkerProfile) -> UpstrokeError {
     }
 }
 
-/// Argument list, kept separate from binary resolution so it is testable on a
-/// machine with no CLI installed.
-///
-/// Two shapes, because the CLI has two. A fresh attempt sets the sandbox that
-/// the session will carry; a resumed one inherits it and would be rejected for
-/// passing `-s` at all (observed: exit 2, "unexpected argument '-s' found").
 pub fn build_args(run: &TaskRun) -> Vec<String> {
     let mut args = vec!["exec".to_owned()];
     if let Some(session) = &run.resume_session {
@@ -835,21 +604,8 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         args.push(session.clone());
     }
     args.push("--json".to_owned());
-    // Passed on both shapes even though a resumed session already knows its
-    // model: the recorded command should say what it ran on without a reader
-    // having to open the session file, and a future change to the CLI's
-    // default must not silently move a resumed retry to another model.
     args.push("--model".to_owned());
     args.push(run.profile.model.clone());
-    // Effort, for exactly the reason the model is passed above — and this axis
-    // had the bug that argument was written to prevent. This CLI's default
-    // comes from the *provider's* roster, not from the flag set: `gpt-5.6-sol`
-    // carries `default_reasoning_level: low`, so every review this project ran
-    // before this line existed was judged at the lowest setting, silently, and
-    // a roster refresh could move it again without a release. Passed on the
-    // resumed shape too: `-c` is accepted there (measured — unlike `-s`, which
-    // is rejected), and a retry must not think harder or less hard than the
-    // attempt it is continuing.
     if let Some(effort) = run.profile.effort {
         args.push("-c".to_owned());
         args.push(format!("model_reasoning_effort={}", effort_flag(effort)));
@@ -859,17 +615,10 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         args.push(sandbox_mode(&run.profile).to_owned());
     }
     args.extend(run.profile.extra_args.iter().cloned());
-    // `-` is "read the prompt from stdin" and must be last: everything after it
-    // would be taken as the prompt's own arguments.
     args.push("-".to_owned());
     args
 }
 
-/// Outcome parsing over the JSONL event stream.
-///
-/// Defensive throughout, like every other adapter here: a line that is not JSON
-/// is skipped rather than failing the attempt, and a missing field degrades the
-/// status instead of panicking. The engine owns `diff` and `transcript_path`.
 fn parse_output(out: &ProcessOutput) -> Outcome {
     let mut outcome = Outcome {
         status: OutcomeStatus::AgentError,
@@ -908,8 +657,6 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
                     .and_then(Value::as_str)
                     .is_some_and(|t| t == "agent_message");
                 if is_message {
-                    // Last one wins: the final message is the agent's answer,
-                    // and it is the field a reviewer's verdict travels in.
                     message = item
                         .and_then(|i| i.get("text"))
                         .and_then(Value::as_str)
@@ -917,10 +664,6 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
                 }
             }
             Some("turn.completed") => {
-                // Summed rather than replaced. One invocation emitted exactly
-                // one of these, tool call and all (measured), so this is
-                // defence against a future version that reports per step —
-                // where taking the last would quietly under-count.
                 usage = Some(add_usage(usage, event.get("usage")));
             }
             Some("error") => {
@@ -951,18 +694,12 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
         return outcome;
     }
 
-    // Failures only — a successful task *about* rate limiting must never read
-    // as the pool being exhausted (see `looks_rate_limited`).
     let joined = errors.join("\n");
     outcome.status = if looks_rate_limited(&joined) || looks_rate_limited(&out.stderr) {
         OutcomeStatus::RateLimited
     } else {
         OutcomeStatus::AgentError
     };
-    // The `error` events first: on this route stderr is a tracing log, so the
-    // event stream carries the diagnostic a human actually wants. An
-    // unauthenticated run exits 101 with 401s here, which is an agent error
-    // and not a rate limit — a distinction the ladder acts on.
     outcome.detail = [
         (!joined.is_empty()).then(|| util::tail(&joined, 2000)),
         message,
@@ -974,11 +711,6 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
     outcome
 }
 
-/// Fold one `turn.completed`'s usage into the running total.
-///
-/// `reasoning_output_tokens` is a *subset* of `output_tokens` on this CLI, not
-/// an addition to it, so it is carried across rather than added in — summing
-/// both would double-count the thinking.
 fn add_usage(total: Option<Usage>, reported: Option<&Value>) -> Usage {
     let mut total = total.unwrap_or_default();
     let Some(reported) = reported else {
@@ -992,8 +724,6 @@ fn add_usage(total: Option<Usage>, reported: Option<&Value>) -> Usage {
     };
     add(&mut total.input_tokens, field("input_tokens"));
     add(&mut total.output_tokens, field("output_tokens"));
-    // Vendor names differ; the concepts line up. `cached_input_tokens` is a
-    // read from the cache, `cache_write_input_tokens` is a write into it.
     add(
         &mut total.cache_read_input_tokens,
         field("cached_input_tokens"),
@@ -1006,17 +736,10 @@ fn add_usage(total: Option<Usage>, reported: Option<&Value>) -> Usage {
         &mut total.reasoning_output_tokens,
         field("reasoning_output_tokens"),
     );
-    // One `turn.completed` is one turn, so this counts them for free.
     total.num_turns = Some(total.num_turns.unwrap_or(0) + 1);
     total
 }
 
-/// Read `codex login status`, as defensively as everything else here.
-///
-/// Observed forms (0.147.0): `Not logged in`, and `Logged in using ChatGPT`.
-/// The negative is checked first because it contains the positive as a
-/// substring — matching "logged in" first would call a signed-out account
-/// signed in, which is the one error `AuthState` exists to prevent.
 fn parse_login_status(out: &ProcessOutput) -> Discovery {
     let mut discovery = Discovery::unknown();
     if out.timed_out {
@@ -1034,9 +757,6 @@ fn parse_login_status(out: &ProcessOutput) -> Discovery {
         ));
     }
     discovery.auth = AuthState::Authenticated;
-    // §13's two billing shapes. A ChatGPT plan is a rate-limit window; an API
-    // key is metered dollars. Anything else is left for the caller's documented
-    // default rather than guessed at.
     if text.contains("chatgpt") {
         discovery.shape = Some(PoolKind::SubscriptionWindow);
         discovery = discovery.with_note(
@@ -1052,25 +772,8 @@ fn parse_login_status(out: &ProcessOutput) -> Discovery {
     discovery
 }
 
-// ---------------------------------------------------------------------------
-// The CLI this adapter names, and what to tell an operator whose boundary
-// does not have it. `super::bin` owns the mechanics.
-// ---------------------------------------------------------------------------
-
-/// This CLI, as the boundary that will execute it names it.
-///
-/// One name, not a platform-dependent candidate list. This adapter used to
-/// resolve the name against the coordinator host's `PATH`, spawning once per
-/// candidate to skip a Windows Store package payload that is visible to a
-/// filesystem lookup but returns access denied when spawned. Both halves were
-/// answers to a question an adapter may not ask: the boundary that executes
-/// the CLI is the thing that knows which file the name is, and with a
-/// container runner it is not this machine's filesystem at all
-/// (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`). Skipping an unspawnable candidate is
-/// now the job of whatever resolves the name; so is `PATHEXT`.
 const CLI: &str = "codex";
 
-/// What to tell an operator whose boundary has no `codex`.
 const INSTALL_HINT: &str = "Install the OpenAI Codex CLI there (`npm install -g @openai/codex`), or select a different \
      agent.";
 
@@ -1078,8 +781,6 @@ fn cli() -> Invocation {
     Invocation::named(CLI)
 }
 
-/// Registry entry, so `by_id("codex")` resolves without this module being
-/// reached through the concrete type.
 impl AdapterSource for CodexAdapter {
     fn get(&self, id: &str) -> Option<&dyn AgentAdapter> {
         (id == ADAPTER_ID).then_some(self)
@@ -1093,8 +794,6 @@ mod tests {
     use super::*;
     use crate::ir::WorkerProfile;
 
-    /// Flags that would hand the agent the machine. §20 says none is ever
-    /// passed, so the list exists to be asserted against.
     const FORBIDDEN: [&str; 4] = [
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
@@ -1411,11 +1110,6 @@ mod tests {
 
     #[test]
     fn a_fresh_attempt_sets_its_sandbox_and_a_resumed_one_must_not() {
-        // The CLI's two shapes, which are not one shape with a flag swapped.
-        // `exec resume` rejects `-s` outright — observed as exit 2, "unexpected
-        // argument '-s' found" — because the sandbox belongs to the session and
-        // is inherited. Passing it anyway would fail every same-rung retry for
-        // a reason that has nothing to do with the code.
         let fresh = build_args(&run(PermissionMode::Edit, None));
         assert!(fresh.starts_with(&["exec".to_owned()]), "{fresh:?}");
         assert!(!fresh.contains(&"resume".to_owned()), "{fresh:?}");
@@ -1466,9 +1160,6 @@ mod tests {
 
     #[test]
     fn a_profile_without_an_effort_passes_none_rather_than_guessing() {
-        // Only reachable from a hand-built profile: the engine sets an effort
-        // on every profile it makes. Passing a guess here would be worse than
-        // the CLI's own default, because it would look deliberate.
         let mut run = run(PermissionMode::Edit, None);
         run.profile.effort = None;
         let args = build_args(&run);
@@ -1477,16 +1168,10 @@ mod tests {
 
     #[test]
     fn the_prompt_is_the_last_argument_and_it_is_stdin() {
-        // Windows caps argv at ~8,191 bytes and a review prompt carries the
-        // diff, so the prompt has never been passable as an argument. `-` says
-        // "read it from stdin", and anything after it would be swallowed as the
-        // prompt's own arguments.
         for resume in [None, Some("sess")] {
             let args = build_args(&run(PermissionMode::ReadOnly, resume));
             assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
         }
-        // And the payload is actually written, or the CLI sits waiting on a
-        // pipe nobody closed.
         let run = run(PermissionMode::Edit, None);
         assert_eq!(CodexAdapter.stdin_payload(&run), "do the thing");
     }
@@ -1494,12 +1179,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_implementer_is_refused_where_no_sandbox_can_enforce_it() {
-        // Windows has no sandbox helper (`codex doctor`: `linux helper: none`),
-        // so `exec` degrades to read-only and writes nothing while returning 0.
-        // Measured on run 01KZRMHA28M5CM88VAXP613X9P, which spent both attempts
-        // on empty diffs and then parked asking for write access it had been
-        // granted. A capability this platform cannot deliver is a refusal to
-        // start (§19), not a task that fails after spending.
         let err = edit_refusal(&profile(PermissionMode::Edit))
             .expect("an implementer profile must be refused on Windows");
         let text = err.to_string();
@@ -1508,7 +1187,6 @@ mod tests {
             text.contains("--approve-for-me"),
             "the refusal has to say which door was tried and why it is shut: {text}"
         );
-        // And where to go instead: Linux, or another agent.
         assert!(text.contains("Linux"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
     }
@@ -1516,10 +1194,6 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn an_implementer_is_allowed_where_the_sandbox_is_real() {
-        // Same CLI, same flags, helper present: `--sandbox workspace-write`
-        // wrote inside the workspace and was blocked outside it, both measured
-        // in a container. The refusal above is scoped to the platform that
-        // cannot enforce a boundary, not to the CLI.
         assert!(
             edit_refusal(&profile(PermissionMode::Edit)).is_none(),
             "an implementer is fine where the sandbox is enforced"
@@ -1528,8 +1202,6 @@ mod tests {
 
     #[test]
     fn a_reviewer_is_read_only_and_nothing_is_ever_given_the_machine() {
-        // Never refused anywhere: read-only is enforced on every platform, and
-        // it is the seat this adapter is most useful in.
         assert!(edit_refusal(&profile(PermissionMode::ReadOnly)).is_none());
         let args = build_args(&run(PermissionMode::ReadOnly, None));
         assert!(args.contains(&"read-only".to_owned()), "{args:?}");
@@ -1548,8 +1220,6 @@ mod tests {
 
     #[test]
     fn a_successful_run_yields_its_session_message_and_tokens() {
-        // The real event stream, from a tool-using run against codex-cli
-        // 0.147.0 on 2026-08-11.
         let stdout = r#"{"type":"thread.started","thread_id":"019ff122-4d61-7323-a217-843ddfe5932c"}
 {"type":"turn.started"}
 {"type":"item.started","item":{"id":"item_0","type":"command_execution"}}
@@ -1560,16 +1230,12 @@ mod tests {
         let outcome = parse_output(&out);
 
         assert_eq!(outcome.status, OutcomeStatus::Completed);
-        // What the supervisor measured, carried through unchanged: see the
-        // same assertion in the Claude adapter for why it is asserted at all.
         assert_eq!(outcome.duration, out.duration);
         assert_eq!(
             outcome.session_id.as_deref(),
             Some("019ff122-4d61-7323-a217-843ddfe5932c"),
             "the thread id is what `exec resume` takes"
         );
-        // The agent's final message, not the command_execution item before it.
-        // A reviewer's verdict travels in exactly this field.
         assert_eq!(outcome.detail.as_deref(), Some("hi"));
 
         let usage = outcome.usage.expect("usage");
@@ -1577,32 +1243,22 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(102));
         assert_eq!(usage.cache_read_input_tokens, Some(22016));
         assert_eq!(usage.num_turns, Some(1));
-        // Tokens, never a price: this route reports no dollars and upstroke does
-        // not own a rate table.
         assert_eq!(outcome.cost_usd, None);
     }
 
     #[test]
     fn several_turns_are_summed_rather_than_last_wins() {
-        // One invocation emits one `turn.completed` today, tool call and all.
-        // This is the guard for a version that reports per step, where taking
-        // the last would silently under-count the run.
         let stdout = r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2,"reasoning_output_tokens":1}}
 {"type":"turn.completed","usage":{"input_tokens":30,"output_tokens":5,"reasoning_output_tokens":4}}"#;
         let usage = parse_output(&output(0, stdout, "")).usage.expect("usage");
         assert_eq!(usage.input_tokens, Some(40));
         assert_eq!(usage.output_tokens, Some(7));
-        // Carried, not double-counted: reasoning tokens are a subset of output.
         assert_eq!(usage.reasoning_output_tokens, Some(5));
         assert_eq!(usage.num_turns, Some(2));
     }
 
     #[test]
     fn an_unauthenticated_run_is_an_agent_error_not_an_exhausted_pool() {
-        // Observed: five 401 retries then exit 101. The ladder acts on this
-        // distinction — a rate limit defers and waits for a window, an agent
-        // error spends an attempt — so calling a signed-out account "rate
-        // limited" would park a run forever on a problem that never resolves.
         let stdout = r#"{"type":"thread.started","thread_id":"t1"}
 {"type":"error","message":"Reconnecting... 2/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header)"}"#;
         let outcome = parse_output(&output(101, stdout, "ERROR codex_api::endpoint: 401"));
@@ -1631,9 +1287,6 @@ mod tests {
 
     #[test]
     fn junk_on_stdout_never_fails_an_attempt() {
-        // Warnings, progress chatter, a half-written line at a kill — none of
-        // it is JSON and none of it should turn a finished attempt into a
-        // failure.
         let stdout = "Reading additional input from stdin...\n\
                       {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n\
                       {not json at all";
@@ -1644,9 +1297,6 @@ mod tests {
 
     #[test]
     fn signed_out_is_never_read_as_signed_in() {
-        // "Not logged in" contains "logged in", so order of checks is the whole
-        // test: a confident wrong "you are signed in" writes a pool the
-        // operator trusts and a run then fails against.
         let signed_out = parse_login_status(&output(0, "Not logged in\n", ""));
         assert_eq!(signed_out.auth, AuthState::NotAuthenticated);
         assert_eq!(signed_out.shape, None);
@@ -1659,25 +1309,11 @@ mod tests {
             "a ChatGPT plan is a window, not metered dollars"
         );
 
-        // Anything unrecognised stays Unknown and says so, rather than being
-        // forced into one of the two answers.
         let odd = parse_login_status(&output(0, "something new entirely\n", ""));
         assert_eq!(odd.auth, AuthState::Unknown);
         assert!(!odd.notes.is_empty());
     }
 
-    /// A Runner that records every request and answers each config-probe
-    /// surface the way a working `codex` does.
-    ///
-    /// The answers are what let the sequence *complete*: a validator that
-    /// refuses stops the walk, and a walk that stops after one process cannot
-    /// say anything about the identities of the other five.
-    /// A boundary that answers every one of this adapter's pre-flight
-    /// processes, and records each request.
-    ///
-    /// It answers by **argument**, never by program: what the CLI is called at
-    /// the boundary is the boundary's business, and a fixture that keyed on the
-    /// program string would be asserting the adapter's answer against itself.
     struct RecordingRunner {
         seen: std::sync::Mutex<Vec<crate::runner::RunnerRequest>>,
     }
@@ -1722,8 +1358,6 @@ mod tests {
                 .push(request.clone());
             let args = request.command.args.join(" ");
             if args.contains(CONFIG_PROBE_UNKNOWN_KEY) {
-                // The control: the strict parser rejects the unknown key
-                // *before* the local missing-schema guard.
                 return Ok(output(
                     2,
                     "",
@@ -1731,8 +1365,6 @@ mod tests {
                 ));
             }
             if args.contains("model_reasoning_effort=") {
-                // The key is accepted, and the run then stops on the schema
-                // file that deliberately does not exist.
                 return Ok(output(
                     2,
                     "",
@@ -1749,10 +1381,6 @@ mod tests {
                 return Ok(output(0, "--json --model -c, --config", ""));
             }
             if args == "debug models" {
-                // Every model the catalog knows, each advertising every
-                // effort. Derived from the catalog rather than written out:
-                // nothing here asserts *which* models exist, so the catalog is
-                // an input to this fixture and the oracle for nothing.
                 let models: Vec<_> = catalog::known_models(ADAPTER_ID)
                     .into_iter()
                     .map(|slug| {
@@ -1774,26 +1402,6 @@ mod tests {
         }
     }
 
-    /// The six strict-config parser probes really are six identities.
-    ///
-    /// `decisions.admission_and_leases.permits.invocation_identity`:
-    /// `InvocationId` is "unique **per process**", and `invariants[19]`
-    /// (INV-20) requires every Runner process to carry one. Two processes
-    /// sharing an identity collide in the invocation ledger and in every
-    /// invocation-derived containment scope.
-    ///
-    /// `every_preflight_process_has_its_own_ordinal` asserts the *table*
-    /// `probe_ordinal::ALL`, which is hand-written and contains only the
-    /// **declared** ordinals. These six are **computed** — `CONFIG_BASE +
-    /// surface.index() * CONFIG_PER_SURFACE + step` — so a `ConfigProbeSurface::
-    /// Resume` whose `index()` returned `Fresh`'s left the six processes
-    /// carrying three identities with the whole suite green
-    /// (`PR5-CORRECTNESS-008`). The repair is to stop asking the table and
-    /// start asking the requests.
-    ///
-    /// The invocation is built with [`Invocation::at`] rather than named, so
-    /// this drives the six config probes over an absolute program without
-    /// depending on what this machine has installed.
     #[test]
     fn the_six_config_parser_probes_are_six_distinct_identities() {
         let runner = RecordingRunner::new();
@@ -1818,8 +1426,6 @@ mod tests {
             "six processes carrying {} identities: {identities:?}",
             distinct.len()
         );
-        // And they are the probe form naming this agent, so a "distinct" set
-        // cannot be six values of some other shape.
         assert!(
             identities
                 .iter()
@@ -1827,9 +1433,6 @@ mod tests {
             "{identities:?}"
         );
 
-        // The two surfaces are really two: the resumed one carries `resume`
-        // and the fresh one does not, so the six requests are six *different*
-        // processes and not one repeated six times.
         let resumed = runner
             .seen()
             .iter()
@@ -1837,8 +1440,6 @@ mod tests {
             .count();
         assert_eq!(resumed, 3, "three of the six probe the resumed surface");
 
-        // No computed ordinal may land on a declared one, which is the other
-        // way this block can collide.
         let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
         let computed: BTreeSet<u32> = identities
             .iter()
@@ -1856,21 +1457,6 @@ mod tests {
         );
     }
 
-    /// The twelve declared ordinals are **exactly** the processes this
-    /// adapter's pre-flight starts — no thirteenth, and none outside the table.
-    ///
-    /// This replaces `every_binary_resolution_candidate_carries_its_own_identity`,
-    /// and the property it carries is the one that mattered: *no process this
-    /// adapter starts takes an identity the table does not enumerate.* That
-    /// test could only assert it of the variable-length block separately,
-    /// because binary resolution spawned once per unbounded PATH candidate and
-    /// no table could speak for it. The adapter now names its CLI and the
-    /// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so the
-    /// variable-length block is gone and the claim can be made over the whole
-    /// domain at once, against the requests rather than against the table.
-    ///
-    /// Both entry points, because `probe` and `discover` are separately
-    /// droppable and each has its own ordinals: ten and two.
     #[test]
     fn preflight_starts_exactly_the_processes_the_ordinal_table_declares() {
         let runner = RecordingRunner::new();
@@ -1895,9 +1481,6 @@ mod tests {
             "two pre-flight processes shared one identity: {identities:?}"
         );
 
-        // Every ordinal actually used is one the table declares. The table is
-        // the expected value here and the requests are the result, which is
-        // the direction that catches a step taking an ordinal nobody reserved.
         let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
         let used: BTreeSet<u32> = identities
             .iter()
@@ -1913,15 +1496,6 @@ mod tests {
         );
     }
 
-    /// Every pre-flight process this adapter starts names the CLI and nothing
-    /// this machine contributed — over the whole pre-flight, not one call.
-    ///
-    /// The second field this holds constant is **the boundary**: the same
-    /// adapter is driven against two boundaries in one process, in both
-    /// orders, and each must be asked the identical program string. A
-    /// resolution memoised in a process-wide cell — which is what this adapter
-    /// had — is invisible to any test that constructs one runner, and would
-    /// hand the second boundary the first one's answer.
     #[test]
     fn every_preflight_process_names_the_cli_at_whichever_boundary_is_asked() {
         let first = RecordingRunner::new();
@@ -1935,8 +1509,6 @@ mod tests {
             .discover(&second, &caps)
             .expect("second boundary discovery");
 
-        // `codex`, written here rather than read from `CLI`: a constant
-        // compared against itself proves nothing.
         let programs = first.programs();
         assert_eq!(programs.len(), 12);
         assert!(
@@ -1950,14 +1522,6 @@ mod tests {
         );
     }
 
-    /// Every pre-flight process of this adapter carries its own identity.
-    ///
-    /// `decisions.admission_and_leases.permits.invocation_identity` says
-    /// "unique **per process**", and this adapter runs 12 of them, so the
-    /// ordinals it fixes must be 12 distinct values. The expected count is
-    /// written here from the steps the adapter performs, not read from the
-    /// table under test — a table that lost an entry would otherwise agree
-    /// with itself.
     #[test]
     fn every_preflight_process_has_its_own_ordinal() {
         use std::collections::BTreeSet;
@@ -1970,8 +1534,6 @@ mod tests {
         );
         assert_eq!(probe_ordinal::ALL.len(), 12);
 
-        // And they really do render as 12 distinct identities of the packet's
-        // third form, which is the property the ordinals exist for.
         let ids: BTreeSet<String> = probe_ordinal::ALL
             .into_iter()
             .map(|ordinal| {
@@ -1989,13 +1551,8 @@ mod tests {
             "the probe form, naming this agent: {ids:?}"
         );
     }
-    // Runs only where the real CLI exists; deterministic contract fixtures do
-    // the compatibility proof, while this catches local help/catalog drift.
     #[test]
     fn probe_against_real_binary_when_present() {
-        // The host runner's boundary *is* this machine, so what gates this is
-        // whether this machine has the CLI — asked of `util::find_program`
-        // rather than of the adapter, which no longer knows.
         if crate::util::find_program(CLI).is_none() {
             eprintln!("codex not on PATH; skipping live probe");
             return;

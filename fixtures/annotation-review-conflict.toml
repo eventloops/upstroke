@@ -1,0 +1,6 @@
+[routing]
+review = { enabled = false }
+
+[[routing.overrides]]
+paths = ["src/**"]
+second_opinion = "different-vendor"

@@ -1,12 +1,7 @@
-//! Routing resolution (DESIGN.md §10) and the binder preview.
-//!
-//! Chains stay abstract tiers; the binder normally resolves them at attempt
-//! time against live capacity. Step 1 has no capacity engine, so every rung
-//! carries a catalog-derived example binding tagged `preview` (or the pinned
-//! binding tagged `pin`).
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/route.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods)]
 
 use std::fmt;
@@ -15,7 +10,6 @@ use crate::catalog;
 use crate::config::Config;
 use crate::ir::{Task, Tier};
 
-/// Why a rung sits where it does in the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSource {
     Default,
@@ -54,8 +48,6 @@ pub struct ResolvedChain {
     pub attempts_per: u32,
 }
 
-/// Resolve a task's escalation chain: config baseline, then blast-radius
-/// floors, then the designer's advisory `tier=`, then the binding `min=` clip.
 pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
     let kind_chain = cfg.chain_for(task.kind);
     let mut tiers: Vec<(Tier, ChainSource)> = kind_chain
@@ -65,10 +57,6 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
         .collect();
     let mut notes = Vec::new();
 
-    // Blast-radius floors: a matching override raises the start. Blast radius
-    // beats nominal difficulty (§10.2). An override carrying only a
-    // `second_opinion` has no floor to apply and is handled by the reviewer
-    // (§11.3), not here.
     for ov in &cfg.overrides {
         if let Some(start_at) = ov.start_at {
             if task.path_hints.iter().any(|h| ov.globs.is_match(h))
@@ -82,15 +70,8 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
         }
     }
 
-    // `tier=` is advisory: it becomes the chain start only if it outranks the
-    // current start. An annotation that merely agrees with a blast-radius
-    // floor must not take credit for it — the override is what binds, and the
-    // preview has to say so (§10.2: blast radius beats nominal difficulty).
     if let Some(tier) = task.suggested_tier {
         let raised = raise_start(&mut tiers, tier, ChainSource::Annotation);
-        // Agreeing with a silent default still counts as the designer's
-        // decision; agreeing with an override does not — the override is what
-        // holds the start up, and removing the annotation would not lower it.
         if !raised {
             if let Some(first) = tiers.first_mut() {
                 if first.0 == tier && first.1 == ChainSource::Default {
@@ -100,7 +81,6 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
         }
     }
 
-    // `min=` is binding: clip everything below it.
     if let Some(min) = task.min_tier {
         if raise_start(&mut tiers, min, ChainSource::Annotation) {
             notes.push(format!("min={min} clipped the chain start"));
@@ -126,9 +106,6 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
     }
 }
 
-/// Drop rungs below `floor`; if that empties the chain, the floor itself
-/// becomes the only rung. Returns whether anything changed, relabeling the new
-/// start when it did.
 fn raise_start(tiers: &mut Vec<(Tier, ChainSource)>, floor: Tier, source: ChainSource) -> bool {
     let before = tiers.len();
     tiers.retain(|(t, _)| *t >= floor);
@@ -169,21 +146,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
-    /// A directory with no config and one empty pools file, built once.
-    ///
-    /// Every test here routes through it, and it used to be rewritten on every
-    /// call at a path shared by *every process on the machine* — not even
-    /// pid-scoped, so a second `cargo test` binary truncated it under this
-    /// one's readers. The content is identical for every caller, so there was
-    /// never anything to rewrite.
     fn hermetic() -> (PathBuf, PathBuf) {
         static DIRS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
         DIRS.get_or_init(|| {
             let dir = std::env::temp_dir()
                 .join(format!("upstroke-route-hermetic-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch dir");
-            // A real, empty pools file: an explicit pools path that does not
-            // exist is a hard error, and `None` would read the operator's own.
             let empty = dir.join("no-pools.toml");
             std::fs::write(&empty, "# no pools\n").expect("empty pools file");
             (dir, empty)
@@ -249,14 +217,12 @@ mod tests {
         assert_eq!(tiers(&rc), [Tier::Frontier]);
         assert_eq!(rc.rungs[0].source, ChainSource::Annotation);
 
-        // Equal to the baseline start: relabeled as the designer's decision.
         let mut equal = task(TaskKind::Design);
         equal.suggested_tier = Some(Tier::Frontier);
         let rc = resolve(&equal, &cfg);
         assert_eq!(tiers(&rc), [Tier::Frontier]);
         assert_eq!(rc.rungs[0].source, ChainSource::Annotation);
 
-        // Below the baseline start: advisory is ignored.
         let mut lower = task(TaskKind::Design);
         lower.suggested_tier = Some(Tier::Small);
         let rc = resolve(&lower, &cfg);
@@ -291,14 +257,11 @@ mod tests {
         assert_eq!(rc.rungs[0].source, ChainSource::Override);
         assert!(rc.notes.iter().any(|n| n.contains("src/auth/**")));
 
-        // Non-matching paths keep the full default chain.
         let mut unmatched = task(TaskKind::Fix);
         unmatched.path_hints.push("src/api/list.rs".to_owned());
         let rc = resolve(&unmatched, &cfg);
         assert_eq!(tiers(&rc), [Tier::Small, Tier::Mid, Tier::Frontier]);
 
-        // An annotation agreeing with the override must not take credit for
-        // a floor the override is holding up.
         let mut agreeing = task(TaskKind::Fix);
         agreeing.path_hints.push("src/auth/login.rs".to_owned());
         agreeing.suggested_tier = Some(Tier::Frontier);

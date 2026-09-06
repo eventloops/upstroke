@@ -23,6 +23,38 @@ The durable run artifacts are **split in two**, by who is allowed to read each h
 upstroke.toml                       # repo-root config, checked in
 ```
 
+A fresh sequential run reserves the global private root and its repository's
+public root with exclusive directory creation before creating skeleton files,
+opening the event log or entering early-error cleanup. An occupied root refuses
+the new run and preserves the existing run's contents, including when two
+repositories request the same run id. If public reservation fails, creation
+removes only its newly reserved empty private root and reports a failed removal.
+Skeleton creation failures retain partial directories for inspection. Resume
+keeps its idempotent skeleton creation; schema-4 creation keeps its separate
+marker and reciprocal-owner protocol.
+
+New ULIDs retain the 48-bit timestamp and 80-bit suffix layout. The suffix is
+the first ten SHA-256 bytes over `upstroke.ulid.v2` followed by a zero byte and
+the big-endian timestamp, process id and nonce, with widths 64, 32 and 64 bits.
+The separate fields remove the old XOR cancellation between a pid and nonce.
+This changes newly generated values, not the spelling or interpretation of
+persisted ids. It does not promise unpredictable or collision-free names;
+exclusive allocation supplies the fresh-run ownership check.
+
+Test scratch trees use a separate, test-only ownership token. Exclusive
+directory creation is followed by retaining a directory handle. Checked use
+and reclaim compare the current root's filesystem identity with that handle;
+an observed replacement refuses and never becomes the token's claim through
+disarm, failed reclaim or rearm. Once successful removal closes the handle, a
+failed absence observation leaves a consumed claim that can report failure or
+confirm later pathname absence, but cannot reopen a replacement for deletion.
+A recursive remover's child-level `NotFound` is not proof of root absence.
+Pathname absence also does not prove that an original directory moved elsewhere
+was deleted. These are checks at operation boundaries, with the mkdir-to-open
+and subsequent check-to-use intervals stated explicitly. They do not provide
+continuous isolation against an active same-user writer or protect every child
+path from such a writer.
+
 The split keeps transcripts and reviewer records out of ordinary workspace reads, but the shipped host runner does **not** make the public half authoritative against hostile candidate code. Adapter deny rules reduce direct agent-tool access; they are defence in depth, not an OS boundary. Repository-controlled gates execute candidate build/test code as the Upstroke user and can discover the source worktree and modify `.upstroke`. A host-run event log is therefore an operational recovery record for trusted repositories and plans, not a tamper-resistant attestation. Moving coordinator authority outside every role mount and enforcing that with the external/container runner is a blocking backlog item before any stronger claim; use a dedicated OS account or VM for untrusted input.
 
 The v0.2 execution root is deliberately non-authoritative. A container receives only its role's one worktree mount; it never receives the public log, sibling worktrees, or private artifacts. On the host runner the agent permission surface remains the boundary and gate code is not OS-confined — the reason the container runner exists. Worktree disappearance is recoverable from events and internal refs, and cleanup follows a terminal event rather than creating one.
@@ -31,7 +63,7 @@ The execution root is created only when the managed base is a real directory, th
 
 Current host-process crash containment is deliberately platform-specific. On Unix, ordinary descendants remain in an isolated process group and a separate cleanup reaper retains the run's cleanup lease if the conductor is killed; code that deliberately daemonises out of that group remains outside the host-runner contract. On Windows, each command is created suspended, assigned to a private kill-on-close Job Object, and only then resumed. Direct-child success and timeout both terminate and boundedly observe that job empty; abrupt conductor death closes its non-inheritable handle and lets the kernel terminate ordinary descendants. PID scanning and `taskkill` are not part of the ownership protocol. Exact gate/review worktrees likewise record and sync a private intent before `git worktree add`; resume reclaims every such registration before it switches branches or dispatches another worker.
 
-**When a Unix helper does not start.** The cleanup reaper and the job-control guard are forked before any agent exists, and each acknowledges its own startup within a fixed budget. A launch that does not see that acknowledgement fails, ends the helper exactly as it always has — one `SIGKILL`, one `waitpid` — and reports what those two calls answered, alongside how long it waited, that budget, and the descriptor ceiling the helper was closing against. The point of reporting them is one distinction: a helper that had **already ended itself** before the signal, whose exit status names which of its own setup steps refused, against one that was **still running** and had to be killed, which says it was still working when the budget ran out. Nothing else is claimed. The parent asks the kernel nothing about the helper beyond those two calls, and in particular a pid is never treated as evidence of which process it names: while an embedding host may reap this process's children with a wildcard wait, no observation the parent can make establishes that, and the message says only what `kill` and `waitpid` returned.
+**When a Unix helper does not start.** The cleanup reaper and the job-control guard are forked before any agent exists, and each acknowledges its own startup within a fixed budget. A launch that does not see that acknowledgement fails, ends the helper exactly as it always has — one `SIGKILL`, one `waitpid` — and reports what those two calls answered, alongside how long it waited, that budget, the descriptor ceiling the helper was closing against, and how the wait ended: on the helper's own report of the setup step that refused and the error it left, on the acknowledgement pipe closing with no report, or on the budget elapsing with nothing on the pipe. A helper that cannot finish its setup writes that report on the acknowledgement pipe it already owns before it ends, and the wait ends the moment the helper ends on every supported platform. On macOS the wait is a `select`, because `poll` on the FIFO the channel is built from never reports the writer's close. The point of reporting these is one distinction: a helper that had **already ended itself** before the signal, whose report or exit status names which of its own setup steps refused, against one that was **still running** and had to be killed, which says it was still working when the budget ran out. Nothing else is claimed. The parent asks the kernel nothing about the helper beyond those two calls and the pipe it was already reading, and in particular a pid is never treated as evidence of which process it names: while an embedding host may reap this process's children with a wildcard wait, no observation the parent can make establishes that, and the message says only what the pipe carried and what `kill` and `waitpid` returned.
 
 **Synced intents.** Each intent file is one JSON object with exactly four string fields, in this
 order: `kind`, `slot`, `run_id`, `incarnation`. `kind` is one of `task`, `staging` or `snapshot`.
@@ -73,6 +105,12 @@ the authoritative question too; it is not followed by separate ladder,
 A declined `question_answered` likewise freezes the contemporaneous
 `on_task_failure` decision, so resume can append a missing task settlement
 without reinterpreting the human's already-durable answer through edited config.
+
+Schema-3 success validation uses `AttemptRecord::is_successful`: no failure record and every
+review pass approved. A non-passing review without a failure record is inconsistent and is
+refused before replay. It cannot authorize a prepared commit or the following `task_committed`.
+Normal review failures retain their recorded failure and ladder or parking decision. This
+checks the existing settlement contract without adding fields or changing the schema number.
 
 The v0.2 execution topology consequently begins at event schema 4 because its
 task states and transactions change execution meaning. Fresh topology runs write

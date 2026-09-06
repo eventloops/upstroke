@@ -1,23 +1,7 @@
-//! Workspace (DESIGN.md §6): the engine owns git. Agents edit files; only the
-//! engine stages, commits, branches, and rolls back (invariant 1). Every git
-//! operation is a subprocess of the system `git` binary — no library binding.
-//!
-//! # LEGACY-EFFECT
-//!
-//! `decisions.effect_site_inventory.mechanism` puts this module in the **frozen
-//! legacy section** of `effects/allowlist.toml` by name: "legacy modules frozen
-//! at PR5 (… legacy branch/checkout/commit operations in src/workspace.rs …)
-//! each carrying a LEGACY-EFFECT justification". The justification is that
-//! sentence's own: these are the schema-1..3 engine's Git operations, they are
-//! reached only by legacy paths, and `invariants_preserved[1]` requires their
-//! behaviour to be untouched by this slice. The schema-4 primitives —
-//! execution root, detached worktrees with intents, exact snapshots, engine
-//! refs, and the Git-object creation contexts — live behind typed funnels in
-//! [`crate::workspace_manager`] instead, and nothing here calls them.
-//!
-//! The section "may only shrink after PR5 (the test compares against the frozen
-//! list)", so this attribute is a ceiling rather than a licence.
+//! Extended notes: `docs/internals/workspace.md`
 
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -37,35 +21,14 @@ pub struct Workspace {
     root: PathBuf,
 }
 
-/// The immutable candidate captured immediately after staging. Every gate,
-/// review, prepared commit, and CAS uses these object identities rather than
-/// consulting a mutable index again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedCandidate {
-    /// The exact direct branch ref that owned `parent_oid` when this candidate
-    /// was captured. An object id alone is insufficient: two branches may
-    /// legitimately point at the same commit while only one belongs to the run.
     pub branch_ref: String,
     pub parent_oid: String,
     pub tree_oid: String,
     pub diff: String,
 }
 
-/// The fixed arguments of a reviewable diff, before its two revisions.
-///
-/// **Shared because there are now two callers and one meaning.** Schemas 1–3
-/// capture the diff from the task workspace ([`Workspace::capture_candidate`]);
-/// the schema-4 driver captures a tree and asks
-/// [`crate::workspace_manager::WorkspaceManager::candidate_diff`] for the diff
-/// of that tree against its parent. Both produce the text a reviewer judges and
-/// `classify::diff_failure` reads, so both must be the *same* text.
-///
-/// Every flag is load-bearing and each one defends against operator config
-/// rather than against Git's defaults. A configured `diff.external`
-/// (difftastic and friends) replaces the output wholesale; `color.ui` injects
-/// escape codes; `textconv` substitutes a rendered form for the bytes. Any of
-/// those corrupts every downstream check that reads the diff — and
-/// `capture_diff_is_immune_to_user_diff_config` is the test that says so.
 pub(crate) const REVIEW_DIFF_FLAGS: &[&str] = &[
     "-c",
     "color.ui=false",
@@ -77,10 +40,6 @@ pub(crate) const REVIEW_DIFF_FLAGS: &[&str] = &[
 ];
 
 impl Workspace {
-    /// Open an existing git worktree, normalizing to its top level. Running
-    /// from a subdirectory would otherwise scope `git clean` to that
-    /// subdirectory while staging stays whole-tree, so rollback would leave
-    /// residue above the current directory.
     pub fn open(root: &Path) -> Result<Self, UpstrokeError> {
         let probe = Self {
             root: root.to_path_buf(),
@@ -105,12 +64,6 @@ impl Workspace {
         &self.root
     }
 
-    /// The administrative directory private to this physical worktree.
-    ///
-    /// A linked worktree's `.git` is a pointer into the common repository, so
-    /// joining the visible `.git` path would either fail or collapse distinct
-    /// worktrees onto one lease. Git resolves the exact per-worktree directory
-    /// for us without changing tracked or working-tree state.
     pub(crate) fn worktree_git_dir(&self) -> Result<PathBuf, UpstrokeError> {
         let git_dir = self.git_path(&["rev-parse", "--absolute-git-dir"])?;
         if !git_dir.is_absolute() {
@@ -124,9 +77,6 @@ impl Workspace {
         Ok(git_dir)
     }
 
-    /// Decode one path printed by Git without requiring Unix path bytes to be
-    /// UTF-8. Git appends a platform line ending; remove only that delimiter,
-    /// never legal leading or trailing path bytes.
     fn git_path(&self, args: &[&str]) -> Result<PathBuf, UpstrokeError> {
         let mut output = self.git_output(args)?;
         #[cfg(windows)]
@@ -198,9 +148,6 @@ impl Workspace {
         Ok(output.stdout)
     }
 
-    /// Run a Git command with every repository-configured hook and fsmonitor
-    /// disabled. Keep this raw-output primitive reusable by reference updates,
-    /// whose expected compare-and-swap failures need the real exit status.
     pub(crate) fn run_git_with_private_hooks(
         &self,
         args: &[&str],
@@ -270,9 +217,6 @@ impl Workspace {
         let mut stdin = child.stdin.take().ok_or_else(|| UpstrokeError::Git {
             message: format!("git {} did not open stdin", args.join(" ")),
         })?;
-        // Read stdout/stderr while feeding the complete NUL-delimited path
-        // list. A large index can otherwise fill check-attr's stdout pipe and
-        // deadlock the parent while it is still writing stdin.
         let writer = std::thread::spawn(move || stdin.write_all(&input));
         let output = child.wait_with_output().map_err(|e| UpstrokeError::Git {
             message: format!("waiting for git {}: {e}", args.join(" ")),
@@ -320,8 +264,6 @@ impl Workspace {
             .arg("-C")
             .arg(&self.root)
             .args(args)
-            // Environment identity overrides repository/global config and any
-            // inherited GIT_AUTHOR_* or GIT_COMMITTER_* values.
             .env("GIT_AUTHOR_NAME", "upstroke")
             .env("GIT_AUTHOR_EMAIL", "upstroke@upstroke.local")
             .env("GIT_COMMITTER_NAME", "upstroke")
@@ -347,7 +289,6 @@ impl Workspace {
         })
     }
 
-    /// §14 pre-flight: the engine refuses dirty trees.
     pub fn is_clean(&self) -> Result<bool, UpstrokeError> {
         self.refuse_worktree_filters_before("git status")?;
         Ok(self
@@ -356,9 +297,6 @@ impl Workspace {
             .is_empty())
     }
 
-    /// Repository prerequisites whose absence would make the captured tree
-    /// incomplete or its attribute policy unverifiable. Run this before any
-    /// worker is dispatched on both fresh and resumed runs.
     pub fn ensure_execution_prerequisites(&self) -> Result<(), UpstrokeError> {
         require_check_attr_source(self.git_output_with_input(
             &["check-attr", "--source=HEAD", "--stdin", "-z", "filter"],
@@ -393,9 +331,6 @@ impl Workspace {
                 ),
             });
         };
-        // `-t` reports the skip-worktree tag as an uppercase `S` even when an
-        // entry is also marked assume-unchanged. (`-v` would lowercase that
-        // tag and could let a manually sparse index evade this preflight.)
         let index = self.git_output_with_private_hooks(&["ls-files", "-t", "-z"])?;
         let has_skipped_entry = index
             .split(|byte| *byte == 0)
@@ -416,9 +351,6 @@ impl Workspace {
             .to_owned())
     }
 
-    /// The full direct branch ref currently checked out by this worktree.
-    /// Prepared publication is deliberately unavailable from detached HEAD or
-    /// through a symbolic branch alias: the run records one concrete local ref.
     pub fn current_branch_ref(&self) -> Result<String, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
@@ -456,19 +388,10 @@ impl Workspace {
             .to_owned())
     }
 
-    /// Full HEAD sha. The event log records these rather than short ones
-    /// because `--short` picks its length from `core.abbrev` and the repo's
-    /// object count — a sha written by one checkout would not compare equal to
-    /// the same sha read by another, which is exactly the check §15 asks
-    /// `resume` to make.
     pub fn head_sha_full(&self) -> Result<String, UpstrokeError> {
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
     }
 
-    /// The full sha of a commit's first parent — `None` at a root commit.
-    ///
-    /// How `resume` tells a commit sitting directly on its own record apart
-    /// from history that arrived some other way.
     pub fn parent_sha(&self, sha: &str) -> Result<Option<String>, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
@@ -480,7 +403,6 @@ impl Workspace {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
-            // A root commit has no parent. That is an answer, not a failure.
             return Ok(None);
         }
         Ok(Some(
@@ -488,7 +410,6 @@ impl Workspace {
         ))
     }
 
-    /// A commit's subject — the first line of its message.
     pub fn commit_subject(&self, sha: &str) -> Result<String, UpstrokeError> {
         Ok(self
             .git(&["log", "-1", "--format=%s", sha, "--"])?
@@ -505,8 +426,6 @@ impl Workspace {
             .map(|_| ())
     }
 
-    /// Move to an existing branch — how `resume` gets back onto the run's own
-    /// branch when the operator has wandered off it.
     pub fn switch_branch(&self, name: &str) -> Result<(), UpstrokeError> {
         self.refuse_worktree_filters_before("git switch")?;
         let revision = format!("refs/heads/{name}^{{tree}}");
@@ -516,7 +435,6 @@ impl Workspace {
             .map(|_| ())
     }
 
-    /// Whether a branch exists locally.
     pub fn branch_exists(&self, name: &str) -> Result<bool, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
@@ -530,8 +448,6 @@ impl Workspace {
         Ok(output.status.success())
     }
 
-    /// A one-line-per-path summary of everything uncommitted, for telling the
-    /// operator what a resume is about to discard.
     pub fn uncommitted_summary(&self) -> Result<Vec<String>, UpstrokeError> {
         self.refuse_worktree_filters_before("git status")?;
         Ok(self
@@ -542,15 +458,6 @@ impl Workspace {
             .collect())
     }
 
-    /// Keep `.upstroke/` (run dirs, transcripts) out of `status` and out of the
-    /// engine's own commits.
-    ///
-    /// This is a self-ignoring `.upstroke/.gitignore` containing `*` (the
-    /// pattern cargo uses for `target/`) rather than an entry in
-    /// `.git/info/exclude`: it needs no read-modify-write of a file the user
-    /// owns, disappears with the directory, and — unlike `info/exclude` under
-    /// `--git-dir` — behaves correctly in a linked worktree, where git reads
-    /// excludes only from the common directory.
     pub fn ensure_run_exclusions(&self) -> Result<(), UpstrokeError> {
         let dir = self.root.join(".upstroke");
         fs::create_dir_all(&dir).map_err(|e| UpstrokeError::Git {
@@ -565,15 +472,6 @@ impl Workspace {
         })
     }
 
-    /// Stage everything, freeze one parent and tree object, and return their
-    /// complete diff. The diff names those frozen objects rather than rereading
-    /// HEAD or the index, so all three values remain one candidate even if a
-    /// ref or the index changes afterward.
-    ///
-    /// The diff must be a plain unified diff regardless of user config: a
-    /// configured `diff.external` (difftastic and friends) would replace it
-    /// wholesale and `color.ui` would inject escape codes, corrupting every
-    /// downstream check that reads it.
     pub fn capture_candidate(&self) -> Result<CapturedCandidate, UpstrokeError> {
         let branch_ref = self.current_branch_ref()?;
         let parent_oid = self.head_sha_full()?;
@@ -602,17 +500,11 @@ impl Workspace {
         })
     }
 
-    /// Backward-compatible diff-only capture for existing callers.
     pub fn capture_diff(&self) -> Result<String, UpstrokeError> {
         Ok(self.capture_candidate()?.diff)
     }
 
     fn worktree_filter_problem(&self, operation: &str) -> Result<Option<String>, UpstrokeError> {
-        // Commands that inspect or update worktree entries (`add`, `status`,
-        // `switch`, `commit`) can run clean/process filters before a later
-        // tree policy check. Enumerate tracked and addable untracked paths
-        // without refreshing fsmonitor, then evaluate the worktree's
-        // attributes without invoking a driver.
         let paths = self.git_output_with_private_hooks(&[
             "ls-files",
             "--cached",
@@ -630,20 +522,11 @@ impl Workspace {
         Ok(())
     }
 
-    /// Refuse staged evidence whose bytes are not the bytes a gate would see,
-    /// or whose worktree still contains unstaged nested state after `git add`.
-    /// A clean/smudge filter makes the cached diff describe the transformed
-    /// blob while gates see the smudged file. Dirty submodules similarly hide
-    /// executable inputs behind an unchanged gitlink. Neither can be reviewed
-    /// completely, so both are policy failures rather than gate results.
     pub fn review_input_problem(&self) -> Result<Option<String>, UpstrokeError> {
         let tree_oid = self.staged_tree_oid()?;
         self.review_input_problem_for_tree(&tree_oid)
     }
 
-    /// Inspect live nested-worktree state, then bind every semantic input check
-    /// to one captured tree rather than to an index that may have moved since
-    /// its diff was produced.
     pub fn review_input_problem_for_tree(
         &self,
         tree_oid: &str,
@@ -674,9 +557,6 @@ impl Workspace {
     }
 
     fn tree_input_problem(&self, tree_oid: &str) -> Result<Option<String>, UpstrokeError> {
-        // A captured .gitattributes can attach a filter to an otherwise
-        // unchanged file, so changed names are insufficient. `ls-tree`
-        // enumerates every path in the exact candidate and exposes gitlinks.
         let entries = self.git_output(&["ls-tree", "-r", "-z", "--full-tree", tree_oid])?;
         let mut paths = Vec::new();
         for entry in entries
@@ -767,9 +647,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// Read the full object ID of the index tree once. Callers that run more
-    /// than one verifier can retain this identity and materialize the same
-    /// bytes for each verifier even if the source index later changes.
     pub fn staged_tree_oid(&self) -> Result<String, UpstrokeError> {
         let tree = self.git_with_private_hooks(&["write-tree"])?;
         let tree = tree.trim().to_owned();
@@ -777,10 +654,6 @@ impl Workspace {
         Ok(tree)
     }
 
-    /// A clean detached worktree whose HEAD tree is exactly the staged tree.
-    /// Kept for existing callers; new callers that need more than one snapshot
-    /// should retain `capture_candidate()` and use
-    /// `gate_snapshot_for_candidate()`.
     pub fn gate_snapshot(&self) -> Result<GateWorkspace, UpstrokeError> {
         let parent_oid = self.head_sha_full()?;
         let tree = self.staged_tree_oid()?;
@@ -795,18 +668,11 @@ impl Workspace {
         self.gate_snapshot_for_candidate(&parent_oid, &tree)
     }
 
-    /// Materialize a clean detached worktree for one exact tree object ID.
-    /// Gates run here, never in the worker's workspace, so ignored files,
-    /// build residue, and gate side-effects cannot influence or contaminate the
-    /// commit under review.
     pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, UpstrokeError> {
         let parent_oid = self.head_sha_full()?;
         self.gate_snapshot_for_candidate(&parent_oid, tree_oid)
     }
 
-    /// Materialize one frozen candidate. Both object IDs are supplied so a
-    /// concurrent ref move cannot silently change the ephemeral commit's
-    /// parent after the candidate was reviewed.
     pub fn gate_snapshot_for_candidate(
         &self,
         parent_oid: &str,
@@ -815,9 +681,6 @@ impl Workspace {
         self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &std::env::temp_dir())
     }
 
-    /// Materialize a candidate under a durable, caller-owned snapshot store.
-    /// The intent is synced before Git registers the worktree, allowing resume
-    /// to reclaim a snapshot whose owner was terminated without running Drop.
     pub fn gate_snapshot_for_candidate_in_store(
         &self,
         parent_oid: &str,
@@ -833,9 +696,6 @@ impl Workspace {
         )
     }
 
-    /// Reclaim every durable gate-worktree intent in `store`. Callers must use
-    /// the same repository that created the store; intent names contain no
-    /// path supplied by the candidate and cannot escape these fixed children.
     pub fn reclaim_gate_workspaces(&self, store: &Path) -> Result<usize, UpstrokeError> {
         let intents = store.join("intents");
         let entries = match fs::read_dir(&intents) {
@@ -957,9 +817,6 @@ impl Workspace {
         add_worktree(&pending.path, &pending.hooks_path, commit.trim())?;
         self.verify_gate_worktree(&pending.path, &pending.hooks_path)?;
 
-        // The exact path is already known to be the new worktree's top level.
-        // Avoid round-tripping it through Git's textual path output, which is
-        // not necessarily UTF-8 on Unix.
         let workspace = Workspace {
             root: pending.path.clone(),
         };
@@ -1071,8 +928,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// Prepare and pin a commit from the exact candidate identities already
-    /// used by gates and review. This never rereads the mutable index.
     pub fn prepare_commit_from_candidate(
         &self,
         branch_ref: &str,
@@ -1146,8 +1001,6 @@ impl Workspace {
         Ok(prepared)
     }
 
-    /// Commit whatever `capture_diff` staged. §14: commit-per-task,
-    /// `[upstroke] <task-id>: <title>`.
     pub fn commit(&self, message: &str) -> Result<String, UpstrokeError> {
         self.refuse_worktree_filters_before("git commit")?;
         self.git_with_private_hooks(&["commit", "-q", "-m", message])?;
@@ -1226,7 +1079,6 @@ impl Workspace {
         self.git(&["check-ref-format", branch_ref]).map(|_| ())
     }
 
-    /// Return the immediate symbolic target without dereferencing it.
     fn symbolic_ref_target(&self, refname: &str) -> Result<Option<String>, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
@@ -1300,9 +1152,6 @@ impl Workspace {
         }
     }
 
-    /// Remove a private pin for an attempt that never durably recorded a
-    /// successful settlement. The target is read then supplied as the expected
-    /// old value, so even cleanup is compare-and-swap.
     pub fn remove_orphan_prepared_pin(&self, pin_ref: &str) -> Result<(), UpstrokeError> {
         if let Some(target) = self.prepared_pin_target(pin_ref)? {
             self.prepared_update_ref(&["update-ref", "--no-deref", "-d", pin_ref, &target])?;
@@ -1369,11 +1218,6 @@ impl Workspace {
         self.remove_prepared_pin(prepared)
     }
 
-    /// Discard everything since the last commit: staged, unstaged, and
-    /// untracked (ignored files survive). This is both the §14 rollback on a
-    /// failed attempt and the post-commit scrub that keeps gate side-effects
-    /// (build artifacts, lockfile churn) from leaking into the next task's
-    /// captured diff.
     pub fn discard_uncommitted(&self) -> Result<(), UpstrokeError> {
         let tree_oid = self.git(&["rev-parse", "HEAD^{tree}"])?;
         self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
@@ -1419,10 +1263,7 @@ impl Drop for PrivateHooksDir {
 
 #[derive(Clone, Copy)]
 enum SnapshotStoreMode {
-    /// `store_or_root` is a shared parent such as the system temp directory.
-    /// Create one atomically private child and remove it after normal cleanup.
     EphemeralUnderRoot,
-    /// `store_or_root` is the stable per-run store whose intents resume scans.
     ExactDurable,
 }
 
@@ -1436,8 +1277,6 @@ struct PendingGateWorkspace {
 }
 
 impl PendingGateWorkspace {
-    /// Create a uniquely named, owner-private store beneath a caller-owned
-    /// root. The root may be shared (notably `/tmp`) and is never chmodded.
     fn create(source_root: &Path, temp_root: &Path) -> Result<Self, UpstrokeError> {
         let store = temp_root.join(format!(
             "upstroke-gate-worktrees-{}-{}",
@@ -1459,7 +1298,6 @@ impl PendingGateWorkspace {
         }
     }
 
-    /// Use the exact stable store whose synced intents resume will reclaim.
     fn create_in_store(source_root: &Path, store: &Path) -> Result<Self, UpstrokeError> {
         if store == std::env::temp_dir() {
             return Err(UpstrokeError::Git {
@@ -1670,9 +1508,6 @@ fn cleanup_gate_workspace(
             ),
         });
     }
-    // `worktree remove` normally removes the directory too. Once Git confirms
-    // no registration remains, these exact private paths are safe to remove
-    // even if a partially failed add populated only part of either one.
     let _ = fs::remove_dir_all(path);
     let _ = fs::remove_dir_all(hooks_path);
     match fs::remove_file(intent_path) {
@@ -1855,9 +1690,6 @@ mod tests {
     #[test]
     fn sparse_checkout_is_refused_before_worker_spend() {
         let repo = temp_repo("sparse-preflight");
-        // Set these in separate commands: update-index applies only the final
-        // mode option from one invocation. The combination guards against a
-        // detector accidentally keying off assume-unchanged's presentation.
         run_git(&repo, &["update-index", "--skip-worktree", "README.md"]);
         run_git(&repo, &["update-index", "--assume-unchanged", "README.md"]);
         let workspace = Workspace::open(&repo).expect("open");
@@ -1901,7 +1733,6 @@ mod tests {
         ws.discard_uncommitted().expect("discard");
         assert!(ws.is_clean().expect("clean again"));
         assert!(!repo.join("stray.txt").exists(), "untracked cleaned");
-        // core.autocrlf may legitimately restore CRLF on Windows checkouts.
         let readme = fs::read_to_string(repo.join("README.md")).expect("read");
         assert_eq!(readme.replace("\r\n", "\n"), "seed\n");
     }
@@ -1926,7 +1757,6 @@ mod tests {
         assert!(ws.is_clean().expect("clean after commit"));
         assert!(ws.capture_diff().expect("empty diff").trim().is_empty());
 
-        // What `resume` reads to recognise a commit as its own.
         let full = ws.head_sha_full().expect("full sha");
         assert_eq!(
             ws.commit_subject(&full).expect("subject"),
@@ -1963,8 +1793,6 @@ mod tests {
             "tree"
         );
 
-        // Advance the index after capture, then prove the supplied tree still
-        // materializes the first candidate rather than rereading that index.
         fs::write(repo.join("README.md"), "second candidate\n").expect("second edit");
         ws.capture_diff().expect("stage second candidate");
         let snapshot = ws
@@ -2251,7 +2079,6 @@ mod tests {
         let nested = repo.join("crates").join("inner");
         fs::create_dir_all(&nested).expect("nested dirs");
         let ws = Workspace::open(&nested).expect("open from a subdirectory");
-        // Compare canonically: temp dirs may be reached via a symlinked path.
         let expected = fs::canonicalize(&repo).expect("canonical repo");
         let actual = fs::canonicalize(ws.root()).expect("canonical root");
         assert_eq!(
@@ -2297,7 +2124,6 @@ mod tests {
     #[test]
     fn capture_diff_is_immune_to_user_diff_config() {
         let repo = temp_repo("extdiff");
-        // Simulate a user with difftastic-style config and forced color.
         let set = |k: &str, v: &str| {
             let out = Command::new("git")
                 .arg("-C")
@@ -2323,9 +2149,6 @@ mod tests {
         let repo = temp_repo("opaque-diff");
         let ws = Workspace::open(&repo).expect("open");
 
-        // A candidate controls .gitattributes. Without --binary, marking a
-        // source path -diff replaces all changed bytes with the tiny sentence
-        // "Binary files differ", which a read-only reviewer cannot recover.
         fs::write(repo.join(".gitattributes"), "hidden.rs -diff\n").expect("attributes");
         fs::write(repo.join("hidden.rs"), "fn hidden_change() {}\n").expect("hidden source");
         fs::write(repo.join("asset.bin"), b"\0opaque bytes\xff").expect("binary asset");
@@ -2401,8 +2224,6 @@ mod tests {
         assert!(error.contains("before git add"), "{error}");
         assert!(error.contains("filtered.txt"), "{error}");
 
-        // Preserve the independent post-stage guard for a caller opening an
-        // index prepared outside Workspace::capture_candidate.
         run_git(&repo, &["add", "-A"]);
         let filtered_tree = ws.staged_tree_oid().expect("filtered tree");
         fs::write(repo.join(".gitattributes"), "").expect("clear live attributes");
@@ -2426,8 +2247,6 @@ mod tests {
         ws.commit("seed unchanged file")
             .expect("commit baseline file");
 
-        // Only the attributes file changes. The filter target itself is absent
-        // from `diff --cached --name-only` but is still a gate input.
         fs::write(
             repo.join(".gitattributes"),
             "unchanged.txt filter=upstroke-test\n",
@@ -2497,9 +2316,6 @@ mod tests {
             "attribute inspection must not execute the candidate-edited filter helper"
         );
 
-        // Control: the exact raw command that capture used to run executes the
-        // fixture, proving marker absence above is suppression rather than a
-        // helper that could never run on this platform.
         run_git(&repo, &["add", "-A"]);
         assert!(repo.join("filter-ran").exists(), "raw git add ran filter");
     }
@@ -2915,9 +2731,6 @@ mod tests {
             |path, hooks_path, commit| {
                 attempted_path = Some(path.to_path_buf());
                 attempted_hooks_path = Some(hooks_path.to_path_buf());
-                // Model the dangerous failure boundary: Git has registered and
-                // populated the worktree, then the overall add operation is
-                // reported as failed (as a failing post-checkout hook did).
                 ws.add_gate_worktree(path, hooks_path, commit)?;
                 Err(UpstrokeError::Git {
                     message: "synthetic late worktree-add failure".to_owned(),
@@ -3004,22 +2817,12 @@ mod tests {
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
-        // The snapshot's *identifier*, not its path. CODING_STANDARDS.md §12:
-        // "a path is not safely a line: an ancestor may contain the delimiter,
-        // or bytes that are not text at all. Send an identifier the receiver can
-        // rejoin to a root it already knows." The parent supplied `store`, and
-        // `create_in_store_inner` puts every snapshot at `<store>/worktrees/
-        // <name>`, so the name is all the parent is missing -- and unlike the
-        // path it is `upstroke-gates-<pid>-<ulid>`, which no ancestor can spoil.
         let root = snapshot.workspace().root().to_path_buf();
         let name = root
             .file_name()
             .expect("a snapshot root is a directory in the store")
             .to_str()
             .expect("the store names snapshots with an ASCII identifier");
-        // Published last, and atomically. This used to be `fs::write` straight
-        // to `ready`, which creates the name and then fills it -- so the parent,
-        // which polls for the path and then reads it, could read nothing.
         readiness::publish(&ready, &[name]).expect("publish the snapshot identity");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
@@ -3038,9 +2841,6 @@ mod tests {
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
-        // Adopted, so a panicking assertion anywhere below still terminates and
-        // reaps this child rather than leaving it to sleep out its thirty
-        // seconds holding a registered worktree.
         let mut owner = readiness::Producer::adopt(
             Command::new(env::current_exe().expect("test executable"))
                 .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
@@ -3053,18 +2853,11 @@ mod tests {
                 .spawn()
                 .expect("spawn disposable snapshot owner"),
         );
-        // Producer-aware, and the bound is the one this test already used. The
-        // wait it replaces polled only for the path, so an owner that died
-        // before publishing -- a failed `Workspace::open`, a store the helper
-        // could not create -- was reported fifteen seconds later as a producer
-        // that had never published, which is the clock talking rather than the
-        // death (CODING_STANDARDS.md §12).
         let published = readiness::await_signal(&ready, owner.child(), Duration::from_secs(15))
             .or_fail("the snapshot owner never published readiness");
         let [name] = published.as_slice() else {
             panic!("the readiness record is one field, not {published:?}")
         };
-        // Rejoined to the root the parent already knew.
         let snapshot_path = store.join("worktrees").join(name);
         assert!(snapshot_path.exists(), "snapshot was not materialized");
         assert_ne!(
