@@ -109,7 +109,12 @@ in a `PATH` directory shadow the real `claude.exe`.
 
 Unix: the name, and nothing else.
 
-## `impl ProgramNaming` › `fn extensions(pathext: Option<&OsStr>) -> Vec<String> {`
+The name is built with `OsString::push` rather than `format!`, so the
+extension arrives as the code units [`Self::extensions`] returned. The
+program half is a `&str` and is Unicode by construction; the `PATHEXT`
+half is not, and formatting is what would have flattened it.
+
+## `impl ProgramNaming` › `fn extensions(pathext: Option<&OsStr>) -> Vec<OsString> {`
 
 `PATHEXT` as a list, or the platform default when it is unset, empty, or
 carries nothing usable.
@@ -120,7 +125,17 @@ that ends up empty falls back to the default rather than to "no
 candidates at all", because a `PATHEXT` of `;;;` is a malformed variable
 and not an instruction that this machine has no programs.
 
-## `impl ProgramNaming` › `pub(super) fn is_program(self, path: &Path) -> bool {`
+`OsString` and not `String`, because the value is a **name**, and this
+function's answer is spliced into a path that is then looked up. An
+environment variable is not required to be Unicode on either platform —
+arbitrary bytes on Unix, an unpaired surrogate on Windows — and
+`to_string_lossy` would replace exactly those units with `U+FFFD` and
+hand back a name no file has. That is the whole of `SWEEP-HOST-NAMING-002`:
+the conversion was for a diagnostic and it decided identity. The
+default list is written here as `&str` and converted, which is lossless
+because every byte of it is ASCII.
+
+## `impl ProgramNaming` › `pub(super) fn is_program(self, path: &Path) -> Result<bool, std::io::Error> {`
 
 Whether this file is one a spawn of that name would reach.
 
@@ -130,14 +145,95 @@ that stopped at it would refuse — or spawn `EACCES` — where the old code
 found the real one further along. Windows has no such bit, so existence
 is the whole question there.
 
-## `fn executable_bit(path: &Path) -> bool {`
+**Three answers, not two, and one `stat` for all three.** `Ok(false)` is
+*this file is not a program*; `Err` is *this filesystem would not say*.
+Folding the second into the first is `SWEEP-HOST-NAMING-001`: `Path::is_file`
+answers `false` for `EACCES`, `ELOOP`, `EIO` and a timed-out network
+mount exactly as it does for a name that is not there, and the caller
+then reported that nothing of that name is on the `PATH` — a definite
+statement the search had not earned. Only `NotFound` is absence; §7 says
+so in general terms, and here the two are operationally different
+things: absence continues the search, an undetermined answer is carried
+to the end of it.
 
-The execute bit, where the platform has one.
+The metadata is read **once** and every question is answered from that
+one reading. The previous shape asked twice — `Path::is_file`, then
+`fs::metadata` again inside `executable_bit` — which is a second syscall
+whose failure was discarded separately and a second answer that could
+disagree with the first if the path changed between them.
 
-## `fn executable_bit(_path: &Path) -> bool {`
+`fs::metadata` follows symlinks, as `Path::is_file` did, so a symlink to
+an executable stays a program.
+
+### Errors
+
+The `io::Error` of the `stat`, unchanged and unwrapped, for any failure
+that is not `NotFound`. This function has nothing to add to it — the
+path is the caller's, and the caller is the layer that knows the program
+name and the boundary — so it returns the error as it is rather than
+naming an operation twice.
+
+## `fn executable_bit(metadata: &std::fs::Metadata) -> bool {`
+
+The execute bit, where the platform has one, read from the caller's
+metadata rather than from a second question to the filesystem.
+
+## `fn executable_bit(_metadata: &std::fs::Metadata) -> bool {`
 
 Windows files carry no execute bit, so `ProgramNaming::Posix` degrades to
 existence when a grid drives it there. Nothing in production reaches this.
+
+## `fn pathext_entries(pathext: &OsStr) -> Vec<OsString> {`
+
+`PATHEXT`'s entries in this platform's own code units — bytes under
+`#[cfg(unix)]`, UTF-16 code units under `#[cfg(windows)]`.
+
+Two arms because the two platforms spell an `OsStr` differently and std
+offers no encoding-independent way to split one; these are the same two
+accessors `src/agent/bin.rs` uses for the same reason. There is no third
+arm: the crate's supported platforms are the three CI legs, and a target
+that is neither should fail to build here loudly rather than silently
+take a lossy path.
+
+**Each arm is a conversion and nothing else.** The grammar itself is
+[`normalised_extensions`], which is generic over the code-unit width, so
+what a Windows machine does to `PATHEXT` is decided by code the Linux
+suite executes on every run — the property this module is built around,
+and the one whose absence let `PR6D-001` ship.
+
+## `fn normalised_extensions<U>(value: &[U]) -> Vec<Vec<U>>`
+
+The `PATHEXT` grammar: split on `;`, trim, ASCII-fold, keep what is an
+extension.
+
+Generic over the code unit rather than written twice, so the two
+platforms cannot drift apart and so both instantiations are testable
+from any platform — `the_pathext_grammar_reads_the_same_over_both_code_unit_widths`
+runs the `u16` one on Linux. Every rule it applies is an ASCII rule, and
+both encodings are ASCII-transparent supersets, so the grammar never has
+to interpret a unit it cannot read: a non-ASCII unit is passed through
+untouched, which is exactly the behaviour the lossy conversion destroyed.
+
+`U: From<u8>` builds the two constants it compares against, and
+`U: TryInto<u8>` is how a unit is asked whether it is ASCII at all.
+
+## `fn ascii_trimmed<U>(entry: &[U]) -> &[U]`
+
+The entry without its surrounding ASCII whitespace.
+
+`split_first` and `split_last` rather than a range: §7's panic surface
+includes slicing, and this walks in from both ends with no index to get
+wrong.
+
+## `fn ascii_byte<U>(unit: U) -> Option<u8>`
+
+The unit as an ASCII byte, or `None` when it is not one.
+
+Not a discarded error: the `TryInto` failure means "this unit is wider
+than a byte", which together with the `is_ascii` test is a total
+classification of the unit rather than an operation that failed. Every
+rule above is stated in terms of this one question, so a non-ASCII unit
+is never whitespace, never folds, and survives verbatim.
 
 ## `pub(super) fn composed_value<'a>(`
 
@@ -182,6 +278,15 @@ alternative is handing the name to `Command` anyway and letting the spawn
 fail with a bare `NotFound` that names no boundary, which on Windows is
 precisely the failure an operator could not diagnose.
 
+[`UpstrokeError::Filesystem`] — `operation: "stat"`, the candidate path,
+and the `io::Error` as its `#[source]` — when the search matched nothing
+*and* at least one candidate could not be decided. This refusal is a
+different claim from the one above and says so: not "it is not there"
+but "this is what stopped me being able to tell". The variant carries
+the source error rather than a rendering of it, so the kind survives for
+a caller that wants to distinguish a permission problem from a broken
+mount.
+
 ## `return Ok(PathBuf::from(program));`
 
 A location, used as given — no probing, no extension, nothing this
@@ -223,3 +328,65 @@ between installations and `PATHEXT` order decides only within one
 directory. The other nesting promotes a later directory over an
 earlier installation, which is the shape the deleted
 `find_program_candidates` test pinned.
+
+## `if undetermined.is_none() {`
+
+The first candidate this filesystem would not answer for, kept in case
+the search ends with nothing.
+
+**The search continues past it, and that is the whole design decision.**
+An unreadable directory early on `PATH` is what `execvp` and
+`CreateProcessW` both walk straight past, and this function's contract
+is *which file a spawn of that name would reach* — so stopping at the
+first `EACCES` would make it disagree with the platform it models and
+refuse a `claude` that is installed, readable and two entries further
+along. A mode-0700 directory anywhere on the coordinator's own `PATH`
+would otherwise take every agent spawn down with it, which is an outage
+bought for no security: falling through to the next entry is exactly
+what the platform does, so nothing is reachable that would not have been
+reached anyway.
+
+What is *not* allowed is the old ending: claiming absence after a miss
+the search could not read. §7's rule is that only an actual not-found
+becomes absence, and that is satisfied precisely here — absence is
+reported when every miss was `NotFound`, and otherwise the first
+undetermined candidate is reported instead. The relative-`PATH`-entry
+rule above stays fail-closed because it guards a boundary; this one is
+not a boundary, it is a question the filesystem declined to answer.
+
+Only the first is kept. A second undetermined candidate adds a path to
+the diagnostic and nothing to the decision, and the error type carries
+one path.
+
+## `mod tests {`
+
+Four tests, in the file rather than in `src/runner/host/tests.rs`,
+because this module denies the three governed lints and its suite
+therefore cannot build a fixture that writes to a filesystem — every
+`std::fs` creation primitive is on `clippy.toml`'s disallowed list. All
+four are built from values instead, which is also why they are cheap
+enough to sit here.
+
+`a_candidate_this_platform_cannot_stat_is_never_reported_as_absence`
+puts an interior NUL in a `PATH` entry. Every platform rejects that
+before the syscall, with `InvalidInput` rather than `NotFound`, so the
+undetermined path is reached identically on all three legs with no
+fixture and no permission games; the test asserts the platform really
+did answer something other than `NotFound` before it asserts anything
+else, so it cannot pass vacuously.
+`a_candidate_that_is_merely_absent_is_still_absence` is its control on
+the other side of the same boundary, and each fails under the mutation
+that removes the arm it is about.
+
+`a_pathext_entry_no_string_can_carry_reaches_the_candidate_intact`
+drives `ProgramNaming::Windows` — on every platform, per the grid — with
+a `PATHEXT` entry the running platform's `OsStr` can hold and no
+`String` can: a bare `0x80` byte on Unix, an unpaired surrogate on
+Windows. It asserts the fixture is not Unicode first, then that the
+candidate carries those units with only the ASCII half folded, then that
+the lossy spelling is *not* among the candidates.
+
+`the_pathext_grammar_reads_the_same_over_both_code_unit_widths` is the
+one that makes the Windows arm honest on a Linux run: it applies
+[`normalised_extensions`] to the same input as bytes and as UTF-16 code
+units and requires the same answer.
