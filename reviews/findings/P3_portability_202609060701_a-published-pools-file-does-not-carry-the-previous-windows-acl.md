@@ -4,8 +4,8 @@ severity: P3
 disposition: deferred
 category: portability
 pr: 189
-reviewed_sha: cda6f4635bf1fb8de04d0d15e2e4b329d28a6240
-location: src/connect.rs:265
+reviewed_sha: 45bb0725d9420226cd6e2a7f386a16250b46f913
+location: src/connect.rs:317
 provenance: introduced_by_feature
 first_bad: f658080c
 guard: deferred: `the_mode_an_operator_gave_their_pools_file_survives_a_forced_rewrite` is the Unix half and runs under `#[cfg(unix)]`; the Windows half has no witness here because there is nothing yet to witness, and the notes state the limitation rather than claiming the guarantee

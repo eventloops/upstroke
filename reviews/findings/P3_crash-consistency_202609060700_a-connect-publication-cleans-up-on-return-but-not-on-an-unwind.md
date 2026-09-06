@@ -4,8 +4,8 @@ severity: P3
 disposition: deferred
 category: crash-consistency
 pr: 189
-reviewed_sha: cda6f4635bf1fb8de04d0d15e2e4b329d28a6240
-location: src/connect.rs:199
+reviewed_sha: 45bb0725d9420226cd6e2a7f386a16250b46f913
+location: src/connect.rs:208
 provenance: introduced_by_feature
 first_bad: f658080c
 guard: deferred: `an_unwinding_publication_leaves_the_operators_file_byte_for_byte_intact` pins the property that matters (the destination is untouched) on this path; the leftover itself is unpinned deliberately, so that a later Drop guard is not a test to rewrite
