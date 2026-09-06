@@ -284,12 +284,6 @@ settled away, so both mean the run stopped before this task got
 its turn. On a live one `settle` leaves them alone, and the
 attempt record says which of the two it is.
 
-## `TaskState::Deferred | TaskState::Pending => match &progress.in_flight {`
-
-
-
-## `TaskState::Deferred | TaskState::Pending => match &progress.in_flight {`
-
 Every arm here is about a run that is still going, which is why
 both are guarded. `Running` says of itself that only a live
 `status` produces it, and a dangling `in_flight` on an ended run
@@ -384,12 +378,6 @@ cannot see that — a killed run has nothing halted, no budget stop and
 nothing parked, which reads as `Complete` — so it used to print `run
 complete: N task(s) committed` about a run that died mid-attempt,
 one line above `status`'s own `state: interrupted`.
-
-## `if self.interrupted {`
-
-
-
-## `if self.interrupted {`
 
 "So far" is the live line's word on purpose: more may yet come, once
 somebody resumes. Which is also why the resume command is not

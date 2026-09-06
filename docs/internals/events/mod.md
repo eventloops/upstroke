@@ -99,20 +99,20 @@ rewritten from an older schema. Schema-1 binaries fail on the unknown
 event tag; schema-2 binaries understand the tag but reject a transition
 to schema 3 before they can apply the old partial-review contract.
 
-## `#[serde(default, skip_serializing_if = "Option::is_none")]`
+## `AttemptFinished { .. }` › `parking: Option<Box<AttemptParking>>,`
 
 A policy refusal that must finish the paid attempt and park the
 task atomically. Without this, a crash between `attempt_finished`
 and the separate question/parking events can replay the task as
 pending and pay for the same known-unreviewable attempt again.
 
-## `#[serde(default, skip_serializing_if = "Option::is_none")]`
+## `AttemptFinished { .. }` › `transition: Option<Box<AttemptTransition>>,`
 
 The ladder decision caused by this failed attempt. It is part of
 the same durable append as the attempt record: a crash must not
 replay a known failure as pending work on its old rung.
 
-## `#[serde(default, skip_serializing_if = "Option::is_none")]`
+## `AttemptFinished { .. }` › `prepared_commit: Option<Box<PreparedCommit>>,`
 
 The exact commit object prepared from the reviewed index for a
 successful attempt. Creating the object does not move a ref; the
@@ -209,7 +209,7 @@ record survives the repo moving.
 Content hash of the plan text (`ir::content_hash`). A run is bound to
 the plan it froze; a different hash means the task graph moved under it.
 
-## `#[serde(default, skip_serializing_if = "Option::is_none")]`
+## `pub struct RunStarted` › `pub normalized_plan_digest: Option<String>,`
 
 Digest of the exact bytes written to `plan.normalized.json`.
 
@@ -229,7 +229,7 @@ The resolved chain per task, in plan order. Recorded so resume can tell
 that config moved: `Progress.rung` is an index into this chain, and
 re-resolving a different one would silently point it at another tier.
 
-## `#[serde(default)]`
+## `pub struct RunStarted` › `pub effort_policy: Option<ResolvedEffortPolicy>,`
 
 The concrete effort standard this run resolved at pre-flight.
 
@@ -239,7 +239,7 @@ of a resumed run think harder or less hard than the front half. `None`
 means a legacy log predating this record; its first resume re-derives,
 warns, and establishes the value in [`RunResumed::effort_policy`].
 
-## `#[serde(default)]`
+## `pub struct RunStarted` › `pub gate_cmds: Option<Vec<GateSummary>>,`
 
 The effective gates in full, as the run resolved them at pre-flight —
 **the gates a resume runs**, not merely a fingerprint it compares.
@@ -266,7 +266,7 @@ exactly as an absent `reviews` does. Pure addition otherwise:
 `#[serde(default)]` folds an old log to the state it always had, so
 `SCHEMA_VERSION` does not move.
 
-## `#[serde(default)]`
+## `pub struct RunStarted` › `pub reviews: Option<crate::review::ReviewPlan>,`
 
 Who judges this run's code (§11.2–§11.3), resolved at pre-flight.
 
@@ -287,7 +287,7 @@ finish the run with verification silently switched off (step-6 finding
 
 One task's resolved escalation chain, as it stood when the run started.
 
-## `#[serde(default)]`
+## `pub struct ChainSummary` › `pub bindings: Option<Vec<BindingSummary>>,`
 
 The exact binding each rung resolved to at pre-flight, aligned with
 `tiers`. `None` means a schema-1 log predating this snapshot; its first
@@ -326,13 +326,13 @@ builds on.
 
 Attempts that were in flight when the previous process died.
 
-## `#[serde(default)]`
+## `pub struct RunResumed` › `pub discarded: Vec<String>,`
 
 Uncommitted paths this resume threw away: a dead agent's half-written
 edits (§14). Recorded rather than only warned about, so someone reading
 the run tomorrow can still see that work was discarded and what it was.
 
-## `#[serde(default)]`
+## `pub struct RunResumed` › `pub gates: Option<Vec<GateSummary>>,`
 
 The gates this resume **established**, for a run whose log had none.
 
@@ -355,7 +355,7 @@ worth warning about rather than a silent new standard.
 Folds to no state, like `capacity_snapshot`: its reader is the *next*
 resume, which takes it from the log directly ([`recorded_gates`]).
 
-## `#[serde(default)]`
+## `pub struct RunResumed` › `pub effort_policy: Option<ResolvedEffortPolicy>,`
 
 The effort policy established by the first resume of a legacy log.
 
@@ -363,7 +363,7 @@ Current runs record this on `run_started`, so ordinary resumes leave it
 `None`. Once an old log establishes a value here, later resumes use the
 first recorded value and never re-derive it again.
 
-## `#[serde(default)]`
+## `pub struct RunResumed` › `pub reviews: Option<crate::review::ReviewPlan>,`
 
 The review plan established by the first current-binary resume of a
 legacy log.
@@ -374,13 +374,13 @@ every later resume silently adopt a different reviewer or timeout.
 The first resume therefore appends the plan it established; later
 resumes read the first recorded value and leave this `None`.
 
-## `#[serde(default)]`
+## `pub struct RunResumed` › `pub chains: Option<Vec<ChainSummary>>,`
 
 The resolved chain bindings established by the first schema-2 resume of
 a schema-1 log. Current runs carry them on `run_started`; later resumes
 use the first recorded snapshot and leave this `None`.
 
-## `#[serde(default, skip_serializing_if = "Option::is_none")]`
+## `pub struct RunResumed` › `pub normalized_plan_digest: Option<String>,`
 
 Exact normalized-plan byte digest established by the first schema-3
 resume of a legacy run. Current runs carry it in `run_started`, and
@@ -390,24 +390,24 @@ subsequent resumes leave this absent so the first authority wins.
 
 A schema transition appended to an old run without rewriting its beginning.
 
-## `#[serde(default)]`
+## `pub struct AttemptStarted` › `pub adapter: Option<String>,`
 
 Adapter id used for this attempt. `agent` remains for wire compatibility.
 
-## `#[serde(default)]`
+## `pub struct AttemptStarted` › `pub preflight_cli_version: Option<String>,`
 
 CLI version observed during pre-flight; this is not a per-attempt probe.
 
-## `#[serde(default)]`
+## `pub struct AttemptStarted` › `pub effort: Option<Effort>,`
 
 Resolved effort passed to the adapter.
 
-## `#[serde(default)]`
+## `pub struct AttemptStarted` › `pub selection_origin: Option<SelectionOrigin>,`
 
 Why this binding was selected. `None` means an old log did not record
 this fact; `unknown` deliberately is not a value writers can emit.
 
-## `#[serde(default)]`
+## `pub struct AttemptStarted` › `pub pool: Option<String>,`
 
 The capacity pool this attempt draws on (§13), recorded before the
 spawn so an attempt the engine died inside can still be attributed: it
@@ -424,7 +424,7 @@ One attempt's ledger line: which rung it ran on, what it cost, and what
 went wrong. Shared by the log and `report.json` so the ledger has exactly
 one shape.
 
-## `#[serde(default)]`
+## `pub struct AttemptRecord` › `pub pool: Option<String>,`
 
 Which capacity pool this attempt drained (§13), where the pools file
 names one for its agent. Pure addition: `#[serde(default)]` means a log
@@ -435,7 +435,7 @@ which is why `SCHEMA_VERSION` did not move for it.
 
 Whether this attempt resumed the previous one's session (§11.4).
 
-## `#[serde(default)]`
+## `pub struct AttemptRecord` › `pub reviews: Vec<ReviewRecord>,`
 
 The review passes that actually ran, in order (§11.3). Empty when the
 gates failed first and nothing was reviewed.
@@ -446,7 +446,7 @@ second-opinion verdict has to be attributable to the model that gave it.
 Logs written before step 9 read back with this empty — their review
 spend does not replay, which is the price of the shape being right.
 
-## `#[serde(default)]`
+## `pub struct AttemptRecord` › `pub usage: Option<crate::ir::Usage>,`
 
 Token accounting as the CLI reported it, where it reports any.
 
@@ -556,19 +556,19 @@ One review pass's ledger line (§11.2–§11.3).
 
 The lens that ran — `review` or `second-opinion`.
 
-## `#[serde(default)]`
+## `pub struct ReviewRecord` › `pub adapter: Option<String>,`
 
 Adapter id used for this pass. `agent` remains for wire compatibility.
 
-## `#[serde(default)]`
+## `pub struct ReviewRecord` › `pub preflight_cli_version: Option<String>,`
 
 CLI version observed during pre-flight; this is not a per-pass probe.
 
-## `#[serde(default)]`
+## `pub struct ReviewRecord` › `pub effort: Option<Effort>,`
 
 Resolved review effort passed to the adapter.
 
-## `#[serde(default)]`
+## `pub struct ReviewRecord` › `pub pool: Option<String>,`
 
 Which capacity pool this pass drained (§13). A cross-vendor second
 opinion draws on a *different* subscription than the implementer, so a
@@ -603,7 +603,7 @@ ledger is what a person reads when deciding whether to trust a run.
 
 Rate-limited, timed out, or otherwise never reached a verdict.
 
-## `#[serde(default)]`
+## `pub struct FailureRecord` › `pub detail: Option<String>,`
 
 What the next attempt is told, verbatim — §11.4's feedback.
 
@@ -891,12 +891,6 @@ task is a resume refusal, caught before this is ever reached.
 
 Metadata for the reader; contributes no task state.
 
-## `EventBody::RunStarted { .. }`
-
-
-
-## `EventBody::RunStarted { .. }`
-
 `capacity_snapshot` and `pool_exhausted` sit here for opposite
 reasons. The snapshot folds to nothing because nothing routes on
 capacity in v0.1 (§13 read-only) — state it produced would be
@@ -950,12 +944,6 @@ and really drained a pool, and a ledger that hides that is lying
 judged the code. That is the rule §19 applies to an outage and
 step 7 applies to a worker that stopped to ask.
 
-## `EventBody::AttemptInterrupted { task, data, .. } => {`
-
-
-
-## `EventBody::AttemptInterrupted { task, data, .. } => {`
-
 `attempts` is deliberately not rolled back: it numbers this
 task's artifacts, and reusing the interrupted attempt's number
 would overwrite its transcript with the retry's.
@@ -1008,12 +996,6 @@ from a person, and it takes precedence over your earlier
 assumptions" — handing a coding agent a billing decision as task
 guidance.
 
-## `let canned = self.questions[position]`
-
-
-
-## `let canned = self.questions[position]`
-
 The same objection applies to any canned option, whatever the
 kind, and for a reason the first version of this missed: the
 options are the engine's instructions *to the operator*, not the
@@ -1025,12 +1007,6 @@ decisions were routed to the judge, reached the reviewer as "a
 decision from a person… a change that departs from it is a defect
 however well argued". A judge grading a diff against meta-UI text
 can only reject it, every attempt, until the ladder runs out.
-
-## `let canned = self.questions[position]`
-
-
-
-## `let canned = self.questions[position]`
 
 An operator's own words are guidance. A label they picked off a
 list is the un-park, and nothing more.
