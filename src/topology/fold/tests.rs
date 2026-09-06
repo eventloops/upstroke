@@ -6191,6 +6191,176 @@ fn a_rejection_creates_or_widens_exactly_one_lineage_and_registers_its_repair() 
             })
     );
     assert!(ready.transaction().is_none());
+
+    apply(
+        &mut ready,
+        &ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key: TaskKey(3),
+                generation: GenerationId(0),
+                base_sha: base.clone(),
+                worktree_path: "/private/workspaces/tasks/k3-g0".to_owned(),
+                lease: LeaseGrant::InheritedLineage { root: MID },
+                source_candidate: Some(candidate_of(MID, 0)),
+            },
+        }),
+    );
+    let repair_start = ev(TopologyEventBody::AttemptStarted {
+        data: AttemptStarted4 {
+            key: TaskKey(3),
+            generation: GenerationId(0),
+            attempt: AttemptNumber(1),
+            rung: 0,
+            binding: frozen_binding(&ready, TaskKey(3), 0),
+            pool: Some("codex-plus".to_owned()),
+            resume_session: None,
+            materialization_observed: Some(Materialization::Clean),
+        },
+    });
+    apply(&mut ready, &repair_start);
+    let mut repair_prepared = candidate_prepared(TaskKey(3), 0, &base);
+    if let TopologyEventBody::CandidatePrepared { data } = &mut repair_prepared.body {
+        data.lease_effect = CandidateLeaseEffect::WidensLineage {
+            root: MID,
+            paths: region(TaskKey(3)),
+        };
+    }
+    apply(&mut ready, &repair_prepared);
+    apply(&mut ready, &candidate_created(TaskKey(3), 0));
+    apply(
+        &mut ready,
+        &verification_started(TaskKey(3), 0, 2, &head, &proposal),
+    );
+
+    let second_repair = |lineage: Lineage| {
+        let mut spawn = repair_spawn(TaskKey(4), MID, TaskKey(3));
+        spawn.entry.deps = vec![ALPHA];
+        spawn.entry.display_deps = vec![TaskId::from("alpha")];
+        spawn.entry.display_id = TaskId::from(
+            crate::topology::registry::repair_display_id(1, &TaskId::from("alpha")).as_str(),
+        );
+        spawn.entry.lineage = Some(lineage);
+        spawn
+    };
+    let widening = |mutate: Option<BreakRejection>| {
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(2),
+            candidate: candidate_of(TaskKey(3), 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: second_repair(Lineage {
+                root: MID,
+                parent: TaskKey(3),
+                index: 1,
+            }),
+            lease_effect: RejectionLeaseEffect::WidensLineage {
+                root: MID,
+                paths: region(TaskKey(3)),
+            },
+        };
+        if let Some(mutate) = mutate {
+            mutate(&mut rejected);
+        }
+        ev(TopologyEventBody::MergeRejected {
+            data: Box::new(rejected),
+        })
+    };
+
+    let rooted_elsewhere = refuse(
+        &ready,
+        &widening(Some(|rejected| {
+            rejected.lease_effect = RejectionLeaseEffect::WidensLineage {
+                root: ZETA,
+                paths: region(TaskKey(3)),
+            };
+        })),
+    );
+    let FoldError::InconsistentRecord { kind, detail } = rooted_elsewhere else {
+        panic!("a widening rooted elsewhere must return a contextual record refusal");
+    };
+    assert_eq!(kind, "merge_rejected");
+    assert!(
+        detail.contains(&format!(
+            "it widens lineage {ZETA} and the rejected task descends from {MID}"
+        )),
+        "{detail}"
+    );
+
+    let renumbered = refuse(
+        &ready,
+        &widening(Some(|rejected| {
+            rejected.repair.entry.lineage = Some(Lineage {
+                root: MID,
+                parent: TaskKey(3),
+                index: 0,
+            });
+        })),
+    );
+    let FoldError::InconsistentRecord { kind, detail } = renumbered else {
+        panic!(
+            "a repair numbered as the first member again must return a contextual record \
+             refusal"
+        );
+    };
+    assert_eq!(kind, "merge_rejected");
+    assert!(
+        detail.contains("the repair is the #1 member of lineage")
+            && detail.contains("records index 0"),
+        "{detail}"
+    );
+
+    let creates_on_member = refuse(
+        &ready,
+        &widening(Some(|rejected| {
+            rejected.lease_effect = RejectionLeaseEffect::CreatesLineage {
+                root: TaskKey(3),
+                paths: region(TaskKey(3)),
+            };
+        })),
+    );
+    let FoldError::InconsistentRecord { kind, detail } = creates_on_member else {
+        panic!("a `CreatesLineage` on a lineage member must return a contextual record refusal");
+    };
+    assert_eq!(kind, "merge_rejected");
+    assert!(
+        detail.contains(
+            "a rejection creates a lineage from an ordinary candidate and widens the lineage of \
+             a member"
+        ),
+        "{detail}"
+    );
+
+    apply(&mut ready, &widening(None));
+    assert_eq!(
+        ready.task_state(TaskKey(3)),
+        Some(TaskState::AwaitingRepair)
+    );
+    assert_eq!(ready.task_state(TaskKey(4)), Some(TaskState::Pending));
+    assert!(
+        ready
+            .queue()
+            .expect("started")
+            .get(TaskKey(3), GenerationId(0))
+            .is_none()
+    );
+    assert!(
+        ready
+            .leases()
+            .expect("started")
+            .holds(LeaseOwner::Lineage { root: MID })
+    );
+    assert!(
+        !ready
+            .leases()
+            .expect("started")
+            .holds(LeaseOwner::Candidate {
+                key: TaskKey(3),
+                generation: GenerationId(0)
+            })
+    );
+    assert!(ready.transaction().is_none());
 }
 
 #[test]
