@@ -70,40 +70,72 @@ than left standing: the `m4-workspace` split added \
 commit, so this file is now graded against all three governed lints and named \
 in the domain individually. The level below is unchanged; what changed is that \
 a gate now checks it. \
-THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. These same bodies made these same \
-calls inside `src/workspace_manager.rs`, under that file's own inner allow of \
-all three lints; this row allows TWO of that three, so it is a strict subset \
-and the move changes where the level is stated, not what it permits. \
-WHAT IT NEEDS EACH FOR, measured at extraction by denying all three and \
-counting the errors: `clippy::disallowed_methods`, 15 sites -- it builds and \
-tears down the scratch repositories the suites measure against \
-(`fs::create_dir_all` 5, `fs::write` 4, `fs::remove_dir_all` 2, \
-`fs::remove_file` 1) and runs real children (`Command::output` 1, \
-`Command::status` 1, `Command::spawn` 1), because no funnel owns `git init` and \
-a fixture that never runs `git` builds no repository to measure; \
+THE ALLOWANCE IS NOT WIDER THAN WHAT MOVED. At extraction these same bodies \
+made these same calls inside `src/workspace_manager.rs`, under that file's own \
+inner allow of all three lints. The bodies are no longer byte-identical -- the \
+sweep of this file changed them and the counts below are re-measured -- but the \
+LEVEL is what this clause is about, and it is unchanged: TWO of that three, a \
+strict subset of the parent's allow, so the move still changes where the level \
+is stated and not what it permits. \
+WHAT IT NEEDS EACH FOR, re-measured at the head this row describes by \
+flipping this file's `allow` to `deny` and counting the errors -- the command \
+is in the pull request body, so the numbers can be regenerated rather than \
+trusted: `clippy::disallowed_methods`, 18 sites -- it builds and tears down \
+the scratch repositories the suites measure against (`fs::create_dir_all` 5, \
+`fs::write` 4, `fs::remove_dir_all` 2, `fs::set_permissions` 2, \
+`fs::remove_file` 1), runs real children (`Command::output` 1, \
+`Command::spawn` 1, `Command::status` 1), and asks the operating system \
+whether one of them is still there (`libc::kill` 1, signal 0, in the \
+`#[cfg(unix)]` test that witnesses `KillableGitChild`'s drop), because no \
+funnel owns `git init` and a fixture that never runs `git` builds no \
+repository to measure; \
 `clippy::disallowed_types`, 3 sites, every one `std::process::Command`. \
+AT EXTRACTION THE COUNT WAS 15, AND AN EARLIER ROUND OF THIS SWEEP RECORDED \
+23 THAT WAS NEVER RE-MEASURED AFTER THE CODE CHANGED UNDER IT -- the pass-2 \
+reviewer caught that, and the numbers above are the measurement rather than an \
+estimate. What moved since extraction: `Command::status` is the kill \
+child's again, after a bounded-capture rewrite that used `Command::spawn` was \
+withdrawn under the third pass; the scratch tree's creation and removal are \
+back in this file too, after the §8 token that had taken them into \
+`rundir::scratch_tree` was withdrawn under the fourth; and the tests this file \
+now carries account for the two `fs::set_permissions`, the one `libc::kill` and \
+one of the `Command::spawn` sites. \
 `clippy::disallowed_macros` is RE-DENIED here rather than inherited -- measured \
 at zero sites, and the two `#[cfg(windows)]` bodies a Unix host cannot measure \
 are `ExitStatus` arithmetic naming no macro -- so a `println!` here is still a \
 build error. \
-CONTAINMENT, STATED AS IT IS. Every write and every directory creation is under \
-a root from `scratch`, which is `std::env::temp_dir()` joined with a name \
-carrying the tag, the process id and a per-call ordinal, and `Fixture::drop` \
-removes its own root. Two effects are NOT confined to that root, and they are \
-named rather than elided: `scratch` opens with `let _ = \
-fs::remove_dir_all(&dir)` on that predictable path, so a process-id collision \
-after a crashed run can delete a stale tree this call did not create; and \
-`run_kill_child` re-execs THIS test binary `--exact --ignored` while `git_out` \
-and `KillableGitChild::spawn` run the system `git` in a caller-supplied \
-directory. Both bodies are byte-identical to what already ran inside the parent. \
+CONTAINMENT, STATED AS IT IS, WHICH IS NARROWER THAN IT READS. Most of this \
+module's writes and directory creations are under a root from `scratch`, which \
+is `std::env::temp_dir()` joined with a name carrying the tag, the process id \
+and a per-call ordinal, and `Fixture::drop` removes that root. NOT ALL OF THEM, \
+and the exceptions are named rather than covered by the sentence: `write_file` \
+and `create_dir` write wherever their caller points them, and callers do point \
+them elsewhere -- `effects/attempt-residue-histogram.json` through the first, \
+and `src/engine/topology/scaffold.rs`'s own tag-and-pid `kill_dir` through the \
+second. So this is a property of the callers and not of the types, and no token \
+is issued or checked; `reviews/FINDINGS.md` carries it as a deferred row for the \
+sweep of `src/workspace_manager.rs`. THE REMOVALS ARE NOT TOKEN-CARRIED EITHER. \
+`scratch` pre-cleans a predictable path before acquiring anything, and \
+`Fixture::drop` removes a root it cannot prove it owns -- §8 requires both to \
+carry the `cfg(test)` scratch-tree token, and the pull request that swept this \
+file tried three shapes for that and withdrew all three, because a fixture \
+adopted from another process's tree can hold no token and every substitute \
+either deleted a tree it did not own or leaked one per kill test. That finding \
+is in the ledger with the analysis. Beyond the root, `run_kill_child` re-execs \
+THIS test binary `--exact --ignored`, and `git_out` and \
+`KillableGitChild::spawn` run the system `git` in a caller-supplied directory -- \
+with the environment cleared and rebuilt from an allowlist, so an ambient \
+`GIT_DIR` cannot move the effect into a repository nobody named (measured, git \
+2.43.0). \
 HANDLES, PRECISELY, because a blanket claim here would be false: no item returns \
 a `File`, an `OpenOptions` or a `Command`, but one DOES hand back a live process \
 handle and it is named rather than covered. `KillableGitChild::spawn` returns a \
 `pub(crate)` type owning a `std::process::Child`, because the residue kill \
 sampler has to kill a real `git` at a chosen instant and a handle it cannot \
 reach is a kill it cannot time. Its `child` field is private, it exposes only \
-`kill`, `exited`, `wait` and `fired`, and the whole module is `#[cfg(test)]` so \
-the type is not in the rlib at all. \
+`kill`, `exited`, `wait`, `fired` and `id`, it kills and reaps the child in its \
+own `Drop` because `std::process::Child` does neither, and the whole module is \
+`#[cfg(test)]` so the type is not in the rlib at all. \
 Recorded here rather than left inherited, so the scope is a reviewed artifact \
 rather than an accident of the module tree."""
 
@@ -131,8 +163,9 @@ site-taking APIs and plants the residue and the husks they are meant to find \
 sites, every one `std::process::Command`; `clippy::disallowed_macros`, 3 \
 sites, every one `std::println` in a diagnostic. \
 CONTAINMENT, STATED AS IT IS. The filesystem effects are under roots \
-`fixture::scratch` minted, with the predictable-path pre-clean that row \
-describes; the process effects are the system `git` and re-execs of this test \
+`fixture::scratch` minted, whose predictable tag-and-pid name and pre-clean \
+that row describes and whose §8 finding is in the ledger, the token that would \
+have closed it having been withdrawn after four passes; the process effects are the system `git` and re-execs of this test \
 binary. HANDLES: nothing in this file is `pub` or `pub(crate)` at all, so \
 nothing crosses the module boundary; the one type owning a live \
 `std::process::Child` -- `SampledChild`, the kill sampler's handle -- is \

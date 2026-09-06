@@ -7455,13 +7455,16 @@ fn a_kill_at_id_unread_aborts_before_the_id_is_recorded() {
     );
     // **And it must be an abort by this platform's own measure, not merely
     // an exit that is neither success nor a panic** (PR #136 pass 2,
-    // finding 2). `died_by_abort` names `SIGABRT` on Unix, but on Windows it
-    // is a negation — unsuccessful and not the panic's 101 — because
-    // `abort()` reaches `__fastfail`, whose code has moved between CRT
-    // versions and so cannot be written down. A negation accepts far too
-    // much: change only the Windows arm of `Injection::Kill` from `abort()`
-    // to `process::exit(1)` and the helper still dies at `IdUnread`, still
-    // leaves the object, and still satisfies every assertion here.
+    // finding 2). `died_by_abort` names `SIGABRT` on Unix; on Windows it was
+    // a negation — unsuccessful and not the panic's 101 — because `abort()`
+    // reaches `__fastfail`, whose code has moved between CRT versions and so
+    // cannot be written down. A negation accepts far too much: change only
+    // the Windows arm of `Injection::Kill` from `abort()` to
+    // `process::exit(1)` and the helper still dies at `IdUnread`, still
+    // leaves the object, and still satisfies every assertion here. PR #135
+    // took that finding into `fixture.rs` and replaced the negation with the
+    // same measurement this test uses; the comparison below stays, because it
+    // is what pins the property here rather than in the predicate.
     //
     // What cannot be written down can still be **measured**. This runs one
     // child whose whole body is `std::process::abort()`, on this machine and
