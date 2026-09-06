@@ -28,7 +28,14 @@ compiler.
 Lints:
 
 - Lint levels are repository policy and live only in `Cargo.toml`'s `[lints]` tables. A crate-root
-  `#![allow]` or `#![deny]` does not change policy.
+  `#![allow]` or `#![deny]` does not loosen or narrow a lint `[lints]` already governs. This does
+  not cover a module-level `#![deny]` that activates a lint `[lints]` does not yet govern, ahead of
+  the crate-wide entry `standards/SWEEP.md`'s activation rule says is owed once a file is swept
+  (`src/validate/graph.rs`'s `clippy::indexing_slicing`/`clippy::unreachable`, §7) — that file is
+  stricter than the rest of the tree until the transitional wording retires, which is the point of
+  a per-file activation, not a policy this bullet forbids. Nor does it cover `clippy.toml`'s
+  `disallowed-*` census, which is enforced only through the module-level attributes the next bullet
+  describes.
 - Fix warnings at their cause. A suppression is as narrow as practical and says why. Prefer
   `#[expect(lint, reason = "…")]`, which retires itself when its cause goes; it only works on a leg
   that compiles the region and promotes warnings to errors (§11).
