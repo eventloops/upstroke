@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sourcemaps/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/sourcemaps/upstroke/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/upstroke.svg)](https://crates.io/crates/upstroke)
-[![license](https://img.shields.io/github/license/eventloops/upstroke.svg)](LICENSE)
+[![license](https://img.shields.io/github/license/sourcemaps/upstroke.svg)](LICENSE)
 
 A headless orchestration engine for AI coding agents. You and a frontier model design a piece of
 work; `upstroke` executes the plan unattended: it turns the plan into a dependency graph of typed
