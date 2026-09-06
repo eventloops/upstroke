@@ -333,17 +333,38 @@ selects `proc_find_zombref`, which finds a process that has started
 exiting and not yet been reaped. A short read is `EIO`, a failed one its
 errno.
 
+## `const EXIT_PROBE_INTERVAL: Duration = Duration::from_millis(5);`
+
+The resolution of the bound below, not a sleep standing in for a signal.
+The exit is still what ends the wait: the first question is asked before
+any sleep, so a child that has already exited is reported without one,
+and the last sleep is clamped to what is left of the budget rather than
+overrunning it.
+
 ## `pub(crate) fn await_exit_without_reaping(pid: u32, budget: Duration) -> Result<(), String> {`
 
-Blocks until the child has exited, leaving it a zombie for its owner to
-reap: `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a helper thread, the
-result handed back over a channel with `recv_timeout(budget)`. The exit
-itself is the signal, so no test sleeps to guess at it; the budget bounds
-a wedged child, not a healthy one. On a timeout the thread stays in its
-wait until the caller kills and reaps the child, which ends it with
-`ECHILD`; its `send` then finds no receiver, and that discarded result is
-the whole of its failure path. The one caller of that path kills, waits
-and panics with the budget.
+Waits until the child has exited, leaving it a zombie for its owner to
+reap. It asks `exited_unreaped` — `waitid(P_PID, pid, WEXITED | WNOHANG |
+WNOWAIT)`, the supervisor loop's own question — every
+`EXIT_PROBE_INTERVAL` until the answer is yes or the budget is spent. The
+budget bounds a wedged child, not a healthy one, and an `EINTR` is an
+interrupted question rather than an answer, so it is asked again.
+
+NO THREAD, WHICH IS THE POINT. `PR173-EXIT-WAITER-THREAD-DETACHED`: the
+first shape blocked in `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a helper
+thread whose `JoinHandle` it dropped, and bounded only the receiver's
+`recv_timeout`. After the budget the caller returned while the helper
+stayed in its wait, unjoined and unobservable — §10's "a detached thread
+nobody observes is the worker that dies without a report" — and it ended
+only when the owner's reap turned the wait into `ECHILD`, which is exactly
+what a child wedged in an uninterruptible kernel wait never allows. Of the
+two repairs the finding offered, this is the second: `waitid` has no
+bounded form, so returning the `JoinHandle` would only have converted a
+leaked thread into a join that blocks for as long as the reap does. A poll
+of a question that never blocks bounds the call itself, and there is no
+worker left to join. `agent::proc::tests::
+a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child`
+is the witness, and it fails on the shape above.
 
 ## `fn exited_unreaped(pid: libc::id_t) -> std::io::Result<bool> {`
 

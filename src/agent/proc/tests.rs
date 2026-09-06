@@ -349,6 +349,15 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
     );
 }
 
+/// The bound every body here gives a child to exit, and the bound
+/// `ReapedChild::settle` gives a killed one to become reapable.
+///
+/// It bounds a wedged child rather than timing a healthy one: every wait it
+/// bounds follows a `close_stdin` or a `kill`, so the wait is milliseconds
+/// long when nothing is wrong.
+#[cfg(unix)]
+const EXIT_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 struct ReapedChild {
     pid: u32,
@@ -387,14 +396,68 @@ impl ReapedChild {
             ))),
         }
     }
+
+    /// Kill the child and reap it within `EXIT_WAIT_BUDGET`, REPORTING the
+    /// outcome of both instead of discarding them.
+    ///
+    /// The bound is what makes this callable from a body that is already
+    /// failing: the reap runs only once `await_exit_without_reaping` has SEEN
+    /// the exit, so a child wedged in an uninterruptible kernel wait leaves a
+    /// zombie and a report rather than blocking the harness in a `wait` with
+    /// no bound (`PR173-EXIT-WAITER-THREAD-DETACHED`).
+    fn settle(&mut self) -> Result<String, String> {
+        let pid = self.pid;
+        let Some(mut child) = self.child.take() else {
+            return Ok(format!("pid {pid} had already been reaped"));
+        };
+        // A child that exited on its own is still an unreaped zombie here, so
+        // `kill` reaches it; `ESRCH` is nevertheless the expected answer rather
+        // than a failure if the platform has already released the record.
+        let killed = match child.kill() {
+            Ok(()) => "kill signalled".to_owned(),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                "kill answered ESRCH, so the child was already gone".to_owned()
+            }
+            Err(error) => return Err(format!("cleanup of pid {pid}: kill failed: {error}")),
+        };
+        if let Err(reason) = await_exit_without_reaping(pid, EXIT_WAIT_BUDGET) {
+            return Err(format!(
+                "cleanup of pid {pid}: {killed}, but the exit was never observed, so the child \
+                 was left unreaped rather than waited on without a bound: {reason}"
+            ));
+        }
+        match child.wait() {
+            Ok(status) => Ok(format!("cleanup of pid {pid}: {killed}, reaped {status:?}")),
+            Err(error) => Err(format!(
+                "cleanup of pid {pid}: {killed}, the exit was observed, but the reap failed: \
+                 {error}"
+            )),
+        }
+    }
+
+    /// `settle`, flattened for a message that carries the report either way.
+    fn settle_report(&mut self) -> String {
+        self.settle().unwrap_or_else(|failure| failure)
+    }
 }
 
 #[cfg(unix)]
 impl Drop for ReapedChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if self.child.is_none() {
+            return;
+        }
+        // A `Drop` has nowhere to report to except a failure of its own, and it
+        // must not raise one while an unwind is already under way. Every body
+        // that can reach the failing wait settles EXPLICITLY and puts the
+        // report in its own message; this is the last resort for the paths that
+        // do not, and a cleanup failure with nothing else failing is the
+        // abandoned child the type exists to prevent.
+        if let Err(failure) = self.settle() {
+            assert!(
+                std::thread::panicking(),
+                "a child was abandoned and nothing else had failed: {failure}"
+            );
         }
     }
 }
@@ -433,8 +496,9 @@ fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
     );
 
     child.close_stdin();
-    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-        panic!("{reason}");
+    if let Err(reason) = await_exit_without_reaping(pid, EXIT_WAIT_BUDGET) {
+        let settled = child.settle_report();
+        panic!("{reason}; {settled}");
     }
 
     let exited = observe_child_group(pid);
@@ -486,8 +550,9 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
     );
 
     child.close_stdin();
-    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-        panic!("{reason}");
+    if let Err(reason) = await_exit_without_reaping(pid, EXIT_WAIT_BUDGET) {
+        let settled = child.settle_report();
+        panic!("{reason}; {settled}");
     }
 
     let exited = observe_child_group(pid);
@@ -521,8 +586,9 @@ fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {
     let pid = child.pid();
 
     child.close_stdin();
-    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-        panic!("{reason}");
+    if let Err(reason) = await_exit_without_reaping(pid, EXIT_WAIT_BUDGET) {
+        let settled = child.settle_report();
+        panic!("{reason}; {settled}");
     }
     let exited = observe_child_group(pid);
     assert!(
@@ -552,6 +618,257 @@ fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {
         Err(libc::ECHILD),
         "the child outlived the body that owned it as an unreaped zombie: {after}"
     );
+}
+
+/// A thread of this process that is blocked in `waitid` on a pid, and the
+/// domain the answer was drawn from.
+///
+/// `/proc/<tid>/syscall` reports the syscall's OWN ARGUMENTS, so a wait is
+/// identified by `idtype == P_PID` and `id == pid` rather than by a syscall
+/// number, which differs by architecture. That pair also attributes the wait:
+/// no other thread in this process can be waiting on a pid only this body
+/// knows, so a parallel harness running other tests cannot colour the answer.
+#[cfg(target_os = "linux")]
+struct WaiterCensus {
+    tasks_listed: usize,
+    tasks_read: usize,
+    waiters: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for WaiterCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} waiter(s) {:?} over {} of {} task(s) read",
+            self.waiters.len(),
+            self.waiters,
+            self.tasks_read,
+            self.tasks_listed
+        )
+    }
+}
+
+/// The threads of this process blocked in `waitid(P_PID, pid, ..)`.
+///
+/// A task that is running in user space reports `running`, one the kernel will
+/// not describe reports a negative number, and one that exits between the
+/// listing and the read leaves no file at all; none of the three is a waiter.
+/// An empty or unreadable domain is an instrument that measures nothing, so it
+/// is reported as such rather than as an absence of waiters.
+#[cfg(target_os = "linux")]
+fn waiters_on(pid: u32) -> Result<WaiterCensus, String> {
+    let tasks = std::fs::read_dir("/proc/self/task")
+        .map_err(|error| format!("/proc/self/task could not be listed: {error}"))?;
+    let mut census = WaiterCensus {
+        tasks_listed: 0,
+        tasks_read: 0,
+        waiters: Vec::new(),
+    };
+    for task in tasks {
+        let task = task.map_err(|error| format!("/proc/self/task entry: {error}"))?;
+        census.tasks_listed += 1;
+        let tid = task.file_name().to_string_lossy().into_owned();
+        let Ok(line) = std::fs::read_to_string(task.path().join("syscall")) else {
+            continue;
+        };
+        census.tasks_read += 1;
+        if syscall_line_waits_on(&line, pid) {
+            census.waiters.push(tid);
+        }
+    }
+    if census.tasks_listed == 0 {
+        return Err("/proc/self/task listed no task at all".to_owned());
+    }
+    if census.tasks_read == 0 {
+        return Err(format!(
+            "no /proc/self/task/*/syscall of the {} listed task(s) could be read, so this \
+             instrument cannot see a waiter and its answer is not an absence of one",
+            census.tasks_listed
+        ));
+    }
+    Ok(census)
+}
+
+/// `<number> <arg0> <arg1> ...` where the first two arguments of `waitid` are
+/// its `idtype` and its `id`.
+#[cfg(target_os = "linux")]
+fn syscall_line_waits_on(line: &str, pid: u32) -> bool {
+    let mut fields = line.split_ascii_whitespace();
+    let in_a_syscall = fields
+        .next()
+        .and_then(|number| number.parse::<i64>().ok())
+        .is_some_and(|number| number >= 0);
+    if !in_a_syscall {
+        return false;
+    }
+    let mut argument = || {
+        fields
+            .next()
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+    };
+    let (Some(idtype), Some(id)) = (argument(), argument()) else {
+        return false;
+    };
+    idtype == u64::from(libc::P_PID) && id == u64::from(pid)
+}
+
+/// A held child, spawned the way the group-observation bodies spawn theirs.
+#[cfg(unix)]
+fn child_held_on_its_stdin(what: &str) -> ReapedChild {
+    let mut command = shell("read line; exit 0");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    ReapedChild::new(
+        command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn {what}: {error}")),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child() {
+    // THE POSITIVE CONTROL, FIRST: a census that cannot see a waiter would
+    // report the regression as fixed for the wrong reason. This one is a
+    // deliberate `waitid` on a child that will not exit, spawned through the
+    // owned-and-joined shape the standard asks for, and the census must find
+    // it before the claim below is allowed to mean anything.
+    let mut control_child = child_held_on_its_stdin("the control's child");
+    let control_pid = control_child.pid();
+    let control_id = libc::id_t::try_from(control_pid).expect("the control pid is a Unix wait id");
+    let control = thread::Builder::new()
+        .name("exit-waiter-census-control".to_owned())
+        .spawn(move || {
+            loop {
+                // SAFETY: `siginfo_t` is plain data for which zeroes are a valid value.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: `info` outlives the call; `WNOWAIT` leaves the child
+                // waitable, so the body's own reap still finds it.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        control_id,
+                        &raw mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    break Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    break Err(error);
+                }
+            }
+        })
+        .expect("spawn the control waiter");
+
+    let control_deadline = Instant::now() + EXIT_WAIT_BUDGET;
+    let seen = loop {
+        let census = waiters_on(control_pid).expect("read the waiter census");
+        if !census.waiters.is_empty() {
+            break census;
+        }
+        assert!(
+            Instant::now() < control_deadline,
+            "the control's own `waitid` on pid {control_pid} was never visible to the census, \
+             so this instrument cannot witness a detached waiter and the claim below would be \
+             vacuous: {census}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        seen.waiters.len(),
+        1,
+        "the control planted exactly one waiter on pid {control_pid}: {seen}"
+    );
+
+    // Reaping the control's child is what ends its `waitid`, with `ECHILD`, so
+    // the control thread is joined rather than abandoned in its turn.
+    control_child
+        .settle()
+        .expect("settle the control's child so its waiter can end");
+    let control_outcome = control.join().expect("join the control waiter");
+    assert!(
+        waiters_on(control_pid)
+            .expect("read the waiter census after the control")
+            .waiters
+            .is_empty(),
+        "the control waiter was joined, so nothing may still be waiting on pid \
+         {control_pid} (its own outcome was {control_outcome:?})"
+    );
+
+    // THE CLAIM. A child that holds its stdin open never exits, so the wait
+    // below can only end at its bound.
+    let mut wedged = child_held_on_its_stdin("the child the wait times out on");
+    let pid = wedged.pid();
+    let budget = Duration::from_millis(250);
+    let began = Instant::now();
+    let outcome = await_exit_without_reaping(pid, budget);
+    let waited = began.elapsed();
+    let reason = outcome.expect_err("a child still holding its stdin open has not exited");
+    assert!(
+        waited >= budget,
+        "the wait on pid {pid} returned `{reason}` after {waited:?}, short of its own \
+         {budget:?} bound"
+    );
+
+    let after = waiters_on(pid).expect("read the waiter census after the timeout");
+    assert!(
+        after.waiters.is_empty(),
+        "PR173-EXIT-WAITER-THREAD-DETACHED: the wait returned `{reason}` and left this \
+         process still waiting on pid {pid} — {after} — so its worker outlived the call \
+         that started it, unjoined and unobservable"
+    );
+
+    wedged
+        .settle()
+        .expect("settle the child the wait timed out on");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_exit_wait_on_a_child_that_never_exits_ends_at_its_bound() {
+    let mut child = child_held_on_its_stdin("a child that never exits");
+    let pid = child.pid();
+    let budget = Duration::from_millis(250);
+
+    let began = Instant::now();
+    let reason = await_exit_without_reaping(pid, budget)
+        .expect_err("a child still holding its stdin open has not exited");
+    let waited = began.elapsed();
+
+    assert!(
+        reason.contains(&format!("{budget:?}")),
+        "the diagnostic must name the bound it expired at: {reason}"
+    );
+    assert!(
+        waited >= budget,
+        "the wait returned after {waited:?}, short of its own {budget:?} bound: {reason}"
+    );
+    assert!(
+        waited < EXIT_WAIT_BUDGET,
+        "the wait took {waited:?}, which is not a bound on a child that never exits: {reason}"
+    );
+
+    // The other half of the bound: the same call answers a child that HAS
+    // exited without spending the budget, so the bound is on a wedged child
+    // rather than a wait every healthy body pays for.
+    child.close_stdin();
+    let began = Instant::now();
+    await_exit_without_reaping(pid, EXIT_WAIT_BUDGET)
+        .expect("the child exits once its stdin closes");
+    assert!(
+        began.elapsed() < EXIT_WAIT_BUDGET,
+        "an exited child was not reported within the budget"
+    );
+
+    let status = child.wait().expect("reap the child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 #[test]

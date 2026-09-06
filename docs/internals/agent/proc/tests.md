@@ -222,6 +222,16 @@ reaper — which settles whatever the reaper knows about.
 Do not leak a 60-second sleeper into the rest of the suite when
 this fails.
 
+## `const EXIT_WAIT_BUDGET: Duration = Duration::from_secs(30);`
+
+The one budget the bodies below give a child to exit, and the one
+`ReapedChild::settle` gives a killed child to become reapable. It was three
+inline `Duration::from_secs(30)` call-site literals; naming it is what let
+`settle` share the bound the bodies already used. It bounds a wedged child
+rather than timing a healthy one: every wait it bounds follows a
+`close_stdin` or a `kill`, so the wait is milliseconds long when nothing is
+wrong.
+
 ## `struct ReapedChild {`
 
 The owner of a spawned child for the two group-observation tests below and
@@ -259,14 +269,40 @@ nothing left to do. A second call is an error rather than a second `wait`:
 once a pid is reaped the operating system is free to reissue it, and a
 `kill`/`wait` on a reissued pid is a signal to somebody else's process.
 
+## `impl ReapedChild` › `fn settle(&mut self) -> Result<String, String> {`
+
+The cleanup both `Drop` and the bodies' failing paths go through, BOUNDED and
+REPORTING. `kill`, then `await_exit_without_reaping` for the exit, and only
+then `wait()` — so the reap runs on a child already SEEN to be an exited
+zombie, where it returns at once. A child wedged in an uninterruptible kernel
+wait therefore leaves a zombie and a sentence saying so, rather than blocking
+the harness in a `wait` with no bound.
+
+`PR173-EXIT-WAITER-THREAD-DETACHED` named both halves of what this replaced:
+the discarded `kill` and `wait` results, and the unbounded `wait`. The kill
+outcome, the exit observation and the reap each become part of one string; a
+child that exited on its own is still an unreaped zombie here, so `kill`
+reaches it, and `ESRCH` is carried as the expected answer rather than a
+failure if a platform has already released the record.
+
+## `impl ReapedChild` › `fn settle_report(&mut self) -> String {`
+
+`settle` flattened, because the three bodies that call it are already
+panicking and want the report either way, not a `Result` to branch on.
+
 ## `impl Drop for ReapedChild` › `fn drop(&mut self) {`
 
-The whole point of the type. `kill` then `wait` on every path the body did not
-finish — an early assertion, an `expect`, a `panic!`, a `?` — and nothing at
-all after a successful `wait()`, because the `Option` is empty by then. Both
-results are discarded because a `Drop` has nowhere to report to and the child
-is already leaving: a child that exited on its own answers `kill` with
-`ESRCH`, and that is the expected case rather than a failure.
+The whole point of the type. `settle` on every path the body did not finish —
+an early assertion, an `expect`, a `panic!`, a `?` — and nothing at all after a
+successful `wait()`, because the `Option` is empty by then.
+
+A `Drop` has nowhere to report to except a failure of its own, and it must not
+raise one while an unwind is already under way. So the report is dropped when
+`std::thread::panicking()` — the body's own failure is the message, and the
+three bodies that can reach the failing wait call `settle_report` explicitly
+and put the cleanup outcome in their own panic — and it becomes an assertion
+failure when nothing else has failed, which is the abandoned child this type
+exists to prevent going unnoticed.
 
 ## `fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {`
 
@@ -336,6 +372,80 @@ assertion forced to fail, the test fails on the premise instead of passing.
 `ECHILD` is also the answer if the pid were reissued to an unrelated process
 between the reap and the look, so the assertion cannot be satisfied by a zombie
 under any scheduling.
+
+## `struct WaiterCensus {`
+
+The instrument for `PR173-EXIT-WAITER-THREAD-DETACHED`, and the domain it drew
+its answer from. `/proc/<tid>/syscall` reports the syscall's OWN ARGUMENTS, so
+a wait is recognised by `idtype == P_PID` and `id == pid` rather than by a
+syscall number, which differs by architecture and would pin the test to x86-64.
+
+That pair is also what ATTRIBUTES the wait. A thread census of a process is
+otherwise useless under a parallel harness, where other bodies start and finish
+threads throughout: no other thread in this process can be waiting on a pid
+only this body knows, so the count is unaffected by anything else running.
+
+## `impl std::fmt::Display for WaiterCensus`
+
+The tids as well as the count, and the domain beside them, so a failure names
+which thread and how much of the process the instrument could actually read.
+
+## `fn waiters_on(pid: u32) -> Result<WaiterCensus, String> {`
+
+A task running in user space reports `running`, one the kernel will not
+describe reports a negative number, and one that exits between the listing and
+the read leaves no file at all; none of the three is a waiter.
+
+§12, "every census asserts the size and boundaries of the domain it claims": an
+empty listing, or one where NO task's `syscall` could be read, is an instrument
+that measures nothing, and it is returned as an error rather than as an absence
+of waiters — which is what an unreadable `/proc` would otherwise look like to
+the assertion that follows.
+
+`#[cfg(target_os = "linux")]` because `/proc` is where this answer lives. The
+defect it witnesses is not Linux-only; the instrument is.
+
+## `fn syscall_line_waits_on(line: &str, pid: u32) -> bool {`
+
+`<number> <arg0> <arg1> ...`, where the first two arguments of `waitid` are its
+`idtype` and its `id`. The leading number only has to be a non-negative integer
+— that it is `waitid` follows from `P_PID` and the pid, not from the number.
+
+## `fn child_held_on_its_stdin(what: &str) -> ReapedChild {`
+
+The spawn the group-observation bodies already do, named once for the two
+bodies below that need a child which will not exit until they say so.
+
+## `fn a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child() {`
+
+The regression for `PR173-EXIT-WAITER-THREAD-DETACHED`. A child holding its
+stdin open never exits, so `await_exit_without_reaping` can only end at its
+bound; the claim is about what is left AFTER it does. Nothing in this process
+may still be blocked in `waitid` on that pid, because the call that started
+such a wait has returned and could no longer join, observe or end it.
+
+THE POSITIVE CONTROL RUNS FIRST, and the claim is an ABSENCE, which is the
+shape that goes green when the instrument is blind. So the body first plants a
+deliberate `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a child of its own and
+requires the census to find exactly it. That waiter is owned and joined rather
+than detached — reaping its child is what turns its wait into `ECHILD` — and
+the census must then find it gone. Only then is an empty census allowed to mean
+anything.
+
+MEASURED. On the base — the helper thread whose `JoinHandle` the function
+dropped — this body fails on the claim, having passed its control:
+`1 waiter(s) ["<tid>"] over 3 of 3 task(s) read`, the detached waiter still in
+`waitid` on the child a returned call had stopped observing.
+
+## `fn an_exit_wait_on_a_child_that_never_exits_ends_at_its_bound() {`
+
+The portable half, on every Unix rather than only where `/proc` is. Both
+directions of §12's "every wait is bounded, and the bound bounds a wedged
+producer rather than timing a healthy one": a child that never exits ends the
+wait at the budget and is told so in a diagnostic that names it, and the same
+call on a child whose stdin has just closed returns without spending the
+budget. A poll that had become a sleep would satisfy the first and fail the
+second.
 
 ## `fn timeout_kills_the_process_tree_quickly()` › `let script = if cfg!(windows) {`
 
