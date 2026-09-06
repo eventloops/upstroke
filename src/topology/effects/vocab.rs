@@ -1529,7 +1529,11 @@ pub enum Real {
         // went uncaught. Mutate this file's own source rather than a
         // fixture, since a fixture the old parser already handled would not
         // reach the gap.
-        let source = include_str!("vocab.rs");
+        // Normalize line endings before matching: a Windows checkout of this
+        // very file can carry `\r\n`, which a literal `\n` needle would miss
+        // even though `declared_variants` (built on `str::lines`) does not
+        // care either way.
+        let source = include_str!("vocab.rs").replace("\r\n", "\n");
         let mutated = source.replacen(
             "    ErrorReturn,\n}",
             "    ErrorReturn,\n    Timeout = 2,\n}",
