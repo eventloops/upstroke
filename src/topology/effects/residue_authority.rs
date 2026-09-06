@@ -145,6 +145,36 @@ impl ResidueElement {
             | Self::RegisteredUnpopulatedWorktree => ObjectResidue::Internal,
         }
     }
+
+    /// The element's name, spelled the way the wire form spells it.
+    ///
+    /// The vocabulary owns its own operator spelling. `SWEEP-WORKTREE-008`
+    /// recorded the alternative: `worktree.rs`'s `Residue(element)` displays
+    /// `{element:?}`, and `bijection.rs` writes `{element:?}` into three of its
+    /// failures, so the words an operator reads are the derive's rather than
+    /// chosen ones. Matching `#[serde(rename_all = "snake_case")]` means the
+    /// name in a message and the name in a document are one name;
+    /// `every_residue_element_displays_the_spelling_serde_writes` holds them
+    /// together rather than leaving the two spellings free to drift.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::UnreferencedObject => "unreferenced_object",
+            Self::TemporaryObjectFile => "temporary_object_file",
+            Self::IndexLock => "index_lock",
+            Self::CherryPickHead => "cherry_pick_head",
+            Self::MergeHead => "merge_head",
+            Self::MergeMsg => "merge_msg",
+            Self::OrigHead => "orig_head",
+            Self::SequencerState => "sequencer_state",
+            Self::RegisteredUnpopulatedWorktree => "registered_unpopulated_worktree",
+        }
+    }
+}
+
+impl fmt::Display for ResidueElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_name())
+    }
 }
 
 /// How an entry's evidence was obtained.
@@ -1174,11 +1204,41 @@ impl SubEffectPoint {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
-        AfterEffect, BeforeState, InjectionMode, LockSite, ResidueArtifact, ResumeAction,
-        SubEffectPoint,
+        AfterEffect, BeforeState, InjectionMode, LockSite, ResidueArtifact, ResidueElement,
+        ResumeAction, SubEffectPoint,
     };
     use crate::topology::effects::{EffectSiteId, EntryPhase};
+
+    #[test]
+    fn every_residue_element_displays_the_spelling_serde_writes() {
+        // The spelling in an operator message and the spelling in a document
+        // are one spelling, and this is what keeps them one: a `wire_name` arm
+        // edited away from its serde name fails here rather than surfacing as
+        // two vocabularies for one element.
+        for element in ResidueElement::ALL {
+            let wire = serde_json::to_string(element).expect("a fieldless enum serializes");
+            assert_eq!(wire, format!("\"{element}\""), "{element:?}");
+        }
+        let spellings: BTreeSet<String> = ResidueElement::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            spellings.len(),
+            ResidueElement::ALL.len(),
+            "one spelling for two elements is not a spelling: {spellings:?}"
+        );
+        // And it is not the derive's, which is what the operator messages in
+        // `workspace_manager::worktree` and `topology::effects::bijection`
+        // still carry (`SWEEP-WORKTREE-008`).
+        assert_ne!(
+            ResidueElement::IndexLock.to_string(),
+            format!("{:?}", ResidueElement::IndexLock)
+        );
+    }
 
     #[test]
     fn the_ambient_join_answers_a_different_residue_and_recovery_in_each_mode() {
