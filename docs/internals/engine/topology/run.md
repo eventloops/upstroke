@@ -1432,8 +1432,8 @@ never invented: the base is `run_started(4).base_sha`, and the predicted
 region is the task's `path_hints`. **An empty hint list is `RepoWide`,
 not an empty prefix set** — `PathSet::RepoWide` is documented as the
 classification for an absent answer, and a task with no hints has given
-one. An empty `Prefixes` would be a region that overlaps nothing, which
-would let every task run against every other.
+one. An empty `Prefixes` would be a region that overlaps no bounded
+region, which would let every task run against every other.
 
 ## `impl TopologyRun` › `let paths = self.handle.fold.predicted_region(key).ok_or_else(|| {`
 
