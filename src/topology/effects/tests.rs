@@ -5705,16 +5705,15 @@ fn the_sampling_histogram_totals_its_three_counts_and_saturates() {
     ] {
         assert_eq!(histogram.total(), total, "{histogram:?}");
     }
-    // Saturating, deliberately (§5: the arithmetic is chosen). The answer at
-    // the boundary is `u32::MAX` and not a wrapped zero, and it is *wrong* by
-    // one — which is why the checker does not use it and why the fixture's
-    // real sampling records are compared against `n` in `u64` instead.
+    // Exact, not saturating: `total` sums three `u32`s in `u64`, so the
+    // boundary case that a `u32` sum answered as `u32::MAX` (wrong by one) is
+    // answered correctly. Pinned here so a return to a narrower sum fails.
     let saturated = ClassHistogram {
         none: u32::MAX,
         internal: 1,
         after: 0,
     };
-    assert_eq!(saturated.total(), u32::MAX);
+    assert_eq!(saturated.total(), u64::from(u32::MAX) + 1);
     assert_eq!(
         u64::from(saturated.none) + u64::from(saturated.internal) + u64::from(saturated.after),
         u64::from(u32::MAX) + 1,
