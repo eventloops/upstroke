@@ -21,7 +21,7 @@ The independent review preserved that response in evidence-41eb825d/settle-rende
 
 Convert the moved rustdoc references to Markdown links that work in the intended reader context, with source or notes targets for the named items. A repository backlink to settle.rs does not identify these definitions in events.rs. Record this finding and defer repair under DOCS_FAST_TRACK.md.
 
-## Update, 2026-09-06
+## Update, 2026-09-06 (PR #214)
 
 The two destinations this record cites, `docs/internals/engine/topology/settle.md:40`
 and `:43`, are converted. They now point at `../../topology/events.md`, the notes for
