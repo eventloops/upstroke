@@ -2127,9 +2127,19 @@ And its id is never reused for a new question either.
 
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `let base = sha("base");`
 
-refusals[20], and the epoch scope that makes a resume the way back:
-a budget-stopped run ingests the answer after its resume, and a
-halted one never does, because `halted_at` is never cleared.
+refusals[20], and the epoch scope that makes a resume the way back: both a
+budget-stopped run and a halted one ingest the answer after their resume.
+
+**The sentence that stood here until the sweep of row 39 said the halted one
+never does, "because `halted_at` is never cleared".** `halted_at` is indeed
+never cleared, and `derived_outcome` reads it, so a resumed halted run still
+derives Halted -- but `check_question_answered` does not read it. It compares
+`halted_epoch` with the current epoch, and a resume moves the epoch, so the
+answer door reopens. The two halves of this file's own prose disagreed about
+that, the paragraph below having it right, and the test stopped one line short
+of asking: it resumed and then asserted only that `halted_at` survived.
+Replacing the guard with `self.halted_at.is_some()` -- the reading the wrong
+sentence describes -- was a change the whole fold suite passed.
 
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `apply(&mut halted, &resume(container_runner()));`
 
@@ -2149,6 +2159,14 @@ refusals[18]: halt and budget outrank backoff.
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `apply(&mut budget, &resume(container_runner()));`
 
 Cleared by the resume that raises the ceiling.
+
+The halt below is the other half of that, and the asymmetry is the point:
+`check_defer_wait_elapsed` guards on `halted_at.is_some()`, which no resume
+clears, while `check_question_answered` two files away guards on
+`halted_epoch == self.epoch`, which every resume moves. So one resume reopens
+answers and leaves waits refused. Each guard is asserted after a resume here,
+because each was free to take the other's form: swapping either one for the
+other's expression left the fold suite green.
 
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `let head = sha("head");`
 

@@ -6685,6 +6685,24 @@ fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_the_same_epoch() {
     );
     apply(&mut halted, &resume(container_runner()));
     assert_eq!(halted.halted_at(), Some(ALPHA));
+    assert_eq!(halted.epoch(), Some(Epoch(1)));
+    accepts(&halted, &answer);
+    assert_eq!(
+        refuse(
+            &halted,
+            &ev(TopologyEventBody::DeferWaitElapsed {
+                data: DeferWaitElapsed4 {
+                    waited_ms: 30_000,
+                    round: 1,
+                },
+            })
+        ),
+        FoldError::RunEnding {
+            kind: "defer_wait_elapsed",
+            what: "a halting settlement",
+        },
+        "the resume that reopened the answer door also reopened the wait's"
+    );
 }
 
 fn budget_exceeded(epoch: u32, key: Option<TaskKey>) -> TopologyEvent {
@@ -6800,6 +6818,16 @@ fn a_wait_never_elapses_under_a_halt_or_a_budget_stop() {
             kind: "defer_wait_elapsed",
             what: "a halting settlement",
         }
+    );
+    apply(&mut halted, &resume(container_runner()));
+    assert_eq!(halted.epoch(), Some(Epoch(1)));
+    assert_eq!(
+        refuse(&halted, &elapsed),
+        FoldError::RunEnding {
+            kind: "defer_wait_elapsed",
+            what: "a halting settlement",
+        },
+        "a resume raised the ceiling a budget stop was against and it did the same to a halt"
     );
 
     let head = sha("head");
