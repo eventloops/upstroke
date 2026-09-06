@@ -26,6 +26,7 @@ use crate::topology::schema::TOPOLOGY_SCHEMA;
 
 #[cfg(test)]
 mod outcome;
+#[cfg(test)]
 mod predicates;
 #[cfg(test)]
 mod questions;
