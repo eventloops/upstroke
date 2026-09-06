@@ -153,22 +153,20 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 # Two claims, with two domains, because the two forms cost differently to
 # remove and only one of them has been measured over the whole tree:
 #
-#   (a) EVERY file under docs/internals/, README.md included. N2 and N3 skip
-#       that file because it mirrors no module; its links point at real files
-#       like any other, and nothing about them is this gate's to skip. An
-#       inline link destination is an http/https/mailto
-#       URL, a same-file `#anchor`, or a relative path that exists in this
-#       repository and stays inside it. A Rustdoc item path is none of those,
-#       and no renderer keeps it: GitHub's GFM drops the link and emits the
-#       label alone, measured through `POST /markdown`, and the plain
-#       CommonMark renderer the audit ran emits
+#   (a) EVERY file under docs/internals/, README.md included -- N2 and N3 skip
+#       that one because it mirrors no module, but its links point at real
+#       files like any other's. An inline link destination is an
+#       http/https/mailto URL, a same-file `#anchor`, or a relative path that
+#       exists in this repository and stays inside it. A Rustdoc item path is
+#       none of those, and no renderer keeps it: GitHub's GFM drops the link
+#       and emits the label alone, measured through `POST /markdown`, and the
+#       plain CommonMark renderer the audit ran emits
 #       `<a href="crate::effects::census_domain">`, an href that resolves
-#       nowhere. Eleven
-#       destinations of that shape were in the tree when this was written --
-#       eight spelled `crate::`, and `Self::close_and_wait`,
+#       nowhere. Eleven destinations of that shape were in the tree when this
+#       was written: eight spelled `crate::`, and `Self::close_and_wait`,
 #       `RunState::apply` and `std::time::Duration`, which a `crate::` search
-#       does not find. Resolution is the check that finds all four spellings
-#       and a mistyped relative path with them.
+#       does not find at all. Resolving the destination is what finds every
+#       spelling of it, and a mistyped relative path with them.
 #
 #   (b) The effects notes -- `docs/internals/effects.md` and everything under
 #       `docs/internals/effects/`. A bracketed code span is an inline link or
@@ -181,14 +179,15 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 #       converted, so widen the domain with the conversion, never ahead of it.
 #
 # Both read the file as CommonMark reads it: fenced code blocks are dropped,
-# code spans are found first, and the unit is the leaf block -- not the line,
-# because a code span may cross one, and not the file, because backtick runs
-# pair inside a block and an odd backtick would otherwise swallow whatever
-# came after it. `docs/internals/` also documents these very forms inside
-# code spans and fences, so a scan that read them literally would refuse its
-# own README. Anchors are not resolved: a heading's slug belongs to the
-# renderer, and these headings repeat verbatim within a file, so which
-# heading an anchor names is a review duty here rather than a gate's.
+# code spans are found first, and the unit is the leaf block. Not the line,
+# because a code span may cross one. Not the file, because backtick runs pair
+# inside a block, and an odd backtick would otherwise swallow whatever came
+# after it. `docs/internals/README.md` documents these very forms inside
+# fences, so a scan that read them literally would refuse its own README.
+#
+# Anchors are not resolved. A heading's slug belongs to the renderer, and
+# these headings repeat verbatim within a file, so which heading an anchor
+# names is a review duty here rather than a gate's.
 dest_count=0
 while IFS= read -r notes; do
   in_effects=0
