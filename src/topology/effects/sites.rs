@@ -1644,7 +1644,7 @@ mod tests {
     /// of a site, and `EffectSiteId::from_name` resolves a registry entry by
     /// it, so two sites of one group whose whole attribute profile agrees can
     /// have their names exchanged and every entry written against either then
-    /// names the other. Eight such groups of sites exist -- among them
+    /// names the other. Eight such groups of sites exist — among them
     /// `RunDir.RemovePrivateHusk` and `RunDir.RemovePublicHusk`, which agree on
     /// row, adjacency, fault row, scope, read-only, points, classes, elements,
     /// before state and after effect, and differ in that only one of the two
@@ -1770,7 +1770,7 @@ mod tests {
     /// arm is reachable only for an `EntryPhase::Residue { class }` the site
     /// registers. An element list on a site with no class is therefore data no
     /// consumer can reach and no reader can be held to. The suite asserts the
-    /// other direction -- a registered class has a non-empty list -- and this
+    /// other direction — a registered class has a non-empty list — and this
     /// one is the half nothing pinned.
     ///
     /// The count of sites with a class is asserted too, so the biconditional
