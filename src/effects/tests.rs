@@ -328,6 +328,39 @@ fn the_readiness_expectations_are_per_site_and_both_records_say_so() {
     );
 }
 
+#[test]
+fn the_internals_readme_names_the_records_that_carry_the_readiness_statement() {
+    const README: &str = "docs/internals/README.md";
+    const NOTES: &str = "docs/internals/agent/proc/test_support/readiness.md";
+    const READINESS: &str = "src/agent/proc/test_support/readiness.rs";
+    const SECTION: &str = "\n## What moves\n";
+
+    let readme = fs::read_to_string(repo_root().join(README))
+        .expect("the internals README")
+        .replace("\r\n", "\n");
+    let (_, below) = readme
+        .split_once(SECTION)
+        .unwrap_or_else(|| panic!("{README} no longer has a `What moves` section"));
+    let what_moves = below
+        .split_once("\n## ")
+        .map_or(below, |(section, _)| section);
+
+    for record in [NOTES, ALLOWLIST_TOML] {
+        assert!(
+            what_moves.contains(record),
+            "{README}'s `What moves` section does not name `{record}`, which is one of the two \
+             records `the_readiness_expectations_are_per_site_and_both_records_say_so` reads the \
+             per-site allowance statement from"
+        );
+    }
+    assert!(
+        !what_moves.contains(READINESS),
+        "{README}'s `What moves` section names `{READINESS}` as prose a census reads. The \
+         statement moved to `{NOTES}` and `{ALLOWLIST_TOML}`; the module keeps its marker and \
+         nothing else, so a maintainer sent to the source finds no such sentence"
+    );
+}
+
 fn file_level_denies(source: &str, lint: &str) -> bool {
     matches!(
         crate::effects::lint_levels::file_level_lint_state(source, lint),
