@@ -90,8 +90,10 @@ against the whole `topology::fold` suite at the mutation named:
 - a log that has **not reached a commit marker at all** — empty, or one
   interrupted first line — holds no committed line. Master's
   `map_or(0, …)` default answering `map_or(bytes.len(), …)`, so an
-  unterminated log is read as committed, is caught by this test and by
-  nothing else in the fold suite;
+  unterminated log is read as committed, is the only mutation this test
+  is the sole catcher of: the run is 132 passed and 2 failed, and the
+  second failure is the first-line test, which fails on master's body
+  with or without the mutation and so is not caught by it;
 - the refusal names the **first** committed line that is not an event,
   in both orders and at a line that is neither the first nor the last.
   This is the regression test for the two-pass ordering above: master's
