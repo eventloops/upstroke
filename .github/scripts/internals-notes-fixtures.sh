@@ -153,6 +153,29 @@ printf '//! Extended notes: `%s`\npub const SAMPLE: &str = r#"a " inside\n//! Ex
 check 0 raw_string_holding_a_marker_line_is_not_a_marker
 
 fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &std::ffi::CStr = cr#"a " inside\n//! Extended notes: `docs/internals/other.md`\n"#;\n' "$notes" > "$tree/$module"
+check 0 raw_c_string_holding_a_marker_line_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &[u8] = br#"a " inside\n//! Extended notes: `docs/internals/other.md`\n"#;\n' "$notes" > "$tree/$module"
+check 0 raw_byte_string_holding_a_marker_line_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &std::ffi::CStr = cr#"a " inside"#;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
+check 1 a_comment_after_a_raw_c_string_is_still_read
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const QUOTE: u8 = b\x27"\x27;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
+check 1 a_byte_char_literal_quote_does_not_hide_the_comment_after_it
+
+# N1 accepts one comment form and no other: a block comment carries no marker,
+# however exactly its body is spelled.
+
+fixture capacity
+printf '/*\n//! Extended notes: `%s`\n*/\npub struct Example;\n' "$notes" > "$tree/$module"
+check 1 a_block_comment_body_is_not_a_module_doc_marker
+
+fixture capacity
 printf '//! Extended notes: `%s`\npub const QUOTE: char = \x27"\x27;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
 check 1 a_char_literal_quote_does_not_hide_the_comment_after_it
 
@@ -163,6 +186,10 @@ check 1 block_comment_mention_is_a_second_marker
 fixture capacity
 printf '/* header\n   spanning two lines */\n//! Extended notes: `%s`\npub struct Example;\n' "$notes" > "$tree/$module"
 check 0 marker_below_a_block_comment_header_is_in_the_header
+
+fixture capacity
+printf '/* outer /* inner */ still the header */\n//! Extended notes: `%s`\npub struct Example;\n' "$notes" > "$tree/$module"
+check 0 a_nested_block_comment_closes_only_at_its_own_end
 
 fixture capacity
 printf '//! Extended notes: `%s`\n' "$notes" > "$tree/$module"

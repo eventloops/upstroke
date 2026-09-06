@@ -15,12 +15,16 @@
 #   N4  A module carries at most one marker, and it sits above the first code.
 #
 # The domain is Rust comments, not raw source text (§12). The scan below blanks
-# string, byte-string, raw-string and character literals, and every other code
-# byte, before it looks for the phrase: an ordinary Rust string that happens to
-# contain `Extended notes:` is source text, not a marker, and neither N1 nor N4
-# sees it. Comment bytes keep their own columns, so the spelling check still
-# anchors on the real line, and "the first code" is the first line carrying
+# string, byte-string, C-string, raw-string and character literals, and every
+# other code byte, before it looks for the phrase: an ordinary Rust literal that
+# happens to contain `Extended notes:` is source text, not a marker, and neither
+# N1 nor N4 sees it. Comment bytes keep their own columns, so the spelling check
+# still anchors on the real line, and "the first code" is the first line carrying
 # anything outside a comment.
+#
+# Comment kind is carried too, because N1 accepts one form and no other. A
+# mention inside a block comment counts toward N4 and is refused by N1 however
+# it is spelled: only a `//` line comment can be the module-doc marker.
 #
 # An absent docs/internals/ is a failure, never "nothing to check": with
 # markers in src/ it is a deleted notes tree, and with none it is a gate
@@ -47,13 +51,18 @@ marker_re='^//! Extended notes: `(docs/internals/[A-Za-z0-9_./-]+\.md)`$'
 # --- the comment view of src/ -------------------------------------------------
 #
 # One pass over every Rust source, mirroring `blank_comments_and_strings` in
-# `src/effects.rs`: line and nesting block comments are kept where they stand,
-# and literals and code become spaces. It writes two records:
+# `src/effects.rs`: comments keep their own bytes and columns, and literals and
+# code become spaces. Two views come out of the same walk -- one keeping every
+# comment, one keeping only `//` line comments -- so a mention can be counted
+# and quoted while N1 still refuses any comment form but the module doc. The
+# records are written to stdout, prefixed, so the gate needs no temporary file
+# and runs read-only:
 #
-#   markers  file:line:comment-view-of-the-line   one per line whose comment
-#                                                 text mentions the phrase
-#   summary  file<TAB>markers<TAB>first-marker-line<TAB>first-code-line
-#                                                 one per file that has lines
+#   M file:line:kind:comment-view   one per line whose comment text mentions the
+#                                   phrase; kind is `doc` for a line comment and
+#                                   `block` for a block comment
+#   F file<TAB>markers<TAB>first-marker-line<TAB>first-code-line
+#                                   one per file that has lines
 #
 comment_view='
 function repeat(ch, n,   s) { s = ""; while (n-- > 0) { s = s ch } return s }
@@ -77,27 +86,31 @@ function char_literal(l, i,   c, w, k) {
 
 function blanked(b) { if (b != " " && b != "\t") { code = 1 } }
 
-function view(l,   n, i, out, two, c, j, raw, h, len) {
+# Fills `all` (every comment) and `doc` (line comments only); returns nothing.
+function scan(l,   n, i, two, c, j, raw, h, len) {
   n = length(l)
-  out = ""
+  all = ""
+  doc = ""
   i = 1
   while (i <= n) {
     two = substr(l, i, 2)
     if (depth > 0) {
-      if (two == "/*") { depth += 1; out = out two; i += 2 }
-      else if (two == "*/") { depth -= 1; out = out two; i += 2 }
-      else { out = out substr(l, i, 1); i += 1 }
+      if (two == "/*") { depth += 1; all = all two; doc = doc "  "; i += 2 }
+      else if (two == "*/") { depth -= 1; all = all two; doc = doc "  "; i += 2 }
+      else { all = all substr(l, i, 1); doc = doc " "; i += 1 }
       continue
     }
     if (hashes >= 0) {
       if (substr(l, i, 1) == "\"" && substr(l, i + 1, hashes) == raw_close) {
-        out = out repeat(" ", hashes + 1)
+        all = all repeat(" ", hashes + 1)
+        doc = doc repeat(" ", hashes + 1)
         code = 1
         i += hashes + 1
         hashes = -1
       } else {
         blanked(substr(l, i, 1))
-        out = out " "
+        all = all " "
+        doc = doc " "
         i += 1
       }
       continue
@@ -107,42 +120,57 @@ function view(l,   n, i, out, two, c, j, raw, h, len) {
       len = (c == "\\") ? 2 : 1
       if (len > n - i + 1) { len = n - i + 1 }
       if (c == "\"") { instring = 0 }
-      out = out repeat(" ", len)
+      all = all repeat(" ", len)
+      doc = doc repeat(" ", len)
       code = 1
       i += len
       continue
     }
-    if (two == "//") { out = out substr(l, i); i = n + 1; continue }
-    if (two == "/*") { depth = 1; out = out two; i += 2; continue }
+    if (two == "//") { all = all substr(l, i); doc = doc substr(l, i); i = n + 1; continue }
+    if (two == "/*") { depth = 1; all = all two; doc = doc "  "; i += 2; continue }
     c = substr(l, i, 1)
-    if ((c == "b" || c == "r") && (i == 1 || substr(l, i - 1, 1) !~ /[0-9A-Za-z_]/)) {
+    # Literal prefixes: b, c and r, alone or as br/cr, then any number of hashes
+    # for a raw form. A byte char literal (`b\47x\47`) needs no case: the prefix
+    # match fails and the quote below reads the literal. The identifier-boundary
+    # test is the `is_ident_byte` guard the blanker in `src/effects.rs` carries,
+    # refusing to read a prefix out of the middle of a name; no valid Rust puts an
+    # identifier byte immediately before a literal opener, so no fixture
+    # witnesses it and dropping it changes nothing the gate can see.
+    if ((c == "b" || c == "c" || c == "r") && (i == 1 || substr(l, i - 1, 1) !~ /[0-9A-Za-z_]/)) {
       j = i
-      if (substr(l, j, 1) == "b") { j += 1 }
+      if (c != "r") { j += 1 }
       raw = (substr(l, j, 1) == "r")
       if (raw) { j += 1 }
       h = 0
       while (substr(l, j, 1) == "#") { h += 1; j += 1 }
       if (substr(l, j, 1) == "\"" && (raw || h == 0)) {
-        out = out repeat(" ", j - i + 1)
+        all = all repeat(" ", j - i + 1)
+        doc = doc repeat(" ", j - i + 1)
         code = 1
         i = j + 1
         if (raw) { hashes = h; raw_close = repeat("#", h) } else { instring = 1 }
         continue
       }
     }
-    if (c == "\"") { instring = 1; out = out " "; code = 1; i += 1; continue }
+    if (c == "\"") { instring = 1; all = all " "; doc = doc " "; code = 1; i += 1; continue }
     if (c == Q) {
       len = char_literal(l, i)
-      if (len > 0) { out = out repeat(" ", len); code = 1; i += len; continue }
+      if (len > 0) {
+        all = all repeat(" ", len)
+        doc = doc repeat(" ", len)
+        code = 1
+        i += len
+        continue
+      }
     }
     blanked(c)
-    out = out " "
+    all = all " "
+    doc = doc " "
     i += 1
   }
-  return out
 }
 
-function emit() { if (seen != "") { print seen "\t" count "\t" at "\t" first_code >> summary } }
+function emit() { if (seen != "") { print "F" seen "\t" count "\t" at "\t" first_code } }
 
 BEGIN { Q = "\47"; phrase = "Extended notes:"; hashes = -1 }
 
@@ -159,41 +187,46 @@ FNR == 1 {
 
 {
   code = 0
-  text = view($0)
+  scan($0)
   if (code && first_code == 0) { first_code = FNR }
-  if (index(text, phrase) > 0) {
+  if (index(all, phrase) > 0) {
     count += 1
     if (at == 0) { at = FNR }
-    print FILENAME ":" FNR ":" text >> markers
+    print "M" FILENAME ":" FNR ":" (index(doc, phrase) > 0 ? "doc" : "block") ":" all
   }
 }
 
 END { emit() }
 '
 
-work="$(mktemp -d)"
-trap 'rm -rf -- "$work"' EXIT
-: > "$work/markers"
-: > "$work/summary"
-
 sources=()
 while IFS= read -r source; do
   sources+=("$source")
 done < <(find src -name '*.rs' -type f 2>/dev/null | sort)
 
+scan=''
 if (( ${#sources[@]} > 0 )); then
-  awk -v markers="$work/markers" -v summary="$work/summary" "$comment_view" "${sources[@]}"
+  scan="$(awk "$comment_view" "${sources[@]}")"
 fi
+markers="$(sed -n 's/^M//p' <<< "$scan")"
+summary="$(sed -n 's/^F//p' <<< "$scan")"
 
 # --- N1. every marker is exact, names its own module's notes, and they exist --
 
 marker_count=0
 while IFS= read -r hit; do
+  [[ -z "$hit" ]] && continue
   file="${hit%%:*}"
   rest="${hit#*:}"
   line="${rest%%:*}"
+  rest="${rest#*:}"
+  kind="${rest%%:*}"
   text="${rest#*:}"
 
+  if [[ "$kind" != doc ]]; then
+    error "$file:$line: a block comment is not a marker; the marker is a \`//\` line comment spelled exactly \`//! Extended notes: \`docs/internals/<module>.md\`\`: $text"
+    continue
+  fi
   if [[ ! "$text" =~ $marker_re ]]; then
     error "$file:$line: marker is not spelled exactly \`//! Extended notes: \`docs/internals/<module>.md\`\`: $text"
     continue
@@ -207,13 +240,14 @@ while IFS= read -r hit; do
     || error "$file:$line: marker names $target; this module's notes are $expected"
   [[ -f "$target" ]] \
     || error "$file:$line: marker names $target, which does not exist"
-done < "$work/markers"
+done <<< "$markers"
 
 (( marker_count > 0 )) || error "no \`Extended notes:\` markers found in src/; this gate is inert"
 
 # --- N4. at most one marker per module, in the module header -----------------
 
 while IFS=$'\t' read -r module count at first_code; do
+  [[ -z "$module" ]] && continue
   (( count > 0 )) || continue
   if (( count != 1 )); then
     error "$module carries $count \`Extended notes:\` markers; a module with notes carries exactly one"
@@ -223,7 +257,7 @@ while IFS=$'\t' read -r module count at first_code; do
   if (( first_code > 0 && at > first_code )); then
     error "$module has its marker at line $at, below the first code at line $first_code; it belongs in the module header"
   fi
-done < "$work/summary"
+done <<< "$summary"
 
 # --- N2 + N3. every notes file mirrors a live, marked module -----------------
 
@@ -242,7 +276,7 @@ while IFS= read -r notes; do
   fi
 
   # N2: the module points back at this file, exactly once.
-  back="$(awk -F'\t' -v module="$module" '$1 == module { print $2; found = 1 } END { if (!found) { print 0 } }' "$work/summary")"
+  back="$(awk -F'\t' -v module="$module" '$1 == module { print $2; found = 1 } END { if (!found) { print 0 } }' <<< "$summary")"
   (( back == 1 )) \
     || error "$notes exists but $module carries $back \`Extended notes:\` marker(s); a module with notes carries exactly one"
 
