@@ -457,8 +457,11 @@ impl GroupObservation {
 
     #[cfg(target_os = "macos")]
     fn exited_record_names_its_own_group(&self) -> bool {
+        if self.exited_before != Ok(true) {
+            return false;
+        }
         match (u32::try_from(self.pid), self.zombie_group) {
-            (Ok(pid), Ok(answer)) => answer.pgid == pid,
+            (Ok(pid), Ok(answer)) => answer.pgid == pid && answer.status == libc::SZOMB,
             _ => false,
         }
     }
