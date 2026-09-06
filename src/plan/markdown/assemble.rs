@@ -5,24 +5,30 @@ use super::hints::push_unique;
 use crate::ir::{Artifact, ArtifactId, Task, TaskId, TaskKind};
 
 pub(super) fn assemble(drafts: Vec<Draft>) -> Vec<Task> {
-    let mut taken: Vec<String> = drafts
+    let annotated: Vec<_> = drafts
+        .into_iter()
+        .map(|draft| {
+            let ann = draft.annotation();
+            (draft, ann)
+        })
+        .collect();
+    let mut taken: Vec<String> = annotated
         .iter()
-        .filter_map(|d| d.annotation().id.clone())
+        .filter_map(|(_, ann)| ann.id.clone())
         .collect();
     let mut previous_id: Option<TaskId> = None;
-    let mut tasks = Vec::with_capacity(drafts.len());
-    for draft in drafts {
-        let ann = draft.annotation();
-        let id = match ann.id.clone() {
+    let mut tasks = Vec::with_capacity(annotated.len());
+    for (draft, ann) in annotated {
+        let id = match ann.id {
             Some(explicit) => explicit,
             None => unique_slug(&draft.title, &mut taken),
         };
         let kind = ann.kind.unwrap_or_else(|| heuristic_kind(&draft.title));
-        let depends_on: Vec<TaskId> = match &ann.depends {
+        let depends_on: Vec<TaskId> = match ann.depends {
             Some(ids) => ids.iter().map(|s| TaskId::from(s.as_str())).collect(),
-            None => previous_id.clone().into_iter().collect(),
+            None => previous_id.take().into_iter().collect(),
         };
-        let mut path_hints = ann.paths.clone();
+        let mut path_hints = ann.paths;
         for hint in &draft.hints {
             push_unique(&mut path_hints, hint);
         }

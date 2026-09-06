@@ -250,12 +250,12 @@ second rule here.
 
 settle_succeeded used to live at this spot, and no longer exists: it built an
 `attempt_finished{Succeeded}` that the driver appended between the pin and
-`candidate_prepared`, and its doc argued that INV-07's *"candidate_prepared
+`candidate_prepared`, and its doc argued that `INV-07`'s *"candidate_prepared
 is the sole successful attempt settlement"* was "about which event records
 the candidate, not about which event settles the attempt".
 
 That reading was wrong, and
-`decisions/2026-08-12-merge-queue-execution-topology.md` had already
+`design/26_design_merge_queue_protocol.md` §26 had already
 answered it in the same breath as the sentence it reinterpreted:
 `candidate_prepared` "contains exactly one complete attempt record … ;
 **`attempt_finished` is not also emitted for that attempt**". Ruled CONFORM

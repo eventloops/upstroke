@@ -479,7 +479,7 @@ the prepare, annotated "the settlement, which is not this
 module's". It was not the settlement and it should not have
 been appended: `candidate_prepared` is the sole successful
 settlement for a candidate-producing attempt, per
-`decisions/2026-08-12-merge-queue-execution-topology.md`, and
+`design/26_design_merge_queue_protocol.md` §26, and
 the 2026-08-27 ruling conformed the code to it. **Three
 appends in this sequence, not four**, and the count is the
 assertion — a build that re-introduced the pair would put the
