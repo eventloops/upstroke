@@ -7,6 +7,7 @@ impl TopologyFold {
         self.poisoned = true;
     }
 
+    #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
