@@ -148,9 +148,8 @@ impl TopologyFold {
     #[must_use]
     pub fn open_no_attempt(&self, key: TaskKey) -> Option<GenerationId> {
         self.task(key)?
-            .generations
-            .iter()
-            .find(|generation| generation.class == GenerationClass::OpenNoAttempt)
+            .open()
+            .filter(|generation| generation.class == GenerationClass::OpenNoAttempt)
             .map(|generation| generation.id)
     }
 

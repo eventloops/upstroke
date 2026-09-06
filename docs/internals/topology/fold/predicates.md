@@ -182,8 +182,12 @@ generation is not *ready to be dispatched*. The continuation is a
 different question about the same task, and asking it of `ready` would
 make one predicate mean two things.
 
-A lookup over [`Self::task`]'s own state, deciding nothing: the class is
-what `apply` recorded and the id is the generation's. Poisoning is not
+A lookup over the generation [`Self::task`] holds open, deciding nothing:
+the class is what `apply` recorded and the id is the generation's. It
+reaches that generation through the same `TaskFold::open` the
+continuation eligibility reader uses, so the two cannot name different
+generations; a task whose open generation is of another class, and a
+task holding no open generation at all, are both absence. Poisoning is not
 consulted for the same reason the other statement accessors do not — a
 poisoned fold of a run with an open generation still has one, and `None`
 here would be a false statement rather than a refusal.
