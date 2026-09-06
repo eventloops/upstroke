@@ -61,6 +61,25 @@ pub(super) fn run_harness_inner_on(
     runner: &dyn Runner,
     _contained: &crate::runner::host::Contained,
 ) -> Result<(RunReport, RunState), UpstrokeError> {
+    run_harness_inner_with_id(opts, harness, runner, _contained, ulid::ulid)
+}
+
+/// The same coordinator with the run-id draw supplied. Production passes
+/// `ulid::ulid`; the collision witness supplies a fixed id without modifying
+/// the process-wide clock or nonce. The draw still occurs under the worktree
+/// lease, after preflight, at the production allocation boundary.
+pub(super) fn run_harness_inner_with_id(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+    _contained: &crate::runner::host::Contained,
+    draw_run_id: impl FnOnce() -> String,
+) -> Result<(RunReport, RunState), UpstrokeError> {
+    // Every read-only refusal precedes every lock: the plan, the config, and
+    // `[engine]`'s ceilings are checked here, where nothing has been created
+    // yet, so a config this engine cannot honour cannot leave a git-dir lock
+    // file behind on its way to being refused — and cannot lose a race to a
+    // competing holder of the lease it never needed.
     let validated = validate_inputs(opts, config::EngineLimits::Fresh)?;
     let workspace = Workspace::open(&opts.repo_root)?;
     let worktree_git_dir = workspace.worktree_git_dir()?;
@@ -96,10 +115,10 @@ pub(super) fn run_harness_inner_on(
     let base_sha = workspace.head_sha_full()?;
     let wait_on_block = opts.wait_on_block;
 
-    let run_id = ulid::ulid();
+    let run_id = draw_run_id();
     let branch = format!("upstroke/run-{run_id}");
     let paths = opts.paths(&run_id);
-    paths.create()?;
+    paths.create_fresh()?;
     // Claim this run before publishing its first event. Keep the guard for the
     // whole run; process death releases the primary OS hold, while the lock
     // implementation prevents takeover while prior agents are cleaning up.
@@ -112,6 +131,7 @@ pub(super) fn run_harness_inner_on(
     let opened = rundir::write_plan(&paths.public, &normalized_plan, &mut rundir::NoHooks)
         .and_then(|()| {
             let read_back = fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
+
                 path: plan_path.clone(),
                 source,
             })?;
@@ -134,6 +154,7 @@ pub(super) fn run_harness_inner_on(
     }
 
     let effort_policy = analysis.config.resolved_effort_policy();
+
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
         upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -208,7 +229,7 @@ pub(super) fn run_harness_inner_on(
     })?;
     run.emit_capacity_snapshot(&BTreeMap::new())?;
     let report = run.drain_and_report()?;
-    Ok((report, run.state.clone()))
+    Ok((report, run.state))
 }
 
 pub(super) fn prepared_pin_ref(run_id: &str, task_index: usize, attempt: u32) -> String {

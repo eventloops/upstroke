@@ -157,3 +157,8 @@ How many repairs lineage `root` already holds.
 ## `pub(super) fn check_task_merged(&self, merged: &TaskMerged)…` › `if merged.satisfies != *satisfies {`
 
 "copied exactly from the authorization", not re-derived here.
+
+## `check_merge_prepared` › `if self.lineage_has_question(prepared.key) {`
+
+A sibling attempt can settle with an embedded question after this
+verification started. Recheck before authorizing the ref move.

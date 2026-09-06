@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -17,6 +17,7 @@ use crate::ir::{
 use crate::ladder::Next;
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::review::{PassBinding, ReviewPlan};
+use crate::rundir::scratch_tree::{self, ScratchAcquireRefusal, ScratchTree};
 use crate::rundir::{self, RunPaths};
 use crate::runner::host::{HostEnvironment, HostRunner, KeyCase};
 use crate::runner::{CommandSpec, Runner, gate_request};
@@ -1314,16 +1315,136 @@ fn only_a_retained_generation_is_retried_in_place() {
     assert!(reservations.balances());
 }
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
+type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;
 
-fn scratch(label: &str) -> PathBuf {
-    let nth = SCRATCH.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "upstroke-pr7h-{label}-{}-{nth}",
-        std::process::id()
-    ));
-    rundir::create_public_dir(&dir, &mut rundir::NoHooks).expect("a scratch directory");
-    dir
+const SCRATCH_DRAWS: u32 = 3;
+
+fn scratch(label: &str) -> ScratchTree {
+    scratch_with(scratch_tree::acquire, label)
+}
+
+fn scratch_with(acquire: Acquire, label: &str) -> ScratchTree {
+    let parent = std::env::temp_dir();
+    let tag = format!("pr7h-{label}");
+    let mut occupied = Vec::new();
+    for _ in 0..SCRATCH_DRAWS {
+        match acquire(&parent, &tag) {
+            Ok(tree) => return tree,
+            Err(refusal @ ScratchAcquireRefusal::Occupied { .. }) => occupied.push(refusal),
+            Err(refusal) => panic!("a scratch tree for `{label}`: {refusal:?}"),
+        }
+    }
+    panic!("a scratch tree for `{label}`: {SCRATCH_DRAWS} draws refused as occupied: {occupied:?}");
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+static REFUSED_ONCE: AtomicBool = AtomicBool::new(false);
+
+static OCCUPIED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+static UNDECIDABLE_CALLS: AtomicU32 = AtomicU32::new(0);
+
+fn refuse_once_then_acquire(
+    parent: &Path,
+    tag: &str,
+) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    if REFUSED_ONCE.swap(true, Ordering::SeqCst) {
+        scratch_tree::acquire(parent, tag)
+    } else {
+        Err(ScratchAcquireRefusal::Occupied {
+            root: parent.join(tag),
+        })
+    }
+}
+
+fn always_occupied(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    let call = OCCUPIED_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(ScratchAcquireRefusal::Occupied {
+        root: parent.join(format!("{tag}-refused-{call}")),
+    })
+}
+
+fn undecidable(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    UNDECIDABLE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(ScratchAcquireRefusal::Undecidable {
+        root: parent.join(tag),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    })
+}
+
+#[test]
+fn an_occupied_draw_is_drawn_again() {
+    REFUSED_ONCE.store(false, Ordering::SeqCst);
+    let tree = scratch_with(refuse_once_then_acquire, "drawn-again");
+    assert!(
+        REFUSED_ONCE.load(Ordering::SeqCst),
+        "the double never refused"
+    );
+    assert!(
+        tree.path().is_dir(),
+        "the second draw is not a tree: {}",
+        tree.path().display()
+    );
+}
+
+#[test]
+fn the_draws_are_bounded_and_every_refused_root_is_named() {
+    OCCUPIED_CALLS.store(0, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(|| scratch_with(always_occupied, "bounded"));
+    let message = panic_message(&outcome.expect_err("every draw was refused"));
+    assert_eq!(
+        OCCUPIED_CALLS.load(Ordering::SeqCst),
+        SCRATCH_DRAWS,
+        "the double was not asked exactly {SCRATCH_DRAWS} times"
+    );
+    assert!(
+        message.contains("3 draws refused as occupied"),
+        "the bound is not reported: {message}"
+    );
+    for call in 0..SCRATCH_DRAWS {
+        assert!(
+            message.contains(&format!("pr7h-bounded-refused-{call}")),
+            "refused root {call} is not named: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_undecidable_refusal_is_not_drawn_again() {
+    UNDECIDABLE_CALLS.store(0, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(|| scratch_with(undecidable, "undecidable"));
+    let message = panic_message(&outcome.expect_err("the refusal is raised"));
+    assert_eq!(
+        UNDECIDABLE_CALLS.load(Ordering::SeqCst),
+        1,
+        "an undecidable answer was asked again"
+    );
+    assert!(message.contains("Undecidable"), "{message}");
+    assert!(
+        !message.contains("draws refused"),
+        "an undecidable answer was reported as occupied: {message}"
+    );
+}
+
+#[test]
+fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {
+    let tree = scratch("reclaimed");
+    let path = tree.path().to_path_buf();
+    assert!(path.is_dir(), "the tree was created: {}", path.display());
+    drop(tree);
+    assert!(
+        scratch_tree::proves_absent(&path),
+        "the tree was not reclaimed: {}",
+        path.display()
+    );
 }
 
 struct KillAtPhase {
@@ -1484,21 +1605,28 @@ fn committed(dir: &Path) -> Vec<TopologyEvent> {
 
 #[test]
 fn kill_after_failed_settlement_rematerializes_question() {
-    let dir = scratch("question");
-    let output = spawn_kill_child(&dir, "question");
+    let tree = scratch("question");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
+    let output = spawn_kill_child(dir, "question");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
     let payload = dir
         .join("public")
         .join("questions")
         .join(format!("{}.json", question_for(ALEPH).id.as_str()));
+
     assert!(
-        !payload.exists(),
+        scratch_tree::proves_absent(&payload),
         "the child wrote the question file it was killed before writing: {}{}",
         output.stdout,
         output.stderr
     );
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(
@@ -1520,10 +1648,16 @@ fn kill_after_failed_settlement_rematerializes_question() {
 
 #[test]
 fn retained_generation_not_continued_after_kill() {
-    let dir = scratch("retained");
-    spawn_kill_child(&dir, "retained");
+    let tree = scratch("retained");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
+    spawn_kill_child(dir, "retained");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(

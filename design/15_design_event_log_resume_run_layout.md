@@ -23,6 +23,38 @@ The durable run artifacts are **split in two**, by who is allowed to read each h
 upstroke.toml                       # repo-root config, checked in
 ```
 
+A fresh sequential run reserves the global private root and its repository's
+public root with exclusive directory creation before creating skeleton files,
+opening the event log or entering early-error cleanup. An occupied root refuses
+the new run and preserves the existing run's contents, including when two
+repositories request the same run id. If public reservation fails, creation
+removes only its newly reserved empty private root and reports a failed removal.
+Skeleton creation failures retain partial directories for inspection. Resume
+keeps its idempotent skeleton creation; schema-4 creation keeps its separate
+marker and reciprocal-owner protocol.
+
+New ULIDs retain the 48-bit timestamp and 80-bit suffix layout. The suffix is
+the first ten SHA-256 bytes over `upstroke.ulid.v2` followed by a zero byte and
+the big-endian timestamp, process id and nonce, with widths 64, 32 and 64 bits.
+The separate fields remove the old XOR cancellation between a pid and nonce.
+This changes newly generated values, not the spelling or interpretation of
+persisted ids. It does not promise unpredictable or collision-free names;
+exclusive allocation supplies the fresh-run ownership check.
+
+Test scratch trees use a separate, test-only ownership token. Exclusive
+directory creation is followed by retaining a directory handle. Checked use
+and reclaim compare the current root's filesystem identity with that handle;
+an observed replacement refuses and never becomes the token's claim through
+disarm, failed reclaim or rearm. Once successful removal closes the handle, a
+failed absence observation leaves a consumed claim that can report failure or
+confirm later pathname absence, but cannot reopen a replacement for deletion.
+A recursive remover's child-level `NotFound` is not proof of root absence.
+Pathname absence also does not prove that an original directory moved elsewhere
+was deleted. These are checks at operation boundaries, with the mkdir-to-open
+and subsequent check-to-use intervals stated explicitly. They do not provide
+continuous isolation against an active same-user writer or protect every child
+path from such a writer.
+
 The split keeps transcripts and reviewer records out of ordinary workspace reads, but the shipped host runner does **not** make the public half authoritative against hostile candidate code. Adapter deny rules reduce direct agent-tool access; they are defence in depth, not an OS boundary. Repository-controlled gates execute candidate build/test code as the Upstroke user and can discover the source worktree and modify `.upstroke`. A host-run event log is therefore an operational recovery record for trusted repositories and plans, not a tamper-resistant attestation. Moving coordinator authority outside every role mount and enforcing that with the external/container runner is a blocking backlog item before any stronger claim; use a dedicated OS account or VM for untrusted input.
 
 The v0.2 execution root is deliberately non-authoritative. A container receives only its role's one worktree mount; it never receives the public log, sibling worktrees, or private artifacts. On the host runner the agent permission surface remains the boundary and gate code is not OS-confined — the reason the container runner exists. Worktree disappearance is recoverable from events and internal refs, and cleanup follows a terminal event rather than creating one.

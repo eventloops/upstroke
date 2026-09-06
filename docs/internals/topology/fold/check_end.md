@@ -45,3 +45,9 @@ one that authority froze at that index.
 
 refusals[19] / INV-15: the recorded outcome is the derived one, and
 the derived one is not NotEnding.
+
+## `pub(super) fn check_question_can_park_lineage(`
+
+A question cannot suspend an unresolved process or an already
+authorized publication. Standalone admission questions use this check;
+a settlement's embedded question accounts for its own closing work.

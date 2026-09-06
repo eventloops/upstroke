@@ -488,22 +488,20 @@ then be left out of this test without the coverage assertion failing.
 The version this replaces covered `Dispatch`, `Dispatch (continuing)` and
 `Retry`, and its doc claimed all of them — §19, claim (5).
 
-**What the top guard is load-bearing for, measured rather than assumed.**
-Delete `select`'s `if fold.run_is_ending()` and this test reports **two**
-arms:
+The historical top-guard mutation, before continuation acquired its own
+eligibility reader, reported two arms:
 
 ```text
 Dispatch (continuing) -> Dispatch { …, continuing: true }
 HardBlock             -> HardBlock { questions: [QuestionId("q-aleph-park")] }
 ```
 
-Four of the six are protected twice over: `ready`, `ready_retry` and
-`integration_admissible` embed `!run_is_ending()` in the fold, and this
-module's own `backoff_pending` wrapper embeds it here. The two that rest
-on the guard **alone** are the continuation — `PR7-R3-LOOP-001`, which is
-why the guard exists — and `HardBlock`, which is the same shape one
-accessor over: `TopologyFold::questions_open` is a statement accessor and
-consults no run state either.
+Five of the six now have another ending check: `ready`, `ready_retry`,
+`integration_admissible` and `eligible_continuation` embed it in the fold,
+and this module's `backoff_pending` wrapper embeds it here. `HardBlock`
+still depends on the top guard because `questions_open` is an accounting
+accessor. The historical two-arm mutation is not a measurement of this
+revised implementation; the assertions retain all six positive cases.
 
 `HardBlock` was not witnessed before this widening. The guard already
 covered it, so this is not an open defect — it is the difference between
@@ -551,12 +549,9 @@ A halted run that keeps offering work is the worse of the two: a budget
 stop at least appends a record each iteration, and `halts_run` is set by
 a task that asked the run to stop.
 
-Two arms rather than six, and the reason is measured rather than
-economised: those two are the ones that rest on the guard at all — the
-other four embed `!run_is_ending()` in their own predicate, so they are
-closed against a halt by the same code that closes them against a
-breach. The proof is in the sibling test's doc: delete the guard and it
-reports exactly `Dispatch (continuing)` and `HardBlock`.
+The two cases retain the original continuation and question witnesses.
+Continuation now also consults a fold eligibility reader that refuses a
+halted run. The question branch still depends on the top guard alone.
 
 ## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn settle_bet(fold: &mut TopologyFold, halts: bool) {`
 
@@ -571,8 +566,8 @@ the flag rather than the shape.
 
 ## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn continuation(halts: bool) -> TopologyFold {`
 
-The continuation arm: `TopologyFold::open_no_attempt` is a statement
-accessor, so nothing below the guard refuses on its behalf.
+The continuation arm now has both the top guard and its fold reader's
+ending check. Keep its accepted live control and halted refusal.
 
 ## `fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {` › `fn hard_block(halts: bool) -> TopologyFold {`
 

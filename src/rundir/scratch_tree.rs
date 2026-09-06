@@ -31,20 +31,26 @@
 //! its two-token form, and `decisions/2026-08-30-test-scratch-tree-ownership.md`
 //! is the record.
 //!
-//! # Why reclaiming a scratch tree needs no proof about its contents
+//! # Acquisition and the lifetime of the root
 //!
-//! [`acquire`] **creates** the root it binds, with a non-recursive
-//! `fs::create_dir` that fails if anything is already there. So the root did
-//! not exist before the token did, and every byte beneath it was written after
-//! the token was minted, by whoever holds the token. **Nothing under a token
-//! root predates the token**, so a recursive removal of it cannot destroy
-//! anything another party is entitled to — exclusivity and safety are
-//! structural properties of the acquisition, not claims about the contents.
+//! [`acquire`] creates the root with a non-recursive `fs::create_dir` that
+//! refuses an occupied name, then opens and retains the directory. The token
+//! keeps that original handle across disarm, rearm and failed reclaim. A
+//! checked use and every reclaim compare the pathname's current directory
+//! with the retained handle, refusing an observed replacement. Reclaim also
+//! requires an observation that the root is absent before reporting success.
 //!
-//! Which is why this funnel does not stat for `committed.json` and must not: a
-//! commit record inside a token root is a fixture the holder published there,
-//! not a run's deletion boundary. The boundary is unmoved for every path that
-//! reaches a run directory; see `remove_private_husk`, the
+//! These checks establish identity at the observations. They do not make
+//! mkdir-plus-open atomic, pin later pathname resolution, or protect children
+//! from an active same-user writer. A replacement between a check and a later
+//! filesystem call remains outside that observation. Changing the ULID seed
+//! cannot close those intervals; no continuous isolation guarantee is made.
+//!
+//! The holder may publish a `committed.json` fixture inside the root. This
+//! funnel therefore does not use that file as a deletion boundary; doing so
+//! would prevent cleanup of the very fixture that tests the production rule.
+//! Run-lifecycle deletion retains its separate proof requirement; see
+//! `remove_private_husk`, the
 //! `RunDir.PublishCommitRecord` site, and `engine::topology::create`.
 //!
 //! # Not a production effect
@@ -81,9 +87,11 @@ use super::ownership::commit_record_proves_absence;
 
 /// Ownership of exactly one scratch tree.
 ///
-/// Not `Clone`, not `Copy`, not `Default`, and its field is private to this
+/// Not `Clone`, not `Copy`, not `Default`, and its fields are private to this
 /// module — so the only value of this type that exists anywhere is one
 /// [`acquire`] returned, bound to the root that call created.
+/// The original directory handle supplies identity for use and reclaim checks.
+/// A replacement cannot become the token's claim on retry.
 /// [`remove_scratch_tree`] takes it **by value**, so the call spends it and
 /// it cannot authorise a second deletion. `NoSecondToken` is where all
 /// three of those are made build failures rather than conventions.
@@ -92,6 +100,10 @@ pub(crate) struct ScratchTreeOwnership {
     /// The exact root this token authorises removing: not a prefix of it,
     /// not a path handed to the removal call later.
     root: PathBuf,
+    /// Pins the original directory until removal succeeds. `None` means a
+    /// successful remover consumed that claim but its absence check failed;
+    /// such a token may never acquire authority over a current occupant.
+    directory: Option<fs::File>,
 }
 
 impl ScratchTreeOwnership {
@@ -99,6 +111,122 @@ impl ScratchTreeOwnership {
     pub(crate) fn path(&self) -> &Path {
         &self.root
     }
+
+    /// Observe whether the pathname still resolves to the acquired directory.
+    /// This is a boundary check, not a promise about later path resolution.
+    pub(crate) fn checked_path(&self) -> Result<&Path, ScratchUseFailure> {
+        self.check_identity().map_err(|source| ScratchUseFailure {
+            // The error owns its path so it can outlive the borrowed token.
+            root: self.root.to_path_buf(),
+            source,
+        })?;
+        Ok(&self.root)
+    }
+
+    fn check_identity(&self) -> io::Result<()> {
+        let Some(original) = &self.directory else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the original scratch-directory claim was consumed",
+            ));
+        };
+        let current = open_directory(&self.root)?;
+        if same_directory(original, &current)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the scratch root was replaced after acquisition",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot use scratch root {}: {source}", .root.display())]
+pub(crate) struct ScratchUseFailure {
+    root: PathBuf,
+    #[source]
+    source: io::Error,
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a scratch root must be a directory without a reparse point",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn same_directory(original: &fs::File, current: &fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let original = original.metadata()?;
+    let current = current.metadata()?;
+    Ok(original.dev() == current.dev() && original.ino() == current.ino())
+}
+
+#[cfg(windows)]
+fn same_directory(original: &fs::File, current: &fs::File) -> io::Result<bool> {
+    Ok(windows_directory_id(original)? == windows_directory_id(current)?)
+}
+
+/// Compare the full file id and volume, including on filesystems with 128-bit
+/// ids. Native Windows tests execute this path; a Unix pass does not validate it.
+#[cfg(windows)]
+fn windows_directory_id(file: &fs::File) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let mut information = FILE_ID_INFO::default();
+    let length = u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FILE_ID_INFO exceeds the Windows buffer-size field",
+        )
+    })?;
+    // SAFETY: File owns a live handle for this entire call. The writable,
+    // initialized buffer is exactly FILE_ID_INFO with the corresponding class
+    // and byte length. No pointer escapes and no ownership is transferred.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            std::ptr::from_mut(&mut information).cast(),
+            length,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
 }
 
 /// Why an acquisition refused.
@@ -116,9 +244,10 @@ pub(crate) enum ScratchAcquireRefusal {
     Occupied { root: PathBuf },
     /// The filesystem declined to say. Every error that is not
     /// `AlreadyExists` lands here — the parent is a file, a component is
-    /// missing, a permission is denied, Windows is holding a handle — and
-    /// all of them read the same way: the acquisition did not happen, so
-    /// there is no token and nothing was touched.
+    /// missing, a permission is denied, Windows is holding a handle, or
+    /// identity capture failed after creation. No token is returned. A root
+    /// created before identity capture failed is retained because no captured
+    /// claim authorizes deleting the current occupant.
     Undecidable { root: PathBuf, source: io::Error },
 }
 
@@ -141,13 +270,12 @@ impl ScratchAcquireRefusal {
     }
 }
 
-/// A reclaim that did not happen, carrying its token back.
+/// A reclaim whose pathname absence is unproved, carrying the original claim.
 ///
-/// The token is returned rather than dropped because the tree is still
-/// there and somebody has to own it: a caller that gets the token back can
-/// re-arm a guard over it ([`ScratchTree::rearm`]) and try again, and a
-/// caller that drops the failure has made a decision rather than lost the
-/// only handle by accident.
+/// An ordinary refusal retains the acquired handle across rearm and retry.
+/// If removal succeeded but its absence check failed, the handle is consumed:
+/// rearm can report the failure or confirm later absence, but cannot reopen
+/// the pathname as a new claim. Neither state authorizes a replacement.
 #[derive(Debug)]
 pub(crate) struct ScratchReclaimFailure {
     token: ScratchTreeOwnership,
@@ -183,8 +311,9 @@ impl ScratchReclaimFailure {
 /// callback holding a reclaim's whole authority: it is handed the token's
 /// root and decides what happens to it, so a crate-visible one could delete
 /// an ancestor of the path it was given, ignore the path entirely and
-/// delete something else, or return `Ok(())` having removed nothing — under
-/// which last a caller's tree is reported reclaimed and silently leaks.
+/// delete something else, or return `Ok(())` having removed nothing. The
+/// absence check now refuses that last case, but cannot undo an arbitrary
+/// callback's filesystem changes.
 /// `PR78-SCRATCH-REMOVER-SEAM-AUTHORITY`. Outside witnesses get
 /// [`refuse_to_reclaim`] instead, which names no path and cannot succeed.
 type Remover = fn(&Path) -> io::Result<()>;
@@ -230,11 +359,16 @@ fn report_to_stderr(message: &str) -> io::Result<()> {
 /// therefore decided by the kernel's own exclusive create rather than by a
 /// stat this code could lose a race to, and every other answer refuses.
 ///
-/// **No predictable root.** The name carries `tag` so that a human reading
-/// a leftover tree can tell what left it, and a fresh ULID because a tag is
-/// not enough: two processes, or two runs of one process, collide on a
-/// tag-and-pid name, and colliding on a path somebody else is using is
-/// precisely what made the old pre-clean destructive.
+/// **An occupied root is refused at acquisition.** The name carries `tag` so that a
+/// human reading a leftover tree can tell what left it, and a fresh ULID
+/// because a tag is not enough: two processes, or two runs of one process,
+/// collide on a tag-and-pid name, and colliding on a path somebody else is
+/// using is precisely what made the old pre-clean destructive. `crate::ulid`
+/// hashes separately encoded clock, pid and nonce fields, which removes the
+/// old seed's pid/nonce cancellation. The name remains deterministic and
+/// does not prove uniqueness or ownership. Exclusive creation refuses an
+/// occupied name at that instant. Identity checks detect later replacements
+/// visible at a checked use or reclaim, subject to the module's stated gaps.
 ///
 /// # Errors
 ///
@@ -251,18 +385,29 @@ pub(crate) fn acquire(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAc
 /// [`acquire`] over an exact name.
 ///
 /// **Private to this module, deliberately.** A caller that chose the name
-/// could choose one somebody else owns, which is the whole hazard the ULID
-/// closes; the crate's tests reach only [`acquire`]. It exists because the
-/// one shape a fresh ULID makes unreachable is the shape the occupied-root
-/// witness has to arrange — a root that is already there.
+/// could select another holder's path; the crate's tests reach only
+/// [`acquire`]. This helper lets the occupied-root witness arrange an exact
+/// existing name without controlling the clock, process id or nonce.
 fn acquire_named(parent: &Path, name: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
     let root = parent.join(name);
     match fs::create_dir(&root) {
-        Ok(()) => Ok(ScratchTree {
-            token: Some(ScratchTreeOwnership { root }),
-            remove: remove_tree,
-            report: report_to_stderr,
-        }),
+        Ok(()) => {
+            let directory =
+                open_directory(&root).map_err(|source| ScratchAcquireRefusal::Undecidable {
+                    // Failed identity capture retains the created path. Removing
+                    // it without a captured claim could remove a replacement.
+                    root: root.to_path_buf(),
+                    source,
+                })?;
+            Ok(ScratchTree {
+                token: Some(ScratchTreeOwnership {
+                    root,
+                    directory: Some(directory),
+                }),
+                remove: remove_tree,
+                report: report_to_stderr,
+            })
+        }
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
             Err(ScratchAcquireRefusal::Occupied { root })
         }
@@ -274,12 +419,17 @@ fn acquire_named(parent: &Path, name: &str) -> Result<ScratchTree, ScratchAcquir
 ///
 /// The path removed is the token's, never a caller's: there is no
 /// path-taking variant of this call, so a reclaim cannot be aimed at an
-/// ancestor, a sibling, or anything the acquisition did not create.
+/// ancestor or sibling by supplying a different path. Removal still resolves
+/// the stored pathname after comparing its directory with the original handle.
+/// Replacement after that check remains a check-to-use interval.
+/// Success means the bound pathname is absent. If the original directory was
+/// moved elsewhere, absence does not establish that the moved object was deleted.
 ///
 /// # Errors
 ///
-/// [`ScratchReclaimFailure`], carrying the token back, for every answer
-/// other than success and `NotFound`.
+/// [`ScratchReclaimFailure`] for a refused identity check, removal error or
+/// unproved root absence. A remover's `NotFound` can name a child and is not
+/// itself proof that the root is absent.
 pub(crate) fn remove_scratch_tree(
     token: ScratchTreeOwnership,
 ) -> Result<(), ScratchReclaimFailure> {
@@ -302,49 +452,76 @@ fn remove_scratch_tree_with(
     token: ScratchTreeOwnership,
     remove: Remover,
 ) -> Result<(), ScratchReclaimFailure> {
+    remove_scratch_tree_observing_absence(token, remove, proves_absent)
+}
+
+/// The post-removal observation is injectable only inside this module, so a
+/// witness can publish a replacement after the original handle closes.
+fn remove_scratch_tree_observing_absence(
+    mut token: ScratchTreeOwnership,
+    remove: Remover,
+    absent: fn(&Path) -> bool,
+) -> Result<(), ScratchReclaimFailure> {
+    if token.directory.is_none() {
+        return if absent(token.path()) {
+            Ok(())
+        } else {
+            Err(ScratchReclaimFailure {
+                token,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the original scratch-directory claim was consumed; the pathname remains occupied or undecidable",
+                ),
+            })
+        };
+    }
+    if let Err(source) = token.check_identity() {
+        if source.kind() == io::ErrorKind::NotFound && absent(token.path()) {
+            return Ok(());
+        }
+        return Err(ScratchReclaimFailure { token, source });
+    }
     match remove(token.path()) {
-        Ok(()) => Ok(()),
-        // The one absence a filesystem proves — the same fail-closed
-        // reading `commit_record_proves_absence` makes of conjunct 12's
-        // stat. Every other error is an answer the filesystem declined to
-        // give, so the token comes back and the tree stays somebody's.
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => {
+            // Close the acquired handle before checking absence, including a
+            // Windows directory whose deletion completes when its handles close.
+            drop(token.directory.take());
+            if absent(token.path()) {
+                Ok(())
+            } else {
+                Err(ScratchReclaimFailure {
+                    token,
+                    source: io::Error::other(
+                        "the remover succeeded but root absence is unproved; the original claim is consumed",
+                    ),
+                })
+            }
+        }
+        // A recursive remover can report NotFound for a child while its root
+        // remains. Only a fresh observation of the root can finish cleanup.
+        Err(source) if source.kind() == io::ErrorKind::NotFound && absent(token.path()) => Ok(()),
         Err(source) => Err(ScratchReclaimFailure { token, source }),
     }
 }
 
 /// Refuse to reclaim a token's tree, deterministically and on every host.
 ///
-/// The one thing a witness outside this module may do to a reclaim, and
-/// deliberately the smallest thing that suffices. It **cannot be aimed**:
-/// there is no path parameter, and the root removed — or in this case not
-/// removed — is the token's own. It **cannot be told what to do**: the
-/// remover is a private `fn` item declared inside this one, stateless, with
-/// no captured environment for a second call or a second thread to observe.
-/// And it **cannot report success**: the return type is the failure itself,
-/// so no caller can be handed an `Ok(())` for a tree that is still there.
-///
-/// What comes back is the genuine [`ScratchReclaimFailure`] the private
-/// funnel built, carrying the token it handed back — so a caller reclaims
-/// with [`ScratchReclaimFailure::into_token`] and [`ScratchTree::rearm`],
-/// exactly as it would after a real refusal. Nothing here is fabricated.
+/// This module constructs a deterministic `PermissionDenied` refusal with
+/// the original token unchanged. No filesystem operation runs, including when
+/// the root is absent. The caller supplies no path, remover or reporter, and
+/// the return type has no success arm. It can recover the original claim via
+/// [`ScratchReclaimFailure::into_token`] and [`ScratchTree::rearm`].
 ///
 /// `PR78-SCRATCH-REMOVER-SEAM-AUTHORITY`: this replaced a crate-visible
 /// [`remove_scratch_tree_with`], under which any caller could pass a
 /// remover that deleted an ancestor, ignored its argument, or returned
 /// `Ok(())` having removed nothing.
 pub(crate) fn refuse_to_reclaim(token: ScratchTreeOwnership) -> ScratchReclaimFailure {
-    /// Removes nothing, refuses always, remembers nothing between calls.
-    fn refuse(_root: &Path) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::PermissionDenied))
-    }
-
-    match remove_scratch_tree_with(token, refuse) {
-        Err(failure) => failure,
-        // Unreachable by construction: `refuse` returns `PermissionDenied`
-        // for every input, and the only error the funnel reads as success
-        // is `NotFound`.
-        Ok(()) => unreachable!("a refusing remover cannot reclaim a tree"),
+    // This witness operation refuses even an absent root. It performs no
+    // removal and cannot adopt a replacement or consume the original claim.
+    ScratchReclaimFailure {
+        token,
+        source: io::Error::from(io::ErrorKind::PermissionDenied),
     }
 }
 
@@ -427,6 +604,21 @@ impl ScratchTree {
         match &self.token {
             Some(token) => token.path(),
             // Unreachable by construction: see the field's own note.
+            None => unreachable!("a live scratch guard holds its token"),
+        }
+    }
+
+    /// The exact path, after observing that its current directory is still
+    /// the one acquired. Reclaim performs its own check independently.
+    pub(crate) fn checked_path(&self) -> Result<&Path, ScratchUseFailure> {
+        match &self.token {
+            Some(token) => token.checked_path(),
+            // Only disarm and Drop remove the token, and each consumes the
+            // guard before another method can run.
+            #[expect(
+                clippy::unreachable,
+                reason = "a live guard retains its token until disarm or Drop consumes it"
+            )]
             None => unreachable!("a live scratch guard holds its token"),
         }
     }
@@ -614,16 +806,101 @@ mod witnesses {
         std::env::temp_dir()
     }
 
-    /// Witness 1 — an occupied root refuses, and the occupant keeps its
-    /// bytes.
-    ///
-    /// This is the shape the replaced helper got wrong. It built a
-    /// predictable path and opened with `let _ = fs::remove_dir_all(&dir)`,
-    /// so a collision was resolved by destroying the other holder's tree
-    /// and the destruction was unobservable — the discard is what made it
-    /// silent. Here the collision is arranged deliberately, through the
-    /// module-private name seam, and the assertion is on the occupant's
-    /// content rather than on the refusal alone.
+    /// Closing the original handle cannot turn a later pathname occupant into
+    /// a new claim, even after repeated transfers through refusal and rearm.
+    #[test]
+    fn a_consumed_claim_never_reopens_a_replacement_on_retry() {
+        fn publish_replacement(path: &Path) -> bool {
+            fs::create_dir(path)
+                .expect("original handle is closed before replacement is published");
+            fs::write(path.join("replacement.txt"), b"must survive retries")
+                .expect("replacement content");
+            proves_absent(path)
+        }
+        let outer =
+            acquire(&temp_parent(), "post-removal-replacement").expect("owned witness parent");
+        let tree = acquire_named(outer.path(), "subject").expect("owned original root");
+        let path = tree.path().to_path_buf();
+        let failure = super::remove_scratch_tree_observing_absence(
+            tree.disarm(),
+            super::remove_tree,
+            publish_replacement,
+        )
+        .expect_err("a replacement prevents an absence claim");
+        let mut guard = ScratchTree::rearm(failure.into_token());
+        for _ in 0..3 {
+            let failure = remove_scratch_tree(guard.disarm())
+                .expect_err("the consumed claim cannot delete a replacement on retry");
+            guard = ScratchTree::rearm(failure.into_token());
+            assert_eq!(
+                fs::read(path.join("replacement.txt")).expect("replacement survives retry"),
+                b"must survive retries"
+            );
+            guard
+                .checked_path()
+                .expect_err("a consumed claim cannot authorize fixture reads either");
+        }
+        fs::remove_dir_all(&path).expect("the witness removes its own replacement");
+        drop(guard);
+        assert!(
+            proves_absent(&path),
+            "a consumed claim may confirm only pathname absence"
+        );
+    }
+
+    #[test]
+    fn a_replaced_root_is_not_reclaimed_and_the_original_claim_survives() {
+        let outer = acquire(&temp_parent(), "replaced-root").expect("owned witness parent");
+        let tree = acquire_named(outer.path(), "subject").expect("the original scratch root");
+        let root = tree.path().to_path_buf();
+        let moved = outer.path().join("original");
+        fs::rename(&root, &moved).expect("move the original directory aside");
+        fs::create_dir(&root).expect("install a replacement at the old pathname");
+        fs::write(root.join("other-owner.txt"), b"replacement contents")
+            .expect("replacement has independent content");
+        tree.checked_path()
+            .expect_err("a replaced root cannot be used as the acquired fixture");
+
+        let failure = remove_scratch_tree(tree.disarm())
+            .expect_err("a path replacement must not grant deletion authority");
+        let guarded = ScratchTree::rearm(failure.into_token());
+        assert_eq!(
+            fs::read(root.join("other-owner.txt")).expect("replacement survives refusal"),
+            b"replacement contents"
+        );
+        fs::remove_dir_all(&root).expect("the witness owns and removes its replacement");
+        fs::rename(&moved, &root).expect("restore the original directory at its acquired pathname");
+        guarded
+            .checked_path()
+            .expect("restoring the original satisfies the original identity claim");
+        drop(guarded);
+        assert!(
+            proves_absent(&root),
+            "the original claim can reclaim the restored original"
+        );
+    }
+
+    #[test]
+    fn a_child_not_found_during_reclaim_does_not_prove_root_absence() {
+        fn child_not_found(_root: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        }
+        let outer = acquire(&temp_parent(), "child-not-found").expect("owned witness parent");
+        let tree = acquire_named(outer.path(), "subject").expect("owned scratch root");
+        let root = tree.path().to_path_buf();
+        let failure = remove_scratch_tree_with(tree.disarm(), child_not_found)
+            .expect_err("a child error does not establish that the root is gone");
+        let guarded = ScratchTree::rearm(failure.into_token());
+        assert!(root.is_dir(), "the fixture left its root in place");
+        drop(guarded);
+        assert!(
+            proves_absent(&root),
+            "the real remover reclaims the retained original claim"
+        );
+    }
+
+    /// An occupied root refuses without deleting the occupant's contents.
+    /// The module-private name seam arranges the collision at acquisition.
     #[test]
     fn an_occupied_root_refuses_and_leaves_what_it_found() {
         let parent = acquire(&temp_parent(), "occupied").expect("a parent tree");

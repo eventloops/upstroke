@@ -36,7 +36,9 @@ breach has to be decided by whatever decides the branch.
 [`crate::topology::fold::TopologyFold`] exposes `ready`, `ready_retry`,
 `pipeline_reservable`, `structurally_admissible` and
 `integration_admissible`, and every one of them is false once the fold is
-poisoned. It exposes `run_is_ending`, `backoff_pending` and
+poisoned. Its `eligible_continuation` reader returns no generation once
+poisoned, and excludes lineages with unanswered questions. It exposes
+`run_is_ending`, `backoff_pending` and
 `questions_open` beside them — statements about the run rather than
 authorisations, which is why those three survive a poisoning and why
 `derived_outcome` reads the same three. Nothing here re-derives any of
@@ -48,7 +50,8 @@ largest measured root cause by a factor of three.
 What is left for this module is exactly the packet's own division of
 labour: **which** eligible item to take, and **whether the ceiling permits
 it**. `CandidateQueue::first_eligible` answers the first of those for an
-integration; ascending task key answers it for a dispatch and a retry,
+integration through the fold's question-aware reader; ascending task key
+answers it for a dispatch and a retry,
 which is §14's "lowest plan index first" over the dense registry keys.
 
 ## `pub struct Spend {`
@@ -468,10 +471,9 @@ not implement.
 
 The candidate an eligible integration would take, if one is eligible.
 
-`integration_admissible` decides *whether* — it is the fold's, it already
-folds in "no unresolved transaction" and "run not ending", and it is false
-on a poisoned fold. `first_eligible` decides *which*, over the same three
-inputs the fold hands it.
+The fold supplies both eligibility and identity, including questions on
+other members of the candidate's lineage. The selected step owns its
+candidate snapshot after this borrowed view ends.
 
 ## `fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, AttemptNumber)> {`
 
@@ -486,7 +488,9 @@ the number without inventing it.
 
 ## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {`
 
-The lowest-keyed `ready` task and the generation its dispatch opens.
+The lowest-keyed eligible continuation or fresh dispatch.
+No selection if no registered task can continue or open a representable
+generation; a missing task has no dispatch to offer.
 
 ## `fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {` › `if let Some(generation) = fold.open_no_attempt(key) {`
 
@@ -559,3 +563,45 @@ The stop a breach records.
 
 `key` is `None` where no task's next attempt was refused, which is the
 integration branch and only it.
+
+## `select` › `if fold.run_is_ending() {`
+
+**An ending run offers no work, whatever else is live.**
+
+`loop` says a breach "appends `budget_exceeded` before any effect and
+**proceeds to closure**", and a halted run is the same shape one cause
+over. `run_is_ending()` is `halted_at.is_some() || budget_stop_is_current()`.
+
+The fold's eligibility readers also refuse ending runs, including the
+continuation reader. This top guard keeps closure ahead of every branch,
+including the question branch, whose accounting reader survives a stop.
+Continuation originally used `open_no_attempt` directly. Recovery still
+needs that accounting accessor before `run_resumed`, when a budget stop
+must not hide the worktrees it needs to rebuild.
+
+Found by round 3's `loop` lens, measured end to end: five consecutive
+`step()` calls each returned `Progress::BudgetExceeded` and appended a
+duplicate stop record, because the continuation was offered, refused by
+the ceiling, and offered again — a run that never terminates. With
+`halted_at` set the same path returned `Dispatch { continuing: true }`: a
+halted run spawning a worker.
+
+## `first_ready` › `if let Some(generation) = fold.eligible_continuation(key) {`
+
+**A continuation first, and it cannot compete with a fresh dispatch.**
+`T-DISPATCH`'s `authoritative_state` is "generation open
+(OpenNoAttempt) ... entitlement derived from the open generation", so
+an open generation holds the run's only entitlement at
+`max_parallel = 1` and `ready` is false for every other task —
+`pipeline_reservable` sees none free. The order between the two
+therefore cannot arise in this build.
+
+**`eligibility_order` is silent on it**, naming only "eligible
+integration precedes ready_retry precedes new ordinary dispatch",
+and a continuation is not a *new* dispatch. Reported as a candidate
+erratum rather than chosen here: at a wider pipeline the two can
+coexist and the packet will have to say which wins.
+
+## `first_ready` › `return None;`
+
+This task cannot name another generation in the event format.
