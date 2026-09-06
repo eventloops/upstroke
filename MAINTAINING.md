@@ -181,11 +181,14 @@ the current head, resolved conversations, and merge commits only; it blocks dele
 non-fast-forward updates and has no bypass actor. The merge-queue contract is this: every merge
 goes through the queue, which builds each entry on `master`'s head plus the entries ahead of it,
 requires both contexts on that entry, and lands exactly the commit they passed on, so a branch is
-never required to be up to date on its own. The workflows and the audit below implement that
+never required to be up to date on its own. The queue merges only non-failing entries (the rule's
+grouping strategy is all-green, never head-green): `pr-policy.yml` validates the one pull request
+an entry's queue ref names, so an entry whose own contexts failed must leave the queue rather
+than ride out under a later entry's green. The workflows and the audit below implement that
 contract; the ruleset adopts it as the owner's act once the contract is on `master`, by adding
-the merge-queue rule and removing the up-to-date requirement the queue makes redundant. Until
-then `merge_group` never fires, the up-to-date requirement stands, and step 7's enqueue is an
-auto-merge that waits on the head's own contexts. A tag ruleset on `refs/tags/v*` blocks updates and deletions
+the merge-queue rule with merge method merge and all-green grouping, and removing the up-to-date
+requirement the queue makes redundant. Until then `merge_group` never fires, the up-to-date
+requirement stands, and step 7's enqueue is an auto-merge that waits on the head's own contexts. A tag ruleset on `refs/tags/v*` blocks updates and deletions
 with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
 pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
 is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on

@@ -23,11 +23,14 @@
 #   - the latest `upstroke-ci` and `upstroke-pr-policy` check runs on the head succeeded
 #   - the latest review comment (either the `Reviewed head:` workflow form or the
 #     `<!-- upstroke-frontier-review -->` form) reviewed the head itself, or a commit the head
-#     differs from only by merge commits and pushes confined to reviews/findings/ or
-#     reviews/FINDINGS.md (MAINTAINING step 5 keeps the review across both)
+#     differs from only by clean merge commits (git's own merge of the two parents, the branch
+#     diff byte-identical before and after, and no gate edited by the pull request) and pushes
+#     confined to reviews/findings/ or reviews/FINDINGS.md (MAINTAINING step 5 keeps the review
+#     across both)
 #   - no finding in that review has a severity the lane must fix
-#   - every allowed finding has a ledger row in the body whose disposition is deferred (with a
-#     file under reviews/findings/ on the branch naming the finding id), rejected or accepted-risk
+#   - every allowed finding has a ledger row in the body whose disposition is deferred or
+#     accepted-risk (each with a file under reviews/findings/ on the branch naming the finding
+#     id, since both leave it open) or rejected
 #
 # Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than clean merges
 # and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
@@ -45,8 +48,9 @@
 # does one whose fields name a MUST deviation (a field named mandatory/deviation/must_*, or the
 # word MUST in any string field); a witness or deviation that exists only in prose does not
 # reach the audit, and the deferring implementor's row asserts there is none (MAINTAINING step 5
-# binds them). A master merge-in is checked for being git's own merge of its parents and for
-# leaving no branch commit outside the ledger.
+# binds them). A master merge-in is checked on step 5's terms: git's own merge of its parents,
+# the branch diff byte-identical before and after, no gate edited by the pull request, and no
+# branch commit outside the ledger.
 #
 # Needs: bash, git (a checkout with `origin` pointing at the repository), gh (its built-in --jq
 # does all JSON work; a standalone jq is not required).
@@ -158,11 +162,12 @@ for pr in "${prs[@]}"; do
   esac
 
   # The newest check run per required context on the head: a re-run creates a new run with the
-  # same name, so the runs are grouped by name and the latest start wins before its conclusion
-  # is read; an older success never outranks a newer failure.
+  # same name, so every matching run from every page is listed with its start time, sorted, and
+  # the last start per name is the one whose conclusion is read. `--paginate` runs the jq filter
+  # per page, so the selection happens here in the shell, over all pages, not in jq.
   checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" --paginate \
-    --jq '[.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy")] | group_by(.name) | map(max_by(.started_at // "")) | map("\(.name)=\(.conclusion // .status)") | join(" ")' \
-    | tr '\n' ' ')"
+    --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.started_at // "")\t\(.conclusion // .status)"' \
+    | sort -t $'\t' -k1,1 -k2,2 | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }')"
   for ctx in upstroke-ci upstroke-pr-policy; do
     case " $checks " in
       *" $ctx=success "*) ;;
@@ -196,17 +201,29 @@ for pr in "${prs[@]}"; do
     elif ! git merge-base --is-ancestor "$reviewed" "$head"; then
       blockers+=("reviewed-not-ancestor:${reviewed:0:7}")
     elif [[ "$reviewed" != "$head" ]]; then
-      # Every merge commit the branch added must be exactly what git produces from its two
-      # parents on its own: a merge carrying hand edits, a conflict resolution or a third parent
-      # is a new change (MAINTAINING step 5) that `--no-merges` below would otherwise hide.
+      # A merge-in keeps the review only on MAINTAINING step 5's terms: the merge commit is
+      # exactly what git produces from its two parents on its own (a hand edit, a conflict
+      # resolution or a third parent is a new change that `--no-merges` below would hide), the
+      # branch's diff against its base is byte-identical before and after the merge, and the pull
+      # request edits no gate. Anything wider is reviewed again.
       merge_edits=""
-      for m in $(git rev-list --merges "$reviewed..$head" --not origin/master); do
+      merges="$(git rev-list --merges "$reviewed..$head" --not origin/master)"
+      for m in $merges; do
         if (($(git rev-list --parents -n 1 "$m" | wc -w) != 3)); then merge_edits="$m"; break; fi
         if ! expected="$(git merge-tree --write-tree "$m^1" "$m^2" 2>/dev/null)"; then
           merge_edits="$m"; break   # a conflict, or a git too old for --write-tree: fail closed
         fi
         [[ "$(git rev-parse "$m^{tree}")" == "$expected" ]] || { merge_edits="$m"; break; }
+        # Byte-identical branch diff: the branch side against its base before the merge, and the
+        # merge against the side it merged in, must be the same patch.
+        before="$(git diff "$(git merge-base "$m^1" "$m^2")" "$m^1" | git hash-object --stdin)"
+        after="$(git diff "$m^2" "$m" | git hash-object --stdin)"
+        [[ "$before" == "$after" ]] || { merge_edits="$m"; break; }
       done
+      if [[ -n "$merges" && -z "$merge_edits" ]] \
+        && git diff --name-only "origin/master...$head" -- .github/workflows .github/scripts | grep -q .; then
+        blockers+=("review-stale:gate-edit-with-merge-in")   # step 5: no exemption for a gate-editing pull request
+      fi
       # Commits master already has arrived through a merge-in; only the branch's own count.
       touched="$(git log --no-merges --name-only --format= "$reviewed..$head" --not origin/master | sort -u)"
       if [[ -n "$merge_edits" ]]; then
@@ -310,11 +327,11 @@ PY
     fi
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
-      deferred)
+      deferred|accepted-risk)   # both leave the finding open, and an open finding has its file
         if ! git grep -q -F "$id" "$head" -- reviews/findings 2>/dev/null; then
           blockers+=("no-file:$id")
         fi ;;
-      rejected|accepted-risk) ;;
+      rejected) ;;
       fixed)
         [[ "$moved" == repairs || "$moved" == merge-edits:* ]] || blockers+=("fixed-but-head-unmoved:$id") ;;
       "") blockers+=("no-row:$id") ;;
