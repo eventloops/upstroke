@@ -181,11 +181,7 @@ fn publish_pools(
             ),
         });
     };
-    fs::create_dir_all(named).map_err(|source| UpstrokeError::Filesystem {
-        operation: "create directory",
-        path: named.to_path_buf(),
-        source,
-    })?;
+    create_directory_durably(named)?;
     let destination = publication_target(path)?;
     let Some(directory) = publication_directory(&destination) else {
         return Err(UpstrokeError::Refused {
@@ -215,6 +211,46 @@ fn publish_pools(
         path: directory.to_path_buf(),
         source,
     })
+}
+
+fn create_directory_durably(directory: &Path) -> Result<(), UpstrokeError> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut probe = directory;
+    loop {
+        match fs::metadata(probe) {
+            Ok(_) => break,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(probe.to_path_buf());
+            }
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "read the kind of directory",
+                    path: probe.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        match publication_directory(probe) {
+            Some(parent) if parent != probe => probe = parent,
+            _ => break,
+        }
+    }
+    fs::create_dir_all(directory).map_err(|source| UpstrokeError::Filesystem {
+        operation: "create directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for created in missing.iter().rev() {
+        let Some(parent) = publication_directory(created) else {
+            continue;
+        };
+        util::fsync_dir(parent).map_err(|source| UpstrokeError::Filesystem {
+            operation: "flush the directory of created directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 struct Staged {
@@ -286,7 +322,8 @@ const SYMLINK_FOLLOW_LIMIT: usize = 40;
 
 fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {
     let mut current = path.to_path_buf();
-    for _ in 0..SYMLINK_FOLLOW_LIMIT {
+    let mut followed = 0;
+    loop {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -303,15 +340,18 @@ fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {
         if !metadata.file_type().is_symlink() {
             return Ok(current);
         }
+        if followed == SYMLINK_FOLLOW_LIMIT {
+            return Err(UpstrokeError::Filesystem {
+                operation: "resolve the symlinked pools file",
+                path: path.to_path_buf(),
+                source: std::io::Error::other(format!(
+                    "more than {SYMLINK_FOLLOW_LIMIT} levels of symbolic links"
+                )),
+            });
+        }
         current = named_target(&current)?;
+        followed += 1;
     }
-    Err(UpstrokeError::Filesystem {
-        operation: "resolve the symlinked pools file",
-        path: path.to_path_buf(),
-        source: std::io::Error::other(format!(
-            "more than {SYMLINK_FOLLOW_LIMIT} levels of symbolic links"
-        )),
-    })
 }
 
 fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {
@@ -714,6 +754,39 @@ mod tests {
     }
 
     #[test]
+    fn a_publication_into_directories_it_creates_flushes_each_new_entry_in_its_parent() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdirs")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("made").join("here").join("pools.toml");
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published into a directory that did not exist")
+            .expect("the publication lands");
+        let after = crate::util::barriers_on_this_thread();
+
+        assert_eq!(after.file - before.file, 1);
+        assert_eq!(
+            after.directory - before.directory,
+            3,
+            "two directory entries were created (`made` in the scratch tree, `here` in `made`) \
+             and each is flushed in its parent, then `here` is flushed for the published file"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read what was published"),
+            "published into a directory that did not exist"
+        );
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published again").expect("the second publication lands");
+        let after = crate::util::barriers_on_this_thread();
+        assert_eq!(
+            after.directory - before.directory,
+            1,
+            "nothing was created the second time, so only the published file's directory is flushed"
+        );
+    }
+
+    #[test]
     fn the_directory_a_pools_file_is_published_into_is_openable() {
         assert_eq!(
             publication_directory(Path::new("pools.toml")),
@@ -832,41 +905,70 @@ mod tests {
         assert_eq!(staging_files(tree.path()), Vec::<String>::new());
     }
 
+    /// `count` links in a row, `pools.toml -> link-1 -> … -> link-<count-1>
+    /// -> final.toml`, every one relative; returns the first link and the
+    /// file the chain names, which does not exist.
+    #[cfg(unix)]
+    fn chain_of(tree: &Path, count: usize) -> (PathBuf, PathBuf) {
+        let name = |index: usize| {
+            if index == 0 {
+                "pools.toml".to_owned()
+            } else {
+                format!("link-{index}.toml")
+            }
+        };
+        for index in 0..count {
+            let target = if index + 1 == count {
+                "final.toml".to_owned()
+            } else {
+                name(index + 1)
+            };
+            std::os::unix::fs::symlink(&target, tree.join(name(index)))
+                .expect("one link of the chain");
+        }
+        (tree.join(name(0)), tree.join("final.toml"))
+    }
+
     #[cfg(unix)]
     #[test]
-    fn a_cycle_of_pools_symlinks_is_refused_rather_than_followed_forever() {
-        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-cycle")
-            .expect("acquire an isolated pools directory");
-        let link = tree.path().join("pools.toml");
-        let other = tree.path().join("other.toml");
-        std::os::unix::fs::symlink("other.toml", &link).expect("a link into the cycle");
-        std::os::unix::fs::symlink("pools.toml", &other).expect("and the link back");
+    fn a_chain_at_the_follow_limit_is_published_and_one_past_it_is_refused() {
+        for count in [SYMLINK_FOLLOW_LIMIT - 1, SYMLINK_FOLLOW_LIMIT] {
+            let tree =
+                crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain-limit")
+                    .expect("acquire an isolated pools directory");
+            let (link, named) = chain_of(tree.path(), count);
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let outcome = write_pools(&link, "a replacement with no file to land on");
-            let _ = sender.send((link, outcome));
-        });
-        let (link, outcome) = receiver
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("a resolution with a bound answers well inside it; a cycle followed forever never does");
-        let error = outcome.expect_err("a cycle names no file to publish");
+            write_pools(&link, "published through the chain").expect("a chain the bound admits");
+
+            assert_eq!(
+                fs::read_to_string(&named).expect("the file the chain names now exists"),
+                "published through the chain",
+                "{count} links"
+            );
+            assert!(
+                fs::symlink_metadata(tree.path().join(format!("link-{}.toml", count - 1)))
+                    .expect("read the last link")
+                    .file_type()
+                    .is_symlink(),
+                "the last of {count} links is still a link"
+            );
+            assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+        }
+
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain-over")
+                .expect("acquire an isolated pools directory");
+        let (link, named) = chain_of(tree.path(), SYMLINK_FOLLOW_LIMIT + 1);
+
+        let error = write_pools(&link, "a replacement with no file to land on")
+            .expect_err("one link past the bound is refused");
 
         assert!(
             matches!(error, UpstrokeError::Filesystem { operation: "resolve the symlinked pools file", path: ref failed, ref source }
             if failed == &link && source.to_string().contains("levels of symbolic links")),
             "{error:?}"
         );
-        for path in [&link, &other] {
-            assert!(
-                fs::symlink_metadata(path)
-                    .expect("read the link")
-                    .file_type()
-                    .is_symlink(),
-                "{} is still the operator's link",
-                path.display()
-            );
-        }
+        assert!(!named.exists(), "nothing was published past the bound");
         assert_eq!(
             staging_files(tree.path()),
             Vec::<String>::new(),

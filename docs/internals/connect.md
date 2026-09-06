@@ -151,12 +151,16 @@ The write boundary already names the operation and failed path.
 Replace the file after the caller has decided that replacement is allowed.
 
 **What this write guarantees (§8 asks for the words): atomic replacement, and
-durability of what it publishes.** The content goes to a staging file unique to
+durability of what it publishes — the file, and any directory entry it had to
+create to put the file there.** The content goes to a staging file unique to
 this call in the destination's own directory, is flushed there, and is then
 renamed onto the destination; the directory entry is flushed after the rename.
-A reader of the pools file sees either the previous file whole or this one
-whole, never a truncated or half-written one, and every failure before the
-rename leaves the previous file byte-for-byte intact.
+A directory component that did not exist is created first and its new entry
+flushed in *its* parent ([`create_directory_durably`]), so a first `connect`
+into a `~/.upstroke/` that does not exist yet is as durable as a rewrite into
+one that does. A reader of the pools file sees either the previous file whole
+or this one whole, never a truncated or half-written one, and every failure
+before the rename leaves the previous file byte-for-byte intact.
 
 Until PR #189 this was one `fs::write`, which opens the destination with
 truncation and writes into it. The caller had decided the file *may* be
@@ -183,10 +187,11 @@ and renamed is the file the link names.
 
 ### Errors
 
-Names the operation that failed and the path it failed on: creating the
-directory, resolving a symlinked destination, reading the destination's mode,
-creating, restricting, writing or flushing the staging file, publishing it, or
-flushing the directory afterwards. Every failure from the staging file's
+Names the operation that failed and the path it failed on: reading the kind of
+a directory on the way to the destination, creating the directory, flushing a
+created directory's entry in its parent, resolving a symlinked destination,
+reading the destination's mode, creating, restricting, writing or flushing the
+staging file, publishing it, or flushing the directory afterwards. Every failure from the staging file's
 creation onwards removes that file — on a return through [`Staged::withdraw`],
 which reports a removal that itself fails beside the failure that caused it,
 and on an unwind through the guard's `Drop`.
@@ -224,6 +229,25 @@ staging file is gone.
 What a killed process leaves behind is still one uniquely named `.tmp` that no
 reader of the directory interprets and that the next publication cannot collide
 with; no guard runs in a process that is gone.
+
+## `fn create_directory_durably(directory: &Path) -> Result<(), UpstrokeError> {`
+
+`create_dir_all`, with the durability `create_dir_all` does not give. A new
+directory is a new entry in its parent, and an entry that has not been flushed
+is one a power loss can take back — together with everything published inside
+it, however carefully that was flushed. So the missing suffix of the path is
+found first (walking up until a component exists; a component that is there
+but is not a directory is left for `create_dir_all` to refuse, naming the
+directory the operator asked for), the directories are created by the one
+primitive, and then each created component's parent is flushed, outermost
+first, so that by the time the destination directory itself is flushed after
+the rename every entry above it is on disk too. Pass 1 of the recovery review
+(`SWEEP-CONNECT-009`) found the first `connect` into a `~/.upstroke/` that did
+not exist claiming a durability it had only for the file.
+
+The walk stops at `.` or a root, which always exist. A race — another process
+creating the same directory between the walk and `create_dir_all` — costs one
+flush of an entry that was already there, never a missing one.
 
 ## `struct Staged {`
 
@@ -279,10 +303,15 @@ the guard and the row land in one change.
 
 ## `const SYMLINK_FOLLOW_LIMIT: usize = 40;`
 
-How many links [`publication_target`] follows before calling the chain a cycle.
-Linux's own limit for path resolution is 40 (`MAXSYMLINKS`), so a chain this
-refuses is one the kernel would refuse `fs::write` through with `ELOOP` as
-well; the number is borrowed from there rather than chosen here.
+How many links [`publication_target`] follows before calling the chain a cycle:
+a chain of exactly this many links is published through, one more is refused.
+The value is Linux's own limit for path resolution (`MAXSYMLINKS`), so on
+Linux the chains this refuses are exactly the chains the kernel refuses
+`fs::write` through with `ELOOP`. It is upstroke's limit, not the platform's:
+macOS resolves at most 32 and Windows caps reparse points lower still, and on
+those platforms a chain longer than the platform allows never reaches this
+walk — `run_with` reads the existing file *through* the chain first, and that
+read fails with the platform's own error.
 
 ## `fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {`
 
@@ -309,11 +338,24 @@ with both links intact. `a_chain_of_pools_symlinks_publishes_the_file_the_last_l
 is that chain, with the intermediate link in a subdirectory and a relative
 target, so a resolution against the wrong directory is caught too.
 
-The walk is bounded by [`SYMLINK_FOLLOW_LIMIT`]; a chain that is still a link
-after that many steps is a cycle, and it is refused naming the destination the
-operator gave, not the link the walk happened to stop on. Only a real
-`NotFound` on the path being examined is absence (§7); anything else the stat
-refuses is reported rather than treated as "no link here".
+The walk is bounded by [`SYMLINK_FOLLOW_LIMIT`], and the bound is applied to
+the *link about to be followed*, after the path reached by the previous follow
+has been inspected: a chain of exactly the limit's length ends on a non-link
+that the last inspection accepts, and only the link past it is refused. Pass 1
+of the recovery review (`SWEEP-CONNECT-010`) caught the first version
+counting follows in a `for` and refusing a chain of exactly 40, which Linux
+itself follows;
+`a_chain_at_the_follow_limit_is_published_and_one_past_it_is_refused` now
+publishes through 39 and 40 links and refuses 41. A cycle is refused by the
+same bound, because a cycle is a chain with no end: after the limit's worth of
+follows it is still a link. The refusal names the destination the operator
+gave, not the link the walk happened to stop on. There is deliberately no
+cycle-shaped fixture: a test that hands a genuine cycle to a walk whose bound
+a mutation has removed does not fail, it never returns, and the bound's
+witness is a chain one link longer than the limit, which such a walk publishes
+through and the test then sees as a wrong answer rather than no answer. Only a
+real `NotFound` on the path being examined is absence (§7); anything else the
+stat refuses is reported rather than treated as "no link here".
 
 The directory that is *created* is still the one the operator named, never one
 behind a link: `create_dir_all` runs before this resolution, on `path`'s own
@@ -381,6 +423,16 @@ destination *and* leave behind a `.tmp` that cannot be removed, in exchange for
 an attribute the rename does not carry anyway. A file created here takes the ACL
 its directory gives it, which is what a *new* pools file always took; carrying a
 Windows ACL across a replacement is not attempted and is not claimed.
+
+The same limit holds on Unix for anything beyond the mode bits. What
+[`apply_mode`] carries is the `st_mode` permission bits and nothing else: a
+POSIX access ACL (`setfacl`), a macOS ACL (`chmod +a`), or any other extended
+attribute the operator put on the previous file is on the previous *inode*, and
+the rename publishes a new one that took only what its directory gave it. The
+in-place `fs::write` this replaced kept the inode and therefore kept those.
+`SWEEP-CONNECT-003` records that consequence for every platform, not for
+Windows alone (pass 1 of the recovery review, `SWEEP-CONNECT-011`, found it
+recorded as Windows-only).
 
 ## `fn settings_match(existing: &str, proposed: &str) -> bool {`
 
@@ -508,14 +560,14 @@ which is exactly what umask `0027`, a common hardened default, gives a fresh
 file (`0o666 & !0o027 = 0o640`), so the test failed there before `connect` was
 reached (`SWEEP-CONNECT-007`). The control is gone with the reason for it.
 
-## `let (sender, receiver) = std::sync::mpsc::channel();`
+## `fn chain_of(tree: &Path, count: usize) -> (PathBuf, PathBuf) {`
 
-The resolution runs on its own thread with a bounded wait, because the property
-under test is that a cycle is *refused*, and the failure mode of a resolution
-without a bound is not a wrong answer but no answer: without the bound the test
-would hang rather than fail (§12, "every wait is bounded"). Thirty seconds
-bounds a wedged walk, not a healthy one — the healthy walk answers in
-microseconds.
+A chain of `count` relative links ending on a file that does not exist, so the
+boundary tests can be spelled in the limit's own terms: one under, at, and one
+over. Every test of the bound goes through `write_pools` rather than `connect`,
+because `connect` reads the existing file *through* the chain first and the
+platform's own follow limit (32 on macOS) would fail that read before the walk
+under test ran.
 
 ## `let old = first.content.replace(`
 
