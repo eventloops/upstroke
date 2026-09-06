@@ -20,16 +20,17 @@ repository = "https://github.com/eventloops/upstroke"
 readme = "README.md"
 keywords = ["ai", "agents", "orchestration", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# Internal working documents: useful in the repo, noise in the published
-# crate. Fixtures stay — the parser tests are fixture-driven. `docs/` is the
-# GitHub Pages source, so it is a website rather than part of the library.
+# Exclude working records, automation, and the Pages entry point and domain.
+# Module notes under docs/internals stay in the crate with the source they
+# document. Parser fixtures stay because the tests read them.
 exclude = [
     "reviews/",
     ".github/",
     ".upstroke/",
     ".testagent/",
     "acceptance/",
-    "docs/",
+    "docs/index.html",
+    "docs/CNAME",
     "scripts/",
 ]
 

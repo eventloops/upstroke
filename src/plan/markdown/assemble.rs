@@ -1,22 +1,10 @@
-//! Assembly: ids, kinds, dependencies, artifacts.
-//!
-//! The last step, and the only one that mints IR. Explicit `id=` values are
-//! reserved before any slug is derived, so a derived id never collides with
-//! one an author wrote; duplicate explicit ids are left intact for `validate`
-//! to report. An absent `depends=` chains a task to its predecessor in
-//! document order, and `depends=` with no value breaks that chain
-//! deliberately. Kinds fall back to a keyword heuristic over the title.
-//!
-//! The sink of the DAG: fed by [`super::drafts`] and [`super::hints`], read by
-//! nothing but the adapter itself.
+//! Extended notes: `docs/internals/plan/markdown/assemble.md`
 
 use super::drafts::Draft;
 use super::hints::push_unique;
 use crate::ir::{Artifact, ArtifactId, Task, TaskId, TaskKind};
 
 pub(super) fn assemble(drafts: Vec<Draft>) -> Vec<Task> {
-    // Reserve explicit ids first so derived slugs never collide with them.
-    // Explicit duplicates are left intact for validation to report.
     let mut taken: Vec<String> = drafts
         .iter()
         .filter_map(|d| d.annotation().id.clone())
@@ -125,8 +113,6 @@ fn heuristic_kind(title: &str) -> TaskKind {
     }
 }
 
-/// Artifacts come from `out=` annotations; a bare plan with a Design task
-/// defaults to a conventions brief produced by the first one (§9).
 pub(super) fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Artifact> {
     let mut artifacts: Vec<Artifact> = Vec::new();
     for task in tasks.iter() {

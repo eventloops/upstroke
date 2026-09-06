@@ -1,6 +1,7 @@
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/engine/coordinator.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
@@ -40,10 +41,6 @@ use super::report::{
     ReportHeader, RunOutcome, RunReport, TaskRunStatus, build_report, last_reason,
 };
 
-/// Also hands back the state the run ended with — its own fold of its own log.
-///
-/// Only tests use the second half, to hold the live fold and a replay of the
-/// same file side by side. Nothing in the engine reads state back.
 #[cfg(test)]
 pub(super) fn run_harness_inner(
     opts: &RunOptions,
@@ -58,18 +55,6 @@ pub(super) fn run_harness_inner(
     )
 }
 
-/// The same run, on an explicit boundary. See [`super::run_harness_on`].
-///
-/// `_contained` is INV-18's host portion as a capability: "on Windows every
-/// host child is a member of the coordinator's ambient kill-on-close Job
-/// Object **from creation**", enforced by "ambient job joined at write-command
-/// startup (refusal otherwise)". This function is the write coordinator, and
-/// [`crate::runner::host::Contained`] cannot be built outside
-/// `crate::runner::host`, so no caller — a CLI arm, the frozen public engine
-/// facade, or an entry point added later — can reach a spawn without having
-/// established containment first. That is a compile error rather than a
-/// convention, which is what the previous shape was: the CLI established it
-/// and `engine::run_with` did not.
 pub(super) fn run_harness_inner_on(
     opts: &RunOptions,
     harness: &Harness<'_>,
@@ -97,15 +82,13 @@ pub(super) fn run_harness_inner_with_id(
     // competing holder of the lease it never needed.
     let validated = validate_inputs(opts, config::EngineLimits::Fresh)?;
     let workspace = Workspace::open(&opts.repo_root)?;
-    // Preflight reads the source plan, config, and gate programs from this
-    // physical worktree. Own it before taking that snapshot so another run
-    // cannot leave us with an analysis of its transient edits.
     let worktree_git_dir = workspace.worktree_git_dir()?;
+    // Own the physical worktree before capturing the analysis this run adopts.
+    // The successful lease acquisition arbitrates between conductors; a loser
+    // returns before preflight or Git mutation. Acquire this outer lease before
+    // the per-run lease below and keep both guards until the run finishes, so
+    // error returns and unwinding release them in reverse order.
     let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
-    // The lease is what makes a read of this worktree a fact about it, so the
-    // analysis the run executes is captured and validated here rather than
-    // before — and adopted only once it agrees, byte for byte, with what the
-    // refusal above was decided on.
     let analysis = validated.confirm_under_lease(opts, config::EngineLimits::Fresh)?;
     let Preflight {
         analysis,
@@ -136,25 +119,19 @@ pub(super) fn run_harness_inner_with_id(
     let branch = format!("upstroke/run-{run_id}");
     let paths = opts.paths(&run_id);
     paths.create_fresh()?;
-    // Held for the whole run, released by the OS if this process dies — so a
-    // crash leaves nothing for `resume` to clear by hand.
+    // Claim this run before publishing its first event. Keep the guard for the
+    // whole run; process death releases the primary OS hold, while the lock
+    // implementation prevents takeover while prior agents are cleaning up.
     let _lock = RunLock::acquire(&paths.public)?;
     let _cleanup_scope = _lock.enter_cleanup_scope();
 
-    // Nothing is on the record until the first event lands, so a failure in
-    // this window would leave a run directory with no `events.jsonl` in it —
-    // and that husk becomes `latest_run`, so a bare `upstroke status` reports
-    // "no event log here" for a run that never began, shadowing the real
-    // latest one until someone deletes it by hand. Best-effort: failing to
-    // tidy up must not mask the error that actually stopped the run.
     let plan_path = paths.plan_json();
     let normalized_plan = normalized_plan_bytes(&analysis.plan, &plan_path)?;
     let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
     let opened = rundir::write_plan(&paths.public, &normalized_plan, &mut rundir::NoHooks)
         .and_then(|()| {
             let read_back = fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
-                // The returned error owns its diagnostic path independently
-                // of this function's local plan path.
+
                 path: plan_path.clone(),
                 source,
             })?;
@@ -177,8 +154,7 @@ pub(super) fn run_harness_inner_with_id(
     }
 
     let effort_policy = analysis.config.resolved_effort_policy();
-    // The event owns a durable snapshot of identities, the plan hash and
-    // review policy while the live run retains its independent values.
+
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
         upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -193,9 +169,6 @@ pub(super) fn run_harness_inner_with_id(
         plan_hash: analysis.plan.source.hash.clone(),
         normalized_plan_digest: Some(normalized_plan_digest),
         private_dir: paths.private.to_string_lossy().into_owned(),
-        // Names for the reader, the full gates for the resume — both from the
-        // one list pre-flight resolved, so the log cannot name a gate its own
-        // record does not describe.
         gates: gates.iter().map(|gate| gate.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
@@ -254,9 +227,6 @@ pub(super) fn run_harness_inner_with_id(
     run.emit(EventBody::RunStarted {
         data: Box::new(started),
     })?;
-    // A fresh run has no signals of its own yet, and §13's other sources are
-    // not read in v0.1 — so this snapshot is honestly a record of how little
-    // was known when the run started.
     run.emit_capacity_snapshot(&BTreeMap::new())?;
     let report = run.drain_and_report()?;
     Ok((report, run.state))
@@ -270,96 +240,34 @@ pub(super) struct Run<'a> {
     pub(super) analysis: &'a Analysis,
     pub(super) workspace: &'a Workspace,
     pub(super) paths: RunPaths,
-    /// The append-only record. Every mutation below goes through
-    /// [`Run::emit`], never straight at `state`.
     pub(super) log: EventLog,
-    /// The observer the **legacy** append funnel is driven through.
-    ///
-    /// Production passes [`NoEventHooks`], which is precisely what
-    /// `EventLog::append` passes on its own, so nothing about the legacy
-    /// engine's behaviour moves — `invariants_preserved[1]`. What moves is that
-    /// the failure is now *reachable* (`PR5-CONF-010`, `PR5-CONF-011`).
-    ///
-    /// `production_effect` says "the legacy engine's handling of a returned
-    /// append error is unchanged — **it reports and stops**". The shipped code
-    /// did; nothing required it to. Replacing this function's `?` with an arm
-    /// that pushed a warning and returned `Ok` survived the whole suite, because
-    /// every append failure the suite injects targets an `EventLog` a test
-    /// built directly, and no fixture could make a **live `Run`**'s append fail:
-    /// `emit` called `append`, which hard-codes `NoEventHooks`. A source census
-    /// cannot tell propagation from swallowing inside a live run.
-    ///
-    /// This is the resolution `PR4-CONF-005` reached for the same shape — no
-    /// machine here can make the real primitive fail, so the observer becomes a
-    /// parameter and production passes the no-op one.
     pub(super) log_hooks: Box<dyn crate::events::log::EventHooks>,
-    /// Derived state — the same fold `resume` and `status` build from the log.
     pub(super) state: RunState,
     pub(super) gate_cmds: Vec<String>,
     pub(super) adapters: &'a dyn AdapterSource,
-    /// Where every process of this run executes (DESIGN.md:118). Held for the
-    /// whole run because pre-flight's probes and the attempts must cross the
-    /// same boundary — "Probes run through that same runner, or pre-flight
-    /// could certify a host CLI/version different from the one the attempt
-    /// executes" (DESIGN.md:612).
     pub(super) runner: &'a dyn Runner,
     pub(super) answers: &'a dyn AnswerSource,
     pub(super) notifiers: Vec<&'static dyn Notifier>,
     pub(super) sleeper: &'a dyn Sleeper,
-    /// Probe results per agent id — `session_resume` gates §11.4's resume.
     pub(super) caps: BTreeMap<String, Caps>,
-    /// Who judges each task (§11.2–§11.3), resolved once at pre-flight and
-    /// recorded in `run_started`.
     pub(super) review_plan: ReviewPlan,
-    /// The run's recorded effort standard. Both worker attempts and all review
-    /// passes read this snapshot, including after a resume under changed config.
     pub(super) effort_policy: ResolvedEffortPolicy,
     pub(super) attempt_timeout: Duration,
-    /// Independent wall clock for each configured review pass. Frozen in
-    /// `review_plan`, materialized once by pre-flight.
     pub(super) review_pass_timeout: Duration,
     pub(super) defer_backoff: Duration,
     pub(super) max_defers: u32,
     pub(super) on_task_failure: OnTaskFailure,
-    /// §17's ceilings, with `--budget` already folded in. Checked before every
-    /// spawn; never consulted when deciding *what* binds.
     pub(super) budgets: config::Budgets,
-    /// §12's `ask_before` thresholds.
     pub(super) ask_before: config::AskBefore,
     pub(super) run_id: String,
     pub(super) branch: String,
     pub(super) warnings: Vec<String>,
-    /// Questions no channel could reach a human for. Never asked twice — that
-    /// is what stops a hard block spinning.
-    ///
-    /// Deliberately *not* replayed: it records that a channel was unreachable
-    /// in this process, not something true about the run. A question nobody
-    /// could answer at 2am is exactly the one the operator answers when they
-    /// come back, so a resume has to be free to ask it again.
     pub(super) unanswerable: Vec<QuestionId>,
-    /// Pools this run has already recorded a rate-limit signal for.
-    ///
-    /// Only the *transition* is worth an event. One outage produces a failed
-    /// attempt per deferral (up to `max_defers`), and emitting on each wrote N
-    /// identical records of a single fact — inflating any later count of
-    /// outages by the deferral factor and repeating the same line N times in
-    /// `status --follow`. Retired when an attempt proves the pool is serving
-    /// again, mirroring [`capacity::observe`]'s rule so the log the engine
-    /// writes and the fold a reader performs agree about when a pool came back.
-    ///
-    /// Process-local rather than folded state, like `unanswerable`: seeded on
-    /// resume from the log's own signals, so a resumed run neither re-announces
-    /// an outage the previous process recorded nor misses a fresh one.
     pub(super) exhausted_pools: std::collections::BTreeSet<String>,
     #[cfg(test)]
     pub(super) after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
-/// The observer the live run's legacy append funnel is driven through.
-///
-/// Production is [`NoEventHooks`] — the same thing `EventLog::append` passes —
-/// on both arms. The `#[cfg(test)]` arm exists so a fixture can make a live
-/// `Run`'s append fail (`PR5-CONF-010`, `PR5-CONF-011`).
 #[cfg(test)]
 fn legacy_append_hooks(opts: &RunOptions) -> Box<dyn crate::events::log::EventHooks> {
     match opts.log_hooks {
@@ -368,19 +276,12 @@ fn legacy_append_hooks(opts: &RunOptions) -> Box<dyn crate::events::log::EventHo
     }
 }
 
-/// See the `#[cfg(test)]` twin above.
 #[cfg(not(test))]
 fn legacy_append_hooks(_opts: &RunOptions) -> Box<dyn crate::events::log::EventHooks> {
     Box::new(crate::events::log::NoEventHooks)
 }
 
 impl Run<'_> {
-    /// Append an event and fold it in.
-    ///
-    /// The only way run state changes. Everything below emits; nothing reaches
-    /// past this into `state`, which is what makes a live run and a replay of
-    /// its own log the same computation rather than two that agree by
-    /// inspection.
     pub(super) fn emit(&mut self, body: EventBody) -> Result<(), UpstrokeError> {
         let site = EventSite::LegacyAppend;
         let event = self
@@ -390,14 +291,8 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Drain, settle, and report.
     pub(super) fn drain_and_report(&mut self) -> Result<RunReport, UpstrokeError> {
         if let Err(error) = self.drain() {
-            // The log already holds everything that happened, including the
-            // attempt this died inside — that is what `resume` reads. The
-            // report beside it is a courtesy for whoever opens the directory
-            // next, and failing to write it must not mask the error that
-            // actually stopped the run.
             let partial = self.finish();
             let _ = rundir::write_report(&self.paths.public, &partial, &mut rundir::NoHooks);
             return Err(error);
@@ -425,46 +320,9 @@ impl Run<'_> {
         Ok(report)
     }
 
-    /// Drain the graph (§14, §12).
-    ///
-    /// The four branches are the whole interaction model: pick up answers that
-    /// arrived from somewhere else; run what is ready; if only deferred work is
-    /// left, wait for the pool rather than burning attempts against it; and
-    /// only when none of those is possible — the precise definition of a hard
-    /// block — ask a human.
-    ///
-    /// **Why this terminates.** Every branch consumes something finite and
-    /// nothing replenishes any of them:
-    ///
-    /// - the answer sweep fires only for an *open* question and closes it, and
-    ///   questions are created only by `step_task`;
-    /// - `step_task` moves its task out of `Pending`, and the only routes back
-    ///   are a deferral — bounded by `max_defers`, after which the ladder parks
-    ///   the task instead — or an answer, which closed a question to get there;
-    /// - the wait branch requires a `Deferred` task, which only a deferral
-    ///   creates;
-    /// - the ask branch either closes a question or adds it to `unanswerable`,
-    ///   which is only ever appended to and is checked before asking.
-    ///
-    /// So no cycle exists that does not spend an attempt, a deferral, or a
-    /// question. `an_exhausted_pool_and_a_silent_operator_still_terminate`
-    /// holds it to that against an adapter that never succeeds and an operator
-    /// who never replies.
     fn drain(&mut self) -> Result<(), UpstrokeError> {
         let mut defer_round = 0u32;
         loop {
-            // Invariant 6 in its most useful form: an answer that arrives while
-            // other work is still running un-parks its task there and then,
-            // rather than waiting for the run to have nothing else to do.
-            //
-            // Guarded on the budget stop like the two branches below, and for a
-            // sharper reason than theirs: an answer this run cannot act on is
-            // merely wasted, but a *declined* one routes through `fail_task`,
-            // which sets `halted_at` — and halted outranks budget in
-            // `outcome()`. A decline file sitting on disk would relabel a
-            // budget stop as a task failure, so CI gating on exit 3 to raise a
-            // ceiling would instead see exit 1 and a task blamed for something
-            // the ceiling did. The answers keep for the resume (§15).
             if self.state.budget_stop.is_none() && self.sweep_answers()? {
                 continue;
             }
@@ -490,11 +348,6 @@ impl Run<'_> {
                 })?;
                 continue;
             }
-            // Guarded like the other branches: once the run has halted, no
-            // answer can reach an attempt this session, so asking would spend
-            // a human's attention on a decision the scheduler cannot act on —
-            // and a decline would relabel `halted_at` with a task that was not
-            // the cause. The questions stay open on disk for a resume (§15).
             if self.state.halted_at.is_none()
                 && self.state.budget_stop.is_none()
                 && self.resolve_one_question()?
@@ -506,14 +359,7 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Stable order: among tasks whose dependencies are all done, lowest plan
-    /// index first (§14). Parked, deferred, and blocked tasks are simply not
-    /// ready — which is exactly the skip-ahead §14 asks for.
     fn next_ready(&self) -> Option<usize> {
-        // A halt and a budget stop both end scheduling, for the same reason:
-        // whatever runs next would be work the run has already decided not to
-        // do. The remaining tasks settle as skipped exactly as they do after a
-        // halt, and the questions already open stay open for a resume (§15).
         if self.state.halted_at.is_some() || self.state.budget_stop.is_some() {
             return None;
         }
@@ -524,23 +370,12 @@ impl Run<'_> {
                     tasks
                         .iter()
                         .position(|t| t.id == *dep)
-                        // An unknown dependency cannot exist on a validated
-                        // plan; treating it as satisfied keeps the scheduler
-                        // total rather than deadlocking.
                         .is_none_or(|j| matches!(self.state.states[j], TaskState::Done(_)))
                 })
         })
     }
 
-    /// Drive one task until it yields the scheduler: done, failed, deferred,
-    /// or parked. Retries and escalations happen *inside* — a resumed retry
-    /// keeps the working tree (§14), so no other task may run in between, and
-    /// this loop is what guarantees that.
-    ///
-    /// Returns whether the task ended deferred.
     fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {
-        // Copied out of `self` so they carry the run's lifetime rather than
-        // this method's `&mut self` borrow.
         let analysis = self.analysis;
         let adapters = self.adapters;
         let workspace = self.workspace;
@@ -564,35 +399,8 @@ impl Run<'_> {
                 )?;
                 return Ok(false);
             };
-            // §13's ceiling, checked before EVERY spawn rather than once per
-            // task. The placement is the whole point: an escalation onto a
-            // frontier rung happens inside this loop, so a check that ran only
-            // on the way in would let the most expensive attempt of the run be
-            // the one that dodged the budget. It never influences *what* binds
-            // — capacity-driven routing is v0.2 (§13) — only whether the next
-            // attempt happens at all.
             if let Some(exceeded) = self.budget_breach(index) {
-                // The ceiling is recorded first, and nothing below may take it
-                // back. It is what `outcome()` reads to return `BudgetExceeded`
-                // rather than a task failure, what turns into exit 3 for the CI
-                // job gating on it, and what `resume --budget` needs to find in
-                // order to have a stop to get past. Tidying up afterwards is a
-                // courtesy; the record is the run's account of itself.
                 self.emit(EventBody::BudgetExceeded { data: exceeded })?;
-                // The tree may still hold a rejected attempt's edits, kept by
-                // the ladder below for a resumed retry that is now never going
-                // to run. Handing those back is the one thing §14 rules out —
-                // they are unverified, and staged changes follow `git switch`
-                // onto whatever branch the operator visits next. Nor can they
-                // be saved for the resume: `run_resumed` discards every
-                // uncommitted path and clears the session they belong to, so
-                // keeping them past this point buys nothing at all.
-                //
-                // A git that cannot do it says so and the run still stops at
-                // its ceiling, the way it did before the tidying existed. The
-                // sibling discard on the error path below is `let _ =` for the
-                // same reason; this one warns, because here there is a report
-                // left to carry the warning.
                 if let Err(error) = workspace.discard_uncommitted() {
                     self.warnings.push(format!(
                         "the budget stopped the run, but the working tree could not be cleaned: \
@@ -602,9 +410,6 @@ impl Run<'_> {
                 return Ok(false);
             }
 
-            // Attribution only (§13 read-only): which subscription pays for
-            // this attempt. Resolved here because it needs the run's config,
-            // and passed in.
             let profile = super::assembly::implementer_profile(
                 super::assembly::ImplementerBinding::of_rung(
                     rung,
@@ -624,11 +429,6 @@ impl Run<'_> {
                 .then(|| self.state.progress[index].session.clone())
                 .flatten();
 
-            // Recorded *before* the agent is spawned, so a process that dies
-            // mid-attempt leaves an `attempt_started` with no
-            // `attempt_finished`. That dangling pair is precisely what tells a
-            // later replay an attempt was interrupted (§19's crash row) — the
-            // engine cannot write a record of its own death afterwards.
             let rung_number = u32::try_from(rung_index).unwrap_or(u32::MAX);
             self.emit(EventBody::AttemptStarted {
                 task: task_id.clone(),
@@ -655,14 +455,9 @@ impl Run<'_> {
                 },
             })?;
 
-            // Scoped so every borrow the attempt takes on `self` is released
-            // before the ladder updates this task's progress below.
             let result = {
                 let retry = (attempt > 1).then(|| RetryBrief {
                     resumed: resume.is_some(),
-                    // Owned: the ladder appends to this task's feedback the
-                    // moment the attempt returns, and one clone per attempt
-                    // costs less than threading that borrow through.
                     feedback: self.state.progress[index].feedback.clone(),
                 });
                 let attempt_cx = AttemptCx {
@@ -670,9 +465,6 @@ impl Run<'_> {
                     profile: profile.clone(),
                     adapter,
                     runner: self.runner,
-                    // The legacy engine's own scope for an invocation
-                    // identity: this task's position in the plan. See
-                    // `AttemptCx::invocation`.
                     task_index: u32::try_from(index).unwrap_or(u32::MAX),
                     attempt,
                     stem: stem.clone(),
@@ -683,8 +475,6 @@ impl Run<'_> {
                     timeout: self.attempt_timeout,
                     review_pass_timeout: self.review_pass_timeout,
                     retry,
-                    // The same entries the worker prompt quotes as operator
-                    // instruction, routed to the judge as well (§12).
                     decisions: self.state.progress[index]
                         .feedback
                         .iter()
@@ -695,9 +485,6 @@ impl Run<'_> {
                     after_candidate_capture: self.after_candidate_capture,
                 };
 
-                // Any error between the agent editing files and the verdict
-                // leaves the tree dirty; the run cannot continue but must not
-                // hand the user a half-staged workspace either (§14).
                 match run_attempt(&attempt_cx, workspace, resume.clone()) {
                     Ok(result) => result,
                     Err(error) => {
@@ -707,10 +494,6 @@ impl Run<'_> {
                 }
             };
 
-            // Decide the ladder transition before writing the settlement, then
-            // carry both in one event. A failure record without its decision is
-            // not a safe crash prefix: replay would otherwise buy another
-            // attempt on the old rung or lose an outage refund.
             let next = result.failure.as_ref().map(|failure| {
                 let settlement_session = result.outcome.session_id.as_ref().or(resume.as_ref());
                 let resumable = settlement_session.is_some()
@@ -797,9 +580,6 @@ impl Run<'_> {
                         let question = self.build_question(index, kind, context);
                         parking = Some(Box::new(events::AttemptParking {
                             question: question.clone(),
-                            // An outage or clarification never received a code
-                            // verdict, so its allowance is returned even when
-                            // the outage ceiling sends it to a human.
                             refund_attempt: kind == QuestionKind::Clarify || failure.is_outage(),
                         }));
                         parking_question = Some(question);
@@ -816,11 +596,6 @@ impl Run<'_> {
                 }
             }
 
-            // A passing attempt is turned into an immutable commit object and
-            // pinned before its settlement becomes durable. The event, HEAD
-            // CAS, and pin deletion can therefore be recovered at every crash
-            // prefix without re-running paid work or trusting the mutable
-            // index.
             let prepared_commit = if result.failure.is_none() {
                 let message = format!("[upstroke] {}: {}", task.id, task.title);
                 let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
@@ -869,23 +644,11 @@ impl Run<'_> {
                         outcome: &result.outcome,
                         reviews: &result.reviews,
                         failure: result.failure.as_ref(),
-                        // The legacy wire's own carrier. `ladder_retry` and
-                        // `ladder_escalated` are appended with `summary` and
-                        // `detail` a few lines below, and `Progress::feedback`
-                        // is rebuilt by replaying them, so a copy on the record
-                        // would be the same kilobytes twice — once in the log
-                        // and once in every `report.json`.
                         feedback: super::classify::FeedbackCarrier::LadderEvent,
                     },
                 )),
             });
             if let Err(error) = settlement {
-                // A write/flush/sync error cannot prove whether the newline-
-                // committed event reached disk. Deliberately retain a prepared
-                // pin: resume removes it as an orphan if no settlement landed,
-                // or publishes it if the complete settlement is readable.
-                // Deleting it here would turn an ambiguous sync error into a
-                // schema-3 settlement whose exact object is no longer durable.
                 if let Err(cleanup) = self.workspace.discard_uncommitted() {
                     return Err(UpstrokeError::Git {
                         message: format!(
@@ -897,10 +660,6 @@ impl Run<'_> {
             }
             if let Some(question) = parking_question.as_ref() {
                 if let Err(error) = self.materialize_question(question) {
-                    // The durable settlement is authoritative and already carries
-                    // the complete question. A crash or write failure here cannot
-                    // expose an orphan projection; resume rematerializes the
-                    // question from the event before accepting an answer.
                     if let Err(cleanup) = self.workspace.discard_uncommitted() {
                         return Err(UpstrokeError::Git {
                             message: format!(
@@ -921,9 +680,6 @@ impl Run<'_> {
                     .expect("a successful schema-3 settlement has a prepared commit");
                 self.workspace
                     .advance_prepared_commit(&result.candidate_branch_ref, &prepared)?;
-                // Scrub gate side-effects (build artifacts, lockfile churn) so
-                // they cannot leak into the next task's captured diff; the
-                // commit recorded exactly the verified staged set.
                 self.workspace.discard_uncommitted()?;
                 self.emit(EventBody::TaskCommitted {
                     task: task_id.clone(),
@@ -935,22 +691,10 @@ impl Run<'_> {
                 return Ok(false);
             };
 
-            // §13 source 1: a rate-limit signal is ground truth about a pool,
-            // and the only thing in v0.1 that can call one empty rather than
-            // unmeasured. Recorded separately from the deferral that follows
-            // because they are facts with different lifetimes — the deferral is
-            // about this task's next move, this is about a subscription, and a
-            // later run's estimator reads it back out of the log.
             if failure.kind != FailureKind::Interrupted
                 && !(failure.kind == FailureKind::RateLimited
                     && failure.origin == FailureOrigin::Worker)
             {
-                // This attempt reached a model and got an answer, whatever the
-                // verdict on its code, so any pool it drew on is serving again.
-                // Same rule as `capacity::observe`'s, applied to the engine's
-                // own view so the two cannot disagree about when a pool
-                // recovered — without it, the *next* outage on the same pool
-                // would go unrecorded because the set still held it.
                 self.exhausted_pools.remove(&profile.pool);
             }
             for review in &result.reviews {
@@ -970,10 +714,6 @@ impl Run<'_> {
             )]
             let next = next.expect("a failed attempt has a ladder decision");
 
-            // §14: the tree survives only for a resumed retry, where the
-            // *cumulative* diff is what gets re-gated. Every other branch
-            // hands the scheduler a clean workspace, because another task may
-            // run before this one does again.
             if !matches!(next, Next::RetrySameRung { resume: true }) {
                 self.workspace.discard_uncommitted()?;
             }
@@ -991,18 +731,6 @@ impl Run<'_> {
         }
     }
 
-    /// §11.2/§11.3: the read-only passes that judge one task's attempt.
-    ///
-    /// Reviewers bind at the configured review tier (frontier by default)
-    /// rather than the implementer's rung — a small model reviewing its own
-    /// work is not verification — and [`ReviewPlan::passes_for`] decides
-    /// whether that means one pass or two, and whether the primary rebinds
-    /// away from the model that wrote the code.
-    ///
-    /// An empty list means review is switched off explicitly. A pass whose
-    /// adapter cannot be built is a hard error: verification vanishing without
-    /// a word is worse than a refusal, and pre-flight has already probed every
-    /// agent named here.
     fn reviewers(
         &self,
         index: usize,
@@ -1013,13 +741,7 @@ impl Run<'_> {
             .passes_for(index, &running_on)
             .into_iter()
             .map(|pass: ReviewPass| {
-                // Every pass judges at the review tier's effort, including a
-                // second opinion bound to another vendor: the standard belongs
-                // to the review, not to whichever family happens to apply it.
                 let mut profile = pass.profile(self.effort_policy.review);
-                // A cross-vendor second opinion draws on a different
-                // subscription than the implementer (§11.3, §13), so its pool
-                // is looked up from its own agent rather than inherited.
                 profile.pool = self.pool_name_for(&profile.agent).unwrap_or_default();
                 Ok(Reviewer {
                     adapter: self.adapters.get(&pass.binding.agent).ok_or_else(|| {
@@ -1043,28 +765,11 @@ impl Run<'_> {
             .collect()
     }
 
-    /// §14's pre-flight capacity snapshot, from the state this run has folded
-    /// so far.
-    ///
-    /// Deliberately does **not** probe. Everything a probe would add — auth
-    /// state, versions — is already established by pre-flight, and spawning the
-    /// vendors' CLIs a second time to fill in a metadata event would be work
-    /// nothing reads. The estimator's inputs come from the run's own log, which
-    /// on a fresh run is empty and on a resume carries every signal the earlier
-    /// process recorded.
     pub(super) fn emit_capacity_snapshot(
         &mut self,
         signals: &BTreeMap<String, Option<String>>,
     ) -> Result<(), UpstrokeError> {
-        // No early return on an empty pools file: "nothing was connected" is
-        // exactly as worth recording as a list, and its absence is otherwise
-        // indistinguishable from a pre-step-10 log, or from a binary that never
-        // took a snapshot at all (§14).
         let pools = &self.analysis.config.pools;
-        // Signals come from the caller's fold of this run's log (empty on a
-        // fresh run) rather than from a field kept here, so there is exactly one
-        // place that turns `pool_exhausted` events into observations — the same
-        // reasoning that keeps `RunState::apply` the only writer of run state.
         let estimates = capacity::estimate(
             pools,
             &capacity::Observations {
@@ -1094,15 +799,10 @@ impl Run<'_> {
         self.emit(EventBody::CapacitySnapshot { data: snapshot })
     }
 
-    /// Which pool an agent's attempts drain (§13), or `None` when the pools
-    /// file names none for it. Attribution only — nothing routes on it.
     fn pool_name_for(&self, agent: &str) -> Option<String> {
         capacity::pool_for(agent, &self.analysis.config.pools).map(|pool| pool.name.clone())
     }
 
-    /// §13's reported spend so far — the ledger's own figure, with the ledger's
-    /// own honesty: unpriced attempts contribute nothing, so this is a floor
-    /// wherever a route reports no spend at all.
     fn reported_spend(&self, task: Option<usize>) -> f64 {
         let indices: Vec<usize> = match task {
             Some(index) => vec![index],
@@ -1116,12 +816,6 @@ impl Run<'_> {
             .sum()
     }
 
-    /// Whether a ceiling has been reached, and which one.
-    ///
-    /// `run_usd` is checked before `task_usd` because it is the stricter claim:
-    /// a run at its overall ceiling is done whatever any individual task has
-    /// spent, and naming the run budget is what tells the operator which number
-    /// to raise.
     fn budget_breach(&self, index: usize) -> Option<events::BudgetExceeded> {
         let task = self.analysis.plan.tasks[index].id.to_string();
         if let Some(limit) = self.budgets.run_usd {
@@ -1149,13 +843,6 @@ impl Run<'_> {
         None
     }
 
-    /// §12's `ask_before`: does this escalation need a person's approval first?
-    ///
-    /// Only a move *onto* a frontier rung from somewhere cheaper counts. A
-    /// chain that starts at frontier is where the operator deliberately routed
-    /// the task in config or in an annotation, and §12's concern is silent
-    /// escalation — asking permission for a decision the operator already made
-    /// in writing would train them to answer without reading.
     fn should_approve_spend(
         &self,
         from: crate::ir::Tier,
@@ -1170,12 +857,6 @@ impl Run<'_> {
             && self.reported_spend(None) + pending_spend >= threshold
     }
 
-    /// §13 source 1, recorded: attribute a rate limit to the pool that hit it.
-    ///
-    /// A reviewer's rate limit belongs to the *reviewer's* pool, which on a
-    /// cross-vendor second opinion is a different subscription from the one the
-    /// implementer drained — attributing it to the implementer's would mark a
-    /// healthy pool exhausted and leave the empty one looking fine.
     fn record_pool_exhausted(
         &mut self,
         task: &str,
@@ -1190,11 +871,7 @@ impl Run<'_> {
             },
             FailureOrigin::Worker => (pool_option(&implementer.pool), implementer.agent.clone()),
         };
-        // No pool named for that agent means no subscription to mark. The
-        // signal is still in the log on the attempt record; inventing a pool id
-        // to hang it on would put a fact about nothing into the estimator.
         let Some(pool) = pool else { return Ok(()) };
-        // Only the transition (see `exhausted_pools`).
         if !self.exhausted_pools.insert(pool.clone()) {
             return Ok(());
         }
@@ -1203,11 +880,6 @@ impl Run<'_> {
             data: events::PoolExhausted {
                 pool,
                 agent,
-                // §13 wants a retry-at-reset timer here. Neither CLI reports a
-                // machine-readable reset time today, and parsing one out of
-                // prose would be a guess dressed as a timestamp — so it stays
-                // `None`, `DEFAULT_MAX_DEFERS` stays the bound, and the estimate
-                // says the reset is unknown.
                 reset_at: None,
                 detail: util::head(&failure.reason, 400),
             },
@@ -1220,9 +892,6 @@ impl Run<'_> {
         kind: FailureKind,
         reason: String,
     ) -> Result<(), UpstrokeError> {
-        // The halt policy is resolved here and recorded, not re-derived on
-        // replay: a `upstroke.toml` edited between a run and its resume must not
-        // rewrite which task the report blames for stopping.
         let halts_run = self.on_task_failure == OnTaskFailure::Halt;
         self.fail_task_with_policy(index, kind, reason, halts_run)
     }
@@ -1245,11 +914,6 @@ impl Run<'_> {
         })
     }
 
-    /// §12: raise eagerly, park exactly the affected task, tell the notifiers,
-    /// and write the payload where a UI or `upstroke answer` can read it.
-    /// §12's `ask_before` question: this task is about to escalate onto a
-    /// frontier rung, and the run has already reported enough spend that the
-    /// operator asked to be consulted first.
     fn build_spend_approval(
         &self,
         index: usize,
@@ -1267,8 +931,6 @@ impl Run<'_> {
         self.build_question(index, QuestionKind::ApproveSpend, context)
     }
 
-    /// Attempts whose route reported no spend at all (§13), so the figures this
-    /// run quotes are floors rather than totals.
     fn unpriced_attempts(&self) -> u32 {
         let unpriced = self
             .state
@@ -1285,9 +947,6 @@ impl Run<'_> {
         Question {
             id: interaction::new_question_id(),
             kind,
-            // v0.1 parks only the task that raised it. Dependents are held by
-            // the graph, not by the question, so they stay eligible the moment
-            // an answer arrives.
             affected_tasks: vec![task.id.clone()],
             context,
             options: question_options(kind),
@@ -1295,18 +954,12 @@ impl Run<'_> {
     }
 
     fn materialize_question(&mut self, question: &Question) -> Result<(), UpstrokeError> {
-        // Materialize before notifying: a recipient must always be able to open
-        // the payload it was told about. The caller decides whether the
-        // authoritative event belongs before (atomic settlement parking) or
-        // after (ordinary question flow) this projection.
         interaction::write_question(
             &self.paths.questions(),
             &QuestionRecord::open(question.clone()),
         )?;
         let id = question.id.clone();
         for notifier in &self.notifiers {
-            // A notifier that cannot deliver must not take the run with it: the
-            // question is already on disk either way (§12).
             if let Err(error) = notifier.ask(question) {
                 self.warnings.push(format!(
                     "notifier `{}` could not deliver question {id}: {error}",
@@ -1317,12 +970,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Ingest answers left by `upstroke answer` in another process.
-    ///
-    /// Returns whether anything changed. This is what makes the answer command
-    /// useful while a run is alive rather than only between runs: an operator
-    /// answering from a phone at 2am un-parks the task on the next scheduler
-    /// turn, with no resume needed.
     fn sweep_answers(&mut self) -> Result<bool, UpstrokeError> {
         let open: Vec<QuestionId> = self
             .state
@@ -1339,12 +986,6 @@ impl Run<'_> {
             let Some(answer) = interaction::read_answer(&dir, &id)? else {
                 continue;
             };
-            // Only what actually applied counts as change. A file the engine
-            // reads but declines to act on — an `Unanswered` one, say, which
-            // nothing in `upstroke answer` will write but a hand-edit can —
-            // would otherwise report progress on every turn, and the drain
-            // loop would spin on it forever: this branch is only bounded
-            // because it closes the question it fires for.
             if self.ingest_answer(&id, answer, "answer-file")? {
                 changed = true;
             }
@@ -1352,13 +993,6 @@ impl Run<'_> {
         Ok(changed)
     }
 
-    /// Record an answer and let it take effect. Returns whether it applied.
-    ///
-    /// One path for every channel — a terminal reply, a file written by
-    /// `upstroke answer`, or an answer picked up on resume — so what an answer
-    /// *does* cannot depend on where it came from. The guards below are also
-    /// what makes it safe to offer the same answer twice: a question that is
-    /// already closed absorbs the second one instead of applying it.
     fn ingest_answer(
         &mut self,
         id: &QuestionId,
@@ -1389,9 +1023,6 @@ impl Run<'_> {
             },
         })?;
 
-        // §5: a question that reached a human at runtime is, by definition, a
-        // design-phase defect — logged as one so the accumulated defects can
-        // become review material for the designer prompt.
         self.emit(EventBody::DesignDefect {
             data: events::DesignDefect {
                 question: id.clone(),
@@ -1403,9 +1034,6 @@ impl Run<'_> {
             },
         })?;
 
-        // A decline is the task's failure, not the question's, so it goes
-        // through the one place that owns the halt policy. `apply` leaves a
-        // declined task parked precisely so this can still see who was waiting.
         if answer == Answer::Declined {
             for task_id in affected {
                 let Some(index) = self.state.index_of(task_id.as_str()) else {
@@ -1422,8 +1050,6 @@ impl Run<'_> {
             }
         }
 
-        // Rewrite the payload so a late reader — a UI, or someone opening the
-        // directory tomorrow — sees the whole exchange, not just the question.
         if let Some(record) = self
             .state
             .questions
@@ -1435,11 +1061,6 @@ impl Run<'_> {
         Ok(true)
     }
 
-    /// Ask about the oldest open question. Returns whether anything changed.
-    ///
-    /// This runs only at a hard block, and each question is asked at most
-    /// once: an `Unanswered` result marks it unreachable rather than looping
-    /// back to a channel that already said nobody is there.
     fn resolve_one_question(&mut self) -> Result<bool, UpstrokeError> {
         let Some(position) = self.state.questions.iter().position(|record| {
             record.is_open() && !self.unanswerable.contains(&record.question.id)
@@ -1449,17 +1070,8 @@ impl Run<'_> {
         let question = self.state.questions[position].question.clone();
         let answer = self.answers.resolve(&question)?;
 
-        // The channel may have been waiting on the very file the sweep reads,
-        // so sweep before applying what it returned — and then still apply it.
-        // `ingest_answer` is guarded on the question being open, which is what
-        // makes doing both safe: if the sweep answered *this* question the
-        // typed reply is absorbed, and if it answered a different one — an
-        // operator working through a backlog of parked tasks — this reply
-        // still lands instead of being discarded along with it.
         self.sweep_answers()?;
         if answer == Answer::Unanswered {
-            // §12 CI mode: the task stays parked and the run's exit status
-            // reports it. Not a failure — nobody rejected anything.
             self.unanswerable.push(question.id);
             return Ok(true);
         }
@@ -1467,7 +1079,6 @@ impl Run<'_> {
         Ok(true)
     }
 
-    /// Settle every task that never ran, then report.
     fn finish(&self) -> RunReport {
         build_report(
             ReportHeader {
@@ -1476,11 +1087,7 @@ impl Run<'_> {
                 gates: self.analysis.gates.iter().map(|g| g.name.clone()).collect(),
                 gates_from_config: self.analysis.gates_from_config,
                 warnings: self.warnings.clone(),
-                // The engine only reports on itself once it has stopped.
                 running: false,
-                // A `finish` that runs is by definition not an interruption:
-                // the shape this flag describes is the one left behind when
-                // this function never got the chance.
                 interrupted: false,
             },
             &self.analysis.plan,
@@ -1489,24 +1096,15 @@ impl Run<'_> {
     }
 }
 
-/// What the human is shown. Every agent-authored fragment is quoted behind a
-/// fence the payload cannot close and labelled as agent-authored — a worker
-/// that "asks a question" is still an agent writing into a human's terminal.
 pub(super) struct ParkSubject<'a> {
-    /// The id a human reads.
     pub(super) display_id: &'a str,
-    /// What the task was asked to do.
     pub(super) title: &'a str,
-    /// The bar it was asked to clear.
     pub(super) acceptance: &'a [String],
-    /// How many attempts have run, which the context quotes back.
     pub(super) attempts: u32,
-    /// How many distinct rungs those attempts spent, at least one.
     pub(super) rungs_spent: usize,
 }
 
 impl<'a> ParkSubject<'a> {
-    /// The subject of a schema-3 task and its progress.
     pub(super) fn of(task: &'a Task, progress: &Progress) -> Self {
         Self {
             display_id: task.id.as_str(),
@@ -1524,13 +1122,6 @@ impl<'a> ParkSubject<'a> {
     }
 }
 
-/// The context a parked task's question quotes back to the human.
-///
-/// **Ask for what you read.** It reads the display id, the title, the
-/// acceptance list and the attempt count — never the body, the artifacts or the
-/// plan. Naming them lets the schema-4 driver, which holds a `FrozenTaskSpec`
-/// and no `Task`, raise the same question the legacy engine does rather than
-/// wording its own.
 pub(super) fn question_context(
     task: ParkSubject<'_>,
     kind: QuestionKind,
@@ -1590,15 +1181,6 @@ pub(super) fn question_context(
     context
 }
 
-/// §12's spend approval, in the operator's terms: what is about to happen, what
-/// it has cost so far, and how confident that figure is.
-///
-/// The threshold is a **spend-to-date** reading rather than a forward
-/// projection, and the text says so — see [`crate::config::AskBefore`] for why.
-/// The figure itself is quoted with the ledger's own `?` honesty: a run whose
-/// Copilot attempts report nothing has a reported total that is a floor, and
-/// presenting a floor as a total is how someone approves a number they did not
-/// actually see.
 fn spend_question_context(
     task: &Task,
     onto: crate::ir::Tier,
