@@ -6,6 +6,7 @@
 //! paths.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::EffectSiteId;
 use super::residue_authority::{
@@ -117,7 +118,66 @@ pub fn effect_sites() -> Vec<EffectSiteExport> {
         .collect()
 }
 
+/// Why serializing the generated inventory failed.
+#[derive(Debug, Error)]
+#[error("failed to serialize the effect site inventory: {0}")]
+pub struct ExportError(#[from] serde_json::Error);
+
 /// `effect_sites.json`, pretty-printed for a gate report to attach.
-pub fn effect_sites_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&effect_sites())
+///
+/// # Errors
+///
+/// Returns [`ExportError`] if the generated inventory cannot be serialized to JSON.
+pub fn effect_sites_json() -> Result<String, ExportError> {
+    Ok(serde_json::to_string_pretty(&effect_sites())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_error_names_the_operation_and_wraps_the_source() {
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("malformed input is not valid JSON");
+        let error = ExportError::from(source);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("failed to serialize the effect site inventory: "),
+            "{message}"
+        );
+        assert!(!message.ends_with('.'), "{message}");
+    }
+
+    /// The module doc promises the parent re-exports every item here. This
+    /// compiles only while `crate::topology::effects::ExportError` resolves,
+    /// so a caller outside this module can name the function's error type.
+    #[test]
+    fn export_error_is_nameable_through_the_parent_re_export() {
+        fn through_the_parent(error: crate::topology::effects::ExportError) -> ExportError {
+            error
+        }
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("malformed input is not valid JSON");
+        let error = through_the_parent(ExportError::from(source));
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to serialize the effect site inventory: "),
+            "{error}"
+        );
+    }
+
+    /// The sweep's defect was `effect_sites_json` returning the raw
+    /// `serde_json::Error`. Binding the public call to the typed error at the
+    /// supported parent path compiles only while that signature holds.
+    #[test]
+    fn effect_sites_json_returns_the_typed_error_at_the_parent_path() {
+        let result: Result<String, crate::topology::effects::ExportError> =
+            crate::topology::effects::effect_sites_json();
+        let json = result.expect("the generated inventory serializes");
+        let parsed: Vec<EffectSiteExport> =
+            serde_json::from_str(&json).expect("the inventory round-trips");
+        assert_eq!(parsed, effect_sites());
+    }
 }

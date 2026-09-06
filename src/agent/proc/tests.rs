@@ -302,7 +302,7 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
 
     let supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "sleep 60"])
         .stdin(Stdio::null())
@@ -404,7 +404,7 @@ impl Drop for ReapedChild {
 fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
     let mut supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
@@ -461,7 +461,7 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
         this_group > 0,
         "this process has no readable group: {this_group}"
     );
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
