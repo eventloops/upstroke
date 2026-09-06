@@ -129,7 +129,8 @@ impl RunState {
                     });
                 }
             }
-            _ => {
+            (CandidateLeaseEffect::ReplacesPredicted { .. }, Some(_))
+            | (CandidateLeaseEffect::WidensLineage { .. }, None) => {
                 return Err(FoldError::InconsistentRecord {
                     kind: KIND,
                     detail: "a lineage member widens its lineage and an ordinary candidate \
