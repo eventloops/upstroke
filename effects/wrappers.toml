@@ -1552,6 +1552,9 @@ not_an_effect = [
     "sigpending",
     "sigset_t",
     "sleep",
+    "suseconds_t",
     "sysconf",
+    "time_t",
     "timespec",
+    "timeval",
 ]

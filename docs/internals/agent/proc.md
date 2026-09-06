@@ -647,8 +647,23 @@ How long a forked helper is given to acknowledge that it has started.
 Master's value, named rather than repeated at each wait. This budget
 is deliberately unchanged: row
 `PR125-CLOSE-MACOS-READY-RED-CAUSE-UNKNOWN` records that a larger one
-did not help at the exact head that fails, so what the miss needs is a
-diagnostic, not more time.
+did not help at the exact head that fails. The reason it could not
+help is now known and is `wait_readable`'s section below: on Darwin
+the wait never saw the helper end, so every early death cost the whole
+budget, whatever the budget was. The budget bounds a helper that is
+still running and silent; a helper that has ended is seen at once.
+
+## `mod termination` › `const HELPER_ABORT: u8 = 0x71;`
+
+The first byte of a helper's setup-failure report, distinct from every
+READY, OK, FAIL and guard command byte. A helper that cannot finish its
+setup writes one `SETUP_FAILURE_FRAME_LEN`-byte frame on the
+acknowledgement pipe it already owns, then ends with status 1 as it
+always did. The frame is this marker, the `SetupStep` that failed, the
+position of the lease it was working on, and the errno the call left. The frame is one
+`write` of fewer than `PIPE_BUF` bytes, so it arrives whole or not at
+all, and it is data: a reader that cannot see the pipe close (Darwin,
+below) still wakes for it.
 
 ## `struct State` › `spawning: usize,`
 
@@ -811,6 +826,13 @@ scheduler does with either process. `UPSTROKE_TEST_REAPER_READY_
 DELAY_MS` above drives the same path through the budget instead,
 and depends on the child outrunning it.
 
+Until the Darwin wait was rebuilt on `select` (`wait_readable`), the
+first sentence was true on Linux and false on macOS: CI's macOS leg
+spent the full two seconds per helper on this seam and reported the
+same exit status afterwards, which is how the defect was found
+(`a_helper_that_never_acknowledged_reports_what_ending_it_answered`
+took ~4 s on macOS against ~6 ms on Linux in run 33987067020).
+
 ## `fn spawn_reaper() -> Result<Reaper, String>` › `let containers = container_scope_for_a_new_reaper();`
 
 Rendered BEFORE the fork, like `cleanup_paths` above and for the same
@@ -824,15 +846,43 @@ A separate process group is the crucial boundary: an
 uncatchable kill of Upstroke's foreground job must not also kill
 the process that owns its final agent cleanup.
 
+**The child's call is the only one.** Until PR #172 the parent also
+called `setpgid(pid, pid)` right after the fork, "to close the parent's
+race with the child-side setpgid; either call may win". On Darwin the
+two calls racing on the same new group make the child's fail with
+`EPERM` about once in five to twenty thousand forks. Measured on the
+macOS runner CI uses (macOS 26.6.2, run 33992718199 on branch
+`scratch/darwin-fifo-eof-experiment`, `exp/setpgid_race.c`): with the
+parent's call, the child's `setpgid(0, 0)` returned `EPERM` in 1 to 4 of
+every 20,000 forks across nine tallies, and never in 120,000 forks
+without it; Linux returned no `EPERM` in 60,000 with the parent's call.
+The first READY failure carrying the setup report (CI run 33992302665
+on PR #172, `engine::tests::second_reviewer_spawn_failure_settles_worker_and_first_review_evidence`)
+named exactly this step: "the reaper reported that moving into its own
+process group failed: Operation not permitted (os error 1)", after a wait
+of 24 µs. The parent's call bought nothing the handshake does not
+already give: `begin` returns only after READY, and the child writes
+READY only after its `setpgid` succeeded, so the reaper is in its own
+group before any agent exists in either shape. In the window between the
+fork and the child's call the reaper is still in the parent's group, and
+a kill of that group then takes the reaper with it; no agent exists yet
+to be left behind, and the launch fails at the READY wait. The
+child-side call remains checked, and its failure is reported by step
+and errno.
+
 ## `fn spawn_reaper() -> Result<Reaper, String>` › `let mut delay_left = ready_delay_ms;`
 
 Test subprocesses can hold READY back past the parent's deadline
 so the late-reaper path is driven deterministically.
 
-## `fn spawn_reaper() -> Result<Reaper, String>` › `if unsafe { libc::setpgid(pid, pid) } != 0 {`
+## `fn spawn_reaper() -> Result<Reaper, String>` › `let how = describe_ready_wait("reaper", wait, &cleanup_paths);`
 
-Close the parent's race with the child-side setpgid. Either call may
-win; both establish the same private group before any agent exists.
+How the wait ended, in the message: the helper's own report of the
+step that refused, the pipe closing with no report, the budget
+elapsing with nothing on the pipe, or the wait itself failing. The
+report is decoded with the lease paths this launch rendered before
+the fork, so the lease a refused `open` or `flock` names is the path,
+not a position.
 
 ## `fn spawn_reaper() -> Result<Reaper, String>` › `let end = describe_helper_end(reaper.abandon());`
 
@@ -840,7 +890,10 @@ The teardown is master's, unchanged and in master's order; what
 it answered becomes the diagnostic. Nothing is asked of the pid
 before it, so this adds no window in which a number could be
 reaped elsewhere and reused (row
-`PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`).
+`PR125-CLOSE-PID-IDENTITY-UNDER-A-HOST-WILDCARD-WAITER`). The
+helper's report and the pipe's close arrive on the pipe, which the
+parent already owned and was already reading, so neither asks the
+kernel anything about the pid either.
 
 ## `fn install_reaper_dispositions() -> bool` › `if !scrub_private_helper_dispositions() {`
 
@@ -856,17 +909,30 @@ handler. The private reaper must not inherit that callback (or
 SA_NOCLDWAIT): either can consume the stopped anchor before the
 reaper's blocking waitpid observes it.
 
-## (end of `fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> bool`)
+## `mod termination` › `fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> Result<(), SetupFailure> {`
+
+Take the shared cleanup hold on every active lease, or say which lease
+and which call refused, with the errno it left. The failure is
+returned rather than reported here because the caller owns the
+acknowledgement descriptor.
+
+## (end of `fn lock_cleanup_paths(paths: &[std::ffi::CString]) -> Result<(), SetupFailure>`)
 
 Deliberately leave this independently opened descriptor live.
 Process exit releases its shared lease after cleanup completes.
 
 ## `mod termination` › `let polled = unsafe { libc::poll(&mut command, 1, 10) };`
 
-Poll even before registration. An exec-racing descendant may
-retain a FIFO writer until it exits, so EOF is not a trustworthy
-parent-liveness signal on Darwin. Reparenting is authoritative
-and lets this fork-only helper settle independently.
+Poll even before registration, and never for longer than one slice.
+EOF is not a parent-liveness signal on Darwin, for a stronger reason
+than the one this comment used to give: `poll(2)` on a Darwin FIFO
+reports data and never the last writer's close (`wait_readable`'s
+section has the mechanism and the measurement), so a parent that dies
+with nothing in flight is invisible to this poll however long it
+waits. A fork-only descendant of the parent retaining the writer
+would have the same effect on any platform. Reparenting is
+authoritative and lets this fork-only helper settle independently;
+the ten-millisecond slice is what makes the `getppid` check run.
 
 ## `fn cleanup_reaper_group` › `unsafe {`
 
@@ -941,12 +1007,143 @@ altogether. A helper that exits before READY does so through one of
 its own `_exit(1)` paths, so a status is the difference between "it
 failed setting itself up" and "it was still working when we gave up".
 
+## `mod termination` › `enum SetupStep {`
+
+The steps a helper takes before READY that can refuse, in the order it
+takes them: the reaper installs its signal dispositions, moves into its
+own process group, opens each active cleanup lease and takes the shared
+lock on it; the guard installs its dispositions and forks its probe.
+Closing the inherited descriptors is not here because `close` on a
+number that is not open is not a failure the loop reads. The byte
+encoding is explicit rather than `as`-cast so that a report from a
+helper built at another revision decodes to `None`, never to a
+different step.
+
+## `mod termination` › `fn report_setup_failure_and_exit(ack_fd: libc::c_int, failure: SetupFailure) -> ! {`
+
+The child side of the report. One `write` of the frame, then
+`_exit(1)`: the exit status the parent has always seen from a helper
+that failed its own setup is unchanged, and the frame is what names
+the step. The write is best-effort because nothing better exists at
+that point, the process is ending either way, and its failure is
+observable: the parent reads the pipe closing with no report and says
+so, which is the shape the `UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY`
+seam drives and `helper_ready_failure_helper` pins. Async-signal-safe:
+`write` and `_exit` only, on a frame built by value.
+
+## `mod termination` › `enum AckRead {`
+
+What one bounded read of an acknowledgement byte answered. The four
+answers are the four things a caller does differently: act on the
+byte, treat the helper as gone, treat it as silent, or report the
+wait's own failure. `Option<u8>` collapsed the last three, and the
+READY failure messages could then say only "waited 2s of 2s" for a
+helper that had been dead since the first millisecond.
+
+## `mod termination` › `fn read_guard_ack(fd: libc::c_int, timeout: Duration) -> AckRead {`
+
+One byte within `timeout`, or the reason there was none. The deadline
+is `started.elapsed()` against `timeout`, not `Instant + Duration`,
+which panics on overflow; an interrupted wait or read is retried
+against the time left.
+
+## `mod termination` › `fn wait_readable(fd: libc::c_int, timeout: Duration) -> Readiness {`
+
+Block until `fd` has a byte to read or has no writer left, or until
+`timeout`. Two implementations, because the two platforms' channels
+differ: Linux builds the helper pipes with `pipe2(O_CLOEXEC)` and
+`poll` reports both data and hangup on a pipe; Darwin has no `pipe2`,
+so `create_cloexec_pipe` builds the channel from a FIFO to get an
+atomic close-on-exec open, and **`poll(2)` on a Darwin FIFO never
+reports the last writer's close**.
+
+The mechanism, from XNU. `poll` is implemented over kqueue, and a
+kqueue `EVFILT_READ` knote on a FIFO vnode goes through `vn_kqfilter`
+to the generic vnode filter, whose readable test is
+`vnode_readable_data_count`: for a FIFO that is `fifo_charcount`, the
+number of bytes queued, and nothing else. A writer's `close` runs
+`fifo_close`, which marks the FIFO's read socket `SS_CANTRCVMORE` and
+wakes the *socket's* selinfo; it posts nothing to the vnode's knotes,
+and a re-evaluation would count zero bytes anyway. `select` reaches the
+FIFO through `fifo_select`, which asks the read socket `soreadable`,
+and that test includes `SS_CANTRCVMORE`. A blocking `read` on the FIFO
+sees the close too, through `fifo_read`'s writer count. So data wakes
+`poll`, `select` and `read`; a hangup wakes `select` and `read` only.
+
+Measured rather than reasoned, on the macOS runner CI uses (macOS
+26.5.2, xnu-12377.121.10, run 33989492728 on branch
+`scratch/darwin-fifo-eof-experiment`, `exp/fifo_eof.c`): with the
+channel built exactly as `create_cloexec_pipe` builds it and a forked
+child that closes its end and exits, `poll` returned 0 after the full
+3 s timeout with the child long collected; `select` on the same FIFO
+returned readable at once and the following `read` returned 0; `poll`
+on a `pipe(2)` returned `POLLIN|POLLHUP` at once; and a child that
+wrote one byte woke `poll` on the FIFO at once. Linux passed all five
+at once.
+
+What it cost before this: every helper that ended before READY held
+its launch for the whole `HELPER_READY_BUDGET` and then read as
+"having already exited with status 1", which is the fingerprint row
+`PR125-CLOSE-MACOS-READY-RED-CAUSE-UNKNOWN` carries and the reason a
+ten-second budget at PR #125's head waited ten seconds. It also cost
+the exit-before-READY test four seconds on every macOS run.
+
+Why `select`, and why this symbol. `select` is the one wait primitive
+Darwin gives a FIFO that reports hangup. Its `fd_set` is fixed at
+`FD_SETSIZE` (1024) descriptors, and a descriptor number in a process
+that has opened many files exceeds it (the test binary does routinely);
+the plain `select` symbol refuses such an `nfds` with `EINVAL`. Darwin
+provides the same call without that limit under the symbol the header
+binds when `_DARWIN_UNLIMITED_SELECT` (or the default `_DARWIN_C_SOURCE`)
+is defined, `select$DARWIN_EXTSN`, which takes a caller-sized bit array;
+the `libc` crate binds the limited one, so the extern here names the
+unlimited one directly. The bit array is `slot / 32 + 1` words with one
+bit set, which is every bit below `nfds`, and the call may write the
+time left back into the `timeval`, which is why it is passed by
+mutable reference and not reused. `kqueue` is not an alternative: it is
+what `poll` is built on and carries the same filter. Replacing the FIFO
+with a `pipe` would give `poll` its hangup but lose the atomic
+close-on-exec open that `create_cloexec_pipe`'s section explains, and
+that is a wider change than this one.
+
+Neither implementation reads the descriptor's `revents` or set
+membership beyond "ready": a descriptor that is invalid or in error is
+reported by the `read` that follows, with the errno it leaves.
+
+## `mod termination` › `fn await_ready(fd: libc::c_int, ready: u8, budget: Duration) -> ReadyWait {`
+
+The READY handshake from the parent's side, with every way it can end
+named. A `HELPER_ABORT` first byte is followed by the rest of its frame,
+read against what is left of the same budget; a frame that does not
+complete, or does not decode, is `TruncatedReport` rather than a guess
+at a step. A byte that is neither READY nor the marker is reported as
+the byte, because the guard and the reaper share this function and a
+wrong-helper byte would otherwise read as silence.
+
+## `mod termination` › `fn describe_ready_wait(`
+
+The words the failure message carries for a `ReadyWait`, lowercase and
+without a trailing period so that the message's `; ` joins read as one
+sentence. The lease paths are the parent's rendering of the same list
+the child locked, so `index` names the same file on both sides.
+
 ## `mod termination` › `fn acknowledged(fd: libc::c_int, expected: u8, timeout: Duration) -> bool {`
 
 Whether `expected` arrives on `fd` within `timeout`, skipping any other
 byte first. A reaper that came up after its READY deadline has that
 stale byte queued ahead of its CANCEL acknowledgement; judging the first
-byte alone failed a cancel the reaper had accepted (`C-004`).
+byte alone failed a cancel the reaper had accepted (`C-004`). The pipe
+closing, the budget elapsing and the wait failing are all `false`; a
+flood of unexpected bytes after the deadline ends at the first read
+against a zero remainder (row
+`PR125-CLOSE-FLOODED-CANCEL-UNBOUNDED-BY-THE-FINAL-LOOK`).
+
+## `fn spawn_guard` › `let how = if wait == ReadyWait::Ready {`
+
+The guard's READY is a byte and then its probe's pid; a guard that said
+READY and then ended before the pid is told apart from one that never
+said READY. The guard takes no cleanup lease, so its report is
+described against an empty lease list.
 
 ## `fn spawn_guard` › `let exit_before_ready = std::env::var("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY")`
 
@@ -1616,12 +1813,40 @@ had ended itself, and the message says with what.
 ## `mod tests` › `fn a_helper_that_never_acknowledged_reports_what_ending_it_answered() {`
 
 Both READY failures carry the elapsed wait, the budget, the
-descriptor ceiling and what ending the helper answered.
+descriptor ceiling, how the wait ended and what ending the helper
+answered.
 
-Witnessed against three mutations, each of which fails it:
+Witnessed against four mutations, each of which fails it:
 `close_and_wait_reporting` returning a zero status rather than the
-one `waitpid` filled (the message loses the exit status), and
-`descriptor ceiling {open_max}; ` deleted from either message.
+one `waitpid` filled (the message loses the exit status),
+`descriptor ceiling {open_max}; ` deleted from either message, and
+`wait_readable` polling on macOS (the wait ends at the budget and the
+message says so, not "closed with no report"). The last is the one
+this test could not see before it asserted how the wait ended: the
+message shape was the same after two seconds as after two
+milliseconds.
+
+## `mod tests` › `fn a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file() {`
+
+The regression test for the Darwin wait, and the one that fails on the
+tree before it: `read_guard_ack` answered `TimedOut` after the whole
+budget for a writer that had been collected before the wait began.
+Deterministic by construction: the child is reaped first, so its
+descriptors are closed before the parent looks, which is the shape
+row `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS` asks for. On Linux it
+passes before and after; the platform the defect is on is the one that
+evaluates it (§11).
+
+## `mod tests` › `fn a_reaper_refused_its_cleanup_lease_says_which_lease_and_why() {`
+
+End to end through `spawn_reaper` with a real run lock and cleanup
+scope, so the lease path the reaper reports is the one the conductor
+registered. The exclusive `flock` the test holds is on its own open
+file description; the child's `close` of the inherited copy does not
+release it, and the child's own `open` and `LOCK_SH | LOCK_NB` refuse
+at once, so no scheduling outcome reaches the assertion. This is also
+the only test that drives `report_setup_failure_and_exit` in a real
+child; the frame's encoding is pinned separately without a fork.
 
 ## `pub(crate) mod test_support` › `pub(crate) fn run_with_timeout(`
 
