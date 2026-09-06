@@ -14,13 +14,15 @@ boundary.
 `PR4-ADAPTER-RESOLVES-ON-THE-HOST`'s second clause and `PR6D-001`'s grid.
 Platform-as-value throughout: [`ProgramNaming`]'s two variants are
 constructible on both platforms, so the Windows naming rule is executed by
-the Linux suite on every run. The one genuine `cfg` is [`executable_bit`],
-which asks this filesystem a question the other platform has no answer to.
+the Linux suite on every run. The genuine `cfg`s are [`executable_bit`],
+which asks this filesystem a question the other platform has no answer to,
+and `pathext_entries`'s two conversion arms.
 
-It decides rather than acts. The only filesystem contact is the read-only
-probing a search *is* -- `Path::is_file` and the execute bit -- and the
-memoisation that makes the answer per-boundary rather than per-spawn is the
-parent's, in `HostRunner::program_for`.
+It decides rather than acts. The only filesystem contact is one read-only
+`fs::metadata` probe per candidate, from which the file type and, on Unix,
+the execute bit are both read, and the memoisation that makes the answer
+per-boundary rather than per-spawn is the parent's, in
+`HostRunner::program_for`.
 
 ## `#![deny(`
 
