@@ -3143,9 +3143,8 @@ mod termination {
         probe_fd: libc::c_int,
         probe_pid: libc::pid_t,
     ) -> ! {
-        let mut ready = [0_u8; 5];
-        ready[0] = GUARD_READY;
-        ready[1..].copy_from_slice(&probe_pid.to_ne_bytes());
+        let [first, second, third, fourth] = probe_pid.to_ne_bytes();
+        let ready = [GUARD_READY, first, second, third, fourth];
         if !write_raw(ack_fd, &ready) {
             unsafe { libc::_exit(1) };
         }
@@ -3172,6 +3171,7 @@ mod termination {
             if polled < 0 && !last_errno_is_interrupted() {
                 unsafe { libc::_exit(1) };
             }
+            let [command_poll, wake_poll] = poll_fds;
             if polled == 0 {
                 if unsafe { libc::getppid() } != parent {
                     unsafe { libc::_exit(0) };
@@ -3181,7 +3181,7 @@ mod termination {
                 }
                 continue;
             }
-            if polled > 0 && poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if polled > 0 && command_poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 // SAFETY: `buffer` is valid writable storage and command_fd is
                 // the guard's private read end.
                 let count =
@@ -3189,8 +3189,9 @@ mod termination {
                 if count <= 0 {
                     unsafe { libc::_exit(0) };
                 }
-                for byte in &buffer[..count as usize] {
-                    match *byte {
+                let read = usize::try_from(count).unwrap_or(0);
+                for byte in buffer.iter().copied().take(read) {
+                    match byte {
                         GUARD_ARM => {
                             wake = false;
                             stopping = false;
@@ -3225,7 +3226,7 @@ mod termination {
                     }
                 }
             }
-            if polled > 0 && poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if polled > 0 && wake_poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 drain_pipe(wake_fd);
                 wake = true;
             }
@@ -5242,10 +5243,12 @@ mod termination {
 
         #[test]
         fn a_guard_whose_conductor_is_gone_ends_while_its_pipes_stay_open() {
-            let command = create_cloexec_pipe().expect("a guard command pipe");
-            let ack = create_cloexec_pipe().expect("a guard acknowledgement pipe");
-            let wake = create_cloexec_pipe().expect("a guard wake pipe");
-            let probe = create_cloexec_pipe().expect("a guard probe pipe");
+            let [command_read, command_write] =
+                create_cloexec_pipe().expect("a guard command pipe");
+            let [ack_read, ack_write] =
+                create_cloexec_pipe().expect("a guard acknowledgement pipe");
+            let [wake_read, wake_write] = create_cloexec_pipe().expect("a guard wake pipe");
+            let [probe_read, probe_write] = create_cloexec_pipe().expect("a guard probe pipe");
             // Resolved before either fork, as `spawn_guard` resolves it: the
             // multithreaded child may call only async-signal-safe primitives.
             let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
@@ -5272,50 +5275,63 @@ mod termination {
             // `_exit`.
             let guard = unsafe { libc::fork() };
             if guard == 0 {
-                close_fd(command[1]);
-                close_fd(ack[0]);
-                close_fd(wake[1]);
-                close_fd(probe[0]);
-                close_inherited_fds(&[command[0], ack[1], wake[0], probe[1]], open_max);
-                guard_loop(departed, command[0], ack[1], wake[0], probe[1], departed);
+                close_fd(command_write);
+                close_fd(ack_read);
+                close_fd(wake_write);
+                close_fd(probe_read);
+                close_inherited_fds(&[command_read, ack_write, wake_read, probe_write], open_max);
+                guard_loop(
+                    departed,
+                    command_read,
+                    ack_write,
+                    wake_read,
+                    probe_write,
+                    departed,
+                );
             }
             assert!(
                 guard > 0,
                 "fork a guard: {}",
                 std::io::Error::last_os_error()
             );
-            close_fd(command[0]);
-            close_fd(ack[1]);
-            close_fd(wake[0]);
-            close_fd(probe[1]);
+            close_fd(command_read);
+            close_fd(ack_write);
+            close_fd(wake_read);
+            close_fd(probe_write);
 
-            let mut ready = [0_u8; 5];
-            assert!(
-                read_raw_exact(ack[0], &mut ready) && ready[0] == GUARD_READY,
-                "the guard did not reach its wait: {ready:?}"
-            );
-            let ended = wait_for_lifetime_target(guard);
-            let Some(status) = ended else {
+            let end = |what: &str| -> String {
                 // SAFETY: `guard` is this test's own child and has not been
-                // collected. A guard that outlived its conductor is ended by
-                // the signal no wait can miss, never by closing the writers
-                // this test holds: on Darwin that close is what `poll` does
-                // not report, so it would leave the collection unbounded.
+                // collected.
                 unsafe {
                     let _ = libc::kill(guard, libc::SIGKILL);
                 }
                 let killed = reap(guard);
-                for fd in [command[1], ack[0], wake[1], probe[0]] {
-                    close_fd(fd);
-                }
-                panic!(
-                    "the guard was still waiting with its recorded parent gone and every command \
-                     and wake writer open, and had to be killed: {killed}"
-                )
+                format!("{what}; it was killed and collected: {killed}")
             };
-            for fd in [command[1], ack[0], wake[1], probe[0]] {
+            let said_ready = await_ready(ack_read, GUARD_READY, HELPER_READY_BUDGET);
+            let outcome = if said_ready == ReadyWait::Ready {
+                wait_for_lifetime_target(guard).map_or_else(
+                    || {
+                        Err(end(
+                            "the guard was still waiting with its recorded parent gone and every \
+                             command and wake writer open",
+                        ))
+                    },
+                    Ok,
+                )
+            } else {
+                Err(end(&format!(
+                    "the guard never reached its wait: {}",
+                    describe_ready_wait("guard", said_ready, &[])
+                )))
+            };
+            for fd in [command_write, ack_read, wake_write, probe_read] {
                 close_fd(fd);
             }
+            let status = match outcome {
+                Ok(status) => status,
+                Err(report) => panic!("{report}"),
+            };
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "the guard did not end cleanly: {status}"

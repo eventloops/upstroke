@@ -1279,6 +1279,20 @@ the first child-side action. Descriptor scrubbing can be long on
 high-limit hosts; no signal in that window may run host code or
 leave the only wake relay blocked.
 
+## `fn guard_loop` › `let [first, second, third, fourth] = probe_pid.to_ne_bytes();`
+
+Bounding the wait below modified `guard_loop`, and `standards/SWEEP.md`'s
+activation rule puts §6 and §7 on the whole body of a function a change
+modifies while `src/agent/proc.rs` is still queued rather than swept. So
+the body's panic surface went with the change: the READY frame is built
+by destructuring instead of `ready[0] = …` and `ready[1..]`, the two poll
+entries are read through `let [command_poll, wake_poll] = poll_fds;`
+instead of `poll_fds[0]` and `poll_fds[1]`, and the bytes read are walked
+with `iter().take(read)` instead of `&buffer[..count as usize]`, over a
+length from `usize::try_from`. `cargo clippy -W clippy::indexing_slicing
+-W clippy::unreachable` reports no site of either construct in this
+function or in the test below. Nothing else in the body changed.
+
 ## `mod termination` › `let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, GUARD_POLL_SLICE_MS) };`
 
 Both parent relays and guard-directed foreground signals make a
@@ -1971,11 +1985,16 @@ can never answer it again, and the test holds every command and wake
 writer open for the whole wait, so no end-of-file can end the guard and
 the reparenting check is the only thing that can. The end is observed by
 collecting the child, not by timing the guard's own work (row
-`PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`). A guard that does outlive
-its recorded parent is ended with SIGKILL, never by closing those
-writers: on Darwin that close is exactly what `poll` does not report, so
-closing them first would make the collection unbounded on the platform
-the defect is on. Both platforms evaluate this: holding the writers open
+`PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`). Every wait the test takes is
+bounded: READY through `await_ready` on `HELPER_READY_BUDGET`, the same
+call and budget `spawn_guard` uses, so a guard that stalls before saying
+READY is reported rather than waited on forever; and the collection
+through `wait_for_lifetime_target`. A guard the test cannot account for —
+one that never said READY, or one still waiting when the collection
+budget runs out — is ended with SIGKILL and collected, never by closing
+those writers: on Darwin that close is exactly what `poll` does not
+report, so closing them first would make the collection unbounded on the
+platform the defect is on. Both platforms evaluate this: holding the writers open
 withholds the hangup Linux would otherwise report, so the check under
 test is the same one on each (§11).
 
