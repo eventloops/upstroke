@@ -2974,9 +2974,10 @@ caused it touched an executable token, which is why nothing failed.
 The census reads this module and this file through `include_str!` and holds them
 equal in both directions: every operation carries an adjacent complete
 obligation, the multiset of site obligations equals the multiset recorded here,
-and the guard's protocol sits beside its type. Three separate mutations were run
+and the guard's protocol sits beside its type. Four separate mutations were run
 against it -- adjacency lost, a block shortened but left adjacent, the protocol
-deleted from the site -- and each is detected by a different assertion.
+deleted from the site, the notes copy edited away from the site copy -- and each
+is detected by a different assertion.
 
 It is deliberately outside the `#[cfg(target_os = "linux")]` module it censuses,
 so all three Clippy and test legs evaluate it. `include_str!` embeds the
@@ -2986,6 +2987,17 @@ whitespace-separated words, which absorbs a rewrap of either copy as well.
 Reading at compile time also keeps the census off the runtime effect surface
 this module's allowlist row governs.
 
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `const KEYWORD: &str = "unsafe";`
+
+The census reads the file it lives in, and the keyword is spelled in full here
+because the scan never sees this line: string literals are blanked before the
+scan, so the constant, the fixtures the controls build, and every message that
+names the keyword are prose to it. The first census spelled the needle in two
+pieces to keep from finding itself and skipped only whole-line `//` comments,
+so a literal or a block comment containing the word was read as an operation
+with no obligation; `PR157-ASTRA-SITE-SAFETY-R2-001` is that finding, and the
+blanked view is its repair.
+
 ## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn comment_body(line: &str) -> Option<&str> {`
 
 The text of a `//` comment line, or `None` for code, a blank line, or the module
@@ -2993,23 +3005,45 @@ header. Returning `None` for a blank line is what catches the separator PR #157
 left behind: a block is adjacent exactly when the line above the operation is a
 comment.
 
-## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let block_ending_at = |above: usize| -> Option<String> {`
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn block_ending_at(lines: &[&str], above: usize) -> Option<String> {`
 
 The whole comment block whose last line is `above`, normalised to one line of
 words. Walking upward from the operation rather than downward from the comment is
 what makes a truncated block visible: the remnant is still a comment, but it is
-no longer the line above.
+no longer the line above. It reads the source lines, not the blanked view, so
+the obligation is compared as the reader sees it.
 
-## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let keyword = concat!("un", "safe");`
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn site_obligations(source: &str) -> Result<Vec<String>, String> {`
 
-The census reads the file it lives in, so its needle must not match its own
-source. Spelling the keyword in two pieces keeps the scan from finding an
-operation inside the scanner. Comment lines are skipped before the scan, so the
-word may appear freely in the reasoning at a site.
+The scan proper, over any source text, so the controls below can run it over a
+fixture built from this module and observe a refusal as a value rather than a
+panic. The operations are located in `crate::effects::blank_comments_and_strings`'
+view of the text, which section 12 requires of a census of Rust structure: the
+blanker keeps every position and every newline and replaces comments and
+string, character, byte-string and raw-string literals with spaces, and carries
+its own fixture proof in the effects suite, so this census does not write a
+second one. The line count of the two views is asserted equal before they are
+walked side by side; the keyword is then a whole word of a blanked line, and
+the obligation for that line is read out of the original text at the same
+index, where the comment still is.
 
 ## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let mut opens_at = index;`
 
 The obligation sits above the statement, and a macro or call may open that
 statement on an earlier line -- `assert_eq!(` above the `mkfifo` call. The walk
-crosses those openers and nothing else: never a blank line, and never unrelated
-code, so "adjacent" keeps its meaning.
+crosses those openers and nothing else: it reads the blanked view, where a
+comment line or a line inside a literal is blank and so never ends with `(`,
+and it never crosses a blank line or unrelated code, so "adjacent" keeps its
+meaning.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let lines_here = SOURCE.lines().count();`
+
+The census's own controls, section 12's positive control included, each built by
+appending to the real module so the domain is the whole file and not a
+fixture shaped to pass. The keyword inside a string literal, a raw string
+literal, a one-line and a multi-line block comment and a trailing `//` comment
+must leave the obligations exactly as they were; an operation appended with
+nothing above it must be refused at its own line number, which is also the
+proof that positions are preserved; and an operation appended under a fresh
+`SAFETY:` line must contribute exactly that line's text, read from the source
+where the blanked view has already erased it.

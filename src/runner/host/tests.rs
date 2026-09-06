@@ -5866,6 +5866,7 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
     const PROTOCOL_ITEM: &str = "struct HeldFork {";
     const PROTOCOL_HEADING: &str = "## `struct HeldFork {`";
     const OBLIGATION: &str = "SAFETY:";
+    const KEYWORD: &str = "unsafe";
 
     fn comment_body(line: &str) -> Option<&str> {
         let rest = line.trim().strip_prefix("//")?;
@@ -5879,65 +5880,112 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         words.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    let source: Vec<&str> = SOURCE
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .collect();
-
-    let block_ending_at = |above: usize| -> Option<String> {
-        comment_body(source.get(above)?)?;
+    fn block_ending_at(lines: &[&str], above: usize) -> Option<String> {
+        comment_body(lines.get(above)?)?;
         let mut first = above;
         while first
             .checked_sub(1)
-            .and_then(|previous| source.get(previous))
+            .and_then(|previous| lines.get(previous))
             .and_then(|line| comment_body(line))
             .is_some()
         {
             first = first.saturating_sub(1);
         }
-        let block = source
+        let block = lines
             .get(first..=above)?
             .iter()
             .filter_map(|line| comment_body(line))
             .collect::<Vec<_>>()
             .join(" ");
         Some(normalised(&block))
-    };
-
-    let keyword = concat!("un", "safe");
-    let mut site_obligations: Vec<String> = Vec::new();
-    for (index, line) in source.iter().enumerate() {
-        if comment_body(line).is_some()
-            || !line
-                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
-                .any(|word| word == keyword)
-        {
-            continue;
-        }
-        let mut opens_at = index;
-        while opens_at
-            .checked_sub(1)
-            .and_then(|previous| source.get(previous))
-            .is_some_and(|line| comment_body(line).is_none() && line.trim_end().ends_with('('))
-        {
-            opens_at = opens_at.saturating_sub(1);
-        }
-        let Some(block) = opens_at.checked_sub(1).and_then(&block_ending_at) else {
-            panic!(
-                "src/runner/host/tests.rs:{}: the operation carries no adjacent obligation",
-                index + 1
-            );
-        };
-        assert!(
-            block.starts_with(OBLIGATION),
-            "src/runner/host/tests.rs:{}: the adjacent comment is not an obligation: {block}",
-            index + 1
-        );
-        site_obligations.push(block);
     }
+
+    fn site_obligations(source: &str) -> Result<Vec<String>, String> {
+        let lines: Vec<&str> = source
+            .lines()
+            .map(|line| line.trim_end_matches('\r'))
+            .collect();
+        let blanked = crate::effects::blank_comments_and_strings(source);
+        let code: Vec<&str> = blanked.lines().collect();
+        if code.len() != lines.len() {
+            return Err(format!(
+                "the blanked view has {} lines where the source has {}",
+                code.len(),
+                lines.len()
+            ));
+        }
+        let mut obligations = Vec::new();
+        for (index, statement) in code.iter().enumerate() {
+            if !statement
+                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .any(|word| word == KEYWORD)
+            {
+                continue;
+            }
+            let mut opens_at = index;
+            while opens_at
+                .checked_sub(1)
+                .and_then(|previous| code.get(previous))
+                .is_some_and(|line| line.trim_end().ends_with('('))
+            {
+                opens_at = opens_at.saturating_sub(1);
+            }
+            let Some(block) = opens_at
+                .checked_sub(1)
+                .and_then(|above| block_ending_at(&lines, above))
+            else {
+                return Err(format!(
+                    "{}: the operation carries no adjacent obligation",
+                    index + 1
+                ));
+            };
+            if !block.starts_with(OBLIGATION) {
+                return Err(format!(
+                    "{}: the adjacent comment is not an obligation: {block}",
+                    index + 1
+                ));
+            }
+            obligations.push(block);
+        }
+        Ok(obligations)
+    }
+
+    let site_obligations_here = site_obligations(SOURCE)
+        .unwrap_or_else(|refusal| panic!("src/runner/host/tests.rs:{refusal}"));
     assert!(
-        !site_obligations.is_empty(),
+        !site_obligations_here.is_empty(),
         "no operation was found to check; this census measures nothing"
+    );
+
+    let lines_here = SOURCE.lines().count();
+    let prose = format!(
+        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: u8 = 0; // {KEYWORD}\n"
+    );
+    assert_eq!(
+        site_obligations(&prose).as_deref(),
+        Ok(site_obligations_here.as_slice()),
+        "the keyword in a literal or a comment is prose, not an operation"
+    );
+    let bare = format!("{SOURCE}fn injected() {{\n    let _ = {KEYWORD} {{ 0 }};\n}}\n");
+    assert_eq!(
+        site_obligations(&bare),
+        Err(format!(
+            "{}: the operation carries no adjacent obligation",
+            lines_here + 2
+        )),
+        "an operation with nothing above it is refused at its own line"
+    );
+    let obliged = format!(
+        "{SOURCE}// {OBLIGATION} injected obligation, read from the source, not the blanked view.\nconst _: u8 = {KEYWORD} {{ 0 }};\n"
+    );
+    let mut expected: Vec<&str> = site_obligations_here.iter().map(String::as_str).collect();
+    expected.push("SAFETY: injected obligation, read from the source, not the blanked view.");
+    assert_eq!(
+        site_obligations(&obliged)
+            .as_deref()
+            .map(|found| found.iter().map(String::as_str).collect::<Vec<_>>()),
+        Ok(expected),
+        "an operation under an obligation contributes that obligation's text"
     );
 
     let mut notes: Vec<(&str, String)> = Vec::new();
@@ -5961,7 +6009,7 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         }
     }
 
-    let mut beside_the_code: Vec<&str> = site_obligations.iter().map(String::as_str).collect();
+    let mut beside_the_code: Vec<&str> = site_obligations_here.iter().map(String::as_str).collect();
     let mut in_the_notes: Vec<&str> = notes
         .iter()
         .map(|(_, text)| text.as_str())
@@ -5979,11 +6027,17 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         .find(|(at, _)| *at == PROTOCOL_HEADING)
         .map(|(_, text)| text.as_str())
         .expect("the notes record the guard's protocol");
-    let at_item = source
+    let lines: Vec<&str> = SOURCE
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let at_item = lines
         .iter()
         .position(|line| line.trim() == PROTOCOL_ITEM)
         .expect("the guard the protocol governs");
-    let beside_item = at_item.checked_sub(1).and_then(block_ending_at);
+    let beside_item = at_item
+        .checked_sub(1)
+        .and_then(|above| block_ending_at(&lines, above));
     assert_eq!(
         beside_item.as_deref(),
         Some(protocol),
