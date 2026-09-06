@@ -10,7 +10,7 @@ These notes preserve the module comments after the status repairs. Item headings
 
 Status is a pure read: it opens no branch, spawns no agent, and takes no
 lock. Everything it shows is derived by replaying `events.jsonl` through
-the same [`RunState::apply`](crate::events::RunState::apply) the engine
+the same [`RunState::apply`](events/mod.md) the engine
 writes through, so a running engine and a watching operator are looking at
 one computation rather than two that ought to agree.
 

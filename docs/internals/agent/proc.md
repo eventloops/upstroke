@@ -927,7 +927,7 @@ results are kept rather than discarded.
 
 ## `impl Reaper` › `fn close_and_wait_reporting(self) -> (libc::pid_t, libc::c_int, libc::c_int) {`
 
-[`close_and_wait`](Self::close_and_wait), keeping what the final
+`close_and_wait`, keeping what the final
 `waitpid` answered: the pid it returned or `-1`, the errno it left
 in that case, and the status it filled otherwise. The loop, the
 descriptors it closes and the order are unchanged.

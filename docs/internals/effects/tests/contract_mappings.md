@@ -18,7 +18,7 @@ Four transcribed tables and the one census that answers all four.
 `PR6_CLAUSES` are the three mappings the PR6 reconciliation said it had
 supplied and had not. None of them is in this repository, so each is a
 literal here for the reason `policy.rs` gives about
-[`crate::effects::tests::policy::PACKET_PRIMITIVES`]: the no-self-oracle
+[`crate::effects::tests::policy::PACKET_PRIMITIVES`](policy.md): the no-self-oracle
 rule requires the expected values to come from the document's own text
 rather than from the tree they are checked against.
 
@@ -74,8 +74,8 @@ declaration is inside every whole-tree census's domain, and the tables below
 are dense with names those censuses read: nineteen plus twenty-eight test
 identifiers, several of them container-substrate names. The inline module
 closes it for both of the repository's source cutters at once --
-[`crate::effects::production_region`] truncates at the first `#[cfg(test)]`
-and [`crate::effects::production_code`] excises the item that attribute
+[`crate::effects::production_region`](../../effects.md) truncates at the first `#[cfg(test)]`
+and [`crate::effects::production_code`](../../effects.md) excises the item that attribute
 attaches to -- so none of those names is in any census's region and this
 file reads as the test logic it is.
 
@@ -120,7 +120,7 @@ The nineteen tests `transaction_fault_matrix` row `T-CONTAINER` names in its
 
 **Transcribed, not read.** The packet is not in this repository, so the list
 is a literal here the way
-[`PACKET_PRIMITIVES`](crate::effects::tests::policy::PACKET_PRIMITIVES)
+[`PACKET_PRIMITIVES`](policy.md)
 is — the no-self-oracle rule requires the expected values to come from the
 packet's text rather than from the tree, and a literal is the only shape
 that survives into CI.
@@ -283,7 +283,7 @@ none of which anything read:
    clauses, each with a test **or an owned deferral**.
 
 A name that is not a `#[test]` in this tree fails here, through the same
-[`defining_test_sites`] census `T_CONTAINER_TESTS` uses — so this cannot be
+`defining_test_sites` census `T_CONTAINER_TESTS` uses — so this cannot be
 satisfied by prose, by a helper function with the right name, or by a string
 in a comment.
 

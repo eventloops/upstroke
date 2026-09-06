@@ -16,7 +16,7 @@ Three rules this project pays for when it forgets them are load-bearing
 here:
 
 * **A function may not be its own oracle.** The denylist is checked against
-  [`PACKET_PRIMITIVES`], transcribed from
+  `PACKET_PRIMITIVES`, transcribed from
   `decisions.effect_site_inventory.mechanism`'s own sentence, never against
   itself. The site inventory is checked against the enums.
 * **Enumerations come from the types and the packet.** The site grid iterates
@@ -62,7 +62,7 @@ Reading the tree and the artifacts
 This package's target inventory, read once from `cargo metadata`.
 
 **The acquisition lives here and the authority lives in
-[`census_domain`](crate::effects::census_domain).** Reading a manifest means
+[`census_domain`](../effects.md).** Reading a manifest means
 starting a process, and `effects/allowlist.toml` records `allows = []` for
 `src/effects.rs` on the strength of that file carrying no attribute and
 reaching no denied primitive — "a stronger claim than any other entry in
@@ -86,7 +86,7 @@ instead of announcing themselves.
 
 The inventory of the package whose manifest sits in `manifest_dir`.
 
-Separate from [`crate_roots`] and taking a directory, because a control that
+Separate from `crate_roots` and taking a directory, because a control that
 only ever runs against this tree's own manifest cannot show what the reader
 does with an arbitrary `[[bin]] path` — and an arbitrary `[[bin]] path` is
 the whole of what the stem rule got wrong.
@@ -593,7 +593,7 @@ evidence is a fixture nothing executes is `PR5-C-DOCTEST-FIXTURES-NEVER-RAN`,
 and the rule adopted from it is to name the command that runs the fixture and
 check that the command is one CI runs. `.github/workflows/ci.yml` installs
 the clippy component in both the `test` and the `lint` job, and
-[`the_workflow_that_runs_these_tests_installs_the_compiler_they_need`]
+`the_workflow_that_runs_these_tests_installs_the_compiler_they_need`
 asserts it.
 
 ## `mod ci_model;`
@@ -683,9 +683,9 @@ golden image the runner boots, which this contract cannot read; the decision
 record binds re-curation to it instead. What the contract *can* read is
 pinned: the labels exactly, the suite step exactly -- the command and the
 count that says it executed, see
-[`the_self_hosted_leg_counts_the_tests_it_ran`] -- the platform-default
+`the_self_hosted_leg_counts_the_tests_it_ran` -- the platform-default
 shell on every `run:` step, and a field set with no `if:` or
-`continue-on-error:`. The refusals are executed in [`WORKFLOW_ESCAPES`],
+`continue-on-error:`. The refusals are executed in `WORKFLOW_ESCAPES`,
 every row named `MUT-TEST-WINDOWS-*` and both `MUT-WINDOWS-WITNESS-*`.
 
 ## `fn the_hosted_windows_leg_still_links_every_test_binary() {`
@@ -703,7 +703,7 @@ any of them on current stable cannot pass every hosted leg; what it cannot
 see is a failure that needs a toolchain newer than current stable, which no
 leg has. Its carrier's toolchain input is pinned to `stable` too: the action
 is pinned by commit, and the input is what decides which compiler runs. The
-refusals are executed in [`WORKFLOW_ESCAPES`], `MUT-WINDOWS-BUILD-WITNESS-*`,
+refusals are executed in `WORKFLOW_ESCAPES`, `MUT-WINDOWS-BUILD-WITNESS-*`,
 `MUT-WITNESS-CHECKOUT-REF` and `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
 
 ## `fn no_repository_file_overrides_what_ci_compiles_or_runs() {`
@@ -772,7 +772,7 @@ It is derived from the manifest and quoted from it on failure, because a
 literal `1.85.0` would make this its own oracle for the fact it exists to
 hold.
 
-The refusals are executed in [`WORKFLOW_ESCAPES`] -- every row named
+The refusals are executed in `WORKFLOW_ESCAPES` -- every row named
 `MUT-MSRV-*` -- so this test passing is not the claim that the contract
 refuses nothing.
 
@@ -916,7 +916,7 @@ aggregate makes that gate required.
 The domain is derived from the tree rather than listed here: a written-down
 platform list is one nothing forces an author to extend, which is what the
 previous repair of this test shipped. The two halves join at the target
-tuple -- [`cfg_regions`] decides which runners compile each body, and the
+tuple -- `cfg_regions` decides which runners compile each body, and the
 workflow contract requires a gate job whose `runs-on:` is that runner.
 
 **Why this is one test and not three.** `PR5D-MSVC-CLIPPY-NEVER-RUN` and
@@ -1006,7 +1006,7 @@ The companion artifact states where the funnel bodies actually are
 `Answer.Ingest`, `Answer.PublishRename` and `Answer.StageWrite`, and the
 `AnswerSite::` literals are at `src/rundir.rs:899`, `:912` and `:934` and
 nowhere else. Until this round the only thing reconciling the artifact with
-the tree was a **test-side override** — [`funnel_module`] — so the artifact a
+the tree was a **test-side override** — `funnel_module` — so the artifact a
 gate report carries said something false about this tree and nothing checked
 in said otherwise. Measured: deleting that override makes the three Answer
 sites join the "no funnel names them" set, which is the finding.
@@ -1875,7 +1875,7 @@ searched for the literal `"#[cfg(test)]\npub(crate) mod lint_levels {"`,
 which is a search for a spelling of a newline: the guest checks this
 tree out with CRLF and that needle is `\r\n` there, so the assertion
 held on Unix and on nothing else. What actually has to be true is that
-the item is **removed by** [`crate::effects::production_code`], which is
+the item is **removed by** [`crate::effects::production_code`](../effects.md), which is
 what `#[cfg(test)]` means to every census in this crate — and that is
 read from the region, not from a byte sequence spanning a line.
 

@@ -99,7 +99,7 @@ generate; the separator between its lines is the filesystem's business.
 
 ## `pub(super) fn funnel_module_record() -> String {`
 
-The companion record, from the enums and from [`funnel_module`].
+The companion record, from the enums and from `funnel_module`.
 
 ## `pub(super) fn funnel_module(site: EffectSiteId) -> &'static str {`
 

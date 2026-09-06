@@ -20,3 +20,21 @@ The independent review preserved that response in evidence-41eb825d/settle-rende
 ## What the change that takes this up should do
 
 Convert the moved rustdoc references to Markdown links that work in the intended reader context, with source or notes targets for the named items. A repository backlink to settle.rs does not identify these definitions in events.rs. Record this finding and defer repair under DOCS_FAST_TRACK.md.
+
+## Update, 2026-09-06 (PR #214)
+
+The two destinations this record cites, `docs/internals/engine/topology/settle.md:40`
+and `:43`, are converted. They now point at `../../topology/events.md`, the notes for
+`src/topology/events.rs`, where `Epoch` and `IncarnationId` are documented. Every other
+destination of that shape in `docs/internals/` went with them — eleven in all, three of
+which a `crate::` search does not find — and
+`.github/scripts/validate-internals-notes.sh`'s N5 resolves every inline destination in
+the notes tree from that head on, so the form cannot come back.
+
+This record stays open for the half it names in passing. The other rustdoc shortcut
+references in these notes still render as bracketed code: 23 in `settle.md` alone and
+1743 across 111 notes files. Only the ten effects notes were converted, because they are
+the ten an independent CommonMark rendering audit measured.
+`PR161-NOTES-SHORTCUT-REFERENCES-TREE` is the standing entry for the rest, and N5's
+second half is scoped to the converted files so the domain widens with the conversion
+rather than ahead of it.

@@ -368,7 +368,7 @@ would silently truncate the path — so it is refused rather than trimmed.
 
 ## `pub mod duration_millis {`
 
-Serialize a [`Duration`](std::time::Duration) as whole milliseconds.
+Serialize a `Duration` as whole milliseconds.
 
 Durations ride in both the event log and the report, and serde's default
 `{"secs":3,"nanos":120000000}` is neither readable in a JSONL ops log nor

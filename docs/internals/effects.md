@@ -24,7 +24,7 @@ override those rules.
    `disallowed-methods` / `disallowed-types` / `disallowed-macros` name every
    effect primitive the crate can reach, and "aliases, re-exports, function
    values, method calls, and macro-expanded code in this crate resolve to the
-   same DefId". [`tests::every_declared_effect_denial_refuses_for_the_reason_it_declares`]
+   same DefId". [`tests::every_declared_effect_denial_refuses_for_the_reason_it_declares`](effects/tests.md)
    compiles one fixture per shape and asserts the lint each emits, because
    that sentence is a claim about a toolchain and not a law of nature.
 2. **An allow of a governed lint lives only where the allowlist says.**
@@ -92,7 +92,7 @@ The artifacts, by the names `outputs` gives them
 element: constructed, classified, recovered; per site: sampling N and
 observed-class histogram)".
 
-The *declarations* half. The histogram half is [`RESIDUE_HISTOGRAM_JSON`],
+The *declarations* half. The histogram half is `RESIDUE_HISTOGRAM_JSON`,
 and the split is forced rather than chosen — see there.
 
 ## `pub const RESIDUE_HISTOGRAM_JSON: &str = "effects/residue-histogram.json";`
@@ -100,7 +100,7 @@ and the split is forced rather than chosen — see there.
 The **observed-class histogram** half of the same record (`PR5-CONF-004`).
 
 `outputs` requires, per site, "sampling N **and observed-class histogram**".
-[`RESIDUE_CLASSES_JSON`] is generated from the frozen enums and compared
+`RESIDUE_CLASSES_JSON` is generated from the frozen enums and compared
 byte-for-byte, which it must be — and a histogram is machine-varying by
 construction, since which class a kill sample lands in is a race between the
 kill and Git. A count cannot be byte-pinned and a byte-pinned file cannot
@@ -113,7 +113,7 @@ else's numbers would be worse than no copy.
 ## `pub const FUNNEL_MODULES_JSON: &str = "effects/funnel-modules.json";`
 
 Where each site's funnel **bodies** actually are, where that is not what
-[`EFFECT_SITES_JSON`]'s `module` column says (`PR5-CONF-018`).
+`EFFECT_SITES_JSON`'s `module` column says (`PR5-CONF-018`).
 
 `effect_sites.json` is generated from the frozen enums, so its `module`
 column is `EffectSiteId::module()` — PR3's answer, and the packet's:
@@ -157,7 +157,7 @@ The six lints `mechanism` (2) governs, as bare names.
 
 Bare, because an attribute may write either `disallowed_methods` or
 `clippy::disallowed_methods` and the sentence names them both ways in one
-breath. [`normalize_lint`] is the bridge.
+breath. `normalize_lint` is the bridge.
 
 ## `pub const USED_GOVERNED_LINTS: &[&str] = &[`
 
@@ -165,7 +165,7 @@ The three governed lints this slice actually uses, fully qualified.
 
 `clippy::style`, `clippy::all` and `warnings` are governed and **unused**:
 each would suppress far more than an effect denial, and
-[`tests::the_three_blunt_governed_lints_are_used_by_nobody`] asserts the
+[`tests::the_three_blunt_governed_lints_are_used_by_nobody`](effects/tests.md) asserts the
 count is zero rather than leaving it to habit.
 
 ## `pub fn normalize_lint(entry: &str) -> Option<&'static str> {`
@@ -231,7 +231,7 @@ Raw strings (`r"…"`, `r#"…"#`), byte strings, char literals and escapes are
 handled; a `'a` lifetime is not a char literal and is left alone.
 Comments blanked, **string literals kept**.
 
-The other half of [`blank_comments_and_strings`], and a separate function
+The other half of `blank_comments_and_strings`, and a separate function
 because a census whose needle lives *inside* a string cannot use that one:
 it blanks a literal including its quotes, so a search for `"docker` in its
 output looks for a byte sequence the haystack can no longer contain. That is
@@ -245,7 +245,7 @@ here beside its sibling rather than in each census that wants it.
 
 Line comments, block comments (nested), char literals, escapes and **raw
 strings** (`r"…"`, `r#"…"#`, `b"…"`, `br#"…"#`) are all handled: this
-function tokenises exactly as [`blank_comments_and_strings`] does and differs
+function tokenises exactly as `blank_comments_and_strings` does and differs
 only in keeping a literal's bytes instead of blanking them. Byte offsets are
 not preserved; line breaks are.
 
@@ -285,7 +285,7 @@ to a single push.
 ## `pub fn blank_comments(source: &str) -> String` › `match char_literal_end(bytes, i) {`
 
 `'"'` is the one that matters here: without this arm it opens
-a string. [`char_literal_end`] decides, so this and its
+a string. `char_literal_end` decides, so this and its
 sibling cannot drift apart.
 
 ## `fn char_literal_end(bytes: &[u8], from: usize) -> Option<usize> {`
@@ -307,8 +307,8 @@ of phase: in `('é','{')` the pairing shifts by one and the `{` that is inside
 a char literal survives into the blanked text as visible **code**.
 
 One unbalanced brace is enough to take a file out of every census that
-consults [`production_code`]. [`matching`] counts it, so
-[`configured_item_end`]'s brace arm walks past the item's real `}`, finds no
+consults `production_code`. `matching` counts it, so
+`configured_item_end`'s brace arm walks past the item's real `}`, finds no
 balancing brace and gives up — and giving up used to mean "blank to end of
 file".
 
@@ -367,8 +367,8 @@ Newlines survive so line numbers do.
 
 ## `pub fn blank_comments_and_strings(source: &str) -> String` › `match char_literal_end(bytes, i) {`
 
-[`char_literal_end`] decides, so this and its sibling in
-[`blank_comments`] cannot drift apart.
+`char_literal_end` decides, so this and its sibling in
+`blank_comments` cannot drift apart.
 
 ## `pub fn production_region(source: &str) -> String {`
 
@@ -380,7 +380,7 @@ inside a comment or a string.
 The production **code** of `source`: comments and string literals blanked,
 and every `#[cfg(test)]`-configured item removed.
 
-[`production_region`] answers a different question and keeps its answer: it
+`production_region` answers a different question and keeps its answer: it
 *truncates* at the first `#[cfg(test)]`, which is what a **domain** question
 wants (everything above the cut is certainly production) and what a
 **prohibition** question must not have. Three failures a prohibition census
@@ -425,7 +425,7 @@ Any further attributes stacked on the same item belong to it.
 
 ## `fn configured_item_end(bytes: &[u8], start: usize) -> usize {`
 
-Where the item beginning at `start` ends, exclusive. See [`production_code`].
+Where the item beginning at `start` ends, exclusive. See `production_code`.
 
 **The two give-up paths return `start`, not `bytes.len()`.** Both are reached
 only when the blanked text does not parse — an unbalanced brace, or an item
@@ -435,7 +435,7 @@ decides the value is the *direction* they fail in. `bytes.len()` reads "the
 item is the rest of the file" and blanks it, so a tokeniser that has lost
 phase silently removes every production item below the attribute from every
 census that consults this region — which is exactly what
-[`char_literal_end`]'s desync used to buy. Returning `start` blanks the
+`char_literal_end`'s desync used to buy. Returning `start` blanks the
 attribute and nothing else, so the test module below it reads as production
 and the censuses go **loud** instead. The larger region is always the safe
 one here, for the same reason the doc above gives for not matching angle
@@ -501,7 +501,7 @@ them there.
 
 `src/engine/topology/` is the fifth entry and is **not** in the packet
 sentence, which names `src/engine/topology.rs` only. It is here because
-[`topology_modules_among`] matches with `str::starts_with`, and
+`topology_modules_among` matches with `str::starts_with`, and
 `"src/engine/topology/create.rs"` does not start with
 `"src/engine/topology.rs"` — the sentence's four shapes were written when
 the schema-4 engine was one file, and PR7 makes it a directory. Without
@@ -532,7 +532,7 @@ lost defence-in-depth, not a live escape — and it is closed here because
 `src/runner/` are already prefixes, and `src/rundir.rs` and
 `src/agent/proc.rs` are not in this list at all.
 
-**Why this list takes a directory prefix and [`CLASSIFIED_MODULES`] does
+**Why this list takes a directory prefix and `CLASSIFIED_MODULES` does
 not**, since one commit does both and the two answers look contradictory.
 They are matched differently on purpose. Entries here are matched with
 `str::starts_with`, so a prefix is the only form that covers a module tree,
@@ -807,7 +807,7 @@ decides what a census is allowed to see. This derivation was written twice —
 `runner::tests::whole_file_test_module_declarations` and
 `events::log::tests::declared_whole_file_test_modules`, identical by hand,
 each deciding which files four whole-tree censuses skip. It lives beside
-[`production_code`] now, which is the region those same censuses count over.
+`production_code` now, which is the region those same censuses count over.
 
 ## `pub(crate) mod census_domain` › `pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {`
 
@@ -868,7 +868,7 @@ inspected" is the same rule; this is it applied to the instrument.
 
 ## `pub(crate) mod census_domain` › `pub(crate) fn whole_file_test_modules(`
 
-The **files** [`declared_whole_file_test_modules`] resolves to, as a set a
+The **files** `declared_whole_file_test_modules` resolves to, as a set a
 census can test membership in.
 
 The resolution loop — assert exactly one of the two candidates exists,
@@ -1044,7 +1044,7 @@ for the package whose manifest is `manifest`.
 
 Pure over the document, which is what makes every refusal below
 drivable: the acquisition is a process start and lives in
-[`crate::effects::tests`], where this crate's governance puts one.
+[`crate::effects::tests`](effects/tests.md), where this crate's governance puts one.
 
 ## `impl CrateRoots` › `pub(crate) fn package_dir(&self) -> &std::path::Path {`
 
@@ -1075,7 +1075,7 @@ The directory an out-of-line child of `declared_in` lives in.
 **A crate root owns its directory; an ordinary module owns a directory
 named after it.** `mod.rs` is the first case wherever it sits — that is
 what `mod.rs` means. Everything else is the first case exactly when the
-manifest names it as a target's path, which is what [`CrateRoots`] reads
+manifest names it as a target's path, which is what `CrateRoots` reads
 and what no rule about file names can answer.
 
 Refused rather than decided when `declared_in` is not inside the package
@@ -1094,7 +1094,7 @@ names `proc/test_support/readiness.rs`, and flattened to
 `proc/readiness.rs` it names nothing — a zero-candidate refusal if you
 are lucky and the wrong file if you are not.
 
-`roots` is the package's target inventory, and [`module_directory`] is
+`roots` is the package's target inventory, and `module_directory` is
 why that is a parameter rather than a test on the file's stem.
 
 ## `pub(crate) mod census_domain` › `pub(crate) fn contained_in(base: &std::path::Path, candidate: &std::path::Path) -> bool {`
@@ -1132,7 +1132,7 @@ enclosing inline module's predicate and the declaration's own.
 ## `pub(crate) struct TestModuleDeclaration` › `pub(crate) candidates: [PathBuf; 2],`
 
 `[<dir>/<name>.rs, <dir>/<name>/mod.rs]`, where `<dir>` is the
-declaring file's module directory joined with [`Self::inline_path`].
+declaring file's module directory joined with `Self::inline_path`.
 
 ## `impl TestModuleDeclaration` › `fn render_guard(&self) -> String {`
 
@@ -1158,7 +1158,7 @@ containing `#[cfg(test)] mod policy;` derived a skip for
 measured, with a `git push` planted in it that the census then did not
 see. Over the whole tree the raw split derived 50 skip paths of which
 **34 named no file at all**, and a skip path naming no file is a skip
-that has stopped meaning anything, so [`whole_file_test_modules`] asserts
+that has stopped meaning anything, so `whole_file_test_modules` asserts
 that exactly one of the two candidates exists.
 
 ### Structure, not a literal `#[cfg(test)] mod name;`
@@ -1184,7 +1184,7 @@ So the scan walks each file's **module structure**: brace depth, the
 inline modules open at each point, and the `cfg` predicates on each of
 them. A declaration is test-only when the conjunction of its own
 predicate and every enclosing inline module's predicate is false
-wherever `test` is false — [`entails_test`].
+wherever `test` is false — `entails_test`.
 
 ### What it deliberately does not do
 
@@ -1192,7 +1192,7 @@ wherever `test` is false — [`entails_test`].
 whole-file test module and declares `mod policy;`, so Rust compiles
 `src/effects/tests/policy.rs` only under `cfg(test)` too — and this
 derivation does not say so. Every census in this crate reads
-[`super::production_code`], which removes `#[cfg(test)]` items from the
+`super::production_code`, which removes `#[cfg(test)]` items from the
 files it keeps, and those second-level files carry their own inline
 `cfg(test)` modules and their own `#![deny]` prologues for exactly that
 reason (`effects/tests/classification.rs` and its siblings say so at
@@ -1214,7 +1214,7 @@ than resolved: it is the one construct that can point a declaration
 outside its own directory, and there are none in this tree.
 
 **No `cfg_attr` that applies a `cfg`, and this one is a hole rather
-than a choice.** [`scan_module_declarations`] treats a `cfg_attr` as
+than a choice.** `scan_module_declarations` treats a `cfg_attr` as
 significant only when it contains `path`, so `#[cfg_attr(all(),
 cfg(test))] mod hidden_tests;` — which rustc applies as `#[cfg(test)]`
 and compiles only under test — is read here as an unconditional
@@ -1276,7 +1276,7 @@ Whether that predicate is false wherever `test` is false.
 Why a file's structure could not be read, and where.
 
 Every variant is a refusal rather than a guess. The direction is the one
-[`declared_whole_file_test_modules`] argues for: a scan that cannot tell
+`declared_whole_file_test_modules` argues for: a scan that cannot tell
 what a file declares must not answer, because both wrong answers are
 silent — a missing skip reports a fixture as an offender, and a spurious
 one removes a production file from every census below.
@@ -1323,7 +1323,7 @@ tree satisfies every one of them, so the only way to see one is to hand
 this a source that does not.
 
 Comments and string literals are blanked first —
-[`super::blank_comments_and_strings`], which also handles raw strings,
+`super::blank_comments_and_strings`, which also handles raw strings,
 byte strings and char literals — so a `mod` written in prose is spaces.
 The predicate text is read from the **raw** span at the same offsets,
 because blanking erases what is inside a string and `feature = "x"` would
@@ -1393,7 +1393,7 @@ Rust — became `mod = 1;`, a `mod` item with no name, and the
 whole file was refused; `use std::r#mod as tests;` inside a
 `#[cfg(test)]` module became `mod as;`, a test-only
 declaration the crate never wrote, whose skip names a file
-that does not exist. [`word`] is the token this scan reads
+that does not exist. `word` is the token this scan reads
 everywhere else, and the fallback reads it too now.
 
 ## `pub(crate) mod census_domain` › `struct MacroInvocation {`
@@ -1414,7 +1414,7 @@ The index of the matching closing delimiter.
 
 ## `pub(crate) mod census_domain` › `fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {`
 
-[`MacroInvocation`] beginning at `at`, or `None`.
+`MacroInvocation` beginning at `at`, or `None`.
 
 The shape is an identifier, `!`, an optional second identifier — that is
 `macro_rules! name { … }`, the one form that has one — and a delimited
@@ -1462,7 +1462,7 @@ is how a macro takes a keyword for a name.
 Where a module-shaped token sequence starts inside `from..to`, if any.
 
 "Module-shaped" is the word `mod`, a name, and a `;` or `{` — the same
-three tokens [`module_at`] reads, minus the visibility prefix, because
+three tokens `module_at` reads, minus the visibility prefix, because
 what matters here is only whether the body *could* expand to a module.
 
 ## `fn module_shaped_between(bytes: &[u8], from: usize, to: usize) -> Option<usize> {` › `let declared = word(bytes, name_at);`
@@ -1508,7 +1508,7 @@ Rust's keywords, strict and reserved.
 **A keyword cannot be a macro's path segment**, and that is the only
 structural thing separating `if !(…)` from `foo!(…)`: both are an
 identifier, a `!` and a delimited group. Written raw it can --
-`r#if!(…)` is a macro named `if` -- which is why [`Word`] carries that
+`r#if!(…)` is a macro named `if` -- which is why `Word` carries that
 bit rather than only the text.
 
 ## `pub(crate) mod census_domain` › `fn is_keyword(text: &[u8]) -> bool {`
@@ -1533,7 +1533,7 @@ The index of the body's `{`, or `None` for `mod name;`.
 
 ## `pub(crate) mod census_domain` › `fn module_at(bytes: &[u8], at: usize) -> Option<ModuleShape> {`
 
-[`ModuleShape`] at `at`, or `None` when this is not a `mod` item.
+`ModuleShape` at `at`, or `None` when this is not a `mod` item.
 
 `pub`, `pub(crate)`, `pub(super)` and `pub(in a::b)` are transparent:
 they are read and stepped over rather than treated as the start of some
@@ -1569,7 +1569,7 @@ A `cfg` predicate, reduced to the one question this module asks of it.
 every CI valuation, which platform compiles which body — and answers a
 different question with them. This decides one: is the predicate false
 wherever `test` is false. So every atom that is not `test` collapses to
-[`Predicate::Other`], and the grammar below is the whole of what the
+`Predicate::Other`, and the grammar below is the whole of what the
 derivation reads. A predicate it cannot parse is a refusal, not a guess.
 
 ## `pub(crate) enum Predicate` › `Test,`
@@ -1626,7 +1626,7 @@ false.
 
 ## `pub(crate) mod census_domain` › `pub(crate) fn parse_predicate(written: &str) -> Result<Predicate, String> {`
 
-`written` as a [`Predicate`], or why it cannot be read.
+`written` as a `Predicate`, or why it cannot be read.
 
 The grammar is `all(…)`, `any(…)`, `not(P)`, and an atom — a bare name
 or `name = "value"`. Anything else is refused: an unknown combinator, an
@@ -1647,7 +1647,7 @@ The **file-module-level lint state** reader, for the governance censuses.
 `#[cfg(test)]` and `pub(crate)`, and both halves are the point. This is a
 census instrument, not a product API: nothing the binary does consults it,
 and a `pub fn` here would have been a shipped surface added for a test to
-call. It sits at the BOTTOM beside [`census_domain`] for the same reason
+call. It sits at the BOTTOM beside `census_domain` for the same reason
 that module does — `production_region` cuts a file at its first
 `#[cfg(test)]` and
 `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
@@ -1673,7 +1673,7 @@ would report a governance state for a file that has none.
 
 ## `pub(crate) mod lint_levels` › `pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {`
 
-[`Resolution`] for `lint` over `source`'s file-module prologue.
+`Resolution` for `lint` over `source`'s file-module prologue.
 
 "File-module level" is the whole of the claim, and it is narrower than
 "somewhere in the file". A lint level is scoped by the module tree, so
@@ -1688,7 +1688,7 @@ answered by the wrong evidence.
 So the walk is: from the first byte, over whitespace and **inner**
 attributes only, stopping at the first token that is neither. That is
 exactly the region an `#![…]` may govern the file module from, and it is the
-same rule [`super::is_module_level`] applies to the inner half of its answer.
+same rule `super::is_module_level` applies to the inner half of its answer.
 
 ### Ordered, because rustc is ordered
 
@@ -1717,7 +1717,7 @@ what the compiler does.
 lint to rustc and reads as `None` here. The direction is the safe one — a
 census is told a module states nothing when it states something, which is
 loud — and the tree is measured rather than trusted:
-[`tests::the_three_blunt_governed_lints_are_used_by_nobody`] asserts that
+[`tests::the_three_blunt_governed_lints_are_used_by_nobody`](effects/tests.md) asserts that
 `clippy::all`, `clippy::style` and `warnings` are used by no file at all.
 
 Comments and string literals are blanked first, so a level quoted in a doc
@@ -1725,7 +1725,7 @@ comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
 this crate's effect fixtures are written as exactly those two shapes.
 
 `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
-[`super::normalize_lint`] is the bridge, as it is everywhere else here.
+`super::normalize_lint` is the bridge, as it is everywhere else here.
 
 ## `pub(crate) fn file_level_lint_resolution(source: &str, lint: &str) -> Resolution {` › `if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {`
 
@@ -1746,7 +1746,7 @@ than a level; anything else replaces what came before it.
 
 The level in force for `lint` at `source`'s file-module scope, or none.
 
-[`file_level_lint_resolution`] without the `E0453` bit, for the censuses
+`file_level_lint_resolution` without the `E0453` bit, for the censuses
 that ask only which level governs a module.
 
 ## `pub(crate) mod lint_levels` › `fn names_lint(entry: &str, lint: &str) -> bool {`
