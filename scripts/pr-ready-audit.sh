@@ -4,9 +4,12 @@
 #
 #   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
 #
-# NAME must not be a lane:* label. Before adding the ready label or enqueueing, the head is read
-# again and must still be the head the audit judged; otherwise the pull request is left unlabelled
-# (HEAD-MOVED) and a later run judges the new head.
+# NAME must not be a lane:* label. The ready label is advisory: it reports that this audit found
+# the head it read READY. A GitHub label is not bound to a commit, so the head is read again
+# before the label is written and again after, and a label written across a push is removed
+# (HEAD-MOVED); that narrows the race, it cannot close it. The act bound to the audited head is
+# the enqueue, through `gh pr merge --match-head-commit`; nothing may treat the label alone as
+# permission to merge.
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
@@ -334,9 +337,14 @@ PY
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
       deferred|accepted-risk)   # both leave the finding open, and an open finding has its file
-        # The file is the one whose `id:` frontmatter line is exactly this id (README: the id
-        # lives in the frontmatter, not the name); an id merely mentioned elsewhere is not a file.
-        nfiles="$(git grep -l -E "^id: *${id}\$" "$head" -- 'reviews/findings/*.md' 2>/dev/null | wc -l | tr -d ' ')"
+        # The file is the one with a frontmatter line that is exactly `id: <this id>` (README:
+        # the id lives in the frontmatter, not the name); an id merely mentioned elsewhere is not
+        # a file. The id is matched as a fixed string and a whole line, never as a pattern, and a
+        # miss is a blocker, not an exit: every command here tolerates "no match".
+        nfiles=0
+        for cand in $(git grep -l -F -e "id: $id" "$head" -- 'reviews/findings/*.md' 2>/dev/null | sed 's/^[^:]*://' || true); do
+          if git show "$head:$cand" 2>/dev/null | grep -qxF "id: $id"; then nfiles=$((nfiles + 1)); fi
+        done
         case "$nfiles" in
           1) ;;
           0) blockers+=("no-file:$id") ;;
@@ -376,8 +384,12 @@ PY
       [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$l" >/dev/null
     done
     [[ " $labels " != *" lane:$lane "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "lane:$lane" >/dev/null
-    # The ready label names a head: a push since the audit read $head means the verdict above is
-    # about a commit the pull request no longer has, so the label is withheld or removed.
+    # The ready label is a report of this audit at $head, not an authorisation: GitHub labels are
+    # not bound to a commit, so a push can always land between the audit and the label write.
+    # The head is read again before the write and again after it, and a label written across a
+    # move is removed; that narrows the window, it cannot close it. The act that is bound to the
+    # audited head is the enqueue, through --match-head-commit, and nothing may treat the label
+    # alone as permission to merge.
     if [[ "$state" == READY ]]; then
       now="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
       if [[ "$now" != "$head" ]]; then
@@ -387,6 +399,14 @@ PY
     fi
     if [[ "$state" == READY && "$draft" != "true" ]]; then
       [[ " $labels " != *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
+      after="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
+      if [[ "$after" != "$head" ]]; then
+        gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
+        echo "      head moved to ${after:0:7} while labelling ${head:0:7}: label removed, not enqueued"
+        state=HEAD-MOVED
+      fi
+    fi
+    if [[ "$state" == READY && "$draft" != "true" ]]; then
       if ((enqueue)); then
         # --match-head-commit binds the enqueue to the head this audit judged: a push that
         # lands between the audit and this call makes GitHub refuse, never enqueue the newcomer.

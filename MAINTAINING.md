@@ -200,9 +200,11 @@ contract, and changing it is a change to this file first.
 Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-ready-audit.sh`,
 which decides a pull request's lane from its branch prefix alone (`codex/findings-p3-*`,
 `codex/findings-*`, everything else), counts only the owner's review comments, keeps the `lane:*`
-and `ready-to-merge` labels current (a label is its output, never its input), and
-with `--enqueue` adds each ready pull request to the queue in the order its arguments give, so
-the caller states the priority. The
+and `ready-to-merge` labels current (a label is its output, never its input, and
+`ready-to-merge` is advisory: it reports the audit's verdict on the head it read, while the act
+bound to that head is the enqueue itself, which names the commit), and with `--enqueue` adds
+each ready pull request to the queue in the order its arguments give, so the caller states the
+priority. The
 P3 findings lane is ready only on a `PASS`; the P1/P2 findings lane fixes P0–P2 and files P3;
 feature and sweep work fixes P0–P1 and files P2 and P3, one file per finding under
 `reviews/findings/` with a `deferred` ledger row. A witnessed defect or a `MUST` deviation is
