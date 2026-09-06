@@ -25,6 +25,8 @@ use crate::topology::registry::{FrozenReviews, FrozenRung, FrozenTaskSpec, Linea
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
 #[cfg(test)]
+mod predicates;
+#[cfg(test)]
 mod questions;
 
 const RUN_ID: &str = "01FOLD0000000000000000000A";
