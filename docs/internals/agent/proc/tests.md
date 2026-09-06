@@ -317,16 +317,18 @@ finding names cannot be staged on demand, because it needs XNU to reuse
 a freed pid for an unrelated live group leader. So the records are built
 in the test and handed to `GroupObservation::leads_own_group`, which is
 the call site the grid and the oracle both use. This process's own
-`SZOMB` record naming its own pid must read `true`, and six records must
-read `false`: a live (`SRUN`) record for a pid that is not this
+`SZOMB` record naming its own pid must read `true`, and seven records
+must read `false`: a live (`SRUN`) record for a pid that is not this
 process's child, a zombie of some other parent, a record naming another
-group, no record at all, a running child, and a pid this process never
-had. A `getpgid` failure other than `ESRCH` reads `false` beside a
+group, no record at all, a running child, this process's own unreaped
+child beside a record that is not a zombie's, and a pid this process
+never had. A `getpgid` failure other than `ESRCH` reads `false` beside a
 perfect record.
 
 MEASURED, because a test that cannot fail proves nothing. At `51ef2c3`
-— this body without the repair — `test (macos-latest)` (run 34014712713,
-job 101436393531, `macos-latest`) failed it on the first of the six:
+— this body without the repair, and before the review added the seventh
+rejected record — `test (macos-latest)` (run 34014712713, job
+101436393531, `macos-latest`) failed it on the first record it rejects:
 "a live process holding the pid, which `proc_pidinfo` reaches through
 `proc_find` before it ever consults the zombie list answered for its own
 group: pid 424242: before the look waitid failed: No child processes (os
@@ -334,9 +336,19 @@ error 10); getpgid failed: No such process (os error 3);
 proc_pidinfo(PROC_PIDT_SHORTBSDINFO, zombie) answered pgid 424242 status
 2; after the look waitid failed: No child processes (os error 10)" —
 status 2 is `SRUN`. On that same job
-`a_reaped_childs_pid_never_answers_for_its_own_group` passed, and
-`test (ubuntu-latest)` and `test (winguest)` compile neither test of the
-pair and passed.
+`a_reaped_childs_pid_never_answers_for_its_own_group` passed.
+`test (ubuntu-latest)` compiles and ran that control, which is
+`#[cfg(unix)]`, and passed; this test is `#[cfg(target_os = "macos")]`
+and no leg but macOS compiles it. `test (winguest)` compiles neither.
+
+The seven rejected records exercise each condition on its own. Six fail
+on `exited_before`, on having no record to read, or on the group the
+record names, so `pbsi_status` never decides them; the seventh pairs
+`Ok(true)` with its own pid and an `SRUN` record, and the `SZOMB`
+comparison is the only thing that rejects it. Drop any one of the three
+conditions and one of the seven reads `true`: without `exited_before`
+the other parent's zombie does, without `SZOMB` the seventh does, and
+without the group comparison the record naming another group does.
 
 ## `fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {`
 

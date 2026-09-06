@@ -613,6 +613,11 @@ fn only_this_processs_own_zombie_answers_for_its_group_after_an_esrch() {
             after_esrch(Ok(false), own_group(libc::SRUN)),
         ),
         (
+            "this process's own unreaped child beside a record that is not a \
+             zombie's, so the two conditions bind independently",
+            after_esrch(Ok(true), own_group(libc::SRUN)),
+        ),
+        (
             "a pid this process never had as a child, with no record",
             after_esrch(Err(libc::ECHILD), Err(libc::ESRCH)),
         ),
