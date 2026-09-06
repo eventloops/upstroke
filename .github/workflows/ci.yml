@@ -15,6 +15,7 @@ on:
   # Repository rules). The concurrency key below is `github.ref` for this
   # event, one queue branch per entry, so entries never cancel each other.
   merge_group:
+    types: [checks_requested]
     branches: [master, codex/parallelism-design]
 
 permissions:

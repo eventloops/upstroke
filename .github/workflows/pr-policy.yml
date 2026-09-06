@@ -19,6 +19,7 @@ on:
   # has between the last pull-request run and the merge. The ruleset requires
   # this context on the entry too.
   merge_group:
+    types: [checks_requested]
     branches: [master, codex/parallelism-design]
 
 permissions:

@@ -22,7 +22,8 @@
 #       decided (decisions/2026-08-21-stacked-slice-prs.md) plus the merge
 #       queue: ci.yml triggers on push, pull_request and merge_group,
 #       pr-policy.yml on pull_request and merge_group, each with the branch
-#       list [master, codex/parallelism-design] and nothing else. The two
+#       list [master, codex/parallelism-design] and nothing else, and
+#       merge_group with the activity type [checks_requested] only. The two
 #       attestation workflows that record once pinned were retired with the App
 #       check (decisions/2026-08-23-retire-app-attestation.md); there is no
 #       privileged workflow left to pin.
@@ -94,6 +95,10 @@ events() {
 # `branches:` is printed, so two filters -- or none -- fail the exact comparison.
 branches_line() {
   block "$1" "$2" | grep -E '^\s*branches:' | sed -E 's/^\s+//; s/\s+$//' || true
+}
+# types_line <file> <event>: the activity-type filter under one event, same terms as above.
+types_line() {
+  block "$1" "$2" | grep -E '^\s*types:' | sed -E 's/^\s+//; s/\s+$//' || true
 }
 
 # --- C1. the documents exist; every path they name resolves, per occurrence --
@@ -202,22 +207,34 @@ pin_branches() {  # pin_branches <file> <event> <expected branches line>
   [[ "$got" == "$want" ]] \
     || error "$f: $event must carry exactly '$want', got: ${got:-<none>}"
 }
+pin_types() {  # pin_types <file> <event> <expected types line>
+  local f="$1" event="$2" want="$3" got
+  got="$(types_line "$f" "$event")"
+  [[ "$got" == "$want" ]] \
+    || error "$f: $event must carry exactly '$want', got: ${got:-<none>}"
+}
 for f in .github/workflows/ci.yml .github/workflows/pr-policy.yml; do
   [[ -f "$f" ]] || error "$f is missing"
 done
 # merge_group is pinned on both workflows and on the same branch list: an entry
 # the queue builds for either base must receive both required contexts, or it
-# sits in the queue until it times out (MAINTAINING.md, Repository rules).
+# sits in the queue until it times out (MAINTAINING.md, Repository rules). Its
+# activity type is pinned to checks_requested: an unpinned merge_group
+# subscribes to every activity type GitHub adds later, and both contexts would
+# start running on them.
+merge_group_types='types: [checks_requested]'
 if [[ -f .github/workflows/ci.yml ]]; then
   pin_events .github/workflows/ci.yml "merge_group pull_request push"
   pin_branches .github/workflows/ci.yml push "$slice_list"
   pin_branches .github/workflows/ci.yml pull_request "$slice_list"
   pin_branches .github/workflows/ci.yml merge_group "$slice_list"
+  pin_types .github/workflows/ci.yml merge_group "$merge_group_types"
 fi
 if [[ -f .github/workflows/pr-policy.yml ]]; then
   pin_events .github/workflows/pr-policy.yml "merge_group pull_request"
   pin_branches .github/workflows/pr-policy.yml pull_request "$slice_list"
   pin_branches .github/workflows/pr-policy.yml merge_group "$slice_list"
+  pin_types .github/workflows/pr-policy.yml merge_group "$merge_group_types"
 fi
 
 if (( failed )); then

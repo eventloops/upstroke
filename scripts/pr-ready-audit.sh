@@ -4,6 +4,10 @@
 #
 #   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
 #
+# NAME must not be a lane:* label. Before adding the ready label or enqueueing, the head is read
+# again and must still be the head the audit judged; otherwise the pull request is left unlabelled
+# (HEAD-MOVED) and a later run judges the new head.
+#
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
 # so the caller states the priority; with no arguments it walks `gh pr list` order, newest first,
@@ -29,8 +33,8 @@
 #     across both)
 #   - no finding in that review has a severity the lane must fix
 #   - every allowed finding has a ledger row in the body whose disposition is deferred or
-#     accepted-risk (each with a file under reviews/findings/ on the branch naming the finding
-#     id, since both leave it open) or rejected
+#     accepted-risk (each with exactly one file under reviews/findings/ on the branch whose
+#     `id:` frontmatter is the finding id, since both leave it open) or rejected
 #
 # Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than clean merges
 # and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
@@ -65,7 +69,9 @@ while (($#)); do
   case "$1" in
     --apply) apply=1 ;;
     --enqueue) apply=1; enqueue=1 ;;
-    --ready-label) ready_label="$2"; shift ;;
+    --ready-label)
+      ready_label="$2"; shift
+      [[ "$ready_label" == lane:* ]] && { echo "refusing: --ready-label must not be a lane:* label" >&2; exit 2; } ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) prs+=("$1") ;;
   esac
@@ -328,9 +334,14 @@ PY
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
       deferred|accepted-risk)   # both leave the finding open, and an open finding has its file
-        if ! git grep -q -F "$id" "$head" -- reviews/findings 2>/dev/null; then
-          blockers+=("no-file:$id")
-        fi ;;
+        # The file is the one whose `id:` frontmatter line is exactly this id (README: the id
+        # lives in the frontmatter, not the name); an id merely mentioned elsewhere is not a file.
+        nfiles="$(git grep -l -E "^id: *${id}\$" "$head" -- 'reviews/findings/*.md' 2>/dev/null | wc -l | tr -d ' ')"
+        case "$nfiles" in
+          1) ;;
+          0) blockers+=("no-file:$id") ;;
+          *) blockers+=("duplicate-file:$id") ;;
+        esac ;;
       rejected) ;;
       fixed)
         [[ "$moved" == repairs || "$moved" == merge-edits:* ]] || blockers+=("fixed-but-head-unmoved:$id") ;;
@@ -365,6 +376,15 @@ PY
       [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$l" >/dev/null
     done
     [[ " $labels " != *" lane:$lane "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "lane:$lane" >/dev/null
+    # The ready label names a head: a push since the audit read $head means the verdict above is
+    # about a commit the pull request no longer has, so the label is withheld or removed.
+    if [[ "$state" == READY ]]; then
+      now="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
+      if [[ "$now" != "$head" ]]; then
+        echo "      head moved to ${now:0:7} since the audit read ${head:0:7}: not labelled, not enqueued"
+        state=HEAD-MOVED
+      fi
+    fi
     if [[ "$state" == READY && "$draft" != "true" ]]; then
       [[ " $labels " != *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
       if ((enqueue)); then
