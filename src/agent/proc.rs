@@ -177,8 +177,7 @@ fn run_with_timeout_and_limit(
         #[cfg(unix)]
         if let Err(error) = termination.register(child.id()) {
             drop(termination);
-            kill_tree(terminate_site, &mut child)?;
-            return Err(error);
+            return Err(error.with_cleanup(kill_tree(terminate_site, &mut child)));
         }
         #[cfg(unix)]
         apply(
@@ -214,14 +213,14 @@ fn run_with_timeout_and_limit(
             Err(error) => {
                 #[cfg(unix)]
                 {
-                    let cleanup = termination.finish();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    cleanup?;
+                    return Err(settle_failed_supervision(
+                        error,
+                        termination.finish(),
+                        &mut child,
+                    ));
                 }
                 #[cfg(not(unix))]
-                kill_tree(terminate_site, &mut child)?;
-                return Err(error);
+                return Err(error.with_cleanup(kill_tree(terminate_site, &mut child)));
             }
         };
 
@@ -232,9 +231,7 @@ fn run_with_timeout_and_limit(
             match child_exited_unreaped(&child) {
                 Ok(true) => {
                     if let Err(error) = termination.finish() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error);
+                        return Err(settle_failed_supervision(error, Ok(()), &mut child));
                     }
                     let status = child.wait().map_err(|e| UpstrokeError::Agent {
                         message: format!("reaping agent process: {e}"),
@@ -245,9 +242,7 @@ fn run_with_timeout_and_limit(
                     if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
                         output_limited = true;
                         if let Err(error) = termination.finish() {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(error);
+                            return Err(settle_failed_supervision(error, Ok(()), &mut child));
                         }
                         let _ = child.kill();
                         let _ = child.wait();
@@ -255,9 +250,7 @@ fn run_with_timeout_and_limit(
                     } else if started.elapsed() >= timeout {
                         timed_out = true;
                         if let Err(error) = termination.finish() {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(error);
+                            return Err(settle_failed_supervision(error, Ok(()), &mut child));
                         }
                         let _ = child.kill();
                         let _ = child.wait();
@@ -266,13 +259,14 @@ fn run_with_timeout_and_limit(
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
-                    let cleanup = termination.finish();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    cleanup?;
-                    return Err(UpstrokeError::Agent {
+                    let primary = UpstrokeError::Agent {
                         message: format!("waiting on agent process: {e}"),
-                    });
+                    };
+                    return Err(settle_failed_supervision(
+                        primary,
+                        termination.finish(),
+                        &mut child,
+                    ));
                 }
             }
         };
@@ -296,10 +290,10 @@ fn run_with_timeout_and_limit(
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
-                    kill_tree(terminate_site, &mut child)?;
-                    return Err(UpstrokeError::Agent {
+                    let primary = UpstrokeError::Agent {
                         message: format!("waiting on agent process: {e}"),
-                    });
+                    };
+                    return Err(primary.with_cleanup(kill_tree(terminate_site, &mut child)));
                 }
             }
         };
@@ -354,12 +348,47 @@ fn finish_pipe_reports<T>(
     if additional.is_empty() {
         return outcome;
     }
-    let additional = additional.join("; ");
-    let message = match outcome {
-        Ok(_) => format!("pipe supervision failed during cleanup: {additional}"),
-        Err(primary) => format!("{primary}; additional pipe cleanup failure: {additional}"),
+    let primary = match outcome {
+        Ok(_) => UpstrokeError::Agent {
+            message: "pipe supervision failed during cleanup".to_owned(),
+        },
+        Err(primary) => primary,
     };
-    Err(UpstrokeError::Agent { message })
+    Err(additional.into_iter().fold(primary, |primary, message| {
+        primary.with_cleanup(Err(UpstrokeError::Agent { message }))
+    }))
+}
+
+#[cfg(unix)]
+fn settle_failed_supervision(
+    primary: UpstrokeError,
+    cleanup: Result<(), UpstrokeError>,
+    child: &mut ProcessTree,
+) -> UpstrokeError {
+    let primary = primary.with_cleanup(cleanup);
+    let kill = child.kill();
+    let wait = child.wait().map(|_| ());
+    finish_failed_supervision_cleanup(primary, kill, wait)
+}
+
+#[cfg(unix)]
+fn finish_failed_supervision_cleanup(
+    primary: UpstrokeError,
+    kill: std::io::Result<()>,
+    wait: std::io::Result<()>,
+) -> UpstrokeError {
+    // A successful wait proves the child was reaped, including the race where
+    // it exited before kill. A failed wait cannot justify suppressing kill.
+    match wait {
+        Ok(_) => primary,
+        Err(source) => primary
+            .with_cleanup(kill.map_err(|source| UpstrokeError::Agent {
+                message: format!("killing agent after supervision failure: {source}"),
+            }))
+            .with_cleanup(Err(UpstrokeError::Agent {
+                message: format!("reaping agent after supervision failure: {source}"),
+            })),
+    }
 }
 
 mod drain;

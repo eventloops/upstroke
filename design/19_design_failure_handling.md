@@ -16,3 +16,8 @@
 | Budget or pool budget exceeded | ledger | stop scheduling; run ends `BudgetExceeded` |
 | Merge conflict or code-attributed stale integration rejection (v0.2) | merge queue | publish nothing; atomically append rejection plus its replayable frozen Fix task, respecting hard pins/ceilings and the lineage-wide `max_merge_repairs`; infrastructure keeps its ordinary policy |
 | Engine crash / power loss | — | `upstroke resume` replays the event log |
+
+Pipe setup failures identify the affected stream and native operation. If
+supervision fails and cleanup also fails, the original typed failure remains
+primary and the additional cleanup failures are reported alongside it. A
+successful cleanup does not change the original error category.

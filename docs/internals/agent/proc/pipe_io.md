@@ -33,7 +33,7 @@ The parent's three endpoints, transferred directly to their workers.
 
 Configuration retained until a successfully spawned child is registered.
 
-## `pub(super) fn configure(command: &mut Command) -> io::Result<Self> {`
+## `pub(super) fn configure(command: &mut Command) -> Result<Self, SetupError> {`
 
 Configure all three streams. Drop Command after spawn, then call take.
 
@@ -45,7 +45,7 @@ Native pipe creation or mode-setting failed. Partial pairs close here.
 All pairs exist before Command changes. Each opposite endpoint
 moves into Stdio; no extra writer/reader copy is retained here.
 
-## `pub(super) fn take(self, child: &mut Child) -> io::Result<Endpoints> {`
+## `pub(super) fn take(self, child: &mut Child) -> Result<Endpoints, SetupError> {`
 
 Transfer parent endpoints after successful spawn and Command drop.
 
@@ -73,3 +73,15 @@ feeder. The live peer never consumes these bytes.
 
 Only this test owns and waits for this child. A refused poll or
 deadline always reaches kill plus wait before any assertion fails.
+
+## Setup errors
+
+`SetupError` distinguishes a missing configured stream from a native setup
+failure. Native failures retain the stream, the operation and the original
+I/O source. The Unix operations name F_GETFL and F_SETFL; Windows names
+CreatePipe and SetNamedPipeHandleState. Callers receive this context before
+adding the process-supervision context.
+
+The polling traits retain the standard I/O result contract because their
+worker callers classify WouldBlock, Interrupted and BrokenPipe directly and
+add the known stream when publishing a terminal failure.

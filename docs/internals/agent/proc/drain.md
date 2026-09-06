@@ -228,10 +228,10 @@ without waiting for an escaped descendant to act on the pipe.
 
 ## `collect_with_wait` › `let (bytes, verdict) = {`
 
-A reader that has let go leaves the capture owned here, and it is
-moved out; one still running keeps its handle, and the supervisor
-takes a copy of what has arrived and the verdict, if any, that came
-with it.
+Collection releases and joins the reader before locking the capture.
+The joined worker can no longer append bytes or publish a verdict.
+The supervisor moves the captured bytes with `mem::take`; it does not
+copy a running reader's buffer. Release before EOF remains a partial capture.
 
 ## `fn publish_panic(capture: &Mutex<Capture>, stream: Stream) {`
 

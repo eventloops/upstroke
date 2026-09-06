@@ -8,6 +8,7 @@
 
 use std::io;
 use std::process::{Child, Command, Stdio};
+use thiserror::Error;
 
 pub(super) trait PollRead: Send + 'static {
     fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize>;
@@ -15,6 +16,30 @@ pub(super) trait PollRead: Send + 'static {
 
 pub(super) trait PollWrite: Send + 'static {
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+}
+
+#[derive(Debug, Error)]
+pub(super) enum SetupError {
+    #[cfg(unix)]
+    #[error("configured child {stream} pipe is absent")]
+    Missing { stream: &'static str },
+    #[error("{operation} for agent {stream} pipe: {source}")]
+    Native {
+        stream: &'static str,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl SetupError {
+    fn native(stream: &'static str, operation: &'static str) -> Self {
+        Self::Native {
+            stream,
+            operation,
+            source: io::Error::last_os_error(),
+        }
+    }
 }
 
 pub(super) struct Endpoints {
@@ -38,7 +63,7 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
-    pub(super) fn configure(command: &mut Command) -> io::Result<Self> {
+    pub(super) fn configure(command: &mut Command) -> Result<Self, SetupError> {
         #[cfg(unix)]
         {
             command
@@ -49,9 +74,9 @@ impl Prepared {
         }
         #[cfg(windows)]
         {
-            let (stdin, child_stdin) = windows::pair(false)?;
-            let (stdout, child_stdout) = windows::pair(true)?;
-            let (stderr, child_stderr) = windows::pair(true)?;
+            let (stdin, child_stdin) = windows::pair("stdin", false)?;
+            let (stdout, child_stdout) = windows::pair("stdout", true)?;
+            let (stderr, child_stderr) = windows::pair("stderr", true)?;
             command
                 .stdin(Stdio::from(child_stdin))
                 .stdout(Stdio::from(child_stdout))
@@ -66,16 +91,25 @@ impl Prepared {
         }
     }
 
-    pub(super) fn take(self, child: &mut Child) -> io::Result<Endpoints> {
+    pub(super) fn take(self, child: &mut Child) -> Result<Endpoints, SetupError> {
         #[cfg(unix)]
         {
-            let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
-            let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
-            let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or(SetupError::Missing { stream: "stdin" })?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or(SetupError::Missing { stream: "stdout" })?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or(SetupError::Missing { stream: "stderr" })?;
             Ok(Endpoints {
-                stdin: Writer(unix::nonblocking(stdin)?),
-                stdout: Reader(unix::nonblocking(stdout)?),
-                stderr: Reader(unix::nonblocking(stderr)?),
+                stdin: Writer(unix::nonblocking("stdin", stdin)?),
+                stdout: Reader(unix::nonblocking("stdout", stdout)?),
+                stderr: Reader(unix::nonblocking("stderr", stderr)?),
             })
         }
         #[cfg(windows)]
@@ -87,32 +121,33 @@ impl Prepared {
 }
 
 #[cfg(unix)]
-fn missing(stream: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("configured child {stream} pipe is absent"),
-    )
-}
-
-#[cfg(unix)]
 mod unix {
-    use super::{PollRead, PollWrite, Reader, Writer};
+    use super::{PollRead, PollWrite, Reader, SetupError, Writer};
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
 
-    pub(super) fn nonblocking(pipe: impl Into<OwnedFd>) -> io::Result<File> {
+    pub(super) fn nonblocking(
+        stream: &'static str,
+        pipe: impl Into<OwnedFd>,
+    ) -> Result<File, SetupError> {
         let file = File::from(pipe.into());
         // SAFETY: file owns this valid descriptor throughout both calls.
         // F_GETFL takes no third argument and does not transfer ownership.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         if flags < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(SetupError::native(
+                stream,
+                "reading status flags with F_GETFL",
+            ));
         }
         // SAFETY: F_SETFL takes the integer status flags. Preserve every
         // existing flag and add nonblocking mode only on this parent endpoint.
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(SetupError::native(
+                stream,
+                "setting nonblocking mode with F_SETFL",
+            ));
         }
         Ok(file)
     }
@@ -132,7 +167,7 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-    use super::{PollRead, PollWrite, Reader, Writer};
+    use super::{PollRead, PollWrite, Reader, SetupError, Writer};
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr;
@@ -140,13 +175,19 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{CreatePipe, PIPE_NOWAIT, SetNamedPipeHandleState};
 
-    pub(super) fn pair(parent_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    pub(super) fn pair(
+        stream: &'static str,
+        parent_reads: bool,
+    ) -> Result<(OwnedHandle, OwnedHandle), SetupError> {
         let mut reader = ptr::null_mut();
         let mut writer = ptr::null_mut();
         // SAFETY: the output slots are writable HANDLE storage. Null security
         // attributes make both newly created handles noninheritable here.
         if unsafe { CreatePipe(&mut reader, &mut writer, ptr::null(), 64 * 1024) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(SetupError::native(
+                stream,
+                "creating endpoints with CreatePipe",
+            ));
         }
         // SAFETY: successful CreatePipe returned distinct owned valid handles.
         // Each enters one OwnedHandle and is closed on every subsequent error.
@@ -165,7 +206,10 @@ mod windows {
             SetNamedPipeHandleState(parent.as_raw_handle(), &mode, ptr::null(), ptr::null())
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(SetupError::native(
+                stream,
+                "setting nonblocking mode with SetNamedPipeHandleState",
+            ));
         }
         Ok((parent, child))
     }
@@ -259,6 +303,22 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn native_setup_diagnostics_keep_the_stream_operation_and_io_cause() {
+        let error = SetupError::Native {
+            stream: "stderr",
+            operation: "setting nonblocking mode",
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "mode refused"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "setting nonblocking mode for agent stderr pipe: mode refused"
+        );
+        let cause = std::error::Error::source(&error).expect("native cause retained");
+        let cause = cause.downcast_ref::<io::Error>().expect("typed I/O cause");
+        assert_eq!(cause.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[cfg(unix)]
     fn pair(parent_reads: bool) -> (ReaderOrWriter, std::os::fd::OwnedFd) {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -273,12 +333,16 @@ mod tests {
         let write = unsafe { OwnedFd::from_raw_fd(write) };
         if parent_reads {
             (
-                ReaderOrWriter::Read(Reader(unix::nonblocking(read).expect("read mode"))),
+                ReaderOrWriter::Read(Reader(
+                    unix::nonblocking("stdout", read).expect("read mode"),
+                )),
                 write,
             )
         } else {
             (
-                ReaderOrWriter::Write(Writer(unix::nonblocking(write).expect("write mode"))),
+                ReaderOrWriter::Write(Writer(
+                    unix::nonblocking("stdin", write).expect("write mode"),
+                )),
                 read,
             )
         }
@@ -286,7 +350,8 @@ mod tests {
 
     #[cfg(windows)]
     fn pair(parent_reads: bool) -> (ReaderOrWriter, std::os::windows::io::OwnedHandle) {
-        let (parent, peer) = windows::pair(parent_reads).expect("native pipe and parent mode");
+        let (parent, peer) =
+            windows::pair("test stream", parent_reads).expect("native pipe and parent mode");
         let endpoint = if parent_reads {
             ReaderOrWriter::Read(Reader(parent))
         } else {

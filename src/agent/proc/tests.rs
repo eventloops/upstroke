@@ -3370,3 +3370,63 @@ fn staging_names(dir: &Path) -> Vec<String> {
         .filter(|name| name.ends_with(".publishing"))
         .collect()
 }
+
+#[test]
+fn pipe_cleanup_reports_preserve_the_primary_without_duplicate_prefixes() {
+    let input = worker::FailureReport::default();
+    input.record("writing stdin: write refused");
+    let output = worker::FailureReport::default();
+    output.record("reading stdout: read refused");
+    let error = finish_pipe_reports::<()>(
+        Err(UpstrokeError::Agent {
+            message: "starting stderr worker: thread refused".to_owned(),
+        }),
+        [Some(input), Some(output), None],
+    )
+    .expect_err("startup and both worker failures survive");
+    assert_eq!(
+        error.to_string(),
+        "agent error: starting stderr worker: thread refused; additional cleanup failure: agent error: writing stdin: write refused; additional cleanup failure: agent error: reading stdout: read refused"
+    );
+    let UpstrokeError::WithCleanup(bundle) = error else {
+        panic!("typed cleanup bundle")
+    };
+    assert!(
+        matches!(bundle.primary.as_ref(), UpstrokeError::Agent { message } if message == "starting stderr worker: thread refused")
+    );
+    assert_eq!(bundle.additional.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_failure_survives_reaper_kill_and_wait_failures() {
+    let primary = UpstrokeError::Agent {
+        message: "starting stdout worker: thread refused".to_owned(),
+    }
+    .with_cleanup(Err(UpstrokeError::Agent {
+        message: "reaper refused".to_owned(),
+    }));
+    let error = finish_failed_supervision_cleanup(
+        primary,
+        Err(std::io::Error::other("kill refused")),
+        Err(std::io::Error::other("wait refused")),
+    );
+    assert_eq!(
+        error.to_string(),
+        "agent error: starting stdout worker: thread refused; additional cleanup failure: agent error: reaper refused; additional cleanup failure: agent error: killing agent after supervision failure: kill refused; additional cleanup failure: agent error: reaping agent after supervision failure: wait refused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reaped_child_makes_the_racing_kill_error_irrelevant() {
+    let primary = UpstrokeError::Agent {
+        message: "startup refused".to_owned(),
+    };
+    let error = finish_failed_supervision_cleanup(
+        primary,
+        Err(std::io::Error::other("already exited")),
+        Ok(()),
+    );
+    assert!(matches!(error, UpstrokeError::Agent { message } if message == "startup refused"));
+}

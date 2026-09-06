@@ -2047,3 +2047,12 @@ installs SIG_DFL for SIGCHLD and has no other waiter or child.
 
 The outer test makes the reaper exit without READY. This
 forces startup refusal regardless of process scheduling.
+
+## Pipe startup failure reporting
+
+A failed pipe or worker startup retains its original error while settling the
+registered process. Reaper, kill and wait failures accompany that primary
+failure. A successful wait proves the direct child was reaped and makes a
+racing kill refusal irrelevant. If wait fails, both kill and wait errors are
+reported. Deferred worker reports append through `WithCleanup`, preserving
+the primary type and avoiding a second agent-error prefix around it.

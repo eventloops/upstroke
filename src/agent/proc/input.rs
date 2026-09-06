@@ -553,8 +553,9 @@ mod tests {
         )
         .expect_err("both failures remain observable")
         .to_string();
-        assert!(
-            error.contains("primary supervision failure") && error.contains("finite stdin failure")
+        assert_eq!(
+            error,
+            "agent error: primary supervision failure; additional cleanup failure: agent error: writing stdin: finite stdin failure"
         );
     }
 }
