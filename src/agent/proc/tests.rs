@@ -350,6 +350,56 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
 }
 
 #[cfg(unix)]
+struct ReapedChild {
+    pid: u32,
+    child: Option<Child>,
+}
+
+#[cfg(unix)]
+impl ReapedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            pid: child.id(),
+            child: Some(child),
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn close_stdin(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            drop(child.stdin.take());
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => {
+                let status = child.wait()?;
+                self.child = None;
+                Ok(status)
+            }
+            None => Err(std::io::Error::other(format!(
+                "pid {} has already been reaped",
+                self.pid
+            ))),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
     let mut supervisor =
@@ -361,10 +411,12 @@ fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     supervisor.prepare(&mut command);
-    let mut child = command
-        .spawn()
-        .expect("spawn a child that holds until its stdin closes");
-    let pid = child.id();
+    let mut child = ReapedChild::new(
+        command
+            .spawn()
+            .expect("spawn a child that holds until its stdin closes"),
+    );
+    let pid = child.pid();
     supervisor
         .register(pid)
         .expect("register the child's group with the supervisor");
@@ -380,10 +432,8 @@ fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
         "the pre-exec closure did not run at all, so this witnesses nothing: {alive}"
     );
 
-    drop(child.stdin.take());
+    child.close_stdin();
     if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-        let _ = child.kill();
-        let _ = child.wait();
         panic!("{reason}");
     }
 
@@ -417,10 +467,12 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .expect("spawn a child that stays in this process's group");
-    let pid = child.id();
+    let mut child = ReapedChild::new(
+        command
+            .spawn()
+            .expect("spawn a child that stays in this process's group"),
+    );
+    let pid = child.pid();
 
     let alive = observe_child_group(pid);
     assert_eq!(
@@ -433,10 +485,8 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
         "a running child nothing moved answered for its own group: {alive}"
     );
 
-    drop(child.stdin.take());
+    child.close_stdin();
     if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-        let _ = child.kill();
-        let _ = child.wait();
         panic!("{reason}");
     }
 
@@ -453,6 +503,55 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
 
     let status = child.wait().expect("reap the control child");
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {
+    let mut command = shell("read line; exit 0");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = ReapedChild::new(
+        command
+            .spawn()
+            .expect("spawn a child that holds until its stdin closes"),
+    );
+    let pid = child.pid();
+
+    child.close_stdin();
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        panic!("{reason}");
+    }
+    let exited = observe_child_group(pid);
+    assert!(
+        exited.had_exited_before_the_look(),
+        "the premise: the child is an exited, unreaped zombie when it is looked at: {exited}"
+    );
+
+    const DELIBERATE: &str = "the premise assertion the scheduling case makes fail";
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owned_across_the_unwind = child;
+        panic!("{DELIBERATE}");
+    }));
+    let payload = unwound.expect_err("the body must have left through a panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied());
+    assert_eq!(
+        message,
+        Some(DELIBERATE),
+        "the body left through some other panic, so the reap this observes is not the one claimed"
+    );
+
+    let after = observe_child_group(pid);
+    assert_eq!(
+        after.exited_before,
+        Err(libc::ECHILD),
+        "the child outlived the body that owned it as an unreaped zombie: {after}"
+    );
 }
 
 #[test]
