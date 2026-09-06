@@ -1457,11 +1457,25 @@ mod tests {
         let Some(body) = text.strip_suffix(',') else {
             return false;
         };
-        let identifier = match body.find('(') {
-            Some(open) if body.ends_with(')') => body.get(..open).unwrap_or_default(),
-            Some(_) => return false,
+        let identifier = match body.find(['(', '{', '=']) {
+            Some(cut) if body.as_bytes()[cut] == b'(' => {
+                if body.ends_with(')') {
+                    body.get(..cut).unwrap_or_default()
+                } else {
+                    return false;
+                }
+            }
+            Some(cut) if body.as_bytes()[cut] == b'{' => {
+                if body.ends_with('}') {
+                    body.get(..cut).unwrap_or_default()
+                } else {
+                    return false;
+                }
+            }
+            Some(cut) => body.get(..cut).unwrap_or_default(),
             None => body,
-        };
+        }
+        .trim();
         let mut characters = identifier.chars();
         matches!(characters.next(), Some(first) if first.is_ascii_uppercase())
             && characters.all(|c| c.is_ascii_alphanumeric())
@@ -1479,6 +1493,8 @@ pub enum Real {
     One,
     // Two,
     Three(Payload),
+    Timeout = 2,
+    Struct { field: Payload },
 }
 ";
         assert_eq!(
@@ -1488,19 +1504,53 @@ pub enum Real {
         );
         assert_eq!(
             declared_variants(fixture),
-            vec![("Real".to_owned(), 2)],
-            "a commented-out or quoted variant was counted, or a real one was not"
+            vec![("Real".to_owned(), 4)],
+            "a commented-out or quoted variant was counted, or a real one was not \
+             (an explicit discriminant or a struct-bodied variant lost)"
         );
 
         // The injected violation: one variant added to the enum and to nothing
         // else has to move the count.
         let widened = fixture.replace("    Three(Payload),", "    Three(Payload),\n    Four,");
-        assert_eq!(declared_variants(&widened), vec![("Real".to_owned(), 3)]);
+        assert_eq!(declared_variants(&widened), vec![("Real".to_owned(), 5)]);
 
         // And the blanker survives the two literal shapes that make a naive
         // scanner lose its place.
         let tricky = "let comma = ',';\nlet quote = '\\'';\npub enum After {\n    One,\n}\n";
         assert_eq!(declared_variants(tricky), vec![("After".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn a_discriminant_variant_added_to_a_real_enum_without_updating_all_is_caught() {
+        // The mutation the census is for: a variant added to a real `pub
+        // enum` here and to nothing else. Written with an explicit
+        // discriminant, the shape the old `is_variant_line` lost -- so the
+        // count silently agreed with the untouched `ALL` and this omission
+        // went uncaught. Mutate this file's own source rather than a
+        // fixture, since a fixture the old parser already handled would not
+        // reach the gap.
+        let source = include_str!("vocab.rs");
+        let mutated = source.replacen(
+            "    ErrorReturn,\n}",
+            "    ErrorReturn,\n    Timeout = 2,\n}",
+            1,
+        );
+        assert_ne!(
+            mutated, source,
+            "the InjectionMode text to mutate was not found"
+        );
+        let counted = declared_variants(&mutated);
+        let declared = counted
+            .iter()
+            .find(|(name, _)| name == "InjectionMode")
+            .map(|(_, count)| *count)
+            .expect("InjectionMode still declared in the mutated source");
+        assert_eq!(
+            declared,
+            InjectionMode::ALL.len() + 1,
+            "the added discriminant variant was not counted, so the census could not \
+             catch the omission from `ALL` that this mutation stands in for"
+        );
     }
 
     #[test]
