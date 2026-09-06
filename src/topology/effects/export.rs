@@ -148,4 +148,23 @@ mod tests {
         );
         assert!(!message.ends_with('.'), "{message}");
     }
+
+    /// The module doc promises the parent re-exports every item here. This
+    /// compiles only while `crate::topology::effects::ExportError` resolves,
+    /// so a caller outside this module can name the function's error type.
+    #[test]
+    fn export_error_is_nameable_through_the_parent_re_export() {
+        fn through_the_parent(error: crate::topology::effects::ExportError) -> ExportError {
+            error
+        }
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("malformed input is not valid JSON");
+        let error = through_the_parent(ExportError::from(source));
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to serialize the effect site inventory: "),
+            "{error}"
+        );
+    }
 }

@@ -64,7 +64,7 @@ mod vocab;
 
 pub use self::bijection::{BijectionFailure, check_bijection};
 pub use self::export::{
-    EffectSiteExport, PointExport, ResidueClassExport, effect_sites, effect_sites_json,
+    EffectSiteExport, ExportError, PointExport, ResidueClassExport, effect_sites, effect_sites_json,
 };
 pub use self::harness::{
     FastSequence, HarnessError, HookHarness, HookPhase, Injection, Observation,
