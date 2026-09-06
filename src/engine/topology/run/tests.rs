@@ -332,3 +332,60 @@ fn both_attempt_started_arms_take_their_pool_from_an_authority() {
          plan disagree about which pool the attempt drained: {invented:?}"
     );
 }
+
+/// `PR160-NOTES-SUCCESS-SETTLEMENT`. The `Settled {` notes summarised the
+/// ready-dispatch branch as ending in `attempt_finished`, which is only the
+/// rejected half. An accepted settlement never appends `attempt_finished` at
+/// all: [`super::TopologyRun::promote_candidate`] runs instead and the branch
+/// ends at `candidate_prepared` then `task_candidate_created`, the rule
+/// `design/15_design_event_log_resume_run_layout.md` and
+/// `design/26_design_merge_queue_protocol.md` state and the fold enforces.
+/// Pin the two settlements separately so a reader reconstructing a successful
+/// attempt's durable record is not sent looking for an event that is never
+/// written; `src/export.rs` and `agent/proc/tests.rs` pin prose the same way.
+#[test]
+fn the_settled_notes_separate_the_successful_and_the_failed_settlement() {
+    const NOTES: &str = include_str!("../../../../docs/internals/engine/topology/run.md");
+
+    let settled = NOTES
+        .split("\n## ")
+        .find(|section| section.starts_with("`pub enum Progress` › `Settled {`"))
+        .expect("the notes carry the `Settled {` heading the branch summary sits under");
+    // Match on the prose, not on where its line breaks fall: a reflow must not
+    // break the pin, only a changed claim.
+    let settled = settled.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for (proposition, pin) in [
+        (
+            "which settlement is appended depends on `accepted`",
+            "depends on `accepted`",
+        ),
+        (
+            "a rejected attempt settles with `attempt_finished`",
+            "rejected attempt ends at `attempt_finished`",
+        ),
+        (
+            "an accepted attempt appends no `attempt_finished`",
+            "never appends `attempt_finished`",
+        ),
+        (
+            "an accepted attempt settles at `candidate_prepared`",
+            "`candidate_prepared`",
+        ),
+        (
+            "and `task_candidate_created` follows it",
+            "`task_candidate_created`",
+        ),
+    ] {
+        assert!(
+            settled.contains(pin),
+            "the `Settled {{` summary must state that {proposition}; looked for {pin:?} in:\n{settled}"
+        );
+    }
+
+    assert!(
+        !settled.contains("the attempt through the Runner, and `attempt_finished`."),
+        "the retired claim that the whole ready-dispatch branch ends in \
+         `attempt_finished` must not come back:\n{settled}"
+    );
+}
