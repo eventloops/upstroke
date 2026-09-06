@@ -4,9 +4,13 @@
 #
 #   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [--reviewer LOGIN] [PR ...]
 #
-# --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY,
-# un-drafted pull request to the merge queue (`gh pr merge --merge --auto`) in the order listed,
-# which is the priority order; it implies --apply.
+# --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
+# pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
+# so the caller states the priority; with no arguments it walks `gh pr list` order, newest first,
+# which is not a priority. It implies --apply.
+#
+# --ready-label NAME uses an existing label of that name as it is (the audit adds and removes it
+# on pull requests and never recolours or redescribes it) and creates it only when absent.
 #
 # Lanes, decided by the branch prefix and nothing else (a lane:* label is output, never input;
 # a wrong one is corrected by --apply and reported as lane-label-mismatch):
@@ -15,7 +19,7 @@
 #   lane:feature         everything else       must fix P0-P1; P2-P3 may be filed and deferred
 #
 # A pull request is READY when all of these hold on its current head:
-#   - not a draft, no merge conflicts
+#   - not a draft; GitHub reports it mergeable (DIRTY, UNKNOWN and BLOCKED all fail closed)
 #   - the latest `upstroke-ci` and `upstroke-pr-policy` check runs on the head succeeded
 #   - the latest review comment (either the `Reviewed head:` workflow form or the
 #     `<!-- upstroke-frontier-review -->` form) reviewed the head itself, or a commit the head
@@ -70,15 +74,19 @@ if ((${#prs[@]} == 0)); then
   mapfile -t prs < <(gh pr list --repo "$repo" --state open --limit 100 --json number --jq '.[].number')
 fi
 
+# Creates a label only when the repository has none of that name: an existing label, including
+# one handed in as --ready-label, keeps its colour and description.
 ensure_labels() {
-  gh label create lane:feature --repo "$repo" --color 0e8a16 --force \
-    --description "feature or sweep work: fix P0-P1, file P2-P3" >/dev/null
-  gh label create lane:findings-p1p2 --repo "$repo" --color fbca04 --force \
-    --description "P1/P2 findings workflow: fix P0-P2, file P3" >/dev/null
-  gh label create lane:findings-p3 --repo "$repo" --color d93f0b --force \
-    --description "P3 findings workflow: ready only on PASS" >/dev/null
-  gh label create "$ready_label" --repo "$repo" --color 5319e7 --force \
-    --description "audit passed: enqueue for merge" >/dev/null
+  local existing
+  existing="$(gh label list --repo "$repo" --limit 200 --json name --jq '.[].name')"
+  create() {
+    grep -qxF "$1" <<< "$existing" \
+      || gh label create "$1" --repo "$repo" --color "$2" --description "$3" >/dev/null
+  }
+  create lane:feature 0e8a16 "feature or sweep work: fix P0-P1, file P2-P3"
+  create lane:findings-p1p2 fbca04 "P1/P2 findings workflow: fix P0-P2, file P3"
+  create lane:findings-p3 d93f0b "P3 findings workflow: ready only on PASS"
+  create "$ready_label" 5319e7 "audit passed: enqueue for merge"
 }
 
 lane_for() {
@@ -99,9 +107,16 @@ must_fix_for() {
 }
 
 # The latest review comment on a pull request posted by the trusted reviewer, or nothing.
+# `--paginate` hands `--jq` each page separately, so `last` is per page: each page yields its
+# newest match as "<created_at> <id>", the newest across pages wins by timestamp, and that one
+# comment is fetched by id. Comments arrive oldest first, so the per-page `last` is its newest.
 latest_review() {
-  gh api "repos/$repo/issues/$1/comments" --paginate \
-    --jq "[.[] | select(.user.login == \"$reviewer\") | select(.body | test(\"<!-- upstroke-frontier-review|Reviewed head: [0-9a-f]{40}\"))] | last | .body // empty"
+  local id
+  id="$(gh api "repos/$repo/issues/$1/comments?per_page=100" --paginate \
+    --jq "[.[] | select(.user.login == \"$reviewer\") | select(.body | test(\"<!-- upstroke-frontier-review|Reviewed head: [0-9a-f]{40}\"))] | last | select(. != null) | \"\(.created_at) \(.id)\"" \
+    | sort | tail -1 | awk '{print $2}')"
+  [[ -n "$id" ]] && gh api "repos/$repo/issues/comments/$id" --jq '.body'
+  return 0
 }
 
 # Ledger rows from the body: "ID<TAB>severity<TAB>sha-or-location<TAB>disposition" per row.
@@ -119,17 +134,27 @@ if ((apply)); then ensure_labels; fi
 
 printf '%-5s %-14s %-8s %-13s %s\n' PR LANE HEAD STATE DETAIL
 for pr in "${prs[@]}"; do
-  meta="$(gh pr view "$pr" --repo "$repo" \
-    --json headRefName,headRefOid,isDraft,mergeStateStatus,labels \
-    --jq '[.headRefName, .headRefOid, (.isDraft|tostring), .mergeStateStatus, ([.labels[].name]|join(" "))] | @tsv')"
-  IFS=$'\t' read -r branch head draft merge_state labels <<< "$meta"
+  # GitHub computes mergeability lazily and answers UNKNOWN until it has; asking again after a
+  # pause usually settles it, and an UNKNOWN that survives three asks fails closed below.
+  for attempt in 1 2 3; do
+    meta="$(gh pr view "$pr" --repo "$repo" \
+      --json headRefName,headRefOid,isDraft,mergeStateStatus,labels \
+      --jq '[.headRefName, .headRefOid, (.isDraft|tostring), .mergeStateStatus, ([.labels[].name]|join(" "))] | @tsv')"
+    IFS=$'\t' read -r branch head draft merge_state labels <<< "$meta"
+    [[ "$merge_state" == UNKNOWN && $attempt -lt 3 ]] || break
+    sleep 3
+  done
   lane="$(lane_for "$branch")"
   must_fix="$(must_fix_for "$lane")"
   blockers=()
   state=READY
 
   [[ "$draft" == "true" ]] && blockers+=("draft")
-  [[ "$merge_state" == "DIRTY" ]] && blockers+=("conflicts")
+  case "$merge_state" in
+    DIRTY) blockers+=("conflicts") ;;
+    UNKNOWN|"") blockers+=("mergeability-unknown") ;;   # GitHub has not computed it yet
+    BLOCKED) blockers+=("blocked-by-rules") ;;          # a ruleset requirement is unmet, e.g. an unresolved conversation
+  esac
 
   # Latest check runs on the head, one per required context.
   checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" \
@@ -179,32 +204,65 @@ for pr in "${prs[@]}"; do
     fi
   fi
 
-  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" (id empty for the
-  # frontier form). One finding object per line, so a witness field is read from its own object.
+  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" ("-" for no id). The JSON
+  # form is read by a JSON parser, never by regex; without one the audit fails closed. The
+  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and a P0
+  # or P1 token anywhere else in the text blocks as unparsed rather than being missed.
   findings=()
   if [[ -n "$review" ]]; then
     if grep -q '"findings"' <<< "$review"; then
-      while IFS=$'\t' read -r sev id wit; do
-        [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
-      done < <(grep -oE '"findings": ?\[.*' <<< "$review" | sed -E 's/\},\{/}\n{/g' | awk '
-        {
-          sev = ""; id = ""; wit = 0
-          if (match($0, /"severity": ?"P[0-3]"/)) sev = substr($0, RSTART + RLENGTH - 3, 2)
-          if (match($0, /"id": ?"[^"]+"/)) { id = substr($0, RSTART, RLENGTH); sub(/^"id": ?"/, "", id); sub(/"$/, "", id) }
-          if ($0 ~ /"(witness|reproduction|repro|failing_test|mutation|mutation_witness)": ?"[^"]+"/) wit = 1
-          if (id == "") id = "-"
-          if (sev != "") print sev "\t" id "\t" wit
-        }')
+      py="$(command -v python3 || command -v python || true)"
+      if [[ -z "$py" ]]; then
+        blockers+=("findings-unparsed:no-python")
+      else
+        review_file="$(mktemp)"
+        printf '%s' "$review" > "$review_file"
+        while IFS=$'\t' read -r sev id wit; do
+          [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
+        done < <("$py" - "$review_file" <<'PY'
+import json, re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+# The verdict is the last fenced JSON object; the older bare form has no fence.
+found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
+try:
+    verdict = json.loads(found[-1]) if found else None
+except ValueError:
+    verdict = None
+if not isinstance(verdict, dict) or not isinstance(verdict.get("findings"), list):
+    print("ERR\tunparsed\t0")
+    sys.exit(0)
+for f in verdict["findings"]:
+    if not isinstance(f, dict):
+        print("ERR\tunparsed\t0")
+        continue
+    sev = str(f.get("severity", "")).strip()
+    fid = str(f.get("id", "")).strip() or "-"
+    wit = int(any(str(f.get(k, "")).strip() for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
+    if not re.fullmatch(r"P[0-3]", sev):
+        print("ERR\tbad-severity:" + fid + "\t0")
+        continue
+    print(sev + "\t" + fid + "\t" + str(wit))
+PY
+)
+        rm -f "$review_file"
+      fi
     else
       while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
+      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[01]\b' | head -1 || true)"
+      [[ -n "$stray" ]] && blockers+=("findings-unparsed:$stray-outside-numbered-findings")
     fi
   fi
   [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
+  [[ "$verdict" == CHANGES_REQUIRED && ${#findings[@]} -eq 0 ]] && blockers+=("findings-unparsed:changes-required-lists-none")
 
   rows="$(ledger_rows "$pr")"
   for f in "${findings[@]}"; do
     IFS=$'\t' read -r sev id wit <<< "$f"
     [[ "$id" == "-" ]] && id=""   # "-" stands in for "no id": a tab-separated read collapses empty fields
+    if [[ "$sev" == ERR ]]; then
+      blockers+=("findings-unparsed:$id")
+      continue
+    fi
     if [[ "$wit" == 1 ]]; then
       blockers+=("witnessed:${id:-unnamed}")
       continue
@@ -232,10 +290,10 @@ for pr in "${prs[@]}"; do
   done
 
   # Hard blockers decide first; a repair push only matters once nothing else stands in the way.
-  # Draft is not a blocker: the implementor un-drafts when the audit says READY.
+  # A draft is NOT-READY: READY means enqueueable as it stands.
   hard=()
   for b in "${blockers[@]:-}"; do
-    [[ -n "$b" && "$b" != draft && "$b" != manual:* ]] && hard+=("$b")
+    [[ -n "$b" && "$b" != manual:* ]] && hard+=("$b")
   done
   if ((${#hard[@]})); then
     state=NOT-READY
