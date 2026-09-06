@@ -174,10 +174,12 @@ for pr in "${prs[@]}"; do
 
   # The newest check run per required context on the head: a re-run creates a new run with the
   # same name, so every matching run from every page is listed with its start time, sorted, and
-  # the last start per name is the one whose conclusion is read. `--paginate` runs the jq filter
+  # the last start per name is the one whose conclusion is read; a run not yet started (queued,
+  # no start time) sorts last, so its status is what blocks, never an older run's conclusion.
+  # `--paginate` runs the jq filter
   # per page, so the selection happens here in the shell, over all pages, not in jq.
   checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" --paginate \
-    --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.started_at // "")\t\(.conclusion // .status)"' \
+    --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.started_at // "9999-12-31T00:00:00Z")\t\(.conclusion // .status)"' \
     | sort -t $'\t' -k1,1 -k2,2 | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }')"
   for ctx in upstroke-ci upstroke-pr-policy; do
     case " $checks " in
