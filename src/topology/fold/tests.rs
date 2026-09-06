@@ -3772,6 +3772,70 @@ fn an_interruption_closes_its_generation_and_returns_its_task_to_pending() {
 }
 
 #[test]
+fn an_interruption_returns_a_task_to_pending_even_if_it_was_not_pending() {
+    // `check_dispatched` never lets a real event stream reach `apply` with the task away from
+    // `Pending` here, so the postcondition below can only be witnessed by calling `RunState::apply`
+    // directly, bypassing the checker that normally guarantees it.
+    let mut fold = started();
+    let mut run = fold.run.take().expect("started");
+    run.tasks[ZETA.index()].state = TaskState::AwaitingRepair;
+    run.apply(
+        &TopologyEventBody::AttemptInterrupted {
+            data: AttemptInterrupted4 {
+                key: ZETA,
+                generation: GenerationId(0),
+                attempt: AttemptNumber(1),
+                lease: LeaseDisposition::PredictedReleased,
+                detail: "direct fixture".to_owned(),
+            },
+        },
+        &Derived::None,
+    );
+    assert_eq!(
+        run.tasks[ZETA.index()].state,
+        TaskState::Pending,
+        "an interrupted attempt must return its task to Pending regardless of the state found there"
+    );
+    fold.run = Some(run);
+}
+
+#[test]
+fn a_decline_spares_a_transaction_that_already_authorized_publication() {
+    // `check_question_answered` refuses a decline on a `Prepared` transaction's own lineage
+    // before it is ever appended, so the arm below can only be witnessed by calling
+    // `RunState::apply` directly with a state the checker would never let this event reach.
+    let mut fold = started();
+    let mut run = fold.run.take().expect("started");
+    run.transaction = Some(Transaction {
+        sequence: SequenceId(0),
+        candidate: candidate_of(MID, 0),
+        class: TransactionClass::Prepared {
+            proposed_sha: sha("commit-2-0"),
+            satisfies: vec![MID],
+        },
+    });
+    run.apply(
+        &TopologyEventBody::QuestionAnswered {
+            data: QuestionAnswered4 {
+                key: MID,
+                question: QuestionId::from("q-park-Ünicode"),
+                answer: Answer4::Declined {
+                    decline_halts_run: false,
+                },
+                via: "operator".to_owned(),
+            },
+        },
+        &Derived::Answer(QuestionOrigin::Admission),
+    );
+    assert!(
+        run.transaction.is_some(),
+        "a decline on a Prepared transaction's own lineage must not cancel a transaction that \
+         has already authorized publication"
+    );
+    fold.run = Some(run);
+}
+
+#[test]
 fn an_override_replaces_the_frozen_binding_for_every_later_attempt() {
     let base = sha("base");
     let mut fold = started();
