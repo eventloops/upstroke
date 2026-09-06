@@ -22,6 +22,13 @@ impl TopologyFold {
                 defect: defect.to_string(),
             })?;
 
+        if started.limits.max_parallel == 0 {
+            return Err(FoldError::UnusableLimit {
+                limit: "max_parallel",
+                value: started.limits.max_parallel,
+            });
+        }
+
         if started.normalized_plan_digest != self.inputs.normalized_plan_digest {
             return Err(FoldError::DigestMismatch {
                 what: "normalized plan",

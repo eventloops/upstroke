@@ -26,6 +26,16 @@ refusals[5], first half: the record must name everything needed to
 re-establish the runner. The digest is not required — it is the
 manifest digest when the runtime reported one (INV-23).
 
+## `impl TopologyFold` › `if started.limits.max_parallel == 0 {`
+
+The entitlement this run freezes must admit work. `max_parallel = 0`
+makes `pipeline_reservable` false for the life of the run, so nothing
+is ever structurally admissible, no state the run reaches has an
+outcome to derive, and every `run_finished` is refused — the log folds
+to a state with no exit. DESIGN §26, "Frozen limits". The other two
+limits have no such floor: each gates a branch that still answers at
+zero.
+
 ## `impl TopologyFold` › `if started.normalized_plan_digest != self.inputs.normalized_plan_digest {`
 
 refusals[4]: both digests, against the bytes this reader was handed.

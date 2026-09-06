@@ -2002,6 +2002,76 @@ fn a_run_started_carries_a_runner_record_that_could_be_re_established() {
 }
 
 #[test]
+fn a_run_started_freezes_an_entitlement_that_admits_work() {
+    let frozen = run_started().limits;
+    let with_limits = |limits: TopologyLimits| {
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                limits,
+                ..run_started()
+            }),
+        })
+    };
+
+    assert_eq!(
+        refuse(
+            &TopologyFold::new(inputs()),
+            &with_limits(TopologyLimits {
+                max_parallel: 0,
+                ..frozen
+            })
+        ),
+        FoldError::UnusableLimit {
+            limit: "max_parallel",
+            value: 0,
+        }
+    );
+
+    // The refusal is of an entitlement that admits nothing, not of the digit
+    // zero: `max_parallel` is the only limit with an unfoldable value. Measured
+    // on this fixture, a run started at each of the three below is
+    // `structurally_admissible` and derives `NotEnding`, because the other two
+    // limits gate a branch that still answers at zero -- every outage parks
+    // rather than defers, and a rejection must spawn a repair reporting the
+    // same zero.
+    for (label, limits) in [
+        (
+            "one task at a time",
+            TopologyLimits {
+                max_parallel: 1,
+                ..frozen
+            },
+        ),
+        (
+            "no automatic deferral",
+            TopologyLimits {
+                max_defers: 0,
+                ..frozen
+            },
+        ),
+        (
+            "no automatic repair",
+            TopologyLimits {
+                max_merge_repairs: 0,
+                ..frozen
+            },
+        ),
+    ] {
+        let mut fold = TopologyFold::new(inputs());
+        apply(&mut fold, &with_limits(limits));
+        assert!(
+            fold.structurally_admissible(),
+            "a run recording {label} admits work"
+        );
+        assert_eq!(
+            fold.derived_outcome(),
+            DerivedOutcome::NotEnding,
+            "a run recording {label} has an outcome to derive"
+        );
+    }
+}
+
+#[test]
 fn a_resume_that_established_a_different_runner_is_refused_field_by_field() {
     let fold = started();
     accepts(&fold, &resume(container_runner()));

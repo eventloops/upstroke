@@ -58,6 +58,14 @@ pub enum FoldError {
     IncompleteRunner { defect: String },
 
     #[error(
+        "this `run_started` records `{limit} = {value}`; a run whose entitlement admits no work \
+         can neither dispatch nor end, and the limits this event freezes are what every later \
+         event is folded against, so the limit is refused here rather than at the first task \
+         that cannot be started"
+    )]
+    UnusableLimit { limit: &'static str, value: u32 },
+
+    #[error(
         "this incarnation established a different runner from the one the run started with: the \
          {field} differs. A run's confinement boundary and image are fixed for its life."
     )]
@@ -705,6 +713,7 @@ mod parent_tests {
             FoldError::AlreadyStarted => "AlreadyStarted",
             FoldError::NotTopologySchema { .. } => "NotTopologySchema",
             FoldError::IncompleteRunner { .. } => "IncompleteRunner",
+            FoldError::UnusableLimit { .. } => "UnusableLimit",
             FoldError::RunnerMoved { .. } => "RunnerMoved",
             FoldError::DigestMismatch { .. } => "DigestMismatch",
             FoldError::RegistryUnbuildable { .. } => "RegistryUnbuildable",
@@ -752,6 +761,13 @@ mod parent_tests {
                     defect: "defect-03".to_owned(),
                 },
                 vec!["defect-03".to_owned()],
+            ),
+            (
+                FoldError::UnusableLimit {
+                    limit: "limit-32",
+                    value: 932,
+                },
+                vec!["limit-32".to_owned(), "932".to_owned()],
             ),
             (
                 FoldError::RunnerMoved {
@@ -1021,7 +1037,7 @@ mod parent_tests {
         let refusals = refusals();
         assert_eq!(
             refusals.len(),
-            32,
+            33,
             "the sample list is one refusal per `FoldError` variant; `variant_name` is exhaustive, \
              so a new variant cannot compile without an arm there and a sample here"
         );
