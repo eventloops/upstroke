@@ -181,7 +181,7 @@ fn publish_pools(
             ),
         });
     };
-    create_directory_durably(named, util::fsync_dir)?;
+    let created = create_directory_durably(named, util::fsync_dir)?;
     let destination = publication_target(path)?;
     let Some(directory) = publication_directory(&destination) else {
         return Err(UpstrokeError::Refused {
@@ -210,21 +210,24 @@ fn publish_pools(
         operation: "flush the directory of pools file",
         path: directory.to_path_buf(),
         source,
-    })
+    })?;
+    flush_created_entries(&created, util::fsync_dir)
 }
 
 fn create_directory_durably(
     directory: &Path,
     mut flush: impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<(), UpstrokeError> {
+) -> Result<Vec<PathBuf>, UpstrokeError> {
     let mut components: Vec<&Path> = directory
         .ancestors()
         .filter(|ancestor| ancestor.file_name().is_some())
         .collect();
     components.reverse();
+    let mut created = Vec::new();
     for component in components {
         match fs::create_dir(component) {
             Ok(()) => {
+                created.push(component.to_path_buf());
                 let Some(parent) = publication_directory(component) else {
                     continue;
                 };
@@ -260,6 +263,23 @@ fn create_directory_durably(
                 });
             }
         }
+    }
+    Ok(created)
+}
+
+fn flush_created_entries(
+    created: &[PathBuf],
+    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), UpstrokeError> {
+    for component in created.iter().rev() {
+        let Some(parent) = publication_directory(component) else {
+            continue;
+        };
+        flush(parent).map_err(|source| UpstrokeError::Filesystem {
+            operation: "flush the directory of created directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -778,9 +798,10 @@ mod tests {
         assert_eq!(after.file - before.file, 1);
         assert_eq!(
             after.directory - before.directory,
-            3,
+            5,
             "two directory entries were created (`made` in the scratch tree, `here` in `made`) \
-             and each is flushed in its parent, then `here` is flushed for the published file"
+             and each is flushed in its parent as it is made, then `here` is flushed for the \
+             published file, then both entries are flushed again now that the file pins them"
         );
         assert_eq!(
             fs::read_to_string(&path).expect("read what was published"),
@@ -798,7 +819,8 @@ mod tests {
     }
 
     #[test]
-    fn each_created_directory_entry_is_flushed_in_its_parent_outermost_first_and_nothing_else_is() {
+    fn each_created_directory_entry_is_flushed_in_its_parent_as_it_is_made_and_again_after_the_publication()
+     {
         let tree =
             crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-order")
                 .expect("acquire an isolated pools directory");
@@ -806,12 +828,13 @@ mod tests {
         let here = made.join("here");
 
         let mut flushed: Vec<PathBuf> = Vec::new();
-        create_directory_durably(&here, |parent| {
+        let created = create_directory_durably(&here, |parent| {
             flushed.push(parent.to_path_buf());
             Ok(())
         })
         .expect("the directories are created");
 
+        assert_eq!(created, vec![made.clone(), here.clone()], "outermost first");
         assert_eq!(
             flushed,
             vec![tree.path().to_path_buf(), made.clone()],
@@ -822,11 +845,24 @@ mod tests {
         assert!(here.is_dir());
 
         flushed.clear();
-        create_directory_durably(&here, |parent| {
+        flush_created_entries(&created, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the entries are flushed again");
+        assert_eq!(
+            flushed,
+            vec![made.clone(), tree.path().to_path_buf()],
+            "after the publication the same two entries are flushed once more, innermost first"
+        );
+
+        flushed.clear();
+        let created = create_directory_durably(&here, |parent| {
             flushed.push(parent.to_path_buf());
             Ok(())
         })
         .expect("an existing directory is accepted");
+        assert_eq!(created, Vec::<PathBuf>::new());
         assert_eq!(
             flushed,
             Vec::<PathBuf>::new(),
@@ -862,32 +898,48 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_replaced_by_someone_else_between_two_creations_is_used_and_only_this_calls_entries_are_flushed()
-     {
+    fn a_directory_replaced_after_its_entry_was_flushed_has_the_replacement_flushed_before_return()
+    {
         let tree =
             crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-replaced")
                 .expect("acquire an isolated pools directory");
         let made = tree.path().join("made");
         let here = made.join("here");
+        let marker = made.join("theirs");
 
         let mut flushed: Vec<PathBuf> = Vec::new();
-        create_directory_durably(&here, |parent| {
-            if parent == tree.path() {
-                fs::remove_dir(&made).expect("someone else removes `made`");
-                fs::create_dir(&made).expect("and puts their own `made` in its place");
-            }
+        let created = create_directory_durably(&here, |parent| {
             flushed.push(parent.to_path_buf());
+            if parent == tree.path() {
+                fs::remove_dir(&made).expect("someone else removes `made` after its flush");
+                fs::create_dir(&made).expect("and puts their own `made` in its place");
+                fs::write(&marker, "").expect("with something of theirs inside it");
+            }
             Ok(())
         })
         .expect("`here` is created inside the directory someone else now owns");
+        flush_created_entries(&created, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the entries are flushed again");
 
-        assert!(here.is_dir());
+        assert!(
+            marker.is_file() && here.is_dir(),
+            "`here` was made inside the replacement, beside what its owner put there"
+        );
         assert_eq!(
             flushed,
-            vec![tree.path().to_path_buf(), made.clone()],
-            "this call flushed the `made` it created and the `here` it created; the `made` \
-             someone else recreated is theirs to flush, and `create_dir` said so by refusing \
-             to create it twice"
+            vec![
+                tree.path().to_path_buf(),
+                made.clone(),
+                made.clone(),
+                tree.path().to_path_buf()
+            ],
+            "the first flush of the scratch tree covered the `made` this call made and was \
+             made stale by the replacement; the last flush of the scratch tree comes after \
+             `here` exists inside the replacement, so it is the replacement's entry it makes \
+             durable"
         );
     }
 

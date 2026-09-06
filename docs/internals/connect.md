@@ -250,17 +250,21 @@ first repair deciding what it had created from a scan made *before*
 unflushed recreation — check-then-act against shared filesystem state, which
 §10 forbids. Nothing is inferred now: the flush follows the create's own `Ok`.
 
-The two interleavings that shared state admits have defined outcomes, each
-pinned by a test that runs the other party inside the flush step, which is the
-one point between two creations: another process removing a component this
-call just made makes the next `create_dir` fail with `NotFound`, reported as a
-failed directory creation naming the component that could not be made; another
-process removing and recreating it makes that component theirs — `create_dir`
-says so by refusing to make it twice — and this call flushes only the entries
-it made, which is §8's ownership rule ("removes only what this operation can
-prove it owns") applied to flushing. An `AlreadyExists` whose occupant is not a
-directory is refused naming that component, so a `--pools` whose parent is a
-regular file still reports the failed directory creation naming that parent.
+The components this call created are returned, outermost first, because the
+flush at creation is not the last word on them — see
+[`flush_created_entries`] for the window it leaves and how the publication
+closes it.
+
+The interleavings that shared state admits have defined outcomes, each pinned
+by a test that runs the other party inside the flush step, which is the one
+point between two creations: another process removing a component this call
+just made makes the next `create_dir` fail with `NotFound`, reported as a failed
+directory creation naming the component that could not be made; another process
+removing and recreating it makes that component theirs — `create_dir` says so
+by refusing to make it twice — and this call goes on to create inside the
+replacement. An `AlreadyExists` whose occupant is not a directory is refused
+naming that component, so a `--pools` whose parent is a regular file still
+reports the failed directory creation naming that parent.
 
 The flush is a parameter (`util::fsync_dir` in production, the one call site
 in [`publish_pools`]) so a test can record *which* entries were flushed and in
@@ -269,6 +273,35 @@ witnessed separately by
 `a_publication_into_directories_it_creates_flushes_each_new_entry_in_its_parent`,
 which runs `write_pools` end to end, so a call site handing in a no-op is
 caught there.
+
+## `fn flush_created_entries(`
+
+The second flush of every entry this call created, innermost first, after the
+pools file has been published and its own directory flushed.
+
+The flush at creation makes an entry durable at the moment it becomes this
+call's, but a directory that holds nothing yet can be removed and recreated by
+someone else between that flush and the next creation, and this call then
+creates the next component inside a replacement whose entry in *its* parent
+nobody flushed — pass 3 of the recovery review found exactly that
+(`SWEEP-CONNECT-013`). Nothing at creation time can close that window, because
+the other party acts after it; what closes it is the publication. Once the
+pools file exists, every component above it is non-empty, and a non-empty
+directory cannot be replaced by anything short of deleting the file — which is
+loss by another process's hand, not a durability failure of this one. So the
+chain is flushed once more *after* the rename: each created component's parent,
+innermost first, whatever entry now stands at that name. That is the bounded
+revalidation the finding asked for, bounded at one pass because after the
+publication there is nothing left to race.
+`a_directory_replaced_after_its_entry_was_flushed_has_the_replacement_flushed_before_return`
+runs the replacement after the real first flush returns and shows the last
+flush of the parent coming after the component exists inside the replacement;
+`a_publication_into_directories_it_creates_flushes_each_new_entry_in_its_parent`
+counts the whole sequence through the real barrier — two entries flushed as
+they are made, the published file's directory, then the two entries again.
+
+The flush is the same parameter as [`create_directory_durably`]'s, for the
+same reason.
 
 ## `struct Staged {`
 
