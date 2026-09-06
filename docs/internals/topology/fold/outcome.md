@@ -111,3 +111,20 @@ count can meet, and `usize::MAX` is the narrowest bound that is still
 true of it. Saturating a *limit* upwards admits nothing the real limit
 would refuse, which is why this one is not a refusal the way
 [`Self::dispatch_lease_check`]'s is.
+
+## `pub(super) fn backoff_pending(&self) -> bool {`
+
+The task half is the fold's own `deferred_tasks` set and deliberately not
+`TaskState::Deferred`. DESIGN §26: "Execution backoff remains pending
+beneath a question. An elapsed wait or resume consumes it once, including
+hidden waits, without closing questions." `set_state`'s `AwaitingInput`
+arm is the other half of that sentence — it removes nothing from the set,
+so `refresh_task_state` restores `Deferred` when the question is
+answered — and a task that was deferred and is now parked answers `true`
+here while its state says `AwaitingInput`. That is the design's answer,
+not a leak: the run is not `Parked` until the wait it already owes is
+consumed.
+
+`topology::census`'s mirror of this predicate reads the task state
+instead, so in that one state it is narrower than what it checks; the
+finding is `SWEEP-FOLD-OUTCOME-CENSUS-BACKOFF-MIRROR`.
