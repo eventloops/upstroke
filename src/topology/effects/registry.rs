@@ -163,10 +163,19 @@ pub struct ClassHistogram {
 
 impl ClassHistogram {
     /// How many samples the histogram accounts for.
-    pub const fn total(self) -> u32 {
-        self.none
-            .saturating_add(self.internal)
-            .saturating_add(self.after)
+    ///
+    /// Widened rather than saturated, because the answer is compared with a
+    /// claimed sample count and a saturating sum agrees with a claim it should
+    /// refuse: `{ none: u32::MAX, internal: 1, after: 0 }` accounts for one
+    /// sample more than `u32::MAX` and a `u32` sum said `u32::MAX`. Three
+    /// `u32`s cannot overflow a `u64`, so this is exact for every value of the
+    /// three fields and has no failure case to report.
+    pub const fn total(self) -> u64 {
+        // Widening casts, and the only reason they are casts rather than
+        // `u64::from`: the conversion trait is not const-callable on the MSRV
+        // and this stays a `const fn`. Every `u32` is a `u64`, so none of the
+        // three loses a bit, and their sum is at most 3 * (2^32 - 1).
+        self.none as u64 + self.internal as u64 + self.after as u64
     }
 }
 
@@ -998,6 +1007,30 @@ mod tests {
                 class: ResidueClass::ObjectInternal.name(),
             },
             "a class the site does not register has no residue rows to quote back"
+        );
+    }
+
+    #[test]
+    fn the_histogram_totals_every_sample_it_holds_without_saturating() {
+        let histogram = ClassHistogram {
+            none: u32::MAX,
+            internal: 1,
+            after: 0,
+        };
+        assert_eq!(
+            histogram.total(),
+            u64::from(u32::MAX) + 1,
+            "a saturating sum answers u32::MAX here and agrees with an n it should refuse"
+        );
+        assert_eq!(ClassHistogram::default().total(), 0);
+        assert_eq!(
+            ClassHistogram {
+                none: 2,
+                internal: 1,
+                after: 1,
+            }
+            .total(),
+            4
         );
     }
 
