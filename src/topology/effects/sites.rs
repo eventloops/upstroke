@@ -666,8 +666,12 @@ pub enum RunDirSite {
     /// rlib, it takes no site here and adds none to `effect_sites.json`, it
     /// cannot mint or weaken a `PrivateHalfProof`, and conjunct 12 of the
     /// ownership proof is unmoved and still fail-closed.
-    /// `decisions/2026-08-30-test-scratch-tree-ownership.md` states the
-    /// authority model in its two-token form.
+    /// `DESIGN.md` §15 states the authority model and `CODING_STANDARDS.md` §8
+    /// states it in its two-token form: `rundir::PrivateHalfProof` in every
+    /// build, the `cfg(test)`-only scratch-tree token beside it. The
+    /// 2026-08-30 decision record this sentence used to cite went with the
+    /// `decisions/` directory on 2026-09-03, and `DESIGN.md`'s record index is
+    /// what says where each such record's substance now lives.
     PublishCommitRecord,
     /// P4: `plan.normalized.json`.
     WritePlan,
@@ -1278,15 +1282,22 @@ impl LockSite {
 
 /// The report funnel.
 ///
-/// One site. `report.json` is also named by [`RunDirSite::WriteReport`] in the
-/// frozen inventory; both are implemented because both are named, and the two
-/// are the same durable object reached through two funnels — see the
-/// `topology::effects` worker report for the note against the design.
+/// One site, and `report.json` is named twice in the frozen inventory: here and
+/// at [`RunDirSite::WriteReport`]. Both are declared because both are named —
+/// not because both are reached. At this head one of the two has a funnel:
+/// `RunDir.WriteReport` is funnelled in `src/rundir.rs`, while this site's
+/// module, `src/util.rs`, names no `ReportSite` at all, which is what makes
+/// `Report.Write` the single entry of `SITES_WITHOUT_A_FUNNEL` in
+/// `src/effects/tests/artifacts.rs`. That census —
+/// `every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent`
+/// in `src/effects/tests.rs` — is the live answer to which sites a funnel
+/// reaches; this sentence is a pointer to it and goes stale the moment it
+/// disagrees.
 ///
-/// Named rather than left as "this module" because the split moved this type
-/// out of the root: at base the phrase denoted `topology::effects`, and in this
-/// child it reads as `sites`, which has no worker report and is not what the
-/// note is about.
+/// One durable object under two inventory names is the owner's standing
+/// finding `PR3-REPORT-DOUBLE-NAME` (`reviews/findings/`, history in
+/// `reviews/FINDINGS.md` §2): ST-07 will demand two hook executions for one
+/// write. It is not this module's to resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportSite {
     /// Writing `report.json`.
