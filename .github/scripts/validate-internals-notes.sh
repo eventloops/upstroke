@@ -178,16 +178,50 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 #       standing entry for them. This claim is what keeps the converted files
 #       converted, so widen the domain with the conversion, never ahead of it.
 #
-# Both read the file as CommonMark reads it: fenced code blocks are dropped,
-# code spans are found first, and the unit is the leaf block. Not the line,
-# because a code span may cross one. Not the file, because backtick runs pair
-# inside a block, and an odd backtick would otherwise swallow whatever came
-# after it. `docs/internals/README.md` documents these very forms inside
-# fences, so a scan that read them literally would refuse its own README.
+# THIS IS A LEXICAL REFUSAL, NOT A MARKDOWN PARSER, and that is a decision
+# rather than a shortcut. The first two versions of this check tried to read
+# the file the way CommonMark reads it -- drop fenced blocks, pair backtick
+# runs into code spans, scan a leaf block at a time -- and review found four
+# defects in the reading itself: a whole-file scan let an odd backtick swallow
+# a later destination; a wrapped line opening on `#[cfg(test)]` was taken for
+# an ATX heading; ` ```a code span``` ` was taken for an opening fence, whose
+# info string may not contain a backtick, and everything after it was skipped;
+# and "```not-a-closing-fence" was taken for a closing one. Each fix was
+# correct and each left the next corner: HTML blocks, setext headings, lazy
+# continuation, list-item containers, indented code, tables. `test-docs-
+# consistency.sh` records four review rounds learning the same thing about the
+# same kind of surface, and withdrew every claim that needed it.
 #
-# Anchors are not resolved. A heading's slug belongs to the renderer, and
-# these headings repeat verbatim within a file, so which heading an anchor
-# names is a review duty here rather than a gate's.
+# So this scans the bytes and refuses the form wherever it appears, in a code
+# span or a fence or a comment as much as in prose. A false refusal is a
+# quoted example, and the only file whose job is to quote these forms is
+# `docs/internals/README.md`; `quoted_destination` below lists its three by
+# exact text. Anything else is a violation, and a new quotation is a visible
+# row in that list rather than a silent pass. The trade is deliberate: a
+# refusal too many costs one reviewed line, a refusal too few is the defect
+# coming back.
+#
+# Two things this deliberately does not do. It does not resolve `#anchor`s: a
+# heading's slug belongs to the renderer, these headings repeat verbatim
+# within a file, and which one an anchor names is a review duty rather than a
+# gate's. And it does not read link reference definitions -- `[label]: dest`.
+# Telling a real definition from the `[`item`]: prose` shape that fills these
+# notes needs block position, which is exactly what is not computed here.
+# Inside (b)'s domain that shape cannot survive anyway: it is a bracketed code
+# span with no `(` after it, which is what (b) refuses. Outside it, it is part
+# of the 1743.
+
+# The occurrences that are quoted rather than used, by file and exact
+# destination text. All three are worked examples in the notes README: two
+# predate this check and show the backlink contract, and the third is the
+# retired Rustdoc form itself, shown so a reader can recognize it.
+quoted_destinations=(
+  'docs/internals/README.md|../../../src/runner/host.rs'
+  'docs/internals/README.md|relative/path.rs'
+  'docs/internals/README.md|crate::effects::census_domain'
+)
+declare -A quoted_used=()
+
 dest_count=0
 while IFS= read -r notes; do
   in_effects=0
@@ -201,9 +235,9 @@ while IFS= read -r notes; do
       continue
     fi
     # CommonMark's destination, then its optional title: `<dest>` keeps
-    # spaces, a bare destination ends at the first one. Neither form is used
-    # in the notes today; reading them is what keeps a title from arriving as
-    # part of the path and failing a file that is correct.
+    # spaces, a bare destination ends at the first one. A destination may be
+    # written on the line after its `(`, so leading whitespace is stripped
+    # rather than read as an empty path.
     dest="${text#"${text%%[![:space:]]*}"}"
     if [[ "$dest" == '<'*'>'* ]]; then
       dest="${dest#<}"
@@ -211,6 +245,15 @@ while IFS= read -r notes; do
     else
       dest="${dest%%[[:space:]]*}"
     fi
+    quoted=0
+    for entry in "${quoted_destinations[@]}"; do
+      if [[ "$notes|$dest" == "$entry" ]]; then
+        quoted_used["$entry"]=1
+        quoted=1
+        break
+      fi
+    done
+    (( quoted == 0 )) || continue
     case "$dest" in
       http://* | https://* | mailto:* | '#'*) continue ;;
     esac
@@ -228,59 +271,63 @@ while IFS= read -r notes; do
     [[ -e "$root/$resolved" ]] \
       || error "$notes:$at: link destination '$dest' resolves to $resolved, which does not exist"
   done < <(awk -v effects="$in_effects" '
-    # Line number of offset p inside block b, relative to the block start.
-    function lineat(b, p,   k, ahead) {
-      ahead = 0
-      for (k = 1; k < p; k++) if (substr(b, k, 1) == "\n") ahead++
-      return ahead
+    function lineof(p,   k) {
+      for (k = 1; k <= last; k++) if (p <= nl[k]) return k
+      return last
     }
-    # One leaf block, read the way CommonMark reads inline text: backtick runs
-    # pair inside the block and nowhere else, so an odd backtick in one
-    # paragraph cannot swallow the next. A whole-file scan misses one of the
-    # eleven destinations for exactly that reason -- events/mod.md:856, whose
-    # `](RunState::apply)` falls inside a span opened two blocks earlier.
-    function scan(b, ln0,   n, i, c, j, run, k, m, closed, ch, label) {
-      n = length(b)
+    { sub(/\r$/, ""); doc = doc $0 "\n"; nl[NR] = length(doc); last = NR }
+    END {
+      n = length(doc)
       i = 1
       while (i <= n) {
-        c = substr(b, i, 1)
-        if (c == "\\") { i += 2; continue }
-        if (c == "`") {
-          j = i
-          while (j <= n && substr(b, j, 1) == "`") j++
-          run = j - i
+        c = substr(doc, i, 1)
+        # A bracketed code span. The backtick run is matched inside the
+        # brackets and nowhere else, so nothing elsewhere in the file can
+        # change what this is: no pairing across paragraphs, no fence state,
+        # no block boundary to get wrong.
+        if (effects && c == "[" && (i == 1 || substr(doc, i - 1, 1) != "\\") \
+            && substr(doc, i + 1, 1) == "`") {
+          j = i + 1
+          while (substr(doc, j, 1) == "`") j++
+          run = j - i - 1
           k = j
           closed = 0
           while (k <= n) {
-            if (substr(b, k, 1) == "`") {
+            if (substr(doc, k, 2) == "\n\n") break
+            if (substr(doc, k, 1) == "`") {
               m = k
-              while (m <= n && substr(b, m, 1) == "`") m++
+              while (m <= n && substr(doc, m, 1) == "`") m++
               if (m - k == run) { closed = m; break }
               k = m
             } else k++
           }
-          if (closed == 0) { i = j; continue }
-          if (effects && i > 1 && substr(b, i - 1, 1) == "[" \
-              && substr(b, closed, 1) == "]" && substr(b, closed + 1, 1) != "(") {
-            # One record per finding: a code span may hold a line break or a
-            # tab, and either would split this line and hand the reader a
-            # second, invented error with no line number.
-            label = substr(b, i, closed - i)
+          if (closed > 0 && substr(doc, closed, 1) == "]" \
+              && substr(doc, closed + 1, 1) != "(") {
+            label = substr(doc, i + 1, closed - i - 1)
             gsub(/[\n\t]/, " ", label)
-            printf "SHORTCUT\t%d\t%s\n", ln0 + lineat(b, i), label
+            printf "SHORTCUT\t%d\t%s\n", lineof(i), label
+            i = closed + 1
+            continue
           }
-          i = closed
-          continue
         }
-        if (c == "]" && substr(b, i + 1, 1) == "(") {
+        # An inline destination. Parentheses balance, a line break inside is
+        # legal CommonMark and common in wrapped prose, and a blank line ends
+        # the search rather than running the rest of the file into it.
+        if (c == "]" && substr(doc, i + 1, 1) == "(") {
+          depth = 1
           k = i + 2
+          torn = 0
           while (k <= n) {
-            ch = substr(b, k, 1)
-            if (ch == ")" || ch == "(" || ch == "\n") break
+            if (substr(doc, k, 2) == "\n\n") { torn = 1; break }
+            ch = substr(doc, k, 1)
+            if (ch == "(") depth++
+            else if (ch == ")") { depth--; if (depth == 0) break }
             k++
           }
-          if (substr(b, k, 1) == ")") {
-            printf "DEST\t%d\t%s\n", ln0 + lineat(b, i), substr(b, i + 2, k - i - 2)
+          if (!torn && k <= n && substr(doc, k, 1) == ")") {
+            dst = substr(doc, i + 2, k - i - 2)
+            gsub(/[\n\t]/, " ", dst)
+            printf "DEST\t%d\t%s\n", lineof(i), dst
             i = k + 1
             continue
           }
@@ -288,44 +335,18 @@ while IFS= read -r notes; do
         i++
       }
     }
-    function flush() {
-      if (buf != "") scan(buf, bufline)
-      buf = ""
-      bufline = 0
-    }
-    {
-      line = $0
-      sub(/\r$/, "", line)
-      body = line
-      sub(/^ */, "", body)
-      ch = ""
-      run = 0
-      if (length(line) - length(body) <= 3) {
-        ch = substr(body, 1, 1)
-        if (ch == "`" || ch == "~") { while (substr(body, run + 1, 1) == ch) run++ }
-      }
-      if (infence) {
-        if (run >= 3 && ch == fchar && run >= flen) infence = 0
-        next
-      }
-      if (run >= 3) { flush(); infence = 1; fchar = ch; flen = run; next }
-      if (line ~ /^[ \t]*$/) { flush(); next }
-      # An ATX heading, as CommonMark spells one: one to six `#` and then a
-      # space, a tab, or the end of the line. A wrapped prose line opening on
-      # `#[cfg(test)]` is not a heading and must not split its own paragraph.
-      hashes = 0
-      while (substr(body, hashes + 1, 1) == "#") hashes++
-      after = substr(body, hashes + 1, 1)
-      if (hashes >= 1 && hashes <= 6 && (after == "" || after == " " || after == "\t")) {
-        flush(); scan(line, NR); next
-      }
-      if (buf == "") { bufline = NR; buf = line } else buf = buf "\n" line
-    }
-    END { flush() }
   ' "$notes")
 done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 
 (( dest_count > 0 )) || error "no relative link destinations found under $notes_root; N5 is inert"
+
+# An exemption that stopped applying is a hole nobody is watching. Every row
+# whose file is present must have matched something in it.
+for entry in "${quoted_destinations[@]}"; do
+  [[ -f "${entry%%|*}" ]] || continue
+  [[ -n "${quoted_used[$entry]:-}" ]] \
+    || error "${entry%%|*} no longer quotes '${entry#*|}'; drop that row from quoted_destinations"
+done
 
 # The effects notes are (b)'s whole domain. If the module is here and its
 # notes are not, the claim measures nothing and says so rather than passing.

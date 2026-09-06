@@ -77,14 +77,16 @@ A reference here is therefore one of two things.
 notes file and that file is not this one:
 
 ```markdown
-[`crate::effects::production_code`](../../effects.md)
+[`crate::effects::production_code`](effects.md)
 ```
 
-The destination is the other file, not a heading inside it. Headings are exact
-source signature substrings and repeat verbatim within a file — `effects.md`
-carries the `census_domain` module heading twice — so an anchor would name
-whichever copy the renderer's slugger numbered first. Where an anchor is
-genuinely unambiguous it is welcome; the gate does not resolve one.
+The destination is relative to the file the link is written in, so the same link
+in `effects/tests/source_oracles.md` is spelled `../../effects.md`. It names the
+other file, not a heading inside it: headings are exact source signature
+substrings and repeat verbatim within a file — `effects.md` carries the
+`census_domain` module heading twice — so an anchor would name whichever copy
+the renderer's slugger numbered first. Where an anchor is genuinely unambiguous
+it is welcome; the gate does not resolve one.
 
 **A plain code span** otherwise:
 
@@ -165,7 +167,9 @@ four Bash gates) and holds the two trees to each other in both directions:
   destination is an `http`/`https`/`mailto` URL, a same-file `#anchor`, or a
   relative path that exists in this repository and stays inside it — the check
   that catches `crate::effects::census_domain`, `Self::close_and_wait` and
-  `std::time::Duration` alike, and a mistyped relative path with them;
+  `std::time::Duration` alike, and a mistyped relative path with them. The three
+  destinations quoted as examples in this file are listed in the validator by
+  exact text and nothing else is exempt;
 - and in the effects notes — `effects.md` and everything under `effects/` —
   every bracketed code span is an inline link rather than a shortcut reference.
   Those ten files are the domain because they are the ten an independent
@@ -183,18 +187,31 @@ Hidden links, plain paths, code examples, and images do not satisfy it. Its
 isolated fixtures exercise valid depths and CRLF, malformed backlinks, missing
 files, and misplaced or duplicate markers.
 
-The link checks read a file the way CommonMark reads it: fenced blocks dropped,
-code spans found first, and one leaf block at a time — not one line, because a
-code span may cross one, and not the whole file, because backtick runs pair
-inside a block and an odd backtick in one paragraph would otherwise swallow the
-link in the next. Fenced blocks are dropped before any of that, which is why the
-retired forms can be written out here, in a file the gate reads, without failing
-it. Their fixtures cover a shortcut reference in the effects notes and one
-outside them, a reference wrapped across a line break, a Rustdoc destination
-with and without `crate::`, a destination that leaves the repository, external
-and anchor destinations, a destination carrying a title, one hidden behind an
-odd backtick a block earlier, and a wrapped prose line opening on `#[cfg(test)]`
-— which is not an ATX heading and must not split the paragraph it is inside.
+The link checks are lexical, and that is a decision rather than a shortcut. They
+refuse the retired forms wherever the bytes appear — inside a code span, inside a
+fenced block, inside an HTML comment — because two earlier versions did try to
+read the file the way CommonMark reads it, and review found four defects in the
+reading before it found any in the notes. Each fix was correct and each left the
+next corner. `.github/scripts/test-docs-consistency.sh` records four review
+rounds learning the same thing about the same kind of surface.
+
+A false refusal is therefore a form quoted rather than used, and this README is
+the only file whose job is to quote them. The validator lists its three by exact
+text, so a new quotation is a reviewed line in that list rather than a silent
+pass, and a row that stops matching is an error rather than a hole. Two things
+the checks deliberately leave alone: `#anchor`s, whose slug belongs to the
+renderer, and link reference definitions, since telling `[label]: dest` from the
+`[`item`]: prose` shape that fills these notes needs the block position that is
+not computed.
+
+The fixtures cover a shortcut reference in the effects notes and one outside
+them, one below `effects/`, one wrapped across a line break, one inside a fenced
+block; an inline link; a Rustdoc destination with and without `crate::`, one
+wrapped onto the next line, one inside a fence, one inside a code span, an
+unresolvable relative destination, one that leaves the repository, external and
+anchor destinations, a destination carrying a title and one in angle brackets; a
+quoted destination in this README and an unlisted one beside it; and an effects
+module whose notes are gone.
 
 The gate does not check section headings, arbitrary source prose, or whether a
 note remains true. Those are review duties under §13, including its site-required
