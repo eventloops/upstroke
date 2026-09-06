@@ -184,10 +184,12 @@ and renamed is the file the link names.
 ### Errors
 
 Names the operation that failed and the path it failed on: creating the
-directory, reading the destination's mode, creating, restricting, writing or
-flushing the staging file, publishing it, or flushing the directory afterwards.
-Every failure from the staging file's creation onwards removes that file, and a
-removal that itself fails is reported beside the failure that caused it.
+directory, resolving a symlinked destination, reading the destination's mode,
+creating, restricting, writing or flushing the staging file, publishing it, or
+flushing the directory afterwards. Every failure from the staging file's
+creation onwards removes that file — on a return through [`Staged::withdraw`],
+which reports a removal that itself fails beside the failure that caused it,
+and on an unwind through the guard's `Drop`.
 
 ## `fn publish_pools(`
 
@@ -205,32 +207,113 @@ The staging name is `.pools-<ULID>.tmp` in the destination's own directory:
 inside it because a rename is only atomic within one filesystem, and unique per
 call because §8 refuses a fixed temporary name that two writers can collide on.
 
-`if let Err(error) = landed` is the one cleanup point. Every *return* between
-the staging file's creation and its publication passes through it, and the file
-is this call's alone to remove — `create_new` established that. An unwind is the
-one path that does not reach it, and nothing between those two points panics; a
-`Drop` guard is what would cover it if anything ever did, and
-`SWEEP-CONNECT-002` in `reviews/findings/` carries why this file does not have
-one yet. What a killed process leaves behind is one uniquely named `.tmp` that
-no reader of the directory interprets and that the next publication cannot
-collide with.
+The staging file is owned by a [`Staged`] guard from the moment `create_new`
+makes it this call's alone until it is either published (`published` disarms the
+guard: the name is now the operator's file) or withdrawn (`withdraw` removes it
+and reports the failure it was withdrawn for). Those are the two ways a return
+leaves this function; an unwind is the third way out, and the guard's `Drop`
+removes the file on that path. §6 asks for exactly this shape — "a guard or
+resource-owning type beats a `start`/`finish` pair whose second half can be
+skipped" — and pass 2 of PR #189 (`SWEEP-CONNECT-005`) found the second half
+skipped: until this guard, the cleanup was one `if let Err` that every failing
+return passed through and an unwind stepped over, leaving the `.tmp` behind.
+`an_unwinding_publication_leaves_the_operators_file_byte_for_byte_intact`
+now pins both halves of that path: the destination is untouched *and* the
+staging file is gone.
+
+What a killed process leaves behind is still one uniquely named `.tmp` that no
+reader of the directory interprets and that the next publication cannot collide
+with; no guard runs in a process that is gone.
+
+## `struct Staged {`
+
+The staging file, owned: a path this call created with `create_new` and is
+therefore entitled to remove, and a flag that says whether it still holds it.
+The `bool` rather than an `Option<PathBuf>`: the path is read on every arm and
+never absent, so an `Option` would put an `expect` where a field read belongs.
+
+## `fn create(path: PathBuf) -> Result<(Self, fs::File), UpstrokeError> {`
+
+`create_new`, then the guard. A creation that fails owns nothing, so the error
+carries the path and no guard exists to remove a file that was never made. The
+open handle is returned beside the guard rather than held in it: [`stage`] must
+close it before the caller renames or removes the name, because Windows can
+refuse both while a handle is open, and a handle inside the guard would live
+exactly as long as the name.
+
+## `fn published(mut self) {`
+
+Disarm. The name is now the operator's `pools.toml`; there is nothing of this
+call's left to remove.
+
+## `fn withdraw(mut self, error: UpstrokeError) -> UpstrokeError {`
+
+Remove the staging file after a failed publication, reporting a removal that
+itself fails beside the failure that caused it. Disarms first, and takes the
+path out of the guard rather than cloning it: `self` is consumed, so `Drop`
+runs at the end of this method and finds nothing to do.
+
+A `NotFound` is not a failure to report: it means the file this call staged is
+already gone, which is the state the removal was for.
+
+## `impl Drop for Staged {`
+
+The unwind path. `published` and `withdraw` are the two ways a return leaves
+[`publish_pools`] and both disarm, so an armed guard reaching `drop` is one
+whose owner panicked between `create_new` and the rename. The removal is
+attempted; a removal that fails cannot be reported from here — the thread is
+unwinding, and a panic raised while unwinding aborts the process, which would
+cost the diagnosis of whatever actually failed — so that one arm is suppressed,
+and the notes say so where the code does. The destination is intact on this
+path (nothing renames until `stage` has fully succeeded), so what a suppressed
+removal leaves is one uniquely named `.tmp`, the same residue a kill leaves.
+
+`effects/wrappers.toml` classifies this `drop` as `effectful_unnameable`, the
+class `src/workspace.rs` uses for its own `Drop`: it performs a filesystem
+effect, and a trait method on a private type has no path clippy could deny.
+`effects::externally_reachable_fns` derives `drop` from any `impl … for …`
+span whatever the type's visibility, so without that row
+`every_externally_reachable_fn_of_a_legacy_or_shared_module_is_classified`
+fails with `src/connect.rs unclassified: ["drop"]` — measured, which is why
+the guard and the row land in one change.
+
+## `const SYMLINK_FOLLOW_LIMIT: usize = 40;`
+
+How many links [`publication_target`] follows before calling the chain a cycle.
+Linux's own limit for path resolution is 40 (`MAXSYMLINKS`), so a chain this
+refuses is one the kernel would refuse `fs::write` through with `ELOOP` as
+well; the number is borrowed from there rather than chosen here.
 
 ## `fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {`
 
 The file a publication actually replaces: the destination, or — when the
-destination is a symlink — what that link resolves to.
+destination is a symlink — the first non-link the chain of links reaches,
+existing or not.
 
 A rename replaces a name. Without this, `upstroke connect --force` over a
 symlinked `pools.toml` would leave a regular file where the operator's link was
 and their real file untouched and stale, and it would do it silently. `fs::write`
 followed the link, and so does this.
 
-`canonicalize` resolves the whole chain. A link that resolves to nothing is not
-an error here: [`named_target`] takes the name it holds, which is the path
-`fs::write` would have created through it, so a dangling link is filled in
-rather than replaced. Only a real `NotFound` on the destination itself is
-absence (§7); anything else the stat refuses is reported rather than treated as
-"no link here".
+The chain is walked one link at a time, each relative target resolved against
+the directory of the link that holds it ([`named_target`]), until the path is
+not a symlink: a regular file, which is replaced, or nothing at all, which is
+created — the path `fs::write` would have created through the same chain, so a
+dangling link is filled in rather than replaced. That is the shape
+`SWEEP-CONNECT-006` asked for. The first version resolved a live chain with
+`canonicalize` and fell back to *one* `read_link` when `canonicalize` reported
+`NotFound`; for `pools.toml -> intermediate -> absent-final` that fallback
+published onto `intermediate`, turning the operator's second link into a
+regular file and leaving `absent-final` absent, where `fs::write` created it
+with both links intact. `a_chain_of_pools_symlinks_publishes_the_file_the_last_link_names`
+is that chain, with the intermediate link in a subdirectory and a relative
+target, so a resolution against the wrong directory is caught too.
+
+The walk is bounded by [`SYMLINK_FOLLOW_LIMIT`]; a chain that is still a link
+after that many steps is a cycle, and it is refused naming the destination the
+operator gave, not the link the walk happened to stop on. Only a real
+`NotFound` on the path being examined is absence (§7); anything else the stat
+refuses is reported rather than treated as "no link here".
 
 The directory that is *created* is still the one the operator named, never one
 behind a link: `create_dir_all` runs before this resolution, on `path`'s own
@@ -241,9 +324,11 @@ somewhere else.
 
 ## `fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {`
 
-The path a dangling link names, resolved against the link's own directory when
-it is relative — which is how the kernel resolves it, and how `fs::write`
-through that link would have.
+The path one link names, resolved against that link's own directory when it is
+relative — which is how the kernel resolves it, and how `fs::write` through
+that link would have. Called once per link of a chain, so "the link's own
+directory" is the directory of the link being read, not of the destination the
+operator named.
 
 ## `fn publication_directory(path: &Path) -> Option<&Path> {`
 
@@ -266,12 +351,11 @@ stat that fails for any reason other than `NotFound` refuses.
 
 ## `fn stage(`
 
-Create the staging file, restrict it, fill it, and flush it.
-
-`create_new` rather than a create-or-truncate: an existing name of any kind,
-including a symlink planted in the directory, is refused instead of followed
-(§8's exclusivity rule), which is what makes the staged file this call's alone
-to publish or remove.
+Restrict the staging file, fill it, and flush it. The file was created by
+[`Staged::create`] — `create_new` rather than a create-or-truncate, so an
+existing name of any kind, including a symlink planted in the directory, is
+refused instead of followed (§8's exclusivity rule), which is what makes the
+staged file this call's alone to publish or remove.
 
 The mode is applied before the content, not after: a file the operator had
 restricted must not exist under wider bits while it holds anything.
@@ -297,14 +381,6 @@ destination *and* leave behind a `.tmp` that cannot be removed, in exchange for
 an attribute the rename does not carry anyway. A file created here takes the ACL
 its directory gives it, which is what a *new* pools file always took; carrying a
 Windows ACL across a replacement is not attempted and is not claimed.
-
-## `fn discard(staged: &Path, error: UpstrokeError) -> UpstrokeError {`
-
-Remove the staging file after a failed publication, reporting a removal that
-itself fails beside the failure that caused it.
-
-A `NotFound` is not a failure to report: it means the file this call staged is
-already gone, which is the state the removal was for.
 
 ## `fn settings_match(existing: &str, proposed: &str) -> bool {`
 
@@ -420,6 +496,26 @@ installed at all.
 ## `FakeAdapter {`
 
 Installed nowhere: the normal single-vendor machine.
+
+## `const OPERATORS: u32 = 0o740;`
+
+A mode ordinary file creation cannot produce. A fresh file's mode is
+`0o666 & !umask`, which never carries an execute bit, so `0o740` differs from
+what any umask hands the staging file and the assertion witnesses the carrying
+under every umask a runner can have. The previous witness used `0o640` and a
+control file that refused to proceed when a fresh file already had that mode —
+which is exactly what umask `0027`, a common hardened default, gives a fresh
+file (`0o666 & !0o027 = 0o640`), so the test failed there before `connect` was
+reached (`SWEEP-CONNECT-007`). The control is gone with the reason for it.
+
+## `let (sender, receiver) = std::sync::mpsc::channel();`
+
+The resolution runs on its own thread with a bounded wait, because the property
+under test is that a cycle is *refused*, and the failure mode of a resolution
+without a bound is not a wrong answer but no answer: without the bound the test
+would hang rather than fail (§12, "every wait is bounded"). Thirty seconds
+bounds a wedged walk, not a healthy one — the healthy walk answers in
+microseconds.
 
 ## `let old = first.content.replace(`
 

@@ -197,17 +197,19 @@ fn publish_pools(
     };
     let inherited = destination_mode(&destination)?;
 
-    let staged = directory.join(format!(".pools-{}.tmp", crate::ulid::ulid()));
-    let landed = stage(&staged, content, inherited).and_then(|()| {
-        publish(&staged, &destination).map_err(|source| UpstrokeError::Filesystem {
+    let (staged, file) =
+        Staged::create(directory.join(format!(".pools-{}.tmp", crate::ulid::ulid())))?;
+    let landed = stage(file, staged.path(), content, inherited).and_then(|()| {
+        publish(staged.path(), &destination).map_err(|source| UpstrokeError::Filesystem {
             operation: "publish pools file",
             path: destination.clone(),
             source,
         })
     });
     if let Err(error) = landed {
-        return Err(discard(&staged, error));
+        return Err(staged.withdraw(error));
     }
+    staged.published();
     util::fsync_dir(directory).map_err(|source| UpstrokeError::Filesystem {
         operation: "flush the directory of pools file",
         path: directory.to_path_buf(),
@@ -215,32 +217,101 @@ fn publish_pools(
     })
 }
 
+struct Staged {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl Staged {
+    fn create(path: PathBuf) -> Result<(Self, fs::File), UpstrokeError> {
+        let file = match fs::File::create_new(&path) {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "create staged pools file",
+                    path,
+                    source,
+                });
+            }
+        };
+        Ok((Staged { path, owned: true }, file))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn published(mut self) {
+        self.owned = false;
+    }
+
+    fn withdraw(mut self, error: UpstrokeError) -> UpstrokeError {
+        self.owned = false;
+        let path = std::mem::take(&mut self.path);
+        match fs::remove_file(&path) {
+            Ok(()) => error,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
+            Err(cleanup) => UpstrokeError::Filesystem {
+                operation: "remove staged pools file",
+                path,
+                source: std::io::Error::new(
+                    cleanup.kind(),
+                    format!("{error}; and the staged file could not be removed: {cleanup}"),
+                ),
+            },
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_cleanup) => {
+                // SUPPRESSED, and only here: this arm is reached while the
+                // thread is unwinding (see the notes), where a panic would
+                // abort the process and cost the diagnosis of whatever
+                // actually failed. The destination is intact; what remains
+                // is one uniquely named `.tmp` no reader interprets.
+            }
+        }
+    }
+}
+
+const SYMLINK_FOLLOW_LIMIT: usize = 40;
+
 fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(path.to_path_buf());
+    let mut current = path.to_path_buf();
+    for _ in 0..SYMLINK_FOLLOW_LIMIT {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(current);
+            }
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "read the kind of pools file",
+                    path: current,
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
         }
-        Err(source) => {
-            return Err(UpstrokeError::Filesystem {
-                operation: "read the kind of pools file",
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    if !metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
+        current = named_target(&current)?;
     }
-    match fs::canonicalize(path) {
-        Ok(target) => Ok(target),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => named_target(path),
-        Err(source) => Err(UpstrokeError::Filesystem {
-            operation: "resolve the symlinked pools file",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
+    Err(UpstrokeError::Filesystem {
+        operation: "resolve the symlinked pools file",
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!(
+            "more than {SYMLINK_FOLLOW_LIMIT} levels of symbolic links"
+        )),
+    })
 }
 
 fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {
@@ -278,15 +349,11 @@ fn destination_mode(path: &Path) -> Result<Option<fs::Permissions>, UpstrokeErro
 }
 
 fn stage(
+    mut file: fs::File,
     staged: &Path,
     content: &str,
     inherited: Option<fs::Permissions>,
 ) -> Result<(), UpstrokeError> {
-    let mut file = fs::File::create_new(staged).map_err(|source| UpstrokeError::Filesystem {
-        operation: "create staged pools file",
-        path: staged.to_path_buf(),
-        source,
-    })?;
     apply_mode(staged, inherited)?;
     file.write_all(content.as_bytes())
         .map_err(|source| UpstrokeError::Filesystem {
@@ -316,21 +383,6 @@ fn apply_mode(staged: &Path, inherited: Option<fs::Permissions>) -> Result<(), U
 #[cfg(not(unix))]
 fn apply_mode(_staged: &Path, _inherited: Option<fs::Permissions>) -> Result<(), UpstrokeError> {
     Ok(())
-}
-
-fn discard(staged: &Path, error: UpstrokeError) -> UpstrokeError {
-    match fs::remove_file(staged) {
-        Ok(()) => error,
-        Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
-        Err(cleanup) => UpstrokeError::Filesystem {
-            operation: "remove staged pools file",
-            path: staged.to_path_buf(),
-            source: std::io::Error::new(
-                cleanup.kind(),
-                format!("{error}; and the staged file could not be removed: {cleanup}"),
-            ),
-        },
-    }
 }
 
 fn settings_match(existing: &str, proposed: &str) -> bool {
@@ -628,6 +680,11 @@ mod tests {
             mine,
             "an unwind past a publication replaced nothing"
         );
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "and the staged file went with the unwind, not just with a return"
+        );
     }
 
     #[test]
@@ -736,10 +793,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_chain_of_pools_symlinks_publishes_the_file_the_last_link_names() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain")
+            .expect("acquire an isolated pools directory");
+        let dotfiles = tree.path().join("dotfiles");
+        fs::create_dir(&dotfiles).expect("the directory the intermediate link lives in");
+        let link = tree.path().join("pools.toml");
+        let intermediate = dotfiles.join("intermediate.toml");
+        let named = tree.path().join("absent-final.toml");
+        std::os::unix::fs::symlink("dotfiles/intermediate.toml", &link)
+            .expect("the operator's link, to another link");
+        std::os::unix::fs::symlink("../absent-final.toml", &intermediate)
+            .expect("a relative link that only resolves against its own directory");
+
+        assert_eq!(connect(&link, false).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "the operator's link is still a link"
+        );
+        assert!(
+            fs::symlink_metadata(&intermediate)
+                .expect("read the intermediate link")
+                .file_type()
+                .is_symlink(),
+            "and so is the link it names: a one-level resolution publishes over this one"
+        );
+        let published = fs::read_to_string(&named).expect("the file the chain names now exists");
+        assert!(published.contains("[pools.claude-code]"), "{published}");
+        assert_eq!(
+            fs::read_to_string(&link).expect("read through the chain"),
+            published,
+            "and the chain still reaches it"
+        );
+        assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cycle_of_pools_symlinks_is_refused_rather_than_followed_forever() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-cycle")
+            .expect("acquire an isolated pools directory");
+        let link = tree.path().join("pools.toml");
+        let other = tree.path().join("other.toml");
+        std::os::unix::fs::symlink("other.toml", &link).expect("a link into the cycle");
+        std::os::unix::fs::symlink("pools.toml", &other).expect("and the link back");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = write_pools(&link, "a replacement with no file to land on");
+            let _ = sender.send((link, outcome));
+        });
+        let (link, outcome) = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("a resolution with a bound answers well inside it; a cycle followed forever never does");
+        let error = outcome.expect_err("a cycle names no file to publish");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "resolve the symlinked pools file", path: ref failed, ref source }
+            if failed == &link && source.to_string().contains("levels of symbolic links")),
+            "{error:?}"
+        );
+        for path in [&link, &other] {
+            assert!(
+                fs::symlink_metadata(path)
+                    .expect("read the link")
+                    .file_type()
+                    .is_symlink(),
+                "{} is still the operator's link",
+                path.display()
+            );
+        }
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "nothing was staged for a publication with no destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_mode_an_operator_gave_their_pools_file_survives_a_forced_rewrite() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        const OPERATORS: u32 = 0o640;
+        const OPERATORS: u32 = 0o740;
 
         let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mode")
             .expect("acquire an isolated pools directory");
@@ -749,20 +889,6 @@ mod tests {
         fs::write(&path, mine).expect("the operator's hand-written file");
         fs::set_permissions(&path, fs::Permissions::from_mode(OPERATORS))
             .expect("the operator restricts their own file");
-
-        let control = tree.path().join("control");
-        fs::write(&control, "what a fresh file in this directory gets")
-            .expect("a control the runner's umask decides");
-        let fresh = fs::metadata(&control)
-            .expect("read the control's mode")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_ne!(
-            fresh, OPERATORS,
-            "this assertion is only a witness where the operator's mode is not the mode a \
-             fresh file already gets under the runner's umask"
-        );
 
         assert_eq!(connect(&path, true).outcome, Wrote::Written);
 
