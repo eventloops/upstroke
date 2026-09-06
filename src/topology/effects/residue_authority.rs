@@ -321,8 +321,18 @@ pub enum ResidueArtifact {
     TornTailTruncated,
     /// `Event.OpenLog`'s `SyncPrefix` point.
     PrefixPossiblyNonDurable,
-    /// A Windows containment point.
+    /// A Windows containment point a coordinator kill leaves.
     NoHostProcess,
+    /// The Windows ambient join's *error* contract: the refusal precedes the
+    /// join, so nothing was spawned and nothing was terminated.
+    ///
+    /// A separate artifact from [`Self::NoHostProcess`] because the two modes
+    /// are at different states. `agent::proc::ambient::join_ambient_job_with`
+    /// applies the error-return hook *before* `join()` and the kill hook
+    /// *after* it, and refuses with "No process was spawned": no handle closes
+    /// and the kernel terminates nothing. `NoHostProcess`'s own words name a
+    /// mechanism that did not run.
+    NoProcessSpawned,
     /// A Unix containment point.
     ReaperHeldGroup,
 }
@@ -349,6 +359,7 @@ impl ResidueArtifact {
         Self::TornTailTruncated,
         Self::PrefixPossiblyNonDurable,
         Self::NoHostProcess,
+        Self::NoProcessSpawned,
         Self::ReaperHeldGroup,
     ];
 
@@ -402,6 +413,10 @@ impl ResidueArtifact {
                 "no host process: the ambient handle closes and the kernel terminates the stub or \
                  tree"
             }
+            Self::NoProcessSpawned => {
+                "no host process: the refusal precedes the ambient join, so nothing was spawned \
+                 and nothing was terminated"
+            }
             Self::ReaperHeldGroup => {
                 "a process group the reaper settles while holding its shared cleanup hold, R28"
             }
@@ -448,6 +463,13 @@ pub enum ResumeAction {
     AmbientHandleTerminates,
     /// A Unix containment point: the reaper settles the group.
     ReaperSettlesGroup,
+    /// The Windows ambient join's error contract: the write command refuses
+    /// before any process exists.
+    ///
+    /// Not [`Self::RefuseResumably`], whose words are the event log's — "the
+    /// next open repeats the barrier" is the stable-prefix barrier, and a job
+    /// object has no open and no barrier.
+    RefuseUnspawned,
 }
 
 impl ResumeAction {
@@ -463,6 +485,7 @@ impl ResumeAction {
         Self::RefuseResumably,
         Self::AmbientHandleTerminates,
         Self::ReaperSettlesGroup,
+        Self::RefuseUnspawned,
     ];
 
     /// The words an entry's `resume_action` must carry.
@@ -498,6 +521,10 @@ impl ResumeAction {
             }
             Self::ReaperSettlesGroup => {
                 "nothing to resume: the reaper settles the group while holding its cleanup hold"
+            }
+            Self::RefuseUnspawned => {
+                "nothing to resume: the write command refuses before the ambient join, and no \
+                 process was spawned"
             }
         }
     }
@@ -1018,8 +1045,21 @@ impl SubEffectPoint {
         }
     }
 
-    /// The artifacts a fault at this point leaves.
-    pub const fn residue_artifact(self) -> ResidueArtifact {
+    /// The artifacts a fault at this point in this mode leaves.
+    ///
+    /// The mode is half the coordinate here for the same reason it is half of
+    /// [`Self::resume_action`]'s, and this half was left behind: every point
+    /// but one leaves the same durable shape whichever way the fault arrives —
+    /// an `Err` injected *at* `Create` still created the log, and a partial
+    /// write is a partial write however it ended — but `AmbientJobJoined` does
+    /// not. `agent::proc::ambient::join_ambient_job_with` applies the
+    /// error-return hook **before** `join()` and the kill hook **after** it, so
+    /// a kill leaves the ambient handle to close and the kernel to terminate
+    /// the stub or tree, while an `Err` refuses with "No process was spawned"
+    /// and terminates nothing. One artifact for both gave the error-return
+    /// coordinate a kill's mechanism, which is the same contradiction between
+    /// an entry's two halves that [`Self::residue_rows`] was written to end.
+    pub const fn residue_artifact(self, mode: InjectionMode) -> ResidueArtifact {
         match self {
             Self::IdUnread => ResidueArtifact::IdNotRecorded,
             Self::Written => ResidueArtifact::UnsyncedBytes,
@@ -1028,10 +1068,13 @@ impl SubEffectPoint {
             Self::Create => ResidueArtifact::LogCreated,
             Self::TruncateTornTail => ResidueArtifact::TornTailTruncated,
             Self::SyncPrefix => ResidueArtifact::PrefixPossiblyNonDurable,
-            Self::AmbientJobJoined
-            | Self::CreatedSuspended
-            | Self::PrivateJobAssigned
-            | Self::Resumed => ResidueArtifact::NoHostProcess,
+            Self::AmbientJobJoined => match mode {
+                InjectionMode::Kill => ResidueArtifact::NoHostProcess,
+                InjectionMode::ErrorReturn => ResidueArtifact::NoProcessSpawned,
+            },
+            Self::CreatedSuspended | Self::PrivateJobAssigned | Self::Resumed => {
+                ResidueArtifact::NoHostProcess
+            }
             Self::ReaperStarted | Self::PreExecPgidAndRegister | Self::Exec | Self::Registered => {
                 ResidueArtifact::ReaperHeldGroup
             }
@@ -1070,10 +1113,15 @@ impl SubEffectPoint {
             // for both modes, and the packet says so of both.
             Self::SyncPrefix => ResumeAction::RefuseResumably,
             // "Spawn.AmbientJobJoined (once per process at startup; failure
-            // refuses the write command)".
+            // refuses the write command)". The refusal is not
+            // `RefuseResumably`: that action's words end "the next open repeats
+            // the barrier", which is the event log's stable-prefix barrier, and
+            // an ambient join has neither an open nor a barrier. What it does
+            // have is its own refusal, `AMBIENT_REFUSAL_PREFIX` + "No process
+            // was spawned".
             Self::AmbientJobJoined => match mode {
                 InjectionMode::Kill => ResumeAction::AmbientHandleTerminates,
-                InjectionMode::ErrorReturn => ResumeAction::RefuseResumably,
+                InjectionMode::ErrorReturn => ResumeAction::RefuseUnspawned,
             },
             Self::CreatedSuspended | Self::PrivateJobAssigned | Self::Resumed => {
                 ResumeAction::AmbientHandleTerminates
@@ -1082,5 +1130,86 @@ impl SubEffectPoint {
                 ResumeAction::ReaperSettlesGroup
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InjectionMode, ResidueArtifact, ResumeAction, SubEffectPoint};
+    use crate::topology::effects::{EffectSiteId, EntryPhase};
+
+    #[test]
+    fn the_ambient_join_answers_a_different_residue_and_recovery_in_each_mode() {
+        let point = SubEffectPoint::AmbientJobJoined;
+        // `join_ambient_job_with` applies the error-return hook before
+        // `join()` and the kill hook after it, so the two modes are at
+        // different states and cannot share one residue.
+        assert_eq!(
+            point.residue_artifact(InjectionMode::Kill),
+            ResidueArtifact::NoHostProcess
+        );
+        assert_eq!(
+            point.residue_artifact(InjectionMode::ErrorReturn),
+            ResidueArtifact::NoProcessSpawned
+        );
+        // The kill's words name a mechanism the refusal does not run, which is
+        // what made one artifact for both a false claim at the error-return
+        // coordinate rather than a merely coarse one.
+        assert!(
+            ResidueArtifact::NoHostProcess
+                .detail()
+                .contains("the kernel terminates")
+        );
+        assert!(
+            !ResidueArtifact::NoProcessSpawned
+                .detail()
+                .contains("the kernel terminates")
+        );
+        assert!(
+            ResidueArtifact::NoProcessSpawned
+                .detail()
+                .contains("nothing was spawned")
+        );
+
+        assert_eq!(
+            point.resume_action(InjectionMode::Kill),
+            ResumeAction::AmbientHandleTerminates
+        );
+        assert_eq!(
+            point.resume_action(InjectionMode::ErrorReturn),
+            ResumeAction::RefuseUnspawned
+        );
+        // And the recovery is not the event log's refusal: that one ends at a
+        // barrier an ambient join has not got.
+        assert!(
+            ResumeAction::RefuseResumably
+                .text()
+                .contains("the next open repeats the barrier")
+        );
+        assert!(!ResumeAction::RefuseUnspawned.text().contains("barrier"));
+
+        // The split is this point's, not a blanket change: every other point
+        // leaves the same durable shape whichever way the fault arrives.
+        for other in SubEffectPoint::ALL
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != point)
+        {
+            assert_eq!(
+                other.residue_artifact(InjectionMode::Kill),
+                other.residue_artifact(InjectionMode::ErrorReturn),
+                "{other}"
+            );
+        }
+
+        // Through the parent, which is where an entry meets the authority.
+        let spawn = EffectSiteId::Process(crate::topology::effects::ProcessSite::Spawn);
+        let refused = spawn.semantics(EntryPhase::Point {
+            point,
+            mode: InjectionMode::ErrorReturn,
+        });
+        assert!(refused.rows.is_empty());
+        assert_eq!(refused.artifact, ResidueArtifact::NoProcessSpawned);
+        assert_eq!(refused.action, ResumeAction::RefuseUnspawned);
     }
 }

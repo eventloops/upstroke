@@ -447,7 +447,7 @@ impl EffectSiteId {
     ///   leaves nothing; and a read-only observation performs no effect at all.
     /// * *a sub-effect point* — [`SubEffectPoint::residue_rows`],
     ///   [`SubEffectPoint::residue_artifact`] and
-    ///   [`SubEffectPoint::resume_action`], the last of which reads the mode
+    ///   [`SubEffectPoint::resume_action`], the last two of which read the mode
     ///   because the mode is half the coordinate. The rows are the point's, not
     ///   the site's: a Windows containment kill leaves no host process and so
     ///   no row, and a Unix one leaves the reaper's R28 hold rather than the
@@ -518,7 +518,7 @@ impl EffectSiteId {
             },
             EntryPhase::Point { point, mode } => PhaseSemantics {
                 rows: point.residue_rows(self.row()),
-                artifact: point.residue_artifact(),
+                artifact: point.residue_artifact(mode),
                 action: point.resume_action(mode),
             },
             EntryPhase::Residue { .. } => {

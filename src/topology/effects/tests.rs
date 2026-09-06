@@ -2195,8 +2195,8 @@ const FIXTURE_SHAPES: &[(Host, FixtureShape)] = &[
             order: 3,
             fault_row: 6,
             rows: 9,
-            detail: 17,
-            resume_action: 8,
+            detail: 18,
+            resume_action: 9,
             label: 2,
             evidence_kind: 3,
             test_name: 38,
@@ -4539,8 +4539,8 @@ const POINT_ORACLE: &[(
         SubEffectPoint::AmbientJobJoined,
         InjectionMode::ErrorReturn,
         OracleRows::NoRow,
-        ResidueArtifact::NoHostProcess,
-        ResumeAction::RefuseResumably,
+        ResidueArtifact::NoProcessSpawned,
+        ResumeAction::RefuseUnspawned,
     ),
     (
         SubEffectPoint::CreatedSuspended,
@@ -4836,7 +4836,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 "{point}'s residue rows at a site whose row is {probe_row}"
             );
         }
-        assert_eq!(point.residue_artifact(), artifact, "{point}'s artifact");
+        assert_eq!(
+            point.residue_artifact(mode),
+            artifact,
+            "{point}/{mode:?}'s artifact"
+        );
         assert_eq!(
             point.resume_action(mode),
             action,
@@ -5024,7 +5028,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 );
                 assert_eq!(
                     semantics.artifact,
-                    point.residue_artifact(),
+                    point.residue_artifact(*mode),
                     "{site}/{phase}"
                 );
                 assert_eq!(
@@ -5101,6 +5105,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResidueArtifact::TornTailTruncated
             | ResidueArtifact::PrefixPossiblyNonDurable
             | ResidueArtifact::NoHostProcess
+            | ResidueArtifact::NoProcessSpawned
             | ResidueArtifact::ReaperHeldGroup => {}
         }
     }
@@ -5123,7 +5128,8 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResumeAction::NextOpenConverges
             | ResumeAction::RefuseResumably
             | ResumeAction::AmbientHandleTerminates
-            | ResumeAction::ReaperSettlesGroup => {}
+            | ResumeAction::ReaperSettlesGroup
+            | ResumeAction::RefuseUnspawned => {}
         }
     }
     assert_eq!(
