@@ -124,6 +124,7 @@ disallowed-methods = [
     { path = "libc::pthread_sigmask", reason = "UPSTROKE-EFFECT: thread mask" },
     { path = "libc::setrlimit", reason = "UPSTROKE-EFFECT: process-wide limit" },
     { path = "libc::raise", reason = "UPSTROKE-EFFECT: signals this process" },
+    { path = "libc::pthread_kill", reason = "UPSTROKE-EFFECT: signals one thread of this process; the test-only census control is cancelled with it" },
     { path = "libc::_exit", reason = "UPSTROKE-EFFECT: terminates the process without unwinding" },
     { path = "libc::syscall", reason = "UPSTROKE-EFFECT: an arbitrary kernel call; close_range and getdents64 reach the kernel through it" },
 
