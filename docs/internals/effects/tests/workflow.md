@@ -14,7 +14,7 @@ mutations that prove each complaint fires.
 Every claim here is an equality over a parsed mapping or an exact scalar
 pin, never a `contains` over text — `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE`
 is the row that records what a substring reading of this surface misses.
-[`WORKFLOW_ESCAPES`] is the other half: each entry is a document that *does*
+`WORKFLOW_ESCAPES` is the other half: each entry is a document that *does*
 the forbidden thing, and a complaint **code** it must be refused as. A
 refusal for an unrelated reason is not a refusal of that escape.
 
@@ -45,7 +45,7 @@ Parse a workflow as YAML 1.2, refusing duplicate keys.
 
 Duplicate-key rejection is a property of the parser this crate depends on for
 exactly this reason, and
-[`the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string`]
+`the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string`
 executes it: under last-one-wins every equality below reads the winning entry
 and a mutation hides in the loser.
 
@@ -117,7 +117,7 @@ Measured, `MUT-AGGREGATE-STEM-COLLISION`.
 Every way the parsed workflow fails the gate-wiring contract.
 
 One function so the same contract runs against the real document and against
-each mutation in [`WORKFLOW_ESCAPES`]; an oracle only ever run on conforming
+each mutation in `WORKFLOW_ESCAPES`; an oracle only ever run on conforming
 input is an oracle nobody has seen refuse anything. Each complaint opens with
 a `[kebab-code]`, and the escape table names the code it must provoke -- so a
 mutation that fails for an unrelated reason does not count as refused.
@@ -210,14 +210,14 @@ them, including the ones GitHub adds next. Measured,
 
 ## `fn hosts_tests(target: &CiTarget) -> bool {`
 
-Whether a [`CI_TARGETS`] runner hosts its platform's tests in the `test`
+Whether a `CI_TARGETS` runner hosts its platform's tests in the `test`
 matrix -- every platform but the one whose suite is self-hosted.
 
 ## `pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {`
 
 Every way the self-hosted Windows job fails its contract.
 
-The same shape as [`ci_test_job_complaints`] without the matrix, and with
+The same shape as `ci_test_job_complaints` without the matrix, and with
 the one thing that job cannot say: which machine. A hosted runner is named
 by a scalar `runs-on:`; a self-hosted one by the set of labels a runner must
 carry, and the set is compared whole -- a subset admits every Windows
@@ -255,7 +255,7 @@ head under test.
 `actions/checkout` with no inputs checks out the event's own ref: for a
 pull request, the candidate merged onto its base. Any input -- `ref:`,
 `repository:`, `path:` -- selects something else, and `ref: master` there
-tests `master` while every other leg reads the candidate. [`STEP_FIELDS`]
+tests `master` while every other leg reads the candidate. `STEP_FIELDS`
 admits `with:` because the toolchain and cache actions need it; on a
 checkout step it is refused whole. Measured, `MUT-TEST-WINDOWS-CHECKOUT-REF`
 and `MUT-TEST-CHECKOUT-REF`.
@@ -269,7 +269,7 @@ step whose script is not in the job's pinned set can move the checkout --
 `git fetch origin master && git checkout --detach FETCH_HEAD` -- before the
 pinned command runs, so that command runs against another tree while the
 labels, fields, shell and input-free checkout all still match. A `uses:`
-step off [`PINNED_ACTIONS`] is code nobody here reviewed, with a checkout
+step off `PINNED_ACTIONS` is code nobody here reviewed, with a checkout
 of its own. Measured, `MUT-TEST-WINDOWS-RUN-RETARGETED`,
 `MUT-TEST-RUN-RETARGETED`, `MUT-GATE-RUN-RETARGETED`,
 `MUT-MSRV-RUN-RETARGETED` and `MUT-STEP-USES-UNPINNED`.
@@ -292,12 +292,12 @@ chose running inside an action this contract calls pinned.
 
 Every way a job installs a compiler other than the pinned one.
 
-[`PINNED_ACTIONS`] pins the action by commit; this pins the input that
+`PINNED_ACTIONS` pins the action by commit; this pins the input that
 decides which compiler it installs. A gate downgraded from `stable` to the
 version the golden image already carries leaves no leg compiling on current
 stable, and every other pin in this contract still matches. The MSRV leg is
 not checked here: it pins its own floor against the manifest, in
-[`ci_msrv_job_complaints`]. Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
+`ci_msrv_job_complaints`. Measured, `MUT-GATE-TOOLCHAIN-DOWNGRADED`.
 
 ## `out.push(format!(`
 
@@ -344,7 +344,7 @@ toolchain, which moves only by re-curation. `cargo check` and Clippy on
 without this witness nothing on GitHub's current stable ever code-generates
 or links the Windows tree: a Windows-only codegen or link failure there
 would pass every hosted leg while the guest, one stable behind, links and
-passes. [`WINDOWS_BUILD_WITNESS`] builds every test binary and executes
+passes. `WINDOWS_BUILD_WITNESS` builds every test binary and executes
 none. It lives in the Windows Clippy gate's job, whose field set and shells
 the gate contract pins; this pins the command, exactly once, on exactly one
 hosted Windows job. Measured, `MUT-WINDOWS-BUILD-WITNESS-*`.
@@ -388,8 +388,8 @@ normalised into agreement with whatever the workflow happens to say.
 
 Every way the MSRV leg fails to check the floor this crate publishes.
 
-Nothing above this function reaches that job. [`ci_gate_complaints`] selects
-a job by its `runs-on:` *and* a step whose `run:` is [`CLIPPY_GATE`], and
+Nothing above this function reaches that job. `ci_gate_complaints` selects
+a job by its `runs-on:` *and* a step whose `run:` is `CLIPPY_GATE`, and
 `msrv` matches neither -- it runs on `${{ matrix.os }}` and it runs
 `cargo check`. So until this existed the only structural claim on the MSRV
 leg was that the aggregate needs a job with that id: its matrix could be
@@ -441,9 +441,9 @@ keeps the two from drifting apart.
 Every way the workflow-scope `-D warnings` fails to reach a compilation.
 
 Two claims. The first is the pin: the workflow's own `env:` binds
-[`RUSTFLAGS_KEY`] to exactly [`RUSTFLAGS_VALUE`]. The second is what makes
+`RUSTFLAGS_KEY` to exactly `RUSTFLAGS_VALUE`. The second is what makes
 the first *effective*: no job and no step rebinds that name, and nothing
-anywhere binds [`ENCODED_RUSTFLAGS_KEY`], which Cargo reads in preference to
+anywhere binds `ENCODED_RUSTFLAGS_KEY`, which Cargo reads in preference to
 it.
 
 The override scan walks every job and every step rather than the jobs this

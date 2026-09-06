@@ -257,7 +257,7 @@ the gates come from — set the standard for the tasks that follow.
 This is the `reviews` contract below, applied to the other half of §14's
 verification: recorded because it is a fact about the run, not about
 today's machine. Budgets stay deliberately re-derived
-([`ResumeOptions::budget_usd`](crate::engine::ResumeOptions)) because a
+([`ResumeOptions::budget_usd`](../engine/options.md)) because a
 ceiling on one's own spending is not identity.
 
 `None` means the log predates this record and says nothing about the
@@ -307,7 +307,7 @@ run it again, because a resume does exactly that.
 All four fields, not just name and command. An earlier draft recorded the
 pair alone on the theory that `timeout` and `shell` are operational settings
 a resume may re-read; that is wrong about `shell`, which is half of what a
-command *means* (see [`ShellKind`](crate::gates::ShellKind)) — the same
+command *means* (see [`ShellKind`](../gates.md)) — the same
 `cmd = "true"` passes always under `sh` and fails always under `cmd.exe`.
 And it is wrong about `timeout` in the same direction, one step weaker: a
 gate that was given twenty minutes and is given one verifies less.
@@ -465,7 +465,7 @@ the evidence survives anyway. That matters more than it sounds: a run
 that did not record its usage can never be re-measured, and §23.2's
 conclusions about where spend goes were drawn entirely from
 cheap-implementer runs. Adapters have been parsing this into
-[`Outcome::usage`](crate::ir::Outcome) since step 3 and the engine threw
+[`Outcome::usage`](../ir.md) since step 3 and the engine threw
 it away.
 
 Pure addition, like `pool` above: `#[serde(default)]` means a log
@@ -853,7 +853,7 @@ replay is an attempt the engine died inside.
 ## `#[derive(Debug, Clone, PartialEq)]`
 
 The run state every reader derives and the engine mutates — the only thing
-[`apply`](RunState::apply) touches.
+`apply` touches.
 
 ## `pub task_ids: Vec<String>,`
 

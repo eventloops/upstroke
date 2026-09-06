@@ -54,6 +54,46 @@ upstroke.rs, whose published `/docs` tree does not contain `src/`.
 Code fragments in section headings are spelled as in source. Search each
 backticked fragment separately; the enclosing item distinguishes repeated lines.
 
+## Referring to an item
+
+These notes were rustdoc before they were Markdown, and rustdoc's two link
+forms do not survive the move. A shortcut reference resolves against the item
+tree in rustdoc; CommonMark looks for a link reference definition, finds none,
+and renders brackets around a code span with nothing behind them. An
+intra-doc destination becomes an `href` spelled `crate::effects::census_domain`,
+which resolves nowhere. `docs/` is the GitHub Pages source for upstroke.rs, so
+both are published exactly as written.
+
+```markdown
+[`normalize_lint`]                                   <- renders as bracketed code
+[`census_domain`](crate::effects::census_domain)     <- href resolves nowhere
+```
+
+A reference here is therefore one of two things.
+
+**An inline Markdown link**, when the reference names a module that has its own
+notes file and that file is not this one:
+
+```markdown
+[`crate::effects::production_code`](../../effects.md)
+```
+
+The destination is the other file, not a heading inside it. Headings are exact
+source signature substrings and repeat verbatim within a file — `effects.md`
+carries the `census_domain` module heading twice — so an anchor would name
+whichever copy the renderer's slugger numbered first. Where an anchor is
+genuinely unambiguous it is welcome; the gate does not resolve one.
+
+**A plain code span** otherwise:
+
+```markdown
+`normalize_lint`, `Self::files`, `ProductionModule::walk`
+```
+
+A bare item name does not identify a file, and a pointer to an item in the file
+the reader already has open is not navigation. Search the backticked fragment;
+the section headings are that grep string.
+
 ## Getting from the code to a note
 
 One marker, in the module header, and nothing else:
@@ -118,7 +158,19 @@ four Bash gates) and holds the two trees to each other in both directions:
   that loses its marker is caught from the notes side;
 - every notes file opens with the Markdown backlink shown above, optionally
   following an H1 and blank lines, and its relative target resolves to its module;
-- a module carries at most one marker, above its first line of code.
+- a module carries at most one marker, above its first line of code;
+- no notes file leaves a Rustdoc item path in a link destination. Every inline
+  destination is an `http`/`https`/`mailto` URL, a same-file `#anchor`, or a
+  relative path that exists in this repository and stays inside it — the check
+  that catches `crate::effects::census_domain`, `Self::close_and_wait` and
+  `std::time::Duration` alike, and a mistyped relative path with them;
+- and in the effects notes — `effects.md` and everything under `effects/` —
+  every bracketed code span is an inline link rather than a shortcut reference.
+  Those ten files are the domain because they are the ten an independent
+  CommonMark rendering audit measured: 145 shortcut references, all converted.
+  1743 remain across 111 other notes files, and
+  `PR161-NOTES-SHORTCUT-REFERENCES-TREE` is the standing entry for them. Widen
+  the domain with the conversion, never ahead of it.
 
 An absent `docs/internals/` is a failure, never "nothing to check": with markers in `src/` it is a
 deleted notes tree, and with none it is a gate measuring nothing. Each check has been broken on
@@ -128,6 +180,17 @@ The gate checks that opening format rather than parsing arbitrary Markdown.
 Hidden links, plain paths, code examples, and images do not satisfy it. Its
 isolated fixtures exercise valid depths and CRLF, malformed backlinks, missing
 files, and misplaced or duplicate markers.
+
+The link checks read a file the way CommonMark reads it: fenced blocks dropped,
+code spans found first, and one leaf block at a time — not one line, because a
+code span may cross one, and not the whole file, because backtick runs pair
+inside a block and an odd backtick in one paragraph would otherwise swallow the
+link in the next. That is why the forms named above can be written out here, in
+a file the gate reads, without failing it. Their fixtures cover a shortcut
+reference in the effects notes and one outside them, a reference wrapped across
+a line break, a Rustdoc destination with and without `crate::`, a destination
+that leaves the repository, external and anchor destinations, a destination
+carrying a title, and one hidden behind an odd backtick a block earlier.
 
 The gate does not check section headings, arbitrary source prose, or whether a
 note remains true. Those are review duties under §13, including its site-required

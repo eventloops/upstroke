@@ -12,7 +12,7 @@ What CI runs, on which runners, and with which shells — as constants.
 
 **One authority, deliberately.** The workflow oracle in `super::workflow`
 checks that `.github/workflows/ci.yml` matches these; the cfg census in
-`super::cfg` decides which of [`CI_TARGETS`]'s runners compiles a predicate.
+`super::cfg` decides which of `CI_TARGETS`'s runners compiles a predicate.
 A runner list written down twice is a list where one copy gets updated, and
 the copy that does not is the one that quietly stops measuring — with
 nothing failing to say so. Both readers take the same table.
@@ -190,15 +190,15 @@ single-use just-in-time config -- in about two and a half minutes
 The labels are an equality because a looser `runs-on:` is a different
 machine: `[self-hosted, windows]` admits any Windows runner the account ever
 registers, and the third label is what names the curated image. The
-platform's Clippy and MSRV legs stay on [`CI_TARGETS`]'s `windows-latest`,
+platform's Clippy and MSRV legs stay on `CI_TARGETS`'s `windows-latest`,
 which is why that entry is unchanged: GitHub's runner is still the witness
 that compiles every `#[cfg(windows)]` body, and through
-[`WINDOWS_BUILD_WITNESS`] the one that code-generates and links it on
+`WINDOWS_BUILD_WITNESS` the one that code-generates and links it on
 current stable, shipped binaries and test harnesses alike.
 
 ## `pub(super) const SELF_HOSTED_TEST_PLATFORM: &str = "windows-latest";`
 
-The [`CI_TARGETS`] runner whose tests run in [`TEST_WINDOWS_JOB`] rather than
+The `CI_TARGETS` runner whose tests run in `TEST_WINDOWS_JOB` rather than
 in the `test` matrix. Its shell and cfg valuations carry over: the guest
 carries PowerShell 7, so a `run:` step resolves to `pwsh` there exactly as
 on `windows-latest`, and it builds the same MSVC tuple.
@@ -343,8 +343,8 @@ Measured, `MUT-DEFAULTS-WORKING-DIRECTORY`.
 
 The workflow's `env:` mapping, pinned whole.
 
-An equality rather than a guard per name. [`RUSTFLAGS_KEY`] and
-[`ENCODED_RUSTFLAGS_KEY`] were guarded by name because they decide what the
+An equality rather than a guard per name. `RUSTFLAGS_KEY` and
+`ENCODED_RUSTFLAGS_KEY` were guarded by name because they decide what the
 compiler sees; but a *name this contract never thought of* decides whether
 the compiled thing runs at all. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER`
 pointed at a script that exits zero makes `cargo test` build every harness
@@ -386,14 +386,14 @@ runner switches off. That is a real limit and it is why this is not written
 as a defence: it catches the file committed by accident, on a developer's
 machine and in CI, and it says in the diff that the convention is deliberate.
 The leg whose execution left GitHub's runners is covered instead by
-[`WINDOWS_TEST_WITNESS`], which counts what actually ran.
+`WINDOWS_TEST_WITNESS`, which counts what actually ran.
 
 ## `pub(super) const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@";`
 
 The toolchain every leg but the MSRV floor installs, and the action that
 installs it.
 
-The action is pinned by commit in [`PINNED_ACTIONS`]; this pins its
+The action is pinned by commit in `PINNED_ACTIONS`; this pins its
 **input**, which is the part that decides which compiler runs. A
 `lint (windows)` downgraded from `stable` to the guest's own `1.97.1` makes
 the hosted witness link the same toolchain the self-hosted leg already
@@ -424,7 +424,7 @@ A runner CI uses, the target it compiles, and the shell its `run:` steps get.
 
 The tuple is the load-bearing half. What discharges a platform's clause is
 not a job *name* but the target whose `#[cfg(...)]` bodies that job compiles,
-and [`cfg_regions`] evaluates predicates against the valuations these
+and `cfg_regions` evaluates predicates against the valuations these
 invocations actually set rather than collecting the names inside them.
 
 ## `pub(super) struct CiTarget` › `pub(super) runner: &'static str,`

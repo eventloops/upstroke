@@ -98,7 +98,7 @@ On a Unix host `std::os::windows::fs::*` is a module that does not exist, so
 clippy reports it. `windows_sys::*` is a crate that is not linked at all, and
 clippy reports **nothing** for those — measured — which is why they are
 cross-checked against the tree's own Windows source instead, by
-[`every_platform_conditional_denial_names_something_real`].
+`every_platform_conditional_denial_names_something_real`.
 
 ## `pub(super) fn host_conditional_paths() -> Vec<&'static str>` › `vec![`
 

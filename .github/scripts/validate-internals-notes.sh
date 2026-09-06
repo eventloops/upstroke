@@ -12,6 +12,10 @@
 #   N3  Every notes file links back to its module, and the link resolves from
 #       the notes file's own directory to the repository root, at any depth.
 #   N4  A module carries at most one marker, and it sits above the first code.
+#   N5  No notes file carries a Rustdoc-only link form. Every inline link
+#       destination resolves -- a URL, a same-file anchor, or a relative path
+#       inside this repository -- and in the effects notes every bracketed
+#       code span is an inline link rather than a shortcut reference.
 #
 # An absent docs/internals/ is a failure, never "nothing to check": with
 # markers in src/ it is a deleted notes tree, and with none it is a gate
@@ -140,8 +144,183 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 
 (( notes_count > 0 )) || error "no notes files under $notes_root; this gate is inert"
 
+# --- N5. no Rustdoc-only link form survives in the notes ---------------------
+#
+# The notes were rustdoc before they were Markdown, and rustdoc's two link
+# forms mean nothing to a Markdown reader. `docs/` is also the GitHub Pages
+# source for upstroke.rs, so what these files render to is published.
+#
+# Two claims, with two domains, because the two forms cost differently to
+# remove and only one of them has been measured over the whole tree:
+#
+#   (a) EVERY notes file. An inline link destination is an http/https/mailto
+#       URL, a same-file `#anchor`, or a relative path that exists in this
+#       repository and stays inside it. A Rustdoc item path is none of those:
+#       `[`census_domain`](crate::effects::census_domain)` renders as
+#       `<a href="crate::effects::census_domain">` and goes nowhere. Eleven
+#       destinations of that shape were in the tree when this was written --
+#       eight spelled `crate::`, and `Self::close_and_wait`,
+#       `RunState::apply` and `std::time::Duration`, which a `crate::` search
+#       does not find. Resolution is the check that finds all four spellings
+#       and a mistyped relative path with them.
+#
+#   (b) The effects notes -- `docs/internals/effects.md` and everything under
+#       `docs/internals/effects/`. A bracketed code span is an inline link or
+#       it is not bracketed: `[`normalize_lint`]` is rustdoc's shortcut
+#       reference, and with no reference definition CommonMark renders it as
+#       `[<code>normalize_lint</code>]`, bracket noise rather than
+#       navigation. 145 of those were in these ten files; 1743 remain in 111
+#       other notes files, and PR161-NOTES-SHORTCUT-REFERENCES-TREE is the
+#       standing entry for them. This claim is what keeps the converted files
+#       converted, so widen the domain with the conversion, never ahead of it.
+#
+# Both read the file as CommonMark reads it: fenced code blocks are dropped,
+# code spans are found first, and the unit is the leaf block -- not the line,
+# because a code span may cross one, and not the file, because backtick runs
+# pair inside a block and an odd backtick would otherwise swallow whatever
+# came after it. `docs/internals/` also documents these very forms inside
+# code spans and fences, so a scan that read them literally would refuse its
+# own README. Anchors are not resolved: a heading's slug belongs to the
+# renderer, and these headings repeat verbatim within a file, so which
+# heading an anchor names is a review duty here rather than a gate's.
+dest_count=0
+while IFS= read -r notes; do
+  in_effects=0
+  case "$notes" in
+    "$notes_root/effects.md" | "$notes_root"/effects/*) in_effects=1 ;;
+  esac
+
+  while IFS=$'\t' read -r kind at text; do
+    if [[ "$kind" == SHORTCUT ]]; then
+      error "$notes:$at: [$text] is a Rustdoc shortcut reference; CommonMark renders it as bracketed code. Make it an inline Markdown link or drop the brackets"
+      continue
+    fi
+    # CommonMark's destination, then its optional title: `<dest>` keeps
+    # spaces, a bare destination ends at the first one. Neither form is used
+    # in the notes today; reading them is what keeps a title from arriving as
+    # part of the path and failing a file that is correct.
+    dest="${text#"${text%%[![:space:]]*}"}"
+    if [[ "$dest" == '<'*'>'* ]]; then
+      dest="${dest#<}"
+      dest="${dest%%>*}"
+    else
+      dest="${dest%%[[:space:]]*}"
+    fi
+    case "$dest" in
+      http://* | https://* | mailto:* | '#'*) continue ;;
+    esac
+    dest_count=$((dest_count + 1))
+    target="${dest%%#*}"
+    if [[ -z "$target" ]]; then
+      error "$notes:$at: link destination '$dest' has no path before its anchor"
+      continue
+    fi
+    resolved="$(cd "${notes%/*}" && realpath -m --relative-to="$root" "$target" 2>/dev/null || true)"
+    if [[ -z "$resolved" || "$resolved" == ../* ]]; then
+      error "$notes:$at: link destination '$dest' resolves outside this repository"
+      continue
+    fi
+    [[ -e "$root/$resolved" ]] \
+      || error "$notes:$at: link destination '$dest' resolves to $resolved, which does not exist"
+  done < <(awk -v effects="$in_effects" '
+    # Line number of offset p inside block b, relative to the block start.
+    function lineat(b, p,   k, ahead) {
+      ahead = 0
+      for (k = 1; k < p; k++) if (substr(b, k, 1) == "\n") ahead++
+      return ahead
+    }
+    # One leaf block, read the way CommonMark reads inline text: backtick runs
+    # pair inside the block and nowhere else, so an odd backtick in one
+    # paragraph cannot swallow the next. A whole-file scan gets three link
+    # destinations wrong for exactly that reason.
+    function scan(b, ln0,   n, i, c, j, run, k, m, closed, ch, label) {
+      n = length(b)
+      i = 1
+      while (i <= n) {
+        c = substr(b, i, 1)
+        if (c == "\\") { i += 2; continue }
+        if (c == "`") {
+          j = i
+          while (j <= n && substr(b, j, 1) == "`") j++
+          run = j - i
+          k = j
+          closed = 0
+          while (k <= n) {
+            if (substr(b, k, 1) == "`") {
+              m = k
+              while (m <= n && substr(b, m, 1) == "`") m++
+              if (m - k == run) { closed = m; break }
+              k = m
+            } else k++
+          }
+          if (closed == 0) { i = j; continue }
+          if (effects && i > 1 && substr(b, i - 1, 1) == "[" \
+              && substr(b, closed, 1) == "]" && substr(b, closed + 1, 1) != "(") {
+            # One record per finding: a code span may hold a line break or a
+            # tab, and either would split this line and hand the reader a
+            # second, invented error with no line number.
+            label = substr(b, i, closed - i)
+            gsub(/[\n\t]/, " ", label)
+            printf "SHORTCUT\t%d\t%s\n", ln0 + lineat(b, i), label
+          }
+          i = closed
+          continue
+        }
+        if (c == "]" && substr(b, i + 1, 1) == "(") {
+          k = i + 2
+          while (k <= n) {
+            ch = substr(b, k, 1)
+            if (ch == ")" || ch == "(" || ch == "\n") break
+            k++
+          }
+          if (substr(b, k, 1) == ")") {
+            printf "DEST\t%d\t%s\n", ln0 + lineat(b, i), substr(b, i + 2, k - i - 2)
+            i = k + 1
+            continue
+          }
+        }
+        i++
+      }
+    }
+    function flush() {
+      if (buf != "") scan(buf, bufline)
+      buf = ""
+      bufline = 0
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      body = line
+      sub(/^ */, "", body)
+      ch = ""
+      run = 0
+      if (length(line) - length(body) <= 3) {
+        ch = substr(body, 1, 1)
+        if (ch == "`" || ch == "~") { while (substr(body, run + 1, 1) == ch) run++ }
+      }
+      if (infence) {
+        if (run >= 3 && ch == fchar && run >= flen) infence = 0
+        next
+      }
+      if (run >= 3) { flush(); infence = 1; fchar = ch; flen = run; next }
+      if (line ~ /^[ \t]*$/) { flush(); next }
+      if (substr(body, 1, 1) == "#") { flush(); scan(line, NR); next }
+      if (buf == "") { bufline = NR; buf = line } else buf = buf "\n" line
+    }
+    END { flush() }
+  ' "$notes")
+done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
+
+(( dest_count > 0 )) || error "no relative link destinations found under $notes_root; N5 is inert"
+
+# The effects notes are (b)'s whole domain. If the module is here and its
+# notes are not, the claim measures nothing and says so rather than passing.
+if [[ -f src/effects.rs && ! -f "$notes_root/effects.md" ]]; then
+  error "src/effects.rs exists but $notes_root/effects.md does not; N5's converted domain is empty"
+fi
+
 if (( failed == 0 )); then
-  echo "internals notes: $marker_count marker(s), $notes_count notes file(s), all resolve both ways"
+  echo "internals notes: $marker_count marker(s), $notes_count notes file(s), $dest_count link destination(s), all resolve both ways"
 fi
 
 exit "$failed"

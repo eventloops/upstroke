@@ -14,7 +14,7 @@ actually compile it.
 The predecessor collected `target_os = "..."` names wherever they appeared
 at a code position and read each name as a platform demanding its own Clippy
 runner. This module decides predicates instead, against the valuations
-`super::ci_model`'s [`CI_TARGETS`] say CI sets — completely, so an unmodelled
+`super::ci_model`'s `CI_TARGETS` say CI sets — completely, so an unmodelled
 name is a hard failure rather than an optimistic guess, and per invocation,
 because `--all-targets` compiles the library twice and merging the two would
 make `all(test, not(test))` look reachable.
@@ -24,12 +24,12 @@ got wrong:
 
   * **Not every cfg gates.** `cfg!(P)` is an expression and
     `#[cfg_attr(P, attr)]` conditions an attribute; the code around either is
-    compiled everywhere. [`CfgForm`] keeps the three apart, and only
-    [`CfgForm::Gate`] is a platform demand.
+    compiled everywhere. `CfgForm` keeps the three apart, and only
+    `CfgForm::Gate` is a platform demand.
   * **An item's predicate is not the attribute written on it.** Stacked
     `#[cfg]`s conjoin, and so does every enclosing guard — the module block
     it sits in, and, for a whole-file module, the `#[cfg(test)] mod name;`
-    that declares the file. [`CfgSite::written`] and [`CfgSite::rendered`]
+    that declares the file. `CfgSite::written` and `CfgSite::rendered`
     are both kept so the difference is visible.
   * **Position and text come from different views.** Nesting and brace depth
     read the blanked source, where a `cfg(` in prose or in a string literal
@@ -78,8 +78,8 @@ One compilation's **complete** cfg valuation.
 
 Complete is the load-bearing word. A name this valuation does not carry is
 not "unknown": rustc leaves it unset, so `cfg(name)` is **false**. That is
-only sound while the set of names is closed, which is what [`MODELLED_FLAGS`]
-and [`MODELLED_KEYS`] close and what [`holds`] refuses to guess past.
+only sound while the set of names is closed, which is what `MODELLED_FLAGS`
+and `MODELLED_KEYS` close and what `holds` refuses to guess past.
 
 ## `struct Valuation` › `invocation: String,`
 
@@ -231,7 +231,7 @@ Every `cfg` occurrence in `sources`, and every one that could not be read.
 Two passes, because a file's guard is written in another file. Pass one reads
 the `#[cfg(P)] mod name;` declarations and resolves each to the file it
 governs; pass two scans every file with the guard it inherited. The files
-[`WHOLE_FILE_TEST_MODULES`] lists exist only under a `cfg(test)` module
+`WHOLE_FILE_TEST_MODULES` lists exist only under a `cfg(test)` module
 declaration -- the population
 `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
 resolves independently -- and a census that missed it would read every
@@ -258,7 +258,7 @@ has cost this repository time before:
   * **the predicate text** is the raw span, because
     `blank_comments_and_strings` erases the platform name along with the
     quotes: reading the name from the blanked view is why the first version
-    found only `windows`. [`CfgReader`] skips comments on its own, which is
+    found only `windows`. `CfgReader` skips comments on its own, which is
     the part the comment blanker cannot do here -- it deletes comment bytes
     rather than blanking them, so it does not preserve the positions this
     scan is built on.
@@ -474,7 +474,7 @@ stopped being true.
 
 Where it is compared with `>=`, the length is a floor. One entry --
 `readiness.rs`, reached through an inline ancestor rather than through an
-attribute on its own declaration -- is outside [`cfg_regions`]' grammar and
+attribute on its own declaration -- is outside `cfg_regions`' grammar and
 carries no `cfg` occurrence, so the two derivations agree on the number
 without that census having to resolve the ancestry that produces it.
 

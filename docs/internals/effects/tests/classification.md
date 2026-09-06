@@ -34,8 +34,8 @@ A file reached by a plain `mod` declaration is inside every whole-tree
 census's domain. That is the constraint `policy.rs` records, and the one
 that kept the effectful build helpers out of it. The inline module closes it
 here for both of the repository's source cutters at once:
-[`crate::effects::production_region`] truncates at the first `#[cfg(test)]`
-and [`crate::effects::production_code`] excises the item that attribute
+[`crate::effects::production_region`](../../effects.md) truncates at the first `#[cfg(test)]`
+and [`crate::effects::production_code`](../../effects.md) excises the item that attribute
 attaches to, so the four bodies are outside both regions and this file reads
 as the test logic it is.
 

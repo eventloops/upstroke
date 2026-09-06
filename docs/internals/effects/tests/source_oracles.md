@@ -12,10 +12,10 @@ The **source oracles**: the twelve checks that hold this crate's own lexical
 instruments against the tree they read.
 
 Four instruments, and every whole-tree census in this repository is built on
-one of them: [`crate::effects::blank_comments`] and
-[`crate::effects::blank_comments_and_strings`] decide what a census can
-*see*, [`crate::effects::production_region`] and
-[`crate::effects::production_code`] decide what it is allowed to *count*,
+one of them: [`crate::effects::blank_comments`](../../effects.md) and
+[`crate::effects::blank_comments_and_strings`](../../effects.md) decide what a census can
+*see*, [`crate::effects::production_region`](../../effects.md) and
+[`crate::effects::production_code`](../../effects.md) decide what it is allowed to *count*,
 and `census_domain::whole_file_test_modules` decides which files it skips
 entirely. A defect in any of them is silent by construction — the census
 stays green and its count is simply lower — so these twelve drive each
@@ -51,8 +51,8 @@ every whole-tree census's domain, and the bodies below are an unusually rich
 source of census needles: a table of funnel prefixes, a `RunnerRequest {`
 quoted in prose, and the container-runtime literal three censuses in this
 crate count files by. The inline module closes it for both source cutters at
-once — [`crate::effects::production_region`] truncates at the first
-`#[cfg(test)]` and [`crate::effects::production_code`] excises the item that
+once — [`crate::effects::production_region`](../../effects.md) truncates at the first
+`#[cfg(test)]` and [`crate::effects::production_code`](../../effects.md) excises the item that
 attribute attaches to — so none of those needles is in any census's region,
 and this file reads as the test logic it is.
 
@@ -93,28 +93,28 @@ non-test `mod <name>;` it writes, with the two files that name can
 resolve to.
 
 Derived rather than enumerated, for the reason
-[`crate::effects::census_domain::declared_whole_file_test_modules`] gives
+[`crate::effects::census_domain::declared_whole_file_test_modules`](../../effects.md) gives
 at length. A `read_dir` filtered to `*.rs` entries gets a census domain
 wrong in both directions at once: a child written in the `<name>/mod.rs`
 layout is a *directory* entry and is skipped, and a `#[cfg(test)] mod
 row_cases;` child carries its `cfg` on the **declaration**, so
-[`production_region`] cannot cut it out of `row_cases.rs` and a stem that
+`production_region` cannot cut it out of `row_cases.rs` and a stem that
 is not exactly `tests` is scanned as production.
 
 **What was checked about the machinery this reuses**, rather than assumed
 from the fact that it exists:
 
-* [`scan_module_declarations`] reads a file's module *structure* — brace
+* `scan_module_declarations` reads a file's module *structure* — brace
   depth, the inline modules open at each point, and the `cfg` on each of
-  them — over [`crate::effects::blank_comments_and_strings`], so a `mod`
+  them — over [`crate::effects::blank_comments_and_strings`](../../effects.md), so a `mod`
   written in prose or in a string is spaces. That is what a text rule
   gets wrong, and `policy.rs` records a phantom skip once derived from a
   declaration written inside a comment.
-* [`candidates_for`] names both out-of-line layouts and folds the inline
+* `candidates_for` names both out-of-line layouts and folds the inline
   path into the directory. It refuses a `#[path]` attribute rather than
   resolving it, which is the one construct that could point a declaration
   outside its own directory.
-* [`sole_present`] refuses zero candidates and refuses two, rather than
+* `sole_present` refuses zero candidates and refuses two, rather than
   picking one. A domain that cannot name the file a declaration resolves
   to is not a domain.
 * **The one thing the scan does not decide**, and it is a hole rather
@@ -122,7 +122,7 @@ from the fact that it exists:
   `#[cfg_attr(all(), cfg(test))] mod hidden;` reads as unconditional.
   This walk is the first caller whose answer depends on that
   classification, so it is the change that would activate the hole —
-  and [`refuse_unclassifiable_cfg_attr`] stops the walk on one rather
+  and `refuse_unclassifiable_cfg_attr` stops the walk on one rather
   than classifying it. The reasoning is there.
 * **The limitation that does *not* transfer.**
   `declared_whole_file_test_modules` deliberately does not close over the
@@ -149,7 +149,7 @@ to leave behind.
 Stop, rather than classify, when a file writes a `cfg_attr` that could
 apply a `cfg`.
 
-[`scan_module_declarations`] treats a `cfg_attr` as significant only when
+`scan_module_declarations` treats a `cfg_attr` as significant only when
 it mentions `path` (`src/effects.rs`), so
 `#[cfg_attr(all(), cfg(test))] mod row_cases;` — which rustc applies as
 `#[cfg(test)]` and compiles only under `test` — is read there as an
@@ -164,7 +164,7 @@ reader of that classification, and so is the change that would put the
 hole in reach: a test-only child read as production drops a file of
 legitimate test code into a census that rejects a wildcard `row()` arm.
 
-**The scan is not widened to close it.** What [`scan_module_declarations`]
+**The scan is not widened to close it.** What `scan_module_declarations`
 decides is what every census in this crate measures; teaching it to
 evaluate `cfg_attr` predicates changes all of them at once and is its own
 change with its own review — the disposition
@@ -228,9 +228,9 @@ substitution walking through it — keep the call, bind its result to
 `_`, scan a hard-coded list instead, and there is still exactly one
 call and no `read_dir`.
 
-So the difference is made a *type* error instead. [`Self::walk`] is
+So the difference is made a *type* error instead. `Self::walk` is
 the only constructor, `sources` is private to this module, and the
-scan is [`Self::row_mapping_wildcards`], a method over source text
+scan is `Self::row_mapping_wildcards`, a method over source text
 only the walk can put in the struct. Under that substitution there is
 no `ProductionModule` to call the scan on, and the census does not
 compile.
@@ -240,9 +240,9 @@ that keeps the walk, keeps the call, and takes its answer from a
 helper beside it that reads the files itself compiles perfectly well,
 and no assertion whose domain is the census's *source text* sees it —
 which is the bypass two lexical repairs were shown to admit. That one
-is closed by [`RowMappingScan::scanned`]: the scan records the path of
+is closed by `RowMappingScan::scanned`: the scan records the path of
 every file it read, the census asserts that collection is
-[`Self::files`], and a helper's stale eight against the walk's nine
+`Self::files`, and a helper's stale eight against the walk's nine
 fails on a set difference rather than on a name.
 
 ## `impl ProductionModule` › `pub(super) fn walk(root: &Path) -> Self {`
@@ -276,10 +276,10 @@ come through this line.
 ## `impl ProductionModule` › `pub(super) fn sources_for_witness(&self) -> Vec<(PathBuf, String)> {`
 
 The walked files with the source the walk read, for the one
-witness that drives [`refuse_macro_declared_modules`] against
+witness that drives `refuse_macro_declared_modules` against
 the real module. Not a way to obtain the domain: the census
-takes its scan from [`Self::row_mapping_wildcards`], and a
-caller holding this still cannot construct a [`RowMappingScan`].
+takes its scan from `Self::row_mapping_wildcards`, and a
+caller holding this still cannot construct a `RowMappingScan`.
 
 ## `impl ProductionModule` › `pub(super) fn files(&self) -> Vec<PathBuf> {`
 
@@ -291,7 +291,7 @@ Scan the module's production regions for `row()` mappings.
 
 **Returns the path of every file it read.** That is what lets a
 caller state its domain as a claim about *values* rather than
-about its own source text; see [`RowMappingScan`].
+about its own source text; see `RowMappingScan`.
 
 ## `pub(super) fn row_mapping_wildcards(&self) -> RowMappingScan` › `let body_end = rest.find("\n    }").unwrap_or(rest.len());`
 
@@ -319,7 +319,7 @@ declaration accounts for**.
 The domain stays *declared*, not enumerated — this does not add the
 directory to it, and a file found here is a refusal rather than a new
 member. What it closes is the direction a declaration scan cannot see
-on its own: [`scan_module_declarations`] reads an item-position macro
+on its own: `scan_module_declarations` reads an item-position macro
 invocation's **tokens**, and a macro whose body lives in a file the
 walk never reads expands to `mod twelfth;` while its invocation site
 shows nothing module-shaped. The walk then stays at eight paths and
@@ -364,7 +364,7 @@ invocation rather than `macro_rules! name {` or `!=`.
 Refuse an item-position macro invocation whose `macro_rules!` the
 walk cannot read.
 
-**This is the half [`refuse_unaccounted_files`] cannot reach.** That
+**This is the half `refuse_unaccounted_files` cannot reach.** That
 one reconciles the module's own directory, so it catches a hidden
 child that lands *inside* it. A macro expanding to
 `#[path = "effects_hidden.rs"] mod hidden;` puts the file beside the
@@ -404,7 +404,7 @@ When such an invocation exists. Driven in both directions by
 
 ## `mod domain` › `pub(super) struct RowMappingScan {`
 
-What [`ProductionModule::row_mapping_wildcards`] read, and what it
+What `ProductionModule::row_mapping_wildcards` read, and what it
 found in it.
 
 **`scanned` is the half that makes the census's domain checkable.**
@@ -417,7 +417,7 @@ own body innocent of every needle, so the assertion's domain (that
 body) was never the claim's domain (the files the census reads).
 
 Recording the paths moves the question to run time. A caller compares
-[`Self::paths`] with [`ProductionModule::files`], and a scan that read
+`Self::paths` with `ProductionModule::files`, and a scan that read
 eight files while the walk produced nine fails on the set difference.
 
 **The fields are private to this module and there is no constructor,
@@ -438,9 +438,9 @@ wider than the domain it counts (the files *reported*) — so the
 repair is the one `CODING_STANDARDS.md` prescribes under
 "Representing state": keep fields private when construction must
 preserve an invariant, and do not expose a representation and ask
-callers to behave. [`ProductionModule::row_mapping_wildcards`] is now
+callers to behave. `ProductionModule::row_mapping_wildcards` is now
 the only expression in the crate that can produce this value, and it
-is a method on a type only [`ProductionModule::walk`] constructs.
+is a method on a type only `ProductionModule::walk` constructs.
 
 ## `pub(super) struct RowMappingScan` › `scanned: Vec<(PathBuf, usize)>,`
 
@@ -470,7 +470,7 @@ How many `row()` mappings were found across all of them.
 
 The files that were read and held no mapping.
 
-The control that keeps [`Self::paths`] from being a tautology:
+The control that keeps `Self::paths` from being a tautology:
 non-empty on the real module, so the recorded collection is
 demonstrably the domain and not the hits.
 
@@ -526,14 +526,14 @@ enumerated for.
 The mappings live in a **module** rather than a file since
 `topology::effects` was split into per-concern child modules:
 `EffectSiteId::row` stayed in the root and the eleven site enums' went to
-`sites.rs`. So the domain is a [`ProductionModule`] — a path here names a
+`sites.rs`. So the domain is a `ProductionModule` — a path here names a
 module, not a file — and
 `the_row_mapping_census_domain_is_the_declared_module` is what measures
 membership in it, in both directions.
 
 **The domain is bound to the walk here, over values.** The scan returns
 the path of every file it read, and the first assertion below is that
-that collection *is* [`ProductionModule::files`]. Two earlier repairs
+that collection *is* `ProductionModule::files`. Two earlier repairs
 asserted the same intent over this function's **source text** — one
 counted the call, one banned the names that can open a file — and both
 were bypassed the same way, by a sibling helper that scans a stale list
@@ -771,7 +771,7 @@ The control.
 The scan's own parser, on this tree's real shapes.
 
 `externally_reachable_fns` decides the classification domain, so a parser
-that quietly saw half the tree would make [`every_externally_reachable_fn_of_a_legacy_or_shared_module_is_classified`]
+that quietly saw half the tree would make `every_externally_reachable_fn_of_a_legacy_or_shared_module_is_classified`
 pass against a domain nobody drew — the omission failure this project's
 reconciliation table exists for, one level down.
 
@@ -797,7 +797,7 @@ the tree. It is in the domain now, which means somebody has to classify it.
 The comment blanker models raw strings, so an unparsed literal cannot erase
 a later one.
 
-`PR6-LANEF-005`. [`blank_comments`] used to track only `"`, and documented
+`PR6-LANEF-005`. `blank_comments` used to track only `"`, and documented
 the omission as safe because "the failure mode is a needle this function does
 not find … loud rather than accept something extra". **For a census over an
 expected set that is backwards**: a missed needle is a false negative, the
@@ -897,7 +897,7 @@ file.
 The second half of `PR7-R2C-CHAR-LITERAL-DESYNC`, and the half that decides
 how much a desync costs. `configured_item_end` has two give-up paths — an
 unbalanced brace and an item with no terminator before end of file — and both
-used to return `bytes.len()`, which [`production_code`] reads as "the item is
+used to return `bytes.len()`, which `production_code` reads as "the item is
 the rest of the file" and blanks. That converts a tokeniser that has lost
 phase into **silence**: every production item below the attribute leaves
 every census that consults this region, and the census reports zero
@@ -928,9 +928,9 @@ declarations, structurally resolved — not a file-name rule.**
 
 The class boundary for `PR7-R5-ATT-001`. Four whole-tree censuses skip test
 files; three took the set from
-[`census_domain::declared_whole_file_test_modules`] and one wrote its own
+[`census_domain::declared_whole_file_test_modules`](../../effects.md) and one wrote its own
 rule, `path.file_stem() == "tests"`. That covers the entries of
-[`WHOLE_FILE_TEST_MODULES`] whose file stem is `tests` — the ones a
+`WHOLE_FILE_TEST_MODULES` whose file stem is `tests` — the ones a
 literal `#[cfg(test)] mod tests;` declares. The crate declares six
 more, and they are exactly the ones a census is most likely to trip over
 — a scaffold, a fake, a fixture and a readiness protocol exist to *name*
@@ -947,7 +947,7 @@ fixture — five denied effect calls among them — as production.
 **Every module named, not counted.** A count alone passes when the
 derivation swaps one file for another — same cardinality, different set
 — and names alone pass when it grows one more nobody looked at.
-[`WHOLE_FILE_TEST_MODULES`] is the census domain as a list of paths, so
+`WHOLE_FILE_TEST_MODULES` is the census domain as a list of paths, so
 comparing against it refuses both, and refuses them by naming the file
 gained or lost rather than by printing two integers.
 
@@ -1076,7 +1076,7 @@ a count.
 
 ## `pub(super) mod oracles` › `pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {`
 
-[`production_code`] removes the item and keeps the file.
+`production_code` removes the item and keeps the file.
 
 Every shape here is one this tree actually contains, and each is a way a
 truncating region loses production code. The censuses that use this helper
@@ -1131,14 +1131,14 @@ And a real attribute beside prose that quotes one is still found.
 
 ## `pub(super) mod oracles` › `pub(in crate::effects::tests) fn the_whole_region_contains_the_truncated_one() {`
 
-The region is a superset of [`production_region`]'s, file by file, over the
+The region is a superset of `production_region`'s, file by file, over the
 tree — and keeps what the truncating region cannot: the code below the cut.
 
 ### What each assertion here is worth, because they are not worth the same
 
 The prefix comparison is a **consistency check on a construction, and it
-cannot fail.** [`production_code`] never writes below the index of its first
-`#[cfg(test)]` match, [`production_region`] cuts at exactly that index, and
+cannot fail.** `production_code` never writes below the index of its first
+`#[cfg(test)]` match, `production_region` cuts at exactly that index, and
 no token straddles a cut that lands on visible code — so the two sides are
 the same bytes of the same blanking, and no input separates them. It is kept
 because it would start failing if either function's cut point moved, which is
@@ -1169,7 +1169,7 @@ or a string literal rather than code —
 |---|---|---|
 | `src/agent/proc.rs` × `run_with_timeout` | 3 | doc comments; the census's expected count was re-derived to 5 |
 | `src/effects.rs` × `Command::new(` | 1 | **a string literal**: `DENIAL_FIXTURES`' `source:` field, a fixture that exists to be refused |
-| `src/effects.rs` × `run_with_timeout` | 1 | a doc comment in [`production_code`]'s own prose |
+| `src/effects.rs` × `run_with_timeout` | 1 | a doc comment in `production_code`'s own prose |
 | five files × `TopologyFold` | 15 | doc comments; that needle decides *set membership* for `FOLD_MENTIONS` and all five files stay in the set |
 
 So the claim that holds is "drops no occurrence that is **code**". The
@@ -1217,7 +1217,7 @@ carried a hazard the other two did not:
 
 | where | what it removed | the hazard it carried |
 |---|---|---|
-| [`production_region`] (`src/effects.rs`, `pub`) | everything from the **first** `#[cfg(test)]`, whatever it attaches to | a `#[cfg(test)] use` truncates the file |
+| `production_region` (`src/effects.rs`, `pub`) | everything from the **first** `#[cfg(test)]`, whatever it attaches to | a `#[cfg(test)] use` truncates the file |
 | `runner::tests::production_region` (private, **removed**) | only `#[cfg(test)] mod … { … }` **blocks** | it did not blank comments, so its counts included prose |
 | `events::log::tests::production_region` (private, still here) | from the first `#[cfg(test)]` in the **raw** source | `PR4-CENSUS-COMMENT-ORACLE`: a `#[cfg(test)]` in a comment truncates |
 
@@ -1232,7 +1232,7 @@ PR7's census repair removed the second and left **two**, which is what the
 count at the bottom now pins. Every whole-tree census that asks a
 *prohibition* question — the barrier census, the four censuses in
 `runner::tests`, the container token census — now shares
-[`crate::effects::production_code`]: the whole file, comments and string
+[`crate::effects::production_code`](../../effects.md): the whole file, comments and string
 literals blanked, every `#[cfg(test)]` **item** removed rather than the file
 truncated at the first one. It is a fourth semantics and deliberately not a
 fourth `production_region`: truncation is right for a *domain* question and
@@ -1275,7 +1275,7 @@ by name rather than quietly removing itself from every census that uses the
 
 What the first `#[cfg(test)]` in `source` attaches to, or `None` when the
 file has none. Read out of the **blanked** text, exactly as
-[`production_region`] reads it, so a `#[cfg(test)]` quoted in a doc
+`production_region` reads it, so a `#[cfg(test)]` quoted in a doc
 comment neither cuts nor is classified — `src/runner/container.rs`
 carries such a comment, its own warning about this hazard.
 

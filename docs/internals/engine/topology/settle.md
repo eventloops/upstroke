@@ -37,10 +37,10 @@ answer neither.
 ### `retained_incarnation` is an `Epoch`
 
 `AttemptSettlement::Retained.retained_incarnation` is typed
-[`Epoch`](crate::topology::events::Epoch) and is compared against the
+[`Epoch`](../../topology/events.md) and is compared against the
 fold's epoch — `state.resumes`, the number of times this run has resumed.
 `RunStarted4::incarnation` and `RunResumed4::incarnation` are
-[`IncarnationId`](crate::topology::events::IncarnationId), a per-process
+[`IncarnationId`](../../topology/events.md), a per-process
 ULID that identifies a coordinator process and is never compared to an
 epoch. The same English word names two different types; this module wires
 the field from [`TopologyFold::epoch`] and never from an `IncarnationId`.
