@@ -109,7 +109,7 @@ Where one of these has to stay, it stays, and the notes file says so.
 ## Keeping them honest
 
 `.github/scripts/test-internals-notes.sh` runs in CI's `lint` job (the Ubuntu one, with the other
-four Bash gates) and holds the two trees to each other in both directions:
+five Bash gates) and holds the two trees to each other in both directions:
 
 - every marker is spelled exactly `//! Extended notes: \`docs/internals/<module>.md\`` — no
   anchor, no prose, no other comment form — names the notes file that its own module's path

@@ -12,7 +12,7 @@ source, documentation, workflows, release machinery and this file.
    Review evidence, Risk and rollback, Review finding ledger — and
    `.github/scripts/validate-pr-body.sh` rejects anything else. Run it against your body before
    pushing.
-3. **Run the nine-command baseline** (`CODING_STANDARDS.md` §2) before every push, then wait for
+3. **Run the ten-command baseline** (`CODING_STANDARDS.md` §2) before every push, then wait for
    the two required contexts: `upstroke-ci` (formatting, Clippy on three platforms, the Linux and macOS
    test matrix, the Windows suite on its self-hosted ephemeral runner `test (winguest)`, the
    MSRV matrix, the six Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
