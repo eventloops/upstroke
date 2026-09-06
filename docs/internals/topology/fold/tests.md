@@ -125,6 +125,24 @@ meant another lands on a value this fixture does not hold.
 
 A fold that has recorded its `run_started` and nothing else.
 
+## `fn attempt_finished_mut(event: &mut TopologyEvent) -> &mut AttemptFinished4 {`
+
+The body of an `attempt_finished` a fixture has just built, for the tables that
+damage one coordinate of an otherwise valid event.
+
+These two accessors exist because §7 denies `unreachable!` in tests as well as in
+production, with no Clippy allowance to take, and the eleven sites that read
+`let ... else { unreachable!("built as an attempt_finished") }` were that
+construct. A test fails its own setup with a message naming the failed premise
+instead, which is what the panic here does, and `#[track_caller]` reports the
+fixture line rather than this one. The premise is live rather than decorative:
+handing either accessor an event of another kind panics with the kind it was
+given.
+
+## `fn candidate_prepared_mut(event: &mut TopologyEvent) -> &mut CandidatePrepared {`
+
+The same accessor for a `candidate_prepared`.
+
 ## `fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {`
 
 --- event builders ----------------------------------------------------

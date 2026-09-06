@@ -429,6 +429,28 @@ fn accepts(fold: &TopologyFold, event: &TopologyEvent) {
     }
 }
 
+#[track_caller]
+fn attempt_finished_mut(event: &mut TopologyEvent) -> &mut AttemptFinished4 {
+    match &mut event.body {
+        TopologyEventBody::AttemptFinished { data } => data,
+        other => panic!(
+            "the fixture builds an `attempt_finished`, and this is a `{}`",
+            other.kind()
+        ),
+    }
+}
+
+#[track_caller]
+fn candidate_prepared_mut(event: &mut TopologyEvent) -> &mut CandidatePrepared {
+    match &mut event.body {
+        TopologyEventBody::CandidatePrepared { data } => data,
+        other => panic!(
+            "the fixture builds a `candidate_prepared`, and this is a `{}`",
+            other.kind()
+        ),
+    }
+}
+
 fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {
     ReviewRecord {
         pass: pass.to_owned(),
@@ -934,9 +956,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     accepts(&fold, &retain(ZETA, 1, session, Epoch(0)));
 
     let mut wrong_attempt = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_attempt.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_attempt);
     data.record.attempt = 2;
     assert!(
         matches!(
@@ -947,9 +967,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut wrong_session = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_session.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_session);
     data.record.session_id = Some("sess-somebody-elses".to_owned());
     let error = refuse(&fold, &wrong_session);
     assert!(
@@ -958,9 +976,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut sessionless = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut sessionless.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut sessionless);
     data.record.session_id = None;
     let error = refuse(&fold, &sessionless);
     assert!(
@@ -969,9 +985,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut wrong_generation = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_generation.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_generation);
     data.generation = GenerationId(1);
     assert!(
         matches!(
@@ -1004,9 +1018,7 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
     let session = "sess-ÜNI-unsettled";
 
     let claims_success = |event: &mut TopologyEvent| {
-        let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(event);
         data.record.failure = None;
         data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
         assert!(
@@ -1052,9 +1064,7 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
         );
 
         let mut judged = settle(ZETA, 0, 1, settlement());
-        let TopologyEventBody::AttemptFinished { data } = &mut judged.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(&mut judged);
         data.record.failure = None;
         data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Failed)];
         assert!(
@@ -3899,9 +3909,7 @@ fn a_candidate_prepared_whose_record_failed_is_refused() {
     accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
     let mut failed = candidate_prepared(ZETA, 0, &base);
-    let TopologyEventBody::CandidatePrepared { data } = &mut failed.body else {
-        unreachable!("built as a candidate_prepared")
-    };
+    let data = candidate_prepared_mut(&mut failed);
     data.attempt.failure = Some(crate::events::FailureRecord {
         kind: crate::ladder::FailureKind::GateFailed,
         origin: crate::ladder::FailureOrigin::Worker,
@@ -3943,9 +3951,7 @@ fn a_candidate_prepared_whose_review_did_not_pass_is_refused() {
         accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
         let mut judged = candidate_prepared(ZETA, 0, &base);
-        let TopologyEventBody::CandidatePrepared { data } = &mut judged.body else {
-            unreachable!("built as a candidate_prepared")
-        };
+        let data = candidate_prepared_mut(&mut judged);
         assert!(data.attempt.failure.is_none());
         data.attempt
             .reviews
@@ -4019,9 +4025,7 @@ fn prepared_with_passes(
     passes: &[(&str, ReviewPassOutcome)],
 ) -> TopologyEvent {
     let mut event = candidate_prepared(key, 0, base);
-    let TopologyEventBody::CandidatePrepared { data } = &mut event.body else {
-        unreachable!("built as a candidate_prepared")
-    };
+    let data = candidate_prepared_mut(&mut event);
     data.attempt.reviews = passes
         .iter()
         .map(|(pass, outcome)| review_pass(pass, *outcome))
@@ -4241,9 +4245,7 @@ fn an_attempt_finished_whose_record_says_success_is_refused() {
     accepts(&fold, &settle(ZETA, 0, 1, closed()));
 
     let mut lying = settle(ZETA, 0, 1, closed());
-    let TopologyEventBody::AttemptFinished { data } = &mut lying.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut lying);
     *data.record = attempt_record(1);
     assert!(data.record.is_successful());
 
@@ -4277,9 +4279,7 @@ fn an_attempt_finished_whose_record_names_another_attempt_is_refused() {
 
     for named in [0, 2, 9] {
         let mut misattributed = settle(ZETA, 0, 1, closed());
-        let TopologyEventBody::AttemptFinished { data } = &mut misattributed.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(&mut misattributed);
         data.record.attempt = named;
 
         let error = refuse(&fold, &misattributed);
