@@ -178,9 +178,18 @@ impl HookHarness {
 
     /// Arm an injection at one point of one site.
     ///
-    /// Refuses a point the site does not expose and a mode the point does not
-    /// support, so a suite cannot quietly arm a fault that no funnel will ever
-    /// consult.
+    /// Refuses a point the site does not declare and a mode that point does
+    /// not declare support for, so a suite cannot quietly arm a fault the
+    /// inventory says no funnel of that site consults.
+    ///
+    /// Which host a point exists on is deliberately not one of the refusals.
+    /// Arming is host-agnostic: [`SubEffectPoint::platform`] is read by
+    /// [`check_bijection`](crate::topology::effects::check_bijection) against
+    /// the host it is given, and a suite drives a platform's point contract
+    /// through a funnel fake on whatever host it runs — as
+    /// `every_family_of_the_harness_bundle_records_into_the_same_harness`
+    /// (`src/engine/topology/seams.rs`) does, arming a Windows-only point and
+    /// asserting the injection it returns, on every host.
     ///
     /// # Errors
     ///
