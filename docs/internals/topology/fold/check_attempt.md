@@ -118,6 +118,25 @@ ST-06: attempts are dense from 1 within a generation.
 refusals[11] / INV-19: the binding is the override when one was
 recorded, and the frozen rung binding otherwise.
 
+## `pub(super) fn check_attempt_started(&self, started: &Attemp…` › `if started.rung != task.rung {`
+
+**An attempt runs at the task's replay-derived ladder position.**
+`design/11_design_verification_ladder.md` step 4 orders the ladder:
+the same rung, then the next rung once `attempts_per` is exhausted,
+then the human as the top rung. That position is `TaskFold.rung`,
+written only by an `Escalated` settlement, and the driver dispatches
+at it (`ladder_position` in `src/engine/topology/run.rs`). Until this
+check the validator indexed the frozen ladder by the event's *own*
+rung and never read the task's, so a log could start a rung-0 attempt,
+carrying rung 0's valid binding, on a task replay had already
+escalated to rung 1: the fold then held rung 1 while the persisted
+attempt said rung 0, and the failure that followed was charged to
+rung 1's allowance although the weaker worker had run. Found by
+PR #180's second review (`PR180-REVIEW2-001`). Exact equality on both
+the override and the frozen-binding path, because the driver writes
+`task.rung` on both; an override replaces the binding, not the
+position.
+
 ## `impl RunState` › `pub(super) fn open_generation<'a>(`
 
 The open generation this event must be naming (ST-06).
@@ -223,6 +242,21 @@ the two doors cannot drift apart again.
 The envelope and the record name one attempt. Without this the
 ledger line a settlement carries can belong to a different
 attempt of the same generation.
+
+## `impl RunState` › `if let SettlementTransition::Escalated { rung } = transition {`
+
+**An escalation climbs exactly one rung, onto a rung the frozen
+ladder has.** The same step 4: `attempts_per` exhausted → the *next*
+rung; chain exhausted → the human, never a further rung.
+`apply_settlement` assigns `task.rung` from this number and resets
+the allowance, so an unchecked value could move a task backward,
+sideways, over a rung or off the ladder, and every later start would
+be measured against a position the design never produces. The driver
+computes the number as `position + 1`, and only while
+`position + 1 < rungs` (`next_step` in `src/ladder.rs`); that is what
+is enforced here. The next rung is computed with `checked_add` and
+kept only if it indexes the ladder, so a position that cannot climb
+fails closed as the off-the-end case rather than being accepted.
 
 ## `impl RunState` › `pub(super) fn check_attempt_interrupted(`
 
