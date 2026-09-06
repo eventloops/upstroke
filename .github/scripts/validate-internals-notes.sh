@@ -153,7 +153,10 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 # Two claims, with two domains, because the two forms cost differently to
 # remove and only one of them has been measured over the whole tree:
 #
-#   (a) EVERY notes file. An inline link destination is an http/https/mailto
+#   (a) EVERY file under docs/internals/, README.md included. N2 and N3 skip
+#       that file because it mirrors no module; its links point at real files
+#       like any other, and nothing about them is this gate's to skip. An
+#       inline link destination is an http/https/mailto
 #       URL, a same-file `#anchor`, or a relative path that exists in this
 #       repository and stays inside it. A Rustdoc item path is none of those,
 #       and no renderer keeps it: GitHub's GFM drops the link and emits the
