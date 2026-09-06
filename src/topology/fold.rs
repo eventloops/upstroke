@@ -639,19 +639,135 @@ fn predicted_region(entry: &TaskEntry) -> PathSet {
     }
     let mut paths = Vec::with_capacity(entry.spec.path_hints.len());
     for hint in &entry.spec.path_hints {
-        let literal: String = hint
-            .replace('\\', "/")
-            .chars()
-            .take_while(|character| !matches!(character, '*' | '?' | '[' | '{'))
-            .collect();
-        let trimmed = literal.trim_end_matches('/');
-        if trimmed.is_empty() {
+        let Some(prefix) = hint_prefix(hint) else {
             return PathSet::RepoWide;
-        }
-        paths.push(GitPath(trimmed.to_owned()));
+        };
+        paths.push(prefix);
     }
     PathSet::Prefixes { paths }
 }
 
+fn hint_prefix(hint: &str) -> Option<GitPath> {
+    const METACHARACTERS: [char; 4] = ['*', '?', '[', '{'];
+    let normalized = hint.replace('\\', "/");
+    let mut prefix = String::with_capacity(normalized.len());
+    for (position, component) in normalized
+        .split('/')
+        .take_while(|component| !component.contains(METACHARACTERS))
+        .enumerate()
+    {
+        if matches!(component, "." | "..") {
+            return None;
+        }
+        if position > 0 {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+    }
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(GitPath(trimmed.to_owned()))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+    use crate::topology::leases::paths_overlap;
+    use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
+
+    fn policy() -> PathPolicy {
+        PathPolicy {
+            version: PathPolicyVersion::V1,
+            case_fold: false,
+            grammar: PathGrammar::Globset,
+        }
+    }
+
+    #[test]
+    fn a_hint_with_no_metacharacter_is_its_own_prefix_and_a_glob_cuts_whole_components() {
+        let cases: [(&str, Option<&str>); 24] = [
+            ("src/literal", Some("src/literal")),
+            ("build.rs", Some("build.rs")),
+            ("src/trailing/", Some("src/trailing")),
+            ("src/star/*.rs", Some("src/star")),
+            ("src/question/?.rs", Some("src/question")),
+            ("src/bracket/[ab].rs", Some("src/bracket")),
+            ("src/brace/{a,b}.rs", Some("src/brace")),
+            (r"src\backslash\deep", Some("src/backslash/deep")),
+            ("src/doubled//inner/", Some("src/doubled//inner")),
+            ("src/\u{dc}ber/", Some("src/\u{dc}ber")),
+            ("src/star*.rs", Some("src")),
+            ("src/eng*", Some("src")),
+            ("src/a*/b", Some("src")),
+            ("src/deep/mod.rs*", Some("src/deep")),
+            (r"src\deep\mod.rs*", Some("src/deep")),
+            ("**/anywhere.rs", None),
+            ("*.rs", None),
+            ("star*.rs", None),
+            ("{a,b}/c", None),
+            ("", None),
+            ("/", None),
+            ("src/./alpha", None),
+            ("src/../src/alpha", None),
+            ("./src/alpha", None),
+        ];
+        for (hint, expected) in cases {
+            assert_eq!(
+                hint_prefix(hint).as_ref().map(GitPath::as_str),
+                expected,
+                "`{hint}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_prefix_overlaps_every_path_its_hint_can_match() {
+        let policy = policy();
+        let covered: [(&str, &str); 5] = [
+            ("src/eng*", "src/engine/mod.rs"),
+            ("src/star*.rs", "src/starship.rs"),
+            ("src/a*/b", "src/alpha/b"),
+            ("src/deep/mod.rs*", "src/deep/mod.rs.bak"),
+            ("src/star/*.rs", "src/star/one.rs"),
+        ];
+        for (hint, matched) in covered {
+            let prefix = hint_prefix(hint).expect("the hint bounds a region");
+            assert!(
+                paths_overlap(&prefix, &GitPath::from(matched), &policy),
+                "`{hint}` derives `{prefix}`, which does not overlap `{matched}` it matches"
+            );
+        }
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/eng"),
+                &GitPath::from("src/engine/mod.rs"),
+                &policy
+            ),
+            "the comparator is component-wise; a prefix cut inside a component is not an ancestor"
+        );
+    }
+
+    #[test]
+    fn a_hint_whose_prefix_has_a_dot_component_bounds_nothing_it_can_be_compared_against() {
+        let policy = policy();
+        for spelling in ["src/./alpha", "src/../src/alpha", "./src/alpha", "../alpha"] {
+            assert!(
+                hint_prefix(spelling).is_none(),
+                "`{spelling}` was kept as a prefix"
+            );
+            assert!(
+                !paths_overlap(
+                    &GitPath::from(spelling),
+                    &GitPath::from("src/alpha"),
+                    &policy
+                ),
+                "`{spelling}` would have been a second spelling the comparator does not match"
+            );
+        }
+    }
+}
