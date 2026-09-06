@@ -47,11 +47,34 @@ fn scratch(tag: &str) -> PathBuf {
 
 type RacingObserver = Box<dyn FnMut(usize, RacingPause)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RacingPerformed {
+    Yielded,
+    Slept(std::time::Duration),
+}
+
 thread_local! {
     static RACING_SCHEDULE: std::cell::RefCell<Vec<(usize, RacingPause, std::time::Instant)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static RACING_PERFORMED: std::cell::RefCell<Vec<(usize, RacingPerformed)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static RACING_OBSERVER: std::cell::RefCell<Option<RacingObserver>> =
         const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn note_racing_performed(performed: RacingPerformed) {
+    let after = RACING_SCHEDULE.with(|schedule| {
+        schedule
+            .try_borrow()
+            .ok()
+            .and_then(|schedule| schedule.last().map(|(failed, _, _)| *failed))
+            .unwrap_or(0)
+    });
+    RACING_PERFORMED.with(|performed_log| {
+        if let Ok(mut performed_log) = performed_log.try_borrow_mut() {
+            performed_log.push((after, performed));
+        }
+    });
 }
 
 pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {
@@ -84,6 +107,26 @@ impl RacingObservation {
                 .map(|(failed, pause, _)| (*failed, *pause))
                 .collect()
         })
+    }
+
+    fn assert_every_pause_was_performed_as_decided(&self, tag: &str) {
+        use super::RACING_SLEEP;
+
+        let decided = self.schedule();
+        let performed = RACING_PERFORMED.with(|performed| performed.borrow().clone());
+        let expected: Vec<(usize, RacingPerformed)> = decided
+            .iter()
+            .filter_map(|(failed, pause)| match pause {
+                RacingPause::Yield => Some((*failed, RacingPerformed::Yielded)),
+                RacingPause::Sleep => Some((*failed, RacingPerformed::Slept(RACING_SLEEP))),
+                RacingPause::Done => None,
+            })
+            .collect();
+        assert_eq!(
+            performed, expected,
+            "[{tag}] what the performer asked of the thread after each failure must be what \
+             the schedule decided: a yield, a sleep of RACING_SLEEP, or nothing after the last"
+        );
     }
 
     fn assert_every_sleep_was_slept(&self, tag: &str) {
@@ -120,6 +163,7 @@ impl Drop for RacingObservation {
 #[cfg(windows)]
 fn observe_racing_attempts(observer: RacingObserver) -> RacingObservation {
     RACING_SCHEDULE.with(|schedule| schedule.borrow_mut().clear());
+    RACING_PERFORMED.with(|performed| performed.borrow_mut().clear());
     RACING_OBSERVER.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut() {
             *slot = Some(observer);
@@ -3920,6 +3964,7 @@ fn windows_stall_then_release(pending: fs::File, work: impl FnOnce()) -> Vec<(us
     }));
     work();
     let schedule = observation.schedule();
+    observation.assert_every_pause_was_performed_as_decided("stall");
     observation.assert_every_sleep_was_slept("stall");
     drop(observation);
     schedule
@@ -4002,6 +4047,7 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
     .expect_err("a view that is still delete-pending after the whole budget must refuse");
     let elapsed = started.elapsed();
     let schedule = observation.schedule();
+    observation.assert_every_pause_was_performed_as_decided("held");
     observation.assert_every_sleep_was_slept("held");
     drop(observation);
 

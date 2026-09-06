@@ -2025,19 +2025,37 @@ only the parent's permissions move.
 Running as root, or on a filesystem that ignores the mode. Restore
 and say so rather than asserting something that is not true here.
 
+## `pub(super) enum RacingPerformed {`
+
+What the performer asked of the thread: a yield, or a sleep of a stated
+length. Recorded by `super::racing_yield` and `super::racing_sleep`'s
+`#[cfg(test)]` twins before they call std, so a test sees the request the
+production `match` dispatched, not the decision it was handed.
+
+## `pub(super) fn note_racing_performed(performed: RacingPerformed) {`
+
+Append `(after, performed)` to this thread's performed log, where `after` is
+the failure count the last decision was reported for. This is the oracle pass
+3 asked for: the decided schedule says what should follow each failure, and
+this says what the performer actually requested, so a `match` arm that sleeps
+where it should yield, or sleeps after `Done`, is a mismatch here whatever
+the clock says. Four mutations were run natively against it — yield-only, the
+terminal arm removed, the `Done` arm sleeping, the `Yield` arm sleeping — and
+every one fails at `assert_every_pause_was_performed_as_decided`.
+
 ## `pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {`
 
-The `#[cfg(test)]` half of the attempt seam in `super::racing_pause`: append
+The `#[cfg(test)]` half of the decision seam in `super::racing_pause`: append
 `(failed, pause, now)` to this thread's schedule, and run whichever observer
 this thread installed. `try_borrow_mut` so an observer that itself removes
 something is a no-op here rather than a panic inside production code. The
-thread-local schedule, the `RacingObservation` guard whose `Drop` uninstalls
-the observer and the `observe_racing_attempts` installer are
-`workspace_manager::fixture`'s shape. The timestamp is what
-`assert_every_sleep_was_slept` reads: two consecutive entries are two
-consecutive failed attempts on one thread, so the gap between them is the
-pause that was actually performed, lower-bounded by the sleep std guarantees,
-and no other thread's scheduling enters into it.
+thread-local logs, the `RacingObservation` guard whose `Drop` uninstalls the
+observer and the `observe_racing_attempts` installer are
+`workspace_manager::fixture`'s shape. The timestamp feeds
+`assert_every_sleep_was_slept`, which is supplementary: the gap between two
+consecutive reports on one thread contains the pause, the next filesystem
+call and any descheduling, so it can only say a sleep was *at least* slept,
+never that the performer was what slept.
 
 ## `fn expected_racing_schedule(failures: usize) -> Vec<(usize, RacingPause)> {`
 
@@ -2057,11 +2075,9 @@ that a sleep ran after the final failure: remove the terminal arm and the
 sixty-fourth entry becomes `Sleep`, which this fails on Linux before any
 Windows run is needed.
 
-What it does not pin is the three-line performer: a `racing_pause` whose
-`Done` arm slept anyway would report `Done` and still sleep, and only a
-timing upper bound could see that, which is the kind of assertion that fails
-spuriously on a starved runner. That mutation was run natively and passes,
-and is recorded as the residual rather than hidden behind a flaky oracle.
+What it does not pin is the performer's dispatch; that is
+`assert_every_pause_was_performed_as_decided`'s, through the
+`racing_yield`/`racing_sleep` twins, and it needs no clock.
 
 ## `fn windows_posix_delete_pending(path: &Path) -> fs::File {`
 
@@ -2117,7 +2133,9 @@ two races of its own — a loser that had not yet started, and a closer
 preempted between its timeout and its close — and a detached thread on unwind;
 none of those exist here.
 
-Returns the loser's schedule, and first checks every sleep in it was slept.
+Returns the loser's schedule, after checking that every pause the schedule
+decided was the one the performer requested, and, supplementarily, that
+every sleep with a following attempt was at least slept.
 
 ## `fn windows_assert_converged_through_the_wait(tag: &str, schedule: &[(usize, RacingPause)]) {`
 
@@ -2136,12 +2154,13 @@ closed its handle. Here the winner is [`windows_posix_delete_pending`], its
 close is the loser's own twentieth failure, and the loser is the real
 `discard` of both views through the one `racing_removal`.
 
-On the yield-only loop this fails at `assert_every_sleep_was_slept`: the
-schedule says failure 17 is followed by a sleep and the next attempt came
-microseconds later. The schedule oracle alone would not see that mutation,
-because the seam reports what the loop decided rather than what it did; the
-on-thread gap is what reports the doing. On the repaired loop the discard
-returns `Ok` on the attempt after the release.
+On the yield-only loop this fails at
+`assert_every_pause_was_performed_as_decided`: the schedule says failures
+17 to 20 are followed by sleeps and the performer requested yields. The
+schedule oracle alone would not see that mutation, because the decision seam
+reports what the loop decided rather than what it did; the performed log is
+what reports the doing. On the repaired loop the discard returns `Ok` on the
+attempt after the release.
 
 Second field held constant: the same empty view the census seeds, the same
 release rule; only which `GitView` discards it moves.
@@ -2155,7 +2174,8 @@ and records no discard.
 
 The things a longer wait could have broken. It must still be bounded, so the
 refusal has to arrive, after exactly the sixty-four-entry schedule ending in
-`Done`, with every sleep in it slept, and within ten times the sleep budget —
+`Done`, with every pause performed as decided and nothing requested after the
+last, and within ten times the sleep budget —
 generous enough for a starved runner and small enough to catch a loop that
 never returns. It must not arrive early, so the lower time bound is the sleep
 budget itself. And it must not be read as absence: `reclaim` stops at

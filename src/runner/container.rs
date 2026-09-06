@@ -227,8 +227,8 @@ fn racing_pause(failed: usize) {
     let pause = racing_pause_after(failed);
     note_racing_attempt(failed, pause);
     match pause {
-        RacingPause::Yield => std::thread::yield_now(),
-        RacingPause::Sleep => std::thread::sleep(RACING_SLEEP),
+        RacingPause::Yield => racing_yield(),
+        RacingPause::Sleep => racing_sleep(RACING_SLEEP),
         RacingPause::Done => {}
     }
 }
@@ -236,6 +236,18 @@ fn racing_pause(failed: usize) {
 #[cfg(not(test))]
 #[inline]
 fn note_racing_attempt(_failed: usize, _pause: RacingPause) {}
+
+#[cfg(not(test))]
+#[inline]
+fn racing_yield() {
+    std::thread::yield_now();
+}
+
+#[cfg(not(test))]
+#[inline]
+fn racing_sleep(duration: Duration) {
+    std::thread::sleep(duration);
+}
 
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -1294,4 +1306,18 @@ mod tests;
 #[inline]
 fn note_racing_attempt(failed: usize, pause: RacingPause) {
     tests::note_racing_attempt(failed, pause);
+}
+
+#[cfg(test)]
+#[inline]
+fn racing_yield() {
+    tests::note_racing_performed(tests::RacingPerformed::Yielded);
+    std::thread::yield_now();
+}
+
+#[cfg(test)]
+#[inline]
+fn racing_sleep(duration: Duration) {
+    tests::note_racing_performed(tests::RacingPerformed::Slept(duration));
+    std::thread::sleep(duration);
 }

@@ -383,9 +383,21 @@ close went unobserved.
 
 The pause after the `failed`th failed attempt of [`racing_removal`] and
 [`read_racing`]: decide with [`racing_pause_after`], report through
-[`note_racing_attempt`], then perform. Report before perform, so a test's
-observer runs after the attempt has returned and before its pause — the point
-at which a controlled winner closes.
+[`note_racing_attempt`], then perform through [`racing_yield`] or
+[`racing_sleep`]. Report before perform, so a test's observer runs after the
+attempt has returned and before its pause — the point at which a controlled
+winner closes.
+
+## `fn racing_yield() {`
+
+`std::thread::yield_now`, behind a name so the `#[cfg(test)]` twin can record
+that the performer asked for a yield before it yields. With [`racing_sleep`],
+the second half of the seam: the decision says what should follow a failure,
+these say what did.
+
+## `fn racing_sleep(duration: Duration) {`
+
+`std::thread::sleep`, behind a name for the same reason as [`racing_yield`].
 
 Not `workspace_manager::remove_tree_once_handles_close`'s schedule, which
 waits for a *dying process* to close its handles and sleeps twenty-five
