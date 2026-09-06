@@ -43,8 +43,8 @@ every refusal says what the task gets instead:
 
 | comment or attribute | warning | what the task gets |
 |---|---|---|
-| `<!-- note -->`, `<!-- Upstroke: -->`, `<!-- upstroke handles it -->` | none: an author's comment | nothing; the comment stays in the body |
-| `<!-- upstroke: ...` with no `-->` in its block | unterminated; ignored | nothing; the text it opened stays in the body |
+| `<!-- note -->`, `<!-- Upstroke: -->`, `<!-- upstroke handles it -->` | none: an author's comment | nothing; in a section body it stays as written, but `checklist_drafts` (`drafts.rs`) only copies `Text`/`Code` events into a title or body, so the same comment vanishes silently from a checklist task |
+| `<!-- upstroke: ...` with no `-->` in its block | unterminated; ignored | nothing; the text it opened stays in the body, section or checklist alike |
 | a second upstroke comment on one task | multiple; the first is used | the first comment, and every one is cut from the body |
 | `token` with no `=` | malformed; ignored | nothing from that token |
 | `wibble=x` | unknown attribute; ignored | nothing from that token |
