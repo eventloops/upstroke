@@ -92,10 +92,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# Lint levels are repository policy and change only here (CODING_STANDARDS.md
-# §2). Each entry landed with the tree already clean under it; the named output
-# modules and the documented §7 invariant sites carry `#[expect]` with reasons,
-# and `clippy.toml` holds the test allowances.
+# Lint levels are repository policy and live here (CODING_STANDARDS.md §2): no
+# attribute loosens or narrows a lint this table governs. §2's two carve-outs
+# stand outside it, in module-level attributes: a `#![deny]` that activates a
+# lint this table does not yet govern, ahead of the entry `standards/SWEEP.md`
+# says is owed (`src/validate/graph.rs`, §7), and the `clippy.toml`
+# `disallowed-*` census. Each entry landed with the tree already clean under it;
+# the named output modules and the documented §7 invariant sites carry
+# `#[expect]` with reasons, and `clippy.toml` holds the test allowances.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
