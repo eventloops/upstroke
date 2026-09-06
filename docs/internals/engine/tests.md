@@ -2015,7 +2015,7 @@ carries the bytes, and the runner is what writes them.
 
 ## `struct RecordingRunner {`
 
-A real [`HostRunner`](crate::runner::host::HostRunner) that writes down what
+A real [`HostRunner`](../../../src/runner/host.rs) that writes down what
 it was asked to run.
 
 It delegates rather than stubs: a recorder that returned canned output

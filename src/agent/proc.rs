@@ -457,8 +457,11 @@ impl GroupObservation {
 
     #[cfg(target_os = "macos")]
     fn exited_record_names_its_own_group(&self) -> bool {
+        if self.exited_before != Ok(true) {
+            return false;
+        }
         match (u32::try_from(self.pid), self.zombie_group) {
-            (Ok(pid), Ok(answer)) => answer.pgid == pid,
+            (Ok(pid), Ok(answer)) => answer.pgid == pid && answer.status == libc::SZOMB,
             _ => false,
         }
     }
@@ -1295,6 +1298,7 @@ mod termination {
     const GUARD_CANCELLED: u8 = 0xc1;
     const GUARD_DISARM: u8 = 0xd1;
     const GUARD_PROBE: u8 = 0xe1;
+    const GUARD_POLL_SLICE_MS: libc::c_int = 250;
     const HANDLE_SIGINT: u8 = 1 << 0;
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
@@ -3129,9 +3133,8 @@ mod termination {
         probe_fd: libc::c_int,
         probe_pid: libc::pid_t,
     ) -> ! {
-        let mut ready = [0_u8; 5];
-        ready[0] = GUARD_READY;
-        ready[1..].copy_from_slice(&probe_pid.to_ne_bytes());
+        let [first, second, third, fourth] = probe_pid.to_ne_bytes();
+        let ready = [GUARD_READY, first, second, third, fourth];
         if !write_raw(ack_fd, &ready) {
             unsafe { libc::_exit(1) };
         }
@@ -3152,18 +3155,23 @@ mod termination {
                     revents: 0,
                 },
             ];
-            let timeout_ms = if armed && stopping { 250 } else { -1 };
-            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, timeout_ms) };
+            // SAFETY: `poll_fds` is valid storage for exactly the two entries
+            // named for the duration of the call, and the timeout is finite.
+            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, GUARD_POLL_SLICE_MS) };
             if polled < 0 && !last_errno_is_interrupted() {
                 unsafe { libc::_exit(1) };
             }
-            if polled == 0 && armed && stopping {
-                if unsafe { libc::getppid() } != parent || !write_byte(probe_fd, GUARD_PROBE) {
+            let [command_poll, wake_poll] = poll_fds;
+            if polled == 0 {
+                if unsafe { libc::getppid() } != parent {
+                    unsafe { libc::_exit(0) };
+                }
+                if armed && stopping && !write_byte(probe_fd, GUARD_PROBE) {
                     unsafe { libc::_exit(0) };
                 }
                 continue;
             }
-            if polled > 0 && poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if polled > 0 && command_poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 // SAFETY: `buffer` is valid writable storage and command_fd is
                 // the guard's private read end.
                 let count =
@@ -3171,8 +3179,9 @@ mod termination {
                 if count <= 0 {
                     unsafe { libc::_exit(0) };
                 }
-                for byte in &buffer[..count as usize] {
-                    match *byte {
+                let read = usize::try_from(count).unwrap_or(0);
+                for byte in buffer.iter().copied().take(read) {
+                    match byte {
                         GUARD_ARM => {
                             wake = false;
                             stopping = false;
@@ -3207,7 +3216,7 @@ mod termination {
                     }
                 }
             }
-            if polled > 0 && poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if polled > 0 && wake_poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 drain_pipe(wake_fd);
                 wake = true;
             }
@@ -5219,6 +5228,103 @@ mod termination {
                 read,
                 AckRead::EndOfFile,
                 "a pipe whose only other writer has been collected did not read as closed"
+            );
+        }
+
+        #[test]
+        fn a_guard_whose_conductor_is_gone_ends_while_its_pipes_stay_open() {
+            let [command_read, command_write] =
+                create_cloexec_pipe().expect("a guard command pipe");
+            let [ack_read, ack_write] =
+                create_cloexec_pipe().expect("a guard acknowledgement pipe");
+            let [wake_read, wake_write] = create_cloexec_pipe().expect("a guard wake pipe");
+            let [probe_read, probe_write] = create_cloexec_pipe().expect("a guard probe pipe");
+            // Resolved before either fork, as `spawn_guard` resolves it: the
+            // multithreaded child may call only async-signal-safe primitives.
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let open_max = libc::c_int::try_from(open_max).expect("a descriptor ceiling");
+            assert!(open_max > 0, "a descriptor ceiling: {open_max}");
+            // SAFETY: the forked child calls only `_exit`.
+            let departed = unsafe { libc::fork() };
+            if departed == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            assert!(
+                departed > 0,
+                "fork a stand-in conductor: {}",
+                std::io::Error::last_os_error()
+            );
+            let status = reap(departed);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the stand-in conductor did not exit cleanly: {status}"
+            );
+
+            // SAFETY: the forked child closes its parent-side descriptors and
+            // enters `guard_loop`, which uses only libc syscalls and ends in
+            // `_exit`.
+            let guard = unsafe { libc::fork() };
+            if guard == 0 {
+                close_fd(command_write);
+                close_fd(ack_read);
+                close_fd(wake_write);
+                close_fd(probe_read);
+                close_inherited_fds(&[command_read, ack_write, wake_read, probe_write], open_max);
+                guard_loop(
+                    departed,
+                    command_read,
+                    ack_write,
+                    wake_read,
+                    probe_write,
+                    departed,
+                );
+            }
+            assert!(
+                guard > 0,
+                "fork a guard: {}",
+                std::io::Error::last_os_error()
+            );
+            close_fd(command_read);
+            close_fd(ack_write);
+            close_fd(wake_read);
+            close_fd(probe_write);
+
+            let end = |what: &str| -> String {
+                // SAFETY: `guard` is this test's own child and has not been
+                // collected.
+                unsafe {
+                    let _ = libc::kill(guard, libc::SIGKILL);
+                }
+                let killed = reap(guard);
+                format!("{what}; it was killed and collected: {killed}")
+            };
+            let said_ready = await_ready(ack_read, GUARD_READY, HELPER_READY_BUDGET);
+            let outcome = if said_ready == ReadyWait::Ready {
+                wait_for_lifetime_target(guard).map_or_else(
+                    || {
+                        Err(end(
+                            "the guard was still waiting with its recorded parent gone and every \
+                             command and wake writer open",
+                        ))
+                    },
+                    Ok,
+                )
+            } else {
+                Err(end(&format!(
+                    "the guard never reached its wait: {}",
+                    describe_ready_wait("guard", said_ready, &[])
+                )))
+            };
+            for fd in [command_write, ack_read, wake_write, probe_read] {
+                close_fd(fd);
+            }
+            let status = match outcome {
+                Ok(status) => status,
+                Err(report) => panic!("{report}"),
+            };
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the guard did not end cleanly: {status}"
             );
         }
 

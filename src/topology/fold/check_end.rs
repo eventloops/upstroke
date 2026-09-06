@@ -141,14 +141,16 @@ impl RunState {
         } = &answered.answer
         {
             let options = open.question.options.len();
-            let chosen = usize::try_from(*option_index).unwrap_or(usize::MAX);
-            if chosen >= options {
+            let Some(chosen) = usize::try_from(*option_index)
+                .ok()
+                .filter(|chosen| *chosen < options)
+            else {
                 return Err(FoldError::WrongQuestion {
                     kind: KIND,
                     question: answered.question.to_string(),
                     detail: format!("offered {options} option(s) and this chose {option_index}"),
                 });
-            }
+            };
             match (binding_override, &open.binding) {
                 (Some(_), None) => {
                     return Err(FoldError::WrongQuestion {
@@ -202,6 +204,26 @@ impl RunState {
         exceeded: &BudgetExceeded4,
     ) -> Result<(), FoldError> {
         const KIND: &str = "budget_exceeded";
+        if !exceeded.limit_usd.is_finite() || !exceeded.spent_usd.is_finite() {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "it records a `{}` ceiling of {} and a spend of {}, and a budget is a finite \
+                     number of dollars",
+                    exceeded.budget, exceeded.limit_usd, exceeded.spent_usd
+                ),
+            });
+        }
+        if exceeded.spent_usd < exceeded.limit_usd {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "it stops the run for a `{}` ceiling of {} that its own recorded spend of {} \
+                     has not reached",
+                    exceeded.budget, exceeded.limit_usd, exceeded.spent_usd
+                ),
+            });
+        }
         if let Some(key) = exceeded.key {
             self.entry(KIND, key)?;
         }
@@ -229,7 +251,9 @@ impl RunState {
                 derived: match &derived {
                     DerivedOutcome::NotEnding => "not ending".to_owned(),
                     DerivedOutcome::Ending(outcome) => outcome_name(outcome).to_owned(),
-                    DerivedOutcome::FoldError => "unreachable".to_owned(),
+                    DerivedOutcome::FoldError => {
+                        "no outcome: this state matches none the fold derives".to_owned()
+                    }
                 },
             });
         }

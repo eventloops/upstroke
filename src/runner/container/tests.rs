@@ -113,7 +113,6 @@ impl RacingObservation {
         use super::RACING_SLEEP;
 
         let decided = self.schedule();
-        let performed = RACING_PERFORMED.with(|performed| performed.borrow().clone());
         let expected: Vec<(usize, RacingPerformed)> = decided
             .iter()
             .filter_map(|(failed, pause)| match pause {
@@ -122,30 +121,35 @@ impl RacingObservation {
                 RacingPause::Done => None,
             })
             .collect();
-        assert_eq!(
-            performed, expected,
-            "[{tag}] what the performer asked of the thread after each failure must be what \
-             the schedule decided: a yield, a sleep of RACING_SLEEP, or nothing after the last"
-        );
+        RACING_PERFORMED.with(|performed| {
+            assert_eq!(
+                *performed.borrow(),
+                expected,
+                "[{tag}] what the performer asked of the thread after each failure must be what \
+                 the schedule decided: a yield, a sleep of RACING_SLEEP, or nothing after the last"
+            );
+        });
     }
 
     fn assert_every_sleep_was_slept(&self, tag: &str) {
         use super::RACING_SLEEP;
 
-        let entries = RACING_SCHEDULE.with(|schedule| schedule.borrow().clone());
-        for pair in entries.windows(2) {
-            let [(failed, pause, at), (_, _, next)] = pair else {
-                continue;
-            };
-            if *pause == RacingPause::Sleep {
-                let gap = next.duration_since(*at);
-                assert!(
-                    gap >= RACING_SLEEP,
-                    "[{tag}] failure {failed} was to be followed by a {RACING_SLEEP:?} sleep and \
-                     the next attempt came {gap:?} later"
-                );
+        RACING_SCHEDULE.with(|schedule| {
+            let entries = schedule.borrow();
+            for pair in entries.windows(2) {
+                let [(failed, pause, at), (_, _, next)] = pair else {
+                    continue;
+                };
+                if *pause == RacingPause::Sleep {
+                    let gap = next.duration_since(*at);
+                    assert!(
+                        gap >= RACING_SLEEP,
+                        "[{tag}] failure {failed} was to be followed by a {RACING_SLEEP:?} \
+                         sleep and the next attempt came {gap:?} later"
+                    );
+                }
             }
-        }
+        });
     }
 }
 
@@ -4559,5 +4563,46 @@ fn a_release_whose_cleanup_fails_still_attempts_every_remaining_step() {
         4,
         "four armed steps, four distinct errors — an error that did not name the step would \
          collapse these"
+    );
+}
+
+/// `PR163-ASTRA-RUSTDOC-LINKS`. `runtime.md` carries Rustdoc shortcut
+/// references like `` [`RuntimeOp`] `` with no Markdown reference
+/// definition. A CommonMark parser renders that as literal text around an
+/// inline-code span — never a link — losing the cross-reference. Detect that
+/// exact failure shape (a text run ending in `[`, an inline-code span, then a
+/// text run starting with `]`, with no link in between) rather than counting
+/// links, so the test still catches a reference that loses its definition
+/// even if the surrounding prose changes.
+#[test]
+fn runtime_notes_rustdoc_shortcuts_resolve_to_links() {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    const NOTES: &str = include_str!("../../../docs/internals/runner/container/runtime.md");
+
+    let events: Vec<Event> = Parser::new(NOTES).collect();
+    let mut broken = Vec::new();
+    let mut depth = 0i32;
+    for window in events.windows(3) {
+        if let Event::Start(Tag::Link { .. }) = window[0] {
+            depth += 1;
+        }
+        if let Event::End(TagEnd::Link) = window[0] {
+            depth -= 1;
+        }
+        if depth > 0 {
+            continue;
+        }
+        if let (Event::Text(before), Event::Code(name), Event::Text(after)) =
+            (&window[0], &window[1], &window[2])
+        {
+            if before.ends_with('[') && after.starts_with(']') {
+                broken.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "unresolved Rustdoc shortcut reference(s) with no Markdown link target: {broken:?}"
     );
 }

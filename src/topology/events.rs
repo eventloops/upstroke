@@ -1446,7 +1446,7 @@ mod tests {
 
     fn path_policy() -> PathPolicy {
         PathPolicy {
-            version: crate::topology::paths::PathPolicyVersion::V1,
+            version: crate::topology::paths::PathPolicyVersion::V2,
             case_fold: true,
             grammar: crate::topology::paths::PathGrammar::Globset,
         }
@@ -4018,7 +4018,7 @@ mod tests {
                         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "registry_digest":
                         "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
-                    "path_policy": {"version": "v1", "case_fold": true, "grammar": "globset"},
+                    "path_policy": {"version": "v2", "case_fold": true, "grammar": "globset"},
                     "limits": {"max_parallel": 7, "max_defers": 3, "max_merge_repairs": 5},
                     "gates": ["fmt", "clippy"],
                     "gates_from_config": true,

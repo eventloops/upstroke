@@ -64,7 +64,7 @@ mod vocab;
 
 pub use self::bijection::{BijectionFailure, check_bijection};
 pub use self::export::{
-    EffectSiteExport, PointExport, ResidueClassExport, effect_sites, effect_sites_json,
+    EffectSiteExport, ExportError, PointExport, ResidueClassExport, effect_sites, effect_sites_json,
 };
 pub use self::harness::{
     FastSequence, HarnessError, HookHarness, HookPhase, Injection, Observation,
@@ -343,22 +343,57 @@ impl EffectSiteId {
         }
     }
 
-    /// The dotted name.
+    /// The dotted name — the [`fmt::Display`] text, owned.
+    ///
+    /// The shape is written once, in the `Display` impl, and read back here.
+    /// It used to be written twice, as two `format!` calls of the same shape,
+    /// and only this one was under test: a `Display` writing `Group:Variant`
+    /// passes the whole scoped suite (measured at `ee5dc81f`), while every
+    /// [`BijectionFailure`] in the crate would then name its site in a
+    /// spelling the wire format refuses.
     pub fn name(self) -> String {
-        format!("{}.{}", self.group().name(), self.variant())
+        self.to_string()
     }
 
     /// The site a dotted name refers to, or an error naming what was written.
+    ///
+    /// Splits at the group separator and compares the two halves against the
+    /// static names, rather than rebuilding up to seventy dotted names and
+    /// comparing whole strings. The point is not the allocations: while this
+    /// function went through [`Self::name`], the round-trip assertion in
+    /// `a_site_name_no_group_declares_is_refused` compared `name()` with
+    /// itself and so could not fail for a change to the name's shape. The
+    /// separator is this function's own knowledge now, and that assertion is
+    /// a round trip between two independent statements of it.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownSite`], carrying the name exactly as it was written, when the
+    /// text has no group separator, names no group, or names no variant of
+    /// the group it does name.
     pub fn from_name(name: &str) -> Result<Self, UnknownSite> {
+        let unknown = || UnknownSite {
+            name: name.to_owned(),
+        };
+        let Some((group, variant)) = name.split_once('.') else {
+            return Err(unknown());
+        };
         Self::all()
             .into_iter()
-            .find(|site| site.name() == name)
-            .ok_or_else(|| UnknownSite {
-                name: name.to_owned(),
-            })
+            .find(|site| site.group().name() == group && site.variant() == variant)
+            .ok_or_else(unknown)
     }
 
     /// Whether this site exposes `point` in `mode`.
+    ///
+    /// Two questions and not three: the point's platform is deliberately not
+    /// one of them. A registry document written on one host is validated on
+    /// the other, so an entry for a Windows containment point is well formed
+    /// everywhere and `RegistryError::NoSuchPoint` must not fire on a
+    /// document that is exactly right. Where the host does decide something
+    /// it decides coverage rather than validity, and that question is asked
+    /// by [`SubEffectPoint::platform`] through [`Platform::required_on`]
+    /// inside [`check_bijection`].
     pub fn exposes(self, point: SubEffectPoint, mode: InjectionMode) -> bool {
         self.sub_effects().contains(&point) && point.supports(mode)
     }
@@ -444,10 +479,12 @@ impl EffectSiteId {
     ///   artifact referenced by [`Self::row`]; a commit-tree leaves an
     ///   unreferenced object; "the pruning sites' after-phase entries record
     ///   the released objects as R27 residue"; a removal that releases nothing
-    ///   leaves nothing; and a read-only observation performs no effect at all.
+    ///   leaves nothing; a momentary hold is given back before the command
+    ///   returns, so no row holds it; and a read-only observation performs no
+    ///   effect at all.
     /// * *a sub-effect point* — [`SubEffectPoint::residue_rows`],
     ///   [`SubEffectPoint::residue_artifact`] and
-    ///   [`SubEffectPoint::resume_action`], the last of which reads the mode
+    ///   [`SubEffectPoint::resume_action`], the last two of which read the mode
     ///   because the mode is half the coordinate. The rows are the point's, not
     ///   the site's: a Windows containment kill leaves no host process and so
     ///   no row, and a Unix one leaves the reaper's R28 hold rather than the
@@ -459,6 +496,15 @@ impl EffectSiteId {
     ///   administrative row to name. "resume action equal to the before-phase
     ///   action".
     /// * *no-execution* — nothing ran.
+    ///
+    /// Total over every `(site, phase)` pair, including the pairs the site
+    /// does not have — a point it does not expose, a class it does not
+    /// register, a no-execution record it may not carry. Those are refused by
+    /// [`validate_entry`], which asks [`Self::exposes`],
+    /// [`Self::registers`] and [`Self::skipped_on_fast_path`] itself; a
+    /// partial table here would be a second place for the same refusal to be
+    /// decided, and the two could disagree. What this function answers is
+    /// what a coordinate *would* leave, not whether the coordinate exists.
     pub fn semantics(self, phase: EntryPhase) -> PhaseSemantics {
         match phase {
             // The recovery is `ResumeUnperformed` for all three
@@ -515,28 +561,53 @@ impl EffectSiteId {
                     artifact: ResidueArtifact::Removed,
                     action: ResumeAction::AdoptPerformed,
                 },
+                AfterEffect::MomentaryHold => PhaseSemantics {
+                    rows: Vec::new(),
+                    artifact: ResidueArtifact::HoldReleased,
+                    action: ResumeAction::RepeatProbe,
+                },
             },
             EntryPhase::Point { point, mode } => PhaseSemantics {
                 rows: point.residue_rows(self.row()),
-                artifact: point.residue_artifact(),
+                artifact: point.residue_artifact(mode),
                 action: point.resume_action(mode),
             },
-            EntryPhase::Residue { .. } => {
-                let rows = if self.row() == ResourceRow::R27 {
-                    vec![ResourceRow::R27]
-                } else {
-                    vec![ResourceRow::R27, self.row()]
-                };
-                PhaseSemantics {
-                    artifact: if rows.len() == 1 {
-                        ResidueArtifact::ObjectsUnreferenced
+            // Read, not discarded. `ResidueClass` is a closed domain, and
+            // what follows is `ObjectInternal`'s answer and no other class's.
+            // A `..` here would hand a second class this one in silence,
+            // which is the shape this function exists to deny an entry one
+            // level up; matched, a second class does not compile until
+            // someone says what it leaves.
+            EntryPhase::Residue { class } => match class {
+                ResidueClass::ObjectInternal => {
+                    // "objects present and unreferenced, R27, with
+                    // administrative residue in the owning worktree", and
+                    // "the list never repeats a row". So there is one
+                    // question — is the administrative row a second row, or
+                    // is this site's own row R27 — and the rows and the
+                    // artifact are both answers to it. The artifact used to
+                    // be read back off `rows.len()`, which is this mechanism
+                    // inferred from its own outcome.
+                    let own = self.row();
+                    let administrative = if own == ResourceRow::R27 {
+                        None
                     } else {
-                        ResidueArtifact::ObjectsAndAdministrativeResidue
-                    },
-                    rows,
-                    action: ResumeAction::ResumeUnperformed,
+                        Some(own)
+                    };
+                    match administrative {
+                        None => PhaseSemantics {
+                            rows: vec![ResourceRow::R27],
+                            artifact: ResidueArtifact::ObjectsUnreferenced,
+                            action: ResumeAction::ResumeUnperformed,
+                        },
+                        Some(row) => PhaseSemantics {
+                            rows: vec![ResourceRow::R27, row],
+                            artifact: ResidueArtifact::ObjectsAndAdministrativeResidue,
+                            action: ResumeAction::ResumeUnperformed,
+                        },
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -587,29 +658,52 @@ impl EffectSiteId {
 // run time. Demote `pub const fn row` to `pub fn row` and the crate, its tests
 // and its generated inventory all still build; the frozen API is broken and
 // nothing says so. A compile-time contract is stated where the compiler
-// enforces it, which is here: none of this module builds unless the four
-// functions are callable in a const context over values taken from the groups'
-// const `ALL` slices.
+// enforces it, which is here: none of this module builds unless every one of
+// the functions is callable in a const context over values taken from the
+// groups' const `ALL` slices.
+//
+// Every one, and not only the four `identity` names. The walk put each site
+// through `row`, `adjacent`, `fault_row`, `scope`, `before_state` and
+// `after_effect`, and left `group`, `variant`, `module`, `observable_orders`,
+// `is_read_only`, `sub_effects`, `residue_classes`, `residue_elements` and
+// `skipped_on_fast_path` — nine more `const fn` on the same type — in the
+// state the six were repaired out of: declared `const fn`, called only from
+// ordinary code, demotable to `pub fn` with the crate still building. The
+// list below is `EffectSiteId`'s whole `const fn` surface, so a function
+// added to the type and left out of the walk is the only way back to it.
 
 /// Walk every group's `ALL` slice at compile time and put every site of it
-/// through the four `identity` functions and the residue authority.
+/// through every `const fn` [`EffectSiteId`] declares.
 ///
-/// A `while` over the slice rather than a list of variants, so the walk covers
-/// whatever `ALL` holds and cannot fall behind a group that grows one.
+/// A loop over the slice rather than a list of variants, so the walk covers
+/// whatever `ALL` holds and cannot fall behind a group that grows one. It
+/// consumes the slice through a subslice pattern rather than by index: an
+/// index panics on a bound, which §7 admits only under an `#[expect]` naming
+/// the proof, and here the pattern is the proof — a matched `[first, tail @
+/// ..]` cannot be out of bounds.
 macro_rules! const_identity_walk {
     ($($group:ident => $wrap:ident),+ $(,)?) => {
         const _: () = {
             $(
-                let mut index = 0;
-                while index < $group::ALL.len() {
-                    let site = EffectSiteId::$wrap($group::ALL[index]);
+                let mut rest: &[$group] = $group::ALL;
+                while let [first, tail @ ..] = rest {
+                    let site = EffectSiteId::$wrap(*first);
+                    let _ = site.group();
+                    let _ = site.variant();
+                    let _ = site.module();
                     let _ = site.row();
                     let _ = site.adjacent();
                     let _ = site.fault_row();
                     let _ = site.scope();
+                    let _ = site.observable_orders();
+                    let _ = site.is_read_only();
+                    let _ = site.sub_effects();
+                    let _ = site.residue_classes();
+                    let _ = site.residue_elements();
+                    let _ = site.skipped_on_fast_path();
                     let _ = site.before_state();
                     let _ = site.after_effect();
-                    index += 1;
+                    rest = tail;
                 }
             )+
         };
@@ -634,8 +728,12 @@ const_identity_walk! {
 /// compile time.
 ///
 /// `EffectSiteId::all()` is a `Vec` and cannot be one; this is the const half
-/// of the same count, and `the_generated_inventory_describes_every_site_and_invents_none`
-/// asserts the two agree.
+/// of the same count, and
+/// `parent_tests::the_const_inventory_count_is_the_length_of_the_inventory`
+/// asserts the two agree. It named
+/// `the_generated_inventory_describes_every_site_and_invents_none` until
+/// 2026-09-06; that test compares the export's length with `all()`'s and with
+/// the literal seventy, and reads this constant nowhere.
 pub const INVENTORY_SIZE: usize = WorktreeSite::ALL.len()
     + SnapshotSite::ALL.len()
     + RefSite::ALL.len()
@@ -699,6 +797,9 @@ const _: () = {
     ));
 };
 
+/// The one statement of the dotted name's shape. [`EffectSiteId::name`], the
+/// `Into<String>` serde uses, and every diagnostic that interpolates a site
+/// all read it from here.
 impl fmt::Display for EffectSiteId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.group().name(), self.variant())
@@ -721,3 +822,102 @@ impl TryFrom<String> for EffectSiteId {
 
 #[cfg(test)]
 mod tests;
+
+/// The items this file itself declares, pinned here.
+///
+/// The family's shared test file is [`tests`], and everything about the group
+/// enums, the harness, the registry and the bijection belongs there. What is
+/// here is the handful of contracts that are this file's own and that the
+/// shared file did not reach: the one statement of the dotted name's shape,
+/// the const inventory count, and the residue class's `(rows, artifact)` pair.
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+
+    #[test]
+    fn the_dotted_name_has_one_authority_and_it_is_display() {
+        let site = EffectSiteId::RunDir(RunDirSite::PublishCommitRecord);
+        // The shape, written out here and not read back from `name()`.
+        assert_eq!(site.to_string(), "RunDir.PublishCommitRecord");
+        assert_eq!(site.name(), "RunDir.PublishCommitRecord");
+        assert_eq!(String::from(site), "RunDir.PublishCommitRecord");
+        // And it is one statement, over the whole inventory: `name()` and the
+        // `Into<String>` the wire format uses are both the `Display` text, so
+        // a change to the shape cannot move a diagnostic and leave the
+        // serialized name where it was, or the reverse. Until 2026-09-06
+        // `Display` was a second `format!` of its own, and writing
+        // `Group:Variant` there passed the whole scoped suite.
+        for site in EffectSiteId::all() {
+            let displayed = site.to_string();
+            assert_eq!(site.name(), displayed, "{displayed}");
+            assert_eq!(String::from(site), displayed, "{displayed}");
+            assert_eq!(
+                displayed,
+                format!("{}.{}", site.group().name(), site.variant()),
+                "{displayed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_crossing_two_real_sites_is_refused() {
+        // Both halves name something: `Object` is a group and
+        // `PublishCommitRecord` is a variant — of `RunDir`. `from_name` reads
+        // the two halves separately now, so this is the pair it could get
+        // wrong; it is refused, and the error quotes what was written.
+        assert!(EffectSiteId::from_name("Object.SnapshotCommitTree").is_ok());
+        assert!(EffectSiteId::from_name("RunDir.PublishCommitRecord").is_ok());
+        let crossed = "Object.PublishCommitRecord";
+        let error = EffectSiteId::from_name(crossed).expect_err("no group declares that pair");
+        assert_eq!(error.name, crossed);
+        assert!(error.to_string().contains(crossed), "{error}");
+    }
+
+    #[test]
+    fn the_const_inventory_count_is_the_length_of_the_inventory() {
+        // The two halves of one count. `INVENTORY_SIZE` sums the groups' `ALL`
+        // slices at compile time and `all()` concatenates the same slices at
+        // run time, and each is its own hand-written list of eleven groups: a
+        // group dropped from one of them alone is this assertion failing.
+        assert_eq!(EffectSiteId::all().len(), INVENTORY_SIZE);
+        // The downstream `const` declaration `identity` promises, read as a
+        // value so the promise is a test and not only a compile.
+        assert_eq!(CANDIDATE_COMMIT_TREE_ROW, ResourceRow::R27);
+    }
+
+    #[test]
+    fn a_residue_class_names_the_administrative_row_only_where_there_is_one() {
+        let internal = EntryPhase::Residue {
+            class: ResidueClass::ObjectInternal,
+        };
+        // A site whose own row is R27: one row, and the artifact that says so.
+        let commit_tree = EffectSiteId::Object(ObjectSite::SnapshotCommitTree);
+        assert_eq!(commit_tree.row(), ResourceRow::R27);
+        assert!(commit_tree.registers(ResidueClass::ObjectInternal));
+        assert_eq!(
+            commit_tree.semantics(internal),
+            PhaseSemantics {
+                rows: vec![ResourceRow::R27],
+                artifact: ResidueArtifact::ObjectsUnreferenced,
+                action: ResumeAction::ResumeUnperformed,
+            }
+        );
+        // A site whose own row holds the administrative residue: two rows, in
+        // that order, and the other artifact.
+        let repair = EffectSiteId::Object(ObjectSite::RepairMaterialize);
+        assert_ne!(
+            repair.row(),
+            ResourceRow::R27,
+            "the two-row case needs a site whose own row is not R27"
+        );
+        assert!(repair.registers(ResidueClass::ObjectInternal));
+        assert_eq!(
+            repair.semantics(internal),
+            PhaseSemantics {
+                rows: vec![ResourceRow::R27, repair.row()],
+                artifact: ResidueArtifact::ObjectsAndAdministrativeResidue,
+                action: ResumeAction::ResumeUnperformed,
+            }
+        );
+    }
+}

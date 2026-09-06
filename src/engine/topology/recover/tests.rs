@@ -543,7 +543,7 @@ fn run_started(
         normalized_plan_digest: "sha256:aaaa".to_owned(),
         registry_digest: String::new(),
         path_policy: PathPolicy {
-            version: PathPolicyVersion::V1,
+            version: PathPolicyVersion::V2,
             case_fold: false,
             grammar: PathGrammar::Globset,
         },

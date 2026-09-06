@@ -9,6 +9,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -4112,6 +4113,31 @@ mod inherited_writer {
         }
     }
 
+    const MARKER_MARGIN: usize = 4096;
+
+    fn marker_exceeding(capacity: usize) -> String {
+        format!(
+            "{} ' $name `printf literal`",
+            "x".repeat(capacity + MARKER_MARGIN)
+        )
+    }
+
+    fn shim_script(marker: &str) -> String {
+        format!("#!/bin/sh\necho \"{marker}:$1\"\n")
+    }
+
+    #[test]
+    fn the_shim_script_exceeds_every_installed_pipe_capacity() {
+        for capacity in [4096_usize, 8 * 1024, 16 * 1024, 64 * 1024] {
+            let script = shim_script(&marker_exceeding(capacity));
+            assert!(
+                script.len() > capacity,
+                "a {capacity}-byte pipe holds the whole {}-byte script, so the shim writer never blocks",
+                script.len()
+            );
+        }
+    }
+
     #[test]
     fn marker_shims_do_not_leave_writers_in_another_threads_fork() {
         let mut helper = Command::new(std::env::current_exe().expect("the test executable"));
@@ -4176,10 +4202,15 @@ mod inherited_writer {
             .expect("open the FIFO reader before the shim writer");
         // SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
 
-        let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
-        assert_eq!(capacity, 4096, "bound the pipe so the script cannot fit");
-        let marker = format!("{} ' $name `printf literal`", "x".repeat(16 * 1024));
-        let expected = format!("#!/bin/sh\necho \"{marker}:$1\"\n").into_bytes();
+        let installed = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        assert!(
+            installed > 0,
+            "bound the shim pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        let capacity = usize::try_from(installed).expect("a positive installed pipe capacity");
+        let marker = marker_exceeding(capacity);
+        let expected = shim_script(&marker).into_bytes();
         let mut actual = vec![0; expected.len()];
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| marker_shim(&root.0, fifo_name, &marker));
@@ -5740,4 +5771,79 @@ fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
     assert_eq!(reachable.stdout.trim(), "RELATIVE:arg");
     assert!(absolute.is_absolute());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// `SWEEP-HOST-ENVIRONMENT-001`: `HostEnvironment` does not implement `Clone`. No caller clones
+// the value (`HostRunner` owns the only field of that type and never clones it), so a `Clone`
+// on a struct holding the whole environment `Vec` would be an unexplained non-trivial clone
+// under §6. The check below is made by the trait system, not by reading source text.
+// `CloneProbe<T>` has an inherent associated const `IMPLEMENTS_CLONE = true` that exists only
+// when `T: Clone`; the blanket `DoesNotImplementClone` supplies `false` for every `T`. An
+// inherent associated item shadows a trait one of the same name, so
+// `<CloneProbe<T>>::IMPLEMENTS_CLONE` is `true` exactly when `T: Clone`, whatever the spelling:
+// one derive attribute, a `#[derive(Clone)]` stacked above `#[derive(Debug)]`, or a hand-written
+// `impl Clone`. Comments and string literals in `environment.rs` are invisible to it. This test
+// deliberately does not read an explanation beside the derive: a justified `Clone` (§6: an owned
+// snapshot or a transfer to another task, explained beside the derive) returns only by replacing
+// the assertion in `host_environment_does_not_implement_clone` together with that explanation.
+trait DoesNotImplementClone {
+    const IMPLEMENTS_CLONE: bool = false;
+}
+
+impl<T: ?Sized> DoesNotImplementClone for T {}
+
+struct CloneProbe<T: ?Sized>(PhantomData<T>);
+
+impl<T: Clone> CloneProbe<T> {
+    const IMPLEMENTS_CLONE: bool = true;
+}
+
+#[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "the probe is decided by the trait system at compile time; the test exists to \
+              report the answer under its own name with the diagnostic below"
+)]
+fn host_environment_does_not_implement_clone() {
+    assert!(
+        !<CloneProbe<HostEnvironment>>::IMPLEMENTS_CLONE,
+        "`HostEnvironment` implements `Clone` again; no call site in the tree clones one, and a \
+         clone of the whole environment is unexplained under §6 (SWEEP-HOST-ENVIRONMENT-001). A \
+         justified `Clone` needs its owned-snapshot or cross-task-transfer explanation beside the \
+         derive and a deliberate replacement of this assertion."
+    );
+}
+
+#[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "positive and negative controls of a compile-time probe are constants by design"
+)]
+fn the_clone_probe_reports_the_trait_however_it_was_implemented() {
+    #[derive(Debug)]
+    struct DebugOnly;
+
+    #[derive(Debug, Clone)]
+    struct DerivedInOneAttribute;
+
+    #[derive(Clone)]
+    // Deliberately a second attribute: the shape a nearest-derive-line scan misses.
+    #[derive(Debug)]
+    struct DerivedInStackedAttributes;
+
+    #[derive(Debug)]
+    struct ImplementedByHand;
+
+    impl Clone for ImplementedByHand {
+        fn clone(&self) -> Self {
+            Self
+        }
+    }
+
+    assert!(!<CloneProbe<DebugOnly>>::IMPLEMENTS_CLONE);
+    assert!(<CloneProbe<DerivedInOneAttribute>>::IMPLEMENTS_CLONE);
+    assert!(<CloneProbe<DerivedInStackedAttributes>>::IMPLEMENTS_CLONE);
+    assert!(<CloneProbe<ImplementedByHand>>::IMPLEMENTS_CLONE);
+    assert!(<CloneProbe<KeyCase>>::IMPLEMENTS_CLONE);
+    assert!(!<CloneProbe<HostRunner>>::IMPLEMENTS_CLONE);
 }

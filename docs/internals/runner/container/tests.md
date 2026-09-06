@@ -2041,7 +2041,9 @@ this says what the performer actually requested, so a `match` arm that sleeps
 where it should yield, or sleeps after `Done`, is a mismatch here whatever
 the clock says. Four mutations were run natively against it — yield-only, the
 terminal arm removed, the `Done` arm sleeping, the `Yield` arm sleeping — and
-every one fails at `assert_every_pause_was_performed_as_decided`.
+three of the four fail at `assert_every_pause_was_performed_as_decided`; the
+terminal-arm-removed mutation instead fails at the independent schedule
+assertions.
 
 ## `pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {`
 

@@ -27,7 +27,19 @@ module and none of them is reachable from outside it.
 
 `md_options` supplies the same parser options to every child. `parser_source`
 makes lone-CR line boundaries visible to the parser without moving source
-byte offsets. Both stay here so the three walks use the same input rules.
+byte offsets. Both stay here so detection and the three parse walks use the
+same input rules.
+
+## `fn sniff(&self, raw: &str) -> bool {`
+
+Detection reads the same normalized source the parse does. `str::lines`
+splits only at LF, so a lone-CR plan whose first line is not a markdown
+shape — a preamble above the first `##` — was refused here before
+`parse_with_warnings` could accept it, while the LF and CRLF spellings of
+the same plan were taken. DESIGN.md §9 supports all three. Normalization
+moves line boundaries only, so it cannot widen what detection accepts: a
+file with no markdown shape in it has none after the CRs become LFs
+either.
 
 ## `fn parser_source(raw: &str) -> Cow<'_, str> {`
 

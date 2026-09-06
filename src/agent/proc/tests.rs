@@ -302,7 +302,7 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
 
     let supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "sleep 60"])
         .stdin(Stdio::null())
@@ -443,7 +443,7 @@ impl Drop for ReapedChild {
 fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
     let mut supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
@@ -501,7 +501,7 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
         this_group > 0,
         "this process has no readable group: {this_group}"
     );
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
@@ -544,6 +544,142 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
 
     let status = child.wait().expect("reap the control child");
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reaped_childs_pid_never_answers_for_its_own_group() {
+    let mut supervisor =
+        termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+    let mut command = shell("read line; exit 0");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    supervisor.prepare(&mut command);
+    let mut child = ReapedChild::new(
+        command
+            .spawn()
+            .expect("spawn a child that holds until its stdin closes"),
+    );
+    let pid = child.pid();
+    supervisor
+        .register(pid)
+        .expect("register the child's group with the supervisor");
+
+    child.close_stdin();
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        panic!("{reason}");
+    }
+    let zombie = observe_child_group(pid);
+    assert!(
+        zombie.had_exited_before_the_look() && zombie.leads_own_group(),
+        "the premise: as an exited, unreaped child this pid answers for its own group, \
+         so the reap below is the only thing that changes: {zombie}"
+    );
+
+    supervisor.finish().expect("settle the child's group");
+    let status = child.wait().expect("reap the child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let reaped = observe_child_group(pid);
+    assert_eq!(
+        reaped.exited_before,
+        Err(libc::ECHILD),
+        "the premise: the reaped pid is no longer a child of this process: {reaped}"
+    );
+    assert!(
+        !reaped.leads_own_group(),
+        "a reaped pid answered for its own group: whatever holds that pid now, this \
+         process cannot see it as its own child, so the answer is about a stranger: \
+         {reaped}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn only_this_processs_own_zombie_answers_for_its_group_after_an_esrch() {
+    const PID_AS_GROUP: u32 = 424_242;
+    const PID: libc::pid_t = PID_AS_GROUP as libc::pid_t;
+    const ANOTHER_GROUP: u32 = 4_242;
+
+    let after_esrch = |exited_before: Result<bool, i32>,
+                       zombie_group: Result<ZombieGroupAnswer, i32>| {
+        GroupObservation {
+            pid: PID,
+            exited_before,
+            group: Err(libc::ESRCH),
+            zombie_group,
+            exited_after: exited_before,
+        }
+    };
+    let own_group = |status: u32| {
+        Ok(ZombieGroupAnswer {
+            pgid: PID_AS_GROUP,
+            status,
+        })
+    };
+
+    let this_processs_zombie = after_esrch(Ok(true), own_group(libc::SZOMB));
+    assert!(
+        this_processs_zombie.leads_own_group(),
+        "the one case the fall-through is for: this process's own exited, unreaped \
+         child, whose zombie record names its own pid as its group: \
+         {this_processs_zombie}"
+    );
+
+    for (case, observation) in [
+        (
+            "a live process holding the pid, which `proc_pidinfo` reaches through \
+             `proc_find` before it ever consults the zombie list",
+            after_esrch(Err(libc::ECHILD), own_group(libc::SRUN)),
+        ),
+        (
+            "a zombie of some other parent holding the pid",
+            after_esrch(Err(libc::ECHILD), own_group(libc::SZOMB)),
+        ),
+        (
+            "a record that names another group",
+            after_esrch(
+                Ok(true),
+                Ok(ZombieGroupAnswer {
+                    pgid: ANOTHER_GROUP,
+                    status: libc::SZOMB,
+                }),
+            ),
+        ),
+        ("no record at all", after_esrch(Ok(true), Err(libc::ESRCH))),
+        (
+            "a running child of this process, which `getpgid` would have answered for",
+            after_esrch(Ok(false), own_group(libc::SRUN)),
+        ),
+        (
+            "this process's own unreaped child beside a record that is not a \
+             zombie's, so the two conditions bind independently",
+            after_esrch(Ok(true), own_group(libc::SRUN)),
+        ),
+        (
+            "a pid this process never had as a child, with no record",
+            after_esrch(Err(libc::ECHILD), Err(libc::ESRCH)),
+        ),
+    ] {
+        assert!(
+            !observation.leads_own_group(),
+            "{case} answered for its own group: {observation}"
+        );
+    }
+
+    let refused = GroupObservation {
+        pid: PID,
+        exited_before: Ok(true),
+        group: Err(libc::EPERM),
+        zombie_group: own_group(libc::SZOMB),
+        exited_after: Ok(true),
+    };
+    assert!(
+        !refused.leads_own_group(),
+        "only `ESRCH` falls through to the exited record: {refused}"
+    );
 }
 
 #[cfg(unix)]
@@ -3965,4 +4101,54 @@ fn a_reaped_child_makes_the_racing_kill_error_irrelevant() {
         Ok(()),
     );
     assert!(matches!(error, UpstrokeError::Agent { message } if message == "startup refused"));
+}
+
+/// `PR156-ASTRA-EXIT-DESTRUCTORS`. The kill-hook rationale used to justify
+/// [`super::hooks::apply`]'s `abort` by saying that `panic!` and
+/// `std::process::exit` "both run destructors". Only the first does:
+/// `std::process::exit` runs no stack destructors on any thread, and what
+/// separates it from `abort` is the process-exit handlers it still runs, not
+/// destructors. Pin the corrected distinction so the three deaths keep their
+/// separate reasons; `src/export.rs` pins design sentences the same way.
+#[test]
+fn the_kill_hook_rationale_separates_unwinding_exit_handlers_and_abort() {
+    const NOTES: &str = include_str!("../../../docs/internals/agent/proc/hooks.md");
+
+    let rationale = NOTES
+        .split("\n## ")
+        .find(|section| section.starts_with("`pub(super) fn apply("))
+        .expect("the notes carry the `apply` heading the kill rationale sits under");
+    // Match on the prose, not on where its line breaks fall: a reflow must not
+    // break the pin, only a changed claim.
+    let rationale = rationale.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for (proposition, pin) in [
+        (
+            "panic unwinds and runs its stack destructors",
+            "`panic!` unwinds",
+        ),
+        (
+            "process::exit runs no stack destructors",
+            "runs **no** stack destructors",
+        ),
+        (
+            "process::exit is separated from abort by exit handlers, not destructors",
+            "process-exit handlers",
+        ),
+        (
+            "abort runs neither unwinding nor an exit handler",
+            "no clean-up is performed and no destructors run",
+        ),
+    ] {
+        assert!(
+            rationale.contains(pin),
+            "the kill rationale must state that {proposition}; looked for {pin:?} in:\n{rationale}"
+        );
+    }
+
+    assert!(
+        !rationale.contains("both of those run destructors"),
+        "the retired claim that `panic!` and `std::process::exit` both run \
+         destructors must not come back:\n{rationale}"
+    );
 }
