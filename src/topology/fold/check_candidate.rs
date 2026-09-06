@@ -102,44 +102,12 @@ impl RunState {
                 ),
             });
         }
-        match (&prepared.lease_effect, entry.lineage) {
-            (CandidateLeaseEffect::ReplacesPredicted { paths }, None) => {
-                if *paths != prepared.actual_paths {
-                    return Err(FoldError::InconsistentRecord {
-                        kind: KIND,
-                        detail: "the region it takes is not the region its diff touched".to_owned(),
-                    });
-                }
-            }
-            (CandidateLeaseEffect::WidensLineage { root, paths }, Some(lineage)) => {
-                if *root != lineage.root {
-                    return Err(FoldError::InconsistentRecord {
-                        kind: KIND,
-                        detail: format!(
-                            "it widens lineage {root} and its task descends from {}",
-                            lineage.root
-                        ),
-                    });
-                }
-                if *paths != prepared.actual_paths {
-                    return Err(FoldError::InconsistentRecord {
-                        kind: KIND,
-                        detail: "the region it widens by is not the region its diff touched"
-                            .to_owned(),
-                    });
-                }
-            }
-            (CandidateLeaseEffect::ReplacesPredicted { .. }, Some(_))
-            | (CandidateLeaseEffect::WidensLineage { .. }, None) => {
-                return Err(FoldError::InconsistentRecord {
-                    kind: KIND,
-                    detail: "a lineage member widens its lineage and an ordinary candidate \
-                             replaces its predicted region; this does the other one"
-                        .to_owned(),
-                });
-            }
-        }
-        Ok(())
+        check_lease_effect(
+            KIND,
+            &prepared.lease_effect,
+            entry.lineage.map(|lineage| lineage.root),
+            &prepared.actual_paths,
+        )
     }
 
     pub(super) fn check_candidate_created(
@@ -150,19 +118,16 @@ impl RunState {
         let candidate = &created.candidate;
         let task = self.task(KIND, candidate.key)?;
         let generation = self.open_generation(KIND, task, candidate.key, candidate.generation)?;
-        let prepared = match &generation.candidate {
-            Some(prepared) if generation.class == GenerationClass::Promoting => prepared,
-            _ => {
-                return Err(FoldError::NotTheOpenGeneration {
-                    kind: KIND,
-                    key: candidate.key.0,
-                    generation: candidate.generation.0,
-                    detail: format!(
-                        "the generation is {} and has prepared no candidate",
-                        generation.class.name()
-                    ),
-                });
-            }
+        let Some(prepared) = promoting_candidate(generation) else {
+            return Err(FoldError::NotTheOpenGeneration {
+                kind: KIND,
+                key: candidate.key.0,
+                generation: candidate.generation.0,
+                detail: format!(
+                    "the generation is {} and has prepared no candidate",
+                    generation.class.name()
+                ),
+            });
         };
         if prepared.candidate != *candidate {
             return Err(FoldError::InconsistentRecord {
@@ -177,5 +142,227 @@ impl RunState {
             });
         }
         Ok(())
+    }
+}
+
+fn check_lease_effect(
+    kind: &'static str,
+    lease_effect: &CandidateLeaseEffect,
+    lineage_root: Option<TaskKey>,
+    actual_paths: &PathSet,
+) -> Result<(), FoldError> {
+    match (lease_effect, lineage_root) {
+        (CandidateLeaseEffect::ReplacesPredicted { paths }, None) => {
+            if paths != actual_paths {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: "the region it takes is not the region its diff touched".to_owned(),
+                });
+            }
+        }
+        (CandidateLeaseEffect::WidensLineage { root, paths }, Some(lineage_root)) => {
+            if *root != lineage_root {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: format!(
+                        "it widens lineage {root} and its task descends from {lineage_root}"
+                    ),
+                });
+            }
+            if paths != actual_paths {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: "the region it widens by is not the region its diff touched".to_owned(),
+                });
+            }
+        }
+        (CandidateLeaseEffect::ReplacesPredicted { .. }, Some(_))
+        | (CandidateLeaseEffect::WidensLineage { .. }, None) => {
+            return Err(FoldError::InconsistentRecord {
+                kind,
+                detail: "a lineage member widens its lineage and an ordinary candidate \
+                         replaces its predicted region; this does the other one"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn promoting_candidate(generation: &GenerationFold) -> Option<&PreparedCandidate> {
+    match &generation.candidate {
+        Some(prepared) if generation.class == GenerationClass::Promoting => Some(prepared),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KIND: &str = "candidate_prepared";
+    const ROOT: TaskKey = TaskKey(1);
+    const ANOTHER_ROOT: TaskKey = TaskKey(7);
+    const MISMATCHED_PAIRING: &str = "a lineage member widens its lineage and an ordinary \
+                                      candidate replaces its predicted region; this does the \
+                                      other one";
+
+    fn region(name: &str) -> PathSet {
+        PathSet::Prefixes {
+            paths: vec![GitPath(format!("src/{name}/"))],
+        }
+    }
+
+    fn refusal(result: &Result<(), FoldError>) -> Option<(&str, &str)> {
+        match result {
+            Err(FoldError::InconsistentRecord { kind, detail }) => Some((kind, detail.as_str())),
+            _ => None,
+        }
+    }
+
+    fn prepared() -> PreparedCandidate {
+        PreparedCandidate {
+            candidate: CandidateRef {
+                key: TaskKey(0),
+                generation: GenerationId(0),
+                commit_sha: CommitSha("c".repeat(40)),
+                candidate_ref: GitRef("refs/upstroke/runs/run/candidates/0/0".to_owned()),
+            },
+            base_sha: CommitSha("b".repeat(40)),
+            tree_sha: CommitSha("t".repeat(40)),
+            paths: region("alpha"),
+        }
+    }
+
+    fn generation(class: GenerationClass, candidate: Option<PreparedCandidate>) -> GenerationFold {
+        GenerationFold {
+            id: GenerationId(0),
+            class,
+            base_sha: CommitSha("b".repeat(40)),
+            lease: GenerationLease::Own,
+            attempts: 1,
+            candidate,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_candidate_takes_exactly_the_region_its_diff_touched() {
+        let taken = CandidateLeaseEffect::ReplacesPredicted {
+            paths: region("alpha"),
+        };
+        assert_eq!(
+            check_lease_effect(KIND, &taken, None, &region("alpha")),
+            Ok(())
+        );
+
+        let elsewhere = CandidateLeaseEffect::ReplacesPredicted {
+            paths: region("beta"),
+        };
+        let refused = check_lease_effect(KIND, &elsewhere, None, &region("alpha"));
+        assert_eq!(
+            refusal(&refused),
+            Some((KIND, "the region it takes is not the region its diff touched"))
+        );
+    }
+
+    #[test]
+    fn a_widening_that_names_a_lineage_its_task_does_not_descend_from_is_refused() {
+        let widens = CandidateLeaseEffect::WidensLineage {
+            root: ANOTHER_ROOT,
+            paths: region("alpha"),
+        };
+        let refused = check_lease_effect(KIND, &widens, Some(ROOT), &region("alpha"));
+        let expected =
+            format!("it widens lineage {ANOTHER_ROOT} and its task descends from {ROOT}");
+        assert_eq!(refusal(&refused), Some((KIND, expected.as_str())));
+    }
+
+    #[test]
+    fn a_widening_widens_by_exactly_the_region_its_diff_touched() {
+        let widens = CandidateLeaseEffect::WidensLineage {
+            root: ROOT,
+            paths: region("alpha"),
+        };
+        assert_eq!(
+            check_lease_effect(KIND, &widens, Some(ROOT), &region("alpha")),
+            Ok(())
+        );
+
+        let elsewhere = CandidateLeaseEffect::WidensLineage {
+            root: ROOT,
+            paths: region("beta"),
+        };
+        let refused = check_lease_effect(KIND, &elsewhere, Some(ROOT), &region("alpha"));
+        assert_eq!(
+            refusal(&refused),
+            Some((KIND, "the region it widens by is not the region its diff touched"))
+        );
+    }
+
+    #[test]
+    fn a_lineage_member_widens_and_an_ordinary_candidate_replaces_and_neither_does_the_other() {
+        let replaces = CandidateLeaseEffect::ReplacesPredicted {
+            paths: region("alpha"),
+        };
+        let by_a_lineage_member = check_lease_effect(KIND, &replaces, Some(ROOT), &region("alpha"));
+        assert_eq!(
+            refusal(&by_a_lineage_member),
+            Some((KIND, MISMATCHED_PAIRING))
+        );
+
+        let widens = CandidateLeaseEffect::WidensLineage {
+            root: ROOT,
+            paths: region("alpha"),
+        };
+        let by_an_ordinary_task = check_lease_effect(KIND, &widens, None, &region("alpha"));
+        assert_eq!(refusal(&by_an_ordinary_task), Some((KIND, MISMATCHED_PAIRING)));
+    }
+
+    #[test]
+    fn the_refusal_carries_the_kind_its_caller_named() {
+        let widens = CandidateLeaseEffect::WidensLineage {
+            root: ROOT,
+            paths: region("alpha"),
+        };
+        let refused = check_lease_effect("task_candidate_created", &widens, None, &region("alpha"));
+        assert_eq!(
+            refusal(&refused),
+            Some(("task_candidate_created", MISMATCHED_PAIRING))
+        );
+    }
+
+    #[test]
+    fn a_promoting_generation_offers_the_candidate_it_prepared() {
+        let held = generation(GenerationClass::Promoting, Some(prepared()));
+        assert_eq!(promoting_candidate(&held), Some(&prepared()));
+    }
+
+    #[test]
+    fn a_generation_that_is_not_promoting_offers_no_candidate_even_when_one_is_attached() {
+        let classes = [
+            GenerationClass::OpenNoAttempt,
+            GenerationClass::InFlight {
+                attempt: AttemptNumber(1),
+            },
+            GenerationClass::RetainedIdle {
+                session: SessionId("session".to_owned()),
+                incarnation: Epoch(0),
+            },
+            GenerationClass::Closed,
+        ];
+        for class in classes {
+            let named = class.name();
+            let held = generation(class, Some(prepared()));
+            assert!(
+                promoting_candidate(&held).is_none(),
+                "a generation that is {named} offered a candidate to promote"
+            );
+        }
+    }
+
+    #[test]
+    fn a_promoting_generation_that_prepared_nothing_offers_no_candidate() {
+        let held = generation(GenerationClass::Promoting, None);
+        assert!(promoting_candidate(&held).is_none());
     }
 }
