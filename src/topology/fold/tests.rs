@@ -24,6 +24,9 @@ use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{FrozenReviews, FrozenRung, FrozenTaskSpec, Lineage, Origin};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
+#[cfg(test)]
+mod questions;
+
 const RUN_ID: &str = "01FOLD0000000000000000000A";
 
 type BreakRunner = fn(&mut RunnerPolicy);
@@ -875,6 +878,36 @@ fn a_retained_generation_holds_no_pipeline_entitlement_and_is_ready_to_retry() {
         "a retained generation is retried, never re-dispatched"
     );
     assert!(fold.structurally_admissible());
+}
+
+#[test]
+fn an_exhausted_generation_attempt_counter_is_refused_without_panicking() {
+    const SESSION: &str = "counter-boundary-session";
+    let mut fold = started();
+    apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+    let first = attempt_started(&fold, ALPHA, 0, 1, 0);
+    apply(&mut fold, &first);
+    apply(&mut fold, &retain(ALPHA, 1, SESSION, Epoch(0)));
+    let retry = attempt_started_resuming(&fold, ALPHA, 0, 2, 0, SESSION);
+    accepts(&fold, &retry);
+
+    let run = fold.run.as_mut().expect("the checked prefix started a run");
+    run.open_generation_mut(ALPHA)
+        .expect("the checked prefix retained this generation")
+        .attempts = u32::MAX;
+    let before = fold.state().cloned();
+    let error = fold
+        .plan_transition(&retry)
+        .expect_err("an exhausted counter has no representable next attempt");
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("counter exhaustion must return a contextual record refusal");
+    };
+    assert_eq!(kind, "attempt_started");
+    assert!(
+        detail.contains(&format!("task {ALPHA} generation 0")),
+        "{detail}"
+    );
+    assert_eq!(fold.state(), before.as_ref());
 }
 
 fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {
@@ -6375,7 +6408,7 @@ fn grid_state(
         };
         match backoff {
             Backoff::None => {}
-            Backoff::DeferredTask => run.tasks[MID.index()].state = TaskState::Deferred,
+            Backoff::DeferredTask => run.set_state(MID, TaskState::Deferred),
             Backoff::DeferredCandidate => run.queue.push(QueueEntry {
                 candidate: candidate_of(MID, 0),
                 paths: region(MID),

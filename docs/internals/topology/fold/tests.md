@@ -290,7 +290,7 @@ room — the reservable predicate is a comparison, not a boolean flag.
 A settlement to `RetainedIdle` releases the pipeline entitlement while
 keeping the generation open — the one class whose two properties differ.
 
-## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent…`
+## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {`
 
 --- the Retained arm asks what the Closed arm asks ---------------------
 
@@ -298,7 +298,7 @@ keeping the generation open — the one class whose two properties differ.
 settlement refusals all construct `Closed`, which is why this arm was
 undriven: it checked the epoch and stopped.
 
-## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent…`
+## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {`
 
 A `Retained` settlement of `key`'s first attempt, session and all.
 
@@ -2700,3 +2700,12 @@ run may say so.
 And the direction that says the predicate is not vacuous: with `cee`
 still Pending rather than Failed, nothing is Blocked, `cee` is
 admissible, and the run is not ending.
+
+## `an_exhausted_generation_attempt_counter_is_refused_without_panicking` › `let run = fold.run.as_mut().expect("the checked prefix started a run");`
+
+Construct only the numeric boundary after a checked retained prefix.
+This is not a claim that a billions-record history was replayed.
+
+## `an_exhausted_generation_attempt_counter_is_refused_without_panicking` › `let before = fold.state().cloned();`
+
+The independent snapshot witnesses that refusing the retry changes no state.

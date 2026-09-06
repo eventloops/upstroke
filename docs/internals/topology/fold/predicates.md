@@ -50,10 +50,9 @@ structurally eligible. These accessors are that second half and nothing
 more — each delegates to the private predicate it names and adds no
 logic of its own.
 
-Each returns the value that is true of a run which has not recorded its
-`run_started` yet, rather than an `Option`: no task of an unstarted run
-is ready, and such a run holds no entitlement. Those are statements, not
-defaults.
+An unstarted run offers no work: readiness predicates return false,
+and the continuation reader returns no generation. Such a run holds no
+entitlement either.
 
 **A poisoned fold authorises nothing.** `plan_transition` refuses with
 `FoldError::Poisoned` once an append has returned an error, and INV-20
@@ -131,8 +130,8 @@ refuse — and the two copies would be free to disagree.
 ## `impl TopologyFold` › `pub fn backoff_pending(&self) -> bool {`
 
 Whether anything is waiting on a wait: a task in
-[`TaskState::Deferred`], or a queue entry whose verification was
-deferred by an outage.
+[`TaskState::Deferred`], a task whose execution backoff is hidden by
+an open question, or a queue entry whose verification was deferred.
 
 This is the *pending work* half of the backoff branch and not the
 branch itself — [`Self::run_is_ending`] is the other half, and
@@ -188,6 +187,8 @@ what `apply` recorded and the id is the generation's. Poisoning is not
 consulted for the same reason the other statement accessors do not — a
 poisoned fold of a run with an open generation still has one, and `None`
 here would be a false statement rather than a refusal.
+A lineage question likewise leaves the generation visible to recovery;
+selection uses the separate continuation eligibility reader.
 
 ## `impl TopologyFold` › `pub fn predicted_region(&self, key: TaskKey) -> Option<PathSet> {`
 
@@ -225,3 +226,19 @@ Whether any question is open.
 The ids themselves are [`Self::open_questions`]; this is the predicate
 `derived_outcome` decides `Parked` with, exposed so that the hard-block
 branch and the derived outcome cannot disagree about what "open" means.
+
+## `pub(crate) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {`
+
+The open generation whose first attempt is structurally eligible.
+
+Unlike `open_no_attempt`, this authorizes selection. It returns `None`
+for an unstarted, poisoned or ending run, an absent task or generation,
+a generation that already started, or a lineage with an open question.
+The generation already holds its pipeline entitlement, so continuation
+does not require another free slot. Event-specific binding and
+materialization facts are still checked when the attempt is recorded.
+
+## `pub(crate) fn eligible_integration_candidate(&self) -> Option<&CandidateRef> {`
+
+The same eligible candidate that makes integration admissible. The
+engine uses this borrowed result so its choice includes lineage questions.

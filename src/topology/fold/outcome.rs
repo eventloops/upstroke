@@ -51,7 +51,7 @@ impl RunState {
                     .get(dep.index())
                     .is_some_and(|dep| dep.state == TaskState::Merged)
             })
-            && self.open_question_for(key).is_none()
+            && !self.lineage_has_question(key)
             && !self.queue.holds_task(key)
             && self
                 .transaction
@@ -96,7 +96,7 @@ impl RunState {
         });
         task.state == TaskState::Pending
             && retained
-            && self.open_question_for(key).is_none()
+            && !self.lineage_has_question(key)
             && self
                 .transaction
                 .as_ref()
@@ -105,29 +105,41 @@ impl RunState {
             && !self.run_is_ending()
     }
 
+    pub(super) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {
+        if self.run_is_ending() || self.lineage_has_question(key) {
+            return None;
+        }
+        self.tasks
+            .get(key.index())
+            .and_then(TaskFold::open)
+            .filter(|generation| generation.class == GenerationClass::OpenNoAttempt)
+            .map(|generation| generation.id)
+    }
+
     pub(super) fn pipeline_reservable(&self) -> bool {
         self.pipeline_held()
             < usize::try_from(self.started.limits.max_parallel).unwrap_or(usize::MAX)
     }
 
     pub(super) fn integration_admissible(&self) -> bool {
-        self.transaction.is_none()
-            && self.pipeline_reservable()
-            && !self.run_is_ending()
-            && self
-                .queue
-                .first_eligible(
-                    |key| self.task_is_awaiting_input(key),
-                    &self.leases,
-                    &self.started.path_policy,
-                )
-                .is_some()
+        self.eligible_integration_candidate().is_some()
+    }
+
+    pub(super) fn eligible_integration_candidate(&self) -> Option<&CandidateRef> {
+        if self.transaction.is_some() || !self.pipeline_reservable() || self.run_is_ending() {
+            return None;
+        }
+        self.queue
+            .first_eligible(
+                |key| self.task_is_awaiting_input(key),
+                &self.leases,
+                &self.started.path_policy,
+            )
+            .map(|entry| &entry.candidate)
     }
 
     pub(super) fn backoff_pending(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| task.state == TaskState::Deferred)
+        !self.deferred_tasks.is_empty()
             || self
                 .queue
                 .entries()

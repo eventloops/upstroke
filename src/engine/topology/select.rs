@@ -9,7 +9,7 @@ use crate::topology::events::{
     AttemptNumber, BudgetExceeded4, CandidateRef, DerivedOutcome, Epoch, GenerationId,
     TopologyEvent, TopologyEventBody,
 };
-use crate::topology::fold::{GenerationClass, TaskState, TopologyFold};
+use crate::topology::fold::{GenerationClass, TopologyFold};
 use crate::topology::registry::TaskKey;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -246,19 +246,7 @@ pub fn checkpoint(step: Step) -> Result<Admitted, UpstrokeError> {
 }
 
 fn eligible_integration(fold: &TopologyFold) -> Option<CandidateRef> {
-    if !fold.integration_admissible() {
-        return None;
-    }
-    let queue = fold.queue()?;
-    let leases = fold.leases()?;
-    let policy = &fold.started()?.path_policy;
-    queue
-        .first_eligible(
-            |key| fold.task_state(key) == Some(TaskState::AwaitingInput),
-            leases,
-            policy,
-        )
-        .map(|entry| entry.candidate.clone())
+    fold.eligible_integration_candidate().cloned()
 }
 
 fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, AttemptNumber)> {
@@ -281,14 +269,16 @@ fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, Atte
 
 fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {
     keys(fold).find_map(|key| {
-        if let Some(generation) = fold.open_no_attempt(key) {
+        if let Some(generation) = fold.eligible_continuation(key) {
             return Some((key, generation, true));
         }
         if !fold.ready(key) {
             return None;
         }
         let task = fold.task(key)?;
-        let generation = u32::try_from(task.generations.len()).ok()?;
+        let Ok(generation) = u32::try_from(task.generations.len()) else {
+            return None;
+        };
         Some((key, GenerationId(generation), false))
     })
 }

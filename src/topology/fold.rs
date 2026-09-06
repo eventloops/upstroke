@@ -441,6 +441,7 @@ pub struct RunState {
     incarnation: IncarnationId,
     questions: BTreeMap<QuestionId, OpenQuestion>,
     seen_questions: BTreeSet<QuestionId>,
+    deferred_tasks: BTreeSet<TaskKey>,
     overrides: BTreeMap<TaskKey, BindingOverride>,
     queue: CandidateQueue,
     leases: LeaseTable,
@@ -553,6 +554,7 @@ impl RunState {
             incarnation,
             questions: BTreeMap::new(),
             seen_questions: BTreeSet::new(),
+            deferred_tasks: BTreeSet::new(),
             overrides: BTreeMap::new(),
             queue: CandidateQueue::new(),
             leases: LeaseTable::new(),
@@ -601,6 +603,20 @@ impl RunState {
         self.questions
             .values()
             .find(|open| open.question.key == key)
+    }
+
+    fn lineage_root(&self, key: TaskKey) -> TaskKey {
+        self.registry
+            .get(key)
+            .and_then(|entry| entry.lineage)
+            .map_or(key, |lineage| lineage.root)
+    }
+
+    fn lineage_has_question(&self, key: TaskKey) -> bool {
+        let root = self.lineage_root(key);
+        self.questions
+            .values()
+            .any(|open| self.lineage_root(open.question.key) == root)
     }
 }
 

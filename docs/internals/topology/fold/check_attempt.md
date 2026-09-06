@@ -254,3 +254,22 @@ promoting generation is not closed — it is promoted.
 
 refusals[18]: halt and budget outrank backoff, so no wait elapses
 under either.
+
+## `check_task_spawned` › `if let Some(lineage) = spawn.entry.lineage {`
+
+check_spawn has established the lineage. Unlike merge_rejected,
+a standalone birth settles no transaction before its question.
+
+## `check_spawn` › `if entry.allowed_agents != self.started.probed_agents {`
+
+The allow-list is the run's, not the registering event's: an entry
+that widened it would admit an agent pre-flight never probed.
+
+## `check_attempt_started` › `match (&generation.class, &started.resume_session) {`
+
+ST-06: a retry names the generation it is retrying, and a fresh
+attempt names one nothing has run in yet.
+
+## `check_attempt_started` › `let next_attempt =`
+
+ST-06: attempts are dense from 1 within a generation.
