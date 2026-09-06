@@ -61,6 +61,36 @@ mod tests {
     }
 
     #[test]
+    fn detect_recognizes_lf_crlf_and_lone_cr_plans_alike() {
+        for (endings, newline) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+            for body in [
+                [
+                    "Preamble",
+                    "## Fix bug",
+                    "<!-- upstroke: min=frontier -->",
+                    "",
+                ],
+                ["Preamble", "- [ ] fix bug", "", ""],
+                ["Preamble", "1. fix bug", "", ""],
+            ] {
+                let raw = body.join(newline);
+                let adapter =
+                    detect(&raw).unwrap_or_else(|error| panic!("{endings} {raw:?}: {error}"));
+                assert_eq!(adapter.id(), "markdown", "{endings} {raw:?}");
+                let plan = adapter
+                    .parse(&raw)
+                    .unwrap_or_else(|error| panic!("{endings} {raw:?}: {error}"));
+                assert_eq!(plan.tasks.len(), 1, "{endings} {raw:?}");
+            }
+            let json = ["{\"tasks\": []}", ""].join(newline);
+            assert!(
+                detect(&json).is_err(),
+                "{endings}: normalization must not widen what detection accepts"
+            );
+        }
+    }
+
+    #[test]
     fn detect_rejects_unrecognized_input() {
         let err = detect("{\"tasks\": []}\n")
             .map(|a| a.id())
