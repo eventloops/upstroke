@@ -321,6 +321,23 @@ mod tests {
     }
 
     #[test]
+    fn checklist_item_drops_an_ordinary_author_comment() {
+        let raw = "\
+# Checklist plan
+
+- [ ] Design the widget API <!-- keep rollback enabled -->
+- [x] Implement the widget store
+";
+        let parsed = parse(raw);
+        let tasks = &parsed.plan.tasks;
+        assert_eq!(
+            tasks[0].title, "Design the widget API",
+            "unlike a section body, a checklist item drops an ordinary author \
+             comment rather than keeping it"
+        );
+    }
+
+    #[test]
     fn ordered_step_plans_become_tasks() {
         let parsed = parse(corpus::STEPS_PLAN);
         let tasks = &parsed.plan.tasks;
