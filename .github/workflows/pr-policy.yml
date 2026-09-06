@@ -5,10 +5,11 @@ on:
   # controlled: a pull request can edit both, so an edit to either is part of
   # the diff the frontier review and the owner judge before merging.
   # decisions/2026-08-23-retire-app-attestation.md
-  # Slice pull requests into the integration branch carry the same body
-  # template and per-PR ledger. decisions/2026-08-21-stacked-slice-prs.md
+  # The branch list is `master` alone; a base is added here and in ci.yml
+  # together, and slice pull requests into an integration branch carry the same
+  # body template and per-PR ledger (MAINTAINING.md, Repository rules).
   pull_request:
-    branches: [master, codex/parallelism-design]
+    branches: [master]
     types: [opened, edited, synchronize, reopened, ready_for_review]
   # A merge-queue entry carries no pull-request payload; the step below reads
   # the pull request's number out of the queue ref and its title, body and
@@ -20,7 +21,7 @@ on:
   # this context on the entry too.
   merge_group:
     types: [checks_requested]
-    branches: [master, codex/parallelism-design]
+    branches: [master]
 
 permissions:
   contents: read
