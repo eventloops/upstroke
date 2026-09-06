@@ -4,8 +4,14 @@ Extended notes for [`src/topology/fold/apply.rs`](../../../../src/topology/fold/
 
 ## Module
 
-The application half of INV-02: what a checked transition does to the
-state, and nothing that decides whether it may.
+The application half of the one-checked-transition rule: what a checked
+transition does to the state, and nothing that decides whether it may. The
+living authority is `design/04`'s fourth invariant — every state transition is
+an event and state is derived by replaying them — with the protocol spelled out
+in `design/26`: "The live writer checks one event, appends that exact event
+successfully once, and applies its delta once to the same fold with no
+intervening transition." (`INV-02` was the retired 2026-08-12 packet's label
+for it; no living document defines that id.)
 
 Application is a deterministic function of the prior state, event and
 checked derivation. It reads no clock, environment or randomness and performs
@@ -76,6 +82,18 @@ by its `merge_verification_started`, which already advanced
 Derive the visible state after answering or waking a task. Question
 origin does not capture a queued candidate, later wake or other answer.
 
+This half reads the six facts off the state; [`derived_state`] below
+turns them into the state. Four of the six readings are witnessed by
+`src/topology/fold/tests.rs` — computing `own_question`,
+`queued_candidate`, `repair_child` or `unelapsed_backoff` as `false`
+each fails tests there. The other two are unreachable rather than
+untested, and measured as such: `owns_transaction` cannot fire where
+`queued_candidate` does not, because a candidate under a transaction
+still holds its queue position until `apply_task_merged` or
+`apply_merge_rejected` removes it; and `terminal` cannot be true here,
+because `check_question_raised` refuses a terminal task and `set_state`
+takes a terminal task out of `deferred_tasks`.
+
 ## `fn fail_lineage(&mut self, key: TaskKey) {`
 
 Decline terminates all unpublished work in the lineage. Already merged
@@ -91,7 +109,7 @@ class. Its already authorized publication must survive.
 Owned keys let each member's resources be consumed without retaining
 a registry borrow across those mutations.
 
-## `pub(super) fn release_holdings_of(&mut self, key: TaskKey) {`
+## `fn release_holdings_of(&mut self, key: TaskKey) {`
 
 Remove this member's queued candidates and candidate/lineage holdings.
 The caller closes its generation and visits every affected member.
@@ -101,7 +119,9 @@ The caller closes its generation and visits every affected member.
 `None` means this key has no task or no open generation. Checked callers
 establish which generation they need before application mutates it.
 
-## `close_generation` › `let releases_own_region = match generation.lease {`
+## `fn releases_own_region(lease: GenerationLease) -> bool {`
+
+Whether a closing generation gives a region back.
 
 Exhaustive over the lease, so a new `GenerationLease` is a compile
 error here rather than one that silently keeps its region held: an
@@ -109,24 +129,41 @@ own generation holds its predicted region and releases it when it
 closes, and an inherited-lineage generation took none of its own and
 releases nothing.
 
-## `apply` › `}`
+**The distinction is a rule, not an observable.** An inherited-lineage
+generation never took a `LeaseOwner::Generation` lease — `apply_dispatched`
+grants one only for `LeaseGrant::Predicted` — so releasing one would
+remove nothing, and answering `true` for both arms changes no state any
+test can see. Measured: with the call site rewritten to
+`releases_own_region(GenerationLease::Own)`, the whole `topology::fold`
+suite stays green. The function is separate and tested so that the rule
+is stated somewhere a mutation dies, which the call site alone cannot
+give it.
 
-**Not counted here.** An attempt that has *started* has not
+## `apply` › `TopologyEventBody::AttemptStarted { data } => {`
+
+**The allowance is not counted here.** An attempt that has *started* has not
 yet spent anything: `ladder::spends_allowance` is total over
 `FailureKind` and its line is "the worker ran and produced
 work to judge", which `attempt_started` cannot know. Counting
 here made this fold a second authority for a rule that has one
 production implementation, and made every interruption, park
-and outage burn a rung the packet says they do not —
-`transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend,
-**allowance refunded**". The count is taken at the settlement,
+and outage burn a rung `design/15` says they do not: an
+attempt the log ends mid-flight is "recorded in the ledger
+with unknown spend, but not counted against the rung's
+allowance, because nothing judged the code — the same rule
+§19 applies to an outage". (`T-ATTEMPT` was the retired
+2026-08-12 packet's row label for that case; no living
+document defines it.) The count is taken at the settlement,
 in `apply_settlement`, from the record the settlement carries.
 
-## `apply` › `self.close_generation(data.key);`
+## `apply` › `TopologyEventBody::AttemptInterrupted { data } => {`
 
-T-ATTEMPT: generation Closed, task Pending, later dispatch a
-new generation. The close releases the ordinary generation's
-own region exactly as every other closing settlement does.
+An interrupted attempt: generation Closed, task Pending, later
+dispatch a new generation. (`apply` closes a generation at two
+sites; this section is the interruption's, not
+`generation_closed`'s, which leaves the task's state alone.) The
+close releases the ordinary generation's own region exactly as
+every other closing settlement does.
 
 ## `apply` › `self.open_question(&data.question, QuestionOrigin::Admission, None);`
 
@@ -171,8 +208,9 @@ than the live failure, and the allowance decision is the same decision
 either way".
 
 **Taken at the settlement, which is what makes the refund free.**
-T-ATTEMPT refunds an interrupted attempt's allowance. An attempt that
-never settled never counted, so there is nothing to give back and no
+An interrupted attempt is not counted against its rung's allowance
+(`design/15`, quoted in the `attempt_started` section above). An
+attempt that never settled never counted, so there is nothing to give back and no
 second rule to keep in step with the first — the refund is the absence
 of a charge rather than a subtraction that could be forgotten.
 
@@ -197,9 +235,12 @@ in flight rather than a silently-promoted one.
 
 ## `apply_settlement` › `if let Some(task) = self.tasks.get_mut(finished.key.index()) {`
 
-The settlement's own number: the packet defines it as the
-rung the escalation climbs *onto*. The allowance is per
-rung, so it starts again here.
+The settlement's own number, which `design/11` step 4 defines
+as the rung the escalation climbs *onto*: "`attempts_per`
+exhausted → next rung". `check_attempt_finished` refuses an
+`Escalated` settlement that names anything but `task.rung + 1`
+within the frozen ladder, so the number this stores is that
+one. The allowance is per rung, so it starts again here.
 
 ## `apply_settlement` › `self.set_defers(finished.key, *defers);`
 
@@ -210,7 +251,7 @@ derivation of a value the log already holds, and a replay
 of the same log would then disagree with the process that
 wrote it.
 
-## `pub(super) fn record_halt(&mut self, key: TaskKey) {`
+## `fn record_halt(&mut self, key: TaskKey) {`
 
 `halted_at` is first in wins, and is never cleared.
 
@@ -244,8 +285,11 @@ worker ran and produced work that was judged and accepted.
 **The settlement, which used to arrive on its own event.** A
 candidate-producing attempt has exactly one successful
 settlement and this is it, so the class transition belongs here
-rather than to an `attempt_finished` the 2026-08-12 record says
-is not emitted.
+rather than to an `attempt_finished` that is not emitted for a
+successful settlement: `design/15` records that
+"`candidate_prepared` is the sole successful settlement for that
+candidate-producing attempt", and `check_attempt_finished`
+refuses a `succeeded` transition for that reason.
 
 ## `apply_candidate_prepared` › `self.charge_allowance(prepared.key, &prepared.attempt);`
 
@@ -267,7 +311,7 @@ other question this run can ask — a `HumanRequired` admission, a parked
 settlement, a verification park, a bare `question_raised`. That is the
 whole of what an override may be validated against.
 
-## `pub(super) fn set_defers(&mut self, key: TaskKey, defers: u32) {`
+## `fn set_defers(&mut self, key: TaskKey, defers: u32) {`
 
 Record the deferral count a `Deferred` settlement carried.
 
@@ -275,6 +319,66 @@ Assignment rather than increment: the number is the settlement's, which
 is what makes a replay of the same log reach the same count as the
 process that wrote it.
 
-## `pub(super) fn close_generation(&mut self, key: TaskKey) {`
+## `fn close_generation(&mut self, key: TaskKey) {`
 
 Close the open generation, releasing the region it held on its own.
+
+## `fn take_candidate_region(`
+
+Take the region a prepared candidate is entitled to.
+
+An ordinary candidate replaces the region its dispatch predicted: the
+generation's lease is released and a candidate lease is granted over the
+paths the diff actually touched, which `check_candidate_prepared` has
+already compared with the record. A lineage member takes nothing of its
+own and widens its lineage's region instead — `design/26`: "The repair
+holds leases on its **actual** affected paths" — so a repair whose diff
+reaches outside the region its rejection created is covered by the
+lineage lease before any candidate can be judged eligible against those
+paths.
+
+Separate from [`RunState::apply_candidate_prepared`] so that both arms
+can be reached with a `LeaseTable` and two values. Dropping the call
+site altogether is caught by `src/topology/fold/tests.rs`; the
+widening's own effect was caught by nothing until this file's test
+block.
+
+## `struct VisibleFacts`
+
+The six current facts an answer or a wake derives a task's state from.
+
+Named fields rather than six positional booleans (§5), because the call
+site is where they are read off the state and a reader has to see which
+is which.
+
+## `fn derived_state(facts: VisibleFacts) -> Option<TaskState> {`
+
+`design/26`'s sentence, in its order: "The answered task keeps a
+terminal state; otherwise another question of its own implies
+`AwaitingInput`, a queued candidate or owned transaction implies
+`AwaitingMerge`, a registered repair child implies `AwaitingRepair`,
+unelapsed execution backoff implies `Deferred`, and otherwise it becomes
+`Pending`."
+
+`None` is the terminal case: keep the state the task reached. It is not
+`TaskState::Merged`, because which terminal state it is belongs to the
+event that set it.
+
+The precedence is the whole content of this function, and it is what six
+review passes of PR #152 argued over, so it is pinned by a table rather
+than by a trace: the question outranks each of the other four facts one
+at a time, both merge facts reach `AwaitingMerge` alone and together, a
+repair child outranks a backoff, and a task with none of them is
+`Pending`.
+
+## `#[cfg(test)] mod tests`
+
+Tests for `take_candidate_region`, `releases_own_region` and
+`derived_state`, in this file rather than in `src/topology/fold/tests.rs`
+where the rest of the fold's tests live. Every method of this module is
+on `&mut RunState`, whose construction needs the `RunStarted4`, plan,
+chain and registry-digest fixture that sibling file builds; that file is
+queue row 39 and the sweep that added these tests could not edit it. The
+three relations were extracted so they could be reached with values
+instead, which is the same reason `src/topology/fold/check_candidate.rs`
+carries a block of its own.

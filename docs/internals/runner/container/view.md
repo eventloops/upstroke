@@ -2,6 +2,8 @@
 
 Extended notes for [`src/runner/container/view.rs`](../../../../src/runner/container/view.rs).
 
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/container/view.rs).
+
 The code is the authority for what it does; this file is the whole of its prose, moved out of
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
@@ -337,7 +339,7 @@ nothing will ever reclaim, because the record naming it is gone.
 an error. It gives a delete-pending name another chance to disappear without
 treating access denial as success. The bound used to be sixty-four yields,
 which a winner descheduled between marking the name and closing its handle
-outlasted; [reviews/FINDINGS.md §43](../../../../reviews/FINDINGS.md) records
+outlasted; [reviews/FINDINGS.md §43](https://github.com/eventloops/upstroke/blob/master/reviews/FINDINGS.md) records
 the first Windows sighting and `PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`
 the measured cause. The later attempts now sleep, on the schedule
 `super::racing_pause` and its constants state. A protected view remains an

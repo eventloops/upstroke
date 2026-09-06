@@ -2,6 +2,8 @@
 
 Extended notes for [`src/runner/container/runtime.rs`](../../../../src/runner/container/runtime.rs).
 
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/container/runtime.rs).
+
 The code is the authority for what it does; this file is the whole of its prose, moved out of
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
@@ -706,3 +708,28 @@ The index of the first entry whose rendering starts with `prefix`.
 ## `impl ContainerTrace` › `pub fn clear(&self) {`
 
 Forget everything recorded so far, keeping the handle.
+
+<!--
+PR163-ASTRA-RUSTDOC-LINKS: the rustdoc shortcut syntax above (`` [`Name`] ``)
+has no Markdown reference definition, so a CommonMark renderer emits plain
+text instead of a link. These definitions give each shortcut a real target
+so the references above resolve.
+-->
+[`ContainerRuntime::probe`]: ../../../../src/runner/container/runtime.rs
+[`ContainerRuntime`]: ../../../../src/runner/container/runtime.rs
+[`CreateSpec::read_only_root`]: ../../../../src/runner/container/runtime.rs
+[`CreateSpec`]: ../../../../src/runner/container/runtime.rs
+[`CreatedContainer::reported_image_id`]: ../../../../src/runner/container/runtime.rs
+[`Mount::Tmpfs`]: ../../../../src/runner/container/runtime.rs
+[`RuntimeError::Failed`]: ../../../../src/runner/container/runtime.rs
+[`RuntimeError::Unreachable`]: ../../../../src/runner/container/runtime.rs
+[`RuntimeError`]: ../../../../src/runner/container/runtime.rs
+[`RuntimeOp`]: ../../../../src/runner/container/runtime.rs
+[`Self::reported_image_id`]: ../../../../src/runner/container/runtime.rs
+[`StopMode`]: ../../../../src/runner/container/runtime.rs
+[`crate::agent::ProcessOutput`]: ../../../../src/agent/proc.rs
+[`crate::runner::Runner`]: ../../../../src/runner/mod.rs
+[`crate::topology::events::ImageIdentity`]: ../../../../src/topology/events.rs
+[`crate::util::DurabilityLedger`]: ../../../../src/util.rs
+[`crate::util::DurableStep`]: ../../../../src/util.rs
+[`super::exec::ContainerRunner::plan`]: ../../../../src/runner/container/exec.rs

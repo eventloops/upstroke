@@ -165,7 +165,7 @@ fn run_started_event() -> TopologyEvent {
                     "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                         .to_owned(),
                 path_policy: PathPolicy {
-                    version: PathPolicyVersion::V1,
+                    version: PathPolicyVersion::V2,
                     case_fold: false,
                     grammar: PathGrammar::Globset,
                 },

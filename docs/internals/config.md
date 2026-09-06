@@ -14,6 +14,38 @@ LEGACY-EFFECT: this module is in the **frozen legacy section** of
 `effects/allowlist.toml`, which carries its justification and the condition
 under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 
+## `#[serde(deny_unknown_fields)]`
+
+The top level of `upstroke.toml`. Its seven fields are exactly the sections
+`design/17` documents for the repo-level file, so an unknown section name is a
+typo and is refused naming it and the accepted seven. Before this attribute a
+misspelled header -- `[budgts]`, `[interation]`, `[runer]` -- deserialized into
+nothing: the whole section vanished, its defaults took effect (no budget
+ceiling; `on_block` interaction in CI; the host runner where the file read as
+confined) and `validate` reported a clean file. A top-level typo deleted the
+largest unit a typo can delete, and this attribute closes that boundary and
+that boundary only (`SWEEP-CONFIG-PARSE-007`, closed by the sweep of
+`src/config/read.rs`). It is not the last silent drop in the file:
+`[routing.strategy]` is read through `RawStrategy`, which carries neither
+`deny_unknown_fields` nor an unknown-key collector, so a misspelled
+`spend_down_afer` there is still discarded without a word
+(`SWEEP-CONFIG-PARSE-008`, open, guarded to this file's own sweep, row 54).
+No forward-compatibility key is lost at the top level: nothing in the tree's
+fixtures, docs or examples writes a top-level key outside the seven.
+
+## `fn a_misspelled_top_level_section_is_refused_not_dropped() {`
+
+Each of the three fixtures used to deserialize into nothing: the whole
+section vanished and its defaults took effect while `validate` reported a
+clean file (`SWEEP-CONFIG-PARSE-007`). The test is witnessed against removing
+the attribute above: without it the load succeeds and the section is dropped.
+The capture is built in memory -- a `FileSnapshot` holding the bytes, the
+state `snapshot_file` records for a file it has read -- and goes through
+`load_captured`, the same path `load` takes once its capture exists, so no
+temporary file, directory or cleanup is part of the oracle (§12): the suite's
+`scratch` helper writes predictable per-process paths with no owning guard,
+and a regression added by a sweep does not lean on it.
+
 ## `gates: Option<toml::Value>,`
 
 Parsed as raw values so shape mistakes get actionable messages instead
@@ -371,7 +403,7 @@ into a record, and the value INV-23's rebuild path compares against a
 recorded one ("today's `[runner]` config that differs warns naming the
 difference and is ignored").
 
-[`RunnerPolicy`]: crate::topology::events::RunnerPolicy
+[`RunnerPolicy`]: ../../src/topology/events.rs
 
 ## `pub kind: RunnerKind,`
 

@@ -217,19 +217,20 @@ Whether it carries a `reason = "…"`.
 
 ## `pub fn blank_comments(source: &str) -> String {`
 
-`source` with every comment and string literal replaced by spaces of the same
-length, newlines preserved.
+`source` with every comment **removed** and every string literal **kept**
+verbatim. A comment's newlines survive, so line numbers do; the rest of its
+bytes do not, so nothing after the first comment sits at the offset it had in
+`source`. Length preservation is [`blank_comments_and_strings`]'s contract,
+not this one's.
 
-The scan has to be blind to text that only *looks* like an attribute.
-`PR4-CENSUS-COMMENT-ORACLE` is in the standing ledger because a source census
-counted a doc comment; this module is worse placed than most, since its own
-build-refusal fixtures are `#[allow(clippy::disallowed_methods)]` written
-inside doc comments and string literals. Blanking rather than deleting keeps
-every byte offset — and therefore every line number — exact.
+```text
+in: /*why*/let x = "docker";
+out: let x = "docker";
+```
 
 Raw strings (`r"…"`, `r#"…"#`), byte strings, char literals and escapes are
 handled; a `'a` lifetime is not a char literal and is left alone.
-Comments blanked, **string literals kept**.
+Comments removed, **string literals kept**.
 
 The other half of [`blank_comments_and_strings`], and a separate function
 because a census whose needle lives *inside* a string cannot use that one:
@@ -356,6 +357,30 @@ not start one.
 
 Accepts `"…"`, `b"…"`, `r"…"`, `r#"…"#` and `br##"…"##`. An unterminated
 literal ends at end of input — a file that does not compile.
+
+## `pub fn blank_comments_and_strings(source: &str) -> String {`
+
+`source` with every comment and string literal replaced by spaces of the same
+length, newlines preserved. The output is exactly as long as the input, so an
+offset, a line and a column measured in it are `source`'s own.
+
+```text
+in: /*why*/let x = "docker";
+out:        let x =         ;
+```
+
+The scan has to be blind to text that only *looks* like an attribute.
+`PR4-CENSUS-COMMENT-ORACLE` is in the standing ledger because a source census
+counted a doc comment; this module is worse placed than most, since its own
+build-refusal fixtures are `#[allow(clippy::disallowed_methods)]` written
+inside doc comments and string literals. Blanking rather than deleting keeps
+every byte offset — and therefore every line number — exact.
+
+A needle that lives *inside* a literal cannot be looked for in this output:
+the quotes are blanked with it, so `"docker` is a byte sequence the haystack
+can no longer contain. [`blank_comments`] is the half that keeps it, and
+`the_notes_give_each_blanker_its_own_contract` runs both worked examples
+above against the functions themselves.
 
 ## `pub fn blank_comments_and_strings(source: &str) -> String` › `for (index, byte) in bytes.iter().enumerate() {`
 

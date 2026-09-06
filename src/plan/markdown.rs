@@ -298,6 +298,19 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_id_is_reserved_before_an_earlier_draft_derives_a_colliding_slug() {
+        let raw = "## Fix X\n\n## Second\n<!-- upstroke: id=fix-x -->\n";
+        let tasks = parse(raw).plan.tasks;
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["fix-x-2", "fix-x"],
+            "the later draft's explicit id must win `fix-x`; the earlier, \
+             untitled-in-annotation draft derives around it"
+        );
+    }
+
+    #[test]
     fn checklist_plans_become_tasks() {
         let raw = "\
 # Checklist plan

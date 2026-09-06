@@ -828,6 +828,42 @@ quoting a needle is still invisible, which is `PR4-CENSUS-COMMENT-ORACLE`.
 
 Line breaks survive, because callers report line numbers.
 
+## `pub(super) mod oracles` › `pub(in crate::effects::tests) fn the_notes_give_each_blanker_its_own_contract() {`
+
+The two blankers have two different contracts, and
+[`docs/internals/effects.md`](../../effects.md) states each one under the
+function it belongs to.
+
+`PR161-ASTRA-BLANKER-CONTRACT`. The notes opened [`blank_comments`] with its
+sibling's contract — "every comment and string literal replaced by spaces of
+the same length" — while the function deletes a comment's bytes and keeps a
+literal's. A census written from that sentence can look for a needle inside a
+literal that is no longer there, or report a line and column measured against
+an input the output is no longer aligned to.
+
+The notes are read with `\r\n` folded to `\n` first. A Windows checkout under
+`core.autocrlf` hands the file back with carriage returns, and the heading and
+fence boundaries this parser looks for are spelled with bare newlines: without
+the fold every section lookup misses and the test fails on the guest while
+passing on Linux.
+
+Prose cannot be pinned by naming the sentence it must not contain, so the
+direction of every assertion here is measured first: which helper preserves
+its input's length is computed from the helper, and the notes are then
+required to say so for that one and not for the other. The worked example
+under each heading is parsed out and run, so an example that stops matching
+its function fails by value rather than by wording.
+
+## `pub(in crate::effects::tests) fn the_notes_give_each_blanker_its_own_contract() {` › `let (deleting_in, deleting_out) = worked_example(&deleting, DELETING);`
+
+The example is the notes' own, not a copy of it kept here: a drift between
+the two documents cannot hide behind a fixture this test owns.
+
+## `pub(in crate::effects::tests) fn the_notes_give_each_blanker_its_own_contract() {` › `for claim in LENGTH_CLAIMS {`
+
+Both length claims, each required in exactly the section whose helper the
+measurement above says holds it.
+
 ## `pub(super) mod oracles` › `pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {`
 
 A char literal whose scalar is more than one byte does not desync the

@@ -125,6 +125,24 @@ meant another lands on a value this fixture does not hold.
 
 A fold that has recorded its `run_started` and nothing else.
 
+## `fn attempt_finished_mut(event: &mut TopologyEvent) -> &mut AttemptFinished4 {`
+
+The body of an `attempt_finished` a fixture has just built, for the tables that
+damage one coordinate of an otherwise valid event.
+
+These two accessors exist because §7 denies `unreachable!` in tests as well as in
+production, with no Clippy allowance to take, and the eleven sites that read
+`let ... else { unreachable!("built as an attempt_finished") }` were that
+construct. A test fails its own setup with a message naming the failed premise
+instead, which is what the panic here does, and `#[track_caller]` reports the
+fixture line rather than this one. The premise is live rather than decorative:
+handing either accessor an event of another kind panics with the kind it was
+given.
+
+## `fn candidate_prepared_mut(event: &mut TopologyEvent) -> &mut CandidatePrepared {`
+
+The same accessor for a `candidate_prepared`.
+
 ## `fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {`
 
 --- event builders ----------------------------------------------------
@@ -213,6 +231,15 @@ halves of this file agree.
 The negative half is what gives it teeth. Perturbing one field of the
 binding must be refused, or the validator is not checking the thing the
 reader produces and the positive half proves nothing.
+
+**The table varies every field of `RungBinding`, and did not always.** It ran
+`model`, `agent` and `effort` and left `tier` and `pinned` alone, so a
+comparison that dropped either of those two would have passed here.
+`matches_frozen` is whole-struct equality against `from_frozen`, so all five are
+compared today; that is a property of one expression, and this table is what
+holds it. The `assert_ne!` above the refusal is the guard the older arms did
+without: a perturbation that perturbs nothing would satisfy the loop by leaving
+the accepted binding in place.
 
 ## `fn attempt_started_resuming(`
 
@@ -354,8 +381,8 @@ settlement that reaches it.
 attempt succeeded — on either arm.**
 
 The sibling-arm witness. `candidate_prepared` is the sole successful
-settlement (INV-07,
-`decisions/2026-08-12-merge-queue-execution-topology.md`), and the
+settlement (`design/26_design_merge_queue_protocol.md` §26; `INV-07` is
+the retired packet's label for the same rule, not itself an authority), and the
 `Closed` arm has enforced that against the record since round 6. The
 `Retained` arm did not, so the invariant held on one path through the
 door and not the other: a retained settlement could carry a record with
@@ -381,6 +408,14 @@ the two agree rather than that each refuses something.
 The one shape both arms must refuse: no failure, and the frozen
 obligation all green — which is exactly what `candidate_prepared`
 requires of the settlement that *is* a success.
+
+## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `let variant_of = |settlement: &AttemptSettlement| match settlement {`
+
+"No arm" is a claim about every variant, and the table below is a list. The
+`match` makes a new variant of `AttemptSettlement` a compile error here, and the
+assertion makes a variant silently dropped from the table a failure: removing the
+`closed` row fails this test rather than quietly narrowing the sentence in the
+title to the one arm left.
 
 ## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `accepts(&fold, &settle(ZETA, 0, 1, settlement()));`
 
@@ -515,6 +550,9 @@ behaves differently after a restart.
 ## `fn a_ladder_position_is_derived_by_replay_and_not_assumed()` › `for attempt in 1..=2u32 {`
 
 Rung 0, two attempts, allowance spent -> escalate onto rung 1.
+Zeta rather than alpha since PR #180: alpha's fixture ladder has one
+rung, and the fold now refuses an escalation onto a rung the frozen
+ladder lacks.
 
 ## `fn a_ladder_position_is_derived_by_replay_and_not_assumed()` › `let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");`
 
@@ -525,6 +563,26 @@ Through the wire, because a resume reads bytes.
 The two assumptions this replaces, shown wrong. A fresh process
 starts both at zero and agrees with the fold on every reading until
 a resume — which is exactly when nothing is watching.
+
+## `fn an_attempt_runs_at_the_replay_derived_rung_and_an_escalation_climbs_exactly_one() {`
+
+**An attempt runs at the rung replay says the task stands on, and an
+escalation moves that position by exactly one rung.** PR #180's
+second review (`PR180-REVIEW2-001`): `check_attempt_started` indexed
+the frozen ladder by the event's own rung and never compared it with
+`TaskFold.rung`, so a rung-0 start with rung 0's valid binding was
+accepted on a task already escalated to rung 1, and `apply_settlement`
+took whatever rung an `Escalated` settlement carried.
+
+The walk: zeta (three rungs) spends rung 0 and escalates onto rung 1;
+a start below (rung 0) and above (rung 2) the position is refused as
+`WrongRung` with the ladder position untouched, the start at the
+position applies; from rung 1 an escalation backward (0), sideways (1)
+or over a rung (3) is refused and the one onto rung 2 applies; from the
+top rung an escalation onto rung 3 is refused, because the human is
+the top rung, and a retry there is charged to rung 2's allowance. Then
+through the wire: the replayed fold holds the same position and refuses
+and accepts the same starts as the live one.
 
 ## `const CHARGE_ALLOWANCE: fn(&mut RunState, TaskKey, &AttemptRecord) = RunState::charge_all…`
 
@@ -754,6 +812,20 @@ process still may not append.
 A record that does not claim the topology schema is not one this
 fold may interpret, whatever else it says.
 
+## `fn a_run_recorded_under_an_earlier_path_policy_is_refused_r…` › `let under = |version: PathPolicyVersion| {`
+
+Finding 1 of PR #212's frontier pass. `hint_prefix` changed which
+region a hint derives, and `check_dispatched` compares a run's durable
+`LeaseGrant::Predicted` against the region the current derivation
+produces from the same frozen hints. A binary carrying the new
+derivation therefore refuses the old log's own accepted dispatches as
+malformed records, one at a time, and an interrupted run with a
+mid-component glob becomes unresumable with no statement of why. The
+frozen `path_policy.version` is where that is said once: v2 is
+accepted, v1 is refused at the event that froze it, and both halves
+are asserted here so an implementation that refused every version
+would fail as loudly as one that accepted every version.
+
 ## `fn a_run_started_carries_a_runner_record_that_could_be_re_e…` › `let mut runner = container_runner();`
 
 refusals[5], first half, over every defect the record can exhibit —
@@ -926,10 +998,11 @@ asymmetry between the two is what the row was written about.
 
 One hint shape, and the region the contract says it derives.
 
-**Transcribed from the rule, not from the code.** The rule is "the
-plan's path hints, taken literally: a hint with no glob metacharacter is
-its own literal prefix; anything else — an absent hint list, or a hint
-whose literal prefix is empty — classifies repo-wide". Reading
+**Transcribed from the rule, not from the code.** The rule is path
+policy v2: the whole components of a hint before the first component
+carrying a glob metacharacter; anything else — an absent hint list, a
+hint that bounds no component, a dotted component, or a backslash
+anywhere in the hint — classifies repo-wide. Reading
 `predicted_region`'s body to build this table would make the grid agree
 with the derivation for the reason the derivation is right or wrong,
 which is the self-oracle shape `CODING_STANDARDS.md` names.
@@ -969,7 +1042,12 @@ dropped, and the separator that precedes it goes with the trim.
 
 ## `HintShape {`
 
-A Windows-shaped hint names Git paths once its separators are.
+A hint carrying a backslash bounds nothing. The character is a
+separator on Windows and an escape under the frozen `globset` grammar
+on Unix, the record does not say which machine wrote the plan, and a
+prefix taken under either reading is narrower than the hint under the
+other — the direction that admits two owners of one file. Path policy
+v2 refuses rather than guesses.
 
 ## `HintShape {`
 
@@ -1151,20 +1229,30 @@ refusals[11] / INV-19, one component at a time. Each case moves one
 field of an otherwise exact binding: a check that compared the whole
 record, or that compared none of it, fails on the case it skipped.
 
-## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `for rung in 0..3u32 {`
-
-The effort is the ladder's effort *for that rung's tier*, not the
-run's default and not another tier's: zeta's rungs are small, mid and
-frontier, resolving to three different efforts.
+`pinned` joined `agent`, `model`, `tier` and `effort` in the sweep of row 39.
+It was the one coordinate of `RungBinding` no table in this file varied, and
+`matches_frozen` ignoring it was a change the whole suite passed.
 
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);`
 
-A rung the ladder does not have.
+A rung the ladder does not have. Since PR #180 it is refused as the
+wrong rung before the ladder is indexed: the task stands on rung 0,
+and an attempt runs at the task's position.
 
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut materializing = attempt_started(&fold, ZETA, 0, 1, 0);`
 
 A repair's attempt records what its worktree was materialized from,
 and an ordinary one records nothing.
+
+## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `for rung in 0..rungs {`
+
+The effort is the ladder's effort *for that rung's tier*, not the
+run's default and not another tier's: zeta's rungs are small, mid and
+frontier, resolving to three different efforts. Walked rung by rung
+since PR #180 — an attempt is accepted only at the task's
+replay-derived position, so each rung above the first is reached by
+applying the exact start and escalating onto it — which is why this
+walk comes last: everything above it runs in generation 0 on rung 0.
 
 ## `fn an_override_is_the_binding_the_frozen_admission_authoriz…` › `let mut fold = started();`
 
@@ -1211,6 +1299,16 @@ The same answer without the override is the ordinary one.
 ## `fn an_override_is_the_binding_the_frozen_admission_authoriz…` › `let mut required = repair_spawn(TaskKey(4), ALPHA, ALPHA);`
 
 A `HumanRequired` admission asks for a person, not for a binding.
+
+## `fn an_answer_may_not_take_an_option_its_admission_authorize…` › `let offered = question("q-binding-Ünicode", BETA).options.len();`
+
+A `HumanBinding` spawn carries two lists -- the options its question
+offers and the bindings its admission authorizes -- and nothing pairs
+their lengths. The option answered here is inside the first and past
+the second, so the range check cannot be what refuses it; the answer
+carrying no override proves that, because it is refused for naming no
+binding rather than for being out of range. What refuses the override
+is the authority itself, which has no entry at that option.
 
 ## `fn an_interruption_closes_its_generation_and_returns_its_ta…` › `let base = sha("base");`
 
@@ -1604,7 +1702,7 @@ Re-derived, not adjusted. This was
 asserted the opposite of the first claim below: that `candidate_prepared`
 is **refused** while the attempt is still running, and accepted only after
 an `attempt_finished{Succeeded}` had promoted the generation. That is the
-dual-settlement pattern `decisions/2026-08-12-merge-queue-execution-topology.md`
+dual-settlement pattern `design/26_design_merge_queue_protocol.md` §26
 forbids — "`attempt_finished` is not also emitted for that attempt" — and the
 fold was *requiring* it. Ruled CONFORM 2026-08-27.
 
@@ -2065,11 +2163,66 @@ Answered once: the second answer has no open question to name.
 
 And its id is never reused for a new question either.
 
+## `fn a_continuation_is_offered_only_for_an_open_generation_no_attempt_has_used() {`
+
+[`TopologyFold::eligible_continuation`], which had no test in this file. The
+engine's selector reads it to decide whether a task with an open generation is
+continued rather than dispatched afresh, so what it returns is the generation a
+worker is about to resume into.
+
+Two things are asserted that no other test held. **The identity**: the fixture
+closes generation 0 and dispatches generation 1, so an answer of
+`GenerationId(0)` — a reader that took the first generation rather than the open
+one — is a different value from the right one. **The class filter**: in flight,
+retained-idle and promoting each get their own arm, because dropping the
+`OpenNoAttempt` filter is a change the fold suite otherwise passes.
+`src/topology/fold/tests/questions.rs` reaches this reader through `select` and
+holds the lineage-question guard; it holds neither of these.
+
+## `fn lineage_with_a_dispatched_repair(ask_about: Option<TaskKey>) -> TopologyFold {`
+
+A lineage whose repair holds an open generation, optionally with a question open
+on the root.
+
+**The question is installed through `RunState::open_question` rather than by an
+event, and the fixture proves it has to be.** Both orders are refused:
+dispatching the member after the question fails `task_dispatched` ("dispatch
+requires no outstanding lineage question or candidate for this task"), and
+raising the question after the dispatch fails `question_raised` ("settle it
+before parking its tasks"). So `eligible_continuation`'s `lineage_has_question`
+arm guards a state no legal log reaches, and the `refuse` above the hand-built
+state records that rather than leaving a reader to wonder. Building an
+unreachable cell by hand is what [`grid_state`] does, for the same reason.
+
+## `fn the_eligible_integration_candidate_is_the_first_the_queue_still_offers() {`
+
+[`TopologyFold::eligible_integration_candidate`], which had no test in this file
+either. `integration_admissible` is its `is_some()` and is asserted in seven
+places, so the *predicate* was covered and the *identity* was not: the selector
+integrates the candidate this returns, and a reader that offered the wrong one
+would have left all seven of those assertions true.
+
+The arms are its three early returns and the queue's own eligibility. The parked
+arm is the one that pins identity — with `mid` awaiting input the offer must be
+`zeta`, and the two candidates are asserted distinguishable first, so an
+either-answer reader cannot pass. Dropping the open-transaction guard is a change
+the fold suite otherwise passes.
+
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `let base = sha("base");`
 
-refusals[20], and the epoch scope that makes a resume the way back:
-a budget-stopped run ingests the answer after its resume, and a
-halted one never does, because `halted_at` is never cleared.
+refusals[20], and the epoch scope that makes a resume the way back: both a
+budget-stopped run and a halted one ingest the answer after their resume.
+
+**The sentence that stood here until the sweep of row 39 said the halted one
+never does, "because `halted_at` is never cleared".** `halted_at` is indeed
+never cleared, and `derived_outcome` reads it, so a resumed halted run still
+derives Halted -- but `check_question_answered` does not read it. It compares
+`halted_epoch` with the current epoch, and a resume moves the epoch, so the
+answer door reopens. The two halves of this file's own prose disagreed about
+that, the paragraph below having it right, and the test stopped one line short
+of asking: it resumed and then asserted only that `halted_at` survived.
+Replacing the guard with `self.halted_at.is_some()` -- the reading the wrong
+sentence describes -- was a change the whole fold suite passed.
 
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `apply(&mut halted, &resume(container_runner()));`
 
@@ -2082,6 +2235,16 @@ derives Halted.
 A resume starts a new epoch without one, and the next breach belongs
 to that epoch rather than the old one.
 
+## `fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_r…` › `accepts(&fold, &breach(12.5, 12.5));`
+
+The producer's own boundary. `Ceiling::breach` stops the run when the
+spend has reached the ceiling, so the equal pair is a breach and the
+pair a cent short of it is not, and the fold refuses the second rather
+than recording a stop the record does not support. The unordered and
+unbounded pairs are the other half: `NaN` compares false against every
+ceiling, so an ordering test alone would accept them, and it is the
+finiteness refusal that names what is wrong with them.
+
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `let base = sha("base");`
 
 refusals[18]: halt and budget outrank backoff.
@@ -2089,6 +2252,14 @@ refusals[18]: halt and budget outrank backoff.
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `apply(&mut budget, &resume(container_runner()));`
 
 Cleared by the resume that raises the ceiling.
+
+The halt below is the other half of that, and the asymmetry is the point:
+`check_defer_wait_elapsed` guards on `halted_at.is_some()`, which no resume
+clears, while `check_question_answered` two files away guards on
+`halted_epoch == self.epoch`, which every resume moves. So one resume reopens
+answers and leaves waits refused. Each guard is asserted after a resume here,
+because each was free to take the other's form: swapping either one for the
+other's expression left the fold suite green.
 
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `let head = sha("head");`
 
@@ -2117,6 +2288,15 @@ Every value of [`Blocker`], so the grid crosses the whole dimension.
 ## `enum Budget {`
 
 Whether a budget stop exists, and whether it belongs to this epoch.
+
+`Older` is a stop one epoch **below** the run's, which is why [`grid_state`]
+starts the run at epoch 1 rather than at 0: at epoch 0 there is no older epoch to
+put one in, and the cell used to hold a stop at `epoch + 1`, which is not what
+its name says and not the direction that can go wrong. `budget_stop_is_current`
+is an equality, and an equality has two ways to loosen; with the stop above the
+epoch only one of them was under test. Reading it as `stop.epoch <= self.epoch`
+— a stop that outlives the resume that was supposed to lift it — passed the
+whole fold suite before this cell was corrected and fails it now.
 
 ## `enum Backoff {`
 
@@ -2426,6 +2606,12 @@ Replay: the same refusal, over the wire, with a valid
 suffix behind it that a lenient reader would have gone on
 to apply.
 
+The assertion beside it counts the lines that differ from the honest trace and
+requires exactly one. It used to be `hostile.len() == trace.len() && index <
+trace.len()`, which is an arithmetic identity and a loop bound — true by
+construction, in a position that reads as a check. What it now checks is that
+the log under test is this trace with one line replaced and no other damage.
+
 ## `fn every_guarded_event_is_refused_the_same_way_live_and_on_…` › `let unguarded: BTreeSet<&'static str> = [`
 
 The sweep is over the vocabulary, not over what was remembered. The
@@ -2449,11 +2635,29 @@ would let a writer append one record and fold another — which is the
 divergence between live state and replay that INV-02 forbids, in the
 one place the two are not literally the same call.
 
+## `const ASK: fn(&TopologyFold, &TopologyEvent) -> Result<TopologyDelta, FoldError> =`
+
+The receiver, pinned as a value. This is the whole of the claim below: nothing
+`plan_transition` does can move the fold, because it takes `&TopologyFold` and
+`TopologyFold` has no interior mutability. Declaring this item `&mut` is a type
+error at this line, and giving `plan_transition` a `&mut self` receiver stops the
+crate compiling.
+
 ## `fn a_refused_transition_changes_nothing()` › `let mut fold = started();`
 
 The other half of INV-02: an invalid transition is never applied,
 which is a property of `plan_transition` being a question rather
 than an action.
+
+**The runtime half of this test could not fail, and now can.** It offered every
+kind to a fold, compared the state with the state before, and asserted equality
+— against a `&self` method, on a type with no `Cell`, `RefCell` or lock in it,
+so the compiler had already decided the answer. A comparison that never sees a
+difference is satisfied by any fold, including one whose applier does nothing.
+So the test now takes the accepted delta it asked for, applies it, and requires
+the same comparison to report a difference; making `apply_delta` inert for
+`question_raised` fails this test with 22 others, where before it failed 22.
+The claim about asking is where it belongs, in [`ASK`] above.
 
 ## `fn the_registry_digest_does_not_widen_when_a_repair_is_regi…` › `let mut fold = started();`
 
@@ -2554,10 +2758,10 @@ holdings, two fates, and exactly one disposition per cell.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let registry = started().registry().expect("started").clone();`
 
-`admission_and_leases.path_policy.prediction`: the literal prefix
-before the first glob metacharacter, and repo-wide for anything
-unsafe or absent — the classification that costs parallelism and
-never costs correctness.
+`admission_and_leases.path_policy.prediction`, as path policy v2
+derives it: the whole components before the first component carrying a
+glob metacharacter, and repo-wide for anything unsafe or absent — the
+classification that costs parallelism and never costs correctness.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let mut hintless = zeta.clone();`
 
@@ -2565,8 +2769,11 @@ Absent, and unsafe, both classify repo-wide.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let mut windows = zeta.clone();`
 
-A backslash-separated hint is a Windows spelling of the same region,
-not a one-component path with a backslash in its name.
+A backslash-separated hint is a Windows spelling of one region and a
+Unix escape naming another, and nothing in the frozen record says
+which machine wrote it. Path policy v2 does not choose: any backslash
+bounds nothing, because a prefix taken under either reading is
+narrower than the hint under the other.
 
 ## `fn the_pipeline_entitlement_is_what_the_fold_derives_it_to_…` › `let base = sha("base");`
 

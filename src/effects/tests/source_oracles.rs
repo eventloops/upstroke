@@ -727,6 +727,102 @@ pub(super) mod oracles {
         );
     }
 
+    fn notes_section(notes: &str, heading: &str) -> String {
+        let after = notes
+            .split_once(&format!("\n{heading}\n"))
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("{heading} is not a heading in the effects notes"));
+        after
+            .split_once("\n## ")
+            .map_or(after, |(section, _)| section)
+            .to_owned()
+    }
+
+    fn worked_example(section: &str, heading: &str) -> (String, String) {
+        let fenced = section
+            .split_once("```text\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("{heading} carries no ```text worked example"));
+        let fenced = fenced
+            .split_once("\n```")
+            .map_or(fenced, |(block, _)| block);
+        let mut input = None;
+        let mut output = None;
+        for line in fenced.lines() {
+            if let Some(rest) = line.strip_prefix("in: ") {
+                input = Some(rest.to_owned());
+            } else if let Some(rest) = line.strip_prefix("out: ") {
+                output = Some(rest.to_owned());
+            }
+        }
+        match (input, output) {
+            (Some(input), Some(output)) => (input, output),
+            _ => panic!("{heading}'s worked example needs an `in: ` line and an `out: ` line"),
+        }
+    }
+
+    pub(in crate::effects::tests) fn the_notes_give_each_blanker_its_own_contract() {
+        const NOTES: &str = "docs/internals/effects.md";
+        const DELETING: &str = "## `pub fn blank_comments(source: &str) -> String {`";
+        const BLANKING: &str = "## `pub fn blank_comments_and_strings(source: &str) -> String {`";
+        const LENGTH_CLAIMS: [&str; 2] = [
+            "replaced by spaces of the same length",
+            "keeps every byte offset",
+        ];
+
+        let notes = fs::read_to_string(repo_root().join(NOTES))
+            .expect("the effects notes")
+            .replace("\r\n", "\n");
+        let deleting = notes_section(&notes, DELETING);
+        let blanking = notes_section(&notes, BLANKING);
+        let (deleting_in, deleting_out) = worked_example(&deleting, DELETING);
+        let (blanking_in, blanking_out) = worked_example(&blanking, BLANKING);
+
+        assert_eq!(
+            blank_comments(&deleting_in),
+            deleting_out,
+            "{DELETING}'s worked example is not what `blank_comments` returns for {deleting_in:?}"
+        );
+        assert_eq!(
+            blank_comments_and_strings(&blanking_in),
+            blanking_out,
+            "{BLANKING}'s worked example is not what `blank_comments_and_strings` returns for \
+             {blanking_in:?}"
+        );
+        assert!(
+            deleting_out.contains("\"docker\"") && !deleting_out.contains("/*"),
+            "{DELETING}'s example has to show a comment gone and a literal kept: {deleting_out:?}"
+        );
+        assert!(
+            !blanking_out.contains("docker") && !blanking_out.contains("/*"),
+            "{BLANKING}'s example has to show both blanked: {blanking_out:?}"
+        );
+
+        for (heading, section, preserves_length) in [
+            (
+                DELETING,
+                &deleting,
+                blank_comments(&deleting_in).len() == deleting_in.len(),
+            ),
+            (
+                BLANKING,
+                &blanking,
+                blank_comments_and_strings(&blanking_in).len() == blanking_in.len(),
+            ),
+        ] {
+            let flattened = section.split_whitespace().collect::<Vec<&str>>().join(" ");
+            for claim in LENGTH_CLAIMS {
+                assert_eq!(
+                    flattened.contains(claim),
+                    preserves_length,
+                    "{heading}: the notes stating \"{claim}\" is {}, while the helper preserving \
+                     its input's length is {preserves_length}",
+                    flattened.contains(claim)
+                );
+            }
+        }
+    }
+
     pub(in crate::effects::tests) fn a_multi_byte_char_literal_keeps_the_blankers_phase() {
         for (label, source, leaked) in [
             (

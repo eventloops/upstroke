@@ -222,7 +222,7 @@ either half of the pair that used to stand in for it.**
 
 Re-derived from `a_successful_settlement_promotes_the_generation_and_keeps_its_region`,
 which asserted that an `attempt_finished{Succeeded}` promotes the generation
-— the event `decisions/2026-08-12-merge-queue-execution-topology.md` says is
+— the event `design/26_design_merge_queue_protocol.md` §26 says is
 "not also emitted for that attempt". The old test was not wrong about the
 build; it was a witness for a shape the record forbids, and re-deriving it
 against the invariant is the point of the 2026-08-27 CONFORM ruling. It was

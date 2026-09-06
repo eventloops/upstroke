@@ -15,8 +15,12 @@ source, documentation, workflows, release machinery and this file.
 3. **Run the nine-command baseline** (`CODING_STANDARDS.md` §2) before every push, then wait for
    the two required contexts: `upstroke-ci` (formatting, Clippy on three platforms, the Linux and macOS
    test matrix, the Windows suite on its self-hosted ephemeral runner `test (winguest)`, the
-   MSRV matrix, the five Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
-   branch behind `master` is updated first and waits again.
+   MSRV matrix, the six Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
+   branch behind `master` is not updated by hand to merge once the ruleset carries the merge
+   queue (Repository rules): the queue builds the entry on `master`'s head and runs both
+   contexts there (step 7), so update it only when the change needs what `master` gained.
+   Until the ruleset carries the queue, the up-to-date requirement stands: a branch behind
+   `master` is updated first and waits again, and the audit reports it as `behind-master`.
 4. **One frontier review pass on the green head.** Give the exact diff and head SHA to an
    independent frontier-class reviewer at `max` effort — today `gpt-5.6-sol` through `codex exec`,
    run by the owner's review driver against the pull request's own base. Allow at least 90 minutes per
@@ -60,8 +64,15 @@ source, documentation, workflows, release machinery and this file.
    ledger rows is recorded as that verdict with each disposition, never as a pass. When the merged
    head differs from the reviewed head, list the delta commits and what verified each. Re-run
    `validate-pr-body.sh` from the default branch against the live title and body.
-7. **Merge with a merge commit** once every conversation is resolved and both contexts are green
-   on the head being merged. The merge is the owner's attestation that the evidence is real and the
+7. **Enqueue for merge** (`gh pr merge --merge --auto`, or the audit's `--enqueue`; both need
+   auto-merge enabled on the repository, which the owner turns on together with the queue rule)
+   once every conversation is resolved and both contexts are green on the head being merged.
+   With the merge-queue rule in the ruleset (Repository rules), the queue builds a merge commit
+   of that head onto `master`'s head plus any entry ahead of it, requires both contexts on that
+   commit, and lands exactly the commit they passed on; an entry whose contexts fail leaves the
+   queue and the pull request says why. Until the rule and the setting exist, the merge is the
+   owner's merge commit on a head whose own contexts are green, as before. Enqueueing, or that
+   merge, is the owner's attestation that the evidence is real and the
    merged head is accounted for: reviewed directly, or separated from the reviewed SHA only by the
    deltas step 5 allows. The owner may delegate the merge, in writing, to the agent doing the work
    on a pull request that has reached this state; the delegation is disclosed in the body. Never
@@ -169,16 +180,40 @@ orphans every ledger row bound to a replaced SHA.
 
 ## Repository rules
 
-The default-branch ruleset requires a pull request and an up-to-date branch, `upstroke-ci` and
-`upstroke-pr-policy` on the current head, resolved conversations, and merge commits only; it blocks
-deletion and non-fast-forward updates and has no bypass actor. A tag ruleset on `refs/tags/v*`
-blocks updates and deletions with no bypass. Required-check names are API: to rename one, land the
-replacement, observe it on a pull request, update the ruleset, then remove the old requirement.
-The workflow trigger contract is fixed too: `ci.yml` runs on `push` and `pull_request`, and
-`pr-policy.yml` on `pull_request`, each with the branch list exactly `[master,
+The default-branch ruleset requires a pull request, `upstroke-ci` and `upstroke-pr-policy` on
+the current head, resolved conversations, and merge commits only; it blocks deletion and
+non-fast-forward updates and has no bypass actor. The merge-queue contract is this: every merge
+goes through the queue, which builds each entry on `master`'s head plus the entries ahead of it,
+requires both contexts on that entry, and lands exactly the commit they passed on, so a branch is
+never required to be up to date on its own. The queue merges only non-failing entries (the rule's
+grouping strategy is all-green, never head-green): `pr-policy.yml` validates the one pull request
+an entry's queue ref names, so an entry whose own contexts failed must leave the queue rather
+than ride out under a later entry's green. The workflows and the audit below implement that
+contract; the ruleset adopts it as the owner's act once the contract is on `master`, by adding
+the merge-queue rule with merge method merge and all-green grouping, and removing the up-to-date
+requirement the queue makes redundant. Until then `merge_group` never fires, the up-to-date
+requirement stands, and step 7 is the owner's merge commit on a head whose own contexts are
+green; auto-merge is enabled on the repository in the same change as the queue rule. A tag ruleset on `refs/tags/v*` blocks updates and deletions
+with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
+pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
+is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on
+`pull_request` and `merge_group`, each with the branch list exactly `[master,
 codex/parallelism-design]` and nothing else, so slice pull requests into the integration branch
-get both contexts; `test-docs-consistency.sh` pins that contract, and changing it is a change to
-this file first.
+and queue entries for either base get both contexts; `test-docs-consistency.sh` pins that
+contract, and changing it is a change to this file first.
+
+Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-ready-audit.sh`,
+which decides a pull request's lane from its branch prefix alone (`codex/findings-p3-*`,
+`codex/findings-*`, everything else), counts only the owner's review comments, keeps the `lane:*`
+and `ready-to-merge` labels current (a label is its output, never its input, and
+`ready-to-merge` is advisory: it reports the audit's verdict on the head it read, while the act
+bound to that head is the enqueue itself, which names the commit), and with `--enqueue` adds
+each ready pull request to the queue in the order its arguments give, so the caller states the
+priority. The
+P3 findings lane is ready only on a `PASS`; the P1/P2 findings lane fixes P0–P2 and files P3;
+feature and sweep work fixes P0–P1 and files P2 and P3, one file per finding under
+`reviews/findings/` with a `deferred` ledger row. A witnessed defect or a `MUST` deviation is
+fixed whatever its label, as step 5 says.
 
 **Trust boundary.** There is one trusted same-repository writer: the owner. A pull request can
 edit `ci.yml`, `pr-policy.yml` and the validators they run and still turn both contexts green, so

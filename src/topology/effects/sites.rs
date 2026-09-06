@@ -666,8 +666,12 @@ pub enum RunDirSite {
     /// rlib, it takes no site here and adds none to `effect_sites.json`, it
     /// cannot mint or weaken a `PrivateHalfProof`, and conjunct 12 of the
     /// ownership proof is unmoved and still fail-closed.
-    /// `decisions/2026-08-30-test-scratch-tree-ownership.md` states the
-    /// authority model in its two-token form.
+    /// `DESIGN.md` §15 states the authority model and `CODING_STANDARDS.md` §8
+    /// states it in its two-token form: `rundir::PrivateHalfProof` in every
+    /// build, the `cfg(test)`-only scratch-tree token beside it. The
+    /// 2026-08-30 decision record this sentence used to cite went with the
+    /// `decisions/` directory on 2026-09-03, and `DESIGN.md`'s record index is
+    /// what says where each such record's substance now lives.
     PublishCommitRecord,
     /// P4: `plan.normalized.json`.
     WritePlan,
@@ -1278,15 +1282,22 @@ impl LockSite {
 
 /// The report funnel.
 ///
-/// One site. `report.json` is also named by [`RunDirSite::WriteReport`] in the
-/// frozen inventory; both are implemented because both are named, and the two
-/// are the same durable object reached through two funnels — see the
-/// `topology::effects` worker report for the note against the design.
+/// One site, and `report.json` is named twice in the frozen inventory: here and
+/// at [`RunDirSite::WriteReport`]. Both are declared because both are named —
+/// not because both are reached. At this head one of the two has a funnel:
+/// `RunDir.WriteReport` is funnelled in `src/rundir.rs`, while this site's
+/// module, `src/util.rs`, names no `ReportSite` at all, which is what makes
+/// `Report.Write` the single entry of `SITES_WITHOUT_A_FUNNEL` in
+/// `src/effects/tests/artifacts.rs`. That census —
+/// `every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent`
+/// in `src/effects/tests.rs` — is the live answer to which sites a funnel
+/// reaches; this sentence is a pointer to it and goes stale the moment it
+/// disagrees.
 ///
-/// Named rather than left as "this module" because the split moved this type
-/// out of the root: at base the phrase denoted `topology::effects`, and in this
-/// child it reads as `sites`, which has no worker report and is not what the
-/// note is about.
+/// One durable object under two inventory names is the owner's standing
+/// finding `PR3-REPORT-DOUBLE-NAME` (`reviews/findings/`, history in
+/// `reviews/FINDINGS.md` §2): ST-07 will demand two hook executions for one
+/// write. It is not this module's to resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportSite {
     /// Writing `report.json`.
@@ -1613,5 +1624,205 @@ impl ContainerSite {
             | Self::UnmountGitView
             | Self::RemoveIntent => &[],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every group's `name()` answers the spelling of the variant itself.
+    ///
+    /// The oracle is `stringify!` over the variant identifier, so nothing here
+    /// is a second hand-written table that can be copied wrong the same way
+    /// `name()` can. Each `match` is exhaustive over its enum, so a variant a
+    /// list omits fails to compile and a variant listed twice is an unreachable
+    /// arm the `-D warnings` leg refuses; the length check ties the list to
+    /// `ALL`, so a walk cannot skip one either.
+    ///
+    /// Why it is worth a test of its own: the dotted name is the wire identity
+    /// of a site, and `EffectSiteId::from_name` resolves a registry entry by
+    /// it, so two sites of one group whose whole attribute profile agrees can
+    /// have their names exchanged and every entry written against either then
+    /// names the other. Eight such groups of sites exist — among them
+    /// `RunDir.RemovePrivateHusk` and `RunDir.RemovePublicHusk`, which agree on
+    /// row, adjacency, fault row, scope, read-only, points, classes, elements,
+    /// before state and after effect, and differ in that only one of the two
+    /// halves is behind the ownership proof. Measured: exchanging that pair's
+    /// names leaves every other test of `topology::effects` passing and this
+    /// one failing, with the checked-in `effect_sites.json` comparison in
+    /// `src/effects/tests.rs` failing beside it.
+    ///
+    /// `Worktree.Remove` and `Worktree.RemoveIntent` are *not* such a pair, and
+    /// an earlier draft of this comment said they were: they differ in
+    /// `after_effect` (`Released` against `Removed`), so two tests of
+    /// `topology::effects::tests` catch that exchange as well.
+    #[test]
+    fn every_sites_name_is_the_spelling_of_its_own_variant() {
+        macro_rules! spellings {
+            ($enum:ident: $($variant:ident),+ $(,)?) => {{
+                assert_eq!(
+                    [$(stringify!($variant)),+].len(),
+                    $enum::ALL.len(),
+                    concat!(stringify!($enum), ": this list and `ALL` are different lengths"),
+                );
+                for site in $enum::ALL {
+                    let spelling = match site {
+                        $($enum::$variant => stringify!($variant),)+
+                    };
+                    assert_eq!(
+                        site.name(),
+                        spelling,
+                        concat!(
+                            stringify!($enum),
+                            " answers a name that is not the spelling of its own variant",
+                        ),
+                    );
+                }
+            }};
+        }
+
+        spellings!(WorktreeSite:
+            CreateExecutionRoot,
+            RemoveExecutionRoot,
+            WriteIntent,
+            Add,
+            Verify,
+            Remove,
+            RemoveIntent,
+            WriteStagingIntent,
+            AddStaging,
+            RemoveStaging,
+            RemoveStagingIntent,
+        );
+        spellings!(SnapshotSite: WriteIntent, Add, Remove, RemoveIntent);
+        spellings!(RefSite:
+            CreateIntegration,
+            CompareAndSwapIntegration,
+            CreateCandidates,
+            DeleteCandidatesRef,
+            PinCandidatePrepared,
+            DeleteCandidatePin,
+            PinPrepared,
+            DeletePreparedPin,
+        );
+        spellings!(ObjectSite:
+            CandidateStage,
+            CandidateWriteTree,
+            SnapshotCommitTree,
+            CandidateCommitTree,
+            ProposalCherryPick,
+            RepairMaterialize,
+        );
+        spellings!(RunDirSite:
+            CreatePublicDir,
+            StageMarker,
+            PublishMarker,
+            RemoveMarker,
+            CreatePrivateDir,
+            StageOwnerRecord,
+            PublishOwnerRecord,
+            StageCommitRecord,
+            PublishCommitRecord,
+            WritePlan,
+            WriteReport,
+            WriteQuestionPayload,
+            RemovePrivateHusk,
+            RemovePublicHusk,
+        );
+        spellings!(EventSite:
+            OpenLog,
+            ProvePrefixStable,
+            AppendFirst,
+            Append,
+            AppendInformational,
+            LegacyOpenLog,
+            LegacyAppend,
+        );
+        spellings!(AnswerSite: StageWrite, PublishRename, Ingest);
+        spellings!(LockSite:
+            AcquireRun,
+            AcquireWorktree,
+            ProbeCleanupExclusive,
+            Release,
+            CreateWorktreeLockFile,
+            ObserveCleanupHold,
+        );
+        spellings!(ReportSite: Write);
+        spellings!(ProcessSite: Spawn, Terminate);
+        spellings!(ContainerSite:
+            WriteIntent,
+            Create,
+            Start,
+            MountGitView,
+            Stop,
+            Remove,
+            UnmountGitView,
+            RemoveIntent,
+        );
+    }
+
+    /// A site lists residue elements exactly where it registers a residue
+    /// class, and nine sites do.
+    ///
+    /// `residue_elements()` is read in one place,
+    /// `registry::validate_entry`'s `Evidence::RecoveryProven` arm, and that
+    /// arm is reachable only for an `EntryPhase::Residue { class }` the site
+    /// registers. An element list on a site with no class is therefore data no
+    /// consumer can reach and no reader can be held to. The suite asserts the
+    /// other direction — a registered class has a non-empty list — and this
+    /// one is the half nothing pinned.
+    ///
+    /// The count of sites with a class is asserted too, so the biconditional
+    /// cannot be satisfied by emptying both sides.
+    #[test]
+    fn a_site_lists_residue_elements_exactly_where_it_registers_a_class() {
+        let mut walked = 0_usize;
+        let mut registering = 0_usize;
+
+        macro_rules! coupled {
+            ($($enum:ident),+ $(,)?) => {{
+                $(
+                    for site in $enum::ALL {
+                        assert_eq!(
+                            site.residue_elements().is_empty(),
+                            site.residue_classes().is_empty(),
+                            "{}.{} lists {} residue element(s) against {} residue class(es)",
+                            stringify!($enum),
+                            site.name(),
+                            site.residue_elements().len(),
+                            site.residue_classes().len(),
+                        );
+                        walked += 1;
+                        if !site.residue_classes().is_empty() {
+                            registering += 1;
+                        }
+                    }
+                )+
+            }};
+        }
+
+        coupled!(
+            WorktreeSite,
+            SnapshotSite,
+            RefSite,
+            ObjectSite,
+            RunDirSite,
+            EventSite,
+            AnswerSite,
+            LockSite,
+            ReportSite,
+            ProcessSite,
+            ContainerSite,
+        );
+
+        assert_eq!(
+            walked, 70,
+            "the domain is every site of every group this file declares",
+        );
+        assert_eq!(
+            registering, 9,
+            "the two `Add` worktrees, the snapshot `Add`, and all six Object sites",
+        );
     }
 }
