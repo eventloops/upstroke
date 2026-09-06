@@ -381,8 +381,8 @@ settlement that reaches it.
 attempt succeeded — on either arm.**
 
 The sibling-arm witness. `candidate_prepared` is the sole successful
-settlement (INV-07,
-`decisions/2026-08-12-merge-queue-execution-topology.md`), and the
+settlement (`design/26_design_merge_queue_protocol.md` §26; `INV-07` is
+the retired packet's label for the same rule, not itself an authority), and the
 `Closed` arm has enforced that against the record since round 6. The
 `Retained` arm did not, so the invariant held on one path through the
 door and not the other: a retained settlement could carry a record with
@@ -1682,7 +1682,7 @@ Re-derived, not adjusted. This was
 asserted the opposite of the first claim below: that `candidate_prepared`
 is **refused** while the attempt is still running, and accepted only after
 an `attempt_finished{Succeeded}` had promoted the generation. That is the
-dual-settlement pattern `decisions/2026-08-12-merge-queue-execution-topology.md`
+dual-settlement pattern `design/26_design_merge_queue_protocol.md` §26
 forbids — "`attempt_finished` is not also emitted for that attempt" — and the
 fold was *requiring* it. Ruled CONFORM 2026-08-27.
 
