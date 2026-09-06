@@ -410,8 +410,18 @@ impl HookHarness {
 
     /// How many executions in total. Zero for a harness nothing has run
     /// through, whatever it has armed.
+    ///
+    /// Saturating, as [`Self::count`] is (§5: the arithmetic is chosen). The
+    /// total was a `sum()`, which is `+`, and `overflow-checks` is on in every
+    /// profile — so a harness whose parts had saturated would have terminated
+    /// the run in the accessor that reports its coverage, where the parts it
+    /// adds up cannot. No test witnesses it: `count` reaches `u32::MAX` only
+    /// through `u32::MAX` hooks of one `(site, phase)`, and nothing else
+    /// constructs an [`Observation`] the harness will read.
     pub fn executions(&self) -> u32 {
-        self.observed.iter().map(|seen| seen.count).sum()
+        self.observed
+            .iter()
+            .fold(0, |total, seen| total.saturating_add(seen.count))
     }
 }
 
