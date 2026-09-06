@@ -1,7 +1,7 @@
 # `src/engine/topology/recover.rs`
 
 Repository source for these notes: [`src/engine/topology/recover.rs`](../../../../src/engine/topology/recover.rs).
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/engine/topology/recover.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/engine/topology/recover.rs).
 The relative link works in a checkout or on GitHub; the GitHub link also works from the published site.
 
 The code is the authority for what it does. The explanatory prose is preserved below.

@@ -2,7 +2,7 @@
 
 Extended notes for [`src/agent/proc/drain.rs`](../../../../src/agent/proc/drain.rs).
 
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/agent/proc/drain.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/agent/proc/drain.rs).
 
 The code defines current behavior. These notes preserve contracts and implementation
 history. Search each backticked heading fragment separately in the source.
