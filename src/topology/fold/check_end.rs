@@ -251,7 +251,9 @@ impl RunState {
                 derived: match &derived {
                     DerivedOutcome::NotEnding => "not ending".to_owned(),
                     DerivedOutcome::Ending(outcome) => outcome_name(outcome).to_owned(),
-                    DerivedOutcome::FoldError => "unreachable".to_owned(),
+                    DerivedOutcome::FoldError => {
+                        "no outcome: this state matches none the fold derives".to_owned()
+                    }
                 },
             });
         }
