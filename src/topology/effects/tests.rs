@@ -1279,6 +1279,47 @@ fn only_the_legacy_event_sites_are_outside_the_claim() {
 }
 
 #[test]
+fn the_claimed_inventory_is_every_site_but_the_two_legacy_ones() {
+    // `EffectSiteId::claimed()` is what every gate hands `check_bijection`,
+    // and the test above states the same fact about `scope()` by filtering
+    // `all()` itself — so nothing read the function. A `claimed()` that
+    // returned `all()` unfiltered satisfies every other use of it in this
+    // suite: a superset passes `every_external_and_process_local_row_has_at
+    // _least_one_claimed_site`, passes the `claimed().len() >= 60` floor,
+    // and adds two more failures to a check that already expects a hundred.
+    let all = EffectSiteId::all();
+    let claimed = EffectSiteId::claimed();
+    let legacy = [
+        EffectSiteId::Event(EventSite::LegacyOpenLog),
+        EffectSiteId::Event(EventSite::LegacyAppend),
+    ];
+    assert_eq!(
+        claimed.len(),
+        all.len() - legacy.len(),
+        "the claim is the inventory less exactly the legacy sites"
+    );
+    let missing: Vec<EffectSiteId> = all
+        .iter()
+        .copied()
+        .filter(|site| !claimed.contains(site))
+        .collect();
+    assert_eq!(missing, legacy.to_vec(), "{missing:?}");
+    for site in &claimed {
+        assert!(site.scope().is_claimed(), "{site}");
+        assert!(all.contains(site), "{site} is claimed and not inventoried");
+    }
+    // A filter of `all()`, not a second derivation: the survivors keep the
+    // inventory's order, so a caller that zips the two lists is not zipping
+    // two orders.
+    let filtered: Vec<EffectSiteId> = all
+        .iter()
+        .copied()
+        .filter(|site| !legacy.contains(site))
+        .collect();
+    assert_eq!(claimed, filtered);
+}
+
+#[test]
 fn the_read_only_sites_are_the_four_the_design_says_perform_no_effect() {
     let read_only: BTreeSet<String> = EffectSiteId::all()
         .into_iter()
@@ -1698,6 +1739,66 @@ fn only_the_three_sites_a_fast_sequence_skips_may_record_that_they_did_not_run()
             "Ref.PinPrepared".to_owned(),
         ]),
         "`structure` names exactly these three as asserted-not-executed"
+    );
+}
+
+#[test]
+fn the_ledger_rows_hosts_and_classes_are_spelt_as_the_design_spells_them() {
+    // Three `name()` functions whose text nothing in this family compared
+    // with a literal. Every assertion elsewhere is between two enum values,
+    // and the wire forms are serde's own renames, so all three could answer
+    // anything: a `ResourceRow` mis-spelt here reaches a reader through a
+    // `RegistryError`, a `BijectionFailure` and every assertion message in
+    // this file, and the ledger it names is `decisions.resource_accounting`.
+    let rows: &[(ResourceRow, &str)] = &[
+        (ResourceRow::R9, "R9"),
+        (ResourceRow::R10, "R10"),
+        (ResourceRow::R11, "R11"),
+        (ResourceRow::R12, "R12"),
+        (ResourceRow::R17, "R17"),
+        (ResourceRow::R18, "R18"),
+        (ResourceRow::R19, "R19"),
+        (ResourceRow::R21, "R21"),
+        (ResourceRow::R22, "R22"),
+        (ResourceRow::R23, "R23"),
+        (ResourceRow::R24, "R24"),
+        (ResourceRow::R25, "R25"),
+        (ResourceRow::R26, "R26"),
+        (ResourceRow::R27, "R27"),
+        (ResourceRow::R28, "R28"),
+    ];
+    assert_eq!(rows.len(), ResourceRow::ALL.len());
+    for (row, spelling) in rows.iter().copied() {
+        assert_eq!(row.name(), spelling, "{row:?}");
+        // Display is the name and not a second spelling of it.
+        assert_eq!(row.to_string(), spelling, "{row:?}");
+    }
+    let spellings: BTreeSet<&str> = ResourceRow::ALL.iter().map(|row| row.name()).collect();
+    assert_eq!(spellings.len(), rows.len(), "two rows share an id");
+
+    // `Host` names reach a reader through every per-host assertion message in
+    // this file, and the two are the whole of the type.
+    assert_eq!(Host::Windows.name(), "windows");
+    assert_eq!(Host::Unix.name(), "unix");
+    assert_eq!(Host::Windows.to_string(), "windows");
+    assert_eq!(Host::Unix.to_string(), "unix");
+    assert_ne!(Host::Windows.name(), Host::Unix.name());
+
+    // The class's name is the classifier outcome it stands for, spelt as the
+    // packet spells it, and is what `RegistryError::ResidueClaimsExecution`
+    // and `NoSuchResidueClass` put in front of a reader. It is not the wire
+    // form, which serde renames.
+    assert_eq!(
+        ResidueClass::ObjectInternal.name(),
+        "ObjectResidue::Internal"
+    );
+    assert_eq!(
+        EntryPhase::Residue {
+            class: ResidueClass::ObjectInternal,
+        }
+        .to_string(),
+        "ObjectResidue::Internal",
+        "the entry phase displays as the class it is about"
     );
 }
 
@@ -3305,6 +3406,103 @@ fn an_unarmed_harness_substantiates_no_mode_however_far_the_funnels_run() {
         points,
         "an unarmed harness substantiated {} of {points} mode(s): {failures:#?}",
         points - unobserved.len()
+    );
+}
+
+#[test]
+fn a_site_a_funnel_only_reached_is_touched_and_covers_nothing() {
+    // `HookHarness::touched` answers over *both* records — what executed and
+    // what a funnel merely walked past — and only the first half was ever
+    // exercised. Every call in this suite is made after `drive`, which hooks
+    // both phases, so the reached half could be deleted and nothing would
+    // say so; `touched` is what
+    // `the_framework_self_test_round_trips_through_enums_harness_and_registry`
+    // uses to show that the three fast-path sites have coverage at all.
+    let site = EffectSiteId::Event(EventSite::AppendFirst);
+    let other = EffectSiteId::Event(EventSite::Append);
+    let phase = HookPhase::Point {
+        point: SubEffectPoint::Written,
+        mode: InjectionMode::Kill,
+    };
+
+    let mut harness = HookHarness::new();
+    assert!(!harness.touched(site));
+    // Reached, deliberately unarmed: nothing is injected and nothing is
+    // coverage.
+    assert_eq!(harness.hook(site, phase), Injection::Proceed);
+    assert!(harness.coverage().is_empty(), "{:?}", harness.coverage());
+    assert_eq!(harness.executions(), 0);
+    assert!(!harness.observed(site, phase));
+    assert_eq!(harness.count(site, phase), 0);
+    assert!(harness.reached_point(site, SubEffectPoint::Written, InjectionMode::Kill));
+    // ...and the funnel was still there, which is the question `touched`
+    // answers and the only record that can answer it here.
+    assert!(
+        harness.touched(site),
+        "a site whose funnel reached a point was reported untouched"
+    );
+    assert!(!harness.touched(other), "a site no funnel reached");
+}
+
+#[test]
+fn a_fast_sequence_is_exercised_by_any_hook_the_harness_records_in_it() {
+    // `DESIGN.md` §26: "a sequence is exercised only by what the harness
+    // observed inside it: the harness records a hook of some site while
+    // recording that sequence. This observation is the marker." *A hook*, and
+    // not an injected one: `HookHarness::hook` records the site into the open
+    // sequence before it decides whether anything fires, so a funnel that
+    // walks past an unarmed point inside a fast integration has exercised it.
+    // Every fast sequence this suite builds is driven through `drive`, which
+    // hooks `Before` first, so the marker was only ever set by a hook phase
+    // and a checker that ignored unarmed points would pass.
+    let host = Host::current();
+    let site = EffectSiteId::Event(EventSite::AppendFirst);
+    let mut harness = HookHarness::new();
+
+    harness.begin_fast_sequence("fast/only-reached");
+    assert_eq!(
+        harness.hook(
+            site,
+            HookPhase::Point {
+                point: SubEffectPoint::Written,
+                mode: InjectionMode::Kill,
+            }
+        ),
+        Injection::Proceed,
+        "the point is unarmed, so nothing is injected and nothing is coverage"
+    );
+    harness.end_fast_sequence();
+    assert!(harness.coverage().is_empty(), "{:?}", harness.coverage());
+
+    // The lookup `check_bijection` reads to tell an invented sequence name
+    // from an exercised one.
+    let sequence = harness
+        .fast_sequence("fast/only-reached")
+        .expect("the sequence the suite began");
+    assert_eq!(sequence.name(), "fast/only-reached");
+    assert_eq!(sequence.touched(), [site]);
+    assert!(sequence.ran(site));
+    assert!(!sequence.ran(EffectSiteId::Event(EventSite::Append)));
+    assert!(
+        harness.fast_sequence("fast/never-begun").is_none(),
+        "a name the suite never began is not a sequence"
+    );
+
+    // And the check agrees: this trace is not the empty one.
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [],
+        "a sequence the harness recorded a hook in was reported empty"
+    );
+    // The contrast, so the assertion above is not passing because nothing is
+    // checked: the same harness with a second sequence nothing was hooked in.
+    harness.begin_fast_sequence("fast/hollow");
+    harness.end_fast_sequence();
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [BijectionFailure::EmptyFastSequence {
+            sequence: "fast/hollow".to_owned(),
+        }]
     );
 }
 
@@ -5446,6 +5644,71 @@ fn the_bijection_refuses_a_hand_edited_slice_that_keys_one_coordinate_twice() {
 }
 
 #[test]
+fn the_sampling_histogram_totals_its_three_counts_and_saturates() {
+    // `ClassHistogram::total` is public and this family reads it nowhere:
+    // `check_evidence` deliberately sums the three fields itself in `u64`,
+    // because a saturating `u32` sum agrees with an `n` of `u32::MAX`
+    // whatever the histogram holds — the reproduction the
+    // "a histogram whose saturating total equals n" direction carries. That
+    // makes the checker's arithmetic its own and leaves this function with no
+    // caller here at all, so its own behaviour is stated here.
+    assert_eq!(ClassHistogram::default().total(), 0);
+    assert_eq!(
+        ClassHistogram {
+            none: 3,
+            internal: 4,
+            after: 5,
+        }
+        .total(),
+        12
+    );
+    // Each field is added, and none is added twice.
+    for (histogram, total) in [
+        (
+            ClassHistogram {
+                none: 1,
+                internal: 0,
+                after: 0,
+            },
+            1,
+        ),
+        (
+            ClassHistogram {
+                none: 0,
+                internal: 1,
+                after: 0,
+            },
+            1,
+        ),
+        (
+            ClassHistogram {
+                none: 0,
+                internal: 0,
+                after: 1,
+            },
+            1,
+        ),
+    ] {
+        assert_eq!(histogram.total(), total, "{histogram:?}");
+    }
+    // Saturating, deliberately (§5: the arithmetic is chosen). The answer at
+    // the boundary is `u32::MAX` and not a wrapped zero, and it is *wrong* by
+    // one — which is why the checker does not use it and why the fixture's
+    // real sampling records are compared against `n` in `u64` instead.
+    let saturated = ClassHistogram {
+        none: u32::MAX,
+        internal: 1,
+        after: 0,
+    };
+    assert_eq!(saturated.total(), u32::MAX);
+    assert_eq!(
+        u64::from(saturated.none) + u64::from(saturated.internal) + u64::from(saturated.after),
+        u64::from(u32::MAX) + 1,
+        "the sum that does not saturate is the one the bijection makes"
+    );
+}
+
+#[test]
 fn the_format_refuses_an_unnamed_test_and_a_duplicate_key() {
     let site = EffectSiteId::Event(EventSite::AppendFirst);
     for blank in ["", "   ", "\t\n"] {
@@ -5859,6 +6122,90 @@ fn the_bijection_fails_on_every_missing_link() {
             host
         )
         .is_empty()
+    );
+}
+
+#[test]
+fn a_phase_bound_to_the_before_action_reports_the_before_entry_it_has_none_to_bind_to() {
+    // `check_bijection` states the resumes-as-before relation between two
+    // entries, and its third arm — there is no before-phase entry to bind to
+    // — was unwitnessed. The two arms that are witnessed both have one:
+    // `the_format_refuses_residue_and_resume_semantics_the_site_does_not_have`
+    // doctors the action and reads `ResumeActionNotBeforeAction`, and the
+    // passing fixture is the agreeing case. Delete the before entry and the
+    // coverage sweep reports it once on its own account, so the relation's
+    // own report is a *count*, not a variant: one per bound phase, plus the
+    // sweep's.
+    let host = Host::current();
+    let commit_tree = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
+    let entries = self_test_registry(host);
+    let bound = entries
+        .iter()
+        .filter(|entry| entry.site == commit_tree && entry.phase.resumes_as_before())
+        .count();
+    assert!(
+        bound >= 2,
+        "the fixture must carry more than one phase bound to the before action: {bound}"
+    );
+
+    let stripped: Vec<RegistryEntry> = entries
+        .iter()
+        .filter(|entry| !(entry.site == commit_tree && entry.phase == EntryPhase::Before))
+        .cloned()
+        .collect();
+    assert_eq!(stripped.len(), entries.len() - 1);
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &stripped,
+        host,
+    );
+    let reported = failures
+        .iter()
+        .filter(|failure| {
+            matches!(
+                failure,
+                BijectionFailure::MissingEntry {
+                    site,
+                    phase: EntryPhase::Before,
+                    ..
+                } if *site == commit_tree
+            )
+        })
+        .count();
+    assert_eq!(
+        reported,
+        bound + 1,
+        "the relation did not report the before entry each bound phase needs: {failures:#?}"
+    );
+
+    // The contrast: dropping a phase that is *not* bound to the before action
+    // is reported once, by the coverage sweep alone.
+    let without_after: Vec<RegistryEntry> = entries
+        .iter()
+        .filter(|entry| !(entry.site == commit_tree && entry.phase == EntryPhase::After))
+        .cloned()
+        .collect();
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &without_after,
+        host,
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|failure| matches!(
+                failure,
+                BijectionFailure::MissingEntry {
+                    site,
+                    phase: EntryPhase::After,
+                    ..
+                } if *site == commit_tree
+            ))
+            .count(),
+        1,
+        "{failures:#?}"
     );
 }
 
