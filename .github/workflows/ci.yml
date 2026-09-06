@@ -90,7 +90,7 @@ jobs:
   # target directory is pre-warmed, so there is no cache step.
   test-windows:
     name: test (winguest)
-    runs-on: [self-hosted, windows, winguest]
+    runs-on: [self-hosted, windows, "${{ github.event_name == 'merge_group' && 'winguest-queue' || 'winguest' }}"]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
