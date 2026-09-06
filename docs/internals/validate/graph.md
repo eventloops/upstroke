@@ -78,8 +78,10 @@ task's `depends_on` in its own order, so the cycle a plan reports is the
 same on every run and every platform, and the same one the recursive search
 this replaced reported. `path` is the chain of tasks the search is inside,
 outermost first, each with the dependencies it has yet to follow; `on_path`
-is that chain as a set, and the two change together at the one push and the
-one pop below, so membership is a lookup rather than a scan. A dependency
+is that chain as a set, and the two change together at each push — root
+initialization and dependency descent both push a new entry onto both — and
+at the one shared pop below, so membership is a lookup rather than a scan.
+A dependency
 already on the path closes a cycle, which is the path from that task down
 plus the edge back to it. A task whose dependencies have all been followed
 is `finished`, and an edge into a finished task leads into a subgraph

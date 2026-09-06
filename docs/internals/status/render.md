@@ -156,9 +156,11 @@ review pass passed, the facts [`AttemptRecord::is_successful`] reads, in
 the same order — and not `failure.is_none()`. A review that rejected the
 code or never reached a verdict is named by pass and model whether or not
 the engine also recorded a failure for it: in production it always does
-(`engine::attempt::evaluate_review` writes a `ReviewFailed` or
-`ReviewUnavailable` failure beside the pass's outcome), so the line a run
-produces is `failed — review failed: …; review \`review\` (model)
+(`engine::attempt::review_failure` writes a `ReviewFailed` failure for a
+rejection, and for an unavailable reviewer maps the outcome status to
+`RateLimited`, `Timeout`, or `ReviewUnavailable`, beside the pass's
+outcome), so the line a run produces is `failed — review failed: …;
+review \`review\` (model)
 rejected it`. A record carrying the outcome and no failure is rendered as
 it reads, "was not approved". Schema-3 validation refuses this inconsistent
 shape, and schema-4 success checks reject it through `is_successful`.
