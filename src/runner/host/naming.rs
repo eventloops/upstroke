@@ -206,7 +206,6 @@ pub(super) fn resolve_program(
     let candidates = naming.candidates(program, composed_value(composed, case, "PATHEXT"));
     let mut searched = 0_usize;
     let mut skipped = 0_usize;
-    let mut undetermined: Option<(PathBuf, std::io::Error)> = None;
     for dir in std::env::split_paths(path.unwrap_or_else(|| OsStr::new(""))) {
         if !dir.is_absolute() {
             skipped += 1;
@@ -218,20 +217,15 @@ pub(super) fn resolve_program(
             match naming.is_program(&file) {
                 Ok(true) => return Ok(file),
                 Ok(false) => {}
-                Err(error) => {
-                    if undetermined.is_none() {
-                        undetermined = Some((file, error));
-                    }
+                Err(source) => {
+                    return Err(UpstrokeError::Filesystem {
+                        operation: "stat",
+                        path: file,
+                        source,
+                    });
                 }
             }
         }
-    }
-    if let Some((file, source)) = undetermined {
-        return Err(UpstrokeError::Filesystem {
-            operation: "stat",
-            path: file,
-            source,
-        });
     }
     Err(UpstrokeError::Refused {
         message: format!(
@@ -260,8 +254,12 @@ pub(super) fn resolve_program(
 #[cfg(test)]
 mod tests {
     use super::{ProgramNaming, normalised_extensions, resolve_program};
+    use crate::error::UpstrokeError;
     use crate::runner::host::KeyCase;
     use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn composed(pairs: &[(&str, &OsStr)]) -> Vec<(OsString, OsString)> {
         pairs
@@ -270,8 +268,11 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_candidate_this_platform_cannot_stat_is_never_reported_as_absence() {
+    /// A `PATH` entry every platform refuses to `stat` before it reaches the
+    /// filesystem: an interior NUL is `InvalidInput`, never `NotFound`, so it
+    /// is the one undetermined candidate no filesystem state can produce or
+    /// remove. The assertion is what keeps the fixture honest.
+    fn undeterminable_directory() -> PathBuf {
         let directory = std::env::temp_dir().join("upstroke-naming\u{0}sweep");
         let probe = std::fs::metadata(directory.join("x"))
             .expect_err("a path with an interior NUL cannot be stat'ed");
@@ -280,8 +281,58 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "the fixture must fail with something other than not-found to witness anything"
         );
+        directory
+    }
 
-        let path = directory.into_os_string();
+    /// A directory this process owns the name of and never creates, so every
+    /// candidate under it is a genuine `NotFound` whatever else is in the
+    /// ambient temporary directory (`SWEEP-HOST-NAMING-005`). Unique per
+    /// call: process id, a per-process counter and the clock.
+    fn never_created_directory(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "upstroke-naming-{tag}-{}-{nonce}-{nanos}",
+            std::process::id()
+        ));
+        let probe = std::fs::symlink_metadata(&directory)
+            .expect_err("a directory nothing has created must not exist");
+        assert_eq!(
+            probe.kind(),
+            std::io::ErrorKind::NotFound,
+            "the fixture must be absent, not merely unreadable, to be a control"
+        );
+        directory
+    }
+
+    /// This test binary, as the one program every platform has installed
+    /// and executable by construction: the directory it lives in and its
+    /// bare file name.
+    fn this_test_binary() -> (PathBuf, String) {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let name = exe
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("the test binary has a Unicode file name")
+            .to_owned();
+        let dir = exe
+            .parent()
+            .expect("the test binary lives in a directory")
+            .to_path_buf();
+        assert!(
+            ProgramNaming::current().is_bare_name(&name),
+            "the fixture must be a bare name for the search to run at all: {name}"
+        );
+        (dir, name)
+    }
+
+    #[test]
+    fn a_candidate_this_platform_cannot_stat_is_never_reported_as_absence() {
+        let path = undeterminable_directory().into_os_string();
         let message = resolve_program(
             "x",
             &composed(&[("PATH", path.as_os_str())]),
@@ -302,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_candidate_that_is_merely_absent_is_still_absence() {
-        let path = std::env::temp_dir().into_os_string();
+        let path = never_created_directory("absent").into_os_string();
         let message = resolve_program(
             "upstroke-no-such-program",
             &composed(&[("PATH", path.as_os_str())]),
@@ -314,6 +365,63 @@ mod tests {
         assert!(
             message.contains("nothing of that name"),
             "a not-found candidate must stay absence: {message}"
+        );
+    }
+
+    #[test]
+    fn an_undetermined_candidate_stops_the_search_before_a_later_match() {
+        let (dir, name) = this_test_binary();
+        let undeterminable = undeterminable_directory();
+        let path = std::env::join_paths([undeterminable.as_path(), dir.as_path()])
+            .expect("neither entry carries the PATH separator");
+
+        let error = resolve_program(
+            &name,
+            &composed(&[("PATH", path.as_os_str())]),
+            KeyCase::Sensitive,
+            ProgramNaming::current(),
+        )
+        .expect_err("a candidate the platform could not answer for is not walked past");
+        match error {
+            UpstrokeError::Filesystem {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "stat");
+                assert_eq!(
+                    path,
+                    undeterminable.join(&name),
+                    "the candidate reported must be the undetermined one, not the later match"
+                );
+                assert_ne!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the source carried must be the platform's own answer"
+                );
+            }
+            other => panic!("expected the stat failure to propagate, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_merely_absent_is_walked_past_to_a_later_match() {
+        let (dir, name) = this_test_binary();
+        let absent = never_created_directory("walked-past");
+        let path = std::env::join_paths([absent.as_path(), dir.as_path()])
+            .expect("neither entry carries the PATH separator");
+
+        let resolved = resolve_program(
+            &name,
+            &composed(&[("PATH", path.as_os_str())]),
+            KeyCase::Sensitive,
+            ProgramNaming::current(),
+        )
+        .expect("a not-found miss continues the search to the installed program");
+        assert_eq!(
+            resolved,
+            dir.join(&name),
+            "the search must reach the program past an absent directory"
         );
     }
 
