@@ -6,6 +6,7 @@
 //! paths.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::EffectSiteId;
 use super::residue_authority::{
@@ -117,7 +118,34 @@ pub fn effect_sites() -> Vec<EffectSiteExport> {
         .collect()
 }
 
+/// Why serializing the generated inventory failed.
+#[derive(Debug, Error)]
+#[error("failed to serialize the effect site inventory: {0}")]
+pub struct ExportError(#[from] serde_json::Error);
+
 /// `effect_sites.json`, pretty-printed for a gate report to attach.
-pub fn effect_sites_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&effect_sites())
+///
+/// # Errors
+///
+/// Returns [`ExportError`] if the generated inventory cannot be serialized to JSON.
+pub fn effect_sites_json() -> Result<String, ExportError> {
+    Ok(serde_json::to_string_pretty(&effect_sites())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_error_names_the_operation_and_wraps_the_source() {
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("malformed input is not valid JSON");
+        let error = ExportError::from(source);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("failed to serialize the effect site inventory: "),
+            "{message}"
+        );
+        assert!(!message.ends_with('.'), "{message}");
+    }
 }
