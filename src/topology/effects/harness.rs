@@ -86,6 +86,15 @@ pub struct Observation {
 }
 
 /// Why the harness refused to arm an injection.
+///
+/// Every field is the typed value the caller passed, the site included.
+/// `DESIGN.md` §26's "diagnostics are typed" reserves free text for a
+/// document's own words — a resume action in the fault matrix's wording, the
+/// name a suite gave a fast sequence, what a hand-edited entry wrote in the
+/// field the format refused — and an arming is a Rust call with no document
+/// in it. Rendering the site to a `String` here made the one field a caller
+/// might match on the one field it would have to parse; the message text is
+/// unchanged, because that rendering was [`EffectSiteId`]'s own `Display`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HarnessError {
     #[error(
@@ -94,7 +103,7 @@ pub enum HarnessError {
     )]
     NoSuchPoint {
         /// The site.
-        site: String,
+        site: EffectSiteId,
         /// The point that was asked for.
         point: SubEffectPoint,
     },
@@ -102,7 +111,7 @@ pub enum HarnessError {
     #[error("`{site}`'s `{point}` point does not support {mode:?} injection")]
     UnsupportedMode {
         /// The site.
-        site: String,
+        site: EffectSiteId,
         /// The point.
         point: SubEffectPoint,
         /// The mode that was asked for.
@@ -172,6 +181,11 @@ impl HookHarness {
     /// Refuses a point the site does not expose and a mode the point does not
     /// support, so a suite cannot quietly arm a fault that no funnel will ever
     /// consult.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::NoSuchPoint`] if `site` does not expose `point`, and
+    /// [`HarnessError::UnsupportedMode`] if `point` does not support `mode`.
     pub fn arm(
         &mut self,
         site: EffectSiteId,
@@ -179,17 +193,10 @@ impl HookHarness {
         mode: InjectionMode,
     ) -> Result<(), HarnessError> {
         if !site.sub_effects().contains(&point) {
-            return Err(HarnessError::NoSuchPoint {
-                site: site.name(),
-                point,
-            });
+            return Err(HarnessError::NoSuchPoint { site, point });
         }
         if !point.supports(mode) {
-            return Err(HarnessError::UnsupportedMode {
-                site: site.name(),
-                point,
-                mode,
-            });
+            return Err(HarnessError::UnsupportedMode { site, point, mode });
         }
         if !self.armed.contains(&(site, point, mode)) {
             self.armed.push((site, point, mode));
@@ -356,5 +363,74 @@ impl HookHarness {
     /// through, whatever it has armed.
     pub fn executions(&self) -> u32 {
         self.observed.iter().map(|seen| seen.count).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::effects::{EventSite, LockSite, ObjectSite};
+
+    /// The two sites this module's tests drive: one with two points in two
+    /// modes, and one with a single kill-only point.
+    const APPEND: EffectSiteId = EffectSiteId::Event(EventSite::AppendFirst);
+    const COMMIT_TREE: EffectSiteId = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
+
+    #[test]
+    fn an_arming_refusal_names_the_site_it_refused_by_type() {
+        let mut harness = HookHarness::new();
+
+        let error = harness
+            .arm(COMMIT_TREE, SubEffectPoint::Written, InjectionMode::Kill)
+            .expect_err("`CandidateCommitTree` exposes only `IdUnread`");
+        assert_eq!(
+            error,
+            HarnessError::NoSuchPoint {
+                site: COMMIT_TREE,
+                point: SubEffectPoint::Written,
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "`Object.CandidateCommitTree` exposes no parent-side sub-effect point `Written`; \
+             arming one would record an execution of a point that does not exist",
+        );
+
+        let error = harness
+            .arm(
+                COMMIT_TREE,
+                SubEffectPoint::IdUnread,
+                InjectionMode::ErrorReturn,
+            )
+            .expect_err("`IdUnread` is kill-only");
+        assert_eq!(
+            error,
+            HarnessError::UnsupportedMode {
+                site: COMMIT_TREE,
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::ErrorReturn,
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "`Object.CandidateCommitTree`'s `IdUnread` point does not support ErrorReturn \
+             injection",
+        );
+
+        // A refusal armed nothing, so the legal arming of the same point is
+        // still the one that fires.
+        harness
+            .arm(COMMIT_TREE, SubEffectPoint::IdUnread, InjectionMode::Kill)
+            .expect("the one point it has, in the one mode it supports");
+        assert_eq!(
+            harness.hook(
+                COMMIT_TREE,
+                HookPhase::Point {
+                    point: SubEffectPoint::IdUnread,
+                    mode: InjectionMode::Kill,
+                },
+            ),
+            Injection::Kill,
+        );
     }
 }
