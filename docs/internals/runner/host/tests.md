@@ -2130,8 +2130,19 @@ the original descriptor, and requires `ETXTBSY` from executing that same inode.
 Execution succeeds after the forked holder exits.
 
 The ownership witness runs the actual `marker_shim` against a FIFO whose
-capacity is smaller than its script. Reading the first byte proves the writer
-is open; the undrained payload keeps it open while another thread forks.
+capacity is smaller than its script. `F_SETPIPE_SZ` rounds a request up to the
+page size and reports the capacity it installed, so the 4096-byte request
+installs 65536 on a 64 KiB-page kernel. `marker_exceeding` sizes the payload
+from that reported capacity, plus `MARKER_MARGIN`, rather than from the
+request. A payload fixed at 16 KiB instead both fails an exact-equality check
+on the return value and, without it, fits such a pipe whole: the writer would
+finish before the fork and the witness would observe nothing. That is
+`PR162-ASTRA-PAGE-SIZE`. `the_shim_script_exceeds_every_installed_pipe_capacity`
+holds the sizing for each page size Linux supports without needing one of those
+kernels to run on, and `shim_script` is the single spelling of the expected
+script that both it and the drain oracle read. Reading the first byte proves
+the writer is open; the undrained payload keeps it open while another thread
+forks.
 After draining exactly the expected script and joining the original writer,
 the reader must see EOF while the forked holder is still alive. An in-process
 writer leaves its descriptor in that holder and produces `WouldBlock` instead.
@@ -2924,7 +2935,7 @@ call; its descriptor is borrowed from reader. The wait is bounded.
 SAFETY: name is a live NUL-terminated path in our private scratch
 directory, and 0600 grants access only to this test's user.
 
-## `let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };`
+## `let installed = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };`
 
 SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
 integer size, and shrinking an empty pipe needs no extra privilege.
