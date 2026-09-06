@@ -844,3 +844,717 @@ impl fmt::Display for SubEffectPoint {
         f.write_str(self.name())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // The canonical spellings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_funnel_group_spells_the_name_a_dotted_site_name_is_built_from() {
+        // `EffectSiteId::name` is `format!("{}.{}", group().name(), variant())`,
+        // so the sibling suite's "a site's name starts with its group's name"
+        // is both sides of one expression and cannot fail. These are the
+        // literals, written here and not read back from `name()`.
+        let expected = [
+            (FunnelGroup::Worktree, "Worktree"),
+            (FunnelGroup::Snapshot, "Snapshot"),
+            (FunnelGroup::Ref, "Ref"),
+            (FunnelGroup::Object, "Object"),
+            (FunnelGroup::RunDir, "RunDir"),
+            (FunnelGroup::Event, "Event"),
+            (FunnelGroup::Answer, "Answer"),
+            (FunnelGroup::Lock, "Lock"),
+            (FunnelGroup::Report, "Report"),
+            (FunnelGroup::Process, "Process"),
+            (FunnelGroup::Container, "Container"),
+        ];
+        assert_eq!(expected.len(), FunnelGroup::ALL.len());
+        for (group, name) in expected {
+            assert_eq!(group.name(), name);
+            assert_eq!(group.to_string(), name, "Display is not `name()`");
+        }
+        let names: BTreeSet<&str> = FunnelGroup::ALL.iter().map(|g| g.name()).collect();
+        assert_eq!(
+            names.len(),
+            FunnelGroup::ALL.len(),
+            "two groups share a name"
+        );
+    }
+
+    #[test]
+    fn every_resource_row_spells_its_ledger_id() {
+        // `name()` is documented as "the row's ledger id" and reaches the
+        // outside world only through `Display`; nothing else in the crate reads
+        // it, so without this table a mutation of either is silent.
+        let expected = [
+            (ResourceRow::R9, "R9"),
+            (ResourceRow::R10, "R10"),
+            (ResourceRow::R11, "R11"),
+            (ResourceRow::R12, "R12"),
+            (ResourceRow::R17, "R17"),
+            (ResourceRow::R18, "R18"),
+            (ResourceRow::R19, "R19"),
+            (ResourceRow::R21, "R21"),
+            (ResourceRow::R22, "R22"),
+            (ResourceRow::R23, "R23"),
+            (ResourceRow::R24, "R24"),
+            (ResourceRow::R25, "R25"),
+            (ResourceRow::R26, "R26"),
+            (ResourceRow::R27, "R27"),
+            (ResourceRow::R28, "R28"),
+        ];
+        assert_eq!(expected.len(), ResourceRow::ALL.len());
+        for (row, name) in expected {
+            assert_eq!(row.name(), name);
+            assert_eq!(row.to_string(), name, "Display is not `name()`");
+        }
+        let names: BTreeSet<&str> = ResourceRow::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(names.len(), ResourceRow::ALL.len(), "two rows share an id");
+    }
+
+    #[test]
+    fn no_row_of_the_logical_domain_and_not_operator_owned_r20_is_a_variant() {
+        // The enum's two exclusion rules, stated as the numbers they exclude:
+        // R1-R8 and R13-R16 are the logical fold/broker domain, and R20 is
+        // external-physical but `operator_owned` -- "never created or pruned by
+        // a run". Absent numbers rather than absent variants, because the
+        // defect this catches is a row admitted later without either rule being
+        // revisited.
+        let admitted: BTreeSet<&str> = ResourceRow::ALL.iter().map(|r| r.name()).collect();
+        for n in 1..=28u8 {
+            let id = format!("R{n}");
+            let expected = !matches!(n, 1..=8 | 13..=16 | 20);
+            assert_eq!(
+                admitted.contains(id.as_str()),
+                expected,
+                "{id} is on the wrong side of the two exclusion rules"
+            );
+        }
+        assert_eq!(admitted.len(), 15);
+    }
+
+    #[test]
+    fn every_enforcement_domain_is_the_one_its_rows_belong_to() {
+        for row in ResourceRow::ALL {
+            let process_local =
+                matches!(row, ResourceRow::R17 | ResourceRow::R22 | ResourceRow::R28);
+            assert_eq!(
+                row.domain(),
+                if process_local {
+                    EnforcementDomain::ProcessLocalOs
+                } else {
+                    EnforcementDomain::ExternalPhysical
+                },
+                "{row}"
+            );
+        }
+        // Both domains are populated, so the crossing above is not a constant.
+        let domains: BTreeSet<EnforcementDomain> =
+            ResourceRow::ALL.iter().map(|r| r.domain()).collect();
+        assert_eq!(domains.len(), 2);
+    }
+
+    #[test]
+    fn every_sub_effect_point_spells_its_own_name() {
+        let expected = [
+            (SubEffectPoint::IdUnread, "IdUnread"),
+            (SubEffectPoint::Written, "Written"),
+            (SubEffectPoint::WrittenFull, "WrittenFull"),
+            (SubEffectPoint::Synced, "Synced"),
+            (SubEffectPoint::Create, "Create"),
+            (SubEffectPoint::TruncateTornTail, "TruncateTornTail"),
+            (SubEffectPoint::SyncPrefix, "SyncPrefix"),
+            (SubEffectPoint::AmbientJobJoined, "AmbientJobJoined"),
+            (SubEffectPoint::CreatedSuspended, "CreatedSuspended"),
+            (SubEffectPoint::PrivateJobAssigned, "PrivateJobAssigned"),
+            (SubEffectPoint::Resumed, "Resumed"),
+            (SubEffectPoint::ReaperStarted, "ReaperStarted"),
+            (
+                SubEffectPoint::PreExecPgidAndRegister,
+                "PreExecPgidAndRegister",
+            ),
+            (SubEffectPoint::Exec, "Exec"),
+            (SubEffectPoint::Registered, "Registered"),
+        ];
+        assert_eq!(expected.len(), SubEffectPoint::ALL.len());
+        for (point, name) in expected {
+            assert_eq!(point.name(), name);
+            assert_eq!(point.to_string(), name, "Display is not `name()`");
+        }
+        let names: BTreeSet<&str> = SubEffectPoint::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(
+            names.len(),
+            SubEffectPoint::ALL.len(),
+            "two points share a name"
+        );
+    }
+
+    #[test]
+    fn every_durable_event_displays_the_tag_the_log_writes() {
+        // `kind()` is crossed against `TOPOLOGY_EVENT_KINDS` by the sibling
+        // suite; what nothing crossed is `Display`, which is what a diagnostic
+        // quoting an adjacency prints.
+        for kind in DurableEvent::ALL {
+            assert_eq!(kind.to_string(), kind.kind(), "{kind:?}");
+        }
+        let tags: BTreeSet<&str> = DurableEvent::ALL.iter().map(|k| k.kind()).collect();
+        assert_eq!(tags.len(), DurableEvent::ALL.len(), "two kinds share a tag");
+        assert_eq!(DurableEvent::RunStarted.kind(), "run_started");
+        assert_eq!(
+            DurableEvent::MergeVerificationUnavailable.kind(),
+            "merge_verification_unavailable"
+        );
+    }
+
+    #[test]
+    fn every_fault_row_displays_the_id_the_matrix_writes() {
+        for row in FaultRow::ALL {
+            assert_eq!(row.to_string(), row.id(), "{row:?}");
+            assert!(
+                row.id().starts_with("T-") && row.id().to_uppercase() == row.id(),
+                "{row:?} is not spelled the way the matrix spells a row"
+            );
+        }
+        let ids: BTreeSet<&str> = FaultRow::ALL.iter().map(|r| r.id()).collect();
+        assert_eq!(ids.len(), FaultRow::ALL.len(), "two rows share an id");
+        assert_eq!(FaultRow::TCandObj.id(), "T-CAND-OBJ");
+        assert_eq!(FaultRow::TRepairDispatch.id(), "T-REPAIR-DISPATCH");
+    }
+
+    // -----------------------------------------------------------------------
+    // The small closed answers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_two_claimed_scopes_are_topology_and_shared_and_legacy_is_not_one() {
+        assert!(SiteScope::Topology.is_claimed());
+        assert!(SiteScope::Shared.is_claimed());
+        assert!(
+            !SiteScope::Legacy.is_claimed(),
+            "a legacy site would acquire the ST-07 bijection requirement"
+        );
+    }
+
+    #[test]
+    fn an_injection_mode_is_a_kill_or_an_error_return_and_all_lists_both() {
+        assert_eq!(
+            InjectionMode::ALL,
+            &[InjectionMode::Kill, InjectionMode::ErrorReturn]
+        );
+    }
+
+    #[test]
+    fn each_host_names_itself_requires_its_own_platform_and_is_the_others_other() {
+        let expected = [
+            (Host::Windows, "windows", Platform::Windows),
+            (Host::Unix, "unix", Platform::Unix),
+        ];
+        assert_eq!(expected.len(), Host::ALL.len());
+        for (host, name, platform) in expected {
+            assert_eq!(host.name(), name);
+            assert_eq!(host.to_string(), name, "Display is not `name()`");
+            assert_eq!(host.platform(), platform);
+            // Written as a fixed pair rather than `current().other()`, which is
+            // reflexive and holds for an `other` that returns its argument.
+            assert_ne!(host.other(), host, "{name} is its own other host");
+            assert_eq!(host.other().other(), host, "{name}");
+        }
+        assert_eq!(Host::Windows.other(), Host::Unix);
+        assert_eq!(Host::Unix.other(), Host::Windows);
+        assert_eq!(
+            Host::current(),
+            if cfg!(windows) {
+                Host::Windows
+            } else {
+                Host::Unix
+            }
+        );
+    }
+
+    #[test]
+    fn a_point_is_required_on_a_host_exactly_when_the_platforms_agree_or_it_is_any() {
+        for platform in [Platform::Any, Platform::Windows, Platform::Unix] {
+            for host in Host::ALL.iter().copied() {
+                let expected = platform == Platform::Any || platform == host.platform();
+                assert_eq!(
+                    platform.required_on(host),
+                    expected,
+                    "{platform:?} on {host}"
+                );
+            }
+        }
+        // Every point is required somewhere: a point required on no host is a
+        // point no suite has to execute, which is the shape of the false
+        // success `Host` exists to have made impossible.
+        for point in SubEffectPoint::ALL {
+            assert!(
+                Host::ALL
+                    .iter()
+                    .any(|host| point.platform().required_on(*host)),
+                "{point} is required on no host"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_is_declared_everywhere_except_written_full_and_error_return_where_a_contract_exists() {
+        for point in SubEffectPoint::ALL {
+            assert_eq!(
+                point.supports(InjectionMode::Kill),
+                *point != SubEffectPoint::WrittenFull,
+                "{point}: the doc's exception is exactly WrittenFull"
+            );
+            assert_eq!(
+                point.supports(InjectionMode::ErrorReturn),
+                point.modes().contains(&InjectionMode::ErrorReturn),
+                "{point}"
+            );
+            assert!(!point.modes().is_empty(), "{point} supports no mode at all");
+        }
+        assert_eq!(
+            SubEffectPoint::WrittenFull.modes(),
+            &[InjectionMode::ErrorReturn]
+        );
+        assert_eq!(SubEffectPoint::IdUnread.modes(), &[InjectionMode::Kill]);
+    }
+
+    #[test]
+    fn an_adjacency_carries_its_event_and_none_carries_nothing() {
+        for kind in DurableEvent::ALL {
+            assert_eq!(Adjacent::Before(*kind).event(), Some(*kind));
+            assert_eq!(Adjacent::After(*kind).event(), Some(*kind));
+        }
+        assert_eq!(Adjacent::None.event(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The wire forms
+    // -----------------------------------------------------------------------
+
+    /// serde's `rename_all = "snake_case"`, reimplemented so the test can say
+    /// what the rule is rather than restate its output variant by variant.
+    fn snake_case(identifier: &str) -> String {
+        let mut out = String::new();
+        for (index, ch) in identifier.char_indices() {
+            if ch.is_ascii_uppercase() {
+                if index != 0 {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_snake_case_rule_is_the_one_serde_applies() {
+        assert_eq!(snake_case("R9"), "r9");
+        assert_eq!(snake_case("R10"), "r10");
+        assert_eq!(snake_case("TCandObj"), "t_cand_obj");
+        assert_eq!(
+            snake_case("PreExecPgidAndRegister"),
+            "pre_exec_pgid_and_register"
+        );
+        assert_eq!(snake_case("Any"), "any");
+    }
+
+    fn wire_form<T: serde::Serialize>(value: &T) -> String {
+        let json = serde_json::to_string(value).expect("a vocabulary value serializes");
+        json.trim_matches('"').to_owned()
+    }
+
+    #[test]
+    fn every_vocabulary_value_writes_the_snake_case_of_its_variant() {
+        // The wire form of `effect_sites.json` and of the checked-in
+        // `effects/residue-classes.json` `row` column. Pinned as the rule plus
+        // the awkward outputs, because the rule is what a later `rename_all`
+        // edit would break.
+        for group in FunnelGroup::ALL {
+            assert_eq!(wire_form(group), snake_case(&format!("{group:?}")));
+        }
+        for row in ResourceRow::ALL {
+            assert_eq!(wire_form(row), snake_case(&format!("{row:?}")));
+        }
+        for row in FaultRow::ALL {
+            assert_eq!(wire_form(row), snake_case(&format!("{row:?}")));
+        }
+        for point in SubEffectPoint::ALL {
+            assert_eq!(wire_form(point), snake_case(&format!("{point:?}")));
+        }
+        for host in Host::ALL {
+            assert_eq!(wire_form(host), snake_case(&format!("{host:?}")));
+        }
+        assert_eq!(wire_form(&FunnelGroup::RunDir), "run_dir");
+        assert_eq!(wire_form(&ResourceRow::R9), "r9");
+        assert_eq!(wire_form(&FaultRow::TCandObj), "t_cand_obj");
+        assert_eq!(wire_form(&SubEffectPoint::WrittenFull), "written_full");
+        assert_eq!(
+            wire_form(&EnforcementDomain::ProcessLocalOs),
+            "process_local_os"
+        );
+        assert_eq!(wire_form(&Platform::Any), "any");
+        assert_eq!(wire_form(&SiteScope::Legacy), "legacy");
+        assert_eq!(wire_form(&InjectionMode::ErrorReturn), "error_return");
+    }
+
+    #[test]
+    fn the_wire_form_is_not_the_ledger_id_for_the_four_types_that_have_one() {
+        // Recorded rather than repaired. `effects/residue-classes.json` is
+        // compared byte-for-byte by `effects::tests`, and its `row` column is
+        // this form, so unifying the two spellings regenerates a checked-in
+        // allowlist and is outside one file's sweep. The finding is
+        // `SWEEP-VOCAB-001`; this assertion is what makes the divergence a
+        // pinned fact rather than an accident, and it is the assertion that
+        // fails when the finding is taken up.
+        assert_ne!(wire_form(&FunnelGroup::RunDir), FunnelGroup::RunDir.name());
+        assert_ne!(wire_form(&ResourceRow::R9), ResourceRow::R9.name());
+        assert_ne!(wire_form(&FaultRow::TCandObj), FaultRow::TCandObj.id());
+        assert_ne!(
+            wire_form(&SubEffectPoint::IdUnread),
+            SubEffectPoint::IdUnread.name()
+        );
+        // `DurableEvent` and `Host` are the two whose accessor and wire form do
+        // agree, which is why the divergence above reads as drift and not as a
+        // convention.
+        for kind in DurableEvent::ALL {
+            assert_eq!(wire_form(kind), kind.kind(), "{kind}");
+        }
+        for host in Host::ALL {
+            assert_eq!(wire_form(host), host.name(), "{host}");
+        }
+    }
+
+    #[test]
+    fn an_adjacency_round_trips_and_refuses_a_second_key_or_an_unknown_one() {
+        let before = Adjacent::Before(DurableEvent::RunStarted);
+        let after = Adjacent::After(DurableEvent::RunStarted);
+        assert_eq!(
+            serde_json::to_string(&before).expect("serializes"),
+            r#"{"before":"run_started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&after).expect("serializes"),
+            r#"{"after":"run_started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Adjacent::None).expect("serializes"),
+            r#""none""#
+        );
+        for (text, value) in [
+            (r#"{"before":"run_started"}"#, before),
+            (r#"{"after":"run_started"}"#, after),
+            (r#""none""#, Adjacent::None),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Adjacent>(text).expect("round trips"),
+                value
+            );
+        }
+        // What actually protects the form: an externally tagged enum admits one
+        // key, and only a declared one. Both refusals are the enum
+        // representation's, not `deny_unknown_fields`', which has no field to
+        // deny on a newtype or unit variant.
+        for refused in [
+            r#"{"before":"run_started","after":"run_started"}"#,
+            r#"{"before":"run_started","extra":1}"#,
+            r#"{"during":"run_started"}"#,
+            r#"{"before":"never_appended"}"#,
+            r#""nothing""#,
+        ] {
+            assert!(
+                serde_json::from_str::<Adjacent>(refused).is_err(),
+                "{refused} was accepted"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The census: every `ALL` lists every variant of its enum
+    // -----------------------------------------------------------------------
+    //
+    // Each `ALL` is a hand-written list beside a hand-written enum, and it is
+    // load-bearing: `SubEffectPoint::ALL` is the coverage obligation the
+    // bijection check enforces, `ResourceRow::ALL` the domain of "every row has
+    // a claimed site", `Host::ALL` the reason a platform claim is not vacuous
+    // on the other host. A variant added to an enum and not to its `ALL` is
+    // silent -- the sibling suite's `assert_eq!(ALL.len(), 11)` compares two
+    // numbers that move together. This census reads the source and compares the
+    // enum's variants to its `ALL`.
+
+    /// Replace every comment and every string, byte-string, raw-string and
+    /// character literal with spaces, preserving byte length and newlines.
+    fn blank_comments_and_literals(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut out = bytes.to_vec();
+        let at = |i: usize| bytes.get(i).copied();
+        let ident_byte =
+            |b: Option<u8>| matches!(b, Some(c) if c.is_ascii_alphanumeric() || c == b'_');
+        let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+            for slot in out.iter_mut().take(to).skip(from) {
+                if *slot != b'\n' {
+                    *slot = b' ';
+                }
+            }
+        };
+        let mut i = 0;
+        while i < bytes.len() {
+            match (at(i), at(i + 1)) {
+                (Some(b'/'), Some(b'/')) => {
+                    let end = source
+                        .get(i..)
+                        .and_then(|rest| rest.find('\n'))
+                        .map_or(bytes.len(), |offset| i + offset);
+                    blank(&mut out, i, end);
+                    i = end;
+                }
+                (Some(b'/'), Some(b'*')) => {
+                    let mut depth = 1usize;
+                    let mut j = i + 2;
+                    while j < bytes.len() && depth > 0 {
+                        match (at(j), at(j + 1)) {
+                            (Some(b'/'), Some(b'*')) => {
+                                depth += 1;
+                                j += 2;
+                            }
+                            (Some(b'*'), Some(b'/')) => {
+                                depth -= 1;
+                                j += 2;
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    blank(&mut out, i, j);
+                    i = j;
+                }
+                (Some(first), _)
+                    if (first == b'r' || first == b'b') && !ident_byte(at(i.wrapping_sub(1))) =>
+                {
+                    // `r"`, `r#"`, `b"`, `br"`, `br#"` -- and anything else
+                    // starting with these letters is an identifier.
+                    let mut j = i + 1;
+                    if first == b'b' && at(j) == Some(b'r') {
+                        j += 1;
+                    }
+                    let raw = first == b'r' || at(i + 1) == Some(b'r');
+                    let mut hashes = 0usize;
+                    if raw {
+                        while at(j) == Some(b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                    }
+                    if at(j) != Some(b'"') || (!raw && hashes > 0) {
+                        i += 1;
+                        continue;
+                    }
+                    j += 1;
+                    let end = if raw {
+                        let mut k = j;
+                        loop {
+                            if k >= bytes.len() {
+                                break bytes.len();
+                            }
+                            if at(k) == Some(b'"')
+                                && (0..hashes).all(|h| at(k + 1 + h) == Some(b'#'))
+                            {
+                                break k + 1 + hashes;
+                            }
+                            k += 1;
+                        }
+                    } else {
+                        end_of_quoted(bytes, j)
+                    };
+                    blank(&mut out, i, end);
+                    i = end;
+                }
+                (Some(b'"'), _) => {
+                    let end = end_of_quoted(bytes, i + 1);
+                    blank(&mut out, i, end);
+                    i = end;
+                }
+                (Some(b'\''), _) => {
+                    // A lifetime, not a literal, unless the quote closes within
+                    // one escape or one character. `&'static [Self]` is the
+                    // shape that a naive scan swallows the rest of the file on.
+                    let end = if at(i + 1) == Some(b'\\') {
+                        let mut k = i + 2;
+                        while k < bytes.len() && at(k) != Some(b'\'') {
+                            k += 1;
+                        }
+                        Some(k + 1)
+                    } else if at(i + 2) == Some(b'\'') {
+                        Some(i + 3)
+                    } else {
+                        None
+                    };
+                    match end {
+                        Some(end) => {
+                            blank(&mut out, i, end);
+                            i = end;
+                        }
+                        None => i += 1,
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        String::from_utf8(out).unwrap_or_else(|_| source.to_owned())
+    }
+
+    /// The index one past the closing quote of a `"`-delimited literal whose
+    /// body starts at `from`.
+    fn end_of_quoted(bytes: &[u8], from: usize) -> usize {
+        let mut i = from;
+        while i < bytes.len() {
+            match bytes.get(i).copied() {
+                Some(b'\\') => i += 2,
+                Some(b'"') => return i + 1,
+                Some(_) => i += 1,
+                None => break,
+            }
+        }
+        bytes.len()
+    }
+
+    /// `(enum name, variants declared)` for every `pub enum` in `source`.
+    fn declared_variants(source: &str) -> Vec<(String, usize)> {
+        let blanked = blank_comments_and_literals(source);
+        let lines: Vec<&str> = blanked.lines().collect();
+        let mut found = Vec::new();
+        let mut index = 0usize;
+        while let Some(line) = lines.get(index) {
+            index += 1;
+            let Some(name) = line
+                .strip_prefix("pub enum ")
+                .and_then(|rest| rest.strip_suffix(" {"))
+            else {
+                continue;
+            };
+            let mut variants = 0usize;
+            while let Some(body) = lines.get(index) {
+                index += 1;
+                if *body == "}" {
+                    break;
+                }
+                if is_variant_line(body.trim()) {
+                    variants += 1;
+                }
+            }
+            found.push((name.to_owned(), variants));
+        }
+        found
+    }
+
+    fn is_variant_line(text: &str) -> bool {
+        let Some(body) = text.strip_suffix(',') else {
+            return false;
+        };
+        let identifier = match body.find('(') {
+            Some(open) if body.ends_with(')') => body.get(..open).unwrap_or_default(),
+            Some(_) => return false,
+            None => body,
+        };
+        let mut characters = identifier.chars();
+        matches!(characters.next(), Some(first) if first.is_ascii_uppercase())
+            && characters.all(|c| c.is_ascii_alphanumeric())
+    }
+
+    #[test]
+    fn the_census_reads_variants_and_not_the_text_that_looks_like_them() {
+        // The blanker's positive control: a variant named only inside a comment
+        // or a string literal is not a variant, and a `'static` lifetime does
+        // not swallow the file behind it.
+        let fixture = "\
+const NOISE: &'static str = \"pub enum Ghost {\\n    Boo,\\n}\";
+const RAW: &str = r#\"pub enum Phantom {\"#;
+pub enum Real {
+    One,
+    // Two,
+    Three(Payload),
+}
+";
+        assert_eq!(
+            blank_comments_and_literals(fixture).len(),
+            fixture.len(),
+            "the blanker moved a byte"
+        );
+        assert_eq!(
+            declared_variants(fixture),
+            vec![("Real".to_owned(), 2)],
+            "a commented-out or quoted variant was counted, or a real one was not"
+        );
+
+        // The injected violation: one variant added to the enum and to nothing
+        // else has to move the count.
+        let widened = fixture.replace("    Three(Payload),", "    Three(Payload),\n    Four,");
+        assert_eq!(declared_variants(&widened), vec![("Real".to_owned(), 3)]);
+
+        // And the blanker survives the two literal shapes that make a naive
+        // scanner lose its place.
+        let tricky = "let comma = ',';\nlet quote = '\\'';\npub enum After {\n    One,\n}\n";
+        assert_eq!(declared_variants(tricky), vec![("After".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn every_all_lists_every_variant_of_its_enum() {
+        let counted = declared_variants(include_str!("vocab.rs"));
+        let names: Vec<&str> = counted.iter().map(|(name, _)| name.as_str()).collect();
+        // The domain this census claims: the eleven `pub enum`s of this file,
+        // by name. A twelfth, or a rename, fails here rather than going
+        // uncounted.
+        assert_eq!(
+            names,
+            vec![
+                "FunnelGroup",
+                "ResourceRow",
+                "EnforcementDomain",
+                "DurableEvent",
+                "Adjacent",
+                "FaultRow",
+                "SiteScope",
+                "InjectionMode",
+                "Platform",
+                "Host",
+                "SubEffectPoint",
+            ],
+            "the enums of this file are not the ones the census expects"
+        );
+
+        let expected: &[(&str, usize)] = &[
+            ("FunnelGroup", FunnelGroup::ALL.len()),
+            ("ResourceRow", ResourceRow::ALL.len()),
+            // No `ALL`: the count is the literal the type's documentation says.
+            ("EnforcementDomain", 2),
+            ("DurableEvent", DurableEvent::ALL.len()),
+            ("Adjacent", 3),
+            ("FaultRow", FaultRow::ALL.len()),
+            ("SiteScope", 3),
+            ("InjectionMode", InjectionMode::ALL.len()),
+            ("Platform", 3),
+            ("Host", Host::ALL.len()),
+            ("SubEffectPoint", SubEffectPoint::ALL.len()),
+        ];
+        for (name, declared) in &counted {
+            let expected = expected
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, count)| *count)
+                .unwrap_or_default();
+            assert_eq!(
+                *declared, expected,
+                "`{name}` declares {declared} variants and its list has {expected}"
+            );
+        }
+        // Non-zero, so a scanner that found nothing cannot pass by finding
+        // nothing on both sides.
+        assert!(counted.iter().all(|(_, declared)| *declared > 0));
+    }
+}
