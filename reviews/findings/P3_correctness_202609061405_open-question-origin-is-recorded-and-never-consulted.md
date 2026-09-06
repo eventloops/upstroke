@@ -5,13 +5,15 @@ disposition: deferred     # `QuestionOrigin` and `OpenQuestion` are declared in 
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/fold.rs:416-426 (the enum and the field); src/topology/fold/apply.rs:47,91,95,163,292 at `ee5dc81f` (every write)
+location: src/topology/fold.rs:416
 provenance: pre_existing
 first_bad:
 guard: the sweeps of `src/topology/fold.rs` (queue row 40), which owns `QuestionOrigin`, `OpenQuestion` and `Derived`, and `src/topology/fold/tests.rs` (row 39), which owns the suite that would pin the distinction
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/fold.rs:416-426 (the enum and the field); src/topology/fold/apply.rs:47,91,95,163,292 at `ee5dc81f` (every write)
 
 `OpenQuestion::origin: QuestionOrigin` is a public field of a public struct, reachable from outside
 the crate through `TopologyFold::open_questions()`. `RunState::open_question` in

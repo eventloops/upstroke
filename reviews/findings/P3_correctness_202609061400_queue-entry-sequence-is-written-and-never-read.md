@@ -5,13 +5,15 @@ disposition: deferred     # the field belongs to src/topology/queue.rs and six o
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/queue.rs:15 (the field); src/topology/fold/apply.rs:249,259,283,290,306 at `ee5dc81f` (every write)
+location: src/topology/queue.rs:15
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/fold/tests.rs` (queue row 39), which holds six of the eight `QueueEntry` literals, together with whoever owns `src/topology/queue.rs`
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/queue.rs:15 (the field); src/topology/fold/apply.rs:249,259,283,290,306 at `ee5dc81f` (every write)
 
 `QueueEntry::sequence: Option<SequenceId>` is written by five statements, all of them in
 `src/topology/fold/apply.rs`, and read by nothing in the crate:

@@ -5,13 +5,15 @@ disposition: deferred     # the trace needs two in-flight tasks and the RunStart
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/fold/apply.rs:177-182 at `ee5dc81f` (`RunState::record_halt`)
+location: src/topology/fold/apply.rs:177
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/fold/tests.rs` (queue row 39), which owns the fixture the trace needs
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/fold/apply.rs:177-182 at `ee5dc81f` (`RunState::record_halt`)
 
 `RunState::record_halt` is first-in-wins:
 

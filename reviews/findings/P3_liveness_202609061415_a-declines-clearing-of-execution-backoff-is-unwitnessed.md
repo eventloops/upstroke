@@ -5,13 +5,15 @@ disposition: deferred     # both halves are in this file, but the trace needs a 
 category: liveness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/fold/apply.rs:461 and 519-536 at `ee5dc81f` (`fail_lineage`'s `deferred_tasks.remove`, and `set_state`'s)
+location: src/topology/fold/apply.rs:461
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/fold/tests.rs` (queue row 39), which owns the fixture the trace needs
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/fold/apply.rs:461 and 519-536 at `ee5dc81f` (`fail_lineage`'s `deferred_tasks.remove`, and `set_state`'s)
 
 `design/26` says a decline "closes their generations, removes candidates and questions, **clears
 execution backoff**, and releases their generation, candidate and lineage holdings". Two statements

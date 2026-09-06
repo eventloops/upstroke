@@ -5,13 +5,15 @@ disposition: deferred
 category: docs-contract
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/effects/registry.rs:166 (as of the reviewed sha)
+location: src/topology/effects/registry.rs:166
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/effects/registry.rs` (queue row 23)
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/effects/registry.rs:166 (as of the reviewed sha)
 
 `ClassHistogram::total` is documented as "how many samples the histogram
 accounts for" and returns `u32` by three `saturating_add`s. At the boundary

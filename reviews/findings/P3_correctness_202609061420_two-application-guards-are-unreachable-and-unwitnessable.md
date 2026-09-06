@@ -5,13 +5,15 @@ disposition: deferred     # both are kept deliberately as defence in depth; pinn
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/fold/apply.rs:24 and 445 at `ee5dc81f`
+location: src/topology/fold/apply.rs:24
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/fold/tests.rs` (queue row 39), or a later change that decides these two are better deleted than kept
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/fold/apply.rs:24 and 445 at `ee5dc81f`
 
 Two statements in `RunState::apply` cannot be witnessed, because the state they would change is
 refused one step earlier. Measured at `ee5dc81f` against the whole `topology::fold` suite (131

@@ -5,13 +5,15 @@ disposition: deferred
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/effects/harness.rs:277 (as of the reviewed sha)
+location: src/topology/effects/harness.rs:277
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/effects/harness.rs` (queue row 22)
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/effects/harness.rs:277 (as of the reviewed sha)
 
 `HookHarness::begin_fast_sequence` opens with `self.end_fast_sequence();`,
 and its doc sentence "A second `begin` closes the first" reads as if that

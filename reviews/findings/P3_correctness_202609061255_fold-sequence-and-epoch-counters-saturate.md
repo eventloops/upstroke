@@ -5,13 +5,15 @@ disposition: deferred     # the refusal belongs in the checkers, which this one-
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/fold/apply.rs:71,254,313,330 at `ee5dc81f`
+location: src/topology/fold/apply.rs:71
 provenance: pre_existing
 first_bad:
 guard: the sweeps of `src/topology/fold/check_integration.rs` (queue row 33) and `src/topology/fold/check_attempt.rs` (row 30, swept), which own the two refusals; `apply` cannot refuse anything
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/fold/apply.rs:71,254,313,330 at `ee5dc81f`
 
 `RunState::apply` advances two run-wide counters with `saturating_add(1)` and nothing refuses the
 event that would exceed them.

@@ -5,13 +5,15 @@ disposition: deferred
 category: correctness
 pr: TBD
 reviewed_sha: ee5dc81fa2b24ecb6db0856f359d76ec66a9d038
-location: src/topology/effects/sites.rs (`WorktreeSite::Verify`, `AnswerSite::Ingest` and `LockSite::ObserveCleanupHold` in `adjacent()`); src/topology/effects.rs (`EffectSiteId::observable_orders`)
+location: src/topology/effects/sites.rs:29
 provenance: pre_existing
 first_bad:
 guard: the sweep of `src/topology/effects.rs`, queue row 28, which owns `observable_orders()`; the fix also moves `design/26_design_merge_queue_protocol.md`
 ---
 
 ## Failure sequence
+
+Location as first recorded: src/topology/effects/sites.rs (`WorktreeSite::Verify`, `AnswerSite::Ingest` and `LockSite::ObserveCleanupHold` in `adjacent()`); src/topology/effects.rs (`EffectSiteId::observable_orders`)
 
 A suite writes the fault-injection registry for `Answer.Ingest`, the answer funnel's read-only
 ingestion (`rundir::ingest_answer`).
