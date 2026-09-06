@@ -241,3 +241,34 @@ claim (2).
 So this census keeps a real and narrower job: the two *literals* name an
 authority rather than inventing a value. It is not a witness that the value
 arriving at them is right.
+
+## `fn the_settled_notes_separate_the_successful_and_the_failed_settlement() {`
+
+`PR160-NOTES-SUCCESS-SETTLEMENT`. The `Progress::Settled` section of
+`docs/internals/engine/topology/run.md` summarised the whole ready-dispatch
+branch as ending in `attempt_finished`. That is only the rejected half.
+[`TopologyRun::settle`] opens with `let Some(failure) = judgement.failure ...
+else`, so an attempt nothing rejected takes [`TopologyRun::promote_candidate`]
+before any failure settlement is built, and that path appends
+`candidate_prepared` then `task_candidate_created` and no `attempt_finished`
+at all. The fold enforces the same rule — `check_attempt_finished` refuses
+`SettlementTransition::Succeeded` outright — and so do
+`design/15_design_event_log_resume_run_layout.md` and
+`design/26_design_merge_queue_protocol.md` §26.
+
+So a reader using that contract to reconstruct a successful attempt's durable
+record was sent looking for an event that is never written. This pins the two
+settlements separately, and refuses the retired sentence by name so the claim
+cannot come back under a reflow.
+
+**It is a text pin and only a text pin.** The behaviour it describes is held
+elsewhere — `recover::tests::the_driver_carries_an_accepted_attempt_through_the_candidate_sequence`
+for the successful durable sequence, and the fold's
+`candidate_prepared_is_the_sole_successful_settlement` for the settlement
+contract. This one asserts that the prose agrees with them; `src/export.rs` and
+`agent/proc/tests.rs` pin the sentences they own the same way.
+
+## `fn the_settled_notes_separate_the_successful_and_the_failed_settlement()` › `let settled = settled.split_whitespace().collect::<Vec<_>>().join(" ");`
+
+Match on the prose, not on where its line breaks fall: a reflow must not break
+the pin, only a changed claim.

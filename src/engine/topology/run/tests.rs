@@ -332,3 +332,48 @@ fn both_attempt_started_arms_take_their_pool_from_an_authority() {
          plan disagree about which pool the attempt drained: {invented:?}"
     );
 }
+
+#[test]
+fn the_settled_notes_separate_the_successful_and_the_failed_settlement() {
+    const NOTES: &str = include_str!("../../../../docs/internals/engine/topology/run.md");
+
+    let settled = NOTES
+        .split("\n## ")
+        .find(|section| section.starts_with("`pub enum Progress` › `Settled {`"))
+        .expect("the notes carry the `Settled {` heading the branch summary sits under");
+    let settled = settled.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for (proposition, pin) in [
+        (
+            "which settlement is appended depends on `accepted`",
+            "depends on `accepted`",
+        ),
+        (
+            "a rejected attempt settles with `attempt_finished`",
+            "rejected attempt ends at `attempt_finished`",
+        ),
+        (
+            "an accepted attempt appends no `attempt_finished`",
+            "never appends `attempt_finished`",
+        ),
+        (
+            "an accepted attempt settles at `candidate_prepared`",
+            "`candidate_prepared`",
+        ),
+        (
+            "and `task_candidate_created` follows it",
+            "`task_candidate_created`",
+        ),
+    ] {
+        assert!(
+            settled.contains(pin),
+            "the `Settled {{` summary must state that {proposition}; looked for {pin:?} in:\n{settled}"
+        );
+    }
+
+    assert!(
+        !settled.contains("the attempt through the Runner, and `attempt_finished`."),
+        "the retired claim that the whole ready-dispatch branch ends in \
+         `attempt_finished` must not come back:\n{settled}"
+    );
+}
