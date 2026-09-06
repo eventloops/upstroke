@@ -313,8 +313,8 @@ was the loser's `CreateFileW`, the error was `STATUS_DELETE_PENDING`
 rendered as os error 5, and the sixty-four attempts were exhausted in less
 time than a scheduler tick.
 
-The ordinary handoff is still microseconds — in 512 native two-remover
-pairs, 234 losers saw `ERROR_ACCESS_DENIED`: 209 once and then `NotFound`,
+The ordinary handoff is still microseconds — across 256 native two-remover
+pairs, 512 callers, 234 losers saw `ERROR_ACCESS_DENIED`: 209 once and then `NotFound`,
 21 twice and then `NotFound`, 4 once and then their own success — so the
 first [`RACING_YIELD_ATTEMPTS`] failures keep the yield, and the failures
 after them sleep [`RACING_SLEEP`] apiece. A sleep gives up the processor for
@@ -362,14 +362,30 @@ to three quarters of one before the refusal. That is paid once, on an error path
 admission, and it is what buys tolerance of a winner stalled for a Windows
 Server quantum.
 
+## `enum RacingPause {`
+
+What follows a failed attempt: a yield, a sleep of [`RACING_SLEEP`], or
+nothing because the attempt was the last. A value rather than two branches so
+the schedule can be asked about without being performed, and reported through
+[`note_racing_attempt`] as what was decided.
+
+## `fn racing_pause_after(failed: usize) -> RacingPause {`
+
+The schedule, pure: `Done` at and past [`RACING_ACCESS_ATTEMPTS`], `Yield`
+through [`RACING_YIELD_ATTEMPTS`], `Sleep` between. Separate from the
+performer so
+`tests::the_racing_pause_is_sixteen_yields_then_forty_seven_sleeps_and_nothing_after_the_last`
+can pin the whole sequence on every platform, including that no pause follows
+the last failure — pass 1 found a sleep there, dead time in which a winner's
+close went unobserved.
+
 ## `fn racing_pause(failed: usize) {`
 
 The pause after the `failed`th failed attempt of [`racing_removal`] and
-[`read_racing`], and before the next: a yield through the first
-[`RACING_YIELD_ATTEMPTS`] failures, then [`RACING_SLEEP`], and nothing at
-all after the [`RACING_ACCESS_ATTEMPTS`]th, because no attempt follows it
-— a sleep there would be dead time in which the winner's close goes
-unobserved. It records the failure through [`note_racing_attempt`] first.
+[`read_racing`]: decide with [`racing_pause_after`], report through
+[`note_racing_attempt`], then perform. Report before perform, so a test's
+observer runs after the attempt has returned and before its pause — the point
+at which a controlled winner closes.
 
 Not `workspace_manager::remove_tree_once_handles_close`'s schedule, which
 waits for a *dying process* to close its handles and sleeps twenty-five
@@ -377,7 +393,7 @@ milliseconds forty times over. This is still a handoff between two live
 reclaimers; the sleep exists only because the winner's remaining step can
 be descheduled, and the budget is an order of magnitude smaller.
 
-## `fn note_racing_attempt(_failed: usize) {}`
+## `fn note_racing_attempt(_failed: usize, _pause: RacingPause) {}`
 
 The `#[cfg(not(test))]` half of a seam that exists for one reason: nothing
 outside the loop can see an *attempt*, and the native Windows tests have to

@@ -22,10 +22,11 @@ use super::runtime::{
 use super::{
     DOCKER_GATED_TESTS, DisposableDirView, DockerCli, FakeOwnerLiveness, FakeRuntime, FoundIntent,
     GitView, GitViewRequest, LaunchPlan, Launched, NoHooks, OrphanWindow, PS_FIELD_SEPARATOR,
-    PS_FORMAT, PS_LABELS, RecordingHooks, TERMINATION_OBSERVATIONS, classify_docker_failure,
-    create_container, docker_gate, is_unreachable_diagnostic, launch, list_intents, mount_git_view,
-    observe_terminated, parse_ps_output, read_intent, reclaim, release, remove_container,
-    remove_intent, start_container, stop_container, unmount_git_view, write_intent,
+    PS_FORMAT, PS_LABELS, RacingPause, RecordingHooks, TERMINATION_OBSERVATIONS,
+    classify_docker_failure, create_container, docker_gate, is_unreachable_diagnostic, launch,
+    list_intents, mount_git_view, observe_terminated, parse_ps_output, read_intent, reclaim,
+    release, remove_container, remove_intent, start_container, stop_container, unmount_git_view,
+    write_intent,
 };
 use crate::error::UpstrokeError;
 use crate::runner::{AgentId, CommandSpec, InvocationId, ProbeTarget, host};
@@ -44,20 +45,25 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-type RacingObserver = Box<dyn FnMut(usize)>;
+type RacingObserver = Box<dyn FnMut(usize, RacingPause)>;
 
 thread_local! {
-    static RACING_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RACING_SCHEDULE: std::cell::RefCell<Vec<(usize, RacingPause, std::time::Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static RACING_OBSERVER: std::cell::RefCell<Option<RacingObserver>> =
         const { std::cell::RefCell::new(None) };
 }
 
-pub(super) fn note_racing_attempt(failed: usize) {
-    RACING_ATTEMPTS.with(|count| count.set(failed));
+pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {
+    RACING_SCHEDULE.with(|schedule| {
+        if let Ok(mut schedule) = schedule.try_borrow_mut() {
+            schedule.push((failed, pause, std::time::Instant::now()));
+        }
+    });
     RACING_OBSERVER.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut() {
             if let Some(observer) = slot.as_mut() {
-                observer(failed);
+                observer(failed, pause);
             }
         }
     });
@@ -70,8 +76,33 @@ struct RacingObservation {
 
 #[cfg(windows)]
 impl RacingObservation {
-    fn failed_attempts(&self) -> usize {
-        RACING_ATTEMPTS.with(std::cell::Cell::get)
+    fn schedule(&self) -> Vec<(usize, RacingPause)> {
+        RACING_SCHEDULE.with(|schedule| {
+            schedule
+                .borrow()
+                .iter()
+                .map(|(failed, pause, _)| (*failed, *pause))
+                .collect()
+        })
+    }
+
+    fn assert_every_sleep_was_slept(&self, tag: &str) {
+        use super::RACING_SLEEP;
+
+        let entries = RACING_SCHEDULE.with(|schedule| schedule.borrow().clone());
+        for pair in entries.windows(2) {
+            let [(failed, pause, at), (_, _, next)] = pair else {
+                continue;
+            };
+            if *pause == RacingPause::Sleep {
+                let gap = next.duration_since(*at);
+                assert!(
+                    gap >= RACING_SLEEP,
+                    "[{tag}] failure {failed} was to be followed by a {RACING_SLEEP:?} sleep and \
+                     the next attempt came {gap:?} later"
+                );
+            }
+        }
     }
 }
 
@@ -88,7 +119,7 @@ impl Drop for RacingObservation {
 
 #[cfg(windows)]
 fn observe_racing_attempts(observer: RacingObserver) -> RacingObservation {
-    RACING_ATTEMPTS.with(|count| count.set(0));
+    RACING_SCHEDULE.with(|schedule| schedule.borrow_mut().clear());
     RACING_OBSERVER.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut() {
             *slot = Some(observer);
@@ -97,6 +128,51 @@ fn observe_racing_attempts(observer: RacingObserver) -> RacingObservation {
     RacingObservation {
         _not_send: std::marker::PhantomData,
     }
+}
+
+fn expected_racing_schedule(failures: usize) -> Vec<(usize, RacingPause)> {
+    use super::{RACING_ACCESS_ATTEMPTS, RACING_YIELD_ATTEMPTS};
+
+    let yields = (1..=RACING_YIELD_ATTEMPTS).map(|failed| (failed, RacingPause::Yield));
+    let sleeps = (RACING_YIELD_ATTEMPTS + 1..RACING_ACCESS_ATTEMPTS)
+        .map(|failed| (failed, RacingPause::Sleep));
+    let done = std::iter::once((RACING_ACCESS_ATTEMPTS, RacingPause::Done));
+    yields.chain(sleeps).chain(done).take(failures).collect()
+}
+
+#[test]
+fn the_racing_pause_is_sixteen_yields_then_forty_seven_sleeps_and_nothing_after_the_last() {
+    use super::{RACING_ACCESS_ATTEMPTS, RACING_YIELD_ATTEMPTS, racing_pause_after};
+
+    let schedule: Vec<_> = (1..=RACING_ACCESS_ATTEMPTS)
+        .map(|failed| (failed, racing_pause_after(failed)))
+        .collect();
+    assert_eq!(schedule, expected_racing_schedule(RACING_ACCESS_ATTEMPTS));
+    let count = |wanted: RacingPause| {
+        schedule
+            .iter()
+            .filter(|(_, pause)| *pause == wanted)
+            .count()
+    };
+    assert_eq!(
+        (
+            count(RacingPause::Yield),
+            count(RacingPause::Sleep),
+            count(RacingPause::Done)
+        ),
+        (16, 47, 1)
+    );
+    assert_eq!(RACING_YIELD_ATTEMPTS, 16);
+    assert_eq!(RACING_ACCESS_ATTEMPTS, 64);
+    assert_eq!(
+        schedule.last(),
+        Some(&(RACING_ACCESS_ATTEMPTS, RacingPause::Done)),
+        "no attempt follows the last failure, so nothing may sleep after it"
+    );
+    assert_eq!(
+        racing_pause_after(RACING_ACCESS_ATTEMPTS + 1),
+        RacingPause::Done
+    );
 }
 
 const REPO_KEY: &str = "0123456789abcdef";
@@ -3835,73 +3911,27 @@ fn windows_stalled_removal_budget() -> std::time::Duration {
 const WINDOWS_RELEASE_AFTER_FAILURES: usize = super::RACING_YIELD_ATTEMPTS + 4;
 
 #[cfg(windows)]
-fn windows_close_once_the_loser_sleeps(
-    pending: fs::File,
-    failures: std::sync::mpsc::Receiver<usize>,
-) -> std::thread::JoinHandle<usize> {
-    use super::{RACING_ACCESS_ATTEMPTS, RACING_SLEEP};
-
-    std::thread::spawn(move || {
-        let mut seen = 0;
-        while seen < WINDOWS_RELEASE_AFTER_FAILURES {
-            seen = failures
-                .recv()
-                .expect("the loser reports every failed attempt until it stops");
+fn windows_stall_then_release(pending: fs::File, work: impl FnOnce()) -> Vec<(usize, RacingPause)> {
+    let mut pending = Some(pending);
+    let observation = observe_racing_attempts(Box::new(move |failed, _| {
+        if failed == WINDOWS_RELEASE_AFTER_FAILURES {
+            drop(pending.take());
         }
-        // The loser has failed past its yields. A repaired loop now sleeps
-        // `RACING_SLEEP` between attempts, so nothing more arrives within half
-        // of one; a yield-only loop reports its remaining attempts within
-        // microseconds, and is drained to its bound before the close so that
-        // its refusal is the outcome rather than a coin toss.
-        while seen < RACING_ACCESS_ATTEMPTS {
-            match failures.recv_timeout(RACING_SLEEP / 2) {
-                Ok(failed) => seen = failed,
-                Err(_) => break,
-            }
-        }
-        drop(pending);
-        seen
-    })
-}
-
-#[cfg(windows)]
-fn windows_stall_then_release(
-    pending: fs::File,
-    work: impl FnOnce(),
-) -> (usize, usize, std::time::Duration) {
-    use std::time::Instant;
-
-    let (report, failures) = std::sync::mpsc::channel();
-    let observation = observe_racing_attempts(Box::new(move |failed| {
-        let _ = report.send(failed);
     }));
-    let closer = windows_close_once_the_loser_sleeps(pending, failures);
-    let started = Instant::now();
     work();
-    let elapsed = started.elapsed();
-    let loser_failed = observation.failed_attempts();
+    let schedule = observation.schedule();
+    observation.assert_every_sleep_was_slept("stall");
     drop(observation);
-    let released_after = closer.join().expect("the closer returned");
-    (loser_failed, released_after, elapsed)
+    schedule
 }
 
 #[cfg(windows)]
-fn windows_assert_converged_through_the_wait(
-    tag: &str,
-    loser_failed: usize,
-    released_after: usize,
-) {
-    use super::RACING_ACCESS_ATTEMPTS;
-
-    assert!(
-        (WINDOWS_RELEASE_AFTER_FAILURES..RACING_ACCESS_ATTEMPTS).contains(&released_after),
-        "[{tag}] the handle was released after failure {released_after}, outside the sleeping \
-         part of the budget"
-    );
+fn windows_assert_converged_through_the_wait(tag: &str, schedule: &[(usize, RacingPause)]) {
     assert_eq!(
-        loser_failed, released_after,
-        "[{tag}] the loser failed {loser_failed} times and the handle was released after \
-         failure {released_after}: the attempt after the release is the one that converges"
+        schedule,
+        expected_racing_schedule(WINDOWS_RELEASE_AFTER_FAILURES),
+        "[{tag}] the loser must fail exactly until the winner's close, on the documented \
+         pause schedule, and converge on the attempt after it"
     );
 }
 
@@ -3925,17 +3955,17 @@ fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_e
         let pending = windows_posix_delete_pending(&path);
 
         let mut outcome = None;
-        let (loser_failed, released_after, elapsed) =
-            windows_stall_then_release(pending, || outcome = Some(view.discard(&path)));
+        let schedule = windows_stall_then_release(pending, || outcome = Some(view.discard(&path)));
 
         outcome.expect("the discard ran").unwrap_or_else(|error| {
             panic!(
-                "[{tag}] the loser of a removal race refused after {elapsed:?} and \
-                     {loser_failed} failed attempts instead of waiting out a winner stalled \
-                     between marking the name and closing its handle: {error}"
+                "[{tag}] the loser of a removal race refused after {} failed attempts \
+                     instead of waiting out a winner stalled between marking the name and \
+                     closing its handle: {error}",
+                schedule.len()
             )
         });
-        windows_assert_converged_through_the_wait(tag, loser_failed, released_after);
+        windows_assert_converged_through_the_wait(tag, &schedule);
         assert!(
             !path.exists(),
             "[{tag}] the view is gone once the stall ends"
@@ -3959,7 +3989,7 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
         launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
     let pending = windows_posix_delete_pending(&view_path);
 
-    let observation = observe_racing_attempts(Box::new(|_| {}));
+    let observation = observe_racing_attempts(Box::new(|_, _| {}));
     let started = Instant::now();
     let error = reclaim(
         &mut hooks,
@@ -3971,7 +4001,8 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
     )
     .expect_err("a view that is still delete-pending after the whole budget must refuse");
     let elapsed = started.elapsed();
-    let failed = observation.failed_attempts();
+    let schedule = observation.schedule();
+    observation.assert_every_sleep_was_slept("held");
     drop(observation);
 
     assert!(
@@ -3979,8 +4010,10 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
         "the refusal carries the native error that stopped it: {error:?}"
     );
     assert_eq!(
-        failed, RACING_ACCESS_ATTEMPTS,
-        "the refusal comes after exactly the bound, not before it and not past it"
+        schedule,
+        expected_racing_schedule(RACING_ACCESS_ATTEMPTS),
+        "the refusal comes after exactly the bound, yields then sleeps strictly between \
+         attempts, and nothing after the last"
     );
     let budget = windows_stalled_removal_budget();
     assert!(
@@ -4049,12 +4082,13 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
     let path = write(&mut hooks);
     let pending = windows_posix_delete_pending(&path);
     let mut found = None;
-    let (loser_failed, released_after, elapsed) =
+    let schedule =
         windows_stall_then_release(pending, || found = Some(list_intents(&fixture.root)));
     let found = found.expect("the listing ran").unwrap_or_else(|error| {
         panic!(
-            "discovery refused after {elapsed:?} and {loser_failed} failed attempts over \
-                 an intent another reclaimer was still closing: {error}"
+            "discovery refused after {} failed attempts over an intent another reclaimer \
+                 was still closing: {error}",
+            schedule.len()
         )
     });
     assert!(
@@ -4062,14 +4096,14 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
         "an intent whose deletion completed during the wait is not a discovered record: \
          {found:?}"
     );
-    windows_assert_converged_through_the_wait("discovery", loser_failed, released_after);
+    windows_assert_converged_through_the_wait("discovery", &schedule);
     assert!(!path.exists());
 
     // The removal half: two reclaimers on one record.
     let path = write(&mut hooks);
     let pending = windows_posix_delete_pending(&path);
     let mut outcome = None;
-    let (loser_failed, released_after, elapsed) = windows_stall_then_release(pending, || {
+    let schedule = windows_stall_then_release(pending, || {
         outcome = Some(remove_intent(
             &mut hooks,
             ContainerSite::RemoveIntent,
@@ -4079,12 +4113,12 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
     });
     outcome.expect("the removal ran").unwrap_or_else(|error| {
         panic!(
-            "the loser of an intent-removal race refused after {elapsed:?} and \
-                 {loser_failed} failed attempts instead of waiting out the winner's close: \
-                 {error}"
+            "the loser of an intent-removal race refused after {} failed attempts instead \
+                 of waiting out the winner's close: {error}",
+            schedule.len()
         )
     });
-    windows_assert_converged_through_the_wait("removal", loser_failed, released_after);
+    windows_assert_converged_through_the_wait("removal", &schedule);
     assert!(!path.exists());
     let _ = fs::remove_dir_all(&fixture.root);
 }

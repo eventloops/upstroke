@@ -2025,14 +2025,43 @@ only the parent's permissions move.
 Running as root, or on a filesystem that ignores the mode. Restore
 and say so rather than asserting something that is not true here.
 
-## `pub(super) fn note_racing_attempt(failed: usize) {`
+## `pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {`
 
-The `#[cfg(test)]` half of the attempt seam in `super::racing_pause`: record
-the count, and run whichever observer this thread installed. `try_borrow_mut`
-so an observer that itself removes something is a no-op here rather than a
-panic inside production code. The shape, the thread-local counter, the
-`RacingObservation` guard whose `Drop` uninstalls the observer and the
-`observe_racing_attempts` installer are `workspace_manager::fixture`'s.
+The `#[cfg(test)]` half of the attempt seam in `super::racing_pause`: append
+`(failed, pause, now)` to this thread's schedule, and run whichever observer
+this thread installed. `try_borrow_mut` so an observer that itself removes
+something is a no-op here rather than a panic inside production code. The
+thread-local schedule, the `RacingObservation` guard whose `Drop` uninstalls
+the observer and the `observe_racing_attempts` installer are
+`workspace_manager::fixture`'s shape. The timestamp is what
+`assert_every_sleep_was_slept` reads: two consecutive entries are two
+consecutive failed attempts on one thread, so the gap between them is the
+pause that was actually performed, lower-bounded by the sleep std guarantees,
+and no other thread's scheduling enters into it.
+
+## `fn expected_racing_schedule(failures: usize) -> Vec<(usize, RacingPause)> {`
+
+The pause schedule as the contract states it, written as three explicit
+ranges rather than as a copy of `racing_pause_after`: a yield after each of
+the first `RACING_YIELD_ATTEMPTS` failures, a sleep after each failure from
+there to one short of `RACING_ACCESS_ATTEMPTS`, and nothing after the last.
+Truncated to the first `failures` entries for a loser that converged early.
+
+## `fn the_racing_pause_is_sixteen_yields_then_forty_seven_sleeps_and_nothing_after_the_last() {`
+
+The schedule pinned on every platform, against `racing_pause_after` directly:
+the whole sequence, its counts spelled as the numbers 16, 47 and 1 so a
+constant that moves is visible here, that the last entry is `Done`, and that
+anything past the bound is `Done` too. This is the guard for pass 1's finding
+that a sleep ran after the final failure: remove the terminal arm and the
+sixty-fourth entry becomes `Sleep`, which this fails on Linux before any
+Windows run is needed.
+
+What it does not pin is the three-line performer: a `racing_pause` whose
+`Done` arm slept anyway would report `Done` and still sleep, and only a
+timing upper bound could see that, which is the kind of assertion that fails
+spuriously on a starved runner. That mutation was run natively and passes,
+and is recorded as the residual rather than hidden behind a flaky oracle.
 
 ## `fn windows_posix_delete_pending(path: &Path) -> fs::File {`
 
@@ -2071,42 +2100,32 @@ passes a test that only asserted "it waited".
 
 ## `const WINDOWS_RELEASE_AFTER_FAILURES: usize = super::RACING_YIELD_ATTEMPTS + 4;`
 
-The failed attempt after which the stalled winner is released: past the
-yields, so the loser is provably in the sleeping part of its budget when the
-close lands, and far enough past them that the release is not on the boundary.
+The failed attempt after which the stalled winner closes: past the yields, so
+the loser is in the sleeping part of its budget when the close lands, and far
+enough past them that the release is not on the boundary.
 
-## `fn windows_close_once_the_loser_sleeps(`
+## `fn windows_stall_then_release(pending: fs::File, work: impl FnOnce()) -> Vec<(usize, RacingPause)> {`
 
-The stalled winner, as a thread: it closes the delete-pending handle only
-after the loser has reported `WINDOWS_RELEASE_AFTER_FAILURES` failed attempts
-through the seam, which orders the close against an attempt that has already
-returned rather than against a clock. Then one more rule, so the yield-only
-loop fails **deterministically** rather than by a coin toss: a repaired loop
-sleeps `RACING_SLEEP` between attempts, so nothing arrives within half of
-one and the close happens at once; a yield-only loop reports its remaining
-attempts within microseconds, so it is drained to its bound first and closes
-only after the refusal it was always going to give. The single residual
-non-determinism is a yield-only loser preempted for longer than half a sleep
-between two of its own attempts, which turns a witnessed failure into a pass
-and is stated here rather than hidden.
+Run `work` on this thread as the loser, with the winner's delete handle held
+in `pending` and released **from the loser's own observer** the moment the
+loser reports its `WINDOWS_RELEASE_AFTER_FAILURES`th failure. There is no
+second thread and no clock: the observer runs after that attempt has returned
+and before its pause, so the close is ordered against an attempt by
+construction, the attempt after it finds the name gone, and nothing can be
+preempted into a different order. Pass 2 showed the earlier closer thread had
+two races of its own — a loser that had not yet started, and a closer
+preempted between its timeout and its close — and a detached thread on unwind;
+none of those exist here.
 
-Returns the failure number the handle was released after, so the test can
-say which attempt converged.
+Returns the loser's schedule, and first checks every sleep in it was slept.
 
-## `fn windows_stall_then_release(`
+## `fn windows_assert_converged_through_the_wait(tag: &str, schedule: &[(usize, RacingPause)]) {`
 
-Run `work` on this thread as the loser with the seam observed, the winner
-stalled in `pending`, and the closer above waiting on the observation.
-Returns the loser's failed-attempt count, the failure the release followed,
-and the elapsed time — the observation is dropped before the closer is
-joined, which is what lets a refused loser's closer return.
-
-## `fn windows_assert_converged_through_the_wait(tag: &str, loser_failed: usize, released_after: usize) {`
-
-The two facts that say the convergence came through the wait and not through
-a name that was never delete-pending: the release fell inside the sleeping
-part of the budget, and the loser's last failure *is* the one the release
-followed, so the attempt after it is the one that found the name gone.
+The one fact that says the convergence came through the wait: the loser's
+schedule is exactly the expected schedule's first
+`WINDOWS_RELEASE_AFTER_FAILURES` entries — sixteen yields, then sleeps up to
+and including the failure the release followed — so the loser failed until
+the close, on the documented pauses, and the attempt after it converged.
 
 ## `fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends() {`
 
@@ -2114,13 +2133,15 @@ followed, so the attempt after it is the one that found the name gone.
 that failed on the Windows CI leg lost sixty-four yields in a fraction of a
 millisecond to a winner that had marked the view delete-pending and not yet
 closed its handle. Here the winner is [`windows_posix_delete_pending`], its
-close is ordered against the loser's twentieth failed attempt, and the loser
-is the real `discard` of both views through the one `racing_removal`.
+close is the loser's own twentieth failure, and the loser is the real
+`discard` of both views through the one `racing_removal`.
 
-On the yield-only loop this fails with the CI failure's own text after
-sixty-four failed attempts: `failed to read <view>: Access is denied. (os
-error 5)`. On the repaired loop the discard returns `Ok` on the attempt after
-the release, which [`windows_assert_converged_through_the_wait`] checks.
+On the yield-only loop this fails at `assert_every_sleep_was_slept`: the
+schedule says failure 17 is followed by a sleep and the next attempt came
+microseconds later. The schedule oracle alone would not see that mutation,
+because the seam reports what the loop decided rather than what it did; the
+on-thread gap is what reports the doing. On the repaired loop the discard
+returns `Ok` on the attempt after the release.
 
 Second field held constant: the same empty view the census seeds, the same
 release rule; only which `GitView` discards it moves.
@@ -2129,19 +2150,18 @@ release rule; only which `GitView` discards it moves.
 
 The fail-closed half of the same repair, at the reclaim boundary: a view held
 delete-pending through the **whole** budget still refuses, and the refusal
-carries the native error, comes after exactly the bound, keeps the intent,
+carries the native error, comes after exactly the schedule, keeps the intent,
 and records no discard.
 
 The things a longer wait could have broken. It must still be bounded, so the
-refusal has to arrive, after exactly `RACING_ACCESS_ATTEMPTS` failures — the
-seam counts them — and within ten times the sleep budget, generous enough for
-a starved runner and small enough to catch a loop that never returns. It must
-not arrive early, so the lower time bound is the sleep budget itself, which a
-yield-only loop fails after a few milliseconds. And it must not be read as
-absence: `reclaim` stops at `UnmountGitView`, so `RemoveIntent` never runs and
-the record that names the residue survives for the next census — which the
-second half demonstrates by dropping the handle and reclaiming, at which
-point view and intent both go.
+refusal has to arrive, after exactly the sixty-four-entry schedule ending in
+`Done`, with every sleep in it slept, and within ten times the sleep budget —
+generous enough for a starved runner and small enough to catch a loop that
+never returns. It must not arrive early, so the lower time bound is the sleep
+budget itself. And it must not be read as absence: `reclaim` stops at
+`UnmountGitView`, so `RemoveIntent` never runs and the record that names the
+residue survives for the next census — which the second half demonstrates by
+dropping the handle and reclaiming, at which point view and intent both go.
 
 Second field held constant: one launched container, one intent, one view;
 only whether the winner's handle ever closes moves.
@@ -2155,8 +2175,7 @@ are exercised: `read_racing`, through `list_intents`, is the census
 discovering records while another reclaimer is mid-delete, and
 `racing_removal`, through `remove_intent`, is two reclaimers on one record.
 Each gets the release rule above; discovery must answer with the record
-absent rather than refuse, and removal must converge. On the yield-only loop
-discovery fails first, with the #152 text.
+absent rather than refuse, and removal must converge.
 
 Second field held constant: one record, written the same way for both halves;
 only which loop meets the stall moves.

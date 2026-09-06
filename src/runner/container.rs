@@ -206,21 +206,36 @@ pub const RACING_YIELD_ATTEMPTS: usize = 16;
 
 pub const RACING_SLEEP: Duration = Duration::from_millis(10);
 
-fn racing_pause(failed: usize) {
-    note_racing_attempt(failed);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RacingPause {
+    Yield,
+    Sleep,
+    Done,
+}
+
+fn racing_pause_after(failed: usize) -> RacingPause {
     if failed >= RACING_ACCESS_ATTEMPTS {
-        return;
-    }
-    if failed <= RACING_YIELD_ATTEMPTS {
-        std::thread::yield_now();
+        RacingPause::Done
+    } else if failed <= RACING_YIELD_ATTEMPTS {
+        RacingPause::Yield
     } else {
-        std::thread::sleep(RACING_SLEEP);
+        RacingPause::Sleep
+    }
+}
+
+fn racing_pause(failed: usize) {
+    let pause = racing_pause_after(failed);
+    note_racing_attempt(failed, pause);
+    match pause {
+        RacingPause::Yield => std::thread::yield_now(),
+        RacingPause::Sleep => std::thread::sleep(RACING_SLEEP),
+        RacingPause::Done => {}
     }
 }
 
 #[cfg(not(test))]
 #[inline]
-fn note_racing_attempt(_failed: usize) {}
+fn note_racing_attempt(_failed: usize, _pause: RacingPause) {}
 
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -1277,6 +1292,6 @@ mod tests;
 
 #[cfg(test)]
 #[inline]
-fn note_racing_attempt(failed: usize) {
-    tests::note_racing_attempt(failed);
+fn note_racing_attempt(failed: usize, pause: RacingPause) {
+    tests::note_racing_attempt(failed, pause);
 }
