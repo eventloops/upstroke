@@ -72,6 +72,74 @@ fn commit_run(repo: &Path, run_id: &str) -> PathBuf {
 }
 
 #[test]
+fn fresh_runs_with_equal_ids_cannot_share_private_artifacts() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "equal-run-ids")
+        .expect("a root owned by this regression test");
+    let private_root = root.path().join("home");
+    let run_id = "01M191Y2PSVX78RNEP31D23K02";
+    let first = RunPaths::with_private_root(&root.path().join("repo-a"), run_id, &private_root);
+    let second = RunPaths::with_private_root(&root.path().join("repo-b"), run_id, &private_root);
+    assert_ne!(first.public, second.public);
+    assert_eq!(first.private, second.private);
+    first
+        .create_fresh()
+        .expect("the first run allocates both halves");
+    let transcript = first.transcripts().join("task-1.json");
+    fs::write(&transcript, b"first run transcript").expect("first run transcript is present");
+
+    let error = second
+        .create_fresh()
+        .expect_err("the occupied private half must refuse a fresh run");
+    assert!(error.to_string().contains("private"), "{error}");
+    assert_eq!(
+        fs::read(&transcript).expect("the first run's transcript survives"),
+        b"first run transcript"
+    );
+    assert!(
+        scratch_tree::proves_absent(&second.public),
+        "the refused run leaves no public husk"
+    );
+}
+
+#[test]
+fn an_occupied_public_root_is_preserved_and_its_private_reservation_is_removed() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "occupied-public-run")
+        .expect("a root owned by this regression test");
+    let paths = paths_in(root.path(), "OCCUPIED");
+    fs::create_dir_all(&paths.public).expect("an older public run exists");
+    fs::write(paths.events(), b"older event log").expect("the older run has content");
+
+    let error = paths
+        .create_fresh()
+        .expect_err("fresh creation refuses the old public root");
+    assert!(error.to_string().contains("public"), "{error}");
+    assert_eq!(
+        fs::read(paths.events()).expect("the old log survives"),
+        b"older event log"
+    );
+    assert!(
+        scratch_tree::proves_absent(&paths.private),
+        "the unused private reservation is removed"
+    );
+}
+
+#[test]
+fn ensuring_existing_run_directories_preserves_resume_contents() {
+    let root = scratch_tree::acquire(&std::env::temp_dir(), "resume-run-dirs")
+        .expect("a root owned by this regression test");
+    let paths = paths_in(root.path(), "RESUME");
+    paths.create_fresh().expect("fresh creation succeeds");
+    fs::write(paths.events(), b"existing event log").expect("existing log");
+    paths
+        .create()
+        .expect("resume may ensure existing skeleton directories");
+    assert_eq!(
+        fs::read(paths.events()).expect("read resumed log"),
+        b"existing event log"
+    );
+}
+
+#[test]
 fn agent_authored_files_land_outside_the_workspace() {
     // The whole point of the split: a reviewer with read access to the
     // repo has no path to the implementer's transcript.

@@ -1,5 +1,4 @@
-//! The attempt lifecycle checks: resume, spawn, dispatch, and a generation
-//! from its first attempt to its close.
+//! Extended notes: `docs/internals/topology/fold/check_attempt.md`
 
 use super::region::{
     admission_name, check_lease_disposition, describe_region, spawn_admission_name,
@@ -8,10 +7,7 @@ use super::start::check_ladder;
 use super::*;
 
 impl RunState {
-    // --- run_resumed -------------------------------------------------------
-
     pub(super) fn check_run_resumed(&self, resumed: &RunResumed4) -> Result<(), FoldError> {
-        // refusals[5], second half: exact equality, field for field (INV-23).
         if let Some(field) = self.started.runner.difference(&resumed.runner) {
             return Err(FoldError::RunnerMoved {
                 field: field.to_string(),
@@ -20,7 +16,16 @@ impl RunState {
         Ok(())
     }
 
-    // --- task_spawned ------------------------------------------------------
+    pub(super) fn check_task_spawned(&self, spawn: &FrozenSpawn) -> Result<(), FoldError> {
+        const KIND: &str = "task_spawned";
+        self.check_spawn(spawn, KIND)?;
+        if spawn.admission.question().is_some() {
+            if let Some(lineage) = spawn.entry.lineage {
+                self.check_question_can_park_lineage(KIND, lineage.root)?;
+            }
+        }
+        Ok(())
+    }
 
     pub(super) fn check_spawn(
         &self,
@@ -32,8 +37,6 @@ impl RunState {
             key: spawn.key.0,
             detail,
         };
-        // refusals[10]: a dynamic task's key is the registry's length at the
-        // event that registers it.
         if spawn.key.index() != self.registry.len() {
             return Err(FoldError::NonDenseKey {
                 kind,
@@ -68,16 +71,29 @@ impl RunState {
                 lineage.root, lineage.parent, spawn.key
             )));
         }
-        // The allow-list is the run's, not the registering event's: an entry
-        // that widened it would admit an agent pre-flight never probed.
+        self.entry(kind, lineage.root)?;
+        self.entry(kind, lineage.parent)?;
+        if self.lineage_root(lineage.parent) != lineage.root {
+            return Err(malformed(format!(
+                "parent {} belongs to lineage {}, not recorded root {}",
+                lineage.parent,
+                self.lineage_root(lineage.parent),
+                lineage.root
+            )));
+        }
+        for ancestor in [lineage.root, lineage.parent] {
+            if self.task(kind, ancestor)?.state == TaskState::Failed {
+                return Err(malformed(format!(
+                    "ancestor {ancestor} has failed; a new repair cannot revive declined work"
+                )));
+            }
+        }
         if entry.allowed_agents != self.started.probed_agents {
             return Err(malformed(format!(
                 "it allows {:?} and this run probed {:?}",
                 entry.allowed_agents, self.started.probed_agents
             )));
         }
-        // Dependencies: every one exists, refers backwards, and the display
-        // list is the same list.
         if entry.deps.len() != entry.display_deps.len() {
             return Err(malformed(format!(
                 "it records {} dependency key(s) and {} display dependency(ies)",
@@ -98,8 +114,6 @@ impl RunState {
                     known.display_id
                 )));
             }
-            // A repair rebases work that was already integrated; a dependency
-            // that is not merged has nothing for it to build on.
             if self.task(kind, *dep)?.state != TaskState::Merged {
                 return Err(malformed(format!(
                     "it depends on {dep}, which is `{}` — a repair's dependencies are merged \
@@ -113,8 +127,6 @@ impl RunState {
         Ok(())
     }
 
-    /// The registered entry's admission and the event's must be the same
-    /// statement about the same task.
     pub(super) fn check_admission<F>(
         &self,
         spawn: &FrozenSpawn,
@@ -196,8 +208,6 @@ impl RunState {
         Ok(())
     }
 
-    // --- task_dispatched ---------------------------------------------------
-
     pub(super) fn check_dispatched(&self, dispatched: &TaskDispatched) -> Result<(), FoldError> {
         const KIND: &str = "task_dispatched";
         let entry = self.entry(KIND, dispatched.key)?;
@@ -211,6 +221,20 @@ impl RunState {
                 expected: "pending",
             });
         }
+        if self.lineage_has_question(dispatched.key)
+            || self.queue.holds_task(dispatched.key)
+            || self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.candidate.key == dispatched.key)
+        {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: "dispatch requires no outstanding lineage question or candidate for this \
+                         task"
+                    .to_owned(),
+            });
+        }
         if let Some(open) = task.open() {
             return Err(FoldError::NotTheOpenGeneration {
                 kind: KIND,
@@ -219,7 +243,6 @@ impl RunState {
                 detail: format!("generation {} is still {}", open.id.0, open.class.name()),
             });
         }
-        // refusals[10]: generations are dense per task.
         if usize::try_from(dispatched.generation.0).unwrap_or(usize::MAX) != task.generations.len()
         {
             return Err(FoldError::NonDenseKey {
@@ -231,42 +254,6 @@ impl RunState {
 
         let is_repair = entry.lineage.is_some();
         match (&dispatched.lease, entry.lineage) {
-            // **The recorded region is derivation-checked, exactly as the
-            // recorded binding is.** One event over, `check_attempt_started`
-            // refuses a binding the fold did not derive
-            // (`FoldError::BindingMismatch`); this arm used to match the
-            // lease's *shape* alone and let `apply_dispatched` grant whatever
-            // region the event carried — so the fold could admit a dispatch on
-            // one region while the lease table held another, and the lease
-            // table's is the one every later overlap check consults.
-            //
-            // That was not hypothetical. A driver that took the plan's hints
-            // literally recorded `src/auth/*.rs` as a **prefix**, which
-            // overlaps nothing, while the fold had admitted the dispatch on
-            // `src/auth`. `84a3978` made the driver read
-            // [`TopologyFold::predicted_region`] instead of deriving its own,
-            // which fixed that instance; nothing stopped the next caller — or
-            // a later slice's second writer — from constructing a
-            // `task_dispatched` the fold would accept and the lease table would
-            // honour. This is the class fix, and it is why the reader and this
-            // validator call the **same** free function rather than two copies
-            // of one rule.
-            //
-            // **Exact equality, and deliberately not a policy-aware one.** The
-            // run's frozen `PathPolicy` decides whether two regions *overlap*,
-            // case-folding component by component; it does not decide whether
-            // two regions are the same region. A recorded `SRC/Auth` that folds
-            // onto a derived `src/auth` is still a different literal, and the
-            // lease table stores literals — so an equality that folded here
-            // would admit a component set the derivation never produced and
-            // hand it to `apply_dispatched` unchanged. Order counts for the
-            // same reason: the derivation emits one prefix per hint in the
-            // frozen order, so a reordered list is a list this run's frozen
-            // hints do not derive.
-            //
-            // Live at the first width above `max_parallel = 1`, where two tasks
-            // holding non-overlapping-by-construction regions edit the same
-            // files; invisible below it.
             (LeaseGrant::Predicted { paths }, None) => {
                 let derived = predicted_region(entry);
                 if *paths != derived {
@@ -331,16 +318,22 @@ impl RunState {
         Ok(())
     }
 
-    // --- attempt_started ---------------------------------------------------
-
     pub(super) fn check_attempt_started(&self, started: &AttemptStarted4) -> Result<(), FoldError> {
         const KIND: &str = "attempt_started";
         let entry = self.entry(KIND, started.key)?;
         let task = self.task(KIND, started.key)?;
         let generation = self.open_generation(KIND, task, started.key, started.generation)?;
 
-        // ST-06: a retry names the generation it is retrying, and a fresh
-        // attempt names one nothing has run in yet.
+        if self.lineage_has_question(started.key) {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "task {} belongs to a lineage with an unanswered question",
+                    started.key
+                ),
+            });
+        }
+
         match (&generation.class, &started.resume_session) {
             (GenerationClass::OpenNoAttempt, None) => {}
             (
@@ -350,8 +343,6 @@ impl RunState {
                 },
                 Some(resumed),
             ) => {
-                // refusals[12]: a session belongs to the incarnation that
-                // retained it, and only that incarnation may resume it.
                 if session != resumed {
                     return Err(FoldError::StaleIncarnation {
                         key: started.key.0,
@@ -394,19 +385,27 @@ impl RunState {
             }
         }
 
-        // ST-06: attempts are dense from 1 within a generation.
-        if started.attempt.0 != generation.attempts + 1 {
+        let next_attempt =
+            generation
+                .attempts
+                .checked_add(1)
+                .ok_or_else(|| FoldError::InconsistentRecord {
+                    kind: KIND,
+                    detail: format!(
+                        "task {} generation {} has exhausted its attempt numbers",
+                        started.key, started.generation.0
+                    ),
+                })?;
+        if started.attempt.0 != next_attempt {
             return Err(FoldError::WrongAttempt {
                 kind: KIND,
                 key: started.key.0,
                 generation: started.generation.0,
                 attempt: started.attempt.0,
-                expected: (generation.attempts + 1).to_string(),
+                expected: next_attempt.to_string(),
             });
         }
 
-        // refusals[11] / INV-19: the binding is the override when one was
-        // recorded, and the frozen rung binding otherwise.
         let mismatch = |detail: String| FoldError::BindingMismatch {
             key: started.key.0,
             attempt: started.attempt.0,
@@ -464,7 +463,6 @@ impl RunState {
         Ok(())
     }
 
-    /// The open generation this event must be naming (ST-06).
     pub(super) fn open_generation<'a>(
         &self,
         kind: &'static str,
@@ -489,7 +487,6 @@ impl RunState {
         Ok(open)
     }
 
-    /// The open generation, additionally required to be running `attempt`.
     pub(super) fn in_flight<'a>(
         &self,
         kind: &'static str,
@@ -522,8 +519,6 @@ impl RunState {
         Ok(open)
     }
 
-    // --- attempt_finished --------------------------------------------------
-
     pub(super) fn check_attempt_finished(
         &self,
         finished: &AttemptFinished4,
@@ -554,17 +549,6 @@ impl RunState {
                         ),
                     });
                 }
-                // **The envelope and the record name one attempt, on this arm
-                // too.** This arm checked the epoch and stopped, so a
-                // current-epoch retained settlement could carry a ledger line
-                // belonging to a different attempt of the same generation —
-                // the same disagreement the `Closed` arm has refused since
-                // round 6, one arm over. Every one of that round's four new
-                // refusal witnesses constructs `Closed`, which is why this arm
-                // was undriven; the `cfa1be8` review found it as its second P1.
-                //
-                // **A door is not fixed until every arm through it asks the
-                // same question.**
                 if finished.record.attempt != finished.attempt.0 {
                     return Err(FoldError::WrongAttempt {
                         kind: KIND,
@@ -574,33 +558,6 @@ impl RunState {
                         expected: finished.attempt.0.to_string(),
                     });
                 }
-                // **And the record does not claim the attempt succeeded.**
-                // `candidate_prepared` is the sole successful settlement
-                // (INV-07,
-                // `decisions/2026-08-12-merge-queue-execution-topology.md`),
-                // and the `Closed` arm has enforced that against the record
-                // since round 6. This arm did not, so the invariant held on one
-                // path through the door and not the other: a current-epoch
-                // retained settlement could carry a record with no failure and
-                // every configured pass green — a record
-                // `check_candidate_prepared` would itself accept — while the
-                // fold held the generation open for a retry. The ledger line an
-                // operator reads would say the work passed.
-                //
-                // **This is not a terminal-failure requirement, and the
-                // difference is the whole of the earlier hesitation.**
-                // `settle::settle_failed` is the only producer of a `Retained`
-                // settlement and it is reached on the failure path, for a
-                // same-rung retry that has a session to resume — so a retained
-                // attempt has not succeeded, by construction. Asking
-                // `!is_successful()` is the record saying that much and no
-                // more: `Retained` carries no transition, so nothing here makes
-                // the generation terminal, and the arm goes on to leave it open
-                // with its lease held.
-                //
-                // One predicate, both arms, as the candidate door and the
-                // closed settlement already share it — a door is not fixed
-                // until every arm through it asks the same question.
                 if finished.record.is_successful() {
                     return Err(FoldError::InconsistentRecord {
                         kind: KIND,
@@ -621,14 +578,6 @@ impl RunState {
                         ),
                     });
                 }
-                // **And the record names the conversation the settlement
-                // keeps.** A `Retained` settlement exists to hold a session for
-                // a same-session retry, and `check_attempt_started` will make
-                // the retry name the *generation's* session — the one this
-                // event puts there. If the ledger line names another session,
-                // or none, then the two halves of one event disagree about
-                // which conversation was left open, and the half a person reads
-                // is not the half the fold enforces.
                 if finished.record.session_id.as_deref() != Some(retained_session.0.as_str()) {
                     return Err(FoldError::InconsistentRecord {
                         kind: KIND,
@@ -647,23 +596,6 @@ impl RunState {
                 }
             }
             AttemptSettlement::Closed { transition, lease } => {
-                // **`attempt_finished` does not settle a success.** INV-07 and
-                // `decisions/2026-08-12-merge-queue-execution-topology.md` say
-                // it outright — `candidate_prepared` is "the **sole**
-                // successful settlement for an attempt that produces a
-                // candidate … `attempt_finished` is not also emitted for that
-                // attempt" — and this build appended both, so one attempt
-                // carried its record on two lines.
-                //
-                // Refused here rather than tolerated downstream. The 2026-08-27
-                // ruling is CONFORM, not supersession, and a reader that
-                // *coped* with the dual pattern would be a second reading of
-                // the same sentence: `Spend::replay` grew per-attempt
-                // deduplication to survive it, which is evidence of the
-                // duplicate rather than permission for it. Schema 4 has no
-                // external writers — `src/engine/mod.rs` is `pub(crate) mod
-                // topology` — so no log this build did not write can carry the
-                // shape, and refusing it costs no compatibility.
                 if matches!(transition, SettlementTransition::Succeeded) {
                     return Err(FoldError::InconsistentRecord {
                         kind: KIND,
@@ -675,14 +607,6 @@ impl RunState {
                         ),
                     });
                 }
-                // **The record must say the attempt failed, and must be this
-                // attempt's.** This door refused `Succeeded` and asked nothing
-                // else, so a settlement could fail a task and halt a run while
-                // carrying a record whose failure field is empty and whose
-                // reviews all passed — a ledger line reporting success attached
-                // to a terminal failure. `AttemptRecord::is_successful` is the
-                // one definition, shared with `check_candidate_prepared`, so
-                // the two doors cannot drift apart again.
                 if finished.record.is_successful() {
                     return Err(FoldError::InconsistentRecord {
                         kind: KIND,
@@ -694,9 +618,6 @@ impl RunState {
                         ),
                     });
                 }
-                // The envelope and the record name one attempt. Without this the
-                // ledger line a settlement carries can belong to a different
-                // attempt of the same generation.
                 if finished.record.attempt != finished.attempt.0 {
                     return Err(FoldError::WrongAttempt {
                         kind: KIND,
@@ -715,8 +636,6 @@ impl RunState {
         Ok(())
     }
 
-    // --- attempt_interrupted -----------------------------------------------
-
     pub(super) fn check_attempt_interrupted(
         &self,
         interrupted: &AttemptInterrupted4,
@@ -730,18 +649,8 @@ impl RunState {
             interrupted.generation,
             interrupted.attempt,
         )?;
-        // The generation does *not* survive an interruption.
-        // `transaction_fault_matrix[T-ATTEMPT].resume_action` is explicit:
-        // "append attempt_interrupted (unknown spend, allowance refunded,
-        // generation Closed, lease by kind) ... task returns Pending; later
-        // dispatch new generation". Nothing was judged and the spend is
-        // unknown, so the worktree is scrubbed with force rather than reused —
-        // which is why an ordinary generation releases its predicted region
-        // here and a lineage member goes on holding its root's.
         check_lease_disposition(KIND, interrupted.key, generation.lease, interrupted.lease)
     }
-
-    // --- generation_closed -------------------------------------------------
 
     pub(super) fn check_generation_closed(
         &self,
@@ -750,8 +659,6 @@ impl RunState {
         const KIND: &str = "generation_closed";
         let task = self.task(KIND, closed.key)?;
         let generation = self.open_generation(KIND, task, closed.key, closed.generation)?;
-        // refusals[15]: an open generation with no attempt in flight. A
-        // promoting generation is not closed — it is promoted.
         match generation.class {
             GenerationClass::OpenNoAttempt | GenerationClass::RetainedIdle { .. } => {}
             ref class => {
@@ -770,11 +677,7 @@ impl RunState {
         check_lease_disposition(KIND, closed.key, generation.lease, closed.lease)
     }
 
-    // --- defer_wait_elapsed ------------------------------------------------
-
     pub(super) fn check_defer_wait_elapsed(&self) -> Result<(), FoldError> {
-        // refusals[18]: halt and budget outrank backoff, so no wait elapses
-        // under either.
         if self.halted_at.is_some() {
             return Err(FoldError::RunEnding {
                 kind: "defer_wait_elapsed",

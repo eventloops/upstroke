@@ -1,3 +1,5 @@
+//! Extended notes: `docs/internals/agent/proc/worker.md`
+
 //! Cancellation and joining for a worker whose individual operations cannot
 //! wait for an external peer. The owner releases before joining on every path.
 //! A finite park and the retained unpark token cover the check-to-park race.
@@ -16,8 +18,6 @@ use std::time::Duration;
 
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// One bounded secondary failure slot. The worker owner and the invocation
-/// share it so a failure found during Drop reaches the invocation's outcome.
 #[derive(Clone, Default)]
 pub(super) struct FailureReport(Arc<Mutex<Option<String>>>);
 
@@ -35,18 +35,12 @@ impl FailureReport {
     }
 }
 
-/// A unique joining owner. The worker shares only its cancellation flag.
 pub(super) struct Worker {
     released: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-    /// Spawn one worker and give it a release flag checked between finite
-    /// nonblocking operations. Names come only from the caller's fixed labels.
-    ///
-    /// # Errors
-    /// The OS refused the thread; the unstarted closure and its pipe are dropped.
     pub(super) fn spawn(
         name: &'static str,
         work: impl FnOnce(&AtomicBool) + Send + 'static,
@@ -58,7 +52,6 @@ impl Worker {
             ));
         }
         let released = Arc::new(AtomicBool::new(false));
-        // The worker may run concurrently with cancellation by its owner.
         let flag = Arc::clone(&released);
         let handle = thread::Builder::new()
             .name(name.to_owned())
@@ -69,8 +62,6 @@ impl Worker {
         })
     }
 
-    /// Release and join once. True names a panic outside the worker's own
-    /// caught operation, which its collector maps to a supervision failure.
     pub(super) fn settle(&mut self) -> bool {
         self.released.store(true, Ordering::SeqCst);
         match self.handle.take() {
@@ -85,10 +76,6 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Drain and Feeder explicitly settle and report before their Worker
-        // field drops. This final fallback retains joining ownership if a
-        // future caller abandons Worker directly. Drop never adds a panic
-        // while another stack is unwinding.
         let _panicked_during_abandonment = self.settle();
     }
 }
@@ -100,7 +87,6 @@ pub(super) mod testing {
 
     impl Worker {
         pub(in crate::agent::proc) fn release_token(&self) -> Arc<AtomicBool> {
-            // Test collection owns cancellation during failed assertions too.
             Arc::clone(&self.released)
         }
 
@@ -126,7 +112,6 @@ pub(super) mod testing {
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
     }
 
-    /// The test keeps both cancellation and the collector's joining owner.
     pub(in crate::agent::proc) struct JoinedReceiver<T> {
         receiver: Receiver<T>,
         collector: Option<JoinHandle<()>>,

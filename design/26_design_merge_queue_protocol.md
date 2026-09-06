@@ -259,6 +259,62 @@ Its payload includes:
   answer records an explicit one-off binding. Declining fails the lineage. The
   engine never silently breaks a pin or policy ceiling.
 
+Questions may park a nonterminal task whose lineage has no open generation or
+integration transaction. This includes queued work, execution backoff and a
+quiet `AwaitingRepair` parent. Distinct question IDs may remain open together;
+an ID is never reused. Standalone admission questions obey the same active-work
+check. A rejection may embed its new admission question because that event
+settles its transaction. An attempt settlement may close its own generation and
+embed a question while a sibling generation or verification is still active.
+
+An open question blocks new dispatch, attempt starts and integration throughout
+its lineage. Unrelated work stays eligible. Candidate selection and integration
+admission use the same question rule. Selection of the first attempt in an
+already dispatched generation also applies that rule. The blocked generation
+keeps its existing pipeline entitlement and remains visible to recovery;
+answering the question can make its continuation eligible again without a new
+dispatch. `merge_prepared` checks again before
+authorizing publication because a sibling may have parked after verification
+started.
+
+An answer removes only its question. The answered task keeps a terminal state;
+otherwise another question of its own implies `AwaitingInput`, a queued
+candidate or owned transaction implies `AwaitingMerge`, a registered repair
+child implies `AwaitingRepair`, unelapsed execution backoff implies `Deferred`,
+and otherwise it becomes `Pending`. Questions elsewhere in the lineage still
+block admission. These are current facts, not a state restored from raise time.
+Execution backoff remains pending beneath a question. An elapsed wait or resume
+consumes it once, including hidden waits, without closing questions. Queue
+verification backoff remains a separate fact.
+
+A decline fails every unmerged lineage member, including the root. It closes
+their generations, removes candidates and questions, clears execution backoff,
+and releases their generation, candidate and lineage holdings. A matching
+`VerificationStarted` transaction is cancelled; late results for closed
+generations or sequences are refused. A `Prepared` transaction has already
+authorized publication, so a decline affecting it is refused before append
+until that publication completes. Already merged ancestors remain merged.
+Unrelated transactions and holdings survive. `decline_halts_run` additionally
+records a run halt; it does not decide whether the lineage fails. New repairs
+must name a coherent root and parent and cannot revive a failed ancestor.
+
+These are durable fold and replay rules. The current topology checkpoint
+driver still refuses human answer ingestion before append. It does not yet
+cancel running agent processes on a decline. A concurrent driver that ingests
+answers must stop the affected work and discard late results before appending
+their completion. Event shapes are unchanged; schema-4 replay now refuses the
+unsafe event orders excluded above, including bare questions during active
+lineage work and questions on terminal tasks.
+
+The live writer checks one event, appends that exact event successfully once,
+and applies its delta once to the same fold with no intervening transition.
+Replay uses the same check and application once per record in order. Private
+delta construction establishes that checking occurred; it does not enforce
+freshness, append ordering or single application. Cloned deltas and separately
+planned deltas can be stale. The public API does not reject this misuse. The
+engine emitter's exclusive mutable ownership and call order enforce the live
+protocol.
+
 At actual dispatch, the engine records the then-current integration head as the
 repair's generation base. For a text conflict, it applies the candidate there
 without committing, leaving the unmerged index for the worker to resolve. For a
@@ -385,3 +441,73 @@ by the combined unknown cost of admitted processes. The ledger must state that
 bound honestly; operators requiring the narrowest stop use `max_parallel = 1`
 until providers expose pre-authorizable envelopes. Concurrency must not turn the
 existing reported-spend ceiling into a falsely exact guarantee.
+
+#### Verification contract: the effect-site bijection
+
+Added 2026-09-05 (PR #146) under §13's same-change rule; not part of the verbatim record above.
+It records what `src/topology/effects` enforces, so that the checker has a design sentence to be
+held to rather than a code comment.
+
+**The inventory is closed and typed.** Every external-effect site a schema-4 run has is a
+variant of `EffectSiteId` (grouped by funnel: worktree, snapshot, ref, object, run directory,
+event, answer, lock, report, process, container). A site that is not a variant does not exist, and
+a registry entry naming one is refused at the wire format. Each site carries, by construction,
+its resource row, its fault-matrix row, its scope (topology, shared or legacy), its parent-side
+sub-effect points and their injection modes and platform, its command-internal residue classes
+and the residue elements each must construct, and at most one observable order — which of the
+effect and its event append is durable first, fixed by the site's adjacency.
+
+**The fault-injection registry is a document of entries keyed (site, phase, order)**, where a
+phase is the before hook, the after hook, one sub-effect point in one injection mode, one residue
+class, or the no-execution record below. An entry's expected residue and resume action are the
+site's own semantics, not the entry's opinion of them; the format refuses an entry that disagrees,
+that carries executed-hook evidence for a residue class (no parent hook can observe a
+command-internal prefix), or that carries recovery-proven evidence for a hook.
+
+**The bijection check** (`check_bijection`) takes an inventory, a hook harness, the entries as a
+bare slice, and a host, and returns every way the following fails; an empty answer is the claim
+holding **over that inventory and that host** and nothing wider. For every claimed site in the
+inventory: the harness observed both hook phases and, in every injection mode it supports, every
+sub-effect point the host requires; an entry exists at every observable order for each of those
+phases and carries passing evidence; and each residue class has a recovery-proven entry whose
+synthetic records construct, recover and classify every element the class lists, and whose
+sampling record is non-zero, classifies every sample, and accounts for exactly `n` samples. An
+entry for a site outside the inventory, a duplicate key, and an entry the format would refuse
+are each reported. Legacy-scoped sites carry no site-coverage requirement. The entry audit and
+the empty-fast-sequence check below apply independently of the inventory. With an empty inventory,
+every supplied entry is reported as outside it; even with no entries, a begun fast sequence with
+no hook observation is reported.
+
+**The fast-path no-execution record.** Item 4 above fixes that an integration whose base is still
+the head publishes the exact candidate: no staging worktree is added, nothing is cherry-picked, and
+no prepared pin is taken. The three sites those effects belong to therefore carry a fifth kind of
+entry, the no-execution record, naming every fast sequence the suite exercised. A sequence is
+exercised only by what the harness observed inside it: the harness records a hook of some site
+while recording that sequence. This observation is the marker. The check includes a sequence
+that is still open and does not establish that the sequence ended or an integration completed.
+The check holds the record to the harness: it fails when the suite began no fast sequence at
+all (an empty harness is not evidence), when a begun sequence had no hook observed inside it (a
+trace the harness saw nothing in is not an exercised fast integration, whatever the records say of
+it), when the record names a sequence the harness never began, when the record says nothing about
+a begun sequence (reporting beside the gap whether the harness observed a hook of the site in it),
+and when the record names a sequence in which the harness did observe a hook of the site — a
+contradiction between record and observation. The record is
+additional to, never instead of, the site's ordinary coverage: the same three sites execute on
+the stale path and are held to every requirement above.
+
+**What the harness can witness, and what the check therefore cannot say.** The harness records
+an execution only when a funnel calls its hook, and a sub-effect point only when its armed
+injection fired. So an absence of observation is not evidence of non-execution: a path that
+performs an effect without its hook is invisible to the harness, and the check's report of "no
+hook observed" inside a sequence is exactly that and no more. That is why the record's own names
+are the claim and the observations are what the claim is held to, and why a registry's sampling
+count `n` is checked for self-consistency and not against any authority: the number is the
+registry's, and whether it held across runs is a property no single document can show.
+
+**Diagnostics are typed.** A failure names its site as `EffectSiteId` and its phase as the hook
+phase or entry phase it is about. The free text a failure carries in its own fields is a document's
+own words: a resume action in the fault matrix's wording, and the name a suite gave a fast
+sequence. An entry the format refuses is reported with the format's own error value embedded, and
+that value carries what the entry wrote in the field the format refused — a residue detail, a
+resume action, a site or phase name as text — so a hand-edited document's own text can reach a
+reader through that one variant, quoted, never interpreted.

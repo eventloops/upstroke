@@ -1,3 +1,5 @@
+//! Extended notes: `docs/internals/agent/proc/input.md`
+
 //! Bounded stdin delivery with a joined nonblocking pipe worker.
 //!
 //! The worker owns its endpoint and input bytes. Supervisor and worker share
@@ -29,10 +31,8 @@ use super::pipe_io::PollWrite;
 use super::worker::{FailureReport, POLL_INTERVAL, Worker};
 use thiserror::Error;
 
-/// Consecutive interruptions retried before a signal storm is a failure.
 const INTERRUPTED_RETRIES: usize = 64;
 
-/// Why stdin supervision failed, with the operation retained in the error.
 #[derive(Debug, Error)]
 pub(super) enum FeedError {
     #[error("starting the stdin feeder thread: {0}")]
@@ -49,18 +49,13 @@ pub(super) enum FeedError {
 
 type Verdict = Mutex<Option<Result<(), FeedError>>>;
 
-/// Proof that the loop already published its failure before pipe teardown.
 struct Published;
 
 fn publish_failure(verdict: &Verdict, error: FeedError) -> Published {
-    // The worker is the only publisher. Poison means it panicked while
-    // publishing, and collection still needs to observe its defined failure.
     *verdict.lock().unwrap_or_else(PoisonError::into_inner) = Some(Err(error));
     Published
 }
 
-/// One stdin writer whose post-exit wait is bounded even if a descendant kept
-/// the read end open. Dropping this value releases the worker too.
 pub(super) struct Feeder {
     verdict: Arc<Verdict>,
     worker: Worker,
@@ -139,20 +134,10 @@ fn write_input<W: PollWrite>(
 }
 
 impl Feeder {
-    /// Move the input and pipe to a writer thread. A broken pipe accepts the
-    /// child's refusal of unread input; other published failures are returned
-    /// by [`Self::collect`].
-    ///
-    /// # Errors
-    ///
-    /// [`FeedError::Start`] when the OS refuses the thread. The closure and
-    /// pipe are dropped on that path, so the caller can settle the child tree.
     pub(super) fn start<W: PollWrite>(pipe: W, bytes: Vec<u8>) -> Result<Self, FeedError> {
         let verdict = Arc::new(Mutex::new(None));
         let worker_verdict = Arc::clone(&verdict);
         let worker = Worker::spawn("stdin-feeder", move |released| {
-            // Keep the shared verdict outside the caught region so it
-            // survives both a write panic and a panic closing the pipe.
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut pipe = pipe;
                 let result = write_input(&mut pipe, &bytes, &worker_verdict, released);
@@ -183,21 +168,10 @@ impl Feeder {
         })
     }
 
-    /// Retain the invocation's observer before another pipe setup can fail.
     pub(super) fn failure_report(&self) -> FailureReport {
         self.report.clone()
     }
 
-    /// Wait for a verdict up to the post-exit grace, then release the writer.
-    /// A still-pending write belongs to an escaped reader after the child has
-    /// exited; delivery of that remaining input is best-effort. Any verdict
-    /// published before collection is inspected even during pipe teardown.
-    ///
-    /// # Errors
-    ///
-    /// A published write failure other than `BrokenPipe`, excessive consecutive
-    /// interruptions, an invalid write count, or a worker panic. A known
-    /// failure is never discarded merely because the thread is not finished.
     pub(super) fn collect(mut self, grace: Duration) -> Result<(), FeedError> {
         let started = Instant::now();
         loop {

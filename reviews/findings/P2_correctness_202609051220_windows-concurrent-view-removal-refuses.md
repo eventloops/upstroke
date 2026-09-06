@@ -85,3 +85,16 @@ winner's live deletion state exceeds the loser's retry budget. Add a regression 
 view/census boundary that preserves permanent-denial refusal and intent retention. Use that
 evidence to choose the repair. A broad retry increase or weakened convergence assertion is not
 supported by the current evidence.
+
+## Owner disposition and carry-forward on 2026-09-05
+
+After the integrated PR #164 passed CI, the owner explicitly cleared its merge hold and
+merged it as 37d74db0d0c58453b4919254986ff5b13303e3f0. The owner directed that this finding
+remain open and be committed to the next PR after that branch integrates master. PR #169
+carries this existing record under its original identifier; it does not repair the Windows
+census behavior or establish that AccessDenied is harmless.
+
+The earlier merge-hold descriptions above record the disposition at those observations.
+The owner's later decision supersedes the PR #164 hold. The observed failures, passing
+observations, log hashes and unresolved native cause remain evidence for a separate
+investigation. This record is separate from the macOS reaper READY failure.

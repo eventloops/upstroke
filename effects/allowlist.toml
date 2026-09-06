@@ -600,6 +600,17 @@ path = "src/rundir/scratch_tree.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
 packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] pub(crate) mod scratch_tree;` of src/rundir.rs"
 review = """
+PR #149 additionally retains an acquired directory handle and compares it with \
+the current root at checked use and reclaim. Unix uses device/inode identity; \
+Windows uses volume serial and the full FileIdInfo identifier through a safe \
+wrapper over GetFileInformationByHandleEx. The token's File remains private, \
+survives ordinary refusal/disarm/rearm, and is consumed after successful \
+removal before the root-absence check. A consumed claim never reopens a \
+replacement. The additional filesystem/identity observations and replacement \
+witnesses use this module's existing two governed-lint allowances; no raw \
+handle, arbitrary-path acquisition, remover or reporter is exported. Native \
+Linux/macOS/Windows tests and Clippy cover their respective branches. The \
+following counts describe the original extraction, not the current file. \
 The second deletion-authority token and its witnesses, extracted from \
 `src/rundir.rs` into a sibling file and given attributes of its own IN THE SAME \
 COMMIT -- never inheriting one. The row above reviewed this module's recursive \
@@ -932,8 +943,9 @@ lib.rs/main.rs". `src/lib.rs` is deliberately NOT in this file, so a crate-level
 allow there fails the scan."""
 shrinks_when = "the CLI reports through a sink the engine owns rather than through the print macros."
 # `disallowed_types` is the union-over-platforms case this file's header
-# predicts: `src/main.rs:1085` is a `#[cfg(windows)]` test that builds a
-# `std::process::Command`, invisible to a Unix clippy run and caught by
+# predicts: `src/main.rs`'s Windows-only test
+# `a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not`
+# builds a `std::process::Command`, invisible to a Unix clippy run and caught by
 # `cargo clippy --target x86_64-pc-windows-msvc`.
 
 [[legacy]]

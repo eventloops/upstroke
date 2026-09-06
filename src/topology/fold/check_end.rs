@@ -1,15 +1,68 @@
-//! The question checks, the budget stop, and the end of a run.
+//! Extended notes: `docs/internals/topology/fold/check_end.md`
 
 use super::start::outcome_name;
 use super::*;
 
 impl RunState {
-    // --- questions ---------------------------------------------------------
-
     pub(super) fn check_question_raised(&self, question: &FrozenQuestion) -> Result<(), FoldError> {
         const KIND: &str = "question_raised";
         self.entry(KIND, question.key)?;
+        let task = self.task(KIND, question.key)?;
+        match task.state {
+            TaskState::Merged | TaskState::Failed => {
+                return Err(FoldError::WrongTaskState {
+                    kind: KIND,
+                    key: question.key.0,
+                    state: task.state.name(),
+                    expected: "nonterminal",
+                });
+            }
+            TaskState::Pending
+            | TaskState::Deferred
+            | TaskState::AwaitingInput
+            | TaskState::AwaitingMerge
+            | TaskState::AwaitingRepair => {}
+        }
+        self.check_question_can_park_lineage(KIND, question.key)?;
         self.check_new_question(KIND, question, question.key)
+    }
+
+    pub(super) fn check_question_can_park_lineage(
+        &self,
+        kind: &'static str,
+        key: TaskKey,
+    ) -> Result<(), FoldError> {
+        let root = self.lineage_root(key);
+        if let Some(transaction) = &self.transaction {
+            if self.lineage_root(transaction.candidate.key) == root {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: format!(
+                        "lineage {root} has unresolved integration sequence {}; settle it before \
+                         parking its tasks",
+                        transaction.sequence.0
+                    ),
+                });
+            }
+        }
+        for entry in self.registry.entries() {
+            if self.lineage_root(entry.key) != root {
+                continue;
+            }
+            if let Some(generation) = self.tasks.get(entry.key.index()).and_then(TaskFold::open) {
+                return Err(FoldError::InconsistentRecord {
+                    kind,
+                    detail: format!(
+                        "lineage {root} has task {} generation {} still {}; settle it before \
+                         parking its tasks",
+                        entry.key,
+                        generation.id.0,
+                        generation.class.name()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn check_question_answered(
@@ -17,8 +70,6 @@ impl RunState {
         answered: &QuestionAnswered4,
     ) -> Result<QuestionOrigin, FoldError> {
         const KIND: &str = "question_answered";
-        // refusals[20]: answers are not ingested in an epoch after a halting
-        // settlement or a budget stop.
         if self.halted_epoch == Some(self.epoch) {
             return Err(FoldError::RunEnding {
                 kind: KIND,
@@ -31,7 +82,6 @@ impl RunState {
                 what: "the budget stop",
             });
         }
-        // refusals[13], A1's half: the answer must agree with itself.
         answered
             .self_consistency()
             .map_err(|defect| FoldError::InconsistentRecord {
@@ -61,6 +111,30 @@ impl RunState {
                 ),
             });
         }
+        match &answered.answer {
+            Answer4::Answered { .. } => {}
+            Answer4::Declined { .. } => {
+                if let Some(transaction) = &self.transaction {
+                    if self.lineage_root(transaction.candidate.key)
+                        == self.lineage_root(answered.key)
+                    {
+                        match &transaction.class {
+                            TransactionClass::VerificationStarted { .. } => {}
+                            TransactionClass::Prepared { .. } => {
+                                return Err(FoldError::InconsistentRecord {
+                                    kind: KIND,
+                                    detail: format!(
+                                        "integration sequence {} already authorizes publication; \
+                                         complete it before declining its lineage",
+                                        transaction.sequence.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Answer4::Answered {
             option_index,
             binding_override,
@@ -75,13 +149,6 @@ impl RunState {
                     detail: format!("offered {options} option(s) and this chose {option_index}"),
                 });
             }
-            // refusals[12] / `task_registry.binding_override`: an override is
-            // validated "against the frozen options of that task's open
-            // HumanBinding question". A1's `self_consistency` has already
-            // proved the override names this answer's task, question and
-            // option; what is left — and what no other check makes — is that
-            // there *is* such an authority and that the agent it names is the
-            // one that authority froze at that index.
             match (binding_override, &open.binding) {
                 (Some(_), None) => {
                     return Err(FoldError::WrongQuestion {
@@ -130,8 +197,6 @@ impl RunState {
         Ok(open.origin)
     }
 
-    // --- budget_exceeded ---------------------------------------------------
-
     pub(super) fn check_budget_exceeded(
         &self,
         exceeded: &BudgetExceeded4,
@@ -152,11 +217,7 @@ impl RunState {
         Ok(())
     }
 
-    // --- run_finished ------------------------------------------------------
-
     pub(super) fn check_run_finished(&self, finished: &RunFinished4) -> Result<(), FoldError> {
-        // refusals[19] / INV-15: the recorded outcome is the derived one, and
-        // the derived one is not NotEnding.
         let derived = self.derived_outcome();
         let matches = match &derived {
             DerivedOutcome::Ending(outcome) => *outcome == finished.outcome,

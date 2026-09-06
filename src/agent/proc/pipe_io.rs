@@ -1,32 +1,19 @@
-//! Owned, nonblocking parent endpoints inside the Process funnel.
-//!
-//! Each endpoint has exactly one worker owner. Polling never waits for the
-//! peer to produce bytes, free pipe capacity or close a handle. WouldBlock
-//! returns control to the worker's cancellation protocol. These traits are
-//! private to proc; an arbitrary blocking Read/Write does not implement them.
-//! Test adapters must obey the same nonblocking operation and teardown rules.
-//!
-//! Prepared owns parent endpoints on Windows, while Command owns the opposite
-//! ends. The caller drops Command immediately after successful spawn, before
-//! taking endpoints. Otherwise those parent copies suppress EOF and refusal.
-//! The governed lint allowance is in the funnel section of effects/allowlist.toml.
+//! Extended notes: `docs/internals/agent/proc/pipe_io.md`
+
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![deny(clippy::disallowed_macros)]
 
 use std::io;
 use std::process::{Child, Command, Stdio};
 
-/// One nonblocking read. A live empty pipe returns WouldBlock; only EOF is zero.
 pub(super) trait PollRead: Send + 'static {
     fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize>;
 }
 
-/// One nonblocking write. A full live pipe returns WouldBlock, never WriteZero.
 pub(super) trait PollWrite: Send + 'static {
     fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize>;
 }
 
-/// The parent's three endpoints, transferred directly to their workers.
 pub(super) struct Endpoints {
     pub(super) stdin: Writer,
     pub(super) stdout: Reader,
@@ -42,17 +29,12 @@ pub(super) struct Reader(std::os::windows::io::OwnedHandle);
 #[cfg(windows)]
 pub(super) struct Writer(std::os::windows::io::OwnedHandle);
 
-/// Configuration retained until a successfully spawned child is registered.
 pub(super) struct Prepared {
     #[cfg(windows)]
     endpoints: Endpoints,
 }
 
 impl Prepared {
-    /// Configure all three streams. Drop Command after spawn, then call take.
-    ///
-    /// # Errors
-    /// Native pipe creation or mode-setting failed. Partial pairs close here.
     pub(super) fn configure(command: &mut Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -67,8 +49,6 @@ impl Prepared {
             let (stdin, child_stdin) = windows::pair(false)?;
             let (stdout, child_stdout) = windows::pair(true)?;
             let (stderr, child_stderr) = windows::pair(true)?;
-            // All pairs exist before Command changes. Each opposite endpoint
-            // moves into Stdio; no extra writer/reader copy is retained here.
             command
                 .stdin(Stdio::from(child_stdin))
                 .stdout(Stdio::from(child_stdout))
@@ -83,11 +63,6 @@ impl Prepared {
         }
     }
 
-    /// Transfer parent endpoints after successful spawn and Command drop.
-    ///
-    /// # Errors
-    /// A configured Unix child pipe is absent or cannot become nonblocking.
-    /// The caller settles the registered child on this supervision failure.
     pub(super) fn take(self, child: &mut Child) -> io::Result<Endpoints> {
         #[cfg(unix)]
         {
@@ -162,7 +137,6 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{CreatePipe, PIPE_NOWAIT, SetNamedPipeHandleState};
 
-    /// Create synchronous endpoints and change only the parent's wait mode.
     pub(super) fn pair(parent_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
         let mut reader = ptr::null_mut();
         let mut writer = ptr::null_mut();
@@ -282,10 +256,6 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    // The peer endpoint stays in this isolated helper process. Killing that
-    // process closes every fixture handle, even if a mode-setting mutation
-    // leaves a worker blocked inside native I/O. There is no child peer or
-    // detached timeout thread to clean up.
     #[cfg(unix)]
     fn pair(parent_reads: bool) -> (ReaderOrWriter, std::os::fd::OwnedFd) {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -375,7 +345,6 @@ mod tests {
             for parent_reads in [true, false] {
                 let (endpoint, peer) = pair(parent_reads);
                 let (pending, observed) = mpsc::sync_channel(1);
-                // The fixture retains the close observer across worker ownership.
                 let closed = Arc::new(AtomicBool::new(false));
                 match endpoint {
                     ReaderOrWriter::Read(reader) => {
@@ -408,8 +377,6 @@ mod tests {
                         );
                     }
                     ReaderOrWriter::Write(mut writer) => {
-                        // Fill the actual native pipe before starting the
-                        // feeder. The live peer never consumes these bytes.
                         let mut full = false;
                         for _ in 0..2048 {
                             match writer.try_write(&[b'x'; 4096]) {
@@ -476,8 +443,6 @@ mod tests {
                 Err(error) => break Err(error),
             }
         };
-        // Only this test owns and waits for this child. A refused poll or
-        // deadline always reaches kill plus wait before any assertion fails.
         if !matches!(&result, Ok(Some(_))) {
             let _already_exited = child.kill();
             child.wait().expect("reap isolated native pipe witness");
