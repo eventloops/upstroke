@@ -226,6 +226,11 @@ note 'The documented example `[Source](relative/path.rs)` is a code span.'
 check 0 destination_inside_a_code_span_is_ignored
 
 fixture capacity
+note 'Prose with `a code span that opens here
+#[cfg(test)] and holds [x](../missing/other.md) and closes here`.'
+check 0 an_attribute_opening_a_wrapped_line_is_not_a_heading
+
+fixture capacity
 printf 'pub struct Effects;\n' > "$tree/src/effects.rs"
 check 1 effects_module_without_notes_leaves_the_converted_domain_empty
 

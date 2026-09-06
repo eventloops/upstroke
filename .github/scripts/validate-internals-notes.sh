@@ -306,7 +306,15 @@ while IFS= read -r notes; do
       }
       if (run >= 3) { flush(); infence = 1; fchar = ch; flen = run; next }
       if (line ~ /^[ \t]*$/) { flush(); next }
-      if (substr(body, 1, 1) == "#") { flush(); scan(line, NR); next }
+      # An ATX heading, as CommonMark spells one: one to six `#` and then a
+      # space, a tab, or the end of the line. A wrapped prose line opening on
+      # `#[cfg(test)]` is not a heading and must not split its own paragraph.
+      hashes = 0
+      while (substr(body, hashes + 1, 1) == "#") hashes++
+      after = substr(body, hashes + 1, 1)
+      if (hashes >= 1 && hashes <= 6 && (after == "" || after == " " || after == "\t")) {
+        flush(); scan(line, NR); next
+      }
       if (buf == "") { bufline = NR; buf = line } else buf = buf "\n" line
     }
     END { flush() }
