@@ -57,6 +57,45 @@ mod tests {
     }
 
     #[test]
+    fn a_write_interrupted_inside_a_character_is_a_torn_tail_and_not_a_rewritten_log() {
+        let (lead, rest) = "é"
+            .as_bytes()
+            .split_first()
+            .expect("a two-byte character has a lead byte");
+        assert_eq!(rest.len(), 1, "the tail is half of one character");
+
+        let mut log = committed(1);
+        log.push(*lead);
+
+        assert_eq!(
+            TopologyFold::parse_log(&log),
+            Ok(vec![event(1)]),
+            "the committed line is the whole of the log, and the half character is dropped"
+        );
+    }
+
+    #[test]
+    fn a_log_that_has_not_reached_a_commit_marker_holds_no_committed_line() {
+        assert_eq!(
+            TopologyFold::parse_log(b""),
+            Ok(Vec::new()),
+            "an empty log holds no event"
+        );
+
+        let mut unterminated = committed(1);
+        assert_eq!(
+            unterminated.pop(),
+            Some(b'\n'),
+            "the fixture ends at a commit marker before the marker is removed"
+        );
+        assert_eq!(
+            TopologyFold::parse_log(&unterminated),
+            Ok(Vec::new()),
+            "an interrupted first line is a torn tail, not an event"
+        );
+    }
+
+    #[test]
     fn the_refusal_names_the_first_committed_line_that_is_not_an_event() {
         let not_an_event = b"{\"event\":\"not_a_kind\"}\n";
         let not_utf8 = [0xff, b'\n'];

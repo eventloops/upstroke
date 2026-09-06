@@ -70,13 +70,30 @@ whose physical shape nobody can account for.
 
 ## `#[cfg(test)] mod tests`
 
-The regression test for the ordering above, in this file rather than in
+Three tests of `parse_log`'s own contract, in this file rather than in
 `src/topology/fold/tests.rs` where the rest of the fold's tests live —
-that file is queue row 39 and the sweep that added this one could not
-edit it. It is the second such block in the `fold` family, after
+that file is queue row 39 and the sweep that added these could not edit
+it. They are the second such block in the `fold` family, after
 `src/topology/fold/check_candidate.rs`, and for the same reason.
 
-The refusal names the **first** committed line that is not an event, in
-both orders and at a line that is neither the first nor the last:
-master's body under this test answers line 3 where the first committed
-non-event is line 1.
+`a_committed_line_that_is_not_an_event_is_a_rewritten_log`, in the
+sibling suite, already pins the whole-log, torn-tail, blank-line and
+per-line-number claims. These pin what it does not, each measured
+against the whole `topology::fold` suite at the mutation named:
+
+- the **torn tail's bytes are never read**, witnessed by a tail that is
+  half of a character — the shape an interrupted write actually leaves
+  behind. Validating UTF-8 over the whole input instead of over each
+  committed line, with the line number master computed, leaves the
+  sibling suite green (132 passed) and is caught only here and by the
+  first-line test;
+- a log that has **not reached a commit marker at all** — empty, or one
+  interrupted first line — holds no committed line. Master's
+  `map_or(0, …)` default answering `map_or(bytes.len(), …)`, so an
+  unterminated log is read as committed, is caught by this test and by
+  nothing else in the fold suite;
+- the refusal names the **first** committed line that is not an event,
+  in both orders and at a line that is neither the first nor the last.
+  This is the regression test for the two-pass ordering above: master's
+  body under these tests answers line 3 where the first committed
+  non-event is line 1.
