@@ -64,13 +64,15 @@ source, documentation, workflows, release machinery and this file.
    ledger rows is recorded as that verdict with each disposition, never as a pass. When the merged
    head differs from the reviewed head, list the delta commits and what verified each. Re-run
    `validate-pr-body.sh` from the default branch against the live title and body.
-7. **Enqueue for merge** (`gh pr merge --merge --auto`, or the audit's `--enqueue`) once every
-   conversation is resolved and both contexts are green on the head being merged. With the
-   merge-queue rule in the ruleset (Repository rules), the queue builds a merge commit of that
-   head onto `master`'s head plus any entry ahead of it, requires both contexts on that commit,
-   and lands exactly the commit they passed on; an entry whose contexts fail leaves the queue and
-   the pull request says why. Enqueueing is the owner's attestation that the evidence is real and
-   the
+7. **Enqueue for merge** (`gh pr merge --merge --auto`, or the audit's `--enqueue`; both need
+   auto-merge enabled on the repository, which the owner turns on together with the queue rule)
+   once every conversation is resolved and both contexts are green on the head being merged.
+   With the merge-queue rule in the ruleset (Repository rules), the queue builds a merge commit
+   of that head onto `master`'s head plus any entry ahead of it, requires both contexts on that
+   commit, and lands exactly the commit they passed on; an entry whose contexts fail leaves the
+   queue and the pull request says why. Until the rule and the setting exist, the merge is the
+   owner's merge commit on a head whose own contexts are green, as before. Enqueueing, or that
+   merge, is the owner's attestation that the evidence is real and the
    merged head is accounted for: reviewed directly, or separated from the reviewed SHA only by the
    deltas step 5 allows. The owner may delegate the merge, in writing, to the agent doing the work
    on a pull request that has reached this state; the delegation is disclosed in the body. Never
@@ -190,7 +192,8 @@ than ride out under a later entry's green. The workflows and the audit below imp
 contract; the ruleset adopts it as the owner's act once the contract is on `master`, by adding
 the merge-queue rule with merge method merge and all-green grouping, and removing the up-to-date
 requirement the queue makes redundant. Until then `merge_group` never fires, the up-to-date
-requirement stands, and step 7's enqueue is an auto-merge that waits on the head's own contexts. A tag ruleset on `refs/tags/v*` blocks updates and deletions
+requirement stands, and step 7 is the owner's merge commit on a head whose own contexts are
+green; auto-merge is enabled on the repository in the same change as the queue rule. A tag ruleset on `refs/tags/v*` blocks updates and deletions
 with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
 pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
 is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on

@@ -8,8 +8,8 @@
 # the head it read READY. A GitHub label is not bound to a commit, so the head is read again
 # before the label is written and again after, and a label written across a push is removed
 # (HEAD-MOVED); that narrows the race, it cannot close it. The act bound to the audited head is
-# the enqueue, through `gh pr merge --match-head-commit`; nothing may treat the label alone as
-# permission to merge.
+# the enqueue, through `gh pr merge --match-head-commit`, and the base is read again just before
+# it (BASE-MOVED); nothing may treat the label alone as permission to merge.
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
@@ -37,10 +37,12 @@
 #     merge of the two parents, the branch diff byte-identical before and after, and no gate
 #     edited by the pull request) and pushes confined to reviews/findings/ or reviews/FINDINGS.md
 #     (MAINTAINING step 5 keeps the review across both)
-#   - the review is against the pull request's own base: the workflow form's base commit must
-#     lie on the current base branch (and, for a base other than master, not on master), and no
-#     base change is recorded on the pull request after the review was posted; the prose form
-#     records no base, so it counts only on a master-based pull request
+#   - the review is against the pull request's own base: the workflow form must record its base
+#     commit, which must lie on the current base branch (and, for a base other than master, not
+#     on master); no base change may be recorded on the pull request after the review was
+#     posted, which is checked again just before an enqueue; the prose form records no base, so
+#     it is bound to the base only by that timeline check and counts only on a master-based
+#     pull request
 #   - no finding in that review has a severity the lane must fix
 #   - every allowed finding has a ledger row in the body whose disposition is deferred, with
 #     exactly one file under reviews/findings/ on the branch whose YAML frontmatter (the block
@@ -378,7 +380,9 @@ audit_one() {
     # refs/pull/N/head is the head whatever repository it lives in; a fork's branch is not on
     # origin, so fetching by branch name would leave the head and the reviewed commit unknown.
     git fetch -q origin "refs/pull/$pr/head" "$base" master 2>/dev/null || true
-    if [[ "$review_base" != "-" ]]; then
+    if [[ "$kind" == json && "$review_base" == "-" ]]; then
+      blockers+=("review-records-no-base")          # the workflow form always records base_sha; one without it is not judged
+    elif [[ "$review_base" != "-" ]]; then
       if ! git cat-file -e "$review_base^{commit}" 2>/dev/null \
         || ! git merge-base --is-ancestor "$review_base" "origin/$base"; then
         blockers+=("review-base-not-on-$base:${review_base:0:7}")
@@ -386,7 +390,7 @@ audit_one() {
         blockers+=("review-base-on-master-not-$base:${review_base:0:7}")
       fi
     elif [[ "$base" != master ]]; then
-      blockers+=("manual:review-records-no-base-and-base-is-$base")
+      blockers+=("manual:prose-review-records-no-base-and-base-is-$base")
     fi
     if ! git cat-file -e "$reviewed^{commit}" 2>/dev/null; then
       blockers+=("reviewed-sha-unknown:${reviewed:0:7}")
@@ -460,9 +464,11 @@ audit_one() {
     case "$disposition" in
       deferred)   # the lane rule: an allowed finding is filed and deferred, one file per finding
         nfiles=0
-        for cand in $(git grep -l -F -e "id: $id" "$head" -- 'reviews/findings/*.md' 2>/dev/null | sed 's/^[^:]*://' || true); do
+        # NUL-separated names, so a path with whitespace stays one candidate.
+        while IFS= read -r -d '' cand; do
+          cand="${cand#*:}"   # git grep prefixes each name with "<sha>:"
           if git show "$head:$cand" 2>/dev/null | frontmatter_has_id "$id"; then nfiles=$((nfiles + 1)); fi
-        done
+        done < <(git grep -l -z -F -e "id: $id" "$head" -- 'reviews/findings/*.md' 2>/dev/null || true)
         case "$nfiles" in
           1) ;;
           0) blockers+=("no-file:$id") ;;
@@ -525,6 +531,22 @@ audit_one() {
         gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
         echo "      head moved to ${after_write:0:7} while labelling ${head:0:7}: label removed, not enqueued"
         state=HEAD-MOVED
+      fi
+    fi
+    if [[ "$state" == READY ]]; then
+      if ((enqueue)); then
+        # The base is read again and the timeline re-checked just before the call: a base changed
+        # since the audit is a different diff, and --match-head-commit binds only the head. That
+        # narrows the base window to the call itself; a retarget after the enqueue lands in the
+        # queue on the new base with both contexts re-run there but without a review of that
+        # diff, and it is visible on the pull request's timeline as a base change after the
+        # review, which the next audit reports.
+        local base_now
+        base_now="$(gh pr view "$pr" --repo "$repo" --json baseRefName --jq .baseRefName)"
+        if [[ "$base_now" != "$base" ]] || retargeted_after "$pr" "$review_at"; then
+          echo "      base changed since the audit read $base: not enqueued"
+          state=BASE-MOVED
+        fi
       fi
     fi
     if [[ "$state" == READY ]]; then
