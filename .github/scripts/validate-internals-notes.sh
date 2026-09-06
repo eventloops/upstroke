@@ -155,9 +155,11 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 #
 #   (a) EVERY notes file. An inline link destination is an http/https/mailto
 #       URL, a same-file `#anchor`, or a relative path that exists in this
-#       repository and stays inside it. A Rustdoc item path is none of those:
-#       `[`census_domain`](crate::effects::census_domain)` renders as
-#       `<a href="crate::effects::census_domain">` and goes nowhere. Eleven
+#       repository and stays inside it. A Rustdoc item path is none of those,
+#       and no renderer keeps it: GitHub's GFM drops the link and emits the
+#       label alone, and the plain CommonMark renderer the audit used emits
+#       `<a href="crate::effects::census_domain">`, which resolves nowhere.
+#       Both were measured through `POST /markdown`. Eleven
 #       destinations of that shape were in the tree when this was written --
 #       eight spelled `crate::`, and `Self::close_and_wait`,
 #       `RunState::apply` and `std::time::Duration`, which a `crate::` search

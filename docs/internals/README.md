@@ -59,14 +59,16 @@ backticked fragment separately; the enclosing item distinguishes repeated lines.
 These notes were rustdoc before they were Markdown, and rustdoc's two link
 forms do not survive the move. A shortcut reference resolves against the item
 tree in rustdoc; CommonMark looks for a link reference definition, finds none,
-and renders brackets around a code span with nothing behind them. An
-intra-doc destination becomes an `href` spelled `crate::effects::census_domain`,
-which resolves nowhere. `docs/` is the GitHub Pages source for upstroke.rs, so
-both are published exactly as written.
+and renders brackets around a code span with nothing behind them. An intra-doc
+destination is neither a path nor a URL, and no renderer keeps it: GitHub's GFM
+drops the link and emits the label alone, and a plain CommonMark renderer emits
+an `href` spelled `crate::effects::census_domain`, which resolves nowhere.
+`docs/` is the GitHub Pages source for upstroke.rs, so both are published
+exactly as written.
 
 ```markdown
-[`normalize_lint`]                                   <- renders as bracketed code
-[`census_domain`](crate::effects::census_domain)     <- href resolves nowhere
+[`normalize_lint`]                                   <- brackets around a code span
+[`census_domain`](crate::effects::census_domain)     <- the destination is lost
 ```
 
 A reference here is therefore one of two things.
