@@ -8,7 +8,7 @@ reviewed_sha: 425ad55b9703ed58542ee322e6a266d7501bdd93
 location: src/config.rs:157
 provenance: pre_existing
 first_bad:
-guard: queue row 54 (`src/config.rs`), together with `SWEEP-CONFIG-PARSE-007`
+guard: queue row 54 (`src/config.rs`); `SWEEP-CONFIG-PARSE-007`, once paired with this, was resolved by PR #178 (the sweep of `src/config/read.rs`), and this finding remains open on its own
 ---
 
 ## Failure sequence
@@ -26,5 +26,5 @@ silently deleted control of the same class as `SWEEP-CONFIG-PARSE-007`.
 
 `#[serde(deny_unknown_fields)]` on `RawStrategy`, refusing by name, on the same rule the
 other sections follow; a test in the parent's suite for the misspelled key, witnessed against
-removing the attribute. Close it with `SWEEP-CONFIG-PARSE-007`: one attribute each, one test
-each.
+removing the attribute — the shape PR #178 used for `RawRepoConfig` when it resolved
+`SWEEP-CONFIG-PARSE-007`, which this finding was once paired with: one attribute, one test.
