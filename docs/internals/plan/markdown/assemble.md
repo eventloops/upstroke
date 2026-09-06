@@ -20,10 +20,23 @@ deliberately. Kinds fall back to a keyword heuristic over the title.
 The sink of the DAG: fed by [`super::drafts`] and [`super::hints`], read by
 nothing but the adapter itself.
 
-## `pub(super) fn assemble(drafts: Vec<Draft>) -> Vec<Task>` › `let mut taken: Vec<String> = drafts`
+## `pub(super) fn assemble(drafts: Vec<Draft>) -> Vec<Task>` › `let annotated: Vec<_> = drafts`
+
+Pair each draft with its annotation once. `Draft::annotation` returns an
+owned copy, so reading it twice — once to reserve explicit ids, once to
+build the task — copied every annotation twice per draft.
+
+## `pub(super) fn assemble(drafts: Vec<Draft>) -> Vec<Task>` › `let mut taken: Vec<String> = annotated`
 
 Reserve explicit ids first so derived slugs never collide with them.
 Explicit duplicates are left intact for validation to report.
+
+The reservation keeps its own copy of each explicit id, and that copy is
+the point: `taken` has to stay valid after the loop below consumes the
+pairing by value, and each annotation's own id moves from there into the
+task it belongs to. The registry and the task are two owners of one
+string, which is what the copy says; nothing here is a borrow the checker
+refused.
 
 ## `pub(super) fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Artifact> {`
 

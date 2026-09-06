@@ -4,7 +4,7 @@ severity: P3
 disposition: deferred
 category: correctness
 pr: 196
-reviewed_sha: 2b511e0dccca33c08b6e0dd175a1a4ee7e0f0264
+reviewed_sha: 0f8acfdadf31b567fbd302b85d0d3cda3b4cda29
 location: src/plan/markdown/assemble.rs:15
 provenance: pre_existing
 first_bad:
@@ -32,8 +32,9 @@ Add a regression that builds a plan (through `MarkdownPlanAdapter::parse_with_wa
 `assemble.rs`) with an early untitled/heuristic draft whose title slugifies to some `X`, and a
 later draft carrying `<!-- upstroke: id=X -->`, and assert both tasks keep distinct ids
 (the later, explicit one keeps `X`; the earlier gets `X-2`). That fixture belongs in
-`src/plan/markdown.rs`'s existing black-box suite, a separate, currently unswept queue row (66's
-sibling family, not row 64) that this sweep's `require_scope` does not allow editing. The
+`src/plan/markdown.rs`'s existing black-box suite — queue row 68, the parent of this family and a
+separate, currently unswept row that this sweep's `require_scope` does not allow editing (row 66
+is `src/plan/markdown/hints.rs`, not the parent). The
 alternative — adding a private, plain-value seam inside `assemble.rs` itself so the reservation
 logic can be unit-tested without a full `Draft`/`Annotation` build — was considered and rejected for this pass: the seam's own input construction would need to clone
 every draft's title and explicit id an extra time in production to hand them across the seam,
