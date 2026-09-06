@@ -36,9 +36,9 @@
 #     across both)
 #   - no finding in that review has a severity the lane must fix
 #   - every allowed finding has a ledger row in the body whose disposition is deferred, with
-#     exactly one file under reviews/findings/ on the branch whose `id:` frontmatter is the
-#     finding id; a rejected or accepted-risk row is the owner's call and sends the pull request
-#     to MANUAL
+#     exactly one file under reviews/findings/ on the branch whose YAML frontmatter (the block
+#     between the opening --- and the next) carries `id: <the finding id>`; a rejected or
+#     accepted-risk row is the owner's call and sends the pull request to MANUAL
 #
 # Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than clean merges
 # and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
@@ -86,14 +86,14 @@ repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
 
 if ((${#prs[@]} == 0)); then
-  mapfile -t prs < <(gh pr list --repo "$repo" --state open --limit 100 --json number --jq '.[].number')
+  mapfile -t prs < <(gh api "repos/$repo/pulls?state=open&per_page=100" --paginate --jq '.[].number')
 fi
 
 # Creates a label only when the repository has none of that name: an existing label, including
 # one handed in as --ready-label, keeps its colour and description.
 ensure_labels() {
   local existing
-  existing="$(gh label list --repo "$repo" --limit 200 --json name --jq '.[].name')"
+  existing="$(gh api "repos/$repo/labels?per_page=100" --paginate --jq '.[].name')"
   create() {
     grep -qxF "$1" <<< "$existing" \
       || gh label create "$1" --repo "$repo" --color "$2" --description "$3" >/dev/null
@@ -173,14 +173,14 @@ for pr in "${prs[@]}"; do
   esac
 
   # The newest check run per required context on the head: a re-run creates a new run with the
-  # same name, so every matching run from every page is listed with its start time, sorted, and
-  # the last start per name is the one whose conclusion is read; a run not yet started (queued,
-  # no start time) sorts last, so its status is what blocks, never an older run's conclusion.
-  # `--paginate` runs the jq filter
-  # per page, so the selection happens here in the shell, over all pages, not in jq.
+  # same name, so every matching run from every page is listed with its id, which GitHub assigns
+  # in creation order, and the highest id per name is the one whose conclusion or status is
+  # read. A run that never started still has an id, so it is ordered by when it was created,
+  # not by a stand-in date. `--paginate` runs the jq filter per page, so the selection happens
+  # here in the shell, over all pages, not in jq.
   checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" --paginate \
-    --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.started_at // "9999-12-31T00:00:00Z")\t\(.conclusion // .status)"' \
-    | sort -t $'\t' -k1,1 -k2,2 | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }')"
+    --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.id)\t\(.conclusion // .status)"' \
+    | sort -t $'\t' -k1,1 -k2,2n | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }')"
   for ctx in upstroke-ci upstroke-pr-policy; do
     case " $checks " in
       *" $ctx=success "*) ;;
@@ -293,7 +293,9 @@ PY
   # Head movement since the reviewed commit.
   moved=""
   if [[ -n "$reviewed" ]]; then
-    git fetch -q origin "$branch" master 2>/dev/null || true
+    # refs/pull/N/head is the head whatever repository it lives in; a fork's branch is not on
+    # origin, so fetching by branch name would leave the head and the reviewed commit unknown.
+    git fetch -q origin "refs/pull/$pr/head" master 2>/dev/null || true
     if ! git cat-file -e "$reviewed^{commit}" 2>/dev/null; then
       blockers+=("reviewed-sha-unknown:${reviewed:0:7}")
     elif ! git merge-base --is-ancestor "$reviewed" "$head"; then
@@ -365,13 +367,16 @@ PY
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
       deferred)   # the lane rule: an allowed finding is filed and deferred, one file per finding
-        # The file is the one with a frontmatter line that is exactly `id: <this id>` (README:
-        # the id lives in the frontmatter, not the name); an id merely mentioned elsewhere is not
-        # a file. The id is matched as a fixed string and a whole line, never as a pattern, and a
-        # miss is a blocker, not an exit: every command here tolerates "no match".
+        # The file is the one whose YAML frontmatter, the block between the opening `---` on
+        # line 1 and the next `---`, carries the line `id: <this id>` (README: the id lives in
+        # the frontmatter, not the name). Only that block is read: the same line in prose or a
+        # code block further down is not a frontmatter id. The id is matched as a fixed string
+        # and a whole line, never as a pattern, and a miss is a blocker, not an exit.
         nfiles=0
         for cand in $(git grep -l -F -e "id: $id" "$head" -- 'reviews/findings/*.md' 2>/dev/null | sed 's/^[^:]*://' || true); do
-          if git show "$head:$cand" 2>/dev/null | grep -qxF "id: $id"; then nfiles=$((nfiles + 1)); fi
+          if git show "$head:$cand" 2>/dev/null \
+            | awk 'NR == 1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }' \
+            | grep -qxF "id: $id"; then nfiles=$((nfiles + 1)); fi
         done
         case "$nfiles" in
           1) ;;
