@@ -1,18 +1,21 @@
 # Contributing to upstroke
 
-Contributions are welcome. Please open an issue before starting anything substantial: the build
-order in `DESIGN.md` §21 is deliberate, and it is worth checking that a change fits where the
-project currently is.
+upstroke is not accepting outside contributions at present. The project is developed by its
+owner, and opening it to other contributors is a question for later, once the v0.2 build order in
+`DESIGN.md` §21 has settled; it is not on offer now. Bug reports and questions are welcome as
+issues. A pull request from outside the project will be closed without review.
+
+The rest of this file records how a change enters `master` today and the terms that would apply
+to contributions if they are accepted, so that nothing here needs deciding at that point.
 
 Every change enters `master` the same way: a draft pull request opened early, the deterministic CI
 and PR-policy gates green, one independent frontier-model review of the exact green head, findings
 triaged (serious P1s fixed and re-reviewed; `MUST` deviations in touched code and evidence-backed
 findings fixed whatever their label; the rest fixed or logged as tech debt), and the owner's merge
 as the attestation. [`MAINTAINING.md`](MAINTAINING.md) has the full lifecycle, trust boundary
-and release contract. Contributions from external forks are provisional: the required checks are
-candidate-controlled, so a fork's entire diff, workflow edits included, is reviewed before merge.
+and release contract.
 
-## Before you send a PR
+## Before a change is sent
 
 CI enforces all nine of these, verbatim, from the repository root:
 
@@ -44,7 +47,9 @@ commands above are the automated baseline, not the whole standard.
 
 ## Contributor Licence Agreement
 
-By submitting a contribution you agree to the terms below. There is nothing to sign: opening a
+These are the terms that would govern contributions if the project opens to them. They are recorded
+now so that the decision to accept contributions, when it comes, does not have to settle them. By
+submitting a contribution you would agree to the terms below. There is nothing to sign: opening a
 pull request is your acceptance, and it applies to every contribution you make to this project.
 
 1. **You keep your copyright.** You are not assigning ownership of anything.
