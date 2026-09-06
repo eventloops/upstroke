@@ -3989,6 +3989,11 @@ mod inherited_writer {
         }
     }
 
+    // This guard owns one forked child's lifetime. Its socket releases the
+    // child after observation; shutdown also releases it on failure. The
+    // child closes the parent's socket endpoint before announcing readiness
+    // and exits after release or its read timeout. Drop waits for that exact
+    // pid, never a group.
     struct HeldFork {
         pid: libc::pid_t,
         release: UnixStream,
@@ -3998,7 +4003,7 @@ mod inherited_writer {
         fn assert_alive(&self) {
             let mut status = 0;
             // SAFETY: pid is this guard's unreaped child and status is writable.
-
+            // WNOHANG observes whether it exited without waiting for release.
             let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             assert_eq!(
                 waited, 0,
@@ -4013,7 +4018,7 @@ mod inherited_writer {
             let mut status = 0;
             let waited = loop {
                 // SAFETY: pid is our unreaped direct child; status is a live,
-
+                // writable c_int. The socket's read timeout bounds the child.
                 let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
                 if result < 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
@@ -4042,7 +4047,12 @@ mod inherited_writer {
         let pid = std::thread::spawn(move || {
             let child_fd = child_socket.as_raw_fd();
             // SAFETY: only the parent returns into Rust after fork. The child
-
+            // uses only close/write/read/_exit, all async-signal-safe, with
+            // live inherited fds and one-byte stack buffers. It never
+            // allocates, unwinds, drops Rust owners, or touches inherited
+            // locks. Closing parent_fd removes its copy of the release
+            // endpoint. The separate child endpoint stays live until _exit
+            // closes all inherited fds.
             unsafe {
                 let pid = libc::fork();
                 if pid == 0 {
@@ -4083,8 +4093,9 @@ mod inherited_writer {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: ready is one initialized pollfd and remains live for this
-
+            // SAFETY: ready is one initialized pollfd and remains live for
+            // this call; its descriptor is borrowed from reader. The wait is
+            // bounded.
             let polled = unsafe { libc::poll(&mut ready, 1, 1000) };
             if polled < 0
                 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
@@ -4163,7 +4174,7 @@ mod inherited_writer {
         let name =
             std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("a NUL-free FIFO path");
         // SAFETY: name is a live NUL-terminated path in our private scratch
-
+        // directory, and 0600 grants access only to this test's user.
         assert_eq!(
             unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
             0,
@@ -4175,7 +4186,7 @@ mod inherited_writer {
             .open(&fifo)
             .expect("open the FIFO reader before the shim writer");
         // SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
-
+        // integer size, and shrinking an empty pipe needs no extra privilege.
         let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
         assert_eq!(capacity, 4096, "bound the pipe so the script cannot fit");
         let marker = format!("{} ' $name `printf literal`", "x".repeat(16 * 1024));
@@ -5740,4 +5751,159 @@ fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
     assert_eq!(reachable.stdout.trim(), "RELATIVE:arg");
     assert!(absolute.is_absolute());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+
+/// §11 places each `SAFETY:` obligation, and §10 each concurrency protocol,
+/// beside the code it governs; §13 keeps both at the site even where a module
+/// has a notes file. Moving this module's prose to
+/// `docs/internals/runner/host/tests.md` once left only each block's opening
+/// line behind, separated from its own operation by a blank line, so a reader
+/// at the site saw a sentence that stopped mid-clause. This holds every site
+/// obligation complete, adjacent, and equal to the notes copy, both ways.
+///
+/// `include_str!` embeds the checked-out bytes, so a Windows checkout under
+/// `core.autocrlf` supplies `\r\n`. Every comparison here is over
+/// whitespace-separated words, which absorbs that and a rewrap alike.
+#[test]
+fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
+    const SOURCE: &str = include_str!("tests.rs");
+    const NOTES: &str = include_str!("../../../docs/internals/runner/host/tests.md");
+    const PROTOCOL_ITEM: &str = "struct HeldFork {";
+    const PROTOCOL_HEADING: &str = "## `struct HeldFork {`";
+
+    /// The text of a `//` comment line, or `None` for code, a blank line or the
+    /// module header. `///` and `//!` are not site obligations either, but the
+    /// header is the only one this module carries above an item under census.
+    fn comment_body(line: &str) -> Option<&str> {
+        let rest = line.trim().strip_prefix("//")?;
+        if rest.starts_with('!') {
+            return None;
+        }
+        Some(rest.trim())
+    }
+
+    fn normalised(words: &str) -> String {
+        words.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    let source: Vec<&str> = SOURCE
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+
+    // The whole comment block whose last line is `above`, or `None` when that
+    // line is not a comment -- which is how a blank separator is caught.
+    let block_ending_at = |above: usize| -> Option<String> {
+        comment_body(source.get(above)?)?;
+        let mut first = above;
+        while first
+            .checked_sub(1)
+            .and_then(|previous| source.get(previous))
+            .and_then(|line| comment_body(line))
+            .is_some()
+        {
+            first = first.saturating_sub(1);
+        }
+        let block = source
+            .get(first..=above)?
+            .iter()
+            .filter_map(|line| comment_body(line))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(normalised(&block))
+    };
+
+    // This census reads the file it lives in, so its needle must not match its
+    // own source: spell the keyword in two pieces.
+    let keyword = concat!("un", "safe");
+    let mut site_obligations: Vec<String> = Vec::new();
+    for (index, line) in source.iter().enumerate() {
+        if comment_body(line).is_some()
+            || !line
+                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .any(|word| word == keyword)
+        {
+            continue;
+        }
+        // The obligation sits above the statement, which a macro or call may
+        // open on an earlier line -- `assert_eq!(`. Cross those openers and
+        // nothing else: never a blank line, never unrelated code.
+        let mut opens_at = index;
+        while opens_at
+            .checked_sub(1)
+            .and_then(|previous| source.get(previous))
+            .is_some_and(|line| comment_body(line).is_none() && line.trim_end().ends_with('('))
+        {
+            opens_at = opens_at.saturating_sub(1);
+        }
+        let Some(block) = opens_at.checked_sub(1).and_then(&block_ending_at) else {
+            panic!(
+                "src/runner/host/tests.rs:{}: the operation carries no adjacent obligation",
+                index + 1
+            );
+        };
+        assert!(
+            block.starts_with("SAFETY:"),
+            "src/runner/host/tests.rs:{}: the adjacent comment is not an obligation: {block}",
+            index + 1
+        );
+        site_obligations.push(block);
+    }
+    assert!(
+        !site_obligations.is_empty(),
+        "no operation was found to check; this census measures nothing"
+    );
+
+    // The notes file repeats each obligation as a paragraph under the heading
+    // naming the code it belongs to.
+    let mut notes: Vec<(&str, String)> = Vec::new();
+    let mut heading = "";
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in NOTES
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .chain(["#"])
+    {
+        if !line.starts_with('#') && !line.trim().is_empty() {
+            paragraph.push(line);
+            continue;
+        }
+        if !paragraph.is_empty() {
+            notes.push((heading, normalised(&paragraph.join(" "))));
+            paragraph.clear();
+        }
+        if line.starts_with('#') {
+            heading = line;
+        }
+    }
+
+    let mut notes_obligations: Vec<String> = notes
+        .iter()
+        .filter(|(_, text)| text.starts_with("SAFETY:"))
+        .map(|(_, text)| text.clone())
+        .collect();
+    site_obligations.sort();
+    notes_obligations.sort();
+    assert_eq!(
+        site_obligations, notes_obligations,
+        "the site obligations and their notes copies must agree exactly"
+    );
+
+    let protocol = notes
+        .iter()
+        .find(|(at, _)| *at == PROTOCOL_HEADING)
+        .map(|(_, text)| text)
+        .expect("the notes record the guard's protocol");
+    let at_item = source
+        .iter()
+        .position(|line| line.trim() == PROTOCOL_ITEM)
+        .expect("the guard the protocol governs");
+    let beside_item = at_item.checked_sub(1).and_then(block_ending_at);
+    assert_eq!(
+        beside_item.as_ref(),
+        Some(protocol),
+        "the guard's protocol must sit beside the type, complete"
+    );
 }
