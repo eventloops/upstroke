@@ -3,7 +3,6 @@
 use super::*;
 
 impl RunState {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
             TopologyEventBody::RunStarted { .. } => {}
@@ -67,7 +66,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_resumed(&mut self, resumed: &RunResumed4) {
+    fn apply_resumed(&mut self, resumed: &RunResumed4) {
         self.epoch = Epoch(self.epoch.0.saturating_add(1));
         self.incarnation = resumed.incarnation.clone();
         self.budget_stop = None;
@@ -75,14 +74,14 @@ impl RunState {
         self.wake_backoff();
     }
 
-    pub(super) fn wake_backoff(&mut self) {
+    fn wake_backoff(&mut self) {
         self.queue.wake_deferred();
         for key in std::mem::take(&mut self.deferred_tasks) {
             self.refresh_task_state(key);
         }
     }
 
-    pub(super) fn register(&mut self, spawn: &FrozenSpawn) {
+    fn register(&mut self, spawn: &FrozenSpawn) {
         self.registry.register(spawn.entry.clone());
         self.tasks.push(TaskFold::new());
         match &spawn.admission {
@@ -98,7 +97,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
+    fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
         let (lease, region) = match &dispatched.lease {
             LeaseGrant::Predicted { paths } => (GenerationLease::Own, Some(paths.clone())),
             LeaseGrant::InheritedLineage { root } => {
@@ -126,7 +125,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_settlement(&mut self, finished: &AttemptFinished4) {
+    fn apply_settlement(&mut self, finished: &AttemptFinished4) {
         self.charge_allowance(finished.key, &finished.record);
 
         match &finished.settlement {
@@ -174,7 +173,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn record_halt(&mut self, key: TaskKey) {
+    fn record_halt(&mut self, key: TaskKey) {
         if self.halted_at.is_none() {
             self.halted_at = Some(key);
             self.halted_epoch = Some(self.epoch);
@@ -194,7 +193,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
+    fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
         let record = PreparedCandidate {
             candidate: prepared.candidate(),
             base_sha: prepared.base_sha.clone(),
@@ -227,7 +226,7 @@ impl RunState {
         self.set_state(prepared.key, TaskState::AwaitingMerge);
     }
 
-    pub(super) fn apply_candidate_created(&mut self, candidate: &CandidateRef) {
+    fn apply_candidate_created(&mut self, candidate: &CandidateRef) {
         let paths = self
             .tasks
             .get(candidate.key.index())
@@ -250,7 +249,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_verification_started(&mut self, started: &MergeVerificationStarted) {
+    fn apply_verification_started(&mut self, started: &MergeVerificationStarted) {
         self.next_sequence = self.next_sequence.saturating_add(1);
         if let Some(entry) = self
             .queue
@@ -269,7 +268,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_verification_unavailable(
+    fn apply_verification_unavailable(
         &mut self,
         unavailable: &MergeVerificationUnavailable,
     ) {
@@ -295,7 +294,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn release_transaction(&mut self) {
+    fn release_transaction(&mut self) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
@@ -307,7 +306,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
+    fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
         match prepared.disposition {
             PreparedDisposition::Fast => {
                 self.next_sequence = self.next_sequence.saturating_add(1);
@@ -324,7 +323,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
+    fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
         match rejected.disposition {
             RejectionDisposition::Conflict { .. } => {
                 self.next_sequence = self.next_sequence.saturating_add(1);
@@ -363,7 +362,7 @@ impl RunState {
         self.register(&rejected.repair);
     }
 
-    pub(super) fn apply_task_merged(&mut self, merged: &TaskMerged) {
+    fn apply_task_merged(&mut self, merged: &TaskMerged) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
@@ -385,7 +384,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4) {
+    fn apply_answer(&mut self, answered: &QuestionAnswered4) {
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -477,7 +476,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn release_holdings_of(&mut self, key: TaskKey) {
+    fn release_holdings_of(&mut self, key: TaskKey) {
         if let Some(task) = self.tasks.get(key.index()) {
             for generation in &task.generations {
                 self.queue.remove(key, generation.id);
@@ -535,7 +534,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn set_defers(&mut self, key: TaskKey, defers: u32) {
+    fn set_defers(&mut self, key: TaskKey, defers: u32) {
         if let Some(task) = self.tasks.get_mut(key.index()) {
             task.defers = defers;
         }
@@ -545,7 +544,7 @@ impl RunState {
         self.tasks.get_mut(key.index())?.open_mut()
     }
 
-    pub(super) fn close_generation(&mut self, key: TaskKey) {
+    fn close_generation(&mut self, key: TaskKey) {
         let Some(generation) = self.open_generation_mut(key) else {
             return;
         };
