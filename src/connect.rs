@@ -315,10 +315,22 @@ mod tests {
             })
         }
 
+        #[expect(
+            clippy::unreachable,
+            reason = "run_with (this file's only caller of AdapterSource) invokes only probe \
+                      and discover on an adapter; build is dead code for this fake by that \
+                      local contract"
+        )]
         fn build(&self, _run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
             unreachable!("connect never spawns an attempt")
         }
 
+        #[expect(
+            clippy::unreachable,
+            reason = "run_with (this file's only caller of AdapterSource) invokes only probe \
+                      and discover on an adapter; parse is dead code for this fake by that \
+                      local contract"
+        )]
         fn parse(&self, _out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
             unreachable!("connect never parses an attempt")
         }
@@ -365,14 +377,6 @@ mod tests {
                 },
             ],
         }
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("upstroke-connect-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch dir");
-        dir.join("pools.toml")
     }
 
     fn connect(path: &Path, force: bool) -> ConnectReport {
@@ -777,7 +781,9 @@ mod tests {
 
     #[test]
     fn a_missing_agent_skips_its_pool_without_taking_the_others_with_it() {
-        let path = scratch("partial");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-partial")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let report = connect(&path, false);
         assert_eq!(report.outcome, Wrote::Written);
         let written = fs::read_to_string(&path).expect("file");
@@ -799,7 +805,9 @@ mod tests {
 
     #[test]
     fn what_connect_writes_parses_back_into_the_pools_it_describes() {
-        let path = scratch("roundtrip");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-roundtrip")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         connect(&path, false);
         let mut warnings = Vec::new();
         let hermetic = path.parent().expect("parent").to_path_buf();
@@ -819,7 +827,9 @@ mod tests {
 
     #[test]
     fn an_existing_file_that_differs_is_never_clobbered() {
-        let path = scratch("clobber");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-clobber")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
                     \"claude-code\"\nprofile = \"work\"\nmonthly_allowance = 300\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -856,7 +866,9 @@ mod tests {
 
     #[test]
     fn operator_keys_with_toml_escapes_survive_a_force_and_read_back_unchanged() {
-        let path = scratch("escapes");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-escapes")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
                     profile = 'C:\\Users\\me\\.claude-work'\nendpoint = \"http://host/#frag \\\"q\\\"\"\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -896,7 +908,10 @@ mod tests {
                 }),
             }],
         };
-        let path = scratch("escaped-key");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-escaped-key")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let opts = ConnectOptions {
             pools_path: Some(path.clone()),
             force: false,
@@ -927,7 +942,10 @@ mod tests {
 
     #[test]
     fn a_file_connect_cannot_parse_carries_nothing_and_the_refusal_does_not_claim_otherwise() {
-        let path = scratch("unparseable");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-unparseable")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
                     profile = \"work\"\nthis line is not toml\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -956,7 +974,10 @@ mod tests {
 
     #[test]
     fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {
-        let path = scratch("idempotent");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-idempotent")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         connect(&path, false);
         let first = fs::read_to_string(&path).expect("file");
 
@@ -974,7 +995,9 @@ mod tests {
 
     #[test]
     fn a_login_between_connects_updates_the_file() {
-        let path = scratch("relogin");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-relogin")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let with = |auth: AuthState| Machine {
             adapters: vec![FakeAdapter {
                 id: "claude-code",
@@ -1021,6 +1044,9 @@ mod tests {
 
     #[test]
     fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-crosscheck")
+                .expect("acquire an isolated pools directory");
         let machine = Machine {
             adapters: vec![FakeAdapter {
                 id: "copilot",
@@ -1042,7 +1068,7 @@ mod tests {
         };
         let report = run_with(
             &ConnectOptions {
-                pools_path: Some(scratch("crosscheck")),
+                pools_path: Some(tree.path().join("pools.toml")),
                 force: false,
             },
             &machine,
@@ -1068,7 +1094,9 @@ mod tests {
                 discovery: Some(Discovery::unknown().with_note("no auth query exists")),
             }],
         };
-        let path = scratch("shape");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-shape")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let report = run_with(
             &ConnectOptions {
                 pools_path: Some(path),

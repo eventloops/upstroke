@@ -277,13 +277,13 @@ valid i64. TOML integers and floats remain distinct in comparison.
 The first line is the only generated timestamp header. A later
 comment using the same words remains part of the content comparison.
 
-## `let path = scratch("roundtrip");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-roundtrip")`
 
 The round trip is the whole contract: a file this command writes must
 be one `config::load` accepts, or `upstroke capacity` reports on
 something `connect` cannot produce.
 
-## `let path = scratch("clobber");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-clobber")`
 
 §17 says the file is hand-editable, so silently overwriting a hand
 edit destroys the operator's own record of their subscriptions.
@@ -296,7 +296,7 @@ of §13's multi-account seam and discovery cannot supply it, so a
 replacement that dropped it would silently delete the one setting
 the refusal above existed to protect.
 
-## `let path = scratch("escapes");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-escapes")`
 
 §13 calls `profile` a config-directory path, and on Windows a path
 holds backslashes. The parent parses the operator's spelling and the
@@ -321,7 +321,7 @@ operator's renamed `[pools."x\"#B"]` down to `[pools."x\"`, called
 the settings equal, and — since the text differed — rewrote the file,
 undoing the rename without `--force`.
 
-## `let path = scratch("unparseable");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-unparseable")`
 
 `operator_keys` reads the existing file leniently: one it cannot
 parse carries no keys at all. The refusal must therefore not tell the
@@ -329,7 +329,7 @@ operator their keys "are carried" — pass 1 of PR #168 found that it
 did — but send them to the proposed text, which is what `--force`
 writes, and say when carrying happens.
 
-## `let path = scratch("idempotent");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-idempotent")`
 
 The header names the write date, so a byte comparison would call
 every second run a conflict — and the only way past a conflict is
@@ -347,7 +347,7 @@ two connects cannot leave the file insisting they are signed out.
 Their real edits (`profile`, `monthly_allowance`, `endpoint`) survive
 both paths — see `an_existing_file_that_differs_is_never_clobbered`.
 
-## `let path = scratch("relogin");`
+## `crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-relogin")`
 
 Auth state is rendered only as a comment, so a settings-only
 comparison reported `unchanged` and left the file telling an operator
