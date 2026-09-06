@@ -22,6 +22,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::error::UpstrokeError;
 use crate::topology::effects::{ContainerSite, EffectSiteId, HookHarness, HookPhase, Injection};
@@ -200,6 +201,18 @@ impl GitView for DisposableDirView {
 }
 
 pub const RACING_ACCESS_ATTEMPTS: usize = 64;
+
+pub const RACING_YIELD_ATTEMPTS: usize = 16;
+
+pub const RACING_SLEEP: Duration = Duration::from_millis(10);
+
+fn racing_pause(attempt: usize) {
+    if attempt < RACING_YIELD_ATTEMPTS {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(RACING_SLEEP);
+    }
+}
 
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -614,7 +627,7 @@ pub fn read_intent(path: &Path) -> Result<ContainerIntent, UpstrokeError> {
 
 fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
     let mut last = None;
-    for _ in 0..RACING_ACCESS_ATTEMPTS {
+    for attempt in 0..RACING_ACCESS_ATTEMPTS {
         match read_intent(path) {
             Ok(record) => return Ok(Some(record)),
             Err(UpstrokeError::Io { source, .. })
@@ -624,7 +637,7 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
             }
             Err(UpstrokeError::Io { source, .. }) => {
                 last = Some(source);
-                std::thread::yield_now();
+                racing_pause(attempt);
             }
             Err(other) => return Err(other),
         }
@@ -777,13 +790,13 @@ fn racing_removal(
     mut remove: impl FnMut() -> Result<(), std::io::Error>,
 ) -> Result<bool, UpstrokeError> {
     let mut last = None;
-    for _ in 0..RACING_ACCESS_ATTEMPTS {
+    for attempt in 0..RACING_ACCESS_ATTEMPTS {
         match remove() {
             Ok(()) => return Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
                 last = Some(error);
-                std::thread::yield_now();
+                racing_pause(attempt);
             }
         }
     }

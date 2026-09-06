@@ -3714,6 +3714,282 @@ fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(windows)]
+fn windows_posix_delete_pending(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let handle = fs::File::options()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .expect("open the view for deletion, as remove_dir_all's last step does");
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).expect("a small struct");
+    // SAFETY: `handle` is open for the duration of the call, `disposition` is a
+    // fully initialised `FILE_DISPOSITION_INFO_EX` and `size` is its size, which
+    // is the contract `FileDispositionInfoEx` documents.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const disposition).cast(),
+            size,
+        )
+    };
+    assert_ne!(
+        set,
+        0,
+        "mark the view delete-pending: {}",
+        std::io::Error::last_os_error()
+    );
+    let error = fs::File::options()
+        .access_mode(FILE_LIST_DIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .expect_err("premise: while the marking handle is open the name is still present");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(5),
+        "premise: remove_dir_all's own open of a delete-pending name answers          ERROR_ACCESS_DENIED, not {error}"
+    );
+    handle
+}
+
+#[cfg(windows)]
+fn windows_stalled_removal_budget() -> std::time::Duration {
+    use super::{RACING_ACCESS_ATTEMPTS, RACING_SLEEP, RACING_YIELD_ATTEMPTS};
+
+    let slept = u32::try_from(RACING_ACCESS_ATTEMPTS - RACING_YIELD_ATTEMPTS)
+        .expect("a small attempt count");
+    RACING_SLEEP * slept
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends() {
+    use std::time::{Duration, Instant};
+
+    const STALL: Duration = Duration::from_millis(100);
+    assert!(
+        STALL * 2 < windows_stalled_removal_budget(),
+        "the fixture's stall must sit well inside the sleep budget, or a pass says nothing"
+    );
+
+    let views: [(&str, Box<dyn GitView>); 2] = [
+        (
+            "disposable",
+            Box::new(DisposableDirView::new(ContainerTrace::recording())),
+        ),
+        (
+            "role",
+            Box::new(super::view::RoleGitView::new(ContainerTrace::recording())),
+        ),
+    ];
+    for (tag, view) in views {
+        let root = scratch(&format!("stalled-remover-{tag}"));
+        let path = root.join("views").join("upstroke-k-r-i-h");
+        fs::create_dir_all(&path).expect("an orphan view, empty as the census seeds it");
+        let pending = windows_posix_delete_pending(&path);
+
+        let (outcome, elapsed) = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(STALL);
+                drop(pending);
+            });
+            let started = Instant::now();
+            let outcome = view.discard(&path);
+            (outcome, started.elapsed())
+        });
+
+        outcome.unwrap_or_else(|error| {
+            panic!(
+                "[{tag}] the loser of a removal race refused after {elapsed:?} instead of \
+                 waiting out a winner stalled between marking the name and closing its \
+                 handle: {error}"
+            )
+        });
+        assert!(
+            elapsed >= STALL / 2,
+            "[{tag}] the discard returned after {elapsed:?}, before the stall could have \
+             ended, so it did not converge through the wait this fixture exercises"
+        );
+        assert!(
+            !path.exists(),
+            "[{tag}] the view is gone once the stall ends"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_intent() {
+    use std::time::Instant;
+
+    let fixture = Fixture::new("held-past-budget", RUN_A, INCARNATION_1, &shell_probe());
+    let mut hooks = fixture.hooks();
+    let name = fixture.plan.name.clone();
+    let view_path = fixture.plan.view.path.clone();
+    let launched =
+        launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
+    let pending = windows_posix_delete_pending(&view_path);
+
+    let started = Instant::now();
+    let error = reclaim(
+        &mut hooks,
+        &fixture.runtime,
+        &fixture.view,
+        &fixture.root,
+        &name,
+        Some(&view_path),
+    )
+    .expect_err("a view that is still delete-pending after the whole budget must refuse");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(&error, UpstrokeError::Io { source, .. } if source.raw_os_error() == Some(5)),
+        "the refusal carries the native error that stopped it: {error:?}"
+    );
+    let budget = windows_stalled_removal_budget();
+    assert!(
+        elapsed >= budget,
+        "the refusal came after {elapsed:?}, before the {budget:?} sleep budget was spent"
+    );
+    assert!(
+        elapsed < budget * 10,
+        "the refusal came after {elapsed:?}: the wait is bounded, and this is not a bound"
+    );
+    assert!(
+        launched.intent_path.exists(),
+        "the intent is retained when the view could not be removed, so the next census can \
+         finish the job rather than admit over residue nothing names"
+    );
+    assert!(
+        !fixture
+            .trace
+            .rendered()
+            .iter()
+            .any(|entry| entry.contains("discard")),
+        "a view that was not removed was recorded as discarded: {:#?}",
+        fixture.trace.rendered()
+    );
+
+    drop(pending);
+    reclaim(
+        &mut hooks,
+        &fixture.runtime,
+        &fixture.view,
+        &fixture.root,
+        &name,
+        Some(&view_path),
+    )
+    .expect("once the name has gone the retained intent is reclaimed by the next census");
+    assert!(!view_path.exists());
+    assert!(!launched.intent_path.exists());
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_once_the_stall_ends() {
+    use std::time::{Duration, Instant};
+
+    const STALL: Duration = Duration::from_millis(100);
+    assert!(STALL * 2 < windows_stalled_removal_budget());
+
+    let fixture = Fixture::new(
+        "stalled-intent-remover",
+        RUN_A,
+        INCARNATION_1,
+        &shell_probe(),
+    );
+    let mut hooks = fixture.hooks();
+    let name = fixture.plan.name.clone();
+    let write = |hooks: &mut RecordingHooks| {
+        write_intent(
+            hooks,
+            ContainerSite::WriteIntent,
+            &fixture.root,
+            &name,
+            &fixture.plan.intent,
+        )
+        .expect("the intent");
+        name.intent_path(&fixture.root)
+    };
+    let stalled = |pending: fs::File, work: &mut dyn FnMut()| {
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(STALL);
+                drop(pending);
+            });
+            let started = Instant::now();
+            work();
+            started.elapsed()
+        })
+    };
+
+    // The read half: a census discovering intents while another reclaimer is
+    // mid-way through deleting one.
+    let path = write(&mut hooks);
+    let pending = windows_posix_delete_pending(&path);
+    let mut found = None;
+    let elapsed = stalled(pending, &mut || {
+        found = Some(list_intents(&fixture.root));
+    });
+    let found = found.expect("the listing ran").unwrap_or_else(|error| {
+        panic!(
+            "discovery refused after {elapsed:?} over an intent another reclaimer was \
+                 still closing: {error}"
+        )
+    });
+    assert!(
+        found.is_empty(),
+        "an intent whose deletion completed during the wait is not a discovered record: \
+         {found:?}"
+    );
+    assert!(
+        elapsed >= STALL / 2,
+        "the listing returned after {elapsed:?}"
+    );
+    assert!(!path.exists());
+
+    // The removal half: two reclaimers on one record.
+    let path = write(&mut hooks);
+    let pending = windows_posix_delete_pending(&path);
+    let mut outcome = None;
+    let elapsed = stalled(pending, &mut || {
+        outcome = Some(remove_intent(
+            &mut hooks,
+            ContainerSite::RemoveIntent,
+            &fixture.root,
+            &name,
+        ));
+    });
+    outcome.expect("the removal ran").unwrap_or_else(|error| {
+        panic!(
+            "the loser of an intent-removal race refused after {elapsed:?} instead of \
+                 waiting out the winner's close: {error}"
+        )
+    });
+    assert!(
+        elapsed >= STALL / 2,
+        "the removal returned after {elapsed:?}"
+    );
+    assert!(!path.exists());
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
 #[test]
 fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {
     const CREDENTIALS: &[(&str, &str)] = &[
