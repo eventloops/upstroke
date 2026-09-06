@@ -590,39 +590,29 @@ fn zombie_group_answer(pid: libc::pid_t) -> Result<ZombieGroupAnswer, i32> {
 }
 
 #[cfg(all(unix, test))]
+const EXIT_PROBE_INTERVAL: Duration = Duration::from_millis(5);
+
+#[cfg(all(unix, test))]
 pub(crate) fn await_exit_without_reaping(pid: u32, budget: Duration) -> Result<(), String> {
     let unsigned = libc::id_t::try_from(pid)
         .map_err(|_| format!("pid {pid} cannot be represented as a Unix wait id"))?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let outcome = loop {
-            // SAFETY: `siginfo_t` is plain data for which zeroes are a valid value.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `info` outlives the call; `WNOWAIT` leaves the child
-            // waitable, so the owner's later `wait` still reaps it.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    unsigned,
-                    &raw mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                break Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                break Err(format!(
-                    "waitid(WEXITED | WNOWAIT) on {pid} failed: {error}"
+    let began = Instant::now();
+    loop {
+        match exited_unreaped(unsigned) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+            Err(error) => {
+                return Err(format!(
+                    "waitid(WEXITED | WNOHANG | WNOWAIT) on {pid} failed: {error}"
                 ));
             }
-        };
-        let _ = tx.send(outcome);
-    });
-    match rx.recv_timeout(budget) {
-        Ok(outcome) => outcome,
-        Err(_) => Err(format!("pid {pid} had not exited within {budget:?}")),
+        }
+        let remaining = budget.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
+            return Err(format!("pid {pid} had not exited within {budget:?}"));
+        }
+        thread::sleep(remaining.min(EXIT_PROBE_INTERVAL));
     }
 }
 
