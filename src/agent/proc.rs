@@ -586,15 +586,6 @@ fn zombie_group_answer(pid: libc::pid_t) -> Result<ZombieGroupAnswer, i32> {
     })
 }
 
-/// How often a child that has not yet exited is asked again.
-///
-/// `waitid` has no bounded form, so the budget is spent on the `WEXITED |
-/// WNOHANG | WNOWAIT` question the supervisor loop already asks rather than on
-/// a blocking wait held by a thread nobody joins. This interval is the
-/// resolution of a bound on a WEDGED child, not a sleep standing in for a
-/// signal: the exit itself is still what ends the wait, the first question is
-/// asked before any sleep, and a child that has already exited is reported
-/// without one.
 #[cfg(all(unix, test))]
 const EXIT_PROBE_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -606,7 +597,6 @@ pub(crate) fn await_exit_without_reaping(pid: u32, budget: Duration) -> Result<(
     loop {
         match exited_unreaped(unsigned) {
             Ok(true) => return Ok(()),
-            // Still running, and an interrupted question is not an answer.
             Ok(false) => {}
             Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
             Err(error) => {

@@ -373,6 +373,27 @@ assertion forced to fail, the test fails on the premise instead of passing.
 between the reap and the look, so the assertion cannot be satisfied by a zombie
 under any scheduling.
 
+## `const JOIN_PROBE_INTERVAL: Duration = Duration::from_millis(5);`
+
+The resolution of `join_within`'s bound, and the interval the two bodies below
+poll at. Like `EXIT_PROBE_INTERVAL` it is the granularity of a bound on a
+WEDGED worker, not a sleep standing in for a signal: the finished check comes
+before any sleep, and the last sleep is clamped to what is left of the budget.
+
+## `fn join_within<T>(handle, budget) -> Result<thread::Result<T>, thread::JoinHandle<T>> {`
+
+`JoinHandle::join` has no bounded form, so a worker that has not finished is
+POLLED rather than blocked on. Finished, and the caller gets `thread::Result`
+— the worker's value or its panic, which is §10's "a worker panic becomes a
+defined outcome". Not finished by the budget, and the caller gets its HANDLE
+BACK, unjoined, to report: the alternative in a cleanup path is a join that
+never ends, which is the same unbounded wait `ReapedChild::settle` exists to
+avoid.
+
+Handing the handle back rather than dropping it inside is what keeps the
+decision with the owner. `a_bounded_join_hands_back_a_worker_that_has_not_
+finished` exercises both arms with a worker it releases itself.
+
 ## `struct WaiterCensus {`
 
 The instrument for `PR173-EXIT-WAITER-THREAD-DETACHED`, and the domain it drew
@@ -390,17 +411,24 @@ only this body knows, so the count is unaffected by anything else running.
 The tids as well as the count, and the domain beside them, so a failure names
 which thread and how much of the process the instrument could actually read.
 
-## `fn waiters_on(pid: u32) -> Result<WaiterCensus, String> {`
+## `fn census_of(pid, tasks) -> Result<WaiterCensus, String> {`
 
-A task running in user space reports `running`, one the kernel will not
-describe reports a negative number, and one that exits between the listing and
-the read leaves no file at all; none of the three is a waiter.
+The census itself, over `(tid, syscall line or None)` pairs rather than over
+`/proc`, so its refusals are reachable from a test:
+`a_waiter_census_refuses_a_domain_it_could_not_read` drives an empty listing, a
+listing nothing could be read from, and a partly readable one.
 
 §12, "every census asserts the size and boundaries of the domain it claims": an
-empty listing, or one where NO task's `syscall` could be read, is an instrument
-that measures nothing, and it is returned as an error rather than as an absence
-of waiters — which is what an unreadable `/proc` would otherwise look like to
-the assertion that follows.
+empty listing, or one where NO task's line could be read, is an instrument that
+measures nothing, and it is an error rather than an absence of waiters — which
+is what an unreadable `/proc` would otherwise look like to a body asserting
+that nothing is waiting.
+
+## `fn waiters_on(pid: u32) -> Result<WaiterCensus, String> {`
+
+The `/proc/self/task` half, kept to reading so that everything with a decision
+in it is in `census_of`. A task that exits between the listing and the read
+leaves no file, and that is `None` rather than a failure of the listing.
 
 `#[cfg(target_os = "linux")]` because `/proc` is where this answer lives. The
 defect it witnesses is not Linux-only; the instrument is.
@@ -409,12 +437,55 @@ defect it witnesses is not Linux-only; the instrument is.
 
 `<number> <arg0> <arg1> ...`, where the first two arguments of `waitid` are its
 `idtype` and its `id`. The leading number only has to be a non-negative integer
-— that it is `waitid` follows from `P_PID` and the pid, not from the number.
+— that it is `waitid` follows from `P_PID` and the pid, not from the number, so
+a task running in user space (`running`) and one the kernel will not describe
+(`-1`) both answer no.
+
+`a_syscall_line_is_read_by_its_wait_arguments_rather_than_its_number` fixes
+that reading: a wait on this pid, a wait on another pid, a wait whose id is not
+a pid, ANOTHER syscall whose first argument happens to be this pid, and the
+three unreadable shapes.
 
 ## `fn child_held_on_its_stdin(what: &str) -> ReapedChild {`
 
-The spawn the group-observation bodies already do, named once for the two
+The spawn the group-observation bodies already do, named once for the three
 bodies below that need a child which will not exit until they say so.
+
+## `struct ControlWaiter {`
+
+The positive control's waiter and the child it waits on, OWNED TOGETHER.
+
+`EXIT-WAITER-CONTROL-DETACHED-ON-FAILURE`, review pass 1 of PR #179: the first
+shape held the `JoinHandle` in a local and joined it after a census read, an
+`assert_eq!` and a `settle().expect(...)`. Any of those leaving through a panic
+dropped the handle mid-unwind, detaching a thread blocked in `waitid` — which
+is the finding this very test exists to witness, recreated inside its own
+control. A guard settles on every path instead.
+
+## `impl ControlWaiter` › `fn start() -> Result<Self, String> {`
+
+A failure to start is returned, not panicked: the child is already owned by a
+`ReapedChild` at that point, and returning lets the caller name what failed
+while the guard still settles the child.
+
+The waiter's outcome is its errno rather than an `io::Error`, so the type is
+`Send` and `Debug` and the joined value can be printed in a report.
+
+## `impl ControlWaiter` › `fn settle(&mut self) -> Result<String, String> {`
+
+Settle the child FIRST, then join. Killing and reaping the child is what ends
+the waiter's `waitid` — a reaped pid answers `ECHILD` — so the join that
+follows is one the child's own bound has already made terminable; `join_within`
+bounds what is left. Every one of the four outcomes is reported: the waiter
+ended and the child settled, the waiter ended but the child did not, the waiter
+panicked, and the waiter was still in its wait at the budget, where the handle
+is reported rather than joined without a bound.
+
+## `impl Drop for ControlWaiter` › `fn drop(&mut self) {`
+
+The same shape as `ReapedChild`'s: settle on every path the body did not
+finish, stay silent during an unwind because a `Drop` must not raise a second
+panic, and fail the test when the cleanup failed and nothing else had.
 
 ## `fn a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child() {`
 
@@ -428,14 +499,38 @@ THE POSITIVE CONTROL RUNS FIRST, and the claim is an ABSENCE, which is the
 shape that goes green when the instrument is blind. So the body first plants a
 deliberate `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a child of its own and
 requires the census to find exactly it. That waiter is owned and joined rather
-than detached — reaping its child is what turns its wait into `ECHILD` — and
-the census must then find it gone. Only then is an empty census allowed to mean
-anything.
+than detached, and the census must then find it gone. Only then is an empty
+census allowed to mean anything.
 
 MEASURED. On the base — the helper thread whose `JoinHandle` the function
 dropped — this body fails on the claim, having passed its control:
 `1 waiter(s) ["<tid>"] over 3 of 3 task(s) read`, the detached waiter still in
 `waitid` on the child a returned call had stopped observing.
+
+What it does NOT witness, stated rather than implied: an unjoined thread doing
+something other than `waitid` on this pid. The census is keyed on the wait, and
+a source-text census over spawns would be a text domain standing in for a
+behaviour claim.
+
+## `fn a_syscall_line_is_read_by_its_wait_arguments_rather_than_its_number() {`
+
+The classifier's own controls, positive and negative, so the census above is
+not the only thing that decides whether a line is a wait on this pid.
+
+## `fn a_waiter_census_refuses_a_domain_it_could_not_read() {`
+
+The census's domain assertions, driven directly. The third case is the one that
+keeps the first two honest: a partly readable domain still answers, with
+`tasks_listed` and `tasks_read` differing, so the refusals are refusals of an
+EMPTY domain rather than of any incomplete one.
+
+## `fn a_bounded_join_hands_back_a_worker_that_has_not_finished() {`
+
+Both arms of `join_within` against a worker the body itself releases. The first
+call cannot race: the worker loops until the flag is set, and the flag is set
+only after the handle has been handed back. The second call then joins the
+released worker and asserts its value, so the bounded path and the value path
+are the same test.
 
 ## `fn an_exit_wait_on_a_child_that_never_exits_ends_at_its_bound() {`
 
