@@ -13,13 +13,23 @@
 # ends on: a label this run wrote across a push or a retarget is taken back (HEAD-MOVED,
 # BASE-MOVED).
 #
-# The act bound to the audited head is the enqueue, through `gh pr merge --match-head-commit`.
-# Nothing in that API binds it to the base, so the base is bound here instead: the identity and
-# the retarget timeline are read just before the call and once more after it, and an enqueue whose
-# head or base has moved is withdrawn with `gh pr merge --disable-auto`. What is left is the
-# interval between that confirmation and the queue's own merge, which no client can close; a
-# retarget landing there is a `base_ref_changed` event after the review, which the next audit
-# reports as `retargeted-after-review`.
+# The act bound to the audited head is the enqueue, and it is the GraphQL `enqueuePullRequest`
+# mutation with `expectedHeadOid`, not `gh pr merge --merge --auto`: that command MERGES a pull
+# request whose base carries no merge-queue rule and which is already mergeable, so a retarget
+# between the audit's last confirmation and the call would land an unreviewed diff outright.
+# `enqueuePullRequest` can only queue, and fails without merging when the base has no queue.
+#
+# Nothing in that API binds the enqueue to the base, so the base is bound here: the head, the base
+# ref and the retarget timeline are confirmed immediately before the call, the queue entry is read
+# back afterwards and must hold the audited head, and the base and timeline are confirmed once
+# more. Anything that fails is withdrawn with `dequeuePullRequest`, and the withdrawal is
+# confirmed by reading the state back -- `gh pr merge --disable-auto` exits successfully on a
+# queued pull request having removed nothing, so no exit status is evidence here. Evidence that
+# cannot be read is UNCONFIRMED, never agreement.
+#
+# What is left is the interval between that final confirmation and the queue's own merge, which no
+# client can close; a retarget landing there is a `base_ref_changed` event after the review, which
+# the next audit reports as `retargeted-after-review`.
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
@@ -66,8 +76,9 @@
 # the numbered findings, so a person reads it), and NOT-READY with the blockers listed. With
 # --apply a READY pull request can still end HEAD-MOVED or BASE-MOVED (its head or its base moved
 # between the audit's read and one of the writes, so it is neither labelled nor enqueued, and a
-# label this run had already written is taken back), or UNCONFIRMED (a re-read of the identity
-# failed, which fails closed on the same terms).
+# label this run had already written is taken back), or UNCONFIRMED (an identity, timeline or
+# queue-state read failed, or a queue entry could not be confirmed present, absent or withdrawn;
+# every one of those fails closed on the same terms as a move).
 #
 # Only review comments posted by the repository owner count, and there is no override: the
 # owner is MAINTAINING's one trusted writer, and anyone else's comment carrying the markers is
@@ -285,15 +296,23 @@ latest_review_id() {
   return 0
 }
 
-# retargeted_after PR ISO-TIME: succeeds when the pull request's base was changed after that
-# moment, which a review posted before it cannot have seen.
-retargeted_after() {
-  local when
-  for when in $(gh api "repos/$repo/issues/$1/timeline?per_page=100" --paginate \
-      --jq '.[] | select(.event == "base_ref_changed") | .created_at'); do
-    [[ "$when" > "$2" ]] && return 0
+# retarget_status PR ISO-TIME: "retargeted" when the pull request's base was changed after that
+# moment (which a review posted before it cannot have seen), "none" when the timeline was read and
+# holds no such change, and "unknown" when the timeline could not be read. The three are kept
+# apart deliberately: an unread timeline is not an absent retarget, and every caller here treats
+# "unknown" as a reason to stop rather than as agreement. `--paginate` fails the whole call when
+# any page fails, so a partial read cannot be reported as "none".
+retarget_status() {
+  local out when
+  if ! out="$(gh api "repos/$repo/issues/$1/timeline?per_page=100" --paginate \
+      --jq '.[] | select(.event == "base_ref_changed") | .created_at' 2>/dev/null)"; then
+    echo unknown
+    return 0
+  fi
+  for when in $out; do
+    [[ "$when" > "$2" ]] && { echo retargeted; return 0; }
   done
-  return 1
+  echo none
 }
 
 # pr_identity PR: the pull request's mutable identity, "<headRefOid> <baseRefName>", read in one
@@ -302,6 +321,77 @@ retargeted_after() {
 pr_identity() {
   gh pr view "$1" --repo "$repo" --json headRefOid,baseRefName \
     --jq '"\(.headRefOid) \(.baseRefName)"' 2>/dev/null || true
+}
+
+# pr_node PR: the pull request's GraphQL node id, or nothing when the read fails.
+pr_node() {
+  gh pr view "$1" --repo "$repo" --json id --jq .id 2>/dev/null || true
+}
+
+# pr_queue_state PR: what the pull request's merge automation actually is right now, as
+# "<queued|not-queued|unknown> <auto|no-auto|unknown> <the queued commit, or ->", read in one
+# query so the three agree. An unreadable answer is "unknown unknown -", never "not-queued": no
+# caller here may read a failed request as evidence that nothing is queued.
+pr_queue_state() {
+  local out
+  out="$(gh api graphql -f owner="${repo%%/*}" -f name="${repo##*/}" -F number="$1" -f query='
+    query($owner:String!,$name:String!,$number:Int!) {
+      repository(owner:$owner,name:$name) {
+        pullRequest(number:$number) {
+          isInMergeQueue
+          autoMergeRequest { enabledAt }
+          mergeQueueEntry { headCommit { oid } }
+        }
+      }
+    }' --jq '.data.repository.pullRequest
+      | "\(if .isInMergeQueue then "queued" else "not-queued" end) \(if .autoMergeRequest then "auto" else "no-auto" end) \(.mergeQueueEntry.headCommit.oid // "-")"' 2>/dev/null)" || out=""
+  if [[ -z "$out" ]]; then printf 'unknown unknown -'; else printf '%s' "$out"; fi
+}
+
+# enqueue_pr PR NODE HEAD: put the pull request in its base branch's merge queue, and nothing
+# else. `enqueuePullRequest` is enqueue-only and `expectedHeadOid` binds it to the head this audit
+# judged. `gh pr merge --merge --auto` is deliberately not used here: when the base carries no
+# merge-queue rule and the pull request is already mergeable, that command merges it there and
+# then, so a retarget landing between this audit's last confirmation and the call would land an
+# unreviewed diff outright instead of queueing it, with no later check able to undo it. This
+# mutation has no such fallback -- it fails, merging nothing, when the base carries no queue.
+enqueue_pr() {
+  gh api graphql -f pr="$2" -f oid="$3" -f query='
+    mutation($pr:ID!,$oid:GitObjectID!) {
+      enqueuePullRequest(input:{pullRequestId:$pr,expectedHeadOid:$oid}) {
+        mergeQueueEntry { id }
+      }
+    }' >/dev/null 2>&1
+}
+
+# dequeue_pr PR NODE: take the pull request back out, and succeed only when it is out.
+# `dequeuePullRequest` acts on the queue entry itself. `gh pr merge --disable-auto` does not: on a
+# queued pull request it exits successfully having removed nothing, so it is called here only to
+# clear a pending auto-merge, and neither call's exit status is the evidence. The state is read
+# back afterwards, and that read is what this function reports.
+dequeue_pr() {
+  gh api graphql -f pr="$2" -f query='
+    mutation($pr:ID!) { dequeuePullRequest(input:{id:$pr}) { clientMutationId } }' >/dev/null 2>&1 || true
+  gh pr merge "$1" --repo "$repo" --disable-auto >/dev/null 2>&1 || true
+  local q_state q_auto q_head
+  read -r q_state q_auto q_head <<< "$(pr_queue_state "$1")"
+  [[ "$q_state" == not-queued && "$q_auto" == no-auto ]]
+}
+
+# base_drift PR HEAD BASE REVIEW_AT: the drift token for everything that can have moved under this
+# audit -- the head, the base ref name, and a retarget recorded after the review -- or nothing when
+# all three are confirmed unchanged. Timeline evidence that could not be read is `unconfirmed:`,
+# not agreement.
+base_drift() {
+  local drift
+  drift="$(identity_drift "$2" "$3" "$(pr_identity "$1")")"
+  if [[ -z "$drift" ]]; then
+    case "$(retarget_status "$1" "$4")" in
+      retargeted) drift="base-moved:retargeted" ;;
+      unknown) drift="unconfirmed:retarget-timeline-unreadable" ;;
+    esac
+  fi
+  printf '%s' "$drift"
 }
 
 # maintain_labels_and_enqueue PR LANE HEAD BASE STATE LABELS REVIEW_AT
@@ -316,10 +406,17 @@ pr_identity() {
 # reconciled against the state this run ENDS on, so a label this run wrote and then found stale
 # is taken back -- reconciling against the labels read before the write would leave it standing.
 #
-# After the enqueue the identity and the retarget timeline are read once more, and an enqueue
-# whose head or base has moved is withdrawn with `--disable-auto` rather than left for the next
-# audit to notice. The residue is the interval between that confirmation and the queue's own
-# merge, which no client can close.
+# The enqueue is `enqueuePullRequest`, which can only queue, bound to the head by
+# `expectedHeadOid`; the base is bound by confirming it immediately before the call, by reading
+# the queue entry back afterwards and requiring it to hold this head, and by confirming the base
+# and the retarget timeline again after the call. A queue entry that fails any of those is
+# withdrawn with `dequeuePullRequest` and the withdrawal is CONFIRMED by reading the state back:
+# no exit status is taken as evidence of anything. Evidence that cannot be read is UNCONFIRMED
+# everywhere, never agreement.
+#
+# The residue is the interval between that final confirmation and the queue's own merge, which no
+# client can close; a retarget landing there is a base change recorded after the review, which the
+# next audit reports as `retargeted-after-review`.
 maintain_labels_and_enqueue() {
   local pr="$1" lane="$2" head="$3" base="$4" state="$5" labels="$6" review_at="$7"
   local l drift wrote_ready=0
@@ -352,11 +449,21 @@ maintain_labels_and_enqueue() {
     fi
   fi
 
-  # Before the enqueue: the timeline as well as the ref name, since a retarget away and back
-  # leaves the name it started with.
+  # The node id the queue mutations address. Without it there is no enqueue and no withdrawal, so
+  # it is read before anything is queued rather than being needed for the first time afterwards.
+  local node=""
   if [[ "$state" == READY ]] && ((enqueue)); then
-    drift="$(identity_drift "$head" "$base" "$(pr_identity "$pr")")"
-    if [[ -z "$drift" ]] && retargeted_after "$pr" "$review_at"; then drift="base-moved:retargeted"; fi
+    node="$(pr_node "$pr")"
+    if [[ -z "$node" ]]; then
+      echo "      #$pr's node id could not be read: not enqueued"
+      state=UNCONFIRMED
+    fi
+  fi
+
+  # Before the enqueue: the timeline as well as the ref name, since a retarget away and back
+  # leaves the name it started with, and an unreadable timeline is not an absent retarget.
+  if [[ "$state" == READY ]] && ((enqueue)); then
+    drift="$(base_drift "$pr" "$head" "$base" "$review_at")"
     if [[ -n "$drift" ]]; then
       echo "      $drift since the audit read ${head:0:7} on $base: not enqueued"
       state="$(drift_state "$drift")"
@@ -364,24 +471,37 @@ maintain_labels_and_enqueue() {
   fi
 
   if [[ "$state" == READY ]] && ((enqueue)); then
-    # --match-head-commit binds the enqueue to the head this audit judged: a push that lands
-    # between the audit and this call makes GitHub refuse, never enqueue the newcomer. Nothing in
-    # the API binds it to the base, so the base is bound by reading it again after the call and
-    # withdrawing an enqueue that no longer names the base the review was against.
-    if gh pr merge "$pr" --repo "$repo" --merge --auto --match-head-commit "$head" >/dev/null 2>&1; then
-      drift="$(identity_drift "$head" "$base" "$(pr_identity "$pr")")"
-      if [[ -z "$drift" ]] && retargeted_after "$pr" "$review_at"; then drift="base-moved:retargeted"; fi
+    if enqueue_pr "$pr" "$node" "$head"; then
+      # What was queued is read back, not assumed: the entry must exist and must hold this head,
+      # and the base and the timeline must still be what the audit judged.
+      local q_state q_auto q_head
+      drift="$(base_drift "$pr" "$head" "$base" "$review_at")"
+      if [[ -z "$drift" ]]; then
+        read -r q_state q_auto q_head <<< "$(pr_queue_state "$pr")"
+        case "$q_state" in
+          queued) [[ "$q_head" == "$head" ]] || drift="head-moved:${q_head:0:7}" ;;
+          not-queued) drift="unconfirmed:enqueue-left-no-entry" ;;
+          *) drift="unconfirmed:queue-state-unreadable" ;;
+        esac
+      fi
       if [[ -z "$drift" ]]; then
         echo "      enqueued #$pr at ${head:0:7} on $base"
-      elif gh pr merge "$pr" --repo "$repo" --disable-auto >/dev/null 2>&1; then
-        echo "      $drift after enqueuing ${head:0:7}: enqueue withdrawn"
+      elif dequeue_pr "$pr" "$node"; then
+        echo "      $drift after enqueuing ${head:0:7}: withdrawn, and the withdrawal read back"
         state="$(drift_state "$drift")"
       else
-        echo "      $drift after enqueuing ${head:0:7}: the enqueue could NOT be withdrawn"
+        echo "      $drift after enqueuing ${head:0:7}: the withdrawal could NOT be confirmed; #$pr may still be queued"
         state="$(drift_state "$drift")"
       fi
     else
-      echo "      could not enqueue #$pr at ${head:0:7} (head moved, already queued, or the ruleset has no merge queue yet)"
+      # A refused enqueue is not a claim about anything: the mutation refuses an already-queued
+      # pull request, a head that has moved past expectedHeadOid, and a base with no merge queue
+      # alike. The state is read so the line says which, and nothing is withdrawn here -- a pull
+      # request already in the queue was put there by someone, and taking it out is not this
+      # branch's business.
+      local r_state r_auto r_head
+      read -r r_state r_auto r_head <<< "$(pr_queue_state "$pr")"
+      echo "      could not enqueue #$pr at ${head:0:7} on $base (it is $r_state, auto-merge $r_auto, entry ${r_head:0:7})"
     fi
   fi
 
@@ -510,9 +630,10 @@ audit_one() {
     # changed after the review was posted is a diff the review never saw, and the workflow
     # form's base commit must lie on the current base branch (and, off master, not on master,
     # since the integration branch carries master's history too).
-    if retargeted_after "$pr" "$review_at"; then
-      blockers+=("retargeted-after-review")
-    fi
+    case "$(retarget_status "$pr" "$review_at")" in
+      retargeted) blockers+=("retargeted-after-review") ;;
+      unknown) blockers+=("retarget-timeline-unreadable") ;;
+    esac
   fi
 
   # Head movement since the reviewed commit, and the base the review was made against.
