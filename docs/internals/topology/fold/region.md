@@ -116,3 +116,20 @@ function chooses, but the one kind of generation its three callers
 and `check_generation_closed`) can reach it with. `fate` is `"closes"` for the
 same reason.
 
+## `#[cfg(test)] mod tests`
+
+Every rendering in this file, in this file rather than in
+`src/topology/fold/tests.rs` where the rest of the fold's tests live. Nothing
+here needs a `RunState`: these are functions of their arguments, and that
+sibling file is queue row 39, which this sweep could not edit.
+
+Before this block the file had no test of its own and none of its strings was
+asserted anywhere in the tree; `check_lease_disposition`'s only coverage was
+two `matches!(…, FoldError::InvalidLeaseDisposition { .. })` assertions in
+`tests.rs` that pin no field and never reach a lineage generation.
+
+Two properties are pinned as properties rather than as strings, because they
+are what the sentences these feed depend on: no two names a refusal can print
+side by side are equal, and an empty region does not render as a repo-wide one.
+The disposition table is written out rather than computed from
+[`GenerationLease::expected`], which is the code under test.
