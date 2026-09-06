@@ -3392,6 +3392,56 @@ fn an_override_is_the_binding_the_frozen_admission_authorized_and_no_other() {
 }
 
 #[test]
+fn an_answer_may_not_take_an_option_its_admission_authorized_no_binding_for() {
+    let mut fold = started();
+    merge_task(&mut fold, ALPHA, 0, 0);
+    let mut spawn = repair_spawn(BETA, ALPHA, ALPHA);
+    let options = vec!["  Codex-CLI  ".to_owned(), "copilot".to_owned()];
+    clip_to_human_binding(&mut spawn, options.clone());
+    apply(&mut fold, &spawn_event(spawn));
+
+    let offered = question("q-binding-Ünicode", BETA).options.len();
+    assert_eq!(
+        (offered, options.len()),
+        (3, 2),
+        "the fixture under test offers more options than it authorizes bindings for"
+    );
+
+    let beyond = |binding_override| {
+        answered(
+            BETA,
+            "q-binding-Ünicode",
+            Answer4::Answered {
+                option_index: 2,
+                binding_override,
+            },
+        )
+    };
+
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(None)) else {
+        panic!("an option the question offers is not refused for being out of range");
+    };
+    assert_eq!(
+        detail,
+        "asked for a binding and this answer names none, so its task has no binding to run"
+    );
+
+    let override_at_two = BindingOverride {
+        key: BETA,
+        question: QuestionId::from("q-binding-Ünicode"),
+        option_index: 2,
+        agent: "claude-code".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        effort: Effort::XHigh,
+    };
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(Some(override_at_two)))
+    else {
+        panic!("an override at an option no binding was authorized for is refused as one");
+    };
+    assert_eq!(detail, "authorized 2 binding(s) and this chose 2");
+}
+
+#[test]
 fn an_interruption_closes_its_generation_and_returns_its_task_to_pending() {
     let base = sha("base");
     let mut fold = started();
@@ -6707,6 +6757,53 @@ fn a_budget_stop_belongs_to_the_epoch_that_hit_the_ceiling() {
         FoldError::InconsistentRecord { .. }
     ));
     accepts(&fold, &budget_exceeded(1, None));
+}
+
+#[test]
+fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_reached() {
+    let fold = started();
+    let breach = |limit_usd: f64, spent_usd: f64| {
+        ev(TopologyEventBody::BudgetExceeded {
+            data: BudgetExceeded4 {
+                epoch: Epoch(0),
+                budget: BudgetKind::Run,
+                limit_usd,
+                spent_usd,
+                key: Some(ZETA),
+            },
+        })
+    };
+
+    accepts(&fold, &breach(12.5, 13.75));
+    accepts(&fold, &breach(12.5, 12.5));
+
+    let FoldError::InconsistentRecord { kind, detail } = refuse(&fold, &breach(12.5, 12.49)) else {
+        panic!("a stop for a ceiling its own spend has not reached is refused as one");
+    };
+    assert_eq!(kind, "budget_exceeded");
+    assert_eq!(
+        detail,
+        "it stops the run for a `run_usd` ceiling of 12.5 that its own recorded spend of 12.49 \
+         has not reached"
+    );
+
+    for (label, limit_usd, spent_usd) in [
+        ("an unordered spend", 12.5_f64, f64::NAN),
+        ("an unordered ceiling", f64::NAN, 13.75),
+        ("an unbounded ceiling", f64::INFINITY, 13.75),
+        ("an unbounded spend", 12.5, f64::INFINITY),
+    ] {
+        let FoldError::InconsistentRecord { kind, detail } =
+            refuse(&fold, &breach(limit_usd, spent_usd))
+        else {
+            panic!("{label} is refused as an inconsistent record");
+        };
+        assert_eq!(kind, "budget_exceeded");
+        assert!(
+            detail.contains("a budget is a finite number of dollars"),
+            "{label}: {detail}"
+        );
+    }
 }
 
 #[test]
