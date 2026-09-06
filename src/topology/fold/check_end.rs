@@ -141,14 +141,16 @@ impl RunState {
         } = &answered.answer
         {
             let options = open.question.options.len();
-            let chosen = usize::try_from(*option_index).unwrap_or(usize::MAX);
-            if chosen >= options {
+            let Some(chosen) = usize::try_from(*option_index)
+                .ok()
+                .filter(|chosen| *chosen < options)
+            else {
                 return Err(FoldError::WrongQuestion {
                     kind: KIND,
                     question: answered.question.to_string(),
                     detail: format!("offered {options} option(s) and this chose {option_index}"),
                 });
-            }
+            };
             match (binding_override, &open.binding) {
                 (Some(_), None) => {
                     return Err(FoldError::WrongQuestion {
