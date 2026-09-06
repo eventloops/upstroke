@@ -1374,7 +1374,14 @@ red was (`W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT`).
 ## `fn group_leadership(observations: &[proc::GroupObservation]) -> (Vec<bool>, String) {`
 
 The decisions and the rendered records side by side, so an assertion
-compares the former and prints the latter.
+compares the former and prints the latter. The print is unconditional —
+every call, not only a failing `assert_eq!`'s message — so a `--nocapture`
+run of a passing grid still carries the raw records, including whatever
+`proc_pidinfo`'s non-zero argument answered on macOS
+(`PR173-LIVE-RECORD-ANSWER-NEVER-PRINTED`). The predicate compared is
+unchanged: on macOS it accepts either a child that currently leads its own
+group or an exited, unreaped child whose own record names its own pid as
+leader.
 
 ## `impl RoleWitness` › `fn handle(&self) -> Self {`
 
@@ -1818,6 +1825,14 @@ the packet's order.
 The witness is the kernel, not this crate: `getpgid(pid) == pid` is true
 exactly when the closure's `setpgid(0, 0)` ran, and it is asked at
 `child_created` — the first instant the parent knows the pid.
+
+## `fn a_passing_grid_prints_the_group_observation_it_promises() {`
+
+Runs [`the_pre_exec_containment_step_runs_in_the_forked_child`] as a
+subprocess with `--exact --nocapture` and asserts its captured stdout
+carries `GROUP_OBSERVATION_MARKER`, proving `group_leadership` prints on the
+path where every prior version printed nothing: a passing grid
+(`PR173-LIVE-RECORD-ANSWER-NEVER-PRINTED`).
 
 ## `fn a_containment_proof_exists_only_where_containment_was_established() {`
 
