@@ -290,7 +290,7 @@ room — the reservable predicate is a comparison, not a boolean flag.
 A settlement to `RetainedIdle` releases the pipeline entitlement while
 keeping the generation open — the one class whose two properties differ.
 
-## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent…`
+## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {`
 
 --- the Retained arm asks what the Closed arm asks ---------------------
 
@@ -298,7 +298,7 @@ keeping the generation open — the one class whose two properties differ.
 settlement refusals all construct `Closed`, which is why this arm was
 undriven: it checked the epoch and stopped.
 
-## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent…`
+## `fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {`
 
 A `Retained` settlement of `key`'s first attempt, session and all.
 
@@ -2700,3 +2700,20 @@ run may say so.
 And the direction that says the predicate is not vacuous: with `cee`
 still Pending rather than Failed, nothing is Blocked, `cee` is
 admissible, and the run is not ending.
+
+## `an_exhausted_generation_attempt_counter_is_refused_without_panicking` › `let run = fold.run.as_mut().expect("the checked prefix started a run");`
+
+Construct only the numeric boundary after a checked retained prefix.
+This is not a claim that a billions-record history was replayed.
+
+## `an_exhausted_generation_attempt_counter_is_refused_without_panicking` › `let before = fold.state().cloned();`
+
+The independent snapshot witnesses that refusing the retry changes no state.
+
+## Question guard regression traces from PR #153
+
+The four open-generation classes refuse a bare question with identical live and replay errors. The unrelated-task control also proves refusal does not consume the question ID. Each case clones its event prefix to replay it independently; the refusal helper owns a state snapshot and replay log for comparison.
+
+Terminal tasks refuse new questions. Quiet parked tasks and repair lineages permit multiple questions; answering one preserves any remaining question and restores the state implied by the candidate or lineage. A queued candidate returns to AwaitingMerge and cannot dispatch another generation.
+
+The repair-member trace checks both an ordinary answer and a nonhalting decline, live and by replay. Decline fails both unmerged members and avoids FoldError; this is fold state evidence, not proof of operating-system process termination. The attempt settlement trace separately checks a halting decline, released lease, and accepted run_finished. These tests use the broader question contract implemented by PR #152; the earlier blanket lineage and answer-state restrictions are superseded.

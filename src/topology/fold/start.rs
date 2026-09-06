@@ -84,7 +84,7 @@ impl TopologyFold {
                 .check_run_resumed(data)
                 .map(|()| self.delta(event, Derived::None)),
             TopologyEventBody::TaskSpawned { data } => run
-                .check_spawn(&data.spawn, kind)
+                .check_task_spawned(&data.spawn)
                 .map(|()| self.delta(event, Derived::None)),
             TopologyEventBody::TaskDispatched { data } => run
                 .check_dispatched(data)

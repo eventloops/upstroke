@@ -78,6 +78,16 @@ impl TopologyFold {
     }
 
     #[must_use]
+    pub(crate) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {
+        if self.poisoned {
+            return None;
+        }
+        self.run
+            .as_ref()
+            .and_then(|run| run.eligible_continuation(key))
+    }
+
+    #[must_use]
     pub fn pipeline_held(&self) -> usize {
         self.run.as_ref().map_or(0, RunState::pipeline_held)
     }
@@ -103,6 +113,15 @@ impl TopologyFold {
                 .run
                 .as_ref()
                 .is_some_and(RunState::integration_admissible)
+    }
+
+    pub(crate) fn eligible_integration_candidate(&self) -> Option<&CandidateRef> {
+        if self.poisoned {
+            return None;
+        }
+        self.run
+            .as_ref()
+            .and_then(RunState::eligible_integration_candidate)
     }
 
     #[must_use]

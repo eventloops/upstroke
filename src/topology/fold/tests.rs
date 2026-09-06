@@ -24,6 +24,9 @@ use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{FrozenReviews, FrozenRung, FrozenTaskSpec, Lineage, Origin};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
+#[cfg(test)]
+mod questions;
+
 const RUN_ID: &str = "01FOLD0000000000000000000A";
 
 type BreakRunner = fn(&mut RunnerPolicy);
@@ -875,6 +878,36 @@ fn a_retained_generation_holds_no_pipeline_entitlement_and_is_ready_to_retry() {
         "a retained generation is retried, never re-dispatched"
     );
     assert!(fold.structurally_admissible());
+}
+
+#[test]
+fn an_exhausted_generation_attempt_counter_is_refused_without_panicking() {
+    const SESSION: &str = "counter-boundary-session";
+    let mut fold = started();
+    apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+    let first = attempt_started(&fold, ALPHA, 0, 1, 0);
+    apply(&mut fold, &first);
+    apply(&mut fold, &retain(ALPHA, 1, SESSION, Epoch(0)));
+    let retry = attempt_started_resuming(&fold, ALPHA, 0, 2, 0, SESSION);
+    accepts(&fold, &retry);
+
+    let run = fold.run.as_mut().expect("the checked prefix started a run");
+    run.open_generation_mut(ALPHA)
+        .expect("the checked prefix retained this generation")
+        .attempts = u32::MAX;
+    let before = fold.state().cloned();
+    let error = fold
+        .plan_transition(&retry)
+        .expect_err("an exhausted counter has no representable next attempt");
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("counter exhaustion must return a contextual record refusal");
+    };
+    assert_eq!(kind, "attempt_started");
+    assert!(
+        detail.contains(&format!("task {ALPHA} generation 0")),
+        "{detail}"
+    );
+    assert_eq!(fold.state(), before.as_ref());
 }
 
 fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {
@@ -6002,6 +6035,382 @@ fn a_decline_fails_its_task_and_halts_only_when_its_recorded_policy_says_so() {
     assert_eq!(halting.halted_at(), Some(ZETA));
 }
 
+fn alpha_open_in_every_class() -> Vec<(&'static str, Vec<TopologyEvent>)> {
+    let base = sha("base");
+    let mut fold = started();
+    let dispatched = dispatch(ALPHA, 0, &base);
+    apply(&mut fold, &dispatched);
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+
+    vec![
+        ("open with no attempt", vec![dispatched.clone()]),
+        ("in flight", vec![dispatched.clone(), start.clone()]),
+        (
+            "retained idle",
+            vec![
+                dispatched.clone(),
+                start.clone(),
+                settle(
+                    ALPHA,
+                    0,
+                    1,
+                    AttemptSettlement::Retained {
+                        retained_session: SessionId("sess-ÜNI-0042".to_owned()),
+                        retained_incarnation: Epoch(0),
+                    },
+                ),
+            ],
+        ),
+        (
+            "promoting",
+            vec![dispatched, start, candidate_prepared(ALPHA, 0, &base)],
+        ),
+    ]
+}
+
+fn folded(events: &[TopologyEvent]) -> (TopologyFold, Vec<TopologyEvent>) {
+    let mut fold = started();
+    let mut log = vec![run_started_event()];
+    for event in events {
+        apply(&mut fold, event);
+        log.push(event.clone());
+    }
+    (fold, log)
+}
+
+#[track_caller]
+fn refused_live_and_on_replay(
+    fold: &TopologyFold,
+    log: &[TopologyEvent],
+    event: &TopologyEvent,
+) -> FoldError {
+    let before = fold.state().cloned();
+    let live = refuse(fold, event);
+    assert_eq!(fold.state().cloned(), before);
+    let mut replayed = log.to_vec();
+    replayed.push(event.clone());
+    let on_replay = TopologyFold::replay(inputs(), &replayed)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a replay of the log plus `{}` must refuse",
+                event.body.kind()
+            )
+        });
+    assert_eq!(
+        live, on_replay,
+        "the live path and the replay refuse differently"
+    );
+    live
+}
+
+#[test]
+fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
+    for (class, events) in alpha_open_in_every_class() {
+        let (fold, log) = folded(&events);
+        let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+        assert_eq!(
+            error,
+            FoldError::InconsistentRecord {
+                kind: "question_raised",
+                detail: format!(
+                    "lineage 1 has task 1 generation 0 still {class}; settle it before parking its tasks"
+                ),
+            },
+            "a generation that is {class} is an open generation"
+        );
+
+        let mut parked = fold.clone();
+        apply(&mut parked, &raised("q-park-Ünicode", MID));
+        assert_eq!(parked.task_state(MID), Some(TaskState::AwaitingInput));
+    }
+}
+
+#[test]
+fn the_question_an_attempt_raises_rides_on_its_settlement_and_a_decline_then_ends_the_run() {
+    let base = sha("base");
+    let mut fold = started();
+    apply(&mut fold, &dispatch(ALPHA, 0, &base));
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    apply(&mut fold, &start);
+    let lease = LeaseOwner::Generation {
+        key: ALPHA,
+        generation: GenerationId(0),
+    };
+    assert!(fold.leases().is_some_and(|leases| leases.holds(lease)));
+    assert!(matches!(
+        refuse(&fold, &raised("q-park-Ünicode", ALPHA)),
+        FoldError::InconsistentRecord {
+            kind: "question_raised",
+            ..
+        }
+    ));
+
+    apply(
+        &mut fold,
+        &settle(
+            ALPHA,
+            0,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Parked {
+                    question: question("q-park-Ünicode", ALPHA),
+                },
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        ),
+    );
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingInput));
+    assert!(fold.task(ALPHA).is_some_and(|task| task.open().is_none()));
+    assert!(fold.leases().is_some_and(|leases| !leases.holds(lease)));
+
+    apply(
+        &mut fold,
+        &answered(
+            ALPHA,
+            "q-park-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: true,
+            },
+        ),
+    );
+
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::Failed));
+    assert_eq!(fold.halted_at(), Some(ALPHA));
+    assert!(fold.task(ALPHA).is_some_and(|task| task.open().is_none()));
+    assert!(fold.leases().is_some_and(|leases| !leases.holds(lease)));
+
+    assert_eq!(
+        fold.derived_outcome(),
+        DerivedOutcome::Ending(RunOutcome::Halted)
+    );
+    accepts(&fold, &run_finished(RunOutcome::Halted, Some(ALPHA)));
+}
+
+#[test]
+fn bare_questions_refuse_terminal_tasks_and_allow_quiet_parked_lineages() {
+    let base = sha("base");
+    let mut merged_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            fast_publication(ALPHA, 0, 0, &base, vec![ALPHA]),
+            merged(ALPHA, 0, 0, vec![ALPHA]),
+        ] {
+            apply(&mut fold, &event);
+            merged_log.push(event);
+        }
+    }
+    let mut failed_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Failed {
+                        halts_run: false,
+                        reason: "  the fixture's terminal failure  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut fold, &event);
+            failed_log.push(event);
+        }
+    }
+
+    let parked_log = vec![raised("q-first-Ünicode", ALPHA)];
+
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut repair_log = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(0),
+            candidate: candidate_of(ALPHA, 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+            lease_effect: RejectionLeaseEffect::CreatesLineage {
+                root: ALPHA,
+                paths: region(ALPHA),
+            },
+        };
+        rejected.repair.entry.deps = Vec::new();
+        rejected.repair.entry.display_deps = Vec::new();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+            ev(TopologyEventBody::MergeRejected {
+                data: Box::new(rejected),
+            }),
+        ] {
+            apply(&mut fold, &event);
+            repair_log.push(event);
+        }
+    }
+    for (state, events) in [("merged", merged_log), ("failed", failed_log)] {
+        let (fold, log) = folded(&events);
+        assert_eq!(fold.task_state(ALPHA).map(TaskState::name), Some(state));
+        let error = refused_live_and_on_replay(&fold, &log, &raised("q-second-Ünicode", ALPHA));
+        assert_eq!(
+            error,
+            FoldError::WrongTaskState {
+                kind: "question_raised",
+                key: 1,
+                state,
+                expected: "nonterminal",
+            }
+        );
+    }
+    for (state, events) in [
+        (TaskState::AwaitingInput, parked_log),
+        (TaskState::AwaitingRepair, repair_log),
+    ] {
+        let (mut fold, mut log) = folded(&events);
+        for event in [
+            raised("q-second-Ünicode", ALPHA),
+            answered(
+                ALPHA,
+                "q-second-Ünicode",
+                Answer4::Answered {
+                    option_index: 0,
+                    binding_override: None,
+                },
+            ),
+        ] {
+            apply(&mut fold, &event);
+            log.push(event);
+        }
+        assert_eq!(fold.task_state(ALPHA), Some(state));
+        let replayed = TopologyFold::replay(inputs(), &log).expect("accepted questions replay");
+        assert_eq!(fold.state(), replayed.state());
+    }
+}
+
+#[test]
+fn a_bare_question_is_refused_on_the_candidate_under_integration() {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingMerge));
+    let error = refused_live_and_on_replay(&fold, &log, &raised("q-park-Ünicode", ALPHA));
+    let FoldError::InconsistentRecord { kind, detail } = error else {
+        panic!("a question on the candidate under integration is refused as one: {error}");
+    };
+    assert_eq!(kind, "question_raised");
+    assert!(detail.contains("sequence 0"), "{detail}");
+
+    let mut released = fold.clone();
+    apply(
+        &mut released,
+        &ev(TopologyEventBody::MergeVerificationInterrupted {
+            data: MergeVerificationInterrupted {
+                sequence: SequenceId(0),
+                detail: "  the coordinator died  ".to_owned(),
+            },
+        }),
+    );
+    apply(&mut released, &raised("q-park-Ünicode", ALPHA));
+    assert_eq!(released.task_state(ALPHA), Some(TaskState::AwaitingInput));
+}
+
+#[test]
+fn a_task_whose_candidate_is_queued_is_not_dispatched_again() {
+    let base = sha("base");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            raised("q-park-Ünicode", ALPHA),
+            answered(
+                ALPHA,
+                "q-park-Ünicode",
+                Answer4::Answered {
+                    option_index: 0,
+                    binding_override: None,
+                },
+            ),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingMerge));
+    assert!(fold.queue().is_some_and(|queue| queue.holds_task(ALPHA)));
+    assert!(
+        !fold.ready(ALPHA),
+        "`ready` has always refused a queued task"
+    );
+    let error = refused_live_and_on_replay(&fold, &log, &dispatch(ALPHA, 1, &base));
+    assert!(matches!(
+        error,
+        FoldError::WrongTaskState {
+            kind: "task_dispatched",
+            state: "awaiting merge",
+            expected: "pending",
+            ..
+        }
+    ));
+
+    let mut integrated = fold.clone();
+    apply(
+        &mut integrated,
+        &fast_publication(ALPHA, 0, 0, &base, vec![ALPHA]),
+    );
+    apply(&mut integrated, &merged(ALPHA, 0, 0, vec![ALPHA]));
+    assert_eq!(integrated.task_state(ALPHA), Some(TaskState::Merged));
+    assert!(matches!(
+        refuse(&integrated, &dispatch(ALPHA, 1, &base)),
+        FoldError::WrongTaskState {
+            state: "merged",
+            ..
+        }
+    ));
+}
+
 #[test]
 fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_the_same_epoch() {
     let base = sha("base");
@@ -6375,7 +6784,7 @@ fn grid_state(
         };
         match backoff {
             Backoff::None => {}
-            Backoff::DeferredTask => run.tasks[MID.index()].state = TaskState::Deferred,
+            Backoff::DeferredTask => run.set_state(MID, TaskState::Deferred),
             Backoff::DeferredCandidate => run.queue.push(QueueEntry {
                 candidate: candidate_of(MID, 0),
                 paths: region(MID),
@@ -8341,4 +8750,77 @@ fn a_failure_blocks_the_whole_dependency_closure_and_not_only_its_neighbours() {
     let prefix = TopologyFold::replay(chain_inputs(), &trace[..1]).expect("the prefix replays");
     assert_eq!(prefix.task_state(CEE), Some(TaskState::Pending));
     assert_eq!(prefix.derived_outcome(), DerivedOutcome::NotEnding);
+}
+
+#[test]
+fn a_quiet_lineage_member_accepts_questions_and_decline_settles_the_lineage() {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut events = Vec::new();
+    {
+        let mut fold = started();
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        let mut rejected = MergeRejected {
+            sequence: SequenceId(0),
+            candidate: candidate_of(ALPHA, 0),
+            rejecting_head: head.clone(),
+            disposition: RejectionDisposition::CodeRejected {
+                verification: verification_record(Verdict::Rejected),
+            },
+            repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+            lease_effect: RejectionLeaseEffect::CreatesLineage {
+                root: ALPHA,
+                paths: region(ALPHA),
+            },
+        };
+        rejected.repair.entry.deps = Vec::new();
+        rejected.repair.entry.display_deps = Vec::new();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            start,
+            candidate_prepared(ALPHA, 0, &base),
+            candidate_created(ALPHA, 0),
+            verification_started(ALPHA, 0, 0, &head, &proposal),
+            ev(TopologyEventBody::MergeRejected {
+                data: Box::new(rejected),
+            }),
+        ] {
+            apply(&mut fold, &event);
+            events.push(event);
+        }
+    }
+    let (fold, log) = folded(&events);
+    assert_eq!(fold.task_state(TaskKey(3)), Some(TaskState::Pending));
+    assert_eq!(fold.task_state(ALPHA), Some(TaskState::AwaitingRepair));
+    for answer in [
+        Answer4::Answered {
+            option_index: 0,
+            binding_override: None,
+        },
+        Answer4::Declined {
+            decline_halts_run: false,
+        },
+    ] {
+        let mut after = fold.clone();
+        let mut replay_log = log.clone();
+        let declined = matches!(answer, Answer4::Declined { .. });
+        for event in [
+            raised("q-park-Ünicode", TaskKey(3)),
+            answered(TaskKey(3), "q-park-Ünicode", answer),
+        ] {
+            apply(&mut after, &event);
+            replay_log.push(event);
+        }
+        if declined {
+            assert_eq!(after.task_state(ALPHA), Some(TaskState::Failed));
+            assert_eq!(after.task_state(TaskKey(3)), Some(TaskState::Failed));
+            assert_ne!(after.derived_outcome(), DerivedOutcome::FoldError);
+        } else {
+            assert_eq!(after.task_state(ALPHA), Some(TaskState::AwaitingRepair));
+            assert!(after.ready(TaskKey(3)));
+        }
+        let replayed = TopologyFold::replay(inputs(), &replay_log).expect("lineage answers replay");
+        assert_eq!(after.state(), replayed.state());
+    }
 }

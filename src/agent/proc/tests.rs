@@ -348,6 +348,112 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
+    let mut supervisor =
+        termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "read line; exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    supervisor.prepare(&mut command);
+    let mut child = command
+        .spawn()
+        .expect("spawn a child that holds until its stdin closes");
+    let pid = child.id();
+    supervisor
+        .register(pid)
+        .expect("register the child's group with the supervisor");
+
+    let alive = observe_child_group(pid);
+    assert!(
+        !alive.had_exited_before_the_look(),
+        "the child exited before it was looked at while running, so this witnesses \
+         nothing about a running child: {alive}"
+    );
+    assert!(
+        alive.leads_own_group(),
+        "the pre-exec closure did not run at all, so this witnesses nothing: {alive}"
+    );
+
+    drop(child.stdin.take());
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{reason}");
+    }
+
+    let exited = observe_child_group(pid);
+    assert!(
+        exited.had_exited_before_the_look(),
+        "the premise: the child is an exited, unreaped zombie when it is looked at: {exited}"
+    );
+    assert!(
+        exited.leads_own_group(),
+        "an exited, unreaped child stopped answering for its own group: {exited}"
+    );
+
+    supervisor.finish().expect("settle the child's group");
+    let status = child.wait().expect("reap the child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
+    // SAFETY: `getpgid(0)` reads this process's own group id and borrows nothing.
+    let this_group = unsafe { libc::getpgid(0) };
+    assert!(
+        this_group > 0,
+        "this process has no readable group: {this_group}"
+    );
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "read line; exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .expect("spawn a child that stays in this process's group");
+    let pid = child.id();
+
+    let alive = observe_child_group(pid);
+    assert_eq!(
+        alive.group,
+        Ok(this_group),
+        "the control child is not in this process's group: {alive}"
+    );
+    assert!(
+        !alive.leads_own_group(),
+        "a running child nothing moved answered for its own group: {alive}"
+    );
+
+    drop(child.stdin.take());
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{reason}");
+    }
+
+    let exited = observe_child_group(pid);
+    assert!(
+        exited.had_exited_before_the_look(),
+        "the premise: the control child is an exited, unreaped zombie when it is looked at: \
+         {exited}"
+    );
+    assert!(
+        !exited.leads_own_group(),
+        "an exited child nothing moved answered for its own group: {exited}"
+    );
+
+    let status = child.wait().expect("reap the control child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
 #[test]
 fn nonzero_exit_is_reported_not_an_error() {
     let out = run_with_timeout(shell("exit 3"), "", Duration::from_secs(30)).expect("spawn shell");

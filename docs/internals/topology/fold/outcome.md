@@ -65,3 +65,8 @@ closure the packet asks for.
 
 Each round adds at least one member or stops, and membership only
 grows, so this runs at most `tasks.len()` rounds.
+
+## `pub(super) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {`
+
+No eligible continuation when the run is ending, its lineage is
+waiting on a question, or the task has no generation awaiting attempt 1.

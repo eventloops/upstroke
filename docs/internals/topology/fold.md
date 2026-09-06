@@ -10,19 +10,18 @@ as it is in the source, so the heading is the grep string that finds the code.
 
 The checked fold: one transition function for a live run and for a replay.
 
-**INV-02 — an invalid transition is never appended, and never applied.**
-[`TopologyFold::plan_transition`] decides whether an event may be applied
-and returns a [`TopologyDelta`] when it may; [`TopologyFold::apply_delta`]
-is the only thing that changes the state, and a `TopologyDelta` is the only
-thing it accepts. The delta has no public constructor, so there is no way to
-reach the state except through the check — which is what makes "the live run
-and the replay use one transition" a property of the types rather than a
-convention two call sites are expected to keep.
+[`TopologyFold::plan_transition`] checks an event against the current fold
+and returns an opaque [`TopologyDelta`]. Private construction guarantees
+that a delta was checked, but does not guarantee freshness or single use.
+A cloned delta, or two deltas planned before either is applied, can become
+stale. [`TopologyFold::apply_delta`] does not recheck them.
 
 A live emission is `plan_transition` → append the exact bytes → `apply_delta`
-only after the append returned `Ok`. A replay is
-[`TopologyFold::replay`], which is those same two calls per event with the
-append taken out. Nothing else exists.
+only after the append returned `Ok`. Apply the delta exactly once to the
+fold that checked it, before planning or applying another transition.
+[`TopologyFold::replay`] uses those same calls once per event in order,
+with the append removed. This protocol preserves INV-02 and DESIGN §26's
+single transition implementation for live execution and replay.
 
 ### What the fold refuses
 
@@ -48,10 +47,8 @@ shapes, and a reader looking for them in one event will not find them:
 
 ### What it does not do
 
-No production path writes or reads a schema-4 log yet, and nothing here
-performs an effect: no ref moves, no worktree is created, no report is
-written. The fold decides what a log *means*; the effects that log
-authorizes, and the typed sites they run through, arrive in later slices.
+This module performs no I/O or Git effects. The schema-4 emitter owns the
+append protocol, while this fold checks transitions and derives run state.
 
 ## `pub enum FoldError {`
 
@@ -250,8 +247,8 @@ is only opened when the previous closed.
 
 ## `pub enum QuestionOrigin {`
 
-Why a question is open, which is what decides where its answer returns the
-task to.
+What raised a question. Answer state is derived from current fold facts,
+including outstanding questions, queued work and unelapsed backoff.
 
 ## `pub enum QuestionOrigin` › `VerificationPark,`
 
@@ -302,7 +299,7 @@ Everything one topology run has recorded.
 
 `PartialEq` and not `Eq`: the run record it holds carries the reported
 spend of a budget stop, and a float has no total equality. Comparing two of
-these is how a live fold and a replayed one are proved identical (INV-02).
+these tests live/replay agreement for the event trace being compared.
 
 ## `pub struct RunState` › `seen_questions: BTreeSet<QuestionId>,`
 
@@ -332,11 +329,11 @@ Digest of the exact `plan.normalized.json` bytes, in the
 
 One checked transition, ready to apply.
 
-Deliberately opaque and deliberately unconstructible outside this module:
-[`TopologyFold::apply_delta`] takes one of these and nothing else, so the
-only path into the state runs through [`TopologyFold::plan_transition`].
-That is INV-02 expressed as a type rather than as a rule two call sites are
-asked to remember.
+Construction is private, so each delta came from
+[`TopologyFold::plan_transition`]. The caller must apply it once to the
+same fold, with no intervening transition. Cloning does not renew that
+precondition, and applying a stale or duplicate delta is not checked.
+On the live path, append its event successfully once before applying it.
 
 ## `impl TopologyDelta` › `pub fn event(&self) -> &TopologyEvent {`
 
@@ -379,13 +376,12 @@ The [`FoldError`] of the first event that does not apply.
 
 ## `impl TopologyFold` › `pub fn plan_transition(&self, event: &TopologyEvent) -> Result<TopologyDelta, FoldError> {`
 
------------------------------------------------------------------------
-The transition
------------------------------------------------------------------------
-
-## `impl TopologyFold` › `pub fn plan_transition(&self, event: &TopologyEvent) -> Result<TopologyDelta, FoldError> {`
-
 Whether `event` may be applied to this state, and what applying it does.
+
+The returned delta is for this fold in its current state. On success,
+append its exact event and apply it once before any other transition.
+Planning a second delta does not reserve either transition or make the
+deltas safe to apply successively without checking again.
 
 ### Errors
 
@@ -401,8 +397,12 @@ error attempts no further transition. The command has already ended.
 
 ## `impl TopologyFold` › `pub fn apply_delta(&mut self, delta: TopologyDelta) {`
 
-Apply a checked transition. Total: every value it needs was decided by
-the check that produced the delta.
+Apply a delta once to the fold that checked it, with no intervening
+transition. On the live path its exact event must first be appended
+successfully once; replay applies it once for the corresponding record.
+
+These are caller preconditions. This method does not validate freshness,
+reject duplicate application or verify that an append occurred.
 
 ## `impl RunState {`
 
@@ -421,3 +421,22 @@ The region an ordinary dispatch of this entry would predict.
 The plan's path hints, taken literally: a hint with no glob metacharacter is
 its own literal prefix. Anything else — an absent hint list, or a hint whose
 literal prefix is empty — classifies repo-wide, which overlaps everything.
+
+## `open_mut` › `VerificationPark,`
+
+A verification could not be run. Its queued candidate remains available
+for verification under a new sequence after the lineage's last answer.
+
+## `open_mut` › `Admission,`
+
+An attempt parked, a repair's admission is gated, or a bare question was
+raised. The origin alone does not determine the task's next state.
+
+## `open_mut` › `deferred_tasks: BTreeSet<TaskKey>,`
+
+Execution backoff still owed, including tasks parked on questions.
+Accepted settlements add keys; elapsed waits and resume clear them.
+
+## `event` › `Answer(QuestionOrigin),`
+
+The checked question's origin, retained before application removes it.
