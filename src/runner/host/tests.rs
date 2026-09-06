@@ -5900,6 +5900,20 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         Some(normalised(&block))
     }
 
+    fn names_the_keyword(statement: &str) -> bool {
+        let joins = |character: char| character.is_alphanumeric() || character == '_';
+        statement.match_indices(KEYWORD).any(|(at, _)| {
+            let before = statement
+                .get(..at)
+                .and_then(|text| text.chars().next_back());
+            let after = statement
+                .get(at + KEYWORD.len()..)
+                .and_then(|text| text.chars().next());
+            !before.is_some_and(|character| joins(character) || character == '#')
+                && !after.is_some_and(joins)
+        })
+    }
+
     fn site_obligations(source: &str) -> Result<Vec<String>, String> {
         let lines: Vec<&str> = source
             .lines()
@@ -5916,10 +5930,7 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         }
         let mut obligations = Vec::new();
         for (index, statement) in code.iter().enumerate() {
-            if !statement
-                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
-                .any(|word| word == KEYWORD)
-            {
+            if !names_the_keyword(statement) {
                 continue;
             }
             let mut opens_at = index;
@@ -5959,12 +5970,12 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
 
     let lines_here = SOURCE.lines().count();
     let prose = format!(
-        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: u8 = 0; // {KEYWORD}\n"
+        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: u8 = 0; // {KEYWORD}\nfn harmless() {{\n    let r#{KEYWORD} = 0;\n    let {KEYWORD}_free = r#{KEYWORD};\n}}\n"
     );
     assert_eq!(
         site_obligations(&prose).as_deref(),
         Ok(site_obligations_here.as_slice()),
-        "the keyword in a literal or a comment is prose, not an operation"
+        "the keyword in a literal, a comment or a raw identifier is prose, not an operation"
     );
     let bare = format!("{SOURCE}fn injected() {{\n    let _ = {KEYWORD} {{ 0 }};\n}}\n");
     assert_eq!(

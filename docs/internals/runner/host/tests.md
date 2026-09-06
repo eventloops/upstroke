@@ -3013,6 +3013,16 @@ what makes a truncated block visible: the remnant is still a comment, but it is
 no longer the line above. It reads the source lines, not the blanked view, so
 the obligation is compared as the reader sees it.
 
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn names_the_keyword(statement: &str) -> bool {`
+
+Whether a blanked line carries the keyword as a token: an occurrence with no
+identifier character on either side, and no `#` before it. Edition 2024 admits
+a keyword as a raw identifier, so `r#unsafe` is a binding, not an operation,
+and a splitter that treats `#` as a delimiter reads it as one;
+`PR157-ASTRA-SITE-SAFETY-RECOVERY-R1-001` is that finding. No other Rust token
+puts `#` directly before the word: an unsafe attribute opens with `#[`, so it
+still counts.
+
 ## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn site_obligations(source: &str) -> Result<Vec<String>, String> {`
 
 The scan proper, over any source text, so the controls below can run it over a
@@ -3041,8 +3051,9 @@ meaning.
 The census's own controls, section 12's positive control included, each built by
 appending to the real module so the domain is the whole file and not a
 fixture shaped to pass. The keyword inside a string literal, a raw string
-literal, a one-line and a multi-line block comment and a trailing `//` comment
-must leave the obligations exactly as they were; an operation appended with
+literal, a one-line and a multi-line block comment and a trailing `//` comment,
+as a raw identifier and as the start of a longer identifier must leave the
+obligations exactly as they were; an operation appended with
 nothing above it must be refused at its own line number, which is also the
 proof that positions are preserved; and an operation appended under a fresh
 `SAFETY:` line must contribute exactly that line's text, read from the source
