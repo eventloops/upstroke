@@ -42,6 +42,28 @@ impl fmt::Display for ValidationErrors {
     }
 }
 
+#[derive(Debug)]
+pub struct CleanupError {
+    pub primary: Box<UpstrokeError>,
+    pub additional: Vec<UpstrokeError>,
+}
+
+impl fmt::Display for CleanupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.primary)?;
+        for error in &self.additional {
+            write!(f, "; additional cleanup failure: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self.primary.as_ref())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum UpstrokeError {
     #[error("failed to read {}: {source}", .path.display())]
@@ -99,9 +121,28 @@ pub enum UpstrokeError {
 
     #[error(transparent)]
     WithWarnings(WarnedError),
+
+    #[error(transparent)]
+    WithCleanup(CleanupError),
 }
 
 impl UpstrokeError {
+    pub(crate) fn with_cleanup(self, cleanup: Result<(), Self>) -> Self {
+        match cleanup {
+            Ok(()) => self,
+            Err(additional) => match self {
+                Self::WithCleanup(mut bundle) => {
+                    bundle.additional.push(additional);
+                    Self::WithCleanup(bundle)
+                }
+                primary => Self::WithCleanup(CleanupError {
+                    primary: Box::new(primary),
+                    additional: vec![additional],
+                }),
+            },
+        }
+    }
+
     pub(crate) fn with_warnings(self, mut warnings: Vec<String>) -> Self {
         if warnings.is_empty() {
             return self;
@@ -160,5 +201,39 @@ mod tests {
         };
         assert!(matches!(bundle.error.as_ref(), UpstrokeError::Parse { .. }));
         assert_eq!(bundle.warnings, ["first", "second"]);
+    }
+
+    #[test]
+    fn cleanup_retains_primary_kind_source_and_exact_diagnostic() {
+        let error = UpstrokeError::Io {
+            path: PathBuf::from("plan.md"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read refused"),
+        }
+        .with_cleanup(Err(UpstrokeError::Agent {
+            message: "reaper refused".to_owned(),
+        }))
+        .with_cleanup(Err(UpstrokeError::Agent {
+            message: "wait refused".to_owned(),
+        }));
+        let UpstrokeError::WithCleanup(bundle) = &error else {
+            panic!("cleanup must preserve the primary in a typed bundle");
+        };
+        assert!(matches!(bundle.primary.as_ref(), UpstrokeError::Io { .. }));
+        assert_eq!(bundle.additional.len(), 2);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("original cause")
+                .to_string(),
+            "read refused"
+        );
+        assert_eq!(
+            error.to_string(),
+            "failed to read plan.md: read refused; additional cleanup failure: agent error: reaper refused; additional cleanup failure: agent error: wait refused"
+        );
+        let unchanged = UpstrokeError::Agent {
+            message: "startup refused".to_owned(),
+        }
+        .with_cleanup(Ok(()));
+        assert!(matches!(unchanged, UpstrokeError::Agent { .. }));
     }
 }

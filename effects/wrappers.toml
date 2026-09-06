@@ -1145,18 +1145,51 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
-    # Snapshot the buffer after a bounded grace instead of joining, so an
-    # orphan holding the write end cannot stall the supervisor.
+    # Release and join the nonblocking reader before taking its capture.
     "collect",
+    "collect_bytes",
     # Whether either stream hit the capture allowance; the supervisor asks
     # before it decides to terminate the tree.
     "drain_limit_exceeded",
+    # Drain::drop cancels and joins, then records an uncollected failure.
+    "drop",
+    "failure_report",
+    # `Display for Stream`: the two stream labels, for diagnostics.
+    "fmt",
     "limit_exceeded",
     # Hands the reader to a thread. `thread::spawn` is not
     # `std::process::Command::spawn`, and this module's own `start` is not a
     # denied path: a segment-matching scan flags both and neither is one.
     "start",
 ]
+
+[[module]]
+path = "src/agent/proc/input.rs"
+crate_path = "upstroke::agent::proc::input"
+funnel = []
+effectful = []
+# Starting the feeder schedules stdin writes inside the private Process funnel.
+effectful_unnameable = ["start"]
+effect_free = ["collect", "drop", "failure_report"]
+
+[[module]]
+path = "src/agent/proc/pipe_io.rs"
+crate_path = "upstroke::agent::proc::pipe_io"
+funnel = []
+effectful = []
+# These private operations create/transfer writable pipe handles or write the
+# Process funnel's stdin. They cannot be named outside the private module.
+effectful_unnameable = ["configure", "nonblocking", "pair", "take", "try_write"]
+effect_free = ["try_read"]
+
+[[module]]
+path = "src/agent/proc/worker.rs"
+crate_path = "upstroke::agent::proc::worker"
+funnel = []
+effectful = []
+effectful_unnameable = []
+# Cancellation, joining and failure slots affect only process-local state.
+effect_free = ["drop", "record", "settle", "spawn", "take"]
 
 [[module]]
 path = "src/agent/claude.rs"

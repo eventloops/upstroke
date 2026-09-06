@@ -67,3 +67,15 @@ Non-fatal diagnostics do not replace or hide the operation's refusal.
 
 Carry earlier warnings through a refusal without changing a clean
 error's variant. An existing diagnostic bundle is flattened in order.
+
+## Cleanup failures
+
+`WithCleanup` owns the original typed failure and each later cleanup failure.
+Successful cleanup returns the original variant unchanged. Further failures
+append in observation order. Display renders the primary once, followed by
+labelled cleanup failures. Its source forwards the primary's underlying
+cause, matching `WithWarnings`, so rendering does not repeat the primary.
+The boxed primary breaks the recursive type without shared ownership.
+
+This adds a public error variant. Downstream exhaustive matches must handle
+`WithCleanup`; callers can inspect its primary and additional typed errors.
