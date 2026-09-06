@@ -403,7 +403,7 @@ into a record, and the value INV-23's rebuild path compares against a
 recorded one ("today's `[runner]` config that differs warns naming the
 difference and is ignored").
 
-[`RunnerPolicy`]: crate::topology::events::RunnerPolicy
+[`RunnerPolicy`]: ../../src/topology/events.rs
 
 ## `pub kind: RunnerKind,`
 
