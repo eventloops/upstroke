@@ -2,15 +2,15 @@
 
 // Allowlist placement: the funnel section of `effects/allowlist.toml`, which
 // carries this module's review clause. `effect_site_inventory.mechanism` (2).
+
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
     clippy::disallowed_macros
 )]
 
-use std::io::Write;
 use std::ops::{Deref, DerefMut};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -140,172 +140,263 @@ fn run_with_timeout_and_limit(
     hooks: &mut dyn SpawnHooks,
 ) -> Result<ProcessOutput, UpstrokeError> {
     validate_process_sites(spawn_site, terminate_site)?;
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut reports = [None, None, None];
+    let [input_report, stdout_report, stderr_report] = &mut reports;
+    let outcome = (|| {
+        let prepared =
+            pipe_io::Prepared::configure(&mut command).map_err(|error| UpstrokeError::Agent {
+                message: format!("preparing agent pipes: {error}"),
+            })?;
 
-    #[cfg(unix)]
-    let mut termination = termination::Supervisor::begin(terminate_site)?;
-    #[cfg(unix)]
-    apply(
-        hooks.point(SubEffectPoint::ReaperStarted),
-        SubEffectPoint::ReaperStarted,
-    )?;
-    #[cfg(unix)]
-    termination.prepare(&mut command);
+        #[cfg(unix)]
+        let mut termination = termination::Supervisor::begin(terminate_site)?;
+        #[cfg(unix)]
+        apply(
+            hooks.point(SubEffectPoint::ReaperStarted),
+            SubEffectPoint::ReaperStarted,
+        )?;
+        #[cfg(unix)]
+        termination.prepare(&mut command);
 
-    let started = Instant::now();
-    let mut child = ProcessTree::spawn(&mut command, hooks).map_err(|e| UpstrokeError::Agent {
-        message: format!(
-            "failed to spawn `{}`: {e}",
-            command.get_program().to_string_lossy()
-        ),
-    })?;
-    #[cfg(unix)]
-    apply(
-        hooks.point(SubEffectPoint::PreExecPgidAndRegister),
-        SubEffectPoint::PreExecPgidAndRegister,
-    )?;
-    #[cfg(unix)]
-    apply(hooks.point(SubEffectPoint::Exec), SubEffectPoint::Exec)?;
-    #[cfg(unix)]
-    if let Err(error) = termination.register(child.id()) {
-        drop(termination);
-        kill_tree(terminate_site, &mut child)?;
-        return Err(error);
-    }
-    #[cfg(unix)]
-    apply(
-        hooks.point(SubEffectPoint::Registered),
-        SubEffectPoint::Registered,
-    )?;
-
-    let stdin_bytes = stdin_data.to_vec();
-    let stdin_handle = child.stdin.take();
-    let stdin_thread = thread::spawn(move || {
-        if let Some(mut pipe) = stdin_handle {
-            let _ = pipe.write_all(&stdin_bytes);
+        let started = Instant::now();
+        let mut child =
+            ProcessTree::spawn(&mut command, hooks).map_err(|e| UpstrokeError::Agent {
+                message: format!(
+                    "failed to spawn `{}`: {e}",
+                    command.get_program().to_string_lossy()
+                ),
+            })?;
+        drop(command);
+        #[cfg(unix)]
+        apply(
+            hooks.point(SubEffectPoint::PreExecPgidAndRegister),
+            SubEffectPoint::PreExecPgidAndRegister,
+        )?;
+        #[cfg(unix)]
+        apply(hooks.point(SubEffectPoint::Exec), SubEffectPoint::Exec)?;
+        #[cfg(unix)]
+        if let Err(error) = termination.register(child.id()) {
+            drop(termination);
+            return Err(error.with_cleanup(kill_tree(terminate_site, &mut child)));
         }
-    });
+        #[cfg(unix)]
+        apply(
+            hooks.point(SubEffectPoint::Registered),
+            SubEffectPoint::Registered,
+        )?;
 
-    let stdout_drain = child
-        .stdout
-        .take()
-        .map(|pipe| Drain::start(pipe, output_limit));
-    let stderr_drain = child
-        .stderr
-        .take()
-        .map(|pipe| Drain::start(pipe, output_limit));
-
-    let mut timed_out = false;
-    let mut output_limited = false;
-    #[cfg(unix)]
-    let code = loop {
-        match child_exited_unreaped(&child) {
-            Ok(true) => {
-                if let Err(error) = termination.finish() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-                let status = child.wait().map_err(|e| UpstrokeError::Agent {
-                    message: format!("reaping agent process: {e}"),
+        let input_error = |error: input::FeedError| UpstrokeError::Agent {
+            message: format!("supervising agent input: {error}"),
+        };
+        let output_error = |error: DrainError| UpstrokeError::Agent {
+            message: format!("supervising agent output: {error}"),
+        };
+        let workers = (|| {
+            let pipes = prepared
+                .take(&mut child)
+                .map_err(|error| UpstrokeError::Agent {
+                    message: format!("taking agent pipes: {error}"),
                 })?;
-                break status.code();
+            let input =
+                input::Feeder::start(pipes.stdin, stdin_data.to_vec()).map_err(input_error)?;
+            *input_report = Some(input.failure_report());
+            let stdout =
+                Drain::start(Stream::Stdout, pipes.stdout, output_limit).map_err(output_error)?;
+            *stdout_report = Some(stdout.failure_report());
+            let stderr =
+                Drain::start(Stream::Stderr, pipes.stderr, output_limit).map_err(output_error)?;
+            *stderr_report = Some(stderr.failure_report());
+            Ok::<_, UpstrokeError>((Some(input), Some(stdout), Some(stderr)))
+        })();
+        let (stdin_feeder, stdout_drain, stderr_drain) = match workers {
+            Ok(workers) => workers,
+            Err(error) => {
+                #[cfg(unix)]
+                {
+                    return Err(settle_failed_supervision(
+                        error,
+                        termination.finish(),
+                        &mut child,
+                    ));
+                }
+                #[cfg(not(unix))]
+                return Err(error.with_cleanup(kill_tree(terminate_site, &mut child)));
             }
-            Ok(false) => {
-                if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
-                    output_limited = true;
+        };
+
+        let mut timed_out = false;
+        let mut output_limited = false;
+        #[cfg(unix)]
+        let code = loop {
+            match child_exited_unreaped(&child) {
+                Ok(true) => {
                     if let Err(error) = termination.finish() {
+                        return Err(settle_failed_supervision(error, Ok(()), &mut child));
+                    }
+                    let status = child.wait().map_err(|e| UpstrokeError::Agent {
+                        message: format!("reaping agent process: {e}"),
+                    })?;
+                    break status.code();
+                }
+                Ok(false) => {
+                    if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
+                        output_limited = true;
+                        if let Err(error) = termination.finish() {
+                            return Err(settle_failed_supervision(error, Ok(()), &mut child));
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Err(error);
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                } else if started.elapsed() >= timeout {
-                    timed_out = true;
-                    if let Err(error) = termination.finish() {
+                        break None;
+                    } else if started.elapsed() >= timeout {
+                        timed_out = true;
+                        if let Err(error) = termination.finish() {
+                            return Err(settle_failed_supervision(error, Ok(()), &mut child));
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Err(error);
+                        break None;
                     }
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
+                    thread::sleep(Duration::from_millis(50));
                 }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let cleanup = termination.finish();
-                let _ = child.kill();
-                let _ = child.wait();
-                cleanup?;
-                return Err(UpstrokeError::Agent {
-                    message: format!("waiting on agent process: {e}"),
-                });
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                child.finish_direct_exit()?;
-                break status.code();
-            }
-            Ok(None) => {
-                if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
-                    output_limited = true;
-                    kill_tree(terminate_site, &mut child)?;
-                    break None;
-                } else if started.elapsed() >= timeout {
-                    timed_out = true;
-                    kill_tree(terminate_site, &mut child)?;
-                    break None;
+                Err(e) => {
+                    let primary = UpstrokeError::Agent {
+                        message: format!("waiting on agent process: {e}"),
+                    };
+                    return Err(settle_failed_supervision(
+                        primary,
+                        termination.finish(),
+                        &mut child,
+                    ));
                 }
-                thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                kill_tree(terminate_site, &mut child)?;
-                return Err(UpstrokeError::Agent {
-                    message: format!("waiting on agent process: {e}"),
-                });
+        };
+        #[cfg(not(unix))]
+        let code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child.finish_direct_exit()?;
+                    break status.code();
+                }
+                Ok(None) => {
+                    if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
+                        output_limited = true;
+                        kill_tree(terminate_site, &mut child)?;
+                        break None;
+                    } else if started.elapsed() >= timeout {
+                        timed_out = true;
+                        kill_tree(terminate_site, &mut child)?;
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let primary = UpstrokeError::Agent {
+                        message: format!("waiting on agent process: {e}"),
+                    };
+                    return Err(primary.with_cleanup(kill_tree(terminate_site, &mut child)));
+                }
             }
+        };
+        let duration = started.elapsed();
+
+        let grace = if timed_out || output_limited {
+            DRAIN_GRACE_KILL
+        } else {
+            DRAIN_GRACE_EXIT
+        };
+        if let Some(feeder) = stdin_feeder {
+            feeder.collect(grace).map_err(input_error)?;
         }
-    };
-    let duration = started.elapsed();
+        let collect = |drain: Option<Drain>| -> Result<(String, bool), UpstrokeError> {
+            match drain {
+                Some(drain) => {
+                    let Captured {
+                        text,
+                        limited,
+                        ended: _,
+                    } = drain.collect(grace).map_err(output_error)?;
+                    Ok((text, limited))
+                }
+                None => Ok((String::new(), false)),
+            }
+        };
+        let (stdout, stdout_limited) = collect(stdout_drain)?;
+        let (stderr, stderr_limited) = collect(stderr_drain)?;
+        output_limited |= stdout_limited || stderr_limited;
 
-    let grace = if timed_out || output_limited {
-        DRAIN_GRACE_KILL
-    } else {
-        DRAIN_GRACE_EXIT
-    };
-    let stdin_deadline = Instant::now() + grace;
-    while !stdin_thread.is_finished() && Instant::now() < stdin_deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-    if stdin_thread.is_finished() {
-        let _ = stdin_thread.join();
-    }
-    let (stdout, stdout_limited) = stdout_drain.map(|d| d.collect(grace)).unwrap_or_default();
-    let (stderr, stderr_limited) = stderr_drain.map(|d| d.collect(grace)).unwrap_or_default();
-    output_limited |= stdout_limited || stderr_limited;
+        Ok(ProcessOutput {
+            code,
+            stdout,
+            stderr,
+            duration,
+            timed_out,
+            output_limited,
+        })
+    })();
+    finish_pipe_reports(outcome, reports)
+}
 
-    Ok(ProcessOutput {
-        code,
-        stdout,
-        stderr,
-        duration,
-        timed_out,
-        output_limited,
-    })
+fn finish_pipe_reports<T>(
+    outcome: Result<T, UpstrokeError>,
+    reports: [Option<worker::FailureReport>; 3],
+) -> Result<T, UpstrokeError> {
+    let additional = reports
+        .into_iter()
+        .flatten()
+        .filter_map(|report| report.take())
+        .collect::<Vec<_>>();
+    if additional.is_empty() {
+        return outcome;
+    }
+    let primary = match outcome {
+        Ok(_) => UpstrokeError::Agent {
+            message: "pipe supervision failed during cleanup".to_owned(),
+        },
+        Err(primary) => primary,
+    };
+    Err(additional.into_iter().fold(primary, |primary, message| {
+        primary.with_cleanup(Err(UpstrokeError::Agent { message }))
+    }))
+}
+
+#[cfg(unix)]
+fn settle_failed_supervision(
+    primary: UpstrokeError,
+    cleanup: Result<(), UpstrokeError>,
+    child: &mut ProcessTree,
+) -> UpstrokeError {
+    let primary = primary.with_cleanup(cleanup);
+    let kill = child.kill();
+    let wait = child.wait().map(|_| ());
+    finish_failed_supervision_cleanup(primary, kill, wait)
+}
+
+#[cfg(unix)]
+fn finish_failed_supervision_cleanup(
+    primary: UpstrokeError,
+    kill: std::io::Result<()>,
+    wait: std::io::Result<()>,
+) -> UpstrokeError {
+    // A successful wait proves the child was reaped, including the race where
+    // it exited before kill. A failed wait cannot justify suppressing kill.
+    match wait {
+        Ok(_) => primary,
+        Err(source) => primary
+            .with_cleanup(kill.map_err(|source| UpstrokeError::Agent {
+                message: format!("killing agent after supervision failure: {source}"),
+            }))
+            .with_cleanup(Err(UpstrokeError::Agent {
+                message: format!("reaping agent after supervision failure: {source}"),
+            })),
+    }
 }
 
 mod drain;
-use self::drain::{Drain, drain_limit_exceeded};
+use self::drain::{Captured, Drain, DrainError, Stream, drain_limit_exceeded};
+
+mod input;
+mod pipe_io;
+mod worker;
 
 fn kill_tree(terminate_site: ProcessSite, child: &mut ProcessTree) -> Result<(), UpstrokeError> {
     debug_assert_eq!(terminate_site, ProcessSite::Terminate);
@@ -4221,6 +4312,64 @@ mod termination {
             }
         }
 
+        fn spawn_sigchld_target() -> (libc::pid_t, std::os::fd::OwnedFd) {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            // Resolve libc's descriptor ceiling before entering the forked
+            // child, where only async-signal-safe operations are permitted.
+            // SAFETY: sysconf takes a constant selector and no pointers.
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let open_max =
+                libc::c_int::try_from(open_max).expect("the descriptor ceiling fits c_int");
+            assert!(open_max > 0, "the descriptor ceiling is available");
+            let [reader, writer] = create_cloexec_pipe().expect("the target lifetime pipe");
+            // SAFETY: create_cloexec_pipe returned two distinct, owned file
+            // descriptors. Each is transferred to exactly one OwnedFd here.
+            let lifetime_read = unsafe { OwnedFd::from_raw_fd(reader) };
+            // SAFETY: writer is the other newly created, independently owned fd.
+            let lifetime_write = unsafe { OwnedFd::from_raw_fd(writer) };
+            // SAFETY: the child only sets its group, closes descriptors, reads
+            // its pipe, inspects errno, and exits without Rust destructors.
+            let target = unsafe { libc::fork() };
+            if target == 0 {
+                // SAFETY: zero names this child and its own new group.
+                if unsafe { libc::setpgid(0, 0) } != 0 {
+                    // SAFETY: exit the forked child without running destructors.
+                    unsafe { libc::_exit(1) };
+                }
+                close_inherited_fds(&[lifetime_read.as_raw_fd()], open_max);
+                let mut byte = [0_u8; 1];
+                loop {
+                    // SAFETY: the retained fd is readable and byte is writable
+                    // for its full length. No allocation or lock follows fork.
+                    let read = unsafe {
+                        libc::read(
+                            lifetime_read.as_raw_fd(),
+                            byte.as_mut_ptr().cast(),
+                            byte.len(),
+                        )
+                    };
+                    if read >= 0 || !last_errno_is_interrupted() {
+                        // EOF is parent death/unwind. Any other terminal pipe
+                        // result also ends this otherwise idle fixture target.
+                        // SAFETY: no Rust state is shared back across fork.
+                        unsafe { libc::_exit(0) };
+                    }
+                }
+            }
+            assert!(target > 0, "fork the SIGCHLD fixture target");
+            drop(lifetime_read);
+            // SAFETY: target is our newly forked child. The child also calls
+            // setpgid so either scheduling order establishes the same group.
+            let result = unsafe { libc::setpgid(target, target) };
+            assert!(
+                result == 0 || matches!(last_errno(), libc::EACCES | libc::EPERM),
+                "setpgid: {}",
+                std::io::Error::last_os_error()
+            );
+            (target, lifetime_write)
+        }
+
         #[test]
         #[ignore = "subprocess helper"]
         fn sigchld_reaper_host_helper() {
@@ -4228,6 +4377,8 @@ mod termination {
                 return;
             }
             REAPED_CHILD_STOP.store(false, Ordering::SeqCst);
+            // SAFETY: this isolated helper deliberately installs the supplied
+            // async-signal-safe SIGCHLD callback before creating its children.
             assert_ne!(
                 unsafe {
                     libc::signal(
@@ -4237,25 +4388,135 @@ mod termination {
                 },
                 libc::SIG_ERR
             );
-            let target = unsafe { libc::fork() };
-            if target == 0 {
-                let _ = unsafe { libc::setpgid(0, 0) };
-                loop {
-                    unsafe { libc::pause() };
-                }
-            }
-            assert!(target > 0);
-            let result = unsafe { libc::setpgid(target, target) };
-            assert!(
-                result == 0 || matches!(last_errno(), libc::EACCES | libc::EPERM),
-                "setpgid: {}",
-                std::io::Error::last_os_error()
-            );
+            let (target, _parent_lifetime) = spawn_sigchld_target();
 
             let reaper = spawn_reaper().expect("spawn private reaper");
             assert!(reaper.register_raw(target), "register target group");
             assert!(reaper.cleanup(target), "cleanup target group");
-            let _ = unsafe { libc::waitpid(target, std::ptr::null_mut(), 0) };
+            let started = Instant::now();
+            loop {
+                // SAFETY: target is the fixture child. The installed callback
+                // may already have reaped it, which is the accepted ECHILD case.
+                let result = unsafe { libc::waitpid(target, std::ptr::null_mut(), libc::WNOHANG) };
+                if result == target || (result < 0 && last_errno() == libc::ECHILD) {
+                    break;
+                }
+                assert!(
+                    result == 0 || last_errno_is_interrupted(),
+                    "wait for settled target"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "reap settled target"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_lifetime_target(target: libc::pid_t) -> Option<libc::c_int> {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                let mut status = 0;
+                // SAFETY: status is writable, and target is this helper's
+                // unreaped child. WNOHANG makes this observation bounded.
+                let result = unsafe { libc::waitpid(target, &mut status, libc::WNOHANG) };
+                if result == target {
+                    return Some(status);
+                }
+                assert!(
+                    result == 0 || last_errno_is_interrupted(),
+                    "polling owned lifetime target: {}",
+                    std::io::Error::last_os_error()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            None
+        }
+
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn sigchld_target_setup_failure_helper() {
+            if std::env::var_os("UPSTROKE_SIGCHLD_TARGET_FAILURE_HELPER").is_none() {
+                return;
+            }
+            // SAFETY: this fresh helper process owns its only child and all
+            // waits. Default SIGCHLD retains a zombie until our waitpid, so a
+            // timed-out mutation can be killed without a PID-reuse window.
+            assert_ne!(
+                unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) },
+                libc::SIG_ERR
+            );
+            let (target, parent_lifetime) = spawn_sigchld_target();
+            let refusal = std::panic::catch_unwind(move || {
+                let _parent_lifetime = parent_lifetime;
+                let _reaper = spawn_reaper().expect("forced reaper startup refusal");
+            });
+            let exited = wait_for_lifetime_target(target);
+            if exited.is_none() {
+                // SAFETY: SIGCHLD is default, target has never been reaped,
+                // and this fresh process has no other waiter. Its identity
+                // remains pinned even if it exits between the poll and kill.
+                assert_eq!(unsafe { libc::kill(target, libc::SIGKILL) }, 0);
+                assert!(
+                    wait_for_lifetime_target(target).is_some(),
+                    "reap the deliberately broken fixture before failing its witness"
+                );
+            }
+            assert!(refusal.is_err(), "the injected startup refusal occurred");
+            let status = exited.expect("the parked target survived parent setup failure");
+            assert!(libc::WIFEXITED(status), "the target exited on pipe closure");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        #[test]
+        fn a_parked_sigchld_target_exits_after_parent_setup_failure() {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "sigchld_target_setup_failure_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("UPSTROKE_SIGCHLD_TARGET_FAILURE_HELPER", "1")
+                .env("UPSTROKE_TEST_HELPER_EXIT_BEFORE_READY", "7")
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            let mut helper = command
+                .spawn()
+                .expect("spawn isolated target-failure helper");
+            let pid = i32::try_from(helper.id()).expect("helper process-group id");
+            let started = Instant::now();
+            loop {
+                if let Some(status) = helper.try_wait().expect("poll the target-failure helper") {
+                    assert!(status.success(), "target-failure helper: {status}");
+                    break;
+                }
+                if started.elapsed() >= Duration::from_secs(60) {
+                    // SAFETY: the helper is our unreaped process-group leader;
+                    // its group is isolated by CommandExt::process_group.
+                    let signaled = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    let cleanup_started = Instant::now();
+                    let mut reaped = false;
+                    while cleanup_started.elapsed() < Duration::from_secs(10) {
+                        if helper
+                            .try_wait()
+                            .expect("reap the timed-out helper")
+                            .is_some()
+                        {
+                            reaped = true;
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    panic!(
+                        "target-failure helper exceeded its bound; kill={signaled}, reaped={reaped}"
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         #[test]

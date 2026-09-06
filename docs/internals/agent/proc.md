@@ -25,9 +25,9 @@ Object before its suspended primary thread is allowed to execute. Closing
 that handle kills ordinary descendants even when the direct child exits
 successfully or Upstroke is terminated. Explicit cleanup uses the same job
 and a bounded wait; it never shells out to a PID-based tree walker. Any
-process that inherited a pipe handle must not be able to stall the drain —
-readers accumulate into shared buffers that are snapshotted after a bounded
-grace instead of joined unconditionally.
+process that inherited a pipe handle must not be able to stall the drain.
+Parent endpoints use nonblocking I/O. After a bounded grace, collection
+releases and joins each worker before taking its captured output.
 
 Unix subtleties are the mirror image: each invocation gets an isolated
 process group so a timeout can kill every member, but that isolation
@@ -153,10 +153,16 @@ containment sub-effect points observable.
 timeout and output-limit cleanup carry the validated termination site into
 the platform primitive. `stdin_data` is bytes because a
 [`crate::runner::CommandSpec`] carries bytes.
+Output collection has a bounded post-exit grace. An escaped descendant
+holding a writer can leave partial stdout or stderr; [`ProcessOutput`]
+does not expose whether either reader reached EOF.
 
 ### Errors
 
-Spawn failure, supervision failure, or a fault the observer injected.
+Spawn failure, supervision failure -- among them a reader thread the OS
+refused, a stream whose read failed rather than ended, or a stdin write
+failure other than the child's broken-pipe refusal, or a fault the observer
+injected. Pipe worker panics are supervision failures too.
 
 ## `let mut termination = termination::Supervisor::begin(terminate_site)?;`
 
@@ -1948,3 +1954,105 @@ did, for `workspace`, `rundir` and the witnesses below.
 `cfg(test)` and `effects::census_domain` resolves it as a whole-file test
 module through that inline ancestry rather than through an attribute
 written here.
+
+## `memoised_outcome` › `pub stdout: String,`
+
+Captured stdout, decoded lossily as UTF-8. An inherited writer that
+outlives the post-exit grace can leave this partial; this public result
+has no flag proving that EOF was observed.
+
+## `memoised_outcome` › `pub stderr: String,`
+
+Captured stderr with the same grace and decoding policy as `stdout`.
+
+## `run_with_timeout_and_limit` › `let mut termination = termination::Supervisor::begin(terminate_site)?;`
+
+Enter before `spawn`: if an interrupt arrives in the narrow interval
+between creating the child and learning its pid, the signal monitor
+waits for this registration rather than terminating Upstroke first and
+orphaning the new process group.
+
+## `run_with_timeout_and_limit` › `apply(`
+
+`Spawn.Registered`: "parent-side registration".
+
+## `run_with_timeout_and_limit` › `drop(command);`
+
+Spawn borrows configured Stdio. Drop our copies of the child's pipe
+ends now, or they would suppress EOF and conceal declined stdin.
+The spawn-error closure above still has Command for its diagnostic.
+
+## `run_with_timeout_and_limit` › `apply(hooks.point(SubEffectPoint::Exec), SubEffectPoint::Exec)?;`
+
+`Spawn.Exec`: `Command::spawn` reports a failed `execvp` through its own
+CLOEXEC status pipe and returns `Err`, so reaching here is the exec
+having succeeded.
+
+## `run_with_timeout_and_limit` › `drop(termination);`
+
+Drop the pre-exec reaper first: it still has an anchor pinning this
+child's group identity and will kill every member before returning.
+
+## `run_with_timeout_and_limit` › `let input_error = |error: input::FeedError| UpstrokeError::Agent {`
+
+Feed stdin from its own thread: the child may not read stdin until it
+has written output, and this thread must not block the pipe drains.
+The copy transfers owned input to a worker joined before this call ends.
+
+## `run_with_timeout_and_limit` › `{`
+
+A missing pipe worker can stall the child. Treat any
+worker-start refusal as a supervision failure and settle
+the tree; dropping successful workers releases them too.
+
+## `run_with_timeout_and_limit` › `if let Err(error) = termination.finish() {`
+
+Leave the exited leader as a zombie until cleanup completes:
+its PID pins the PGID, so no unrelated group can reuse the
+numeric id between observation and the final signal.
+
+## `run_with_timeout_and_limit` › `if let Some(feeder) = stdin_feeder {`
+
+A descendant retaining stdin cannot keep a nonblocking poll waiting.
+Collection releases and joins, then observes every returned failure.
+
+## `run_with_timeout_and_limit` › `let collect = |drain: Option<Drain>| -> Result<(String, bool), UpstrokeError> {`
+
+The public agent result retains the bounded partial-output policy.
+An escaped writer may remain open after the grace. Cancellation
+ends polling and joins the worker, but does not prove EOF. Complete
+binary consumers use collect_bytes and inspect ended and limited.
+
+## `run_with_timeout_and_limit` › `finish_pipe_reports(outcome, reports)`
+
+All worker owners have settled, including early error exits. Each slot
+contributes at most one secondary diagnostic to the returned outcome.
+
+## `mod input;`
+
+The stdin worker's error publication and bounded post-exit lifecycle.
+
+## `fn spawn_sigchld_target() -> (libc::pid_t, std::os::fd::OwnedFd) {`
+
+The parked target owns only its lifetime pipe. A setup failure or
+parent death closes the writer and ends it even before a reaper
+has registered its separate process group.
+
+## `fn wait_for_lifetime_target(target: libc::pid_t) -> Option<libc::c_int> {`
+
+Poll a child owned by the isolated lifetime helper. That helper
+installs SIG_DFL for SIGCHLD and has no other waiter or child.
+
+## `sigchld_target_setup_failure_helper` › `let _reaper = spawn_reaper().expect("forced reaper startup refusal");`
+
+The outer test makes the reaper exit without READY. This
+forces startup refusal regardless of process scheduling.
+
+## Pipe startup failure reporting
+
+A failed pipe or worker startup retains its original error while settling the
+registered process. Reaper, kill and wait failures accompany that primary
+failure. A successful wait proves the direct child was reaped and makes a
+racing kill refusal irrelevant. If wait fails, both kill and wait errors are
+reported. Deferred worker reports append through `WithCleanup`, preserving
+the primary type and avoiding a second agent-error prefix around it.

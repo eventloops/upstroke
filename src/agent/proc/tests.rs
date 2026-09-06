@@ -8,8 +8,9 @@
     clippy::disallowed_macros
 )]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::mpsc;
 
 use crate::topology::effects::Injection;
@@ -466,6 +467,54 @@ fn stdin_reaches_the_child() {
     let out = run_with_timeout(shell(script), "ping pong\n", Duration::from_secs(30))
         .expect("spawn shell");
     assert!(out.stdout.contains("ping"), "stdout: {}", out.stdout);
+}
+
+#[test]
+fn a_child_can_exit_without_consuming_its_input() {
+    let input = "x".repeat(1 << 20);
+    let out = run_with_timeout(shell("exit 0"), &input, Duration::from_secs(30))
+        .expect("the child may decline the remaining input");
+    assert_eq!(out.code, Some(0));
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn nonblocking_pipe_large_input_helper() {
+    if std::env::var_os("UPSTROKE_NONBLOCKING_INPUT_HELPER").is_none() {
+        return;
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .expect("read through stdin EOF");
+    assert_eq!(bytes.len(), 1024 * 1024);
+    assert!(bytes.iter().all(|byte| *byte == b'x'));
+    std::io::stdout()
+        .write_all(&bytes)
+        .expect("echo the complete large input");
+    std::io::stdout().flush().expect("flush echoed input");
+}
+
+#[test]
+fn nonblocking_pipes_deliver_input_larger_than_pipe_capacity() {
+    let input = "x".repeat(1024 * 1024);
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args([
+            "agent::proc::tests::nonblocking_pipe_large_input_helper",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("UPSTROKE_NONBLOCKING_INPUT_HELPER", "1");
+    let output = run_with_timeout(command, &input, Duration::from_secs(30))
+        .expect("nonblocking pipe supervision");
+    assert_eq!(output.code, Some(0), "{}", output.stderr);
+    assert!(!output.timed_out && !output.output_limited);
+    assert!(
+        output.stdout.contains(&input),
+        "every input byte reached the reading child and returned"
+    );
 }
 
 #[test]
@@ -3320,4 +3369,64 @@ fn staging_names(dir: &Path) -> Vec<String> {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.ends_with(".publishing"))
         .collect()
+}
+
+#[test]
+fn pipe_cleanup_reports_preserve_the_primary_without_duplicate_prefixes() {
+    let input = worker::FailureReport::default();
+    input.record("writing stdin: write refused");
+    let output = worker::FailureReport::default();
+    output.record("reading stdout: read refused");
+    let error = finish_pipe_reports::<()>(
+        Err(UpstrokeError::Agent {
+            message: "starting stderr worker: thread refused".to_owned(),
+        }),
+        [Some(input), Some(output), None],
+    )
+    .expect_err("startup and both worker failures survive");
+    assert_eq!(
+        error.to_string(),
+        "agent error: starting stderr worker: thread refused; additional cleanup failure: agent error: writing stdin: write refused; additional cleanup failure: agent error: reading stdout: read refused"
+    );
+    let UpstrokeError::WithCleanup(bundle) = error else {
+        panic!("typed cleanup bundle")
+    };
+    assert!(
+        matches!(bundle.primary.as_ref(), UpstrokeError::Agent { message } if message == "starting stderr worker: thread refused")
+    );
+    assert_eq!(bundle.additional.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_failure_survives_reaper_kill_and_wait_failures() {
+    let primary = UpstrokeError::Agent {
+        message: "starting stdout worker: thread refused".to_owned(),
+    }
+    .with_cleanup(Err(UpstrokeError::Agent {
+        message: "reaper refused".to_owned(),
+    }));
+    let error = finish_failed_supervision_cleanup(
+        primary,
+        Err(std::io::Error::other("kill refused")),
+        Err(std::io::Error::other("wait refused")),
+    );
+    assert_eq!(
+        error.to_string(),
+        "agent error: starting stdout worker: thread refused; additional cleanup failure: agent error: reaper refused; additional cleanup failure: agent error: killing agent after supervision failure: kill refused; additional cleanup failure: agent error: reaping agent after supervision failure: wait refused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reaped_child_makes_the_racing_kill_error_irrelevant() {
+    let primary = UpstrokeError::Agent {
+        message: "startup refused".to_owned(),
+    };
+    let error = finish_failed_supervision_cleanup(
+        primary,
+        Err(std::io::Error::other("already exited")),
+        Ok(()),
+    );
+    assert!(matches!(error, UpstrokeError::Agent { message } if message == "startup refused"));
 }
