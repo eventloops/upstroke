@@ -102,15 +102,23 @@ indistinguishable from "no pool" by the time it reaches the engine
 while the pool still matched for routing. Same reasoning as the
 non-empty `[[gates]]` `name`.
 
-## `Some(toml::Value::Integer(units)) => Allowance::Units(units as f64),`
+## `const EXACTLY_REPRESENTABLE_UNITS: i64 = 1 << 53;`
 
-An `as` narrowing needs a nearby invariant that proves the range (§5); here
-the invariant is what `monthly_allowance` means rather than a bound checked
-in the file. It is a spend ceiling an operator typed by hand, always many
-orders of magnitude below `f64`'s 2^53 exact-integer boundary — the same
-boundary [`connect::render::toml_number`] rounds at when writing this value
-back out — so the cast cannot silently change what the operator wrote. The
-finiteness and sign check just below applies uniformly to both the integer
+An `as` narrowing needs a nearby invariant that proves the range (§5), and
+this one is *checked* rather than assumed. TOML hands `monthly_allowance` the
+whole `i64` range, and above 2^53 the cast stops being lossless: written
+`9223372036854775807`, an operator would have got `9223372036854775808` back —
+a ceiling nobody set. An earlier version of this note argued the range instead
+of enforcing it, reasoning that a hand-typed spend ceiling is never that large;
+that is a claim about operators, not about accepted input, and it was wrong on
+the input the parser actually takes. So the integer branch refuses anything
+above this constant by name, and what survives the cast is the number that was
+written. 2^53 is also the boundary [`connect::render::toml_number`] rounds at
+when writing the value back out, so the two directions agree.
+
+The finiteness and sign check just below applies uniformly to both the integer
 and float branches; for the integer branch it can only ever pass, since a
 cast from a finite `i64` is never `NaN` or infinite, and it is written once
-for both rather than duplicated per branch.
+for both rather than duplicated per branch. The float branch takes no upper
+bound: a `toml` float is already an `f64`, so there is no conversion to lose
+anything, and `is_finite` is the whole of what it needs.

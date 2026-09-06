@@ -11,6 +11,8 @@ use super::{
     Source, UpstrokeError, capacity,
 };
 
+const EXACTLY_REPRESENTABLE_UNITS: i64 = 1 << 53;
+
 pub(super) fn read_repo_config(
     snapshot: &FileSnapshot,
 ) -> Result<(RawRepoConfig, PathBuf), UpstrokeError> {
@@ -24,11 +26,13 @@ pub(super) fn read_repo_config(
         }
         return Ok((RawRepoConfig::default(), path));
     };
-    let raw = toml::from_str(&text).map_err(|e| UpstrokeError::Config {
-        path: path.clone(),
-        message: e.to_string(),
-    })?;
-    Ok((raw, path))
+    match toml::from_str(&text) {
+        Ok(raw) => Ok((raw, path)),
+        Err(e) => Err(UpstrokeError::Config {
+            path,
+            message: e.to_string(),
+        }),
+    }
 }
 
 pub(super) fn read_pools(
@@ -49,10 +53,15 @@ pub(super) fn read_pools(
         }
         return Ok(Vec::new());
     };
-    let raw: RawPools = toml::from_str(&text).map_err(|e| UpstrokeError::Config {
-        path: path.clone(),
-        message: e.to_string(),
-    })?;
+    let raw: RawPools = match toml::from_str(&text) {
+        Ok(raw) => raw,
+        Err(e) => {
+            return Err(UpstrokeError::Config {
+                path,
+                message: e.to_string(),
+            });
+        }
+    };
     let mut entries: Vec<(String, toml::Spanned<toml::Value>)> =
         raw.pools.unwrap_or_default().into_iter().collect();
     entries.sort_by_key(|(_, spanned)| spanned.span().start);
@@ -157,7 +166,16 @@ fn parse_pool(
         Some(toml::Value::String(text)) if text.trim().eq_ignore_ascii_case("auto") => {
             Allowance::Auto
         }
-        Some(toml::Value::Integer(units)) => Allowance::Units(units as f64),
+        Some(toml::Value::Integer(units)) => {
+            if units > EXACTLY_REPRESENTABLE_UNITS {
+                return Err(config_error(format!(
+                    "[pools.{name}] `monthly_allowance = {units}` is larger than an allowance is \
+                     held to ({EXACTLY_REPRESENTABLE_UNITS}) — above that an allowance cannot be \
+                     stored without changing the number you wrote"
+                )));
+            }
+            Allowance::Units(units as f64)
+        }
         Some(toml::Value::Float(units)) => Allowance::Units(units),
         Some(other) => {
             return Err(config_error(format!(
@@ -219,9 +237,24 @@ mod tests {
         true
     }
 
+    /// A path this process has not created and no other run can be holding: the process id
+    /// separates concurrent runs and the counter separates calls within one. Nothing is created
+    /// here, so nothing needs removing — these tests want a name whose whole point is that it
+    /// resolves to no file, and reaching for `fs` to guarantee that would put a governed
+    /// primitive in a module that denies all three and takes no `effects/allowlist.toml` row.
+    fn absent_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "upstroke-config-read-absent-{}-{unique}-{tag}.toml",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn read_repo_config_of_a_required_absent_file_is_an_error() {
-        let path = std::env::temp_dir().join("upstroke-definitely-missing-read-rs.toml");
+        let path = absent_path("required");
         let snapshot = crate::config::snapshot_file(&path, true);
         let err = read_repo_config(&snapshot).expect_err("a required file that is absent errors");
         assert!(matches!(err, UpstrokeError::Config { .. }));
@@ -230,7 +263,7 @@ mod tests {
 
     #[test]
     fn read_repo_config_of_an_optional_absent_file_is_the_default() {
-        let path = std::env::temp_dir().join("upstroke-definitely-missing-read-rs-optional.toml");
+        let path = absent_path("optional");
         let snapshot = crate::config::snapshot_file(&path, false);
         let (raw, returned_path) = read_repo_config(&snapshot).expect("absent optional defaults");
         assert_eq!(returned_path, path);
@@ -360,6 +393,66 @@ mod tests {
         )
         .expect("an integer allowance is accepted");
         assert_eq!(pool.monthly_allowance, Allowance::Units(300.0));
+    }
+
+    #[test]
+    fn monthly_allowance_accepts_a_float_as_units() {
+        let path = Path::new("pools.toml");
+        let mut warnings = Vec::new();
+        let pool = parse_pool(
+            "p",
+            pool_value("kind = \"credits\"\nagent = \"claude-code\"\nmonthly_allowance = 12.5\n"),
+            path,
+            &any_adapter,
+            &mut warnings,
+        )
+        .expect("a float allowance is accepted");
+        assert_eq!(pool.monthly_allowance, Allowance::Units(12.5));
+    }
+
+    #[test]
+    fn the_largest_exactly_representable_integer_allowance_is_accepted_unchanged() {
+        let path = Path::new("pools.toml");
+        let mut warnings = Vec::new();
+        let pool = parse_pool(
+            "p",
+            pool_value(&format!(
+                "kind = \"credits\"\nagent = \"claude-code\"\nmonthly_allowance = {EXACTLY_REPRESENTABLE_UNITS}\n"
+            )),
+            path,
+            &any_adapter,
+            &mut warnings,
+        )
+        .expect("the boundary value is an allowance");
+        // Written out rather than spelled `EXACTLY_REPRESENTABLE_UNITS as f64`, which is the very
+        // cast under test: the expected value has to come from outside the code being proved.
+        assert_eq!(EXACTLY_REPRESENTABLE_UNITS, 9_007_199_254_740_992);
+        assert_eq!(
+            pool.monthly_allowance,
+            Allowance::Units(9_007_199_254_740_992.0),
+            "the boundary value survives the cast as the number that was written"
+        );
+    }
+
+    #[test]
+    fn an_integer_allowance_the_cast_would_change_is_refused() {
+        let path = Path::new("pools.toml");
+        for units in [EXACTLY_REPRESENTABLE_UNITS + 1, i64::MAX] {
+            // i64::MAX casts to 9223372036854775808.0, one more than it is: accepting it would
+            // silently store an allowance the operator did not write.
+            let mut warnings = Vec::new();
+            let err = parse_pool(
+                "p",
+                pool_value(&format!(
+                    "kind = \"credits\"\nagent = \"claude-code\"\nmonthly_allowance = {units}\n"
+                )),
+                path,
+                &any_adapter,
+                &mut warnings,
+            )
+            .expect_err("an allowance past the exactly-representable range is refused");
+            assert!(err.to_string().contains("monthly_allowance"), "got: {err}");
+        }
     }
 
     #[test]
