@@ -82,6 +82,18 @@ by its `merge_verification_started`, which already advanced
 Derive the visible state after answering or waking a task. Question
 origin does not capture a queued candidate, later wake or other answer.
 
+This half reads the six facts off the state; [`derived_state`] below
+turns them into the state. Four of the six readings are witnessed by
+`src/topology/fold/tests.rs` — computing `own_question`,
+`queued_candidate`, `repair_child` or `unelapsed_backoff` as `false`
+each fails tests there. The other two are unreachable rather than
+untested, and measured as such: `owns_transaction` cannot fire where
+`queued_candidate` does not, because a candidate under a transaction
+still holds its queue position until `apply_task_merged` or
+`apply_merge_rejected` removes it; and `terminal` cannot be true here,
+because `check_question_raised` refuses a terminal task and `set_state`
+takes a terminal task out of `deferred_tasks`.
+
 ## `fn fail_lineage(&mut self, key: TaskKey) {`
 
 Decline terminates all unpublished work in the lineage. Already merged
@@ -97,7 +109,7 @@ class. Its already authorized publication must survive.
 Owned keys let each member's resources be consumed without retaining
 a registry borrow across those mutations.
 
-## `pub(super) fn release_holdings_of(&mut self, key: TaskKey) {`
+## `fn release_holdings_of(&mut self, key: TaskKey) {`
 
 Remove this member's queued candidates and candidate/lineage holdings.
 The caller closes its generation and visits every affected member.
@@ -107,13 +119,25 @@ The caller closes its generation and visits every affected member.
 `None` means this key has no task or no open generation. Checked callers
 establish which generation they need before application mutates it.
 
-## `close_generation` › `let releases_own_region = match generation.lease {`
+## `fn releases_own_region(lease: GenerationLease) -> bool {`
+
+Whether a closing generation gives a region back.
 
 Exhaustive over the lease, so a new `GenerationLease` is a compile
 error here rather than one that silently keeps its region held: an
 own generation holds its predicted region and releases it when it
 closes, and an inherited-lineage generation took none of its own and
 releases nothing.
+
+**The distinction is a rule, not an observable.** An inherited-lineage
+generation never took a `LeaseOwner::Generation` lease — `apply_dispatched`
+grants one only for `LeaseGrant::Predicted` — so releasing one would
+remove nothing, and answering `true` for both arms changes no state any
+test can see. Measured: with the call site rewritten to
+`releases_own_region(GenerationLease::Own)`, the whole `topology::fold`
+suite stays green. The function is separate and tested so that the rule
+is stated somewhere a mutation dies, which the call site alone cannot
+give it.
 
 ## `apply` › `TopologyEventBody::AttemptStarted { data } => {`
 
@@ -227,7 +251,7 @@ derivation of a value the log already holds, and a replay
 of the same log would then disagree with the process that
 wrote it.
 
-## `pub(super) fn record_halt(&mut self, key: TaskKey) {`
+## `fn record_halt(&mut self, key: TaskKey) {`
 
 `halted_at` is first in wins, and is never cleared.
 
@@ -287,7 +311,7 @@ other question this run can ask — a `HumanRequired` admission, a parked
 settlement, a verification park, a bare `question_raised`. That is the
 whole of what an override may be validated against.
 
-## `pub(super) fn set_defers(&mut self, key: TaskKey, defers: u32) {`
+## `fn set_defers(&mut self, key: TaskKey, defers: u32) {`
 
 Record the deferral count a `Deferred` settlement carried.
 
@@ -295,6 +319,66 @@ Assignment rather than increment: the number is the settlement's, which
 is what makes a replay of the same log reach the same count as the
 process that wrote it.
 
-## `pub(super) fn close_generation(&mut self, key: TaskKey) {`
+## `fn close_generation(&mut self, key: TaskKey) {`
 
 Close the open generation, releasing the region it held on its own.
+
+## `fn take_candidate_region(`
+
+Take the region a prepared candidate is entitled to.
+
+An ordinary candidate replaces the region its dispatch predicted: the
+generation's lease is released and a candidate lease is granted over the
+paths the diff actually touched, which `check_candidate_prepared` has
+already compared with the record. A lineage member takes nothing of its
+own and widens its lineage's region instead — `design/26`: "The repair
+holds leases on its **actual** affected paths" — so a repair whose diff
+reaches outside the region its rejection created is covered by the
+lineage lease before any candidate can be judged eligible against those
+paths.
+
+Separate from [`RunState::apply_candidate_prepared`] so that both arms
+can be reached with a `LeaseTable` and two values. Dropping the call
+site altogether is caught by `src/topology/fold/tests.rs`; the
+widening's own effect was caught by nothing until this file's test
+block.
+
+## `struct VisibleFacts`
+
+The six current facts an answer or a wake derives a task's state from.
+
+Named fields rather than six positional booleans (§5), because the call
+site is where they are read off the state and a reader has to see which
+is which.
+
+## `fn derived_state(facts: VisibleFacts) -> Option<TaskState> {`
+
+`design/26`'s sentence, in its order: "The answered task keeps a
+terminal state; otherwise another question of its own implies
+`AwaitingInput`, a queued candidate or owned transaction implies
+`AwaitingMerge`, a registered repair child implies `AwaitingRepair`,
+unelapsed execution backoff implies `Deferred`, and otherwise it becomes
+`Pending`."
+
+`None` is the terminal case: keep the state the task reached. It is not
+`TaskState::Merged`, because which terminal state it is belongs to the
+event that set it.
+
+The precedence is the whole content of this function, and it is what six
+review passes of PR #152 argued over, so it is pinned by a table rather
+than by a trace: the question outranks each of the other four facts one
+at a time, both merge facts reach `AwaitingMerge` alone and together, a
+repair child outranks a backoff, and a task with none of them is
+`Pending`.
+
+## `#[cfg(test)] mod tests`
+
+Tests for `take_candidate_region`, `releases_own_region` and
+`derived_state`, in this file rather than in `src/topology/fold/tests.rs`
+where the rest of the fold's tests live. Every method of this module is
+on `&mut RunState`, whose construction needs the `RunStarted4`, plan,
+chain and registry-digest fixture that sibling file builds; that file is
+queue row 39 and the sweep that added these tests could not edit it. The
+three relations were extracted so they could be reached with values
+instead, which is the same reason `src/topology/fold/check_candidate.rs`
+carries a block of its own.
