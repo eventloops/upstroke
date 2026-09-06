@@ -9,6 +9,14 @@ on:
   pull_request:
     branches: [master, codex/parallelism-design]
     types: [opened, edited, synchronize, reopened]
+  # The merge queue builds each entry on the head of its base plus the entries
+  # queued ahead of it, and lands exactly the commit these contexts passed on;
+  # a branch is never brought up to date by hand to merge (MAINTAINING.md,
+  # Repository rules). The concurrency key below is `github.ref` for this
+  # event, one queue branch per entry, so entries never cancel each other.
+  merge_group:
+    types: [checks_requested]
+    branches: [master, codex/parallelism-design]
 
 permissions:
   contents: read
@@ -206,6 +214,7 @@ jobs:
       - run: bash .github/scripts/test-pr-ledger-evidence.sh
       - run: bash .github/scripts/test-docs-consistency.sh
       - run: bash .github/scripts/test-internals-notes.sh
+      - run: bash .github/scripts/test-pr-ready-audit.sh
 
   # Branch protection requires this one deliberately stable context. Keeping
   # the external rule pointed at an aggregate means adding a platform or
