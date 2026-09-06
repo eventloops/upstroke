@@ -120,9 +120,14 @@ fn plan() -> Plan {
 }
 
 fn chain(task: &str) -> ChainSummary {
+    // A chain starts at or above its task's `min_tier`: `src/route.rs`'s
+    // `raise_start` retains only the tiers at or above the floor, so `mid`,
+    // whose plan entry records `min_tier = Some(Tier::Mid)`, cannot carry a
+    // `Small` rung. `check_ladder` refuses a recorded ladder that does.
     let tiers = match task {
         "zeta" => vec![Tier::Small, Tier::Mid, Tier::Frontier],
         "alpha" => vec![Tier::Mid],
+        "mid" => vec![Tier::Mid, Tier::Frontier],
         _ => vec![Tier::Small, Tier::Frontier],
     };
     ChainSummary {
@@ -2311,12 +2316,20 @@ fn both_recorded_digests_are_checked_against_the_frozen_inputs() {
 
 #[test]
 fn a_malformed_ladder_is_refused_before_it_is_stored() {
-    let cases: [(&str, BreakFrozenInputs); 3] = [
+    let cases: [(&str, BreakFrozenInputs); 4] = [
         ("floor above ceiling", |plan, chain| {
             plan.tasks[ZETA.index()].min_tier = Some(Tier::Frontier);
             chain.tiers = vec![Tier::Small, Tier::Mid];
             chain.bindings = Some(bindings_for(&chain.tiers));
         }),
+        (
+            "a floor above the tier the chain starts at",
+            |plan, chain| {
+                plan.tasks[ZETA.index()].min_tier = Some(Tier::Mid);
+                chain.tiers = vec![Tier::Small, Tier::Mid, Tier::Frontier];
+                chain.bindings = Some(bindings_for(&chain.tiers));
+            },
+        ),
         ("tiers that do not escalate", |_, chain| {
             chain.tiers = vec![Tier::Mid, Tier::Small, Tier::Frontier];
             chain.bindings = Some(bindings_for(&chain.tiers));
@@ -2340,11 +2353,19 @@ fn a_malformed_ladder_is_refused_before_it_is_stored() {
         );
     }
 
-    let spawn_cases: [(&str, BreakLadder); 8] = [
+    let spawn_cases: [(&str, BreakLadder); 9] = [
         ("floor above ceiling", |ladder| {
             ladder.tiers = vec![Tier::Mid];
             ladder.rungs = rungs_for(&ladder.tiers);
             ladder.ceiling = Some(Tier::Mid);
+            ladder.floor = Some(Tier::Frontier);
+        }),
+        // DESIGN §26: a repair's `mid` floor is a floor inside the frozen
+        // constraints, so the repair's own first attempt may not run beneath
+        // it. `TaskFold.rung` starts at 0 and `check_attempt_started`
+        // validates the attempt against `rungs[0]`, so a `task_spawned` this
+        // check let through is a repair running one tier below its floor.
+        ("a floor above the tier the chain starts at", |ladder| {
             ladder.floor = Some(Tier::Frontier);
         }),
         ("tiers that do not escalate", |ladder| {

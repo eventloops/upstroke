@@ -82,7 +82,12 @@ Whether a frozen ladder is one an attempt could actually climb.
 
 Fold-boundary work rather than registry work: the registry derives a ladder
 from whatever the run recorded, and this decides whether that ladder may
-enter a fold's state. Both malformations it names are invisible to the
-registry — a floor above its ceiling clips to nothing on the first
-escalation, and a tier list that does not ascend makes "the next rung" mean
-two different things depending on whether it is read by position or by tier.
+enter a fold's state. The three malformations of the floor and the tier list
+are all invisible to the registry, which copies `task.min_tier` into `floor`
+and the recorded tiers into `tiers` and compares neither with the other — a
+floor above its ceiling clips to nothing on the first escalation; a floor
+above the tier the chain starts at binds nothing at all, because the position
+starts at the first rung and the attempt validated against that rung then runs
+beneath the recorded floor (DESIGN §26, "Frozen ladders"); and a tier list
+that does not ascend makes "the next rung" mean two different things depending
+on whether it is read by position or by tier.

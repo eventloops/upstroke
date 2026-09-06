@@ -459,6 +459,21 @@ other two limits carry no such floor, because each gates a branch that still ans
 `max_defers = 0` every integration outage parks rather than defers, and at `max_merge_repairs = 0`
 a rejection spawns a human-required repair reporting that same zero.
 
+#### Frozen ladders: a floor binds the chain start
+
+Added 2026-09-06 under §13's same-change rule; not part of the verbatim record above. It records
+what the fold refuses at the boundary where a recorded ladder enters its state.
+
+A floor clips where a chain starts, and §10.5 has a merge repair's `min_tier = mid` intersected
+with the run's frozen hard pins and ceilings rather than overriding them. The router implements
+the clip, so no chain it produces holds a tier beneath its floor. A recorded ladder, however, is
+whatever the log says: its floor and its tier list are copied from the run record independently
+and neither is derived from the other. A frozen ladder whose first tier is below its recorded
+floor is therefore refused where every other malformation of a ladder is — before it is stored,
+not when something tries to climb it. Without that refusal the floor binds nothing once the run
+is recorded: a ladder's position starts at its first rung, and an attempt validated against that
+rung runs at a tier the run recorded as forbidden.
+
 #### Verification contract: the effect-site bijection
 
 Added 2026-09-05 (PR #146) under §13's same-change rule; not part of the verbatim record above.
