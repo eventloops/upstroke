@@ -8,7 +8,7 @@ reviewed_sha: ce2965be96799b80a785bc4bc2d7eb3f240efb0e
 location: src/runner/container/tests.rs:92
 provenance: introduced_by_feature
 first_bad: ce2965be96799b80a785bc4bc2d7eb3f240efb0e
-guard: PR #174's follow-up, or whichever sweep next opens src/runner/container/tests.rs
+guard: "PR #174's follow-up, or whichever sweep next opens src/runner/container/tests.rs"
 ---
 
 ## Failure sequence
