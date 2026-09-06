@@ -22,6 +22,10 @@
 #   MUT-CHECK-RUN-FIRST-SUCCESS  an older success outranked a newer failure
 #   MUT-CHECK-RUN-UNSTARTED      an unstarted run was ordered by a stand-in date, not its id
 #   MUT-LEDGER-HEADER-AS-ROW     the header or separator line parsed as a row
+#   MUT-REVIEWER-FROM-ORG        an organization owner was trusted as the reviewer, so the
+#                                comment filter matched nothing and every pull request read
+#                                no-review
+#   MUT-REVIEWER-OVERRIDE-IGNORED  an explicit --reviewer was not preferred over the owner
 set -euo pipefail
 export PATH="/usr/bin:/bin:$PATH"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +49,23 @@ expect MUT-LANE-LABEL-INPUT "$(lane_for fix/sampler-kill-and-inspection)" featur
 expect MUT-P3-LANE-DEFERS "$(must_fix_for findings-p3)" "P0 P1 P2 P3"
 expect MUT-P3-LANE-DEFERS "$(must_fix_for findings-p1p2)" "P0 P1 P2"
 expect MUT-P3-LANE-DEFERS "$(must_fix_for feature)" "P0 P1"
+
+# --- whose review counts ------------------------------------------------------------------------
+# A User owner stands in for the reviewer; that is the pre-organization behaviour and it stays.
+expect MUT-REVIEWER-FROM-ORG "$(reviewer_login "" eventloops User)" eventloops
+# An Organization owner authors no comments. Inheriting it yields a filter that matches nothing,
+# which is not a stricter audit but a blind one, so it must fail rather than return a login.
+if reviewer_login "" sourcemaps Organization > "$tmp/org.out" 2>&1; then
+  error "MUT-REVIEWER-FROM-ORG: an Organization owner was accepted as the reviewer, got [$(cat "$tmp/org.out")]"
+fi
+expect MUT-REVIEWER-FROM-ORG "$(cat "$tmp/org.out")" ""
+# An explicit override wins over either, and is the only way to audit an organization-owned repo.
+expect MUT-REVIEWER-OVERRIDE-IGNORED "$(reviewer_login eventloops sourcemaps Organization)" eventloops
+expect MUT-REVIEWER-OVERRIDE-IGNORED "$(reviewer_login someone-else eventloops User)" someone-else
+# A missing login is not a reviewer either, whatever the type claims.
+if reviewer_login "" "" User > "$tmp/empty.out" 2>&1; then
+  error "MUT-REVIEWER-FROM-ORG: an empty owner login was accepted as the reviewer"
+fi
 
 # --- the workflow form: a fenced JSON verdict ---------------------------------------------------
 cat > "$tmp/json.md" <<'EOF'
