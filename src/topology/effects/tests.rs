@@ -936,8 +936,13 @@ fn the_packets_group_level_row_statements_hold_over_whole_groups() {
 }
 
 #[test]
-fn every_external_and_process_local_row_has_at_least_one_claimed_site() {
-    // `outputs`: "every such row has at least one Topology/Shared site".
+fn every_row_a_run_can_act_on_has_at_least_one_claimed_site() {
+    // `outputs`: "every such row has at least one Topology/Shared site" —
+    // stated over `ResourceRow::ALL`, the fifteen rows a run can act on.
+    // R20, the external-physical credential-volume row, is
+    // `operator_owned` and never created or pruned by a run
+    // (`src/runner/container.rs:299`), so it has no effect site and is
+    // excluded from the enum rather than from this loop.
     let claimed: BTreeSet<ResourceRow> = EffectSiteId::claimed()
         .into_iter()
         .map(|s| s.row())
