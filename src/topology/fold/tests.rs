@@ -1856,8 +1856,38 @@ fn the_statement_accessors_report_the_run_rather_than_authorising_anything() {
     );
     assert_eq!(halted.halted_at(), Some(ZETA));
     assert!(halted.run_is_ending());
+
+    apply(&mut halted, &dispatch(ALPHA, 0, &sha("base")));
+    let second_start = attempt_started(&halted, ALPHA, 0, 1, 0);
+    apply(&mut halted, &second_start);
+    apply(
+        &mut halted,
+        &settle(
+            ALPHA,
+            0,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Failed {
+                    halts_run: true,
+                    reason: "  a second halt policy fired  ".to_owned(),
+                },
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        ),
+    );
+    assert_eq!(
+        halted.halted_at(),
+        Some(ZETA),
+        "the run's halt is first-in-wins, not last-in-wins"
+    );
+
     halted.poison();
     assert!(halted.run_is_ending(), "poisoning unsaid a halt");
+    assert_eq!(
+        halted.halted_at(),
+        Some(ZETA),
+        "poisoning does not move which task the halt is attributed to"
+    );
 }
 
 fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
