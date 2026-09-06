@@ -4279,7 +4279,7 @@ const AFTER_EFFECT_ORACLE: &[(&str, AfterEffect)] = &[
     ("Answer.Ingest", AfterEffect::NoEffect),
     ("Lock.AcquireRun", AfterEffect::Referenced),
     ("Lock.AcquireWorktree", AfterEffect::Referenced),
-    ("Lock.ProbeCleanupExclusive", AfterEffect::Referenced),
+    ("Lock.ProbeCleanupExclusive", AfterEffect::MomentaryHold),
     ("Lock.Release", AfterEffect::Removed),
     ("Lock.CreateWorktreeLockFile", AfterEffect::Referenced),
     ("Lock.ObserveCleanupHold", AfterEffect::NoEffect),
@@ -4801,6 +4801,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
         AfterEffect::Unreferenced,
         AfterEffect::Released,
         AfterEffect::Removed,
+        AfterEffect::MomentaryHold,
     ] {
         assert!(
             EffectSiteId::all()
@@ -4991,6 +4992,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 assert_eq!(after.artifact, ResidueArtifact::Removed, "{site}");
                 assert_eq!(after.action, ResumeAction::AdoptPerformed, "{site}");
             }
+            AfterEffect::MomentaryHold => {
+                assert!(after.rows.is_empty(), "{site}");
+                assert_eq!(after.artifact, ResidueArtifact::HoldReleased, "{site}");
+                assert_eq!(after.action, ResumeAction::RepeatProbe, "{site}");
+            }
         }
 
         for class in site.residue_classes() {
@@ -5106,7 +5112,8 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResidueArtifact::PrefixPossiblyNonDurable
             | ResidueArtifact::NoHostProcess
             | ResidueArtifact::NoProcessSpawned
-            | ResidueArtifact::ReaperHeldGroup => {}
+            | ResidueArtifact::ReaperHeldGroup
+            | ResidueArtifact::HoldReleased => {}
         }
     }
     assert_eq!(
@@ -5129,7 +5136,8 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResumeAction::RefuseResumably
             | ResumeAction::AmbientHandleTerminates
             | ResumeAction::ReaperSettlesGroup
-            | ResumeAction::RefuseUnspawned => {}
+            | ResumeAction::RefuseUnspawned
+            | ResumeAction::RepeatProbe => {}
         }
     }
     assert_eq!(

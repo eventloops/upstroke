@@ -247,9 +247,10 @@ pub enum BeforeState {
 /// every site the same after-phase: an effect that publishes something leaves
 /// it referenced by the site's own row, a commit-tree leaves an object nothing
 /// references, "the pruning sites' after-phase entries record the released
-/// objects as R27 residue", and a removal that releases nothing leaves the row
-/// that accounted for what it removed holding nothing. One `vec![self.row()]`
-/// answers all five the same way and is wrong for four of them.
+/// objects as R27 residue", a removal that releases nothing leaves the row
+/// that accounted for what it removed holding nothing, and a momentary hold is
+/// given back before the command returns. One `vec![self.row()]`
+/// answers all six the same way and is wrong for five of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AfterEffect {
@@ -266,6 +267,15 @@ pub enum AfterEffect {
     /// The removal is durable and released no object: the row that accounted
     /// for what it removed holds nothing.
     Removed,
+    /// The site took a hold and gave it back before it returned, so no row is
+    /// left holding it and a resume repeats the probe.
+    ///
+    /// Distinct from [`Self::NoEffect`], which is the read-only claim: this
+    /// site does perform an effect (it creates the lock file it probes) and is
+    /// classified `is_read_only() == false`. Distinct from [`Self::Referenced`]
+    /// because the hold is deliberately not retained — see
+    /// [`LockSite::after_effect`].
+    MomentaryHold,
 }
 
 /// The concrete artifacts a fault at one `(site, phase)` leaves, in the fault
@@ -335,6 +345,8 @@ pub enum ResidueArtifact {
     NoProcessSpawned,
     /// A Unix containment point.
     ReaperHeldGroup,
+    /// A momentary hold the site took and gave back before it returned.
+    HoldReleased,
 }
 
 impl ResidueArtifact {
@@ -361,6 +373,7 @@ impl ResidueArtifact {
         Self::NoHostProcess,
         Self::NoProcessSpawned,
         Self::ReaperHeldGroup,
+        Self::HoldReleased,
     ];
 
     /// The words an entry's `expected_residue.detail` must carry.
@@ -420,6 +433,10 @@ impl ResidueArtifact {
             Self::ReaperHeldGroup => {
                 "a process group the reaper settles while holding its shared cleanup hold, R28"
             }
+            Self::HoldReleased => {
+                "the momentary hold was taken and given back before the command returned, so no \
+                 row is left holding it"
+            }
         }
     }
 }
@@ -470,6 +487,9 @@ pub enum ResumeAction {
     /// next open repeats the barrier" is the stable-prefix barrier, and a job
     /// object has no open and no barrier.
     RefuseUnspawned,
+    /// A momentary hold: it was given back before the command returned, and a
+    /// resume repeats the probe.
+    RepeatProbe,
 }
 
 impl ResumeAction {
@@ -486,6 +506,7 @@ impl ResumeAction {
         Self::AmbientHandleTerminates,
         Self::ReaperSettlesGroup,
         Self::RefuseUnspawned,
+        Self::RepeatProbe,
     ];
 
     /// The words an entry's `resume_action` must carry.
@@ -525,6 +546,10 @@ impl ResumeAction {
             Self::RefuseUnspawned => {
                 "nothing to resume: the write command refuses before the ambient join, and no \
                  process was spawned"
+            }
+            Self::RepeatProbe => {
+                "nothing to resume: the momentary hold was given back before the command \
+                 returned, and the probe is repeated"
             }
         }
     }
@@ -897,12 +922,26 @@ impl LockSite {
     ///
     /// A hold is process-local OS state the row accounts for while it is held;
     /// `Release` ends it and releases no object.
+    ///
+    /// `ProbeCleanupExclusive` is the one site of the group that ends its own
+    /// hold. `rundir`'s `cleanup::take` takes `LOCK_EX | LOCK_NB` and then
+    /// `LOCK_UN` before it returns, and says why in its own words — "Do not
+    /// retain the lock in the conductor: arbitrary forked children would
+    /// inherit its open file description and recreate the false-liveness
+    /// window" — returning a lease that is a path and no hold. R17 is "the
+    /// coordinator's own lock holds (**OS lock state only**)", so after this
+    /// site's after hook R17 holds nothing of what the probe took, and a
+    /// resume cannot "adopt the completed effect": a new process holds no
+    /// cleanup lock and re-probes. `AcquireRun` and `AcquireWorktree` are the
+    /// contrast that makes this a site distinction and not an argument about
+    /// locks in general — each retains its `File` for the lifetime of the
+    /// guard, so R17 does hold their hold at their after hook.
     pub const fn after_effect(self) -> AfterEffect {
         match self {
-            Self::AcquireRun
-            | Self::AcquireWorktree
-            | Self::ProbeCleanupExclusive
-            | Self::CreateWorktreeLockFile => AfterEffect::Referenced,
+            Self::AcquireRun | Self::AcquireWorktree | Self::CreateWorktreeLockFile => {
+                AfterEffect::Referenced
+            }
+            Self::ProbeCleanupExclusive => AfterEffect::MomentaryHold,
             Self::Release => AfterEffect::Removed,
             Self::ObserveCleanupHold => AfterEffect::NoEffect,
         }
@@ -1135,7 +1174,10 @@ impl SubEffectPoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{InjectionMode, ResidueArtifact, ResumeAction, SubEffectPoint};
+    use super::{
+        AfterEffect, BeforeState, InjectionMode, LockSite, ResidueArtifact, ResumeAction,
+        SubEffectPoint,
+    };
     use crate::topology::effects::{EffectSiteId, EntryPhase};
 
     #[test]
@@ -1211,5 +1253,80 @@ mod tests {
         assert!(refused.rows.is_empty());
         assert_eq!(refused.artifact, ResidueArtifact::NoProcessSpawned);
         assert_eq!(refused.action, ResumeAction::RefuseUnspawned);
+    }
+
+    #[test]
+    fn the_cleanup_probe_gives_its_hold_back_and_leaves_no_row_holding_it() {
+        // `rundir`'s `cleanup::take` takes `LOCK_EX | LOCK_NB` and then
+        // `LOCK_UN` before it returns, deliberately; R17 is OS lock state
+        // only, so nothing of what the probe took survives its own after hook
+        // and no resume can adopt it.
+        assert_eq!(
+            LockSite::ProbeCleanupExclusive.after_effect(),
+            AfterEffect::MomentaryHold
+        );
+        let after =
+            EffectSiteId::Lock(LockSite::ProbeCleanupExclusive).semantics(EntryPhase::After);
+        assert!(
+            after.rows.is_empty(),
+            "the released hold is held by no row: {:?}",
+            after.rows
+        );
+        assert_eq!(after.artifact, ResidueArtifact::HoldReleased);
+        assert_eq!(after.action, ResumeAction::RepeatProbe);
+
+        // It is the only site of the group that gives its hold back. The two
+        // acquisitions retain their `File` for the guard's lifetime, so R17
+        // does hold theirs at their own after hook, and the lock-file creation
+        // leaves a file that outlives every run.
+        for retained in [
+            LockSite::AcquireRun,
+            LockSite::AcquireWorktree,
+            LockSite::CreateWorktreeLockFile,
+        ] {
+            assert_eq!(
+                retained.after_effect(),
+                AfterEffect::Referenced,
+                "{}",
+                retained.name()
+            );
+            assert_eq!(
+                EffectSiteId::Lock(retained)
+                    .semantics(EntryPhase::After)
+                    .rows,
+                vec![retained.row()],
+                "{}",
+                retained.name()
+            );
+        }
+        assert_eq!(LockSite::Release.after_effect(), AfterEffect::Removed);
+        assert_eq!(
+            LockSite::ObserveCleanupHold.after_effect(),
+            AfterEffect::NoEffect
+        );
+
+        // Not the read-only claim: the probe creates the lock file it probes,
+        // and the group's one read-only site is the hold observation.
+        assert!(!LockSite::ProbeCleanupExclusive.is_read_only());
+        assert!(LockSite::ObserveCleanupHold.is_read_only());
+        // Its before phase is unchanged: the probe requires no earlier
+        // artifact of its own.
+        assert_eq!(
+            LockSite::ProbeCleanupExclusive.before_state(),
+            BeforeState::Absent
+        );
+        // The words are its own, and neither the publication's nor the
+        // removal's.
+        assert!(
+            ResidueArtifact::HoldReleased
+                .detail()
+                .contains("given back")
+        );
+        assert!(!ResidueArtifact::Referenced.detail().contains("given back"));
+        assert!(
+            ResumeAction::RepeatProbe
+                .text()
+                .contains("the probe is repeated")
+        );
     }
 }
