@@ -117,12 +117,12 @@ role-scoped `HOME`, `PATH`, and credential locations" — resolved for
      `implement` and `review` are the probe and the execution that
      sentence pairs; a `HOME` differing across them would make
      pre-flight certify an environment the attempt never runs in.
-  2. `decisions/2026-08-12-merge-queue-execution-topology.md:331-333` —
+  2. `design/26_design_merge_queue_protocol.md:388-389` (§26) —
      "gate-shell/program availability is checked inside the same
      boundary." The shell probe certifies the shell a gate will run; a
      `PATH` differing between `probe(shell)` and `gate` would certify a
      different program from the one that runs.
-  3. The same decision, :341-342 — "Host runner behavior remains
+  3. The same section, :398 — "Host runner behavior remains
      available and honestly provides **no OS boundary** around gate
      code." Handing gate code a different `HOME` on this host would
      assert an isolation the host does not have: repository-controlled
@@ -131,7 +131,7 @@ role-scoped `HOME`, `PATH`, and credential locations" — resolved for
      would otherwise hand over, and that is [`supplies_credentials`].
 
   The value comes from the base rather than from anything this runner
-  invents, because the same decision says where the base is (:321-322):
+  invents, because the same section says where the base is (:378-379):
   "**The host base starts from the Upstroke process environment**, while
   the container base starts from the image environment." A process
   environment carries one value per key under [`KeyCase`] — so one
