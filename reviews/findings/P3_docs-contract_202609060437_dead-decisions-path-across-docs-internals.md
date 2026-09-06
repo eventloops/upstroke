@@ -1,10 +1,10 @@
 ---
 id: PR179-DOCS-DEAD-DECISIONS-PATH
-severity: P4
+severity: P3
 disposition: deferred     # out of this sweep's file scope; needs its own pass across docs/internals
 category: docs-contract
 pr: 179
-reviewed_sha: 655771a3c1353520dd21fac143abcb6dbc6be252
+reviewed_sha: 25cff9b9112ab31c17fc0db0d2ddc6739de04e29
 location: docs/internals/topology/registry.md:275; docs/internals/topology/fold/tests.md:358,1607; docs/internals/runner/host/environment.md:120; docs/internals/engine/topology/run.md:1257; docs/internals/engine/topology/candidate.md:68; docs/internals/engine/topology/recover/tests.md:1828,1861; docs/internals/engine/topology/attempt.md:65; docs/internals/engine/topology/settle.md:258; docs/internals/engine/topology/settle/tests.md:225; docs/internals/engine/topology/candidate/tests.md:482
 provenance: pre_existing
 first_bad: 2026-09-03 (the decisions/, proposals/ and acceptance/ directories were retired)
