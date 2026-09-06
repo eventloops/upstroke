@@ -229,22 +229,22 @@ bootstrap and audit both through the API:
 
 ```bash
 gh api --method PUT \
-  repos/eventloops/upstroke/actions/permissions/fork-pr-contributor-approval \
+  repos/sourcemaps/upstroke/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10' \
   -f approval_policy=all_external_contributors
 
-gh api --method PUT repos/eventloops/upstroke/immutable-releases \
+gh api --method PUT repos/sourcemaps/upstroke/immutable-releases \
   -H 'X-GitHub-Api-Version: 2026-03-10'
 
 gh variable set UPSTROKE_IMMUTABLE_RELEASES_REQUIRED \
-  --repo eventloops/upstroke --body true
+  --repo sourcemaps/upstroke --body true
 
-gh api repos/eventloops/upstroke/actions/permissions/fork-pr-contributor-approval \
+gh api repos/sourcemaps/upstroke/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10'
-gh api repos/eventloops/upstroke/immutable-releases \
+gh api repos/sourcemaps/upstroke/immutable-releases \
   -H 'X-GitHub-Api-Version: 2026-03-10'
 gh variable get UPSTROKE_IMMUTABLE_RELEASES_REQUIRED \
-  --repo eventloops/upstroke
+  --repo sourcemaps/upstroke
 ```
 
 Fork pull requests are provisional: their checks are candidate-controlled, so the whole diff
