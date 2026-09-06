@@ -153,8 +153,7 @@ mount exactly as it does for a name that is not there, and the caller
 then reported that nothing of that name is on the `PATH` — a definite
 statement the search had not earned. Only `NotFound` is absence; §7 says
 so in general terms, and here the two are operationally different
-things: absence continues the search, an undetermined answer is carried
-to the end of it.
+things: absence continues the search, an undetermined answer ends it.
 
 The metadata is read **once** and every question is answered from that
 one reading. The previous shape asked twice — `Path::is_file`, then
@@ -279,13 +278,14 @@ fail with a bare `NotFound` that names no boundary, which on Windows is
 precisely the failure an operator could not diagnose.
 
 [`UpstrokeError::Filesystem`] — `operation: "stat"`, the candidate path,
-and the `io::Error` as its `#[source]` — when the search matched nothing
-*and* at least one candidate could not be decided. This refusal is a
-different claim from the one above and says so: not "it is not there"
-but "this is what stopped me being able to tell". The variant carries
-the source error rather than a rendering of it, so the kind survives for
-a caller that wants to distinguish a permission problem from a broken
-mount.
+and the `io::Error` as its `#[source]` — at the first candidate the
+filesystem would not answer for, whatever a later `PATH` entry holds.
+This refusal is a different claim from the one above and says so: not
+"it is not there" but "this is what stopped me being able to tell". The
+variant carries the source error rather than a rendering of it, so the
+kind survives for a caller that wants to distinguish a permission
+problem from a broken mount. Why the first and not the last is under
+`Err(source) => {` below.
 
 ## `return Ok(PathBuf::from(program));`
 
@@ -329,54 +329,84 @@ directory. The other nesting promotes a later directory over an
 earlier installation, which is the shape the deleted
 `find_program_candidates` test pinned.
 
-## `if undetermined.is_none() {`
+## `Err(source) => {`
 
-The first candidate this filesystem would not answer for, kept in case
-the search ends with nothing.
+The first candidate this filesystem would not answer for ends the
+search. `NotFound` is the only miss that continues it.
 
-**The search continues past it, and that is the whole design decision.**
-An unreadable directory early on `PATH` is what `execvp` and
-`CreateProcessW` both walk straight past, and this function's contract
-is *which file a spawn of that name would reach* — so stopping at the
-first `EACCES` would make it disagree with the platform it models and
-refuse a `claude` that is installed, readable and two entries further
-along. A mode-0700 directory anywhere on the coordinator's own `PATH`
-would otherwise take every agent spawn down with it, which is an outage
-bought for no security: falling through to the next entry is exactly
-what the platform does, so nothing is reachable that would not have been
-reached anyway.
+**The search does not continue past it, and the cost is named here.**
+`execvp` and `CreateProcessW` both walk straight past an unreadable
+`PATH` entry; measured on the build box (Linux, non-root, 2026-09-06)
+with a mode-000 directory holding a copy of a probe ahead of a readable
+one, `stat` answers `EACCES`, and both `sh -c 'command -v ...'` and a
+direct `execvp` run the later copy. So this function now refuses, at
+that entry, a program the platform would have reached two entries
+further along, and one directory the coordinator cannot read anywhere
+on its own `PATH` fails every spawn through it until the entry is
+removed or made readable. The refusal names that entry, which is the
+repair an operator makes.
 
-What is *not* allowed is the old ending: claiming absence after a miss
-the search could not read. §7's rule is that only an actual not-found
-becomes absence, and that is satisfied precisely here — absence is
-reported when every miss was `NotFound`, and otherwise the first
-undetermined candidate is reported instead. The relative-`PATH`-entry
-rule above stays fail-closed because it guards a boundary; this one is
-not a boundary, it is a question the filesystem declined to answer.
+Why that side. The alternative — remember the first such candidate,
+keep searching, report it only if nothing matches — was the shape
+`b9c73630` shipped, and it discards the error whenever a later entry
+holds the program: an unreadable earlier installation changes which
+file is certified and nothing records that it happened. §7 forbids
+discarding an error through a catch-all match unless the operation is
+explicitly best-effort with its observability defined, and this search
+has no channel to define it on; a warning or a runner event would need a
+design sentence this module cannot write. Pass 2 of PR #185
+(`SWEEP-HOST-NAMING-004`) read pass 1's correction the same way. Parity
+with `execvp` was never the whole contract in any case: the relative
+`PATH` entry above is one the platform searches and this function
+refuses, on purpose.
 
-Only the first is kept. A second undetermined candidate adds a path to
-the diagnostic and nothing to the decision, and the error type carries
-one path.
+Absence is still claimed only when every miss was `NotFound`, which is
+what §7's sentence requires; the change is that an undetermined miss is
+reported at once rather than at exhaustion. The error type carries one
+path, and that is the path the search stopped at.
 
 ## `mod tests {`
 
-Four tests, in the file rather than in `src/runner/host/tests.rs`,
+Six tests, in the file rather than in `src/runner/host/tests.rs`,
 because this module denies the three governed lints and its suite
 therefore cannot build a fixture that writes to a filesystem — every
 `std::fs` creation primitive is on `clippy.toml`'s disallowed list. All
-four are built from values instead, which is also why they are cheap
-enough to sit here.
+six are built from values instead, which is also why they are cheap
+enough to sit here. Three fixtures serve them, none of which creates
+anything: `undeterminable_directory` is a `PATH` entry with an interior
+NUL, which every platform rejects before the syscall with `InvalidInput`
+rather than `NotFound`, so the undetermined path is reached identically
+on all three legs with no permission games — and it asserts the platform
+really did answer something other than `NotFound` before returning, so
+no test over it can pass vacuously. `never_created_directory` is a name
+under the temporary directory that this process owns and never creates
+(process id, a per-process counter and the clock), asserted absent with
+`symlink_metadata` before use: every candidate under it is a genuine
+`NotFound`, whatever another process or a retained fixture has left in
+the shared temporary directory (`SWEEP-HOST-NAMING-005`, which is what
+pointing `PATH` at the ambient directory itself was). `this_test_binary`
+is the directory and bare file name of the running test executable — the
+one program every platform has installed and executable by construction,
+and so the only "later match" a module that cannot write a file can
+offer.
 
 `a_candidate_this_platform_cannot_stat_is_never_reported_as_absence`
-puts an interior NUL in a `PATH` entry. Every platform rejects that
-before the syscall, with `InvalidInput` rather than `NotFound`, so the
-undetermined path is reached identically on all three legs with no
-fixture and no permission games; the test asserts the platform really
-did answer something other than `NotFound` before it asserts anything
-else, so it cannot pass vacuously.
-`a_candidate_that_is_merely_absent_is_still_absence` is its control on
-the other side of the same boundary, and each fails under the mutation
-that removes the arm it is about.
+searches the undeterminable entry alone and requires the `stat` refusal,
+not absence. `a_candidate_that_is_merely_absent_is_still_absence` is its
+control on the other side of the same boundary, over the never-created
+directory, and each fails under the mutation that removes the arm it is
+about.
+
+`an_undetermined_candidate_stops_the_search_before_a_later_match` is
+`SWEEP-HOST-NAMING-004`'s witness: the undeterminable entry first, the
+test binary's own directory second, and the answer must be the
+`Filesystem` variant naming the undeterminable candidate — matched on
+the variant's fields, not on its rendering. Restoring `b9c73630`'s
+fall-through fails this test and nothing else in the `runner::host`
+suite. `a_directory_that_is_merely_absent_is_walked_past_to_a_later_match`
+is its control: the never-created directory first, the binary second,
+and the binary must be found. Making `NotFound` propagate fails it, the
+absence control above, and twenty-one tests of row 44's suite.
 
 `a_pathext_entry_no_string_can_carry_reaches_the_candidate_intact`
 drives `ProgramNaming::Windows` — on every platform, per the grid — with
