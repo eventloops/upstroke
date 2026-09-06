@@ -4,8 +4,14 @@ Extended notes for [`src/topology/fold/apply.rs`](../../../../src/topology/fold/
 
 ## Module
 
-The application half of INV-02: what a checked transition does to the
-state, and nothing that decides whether it may.
+The application half of the one-checked-transition rule: what a checked
+transition does to the state, and nothing that decides whether it may. The
+living authority is `design/04`'s fourth invariant — every state transition is
+an event and state is derived by replaying them — with the protocol spelled out
+in `design/26`: "The live writer checks one event, appends that exact event
+successfully once, and applies its delta once to the same fold with no
+intervening transition." (`INV-02` was the retired 2026-08-12 packet's label
+for it; no living document defines that id.)
 
 Application is a deterministic function of the prior state, event and
 checked derivation. It reads no clock, environment or randomness and performs
@@ -109,24 +115,31 @@ own generation holds its predicted region and releases it when it
 closes, and an inherited-lineage generation took none of its own and
 releases nothing.
 
-## `apply` › `}`
+## `apply` › `TopologyEventBody::AttemptStarted { data } => {`
 
-**Not counted here.** An attempt that has *started* has not
+**The allowance is not counted here.** An attempt that has *started* has not
 yet spent anything: `ladder::spends_allowance` is total over
 `FailureKind` and its line is "the worker ran and produced
 work to judge", which `attempt_started` cannot know. Counting
 here made this fold a second authority for a rule that has one
 production implementation, and made every interruption, park
-and outage burn a rung the packet says they do not —
-`transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend,
-**allowance refunded**". The count is taken at the settlement,
+and outage burn a rung `design/15` says they do not: an
+attempt the log ends mid-flight is "recorded in the ledger
+with unknown spend, but not counted against the rung's
+allowance, because nothing judged the code — the same rule
+§19 applies to an outage". (`T-ATTEMPT` was the retired
+2026-08-12 packet's row label for that case; no living
+document defines it.) The count is taken at the settlement,
 in `apply_settlement`, from the record the settlement carries.
 
-## `apply` › `self.close_generation(data.key);`
+## `apply` › `TopologyEventBody::AttemptInterrupted { data } => {`
 
-T-ATTEMPT: generation Closed, task Pending, later dispatch a
-new generation. The close releases the ordinary generation's
-own region exactly as every other closing settlement does.
+An interrupted attempt: generation Closed, task Pending, later
+dispatch a new generation. (`apply` closes a generation at two
+sites; this section is the interruption's, not
+`generation_closed`'s, which leaves the task's state alone.) The
+close releases the ordinary generation's own region exactly as
+every other closing settlement does.
 
 ## `apply` › `self.open_question(&data.question, QuestionOrigin::Admission, None);`
 
@@ -171,8 +184,9 @@ than the live failure, and the allowance decision is the same decision
 either way".
 
 **Taken at the settlement, which is what makes the refund free.**
-T-ATTEMPT refunds an interrupted attempt's allowance. An attempt that
-never settled never counted, so there is nothing to give back and no
+An interrupted attempt is not counted against its rung's allowance
+(`design/15`, quoted in the `attempt_started` section above). An
+attempt that never settled never counted, so there is nothing to give back and no
 second rule to keep in step with the first — the refund is the absence
 of a charge rather than a subtraction that could be forgotten.
 
@@ -197,9 +211,12 @@ in flight rather than a silently-promoted one.
 
 ## `apply_settlement` › `if let Some(task) = self.tasks.get_mut(finished.key.index()) {`
 
-The settlement's own number: the packet defines it as the
-rung the escalation climbs *onto*. The allowance is per
-rung, so it starts again here.
+The settlement's own number, which `design/11` step 4 defines
+as the rung the escalation climbs *onto*: "`attempts_per`
+exhausted → next rung". `check_attempt_finished` refuses an
+`Escalated` settlement that names anything but `task.rung + 1`
+within the frozen ladder, so the number this stores is that
+one. The allowance is per rung, so it starts again here.
 
 ## `apply_settlement` › `self.set_defers(finished.key, *defers);`
 
@@ -244,8 +261,11 @@ worker ran and produced work that was judged and accepted.
 **The settlement, which used to arrive on its own event.** A
 candidate-producing attempt has exactly one successful
 settlement and this is it, so the class transition belongs here
-rather than to an `attempt_finished` the 2026-08-12 record says
-is not emitted.
+rather than to an `attempt_finished` that is not emitted for a
+successful settlement: `design/15` records that
+"`candidate_prepared` is the sole successful settlement for that
+candidate-producing attempt", and `check_attempt_finished`
+refuses a `succeeded` transition for that reason.
 
 ## `apply_candidate_prepared` › `self.charge_allowance(prepared.key, &prepared.attempt);`
 
