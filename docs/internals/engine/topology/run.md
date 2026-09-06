@@ -211,11 +211,19 @@ The contract passage that says so.
 Partly written, with both halves named **in the branch's own words**.
 
 `loop` states each branch as a sequence of clauses, and a branch can be
-honestly half-built: the ready-dispatch branch's first three clauses are
-a reservation and a dispatch, its last is an entire attempt through the
-Runner. Collapsing that into `Performed` would claim work nobody did,
-and into `NotYetImplemented` would hide a production append that
-genuinely happens. Neither is true, so the type says both.
+honestly half-built. The ready-dispatch branch was, until its attempt and
+settlement landed: its first three clauses were a reservation and a
+dispatch, its last an entire attempt through the Runner, and only the
+first three were written. Collapsing that into `Performed` would have
+claimed work nobody did, and into `NotYetImplemented` would have hidden a
+production append that genuinely happens. Neither was true, so the type
+said both.
+
+**No branch is `PartlyImplemented` today** — every arm of
+[`LoopBranch::disposition`] is `Performed`, `RefusedByCheckpoint` or
+`NotThisSlice`, and
+`a_refusal_names_the_branch_and_says_whether_anything_happened` asserts
+it. The variant stays for the next branch built in halves.
 
 ## `pub enum Disposition` › `#[allow(dead_code)]` (trailing)
 
@@ -267,25 +275,14 @@ the log a kill during the sleep would make false.
 
 The branch reads "ceiling check, provisional dispatch
 reservation, dispatch, run one attempt through the Runner and
-settle". The first three are here. The fourth is an attempt: a
-ladder rung, an adapter-built worker command, a spawn, a capture,
-gates, reviews and a settlement — and the state this build leaves
-instead is `OpenNoAttempt`, which is a **tabled** state, not a
-stuck one: recovery step (g) recreates its worktree at its base,
-and `close_at_run_end` closes it. Stopping here leaves the run in
-a shape the system already knows how to recover.
-All four clauses, and every case of the last one: a success
-through the candidate sequence, a retry, an escalation, an
-outage deferral, a park, and a terminal failure. The last two
+settle". All four clauses, and every case of the last one: a
+success through the candidate sequence, a retry, an escalation,
+an outage deferral, a park, and a terminal failure. The last two
 were refusals until `TaskFold::defers` and the question builder
 existed, and both refusals went with their causes.
 
 ## `pub const fn disposition(self) -> Disposition` › `Self::ReadyRetry => Disposition::Performed,`
 
-"{pipeline} reservation, next attempt in the retained
-generation" is here; running that attempt and settling it is the
-half still owed, and it is the same machinery the ready-dispatch
-branch already runs.
 "{pipeline} reservation, next attempt in the retained
 generation", whole: the reservation, `Worktree.Verify`, the
 retry's `attempt_started`, the attempt itself and its
