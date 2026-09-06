@@ -50,6 +50,22 @@ denied type or macro fails here on its own rather than only under CI's
 is a property of the parent's attribute rather than of this file, and a
 parent's attribute can widen without this file changing.
 
+## `pub(super) fn read_repo_config(`
+
+An absent, explicit `--config` path is an error ("file not found"); an absent,
+discovered one is the normal fresh case and returns [`RawRepoConfig::default`]
+silently — the same explicit/discovered asymmetry [`read_pools`] states below
+for `--pools`. Once bytes exist, `toml::from_str` decides the rest, and
+`RawRepoConfig` denies unknown fields (`SWEEP-CONFIG-PARSE-007`): a misspelled
+top-level section name — `[budgts]`, `[interation]`, `[runer]` — used to
+deserialize into nothing and vanish with no warning, deleting a whole section
+the same way a typo in one of its keys is already refused two levels down
+(§17's "what the repo-level file refuses"). It is now the same refusal as
+those keys: an error naming the section, not a warning and not silence. The
+seven accepted names are exactly `RawRepoConfig`'s fields and exactly what
+`design/17` documents for this file, so the attribute costs no
+forward-compatible key.
+
 ## `pub(super) fn read_pools(`
 
 Read `~/.upstroke/pools.toml` into typed pools (§17).
@@ -87,3 +103,16 @@ indistinguishable from "no pool" by the time it reaches the engine
 (`pool_option` maps `""` to `None`), so the attribution would vanish
 while the pool still matched for routing. Same reasoning as the
 non-empty `[[gates]]` `name`.
+
+## `Some(toml::Value::Integer(units)) => Allowance::Units(units as f64),`
+
+An `as` narrowing needs a nearby invariant that proves the range (§5); here
+the invariant is what `monthly_allowance` means rather than a bound checked
+in the file. It is a spend ceiling an operator typed by hand, always many
+orders of magnitude below `f64`'s 2^53 exact-integer boundary — the same
+boundary [`connect::render::toml_number`] rounds at when writing this value
+back out — so the cast cannot silently change what the operator wrote. The
+finiteness and sign check just below applies uniformly to both the integer
+and float branches; for the integer branch it can only ever pass, since a
+cast from a finite `i64` is never `NaN` or infinite, and it is written once
+for both rather than duplicated per branch.
