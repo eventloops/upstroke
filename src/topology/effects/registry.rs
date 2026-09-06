@@ -520,7 +520,18 @@ impl FaultRegistry {
     }
 
     /// Add an entry, or say why it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`validate_entry`] refuses the entry with, or
+    /// [`RegistryError::DuplicateEntry`] when this registry already holds an
+    /// entry at the same `(site, phase, order)` key. A refused entry is not
+    /// stored.
     pub fn insert(&mut self, entry: RegistryEntry) -> Result<(), RegistryError> {
+        // Propagated as it is: `validate_entry` is this function's format
+        // rule, its error already names the site, the phase and the field it
+        // refused, and `insert` knows nothing about the entry that the
+        // refusal does not already carry.
         validate_entry(&entry)?;
         if self.entries.iter().any(|held| held.key() == entry.key()) {
             return Err(RegistryError::DuplicateEntry {
@@ -568,6 +579,18 @@ impl FaultRegistry {
 /// hand-edited between a gate and a review never went through `insert`, and
 /// "the bijection check fails on a residue-class entry claiming executed-hook
 /// evidence" has to be true of that document too.
+///
+/// # Errors
+///
+/// Returns the first [`RegistryError`] the entry breaks, in this order: the
+/// fault-matrix row, the observable order, a no-execution record at a site the
+/// fast path does not skip, a coordinate the site does not have, the site's own
+/// residue rows, resume action and residue detail, the label the phase and the
+/// evidence each require, the pairing of phase kind with evidence kind, and
+/// last what the evidence itself must name. One error, not a list: `insert`
+/// stores nothing, so there is no partial acceptance for a caller to reason
+/// about, and the ordering is from the coordinate outwards so that the refusal
+/// a reader gets is about a coordinate that exists.
 pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
     let site = entry.site;
     let name = site.name();
@@ -639,6 +662,12 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
     //
     // All three come from one call, so they cannot be checked against two
     // tables that disagree.
+    //
+    // §6: the four refusals below clone the entry's own words into the error.
+    // The error outlives this borrow of `entry` and is what quotes the
+    // document back to a reader, so an owned snapshot is the semantics — not a
+    // borrow-checker workaround. `expected` is the authority's answer and is
+    // moved or `&'static`, never cloned.
     let semantics = site.semantics(entry.phase);
     if entry.expected_residue.rows != semantics.rows {
         return Err(RegistryError::WrongResidueRows {
