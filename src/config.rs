@@ -983,8 +983,6 @@ mod tests {
 
     #[test]
     fn a_misspelled_top_level_section_is_refused_not_dropped() {
-        // Each of these used to deserialize into nothing: the whole section vanished and its
-        // defaults took effect while `validate` reported a clean file (SWEEP-CONFIG-PARSE-007).
         for (name, body, typo) in [
             (
                 "misspelled-budgets.toml",

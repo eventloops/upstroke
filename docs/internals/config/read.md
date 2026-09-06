@@ -103,23 +103,58 @@ indistinguishable from "no pool" by the time it reaches the engine
 while the pool still matched for routing. Same reasoning as the
 non-empty `[[gates]]` `name`.
 
-## `const EXACTLY_REPRESENTABLE_UNITS: i64 = 1 << 53;`
+## `fn converts_exactly(units: i64) -> bool {`
 
 An `as` narrowing needs a nearby invariant that proves the range (§5), and
 this one is *checked* rather than assumed. TOML hands `monthly_allowance` the
-whole `i64` range, and above 2^53 the cast stops being lossless: written
-`9223372036854775807`, an operator would have got `9223372036854775808` back —
-a ceiling nobody set. An earlier version of this note argued the range instead
-of enforcing it, reasoning that a hand-typed spend ceiling is never that large;
-that is a claim about operators, not about accepted input, and it was wrong on
-the input the parser actually takes. So the integer branch refuses anything
-above this constant by name, and what survives the cast is the number that was
-written. 2^53 is also the boundary [`connect::render::toml_number`] rounds at
-when writing the value back out, so the two directions agree.
+whole `i64` range, and an `f64` carries 53 significant bits, so not every
+integer survives the cast: written `9223372036854775807`, an operator would
+have got `9223372036854775808` back — a ceiling nobody set. So the integer
+branch refuses, by name, any integer the cast would change, and what survives
+is the number that was written.
 
-The finiteness and sign check just below applies uniformly to both the integer
+What decides it is the span between the highest and the lowest set bit of the
+magnitude: an integer converts exactly when that span fits in the mantissa,
+whatever its size. `2^53 + 1` needs 54 bits and is refused; `2^53 + 2` and
+`10^16` (the older writer's integer spelling `design/17` names, which is
+`2^16 × 152587890625`) fit and are accepted unchanged. An earlier version of
+this check was a blanket ceiling at `2^53`, which refused those two; and the
+version before that argued the range instead of enforcing it, reasoning that a
+hand-typed spend ceiling is never that large — a claim about operators, not
+about accepted input. Both were wrong on the input the parser actually takes.
+The predicate is integer arithmetic only, so the proof of the cast does not
+itself lean on a cast; the sign is refused just below, where `i64::MIN`, exact
+though it is, fails the same check every negative value fails.
+
+The finiteness and sign check below applies uniformly to both the integer
 and float branches; for the integer branch it can only ever pass, since a
 cast from a finite `i64` is never `NaN` or infinite, and it is written once
-for both rather than duplicated per branch. The float branch takes no upper
-bound: a `toml` float is already an `f64`, so there is no conversion to lose
-anything, and `is_finite` is the whole of what it needs.
+for both rather than duplicated per branch. The float branch takes no
+exactness check: a `toml` float is already an `f64`, so there is no conversion
+to lose anything, and `is_finite` is the whole of what it needs.
+[`connect::render::toml_number`] writes an allowance back out as an integer
+only below `2^53` and as a float otherwise; that is the writer's choice of
+spelling and is unaffected by what the reader accepts.
+
+## `fn absent(tag: &str, required: bool) -> FileSnapshot {`
+
+The absent-file tests need a snapshot whose capture found no file, and they
+build one directly rather than pointing `snapshot_file` at a path that is
+supposed not to exist. A path is only as absent as the filesystem says it is
+at the moment of the read: a fixed name can be satisfied by a leftover, and a
+per-process name can be satisfied by a leftover from an earlier process that
+was issued the same id. `FileSnapshot`'s fields are private to `src/config.rs`
+and visible here because this module is its child, and `Ok(None)` is exactly
+what `snapshot_file` records for a file that is not there, so the fixture is
+the captured state itself with no filesystem in the oracle. Reaching for `fs`
+to manage a real directory would put a governed primitive in a module that
+denies all three and takes no `effects/allowlist.toml` row.
+
+## `fn an_integer_allowance_that_converts_exactly_is_accepted_unchanged() {`
+
+The expected values are written out as float literals rather than spelled
+`written as f64`, which is the very cast under test: the expected value has to
+come from outside the code being proved. The refusal test's `i64::MAX` case is
+the value that motivated the check — it casts to `9223372036854775808.0`, one
+more than it is, and accepting it would silently store an allowance the
+operator did not write.

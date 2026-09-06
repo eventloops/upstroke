@@ -29,6 +29,13 @@ place a typo still deleted silently, and it deleted the largest unit
 forward-compatibility key is lost: nothing in the tree's fixtures, docs or
 examples writes a top-level key outside the seven.
 
+## `fn a_misspelled_top_level_section_is_refused_not_dropped() {`
+
+Each of the three fixtures used to deserialize into nothing: the whole
+section vanished and its defaults took effect while `validate` reported a
+clean file (`SWEEP-CONFIG-PARSE-007`). The test is witnessed against removing
+the attribute above: without it the load succeeds and the section is dropped.
+
 ## `gates: Option<toml::Value>,`
 
 Parsed as raw values so shape mistakes get actionable messages instead

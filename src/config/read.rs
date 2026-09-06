@@ -11,8 +11,6 @@ use super::{
     Source, UpstrokeError, capacity,
 };
 
-const EXACTLY_REPRESENTABLE_UNITS: i64 = 1 << 53;
-
 pub(super) fn read_repo_config(
     snapshot: &FileSnapshot,
 ) -> Result<(RawRepoConfig, PathBuf), UpstrokeError> {
@@ -167,11 +165,12 @@ fn parse_pool(
             Allowance::Auto
         }
         Some(toml::Value::Integer(units)) => {
-            if units > EXACTLY_REPRESENTABLE_UNITS {
+            if !converts_exactly(units) {
                 return Err(config_error(format!(
-                    "[pools.{name}] `monthly_allowance = {units}` is larger than an allowance is \
-                     held to ({EXACTLY_REPRESENTABLE_UNITS}) — above that an allowance cannot be \
-                     stored without changing the number you wrote"
+                    "[pools.{name}] `monthly_allowance = {units}` cannot be held as written — an \
+                     allowance is a 64-bit float, which carries {} significant bits, and this \
+                     integer needs more; write a value that converts without change",
+                    f64::MANTISSA_DIGITS
                 )));
             }
             Allowance::Units(units as f64)
@@ -225,6 +224,13 @@ fn parse_pool(
     })
 }
 
+fn converts_exactly(units: i64) -> bool {
+    let magnitude = units.unsigned_abs();
+    magnitude == 0
+        || u64::BITS - magnitude.leading_zeros() - magnitude.trailing_zeros()
+            <= f64::MANTISSA_DIGITS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,25 +243,17 @@ mod tests {
         true
     }
 
-    /// A path this process has not created and no other run can be holding: the process id
-    /// separates concurrent runs and the counter separates calls within one. Nothing is created
-    /// here, so nothing needs removing — these tests want a name whose whole point is that it
-    /// resolves to no file, and reaching for `fs` to guarantee that would put a governed
-    /// primitive in a module that denies all three and takes no `effects/allowlist.toml` row.
-    fn absent_path(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "upstroke-config-read-absent-{}-{unique}-{tag}.toml",
-            std::process::id()
-        ))
+    fn absent(tag: &str, required: bool) -> FileSnapshot {
+        FileSnapshot {
+            path: PathBuf::from(format!("absent-{tag}.toml")),
+            required,
+            content: Ok(None),
+        }
     }
 
     #[test]
     fn read_repo_config_of_a_required_absent_file_is_an_error() {
-        let path = absent_path("required");
-        let snapshot = crate::config::snapshot_file(&path, true);
+        let snapshot = absent("required", true);
         let err = read_repo_config(&snapshot).expect_err("a required file that is absent errors");
         assert!(matches!(err, UpstrokeError::Config { .. }));
         assert!(err.to_string().contains("file not found"));
@@ -263,10 +261,9 @@ mod tests {
 
     #[test]
     fn read_repo_config_of_an_optional_absent_file_is_the_default() {
-        let path = absent_path("optional");
-        let snapshot = crate::config::snapshot_file(&path, false);
+        let snapshot = absent("optional", false);
         let (raw, returned_path) = read_repo_config(&snapshot).expect("absent optional defaults");
-        assert_eq!(returned_path, path);
+        assert_eq!(returned_path.as_path(), snapshot.path());
         assert!(raw.routing.is_none());
         assert!(raw.pins.is_none());
     }
@@ -411,35 +408,36 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_exactly_representable_integer_allowance_is_accepted_unchanged() {
+    fn an_integer_allowance_that_converts_exactly_is_accepted_unchanged() {
         let path = Path::new("pools.toml");
-        let mut warnings = Vec::new();
-        let pool = parse_pool(
-            "p",
-            pool_value(&format!(
-                "kind = \"credits\"\nagent = \"claude-code\"\nmonthly_allowance = {EXACTLY_REPRESENTABLE_UNITS}\n"
-            )),
-            path,
-            &any_adapter,
-            &mut warnings,
-        )
-        .expect("the boundary value is an allowance");
-        // Written out rather than spelled `EXACTLY_REPRESENTABLE_UNITS as f64`, which is the very
-        // cast under test: the expected value has to come from outside the code being proved.
-        assert_eq!(EXACTLY_REPRESENTABLE_UNITS, 9_007_199_254_740_992);
-        assert_eq!(
-            pool.monthly_allowance,
-            Allowance::Units(9_007_199_254_740_992.0),
-            "the boundary value survives the cast as the number that was written"
-        );
+        for (written, expected) in [
+            ("9007199254740992", 9_007_199_254_740_992.0),
+            ("9007199254740994", 9_007_199_254_740_994.0),
+            ("10000000000000000", 10_000_000_000_000_000.0),
+        ] {
+            let mut warnings = Vec::new();
+            let pool = parse_pool(
+                "p",
+                pool_value(&format!(
+                    "kind = \"credits\"\nagent = \"claude-code\"\nmonthly_allowance = {written}\n"
+                )),
+                path,
+                &any_adapter,
+                &mut warnings,
+            )
+            .expect("an integer that converts exactly is an allowance");
+            assert_eq!(
+                pool.monthly_allowance,
+                Allowance::Units(expected),
+                "{written} survives the cast as the number that was written"
+            );
+        }
     }
 
     #[test]
     fn an_integer_allowance_the_cast_would_change_is_refused() {
         let path = Path::new("pools.toml");
-        for units in [EXACTLY_REPRESENTABLE_UNITS + 1, i64::MAX] {
-            // i64::MAX casts to 9223372036854775808.0, one more than it is: accepting it would
-            // silently store an allowance the operator did not write.
+        for units in [9_007_199_254_740_993_i64, i64::MAX] {
             let mut warnings = Vec::new();
             let err = parse_pool(
                 "p",
