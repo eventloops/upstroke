@@ -297,12 +297,18 @@ an early assertion, an `expect`, a `panic!`, a `?` — and nothing at all after 
 successful `wait()`, because the `Option` is empty by then.
 
 A `Drop` has nowhere to report to except a failure of its own, and it must not
-raise one while an unwind is already under way. So the report is dropped when
-`std::thread::panicking()` — the body's own failure is the message, and the
-three bodies that can reach the failing wait call `settle_report` explicitly
-and put the cleanup outcome in their own panic — and it becomes an assertion
-failure when nothing else has failed, which is the abandoned child this type
-exists to prevent going unnoticed.
+raise one while an unwind is already under way. So when
+`std::thread::panicking()` the report is PRINTED — the harness keeps a failing
+test's captured output beside its panic, so the cleanup outcome survives with
+the body's own failure rather than being discarded, which is what the first two
+shapes of this guard did — and it becomes a panic of its own when nothing else
+has failed, which is the abandoned child this type exists to prevent going
+unnoticed. The three bodies that can reach the failing wait still call
+`settle_report` explicitly and put the cleanup outcome in their own message.
+
+`println!` is the module's allowed reporting macro (`effects/allowlist.toml`,
+the funnel row for this file); it is used only on the unwinding arm, where a
+panic is not available.
 
 ## `fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {`
 
@@ -503,41 +509,129 @@ three unreadable shapes.
 The spawn the group-observation bodies already do, named once for the three
 bodies below that need a child which will not exit until they say so.
 
+## `enum ControlEnd {`
+
+How the control's worker ended, joined and printed in the report: the child
+exited (`waitid` answered), the owner cancelled it, or `waitid` failed with an
+errno. Three variants rather than `Result<(), i32>` because the second is the
+one the repair makes possible and the tests assert on it by name.
+
+## `extern "C" fn interrupt_only(_signal: libc::c_int) {}`
+
+The handler the cancel signal is delivered to. Its whole job is to exist: a
+signal with a handler and no `SA_RESTART` makes the syscall it lands in return
+`EINTR`, and an empty body is trivially async-signal-safe. The worker learns
+WHY it was interrupted from its cancel flag, not from the handler.
+
+## `static CONTROL_CANCEL_HANDLER: std::sync::OnceLock<Result<libc::c_int, String>> =`
+
+The one-time installation, memoised with its outcome so a failed `sigaction`
+is reported to every control that asks and never retried silently. A
+disposition is process-wide, so it is installed once for the process rather
+than once per control; `OnceLock` is the single owner of that fact.
+
+## `fn control_cancel_signal() -> Result<libc::c_int, String> {`
+
+`SIGRTMIN`, the first real-time signal: nothing in `std`, in this crate or in
+this suite gives it a meaning, so a handler for it changes what no other body
+observes. The disposition is process-wide but the DELIVERY is not — the signal
+only ever reaches a thread `interrupt_until_joined` names with `pthread_kill`,
+never the process, and a handler does not survive `exec`, so the children the
+other bodies spawn inherit nothing from it (only `SIG_IGN` crosses `exec`).
+`sa_flags = 0` is the load-bearing line: with `SA_RESTART` the kernel restarts
+`waitid` after the handler and the worker never sees `EINTR`.
+
+The parking note for this ticket weighed this against forking the control into
+another process, which would have had the census read `/proc/<other>/task`
+while the claim reads `/proc/self/task` — a control in a different domain from
+the one it vouches for. The signal keeps the control in the same process and
+the same census.
+
+## `fn interrupt_until_joined<T>(handle, signal, cancel, budget) -> Result<thread::Result<T>, (thread::JoinHandle<T>, String)> {`
+
+The cancellation protocol (§10), and the reason the join no longer depends on
+the child. `cancel` is stored first; then on every probe the worker is
+signalled and `join_within` is asked for one interval, until the worker has
+finished or the budget is spent.
+
+Signalling on EVERY probe is what closes the check-then-act window: the worker
+reads the flag only after an `EINTR`, so a signal that lands while it is in
+user space — between one flag check and the next `waitid` — interrupts nothing,
+and the flag alone would leave it blocked. The next probe's signal lands inside
+the `waitid`. No sleep stands in for a signal here: each interval is a bound on
+one round of the protocol, and the finished check inside `join_within` comes
+before it.
+
+`pthread_kill` against a `JoinHandle` still held names a thread that has not
+been joined and so cannot have been reused; a worker that has just finished
+answers `ESRCH` or 0, and both are ignored. Any other error — `EINVAL` for a
+signal the kernel refuses — is returned with the handle rather than looped on,
+because the loop would then be a 30-second sleep that reports a timeout for a
+different fault.
+
+On the budget the handle is handed BACK, with the reason, exactly as
+`join_within` does. That arm is reachable only if a thread-directed signal is
+not delivered to an interruptibly sleeping thread for the whole budget, which
+is not a state the kernel reaches; it is reported rather than reasoned away.
+
 ## `struct ControlWaiter {`
 
-The positive control's waiter and the child it waits on, OWNED TOGETHER.
+The positive control's waiter, the child it waits on, the signal that cancels
+it and the flag that tells it why, OWNED TOGETHER.
 
-`EXIT-WAITER-CONTROL-DETACHED-ON-FAILURE`, review pass 1 of PR #179: the first
-shape held the `JoinHandle` in a local and joined it after a census read, an
-`assert_eq!` and a `settle().expect(...)`. Any of those leaving through a panic
-dropped the handle mid-unwind, detaching a thread blocked in `waitid` — which
-is the finding this very test exists to witness, recreated inside its own
-control. A guard settles on every path instead.
+`EXIT-WAITER-CONTROL-DETACHED-ON-FAILURE`, review passes 1 and 2 of PR #179.
+The first shape held the `JoinHandle` in a local and joined it after a census
+read, an `assert_eq!` and a `settle().expect(...)`; any of those leaving
+through a panic dropped the handle mid-unwind. The second shape owned the
+handle in this guard but joined it only after killing and reaping the child,
+because a `waitid(WEXITED | WNOWAIT)` ends only when the child does — so a
+child that stayed wedged after `kill` left the worker in its wait, and the
+bounded join handed a handle back that `settle` then dropped. This shape is
+the third: the worker is CANCELLABLE, so the join is independent of the child.
+
+`Arc<AtomicBool>` for the flag is the `worker.rs` shape (§6): the worker reads
+it after every `EINTR` and the owner writes it while the worker is blocked,
+and each side may outlive the other's last use of it.
 
 ## `impl ControlWaiter` › `fn start() -> Result<Self, String> {`
 
 A failure to start is returned, not panicked: the child is already owned by a
 `ReapedChild` at that point, and returning lets the caller name what failed
-while the guard still settles the child.
+while the guard still settles the child. Installing the handler is part of
+starting, so a control that could not be made cancellable never runs.
 
-The waiter's outcome is its errno rather than an `io::Error`, so the type is
-`Send` and `Debug` and the joined value can be printed in a report.
+The worker's loop retries `EINTR` unless the flag is set, so an unrelated
+interruption — none is expected, but the loop does not assume it — puts it
+back into its wait, and only the owner's cancellation ends it early.
+
+## `impl ControlWaiter` › `fn join_worker(&mut self) -> Result<String, String> {`
+
+Cancel and join, bounded and reporting, with NO reference to the child. Its
+three outcomes: the worker ended (with which `ControlEnd`), the worker
+panicked, or the worker could not be joined within the budget — in which case
+the handle is put BACK into the guard rather than dropped, so the guard still
+owns the thread and `Drop` gets its own bounded attempt. A second call after a
+successful first is a no-op that says so.
+
+`a_control_waiter_is_joined_without_its_child_exiting` calls it directly on a
+control whose child is alive and unexited, which is the sequence pass 2 named:
+nothing about the child ends the wait, and the worker is joined anyway.
 
 ## `impl ControlWaiter` › `fn settle(&mut self) -> Result<String, String> {`
 
-Settle the child FIRST, then join. Killing and reaping the child is what ends
-the waiter's `waitid` — a reaped pid answers `ECHILD` — so the join that
-follows is one the child's own bound has already made terminable; `join_within`
-bounds what is left. Every one of the four outcomes is reported: the waiter
-ended and the child settled, the waiter ended but the child did not, the waiter
-panicked, and the waiter was still in its wait at the budget, where the handle
-is reported rather than joined without a bound.
+The worker FIRST, then the child — the reverse of the second shape. Every
+combination of the two outcomes is reported as one sentence, and any failure
+in either half is a failure of the whole: the worker joined but the child not
+settled is still an error, because the guard's promise is both.
 
 ## `impl Drop for ControlWaiter` › `fn drop(&mut self) {`
 
 The same shape as `ReapedChild`'s: settle on every path the body did not
-finish, stay silent during an unwind because a `Drop` must not raise a second
-panic, and fail the test when the cleanup failed and nothing else had.
+finish, print the cleanup outcome during an unwind because a `Drop` must not
+raise a second panic there, and fail the test when the cleanup failed and
+nothing else had. `an_unwind_through_a_body_that_owns_a_control_leaves_no_
+waiter_and_no_zombie` unwinds through a body that owns a live control and
+then reads the census and the child's group.
 
 ## `fn a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child() {`
 
@@ -563,6 +657,37 @@ What it does NOT witness, stated rather than implied: an unjoined thread doing
 something other than `waitid` on this pid. The census is keyed on the wait, and
 a source-text census over spawns would be a text domain standing in for a
 behaviour claim.
+
+## `fn a_control_waiter_is_joined_without_its_child_exiting() {`
+
+The pass-2 sequence made reachable: the control is planted and seen by the
+census, then its worker is joined WITHOUT the child being killed, reaped or
+told to exit. The join must report `Cancelled`, return short of the budget,
+and leave the child alive and unexited (`exited_unreaped` answers no), and
+the census must then find nothing waiting on the pid. Only afterwards is the
+child settled through the guard.
+
+MEASURED. With the signal not sent, with the flag never set, with the flag
+never read, or with the handler installed with `SA_RESTART`, this body fails
+at its 30-second bound: the worker stays in `waitid` until its child dies,
+which nothing in the body does for it.
+
+## `fn an_unwind_through_a_body_that_owns_a_control_leaves_no_waiter_and_no_zombie() {`
+
+The census-failure unwinding pass 2 asked for: a body that owns a live control
+leaves through a panic, and the guard's `Drop` runs during the unwind. After
+the unwind nothing may be waiting on the pid and the child must be reaped
+(`ECHILD` from its own group). The panic payload is checked to be the
+deliberate one, so a second panic from the cleanup would fail the test as a
+different message rather than pass as "a panic".
+
+What it does NOT witness, stated: that the worker was JOINED rather than left
+to finish on its own. `ReapedChild`'s own `Drop` reaps the child either way,
+after which the worker's `waitid` ends on `ECHILD` and the thread exits, so a
+guard that skipped the join would leave the same census and the same group a
+moment later. The join is witnessed by ownership — the handle is a field and
+the type's `Drop` is the only path out — and by the first body, where the
+child is still alive and the join can only be the cancellation.
 
 ## `fn a_syscall_line_is_read_by_its_wait_arguments_rather_than_its_number() {`
 
