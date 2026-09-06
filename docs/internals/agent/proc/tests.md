@@ -222,6 +222,52 @@ reaper — which settles whatever the reaper knows about.
 Do not leak a 60-second sleeper into the rest of the suite when
 this fails.
 
+## `struct ReapedChild {`
+
+The owner of a spawned child for the two group-observation tests below and
+their own regression, `PR173-EARLY-ASSERTION-LEAKS-A-ZOMBIE`. Both bodies
+assert several times between the spawn and their closing `wait()`, and
+`std::process::Child` does not reap on drop: in the scheduling case those
+bodies describe in their own messages — the child gone before the first look —
+the premise assertion panics, the reap is skipped, and the exited child stays
+an unreaped zombie for the rest of the suite. The supervisor of the first test
+settles the child's GROUP and never reaps the direct child, measured; the
+second has no supervisor at all.
+
+§6: RAII owns child processes, and cleanup happens on early return, error and
+panic unwinding — "a guard or resource-owning type beats a `start`/`finish`
+pair whose second half can be skipped". The assertions stay exactly where they
+are; what changes is who owns the child while they run.
+
+`#[cfg(unix)]` because the three bodies that use it are.
+
+## `impl ReapedChild` › `fn new(child: Child) -> Self {`
+
+The pid is copied once, at construction, so `pid()` answers after `wait()` has
+taken the `Child` out and there is no `Option` to unwrap at a call site.
+
+## `impl ReapedChild` › `fn close_stdin(&mut self) {`
+
+`drop(child.stdin.take())`, which is how all three bodies ask the child to
+exit. Silent when the child has already been reaped: closing the stdin of a
+child that is gone is not a failure to report.
+
+## `impl ReapedChild` › `fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {`
+
+The deliberate reap, and it takes the `Child` out on success so `Drop` has
+nothing left to do. A second call is an error rather than a second `wait`:
+once a pid is reaped the operating system is free to reissue it, and a
+`kill`/`wait` on a reissued pid is a signal to somebody else's process.
+
+## `impl Drop for ReapedChild` › `fn drop(&mut self) {`
+
+The whole point of the type. `kill` then `wait` on every path the body did not
+finish — an early assertion, an `expect`, a `panic!`, a `?` — and nothing at
+all after a successful `wait()`, because the `Option` is empty by then. Both
+results are discarded because a `Drop` has nowhere to report to and the child
+is already leaving: a child that exited on its own answers `kill` with
+`ESRCH`, and that is the expected case rather than a failure.
+
 ## `fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {`
 
 The regression test for `W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT`
@@ -238,6 +284,8 @@ passed it throughout, because Linux answers `getpgid` for a zombie.
 `register` then `finish` is the supervisor lifecycle production runs, in
 production's order: `finish` before the reap, while the child is still a
 zombie.
+The child is held in a `ReapedChild`, so a premise assertion that fires before
+that reap still leaves no zombie behind (`PR173-EARLY-ASSERTION-LEAKS-A-ZOMBIE`).
 
 ## `fn a_child_left_in_this_processs_group_never_answers_for_its_own() {`
 
@@ -247,6 +295,99 @@ without the pre-exec step, so it stays in this process's group. Running,
 record names the same group and the decision stays `false`. A
 fall-through that trusted any exited record would pass the regression
 test and fail here.
+Its child is held in a `ReapedChild` for the same reason, and it has no
+supervisor to settle anything on its behalf.
+
+## `fn a_reaped_childs_pid_never_answers_for_its_own_group() {`
+
+The second control the Darwin fall-through needs, and the one
+`PR173-DARWIN-FALL-THROUGH-ACCEPTS-A-LIVE-RECORD` asked for: the same
+child, through the production pre-exec path, witnessed leading its own
+group while it is still an unreaped zombie, then settled and reaped in
+production's order. After the reap `observe_child_group` must answer
+`exited_before == Err(ECHILD)` — the pid is no longer this process's
+child — and the decision must be `false`. The reap is the only thing
+between the two looks, so a `true` here is an answer about whatever
+holds the pid now rather than about the child.
+
+## `fn only_this_processs_own_zombie_answers_for_its_group_after_an_esrch() {`
+
+macOS only, and the decision itself rather than a process: the case the
+finding names cannot be staged on demand, because it needs XNU to reuse
+a freed pid for an unrelated live group leader. So the records are built
+in the test and handed to `GroupObservation::leads_own_group`, which is
+the call site the grid and the oracle both use. This process's own
+`SZOMB` record naming its own pid must read `true`, and seven records
+must read `false`: a live (`SRUN`) record for a pid that is not this
+process's child, a zombie of some other parent, a record naming another
+group, no record at all, a running child, this process's own unreaped
+child beside a record that is not a zombie's, and a pid this process
+never had. A `getpgid` failure other than `ESRCH` reads `false` beside a
+perfect record.
+
+MEASURED, because a test that cannot fail proves nothing. At `51ef2c3`
+— this body without the repair, and before the review added the seventh
+rejected record — `test (macos-latest)` (run 34014712713, job
+101436393531, `macos-latest`) failed it on the first record it rejects:
+"a live process holding the pid, which `proc_pidinfo` reaches through
+`proc_find` before it ever consults the zombie list answered for its own
+group: pid 424242: before the look waitid failed: No child processes (os
+error 10); getpgid failed: No such process (os error 3);
+proc_pidinfo(PROC_PIDT_SHORTBSDINFO, zombie) answered pgid 424242 status
+2; after the look waitid failed: No child processes (os error 10)" —
+status 2 is `SRUN`. On that same job
+`a_reaped_childs_pid_never_answers_for_its_own_group` passed.
+`test (ubuntu-latest)` compiles and ran that control, which is
+`#[cfg(unix)]`, and passed; this test is `#[cfg(target_os = "macos")]`
+and no leg but macOS compiles it. `test (winguest)` compiles neither.
+
+The seven rejected records exercise each condition on its own. Six fail
+on `exited_before`, on having no record to read, or on the group the
+record names, so `pbsi_status` never decides them; the seventh pairs
+`Ok(true)` with its own pid and an `SRUN` record, and the `SZOMB`
+comparison is the only thing that rejects it. Drop any one of the three
+conditions and one of the seven reads `true`: without `exited_before`
+the other parent's zombie does, without `SZOMB` the seventh does, and
+without the group comparison the record naming another group does.
+
+## `fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {`
+
+The regression for `PR173-EARLY-ASSERTION-LEAKS-A-ZOMBIE`. It runs the shape of
+the two bodies above — spawn, hold on stdin, `await_exit_without_reaping`, the
+premise look — and then panics, inside `catch_unwind` and holding the guard,
+where the scheduling case makes the premise assertion fail. The claim is about
+what is left AFTER that unwind:
+`observe_child_group(pid).exited_before` must be `Err(ECHILD)`, the answer for a
+pid this process no longer has as a child, rather than `Ok(true)`, the answer for
+an exited, unreaped zombie.
+
+THE SETUP IS ESTABLISHED OUTSIDE THE `catch_unwind`, AND THE PANIC IT CATCHES IS
+IDENTIFIED. `PR173-ZOMBIE-REGRESSION-SWALLOWS-PREMISE-FAILURE`: an earlier shape
+ran the whole body inside `catch_unwind` and accepted `is_err()`, so a timed-out
+`await_exit_without_reaping` or a failed zombie premise was caught, reaped by the
+guard exactly as an intended unwind would be, and reported as a pass — the test
+went green having established nothing. §12: a missing prerequisite fails
+diagnostically rather than being read as the condition under test. So the wait
+and the premise assertion run in the test's own frame, where their failure is the
+test's failure, and the closure holds only the guard and one panic whose payload
+is compared against the message the test itself wrote. Any other panic reaching
+`catch_unwind` fails on that comparison instead of standing in for it.
+
+`let _owned_across_the_unwind = child;` is load-bearing rather than a name for
+nothing: a `move` closure captures the variables its body USES, so a closure that
+only panicked would not take the guard at all, and the child would be dropped by
+the enclosing frame after the observation instead of by the unwind.
+
+MEASURED, because "the test passes" is not evidence that it detects. On the base
+the same body without the guard — the two tests' own ownership shape — leaves
+`exited_before: Ok(true)`. With the guard's `Drop` body emptied the test fails on
+`Ok(true)`; with `wait` dropped from it and only `kill` kept it fails the same
+way, since a killed child is a zombie until somebody reaps it. With the premise
+assertion forced to fail, the test fails on the premise instead of passing.
+
+`ECHILD` is also the answer if the pid were reissued to an unrelated process
+between the reap and the look, so the assertion cannot be satisfied by a zombie
+under any scheduling.
 
 ## `fn timeout_kills_the_process_tree_quickly()` › `let script = if cfg!(windows) {`
 
