@@ -132,6 +132,69 @@ fixture capacity
 printf 'pub struct Example;\n//! Extended notes: `%s`\n' "$notes" > "$tree/$module"
 check 1 marker_after_code_is_rejected
 
+# The marker domain is Rust comments. Source text that merely contains the
+# phrase is not a marker, and the literals that hold it are removable regions:
+# deleting the blanker turns each of the next three cases red.
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &str = "Extended notes: are pointers";\n' "$notes" > "$tree/$module"
+check 0 ordinary_string_holding_the_phrase_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &str = "https://example.invalid/ Extended notes: are pointers";\n' "$notes" > "$tree/$module"
+check 0 a_url_inside_a_string_does_not_open_a_comment
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &str = "an escaped \\" does not close it // Extended notes: prose";\n' "$notes" > "$tree/$module"
+check 0 an_escaped_quote_does_not_end_the_string_early
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const SAMPLE: &str = r#"a " inside\n//! Extended notes: `docs/internals/other.md`\n"#;\n' "$notes" > "$tree/$module"
+check 0 raw_string_holding_a_marker_line_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &std::ffi::CStr = cr#"a " inside\n//! Extended notes: `docs/internals/other.md`\n"#;\n' "$notes" > "$tree/$module"
+check 0 raw_c_string_holding_a_marker_line_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &[u8] = br#"a " inside\n//! Extended notes: `docs/internals/other.md`\n"#;\n' "$notes" > "$tree/$module"
+check 0 raw_byte_string_holding_a_marker_line_is_not_a_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const HINT: &std::ffi::CStr = cr#"a " inside"#;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
+check 1 a_comment_after_a_raw_c_string_is_still_read
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const QUOTE: u8 = b\x27"\x27;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
+check 1 a_byte_char_literal_quote_does_not_hide_the_comment_after_it
+
+# N1 accepts one comment form and no other: a block comment carries no marker,
+# however exactly its body is spelled.
+
+fixture capacity
+printf '/*\n//! Extended notes: `%s`\n*/\npub struct Example;\n' "$notes" > "$tree/$module"
+check 1 a_block_comment_body_is_not_a_module_doc_marker
+
+fixture capacity
+printf '//! Extended notes: `%s`\npub const QUOTE: char = \x27"\x27;\n// Extended notes: `%s`\n' "$notes" "$notes" > "$tree/$module"
+check 1 a_char_literal_quote_does_not_hide_the_comment_after_it
+
+fixture capacity
+printf '//! Extended notes: `%s`\n/* Extended notes: `%s` */\npub struct Example;\n' "$notes" "$notes" > "$tree/$module"
+check 1 block_comment_mention_is_a_second_marker
+
+fixture capacity
+printf '/* header\n   spanning two lines */\n//! Extended notes: `%s`\npub struct Example;\n' "$notes" > "$tree/$module"
+check 0 marker_below_a_block_comment_header_is_in_the_header
+
+fixture capacity
+printf '/* outer /* inner */ still the header */\n//! Extended notes: `%s`\npub struct Example;\n' "$notes" > "$tree/$module"
+check 0 a_nested_block_comment_closes_only_at_its_own_end
+
+fixture capacity
+printf '//! Extended notes: `%s`\n' "$notes" > "$tree/$module"
+check 0 marker_in_a_module_without_code_is_accepted
+
 fixture capacity
 rm -r "$tree/docs/internals"
 check 1 absent_notes_tree_with_marker_is_rejected
