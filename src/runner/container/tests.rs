@@ -113,7 +113,6 @@ impl RacingObservation {
         use super::RACING_SLEEP;
 
         let decided = self.schedule();
-        let performed = RACING_PERFORMED.with(|performed| performed.borrow().clone());
         let expected: Vec<(usize, RacingPerformed)> = decided
             .iter()
             .filter_map(|(failed, pause)| match pause {
@@ -122,30 +121,35 @@ impl RacingObservation {
                 RacingPause::Done => None,
             })
             .collect();
-        assert_eq!(
-            performed, expected,
-            "[{tag}] what the performer asked of the thread after each failure must be what \
-             the schedule decided: a yield, a sleep of RACING_SLEEP, or nothing after the last"
-        );
+        RACING_PERFORMED.with(|performed| {
+            assert_eq!(
+                *performed.borrow(),
+                expected,
+                "[{tag}] what the performer asked of the thread after each failure must be what \
+                 the schedule decided: a yield, a sleep of RACING_SLEEP, or nothing after the last"
+            );
+        });
     }
 
     fn assert_every_sleep_was_slept(&self, tag: &str) {
         use super::RACING_SLEEP;
 
-        let entries = RACING_SCHEDULE.with(|schedule| schedule.borrow().clone());
-        for pair in entries.windows(2) {
-            let [(failed, pause, at), (_, _, next)] = pair else {
-                continue;
-            };
-            if *pause == RacingPause::Sleep {
-                let gap = next.duration_since(*at);
-                assert!(
-                    gap >= RACING_SLEEP,
-                    "[{tag}] failure {failed} was to be followed by a {RACING_SLEEP:?} sleep and \
-                     the next attempt came {gap:?} later"
-                );
+        RACING_SCHEDULE.with(|schedule| {
+            let entries = schedule.borrow();
+            for pair in entries.windows(2) {
+                let [(failed, pause, at), (_, _, next)] = pair else {
+                    continue;
+                };
+                if *pause == RacingPause::Sleep {
+                    let gap = next.duration_since(*at);
+                    assert!(
+                        gap >= RACING_SLEEP,
+                        "[{tag}] failure {failed} was to be followed by a {RACING_SLEEP:?} \
+                         sleep and the next attempt came {gap:?} later"
+                    );
+                }
             }
-        }
+        });
     }
 }
 
