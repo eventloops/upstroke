@@ -38,6 +38,16 @@ task it belongs to. The registry and the task are two owners of one
 string, which is what the copy says; nothing here is a borrow the checker
 refused.
 
+## `fn unique_slug(title: &str, taken: &mut Vec<String>) -> String {`
+
+Two copies here are owned snapshots, not borrows the checker refused.
+`base` is the stable suffix template: every later round of the loop reads
+it again to build `{base}-{n}`, while `candidate` is replaced, so the
+first candidate has to be its own owned copy rather than a move of
+`base`. The chosen slug then needs two owners: the reservation registry,
+which keeps it so a later draft cannot derive the same slug again, and
+the returned value, which becomes this task's id.
+
 ## `pub(super) fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Artifact> {`
 
 Artifacts come from `out=` annotations; a bare plan with a Design task
