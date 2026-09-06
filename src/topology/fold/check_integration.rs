@@ -582,7 +582,7 @@ fn check_proposal_pin(basis: &VerificationBasis, pin: Option<&GitRef>) -> Result
                     detail: format!(
                         "it pins the proposal at `{}` and an already-present publication \
                          manufactures no commit to pin",
-                        pin.name()
+                        pin.as_str()
                     ),
                 });
             }
