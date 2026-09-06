@@ -1553,6 +1553,7 @@ not_an_effect = [
     "SIG_IGN",
     "SIG_SETMASK",
     "SIG_UNBLOCK",
+    "SRUN",
     "SSTOP",
     "STDERR_FILENO",
     "STDIN_FILENO",

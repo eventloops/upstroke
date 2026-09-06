@@ -28,7 +28,8 @@ impl PlanAdapter for MarkdownPlanAdapter {
     }
 
     fn sniff(&self, raw: &str) -> bool {
-        raw.lines().any(|l| {
+        let source = parser_source(raw);
+        source.lines().any(|l| {
             let t = l.trim_start();
             t.starts_with('#') || t.starts_with("- [") || is_ordered_item(t)
         })
