@@ -50,7 +50,8 @@ impl ProgramNaming {
             names.push(OsString::from(program));
         }
         for extension in Self::extensions(pathext) {
-            let candidate = OsString::from(format!("{program}{extension}"));
+            let mut candidate = OsString::from(program);
+            candidate.push(&extension);
             if !names.contains(&candidate) {
                 names.push(candidate);
             }
@@ -58,43 +59,126 @@ impl ProgramNaming {
         names
     }
 
-    fn extensions(pathext: Option<&OsStr>) -> Vec<String> {
-        let listed: Vec<String> = pathext
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .split(';')
-            .map(|entry| entry.trim().to_ascii_lowercase())
-            .filter(|entry| entry.len() > 1 && entry.starts_with('.'))
-            .collect();
+    fn extensions(pathext: Option<&OsStr>) -> Vec<OsString> {
+        let listed = pathext.map(pathext_entries).unwrap_or_default();
         if listed.is_empty() {
             return Self::DEFAULT_PATHEXT
                 .iter()
-                .map(|extension| (*extension).to_owned())
+                .map(|extension| OsString::from(*extension))
                 .collect();
         }
         listed
     }
 
-    pub(super) fn is_program(self, path: &Path) -> bool {
-        if !path.is_file() {
-            return false;
+    pub(super) fn is_program(self, path: &Path) -> Result<bool, std::io::Error> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Ok(false);
         }
-        match self {
+        Ok(match self {
             Self::Windows => true,
-            Self::Posix => executable_bit(path),
-        }
+            Self::Posix => executable_bit(&metadata),
+        })
     }
 }
 
 #[cfg(unix)]
-fn executable_bit(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+fn executable_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn executable_bit(_path: &Path) -> bool {
+fn executable_bit(_metadata: &std::fs::Metadata) -> bool {
     true
+}
+
+#[cfg(unix)]
+fn pathext_entries(pathext: &OsStr) -> Vec<OsString> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    normalised_extensions(pathext.as_bytes())
+        .into_iter()
+        .map(OsString::from_vec)
+        .collect()
+}
+
+#[cfg(windows)]
+fn pathext_entries(pathext: &OsStr) -> Vec<OsString> {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    let units: Vec<u16> = pathext.encode_wide().collect();
+    normalised_extensions(&units)
+        .into_iter()
+        .map(|entry| OsString::from_wide(&entry))
+        .collect()
+}
+
+fn normalised_extensions<U>(value: &[U]) -> Vec<Vec<U>>
+where
+    U: Copy + PartialEq + From<u8> + TryInto<u8>,
+{
+    let semicolon = U::from(b';');
+    let dot = U::from(b'.');
+    value
+        .split(|unit| *unit == semicolon)
+        .map(|entry| {
+            ascii_trimmed(entry)
+                .iter()
+                .map(|unit| ascii_lowered(*unit))
+                .collect::<Vec<U>>()
+        })
+        .filter(|entry| entry.len() > 1 && entry.first() == Some(&dot))
+        .collect()
+}
+
+fn ascii_trimmed<U>(entry: &[U]) -> &[U]
+where
+    U: Copy + TryInto<u8>,
+{
+    let mut slice = entry;
+    while let Some((first, rest)) = slice.split_first() {
+        if !ascii_space(*first) {
+            break;
+        }
+        slice = rest;
+    }
+    while let Some((last, rest)) = slice.split_last() {
+        if !ascii_space(*last) {
+            break;
+        }
+        slice = rest;
+    }
+    slice
+}
+
+fn ascii_space<U>(unit: U) -> bool
+where
+    U: Copy + TryInto<u8>,
+{
+    matches!(ascii_byte(unit), Some(byte) if byte.is_ascii_whitespace())
+}
+
+fn ascii_lowered<U>(unit: U) -> U
+where
+    U: Copy + From<u8> + TryInto<u8>,
+{
+    match ascii_byte(unit) {
+        Some(byte) => U::from(byte.to_ascii_lowercase()),
+        None => unit,
+    }
+}
+
+fn ascii_byte<U>(unit: U) -> Option<u8>
+where
+    U: Copy + TryInto<u8>,
+{
+    let Ok(byte) = unit.try_into() else {
+        return None;
+    };
+    byte.is_ascii().then_some(byte)
 }
 
 pub(super) fn composed_value<'a>(
@@ -122,6 +206,7 @@ pub(super) fn resolve_program(
     let candidates = naming.candidates(program, composed_value(composed, case, "PATHEXT"));
     let mut searched = 0_usize;
     let mut skipped = 0_usize;
+    let mut undetermined: Option<(PathBuf, std::io::Error)> = None;
     for dir in std::env::split_paths(path.unwrap_or_else(|| OsStr::new(""))) {
         if !dir.is_absolute() {
             skipped += 1;
@@ -130,10 +215,23 @@ pub(super) fn resolve_program(
         searched += 1;
         for candidate in &candidates {
             let file = dir.join(candidate);
-            if naming.is_program(&file) {
-                return Ok(file);
+            match naming.is_program(&file) {
+                Ok(true) => return Ok(file),
+                Ok(false) => {}
+                Err(error) => {
+                    if undetermined.is_none() {
+                        undetermined = Some((file, error));
+                    }
+                }
             }
         }
+    }
+    if let Some((file, source)) = undetermined {
+        return Err(UpstrokeError::Filesystem {
+            operation: "stat",
+            path: file,
+            source,
+        });
     }
     Err(UpstrokeError::Refused {
         message: format!(
@@ -157,4 +255,129 @@ pub(super) fn resolve_program(
                 .to_string_lossy()
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProgramNaming, normalised_extensions, resolve_program};
+    use crate::runner::host::KeyCase;
+    use std::ffi::{OsStr, OsString};
+
+    fn composed(pairs: &[(&str, &OsStr)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (OsString::from(*key), (*value).to_os_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_candidate_this_platform_cannot_stat_is_never_reported_as_absence() {
+        let directory = std::env::temp_dir().join("upstroke-naming\u{0}sweep");
+        let probe = std::fs::metadata(directory.join("x"))
+            .expect_err("a path with an interior NUL cannot be stat'ed");
+        assert_ne!(
+            probe.kind(),
+            std::io::ErrorKind::NotFound,
+            "the fixture must fail with something other than not-found to witness anything"
+        );
+
+        let path = directory.into_os_string();
+        let message = resolve_program(
+            "x",
+            &composed(&[("PATH", path.as_os_str())]),
+            KeyCase::Sensitive,
+            ProgramNaming::current(),
+        )
+        .expect_err("a candidate the platform could not answer for is not an answer")
+        .to_string();
+        assert!(
+            message.contains("failed to stat") && message.contains("upstroke-naming"),
+            "the refusal must name the failed operation and its candidate: {message}"
+        );
+        assert!(
+            !message.contains("nothing of that name"),
+            "an undetermined candidate was reported as absence: {message}"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_is_merely_absent_is_still_absence() {
+        let path = std::env::temp_dir().into_os_string();
+        let message = resolve_program(
+            "upstroke-no-such-program",
+            &composed(&[("PATH", path.as_os_str())]),
+            KeyCase::Sensitive,
+            ProgramNaming::current(),
+        )
+        .expect_err("nothing of that name is installed there")
+        .to_string();
+        assert!(
+            message.contains("nothing of that name"),
+            "a not-found candidate must stay absence: {message}"
+        );
+    }
+
+    #[test]
+    fn a_pathext_entry_no_string_can_carry_reaches_the_candidate_intact() {
+        #[cfg(unix)]
+        let (pathext, folded) = {
+            use std::os::unix::ffi::OsStringExt as _;
+            (
+                OsString::from_vec(vec![b'.', 0x80, b'X']),
+                OsString::from_vec(vec![b'.', 0x80, b'x']),
+            )
+        };
+        #[cfg(windows)]
+        let (pathext, folded) = {
+            use std::os::windows::ffi::OsStringExt as _;
+            (
+                OsString::from_wide(&[u16::from(b'.'), 0xd800, u16::from(b'X')]),
+                OsString::from_wide(&[u16::from(b'.'), 0xd800, u16::from(b'x')]),
+            )
+        };
+
+        assert!(
+            pathext.to_str().is_none(),
+            "the fixture is valid Unicode, so it witnesses nothing"
+        );
+
+        let candidates = ProgramNaming::Windows.candidates("claude", Some(pathext.as_os_str()));
+        let mut expected = OsString::from("claude");
+        expected.push(&folded);
+        assert_eq!(
+            candidates,
+            vec![expected],
+            "the candidate must carry PATHEXT's own code units, ASCII-folded and nothing else"
+        );
+
+        let mut lossy = OsString::from("claude");
+        lossy.push(pathext.to_string_lossy().to_lowercase());
+        assert!(
+            !candidates.contains(&lossy),
+            "the candidate was built through a lossy conversion: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn the_pathext_grammar_reads_the_same_over_both_code_unit_widths() {
+        let bytes = b" .CoM ;; x ; .b ".to_vec();
+        let wide: Vec<u16> = bytes.iter().map(|byte| u16::from(*byte)).collect();
+
+        let from_bytes = normalised_extensions(&bytes);
+        assert_eq!(
+            from_bytes,
+            vec![b".com".to_vec(), b".b".to_vec()],
+            "an entry is trimmed and ASCII-folded, and only an extension survives"
+        );
+
+        let widened: Vec<Vec<u16>> = from_bytes
+            .iter()
+            .map(|entry| entry.iter().map(|byte| u16::from(*byte)).collect())
+            .collect();
+        assert_eq!(
+            normalised_extensions(&wide),
+            widened,
+            "the width Windows reads PATHEXT in must read it exactly as the byte width does"
+        );
+    }
 }
