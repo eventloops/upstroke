@@ -206,13 +206,21 @@ pub const RACING_YIELD_ATTEMPTS: usize = 16;
 
 pub const RACING_SLEEP: Duration = Duration::from_millis(10);
 
-fn racing_pause(attempt: usize) {
-    if attempt < RACING_YIELD_ATTEMPTS {
+fn racing_pause(failed: usize) {
+    note_racing_attempt(failed);
+    if failed >= RACING_ACCESS_ATTEMPTS {
+        return;
+    }
+    if failed <= RACING_YIELD_ATTEMPTS {
         std::thread::yield_now();
     } else {
         std::thread::sleep(RACING_SLEEP);
     }
 }
+
+#[cfg(not(test))]
+#[inline]
+fn note_racing_attempt(_failed: usize) {}
 
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -637,7 +645,7 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
             }
             Err(UpstrokeError::Io { source, .. }) => {
                 last = Some(source);
-                racing_pause(attempt);
+                racing_pause(attempt + 1);
             }
             Err(other) => return Err(other),
         }
@@ -796,7 +804,7 @@ fn racing_removal(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
                 last = Some(error);
-                racing_pause(attempt);
+                racing_pause(attempt + 1);
             }
         }
     }
@@ -1266,3 +1274,9 @@ impl DockerCli {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[inline]
+fn note_racing_attempt(failed: usize) {
+    tests::note_racing_attempt(failed);
+}

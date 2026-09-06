@@ -2025,20 +2025,31 @@ only the parent's permissions move.
 Running as root, or on a filesystem that ignores the mode. Restore
 and say so rather than asserting something that is not true here.
 
+## `pub(super) fn note_racing_attempt(failed: usize) {`
+
+The `#[cfg(test)]` half of the attempt seam in `super::racing_pause`: record
+the count, and run whichever observer this thread installed. `try_borrow_mut`
+so an observer that itself removes something is a no-op here rather than a
+panic inside production code. The shape, the thread-local counter, the
+`RacingObservation` guard whose `Drop` uninstalls the observer and the
+`observe_racing_attempts` installer are `workspace_manager::fixture`'s.
+
 ## `fn windows_posix_delete_pending(path: &Path) -> fs::File {`
 
 Put `path` into the state the loser of a Windows removal race sees while the
 winner is stalled: **delete-pending, name still present**.
 
-This is the winner's own sequence from Rust 1.97.1's `remove_dir_all`, stopped
-one call early. std opens the root with `FILE_LIST_DIRECTORY`, reopens it
-relative to that handle with `DELETE`, sets `FileDispositionInfoEx` with
-`FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`, and closes the delete handle — and
-the name is unlinked by that close, not by the disposition call. Measured on
-the Windows guest against exactly that sequence: between the two calls a
-`CreateFileW` of the name answers `ERROR_ACCESS_DENIED`, and the instant the
-delete handle closes it answers `ERROR_FILE_NOT_FOUND`. The returned handle
-*is* the winner's delete handle; dropping it is the winner reaching its close.
+std's `remove_dir_all` ends by reopening the root relative to its listing
+handle with `DELETE`, setting `FileDispositionInfoEx` with
+`FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`, and closing that handle;
+`DeleteFileW` does the same three things to a file. The name is unlinked by
+the close, not by the disposition call — measured on the Windows guest against
+a raw replay of exactly that sequence: between the two calls a `CreateFileW`
+of the name answers `ERROR_ACCESS_DENIED`, and the instant the delete handle
+closes it answers `ERROR_FILE_NOT_FOUND`. This helper reproduces the state,
+not the call sequence: one open with `DELETE`, one disposition call, and the
+returned handle *is* the winner's delete handle, so dropping it is the winner
+reaching its close.
 
 The premise is asserted with the same open `remove_dir_all` makes first, not
 with `symlink_metadata`: that one falls back to `FindFirstFileExW`, which
@@ -2052,65 +2063,100 @@ call's documented contract, and the whole of the SAFETY obligation.
 ## `fn windows_stalled_removal_budget() -> std::time::Duration {`
 
 How long `racing_removal` sleeps in total before it believes a refusal:
-`RACING_SLEEP` for each attempt after `RACING_YIELD_ATTEMPTS`. Module-scope
-rather than a number restated in each test, for the reason
-`workspace_manager::ATTEMPTS` gives: the control has to reason about the
-budget in the units that produce it, or a budget cut in half passes a test
-that only asserted "it waited".
+`RACING_SLEEP` for each failure after `RACING_YIELD_ATTEMPTS` except the last,
+which no attempt follows. Module-scope rather than a number restated in each
+test, for the reason `workspace_manager::ATTEMPTS` gives: the control has to
+reason about the budget in the units that produce it, or a budget cut in half
+passes a test that only asserted "it waited".
+
+## `const WINDOWS_RELEASE_AFTER_FAILURES: usize = super::RACING_YIELD_ATTEMPTS + 4;`
+
+The failed attempt after which the stalled winner is released: past the
+yields, so the loser is provably in the sleeping part of its budget when the
+close lands, and far enough past them that the release is not on the boundary.
+
+## `fn windows_close_once_the_loser_sleeps(`
+
+The stalled winner, as a thread: it closes the delete-pending handle only
+after the loser has reported `WINDOWS_RELEASE_AFTER_FAILURES` failed attempts
+through the seam, which orders the close against an attempt that has already
+returned rather than against a clock. Then one more rule, so the yield-only
+loop fails **deterministically** rather than by a coin toss: a repaired loop
+sleeps `RACING_SLEEP` between attempts, so nothing arrives within half of
+one and the close happens at once; a yield-only loop reports its remaining
+attempts within microseconds, so it is drained to its bound first and closes
+only after the refusal it was always going to give. The single residual
+non-determinism is a yield-only loser preempted for longer than half a sleep
+between two of its own attempts, which turns a witnessed failure into a pass
+and is stated here rather than hidden.
+
+Returns the failure number the handle was released after, so the test can
+say which attempt converged.
+
+## `fn windows_stall_then_release(`
+
+Run `work` on this thread as the loser with the seam observed, the winner
+stalled in `pending`, and the closer above waiting on the observation.
+Returns the loser's failed-attempt count, the failure the release followed,
+and the elapsed time — the observation is dropped before the closer is
+joined, which is what lets a refused loser's closer return.
+
+## `fn windows_assert_converged_through_the_wait(tag: &str, loser_failed: usize, released_after: usize) {`
+
+The two facts that say the convergence came through the wait and not through
+a name that was never delete-pending: the release fell inside the sleeping
+part of the budget, and the loser's last failure *is* the one the release
+followed, so the attempt after it is the one that found the name gone.
 
 ## `fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends() {`
 
-`PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`, made deterministic. The
-census race that failed on the Windows CI leg lost sixty-four yields in a
-quarter of a millisecond to a winner that had marked the view delete-pending
-and not yet closed its handle. Here the winner is
-[`windows_posix_delete_pending`] and its stall is a hundred milliseconds — far
-longer than the yields reach, well inside the sleep budget, which the first
-assertion checks against the constants so the fixture cannot drift outside
-it — and the loser is the real `discard` of both views, through the one
-`racing_removal`.
+`PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`, forced. The census race
+that failed on the Windows CI leg lost sixty-four yields in a fraction of a
+millisecond to a winner that had marked the view delete-pending and not yet
+closed its handle. Here the winner is [`windows_posix_delete_pending`], its
+close is ordered against the loser's twentieth failed attempt, and the loser
+is the real `discard` of both views through the one `racing_removal`.
 
-On the yield-only loop this fails with the CI failure's own text: `failed to
-read <view>: Access is denied. (os error 5)` after about 250 µs. On the
-repaired loop the discard returns `Ok` once the closer drops the handle, and
-the elapsed-time assertion says the convergence came through the wait rather
-than through a name that was never delete-pending.
+On the yield-only loop this fails with the CI failure's own text after
+sixty-four failed attempts: `failed to read <view>: Access is denied. (os
+error 5)`. On the repaired loop the discard returns `Ok` on the attempt after
+the release, which [`windows_assert_converged_through_the_wait`] checks.
 
 Second field held constant: the same empty view the census seeds, the same
-stall; only which `GitView` discards it moves.
+release rule; only which `GitView` discards it moves.
 
 ## `fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_intent() {`
 
 The fail-closed half of the same repair, at the reclaim boundary: a view held
 delete-pending through the **whole** budget still refuses, and the refusal
-carries the native error, keeps the intent, and records no discard.
+carries the native error, comes after exactly the bound, keeps the intent,
+and records no discard.
 
-The three things a longer wait could have broken. It must still be bounded,
-so the refusal has to arrive — the upper assertion is ten times the budget,
-generous enough for a starved runner and small enough to catch a loop that
-never returns. It must not arrive early, so the lower assertion is the sleep
-budget itself, which the yield-only loop fails after a quarter of a
-millisecond. And it must not be read as absence: `reclaim` stops at
-`UnmountGitView`, so `RemoveIntent` never runs and the record that names the
-residue survives for the next census — which the second half demonstrates by
-dropping the handle and reclaiming, at which point view and intent both go.
+The things a longer wait could have broken. It must still be bounded, so the
+refusal has to arrive, after exactly `RACING_ACCESS_ATTEMPTS` failures — the
+seam counts them — and within ten times the sleep budget, generous enough for
+a starved runner and small enough to catch a loop that never returns. It must
+not arrive early, so the lower time bound is the sleep budget itself, which a
+yield-only loop fails after a few milliseconds. And it must not be read as
+absence: `reclaim` stops at `UnmountGitView`, so `RemoveIntent` never runs and
+the record that names the residue survives for the next census — which the
+second half demonstrates by dropping the handle and reclaiming, at which
+point view and intent both go.
 
 Second field held constant: one launched container, one intent, one view;
 only whether the winner's handle ever closes moves.
 
 ## `fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_once_the_stall_ends() {`
 
-The same stall on the **intent file**, which is the other path the census race
-has refused on: PR #152's run 34001739777 named
-`containers/<name>.intent` with the same os error 5. A file is deleted by
-`DeleteFileW`, which is the same three calls — open with `DELETE`, set the
-POSIX disposition, close — so the window between marking and closing is the
-same, and both loops that meet it are exercised here: `read_racing`, through
-`list_intents`, is the census discovering records while another reclaimer is
-mid-delete, and `racing_removal`, through `remove_intent`, is two reclaimers on
-one record. Each is given a winner stalled past the yields; discovery must
-answer with the record absent rather than refuse, and removal must converge.
-On the yield-only loop discovery fails first, with the #152 text.
+The same forced stall on the **intent file**, which is the other path the
+census race has refused on: PR #152's run 34001739777 named
+`containers/<name>.intent` with the same os error 5. Both loops that meet it
+are exercised: `read_racing`, through `list_intents`, is the census
+discovering records while another reclaimer is mid-delete, and
+`racing_removal`, through `remove_intent`, is two reclaimers on one record.
+Each gets the release rule above; discovery must answer with the record
+absent rather than refuse, and removal must converge. On the yield-only loop
+discovery fails first, with the #152 text.
 
 Second field held constant: one record, written the same way for both halves;
 only which loop meets the stall moves.

@@ -44,6 +44,61 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+type RacingObserver = Box<dyn FnMut(usize)>;
+
+thread_local! {
+    static RACING_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RACING_OBSERVER: std::cell::RefCell<Option<RacingObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn note_racing_attempt(failed: usize) {
+    RACING_ATTEMPTS.with(|count| count.set(failed));
+    RACING_OBSERVER.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(observer) = slot.as_mut() {
+                observer(failed);
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+struct RacingObservation {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(windows)]
+impl RacingObservation {
+    fn failed_attempts(&self) -> usize {
+        RACING_ATTEMPTS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RacingObservation {
+    fn drop(&mut self) {
+        RACING_OBSERVER.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = None;
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn observe_racing_attempts(observer: RacingObserver) -> RacingObservation {
+    RACING_ATTEMPTS.with(|count| count.set(0));
+    RACING_OBSERVER.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = Some(observer);
+        }
+    });
+    RacingObservation {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
 const REPO_KEY: &str = "0123456789abcdef";
 const RUN_A: &str = "01KZRN48A4ZK3AEDST3RJ8HMA4";
 const RUN_B: &str = "01KZS7R0V1ZD6MC290MG350QXF";
@@ -3730,7 +3785,7 @@ fn windows_posix_delete_pending(path: &Path) -> fs::File {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .expect("open the view for deletion, as remove_dir_all's last step does");
+        .expect("open the name for deletion, as the winner's last step does");
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     };
@@ -3749,7 +3804,7 @@ fn windows_posix_delete_pending(path: &Path) -> fs::File {
     assert_ne!(
         set,
         0,
-        "mark the view delete-pending: {}",
+        "mark the name delete-pending: {}",
         std::io::Error::last_os_error()
     );
     let error = fs::File::options()
@@ -3761,7 +3816,8 @@ fn windows_posix_delete_pending(path: &Path) -> fs::File {
     assert_eq!(
         error.raw_os_error(),
         Some(5),
-        "premise: remove_dir_all's own open of a delete-pending name answers          ERROR_ACCESS_DENIED, not {error}"
+        "premise: the loser's own open of a delete-pending name answers ERROR_ACCESS_DENIED, \
+         not {error}"
     );
     handle
 }
@@ -3770,22 +3826,88 @@ fn windows_posix_delete_pending(path: &Path) -> fs::File {
 fn windows_stalled_removal_budget() -> std::time::Duration {
     use super::{RACING_ACCESS_ATTEMPTS, RACING_SLEEP, RACING_YIELD_ATTEMPTS};
 
-    let slept = u32::try_from(RACING_ACCESS_ATTEMPTS - RACING_YIELD_ATTEMPTS)
+    let slept = u32::try_from(RACING_ACCESS_ATTEMPTS - RACING_YIELD_ATTEMPTS - 1)
         .expect("a small attempt count");
     RACING_SLEEP * slept
+}
+
+#[cfg(windows)]
+const WINDOWS_RELEASE_AFTER_FAILURES: usize = super::RACING_YIELD_ATTEMPTS + 4;
+
+#[cfg(windows)]
+fn windows_close_once_the_loser_sleeps(
+    pending: fs::File,
+    failures: std::sync::mpsc::Receiver<usize>,
+) -> std::thread::JoinHandle<usize> {
+    use super::{RACING_ACCESS_ATTEMPTS, RACING_SLEEP};
+
+    std::thread::spawn(move || {
+        let mut seen = 0;
+        while seen < WINDOWS_RELEASE_AFTER_FAILURES {
+            seen = failures
+                .recv()
+                .expect("the loser reports every failed attempt until it stops");
+        }
+        // The loser has failed past its yields. A repaired loop now sleeps
+        // `RACING_SLEEP` between attempts, so nothing more arrives within half
+        // of one; a yield-only loop reports its remaining attempts within
+        // microseconds, and is drained to its bound before the close so that
+        // its refusal is the outcome rather than a coin toss.
+        while seen < RACING_ACCESS_ATTEMPTS {
+            match failures.recv_timeout(RACING_SLEEP / 2) {
+                Ok(failed) => seen = failed,
+                Err(_) => break,
+            }
+        }
+        drop(pending);
+        seen
+    })
+}
+
+#[cfg(windows)]
+fn windows_stall_then_release(
+    pending: fs::File,
+    work: impl FnOnce(),
+) -> (usize, usize, std::time::Duration) {
+    use std::time::Instant;
+
+    let (report, failures) = std::sync::mpsc::channel();
+    let observation = observe_racing_attempts(Box::new(move |failed| {
+        let _ = report.send(failed);
+    }));
+    let closer = windows_close_once_the_loser_sleeps(pending, failures);
+    let started = Instant::now();
+    work();
+    let elapsed = started.elapsed();
+    let loser_failed = observation.failed_attempts();
+    drop(observation);
+    let released_after = closer.join().expect("the closer returned");
+    (loser_failed, released_after, elapsed)
+}
+
+#[cfg(windows)]
+fn windows_assert_converged_through_the_wait(
+    tag: &str,
+    loser_failed: usize,
+    released_after: usize,
+) {
+    use super::RACING_ACCESS_ATTEMPTS;
+
+    assert!(
+        (WINDOWS_RELEASE_AFTER_FAILURES..RACING_ACCESS_ATTEMPTS).contains(&released_after),
+        "[{tag}] the handle was released after failure {released_after}, outside the sleeping \
+         part of the budget"
+    );
+    assert_eq!(
+        loser_failed, released_after,
+        "[{tag}] the loser failed {loser_failed} times and the handle was released after \
+         failure {released_after}: the attempt after the release is the one that converges"
+    );
 }
 
 #[test]
 #[cfg(windows)]
 fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends() {
-    use std::time::{Duration, Instant};
-
-    const STALL: Duration = Duration::from_millis(100);
-    assert!(
-        STALL * 2 < windows_stalled_removal_budget(),
-        "the fixture's stall must sit well inside the sleep budget, or a pass says nothing"
-    );
-
     let views: [(&str, Box<dyn GitView>); 2] = [
         (
             "disposable",
@@ -3802,28 +3924,18 @@ fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_e
         fs::create_dir_all(&path).expect("an orphan view, empty as the census seeds it");
         let pending = windows_posix_delete_pending(&path);
 
-        let (outcome, elapsed) = std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(STALL);
-                drop(pending);
-            });
-            let started = Instant::now();
-            let outcome = view.discard(&path);
-            (outcome, started.elapsed())
-        });
+        let mut outcome = None;
+        let (loser_failed, released_after, elapsed) =
+            windows_stall_then_release(pending, || outcome = Some(view.discard(&path)));
 
-        outcome.unwrap_or_else(|error| {
+        outcome.expect("the discard ran").unwrap_or_else(|error| {
             panic!(
-                "[{tag}] the loser of a removal race refused after {elapsed:?} instead of \
-                 waiting out a winner stalled between marking the name and closing its \
-                 handle: {error}"
+                "[{tag}] the loser of a removal race refused after {elapsed:?} and \
+                     {loser_failed} failed attempts instead of waiting out a winner stalled \
+                     between marking the name and closing its handle: {error}"
             )
         });
-        assert!(
-            elapsed >= STALL / 2,
-            "[{tag}] the discard returned after {elapsed:?}, before the stall could have \
-             ended, so it did not converge through the wait this fixture exercises"
-        );
+        windows_assert_converged_through_the_wait(tag, loser_failed, released_after);
         assert!(
             !path.exists(),
             "[{tag}] the view is gone once the stall ends"
@@ -3837,6 +3949,8 @@ fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_e
 fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_intent() {
     use std::time::Instant;
 
+    use super::RACING_ACCESS_ATTEMPTS;
+
     let fixture = Fixture::new("held-past-budget", RUN_A, INCARNATION_1, &shell_probe());
     let mut hooks = fixture.hooks();
     let name = fixture.plan.name.clone();
@@ -3845,6 +3959,7 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
         launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
     let pending = windows_posix_delete_pending(&view_path);
 
+    let observation = observe_racing_attempts(Box::new(|_| {}));
     let started = Instant::now();
     let error = reclaim(
         &mut hooks,
@@ -3856,10 +3971,16 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
     )
     .expect_err("a view that is still delete-pending after the whole budget must refuse");
     let elapsed = started.elapsed();
+    let failed = observation.failed_attempts();
+    drop(observation);
 
     assert!(
         matches!(&error, UpstrokeError::Io { source, .. } if source.raw_os_error() == Some(5)),
         "the refusal carries the native error that stopped it: {error:?}"
+    );
+    assert_eq!(
+        failed, RACING_ACCESS_ATTEMPTS,
+        "the refusal comes after exactly the bound, not before it and not past it"
     );
     let budget = windows_stalled_removal_budget();
     assert!(
@@ -3903,11 +4024,6 @@ fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_inte
 #[test]
 #[cfg(windows)]
 fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_once_the_stall_ends() {
-    use std::time::{Duration, Instant};
-
-    const STALL: Duration = Duration::from_millis(100);
-    assert!(STALL * 2 < windows_stalled_removal_budget());
-
     let fixture = Fixture::new(
         "stalled-intent-remover",
         RUN_A,
@@ -3927,30 +4043,18 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
         .expect("the intent");
         name.intent_path(&fixture.root)
     };
-    let stalled = |pending: fs::File, work: &mut dyn FnMut()| {
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(STALL);
-                drop(pending);
-            });
-            let started = Instant::now();
-            work();
-            started.elapsed()
-        })
-    };
 
     // The read half: a census discovering intents while another reclaimer is
     // mid-way through deleting one.
     let path = write(&mut hooks);
     let pending = windows_posix_delete_pending(&path);
     let mut found = None;
-    let elapsed = stalled(pending, &mut || {
-        found = Some(list_intents(&fixture.root));
-    });
+    let (loser_failed, released_after, elapsed) =
+        windows_stall_then_release(pending, || found = Some(list_intents(&fixture.root)));
     let found = found.expect("the listing ran").unwrap_or_else(|error| {
         panic!(
-            "discovery refused after {elapsed:?} over an intent another reclaimer was \
-                 still closing: {error}"
+            "discovery refused after {elapsed:?} and {loser_failed} failed attempts over \
+                 an intent another reclaimer was still closing: {error}"
         )
     });
     assert!(
@@ -3958,17 +4062,14 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
         "an intent whose deletion completed during the wait is not a discovered record: \
          {found:?}"
     );
-    assert!(
-        elapsed >= STALL / 2,
-        "the listing returned after {elapsed:?}"
-    );
+    windows_assert_converged_through_the_wait("discovery", loser_failed, released_after);
     assert!(!path.exists());
 
     // The removal half: two reclaimers on one record.
     let path = write(&mut hooks);
     let pending = windows_posix_delete_pending(&path);
     let mut outcome = None;
-    let elapsed = stalled(pending, &mut || {
+    let (loser_failed, released_after, elapsed) = windows_stall_then_release(pending, || {
         outcome = Some(remove_intent(
             &mut hooks,
             ContainerSite::RemoveIntent,
@@ -3978,14 +4079,12 @@ fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_onc
     });
     outcome.expect("the removal ran").unwrap_or_else(|error| {
         panic!(
-            "the loser of an intent-removal race refused after {elapsed:?} instead of \
-                 waiting out the winner's close: {error}"
+            "the loser of an intent-removal race refused after {elapsed:?} and \
+                 {loser_failed} failed attempts instead of waiting out the winner's close: \
+                 {error}"
         )
     });
-    assert!(
-        elapsed >= STALL / 2,
-        "the removal returned after {elapsed:?}"
-    );
+    windows_assert_converged_through_the_wait("removal", loser_failed, released_after);
     assert!(!path.exists());
     let _ = fs::remove_dir_all(&fixture.root);
 }

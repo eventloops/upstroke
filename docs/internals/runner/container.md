@@ -314,11 +314,14 @@ rendered as os error 5, and the sixty-four attempts were exhausted in less
 time than a scheduler tick.
 
 The ordinary handoff is still microseconds — in 512 native two-remover
-pairs the loser saw one or two `ERROR_ACCESS_DENIED` answers and then
-`NotFound` — so the first [`RACING_YIELD_ATTEMPTS`] attempts keep the
-yield, and the rest sleep [`RACING_SLEEP`] apiece. A sleep gives up the
-processor for a scheduler tick, which is the unit the winner's stall is
-measured in.
+pairs, 234 losers saw `ERROR_ACCESS_DENIED`: 209 once and then `NotFound`,
+21 twice and then `NotFound`, 4 once and then their own success — so the
+first [`RACING_YIELD_ATTEMPTS`] failures keep the yield, and the failures
+after them sleep [`RACING_SLEEP`] apiece. A sleep gives up the processor for
+a scheduler tick, which is the unit the winner's stall is measured in. The
+pause sits strictly **between** attempts: after the last failure there is
+nothing left to observe, so nothing sleeps, and a winner that closes after
+the final attempt is met by the next census rather than by a stale answer.
 
 Bounded rather than timed, for the reason [`TERMINATION_OBSERVATIONS`] is: a
 wait with no bound turns "this path cannot be removed" into "this write
@@ -332,13 +335,15 @@ that;
 `runner::container::tests::windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends`
 stalls a winner between the two calls for longer than the yields reach and
 asserts the loser converges once the stall ends. On the yield-only loop the
-second fails with the CI failure's own text after a quarter of a millisecond,
-and the first refuses before its budget could have been spent.
+second fails with the CI failure's own text after sixty-four failed attempts
+in a few milliseconds, and the first refuses before its budget could have
+been spent. Both order the winner's close against an observed attempt through
+[`note_racing_attempt`], not against a clock.
 
 ## `pub const RACING_YIELD_ATTEMPTS: usize = 16;`
 
-How many attempts of [`RACING_ACCESS_ATTEMPTS`] only yield before the loop
-starts sleeping.
+How many failed attempts of [`RACING_ACCESS_ATTEMPTS`] only yield before
+the loop starts sleeping.
 
 Sixteen covers every interleaving the two-remover measurement produced —
 the longest run of non-`NotFound` answers on an unloaded guest was two, and
@@ -351,22 +356,36 @@ winner has genuinely stopped making progress.
 How long each attempt after [`RACING_YIELD_ATTEMPTS`] sleeps.
 
 Ten milliseconds is about one scheduler tick, so the loser reacts within a
-tick or two of the winner's close, and forty-eight of them bound a
-permanently refusing path's cost at half a second to three quarters of one
-before the refusal. That is paid once, on an error path that blocks
+tick or two of the winner's close, and the forty-seven that fit between the
+sixty-four attempts bound a permanently refusing path's cost at half a second
+to three quarters of one before the refusal. That is paid once, on an error path that blocks
 admission, and it is what buys tolerance of a winner stalled for a Windows
 Server quantum.
 
-## `fn racing_pause(attempt: usize) {`
+## `fn racing_pause(failed: usize) {`
 
-The pause between two attempts of [`racing_removal`] and [`read_racing`]:
-a yield for the first [`RACING_YIELD_ATTEMPTS`], then [`RACING_SLEEP`].
+The pause after the `failed`th failed attempt of [`racing_removal`] and
+[`read_racing`], and before the next: a yield through the first
+[`RACING_YIELD_ATTEMPTS`] failures, then [`RACING_SLEEP`], and nothing at
+all after the [`RACING_ACCESS_ATTEMPTS`]th, because no attempt follows it
+— a sleep there would be dead time in which the winner's close goes
+unobserved. It records the failure through [`note_racing_attempt`] first.
 
 Not `workspace_manager::remove_tree_once_handles_close`'s schedule, which
 waits for a *dying process* to close its handles and sleeps twenty-five
 milliseconds forty times over. This is still a handoff between two live
 reclaimers; the sleep exists only because the winner's remaining step can
 be descheduled, and the budget is an order of magnitude smaller.
+
+## `fn note_racing_attempt(_failed: usize) {}`
+
+The `#[cfg(not(test))]` half of a seam that exists for one reason: nothing
+outside the loop can see an *attempt*, and the native Windows tests have to
+order a winner's close against one rather than against a clock (§10: a sleep
+may supplement a concurrency test but cannot be its only oracle). The
+`#[cfg(test)]` twin forwards to `tests::note_racing_attempt`, which runs an
+observer the test installed on the calling thread after the failed attempt
+has already returned. The shape is `workspace_manager::note_removal_attempt`'s.
 
 ## `pub fn write_intent(`
 
