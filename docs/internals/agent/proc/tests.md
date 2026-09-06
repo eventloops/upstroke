@@ -222,6 +222,32 @@ reaper — which settles whatever the reaper knows about.
 Do not leak a 60-second sleeper into the rest of the suite when
 this fails.
 
+## `fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {`
+
+The regression test for `W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT`
+and the experiment `PR125-CLOSE-GROUP-ORACLE-CANNOT-SEE-A-ZOMBIE-ON-DARWIN`
+asked for. A child spawned through the production pre-exec path is held
+on its stdin and observed running (it must lead its own group, and must
+not have exited, or the first look witnesses nothing); its stdin is
+closed, `await_exit_without_reaping` waits for the exit itself, and the
+second look must find an exited, unreaped child that still leads its own
+group. Before the Darwin fall-through in `GroupObservation::leads_own_group`
+this failed on the macOS runner with `getpgid` answering `ESRCH` and the
+exited record answering the child's own pid (run 34001563243); Linux
+passed it throughout, because Linux answers `getpgid` for a zombie.
+`register` then `finish` is the supervisor lifecycle production runs, in
+production's order: `finish` before the reap, while the child is still a
+zombie.
+
+## `fn a_child_left_in_this_processs_group_never_answers_for_its_own() {`
+
+The control for the fall-through: the same two looks at a child spawned
+without the pre-exec step, so it stays in this process's group. Running,
+`getpgid` names this process's group; exited and unreaped, the Darwin
+record names the same group and the decision stays `false`. A
+fall-through that trusted any exited record would pass the regression
+test and fail here.
+
 ## `fn timeout_kills_the_process_tree_quickly()` › `let script = if cfg!(windows) {`
 
 Through the shell, the sleeper is a grandchild — exactly the

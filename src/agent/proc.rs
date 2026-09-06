@@ -358,7 +358,23 @@ pub(crate) struct GroupObservation {
 #[cfg(all(unix, test))]
 impl GroupObservation {
     pub(crate) fn leads_own_group(&self) -> bool {
-        self.group == Ok(self.pid)
+        match self.group {
+            Ok(pgid) => pgid == self.pid,
+            Err(errno) => errno == libc::ESRCH && self.exited_record_names_its_own_group(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exited_record_names_its_own_group(&self) -> bool {
+        match (u32::try_from(self.pid), self.zombie_group) {
+            (Ok(pid), Ok(answer)) => answer.pgid == pid,
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn exited_record_names_its_own_group(&self) -> bool {
+        false
     }
 
     pub(crate) fn had_exited_before_the_look(&self) -> bool {
@@ -369,7 +385,7 @@ impl GroupObservation {
 #[cfg(all(unix, test))]
 impl std::fmt::Display for GroupObservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn exited(answer: Result<bool, i32>) -> String {
+        fn exit_answer(answer: Result<bool, i32>) -> String {
             match answer {
                 Ok(true) => "exited, unreaped".to_owned(),
                 Ok(false) => "running".to_owned(),
@@ -383,7 +399,7 @@ impl std::fmt::Display for GroupObservation {
             f,
             "pid {}: before the look {}; getpgid {}",
             self.pid,
-            exited(self.exited_before),
+            exit_answer(self.exited_before),
             match self.group {
                 Ok(pgid) => format!("answered {pgid}"),
                 Err(errno) => format!("failed: {}", std::io::Error::from_raw_os_error(errno)),
@@ -402,7 +418,7 @@ impl std::fmt::Display for GroupObservation {
                 std::io::Error::from_raw_os_error(errno)
             )?,
         }
-        write!(f, "; after the look {}", exited(self.exited_after))
+        write!(f, "; after the look {}", exit_answer(self.exited_after))
     }
 }
 
