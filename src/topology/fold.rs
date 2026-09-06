@@ -138,6 +138,19 @@ pub enum FoldError {
     },
 
     #[error(
+        "`{kind}` puts attempt {attempt} of task {key} on rung {rung}, and {detail}; a task's \
+         ladder position is derived by replay, an attempt runs at that position, and only an \
+         escalation moves it, one rung up the frozen ladder"
+    )]
+    WrongRung {
+        kind: &'static str,
+        key: u32,
+        attempt: u32,
+        rung: u32,
+        detail: String,
+    },
+
+    #[error(
         "attempt {attempt} of task {key} resumes a session this incarnation may not resume: \
          {detail}. A session belongs to the process that retained it."
     )]
