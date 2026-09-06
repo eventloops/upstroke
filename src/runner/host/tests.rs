@@ -5794,11 +5794,16 @@ impl<T: ?Sized> DoesNotImplementClone for T {}
 
 struct CloneProbe<T: ?Sized>(PhantomData<T>);
 
-impl<T: ?Sized + Clone> CloneProbe<T> {
+impl<T: Clone> CloneProbe<T> {
     const IMPLEMENTS_CLONE: bool = true;
 }
 
 #[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "the probe is decided by the trait system at compile time; the test exists to \
+              report the answer under its own name with the diagnostic below"
+)]
 fn host_environment_does_not_implement_clone() {
     assert!(
         !<CloneProbe<HostEnvironment>>::IMPLEMENTS_CLONE,
@@ -5810,6 +5815,10 @@ fn host_environment_does_not_implement_clone() {
 }
 
 #[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "positive and negative controls of a compile-time probe are constants by design"
+)]
 fn the_clone_probe_reports_the_trait_however_it_was_implemented() {
     #[derive(Debug)]
     struct DebugOnly;
@@ -5818,6 +5827,7 @@ fn the_clone_probe_reports_the_trait_however_it_was_implemented() {
     struct DerivedInOneAttribute;
 
     #[derive(Clone)]
+    // Deliberately a second attribute: the shape a nearest-derive-line scan misses.
     #[derive(Debug)]
     struct DerivedInStackedAttributes;
 
