@@ -535,16 +535,16 @@ impl TopologyFold {
 
     pub fn apply_delta(&mut self, delta: TopologyDelta) {
         let TopologyDelta { event, derived } = delta;
-        if let (TopologyEventBody::RunStarted { data }, Derived::Registry(registry)) =
-            (&event.body, &derived)
-        {
-            self.run = Some(RunState::start(data.clone(), (**registry).clone()));
-            return;
+        match (event.body, derived) {
+            (TopologyEventBody::RunStarted { data }, Derived::Registry(registry)) => {
+                self.run = Some(RunState::start(data, *registry));
+            }
+            (body, derived) => {
+                if let Some(run) = self.run.as_mut() {
+                    run.apply(&body, &derived);
+                }
+            }
         }
-        let Some(run) = self.run.as_mut() else {
-            return;
-        };
-        run.apply(&event.body, &derived);
     }
 
     fn delta(&self, event: &TopologyEvent, derived: Derived) -> TopologyDelta {
