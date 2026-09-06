@@ -18,10 +18,13 @@
 #   C3  CLAUDE.md's gate-count claim equals the tree, and the set of test-*.sh
 #       files in .github/scripts EQUALS the set the lint job invokes, both
 #       directions. An invocation from any other job does not count.
-#   C4  The workflow trigger contract is EXACTLY what MAINTAINING.md's
-#       Repository rules state, plus the merge queue: ci.yml triggers on push,
-#       pull_request and merge_group, pr-policy.yml on pull_request and
-#       merge_group, each with the branch list [master] and nothing else, and
+#   C4  The workflow trigger contract is EXACTLY the value written below, which
+#       restates what MAINTAINING.md's Repository rules say but is NOT compared
+#       with that file -- this gate reads no document here, so a change to the
+#       prose alone passes it, and the two move together by review, not by
+#       machine: ci.yml triggers on push, pull_request and merge_group,
+#       pr-policy.yml on pull_request and merge_group, each with the branch
+#       list [master] and nothing else, and
 #       merge_group with the activity type [checks_requested] only. The two
 #       attestation workflows that record once pinned were retired with the App
 #       check (decisions/2026-08-23-retire-app-attestation.md); there is no
@@ -217,7 +220,7 @@ for f in .github/workflows/ci.yml .github/workflows/pr-policy.yml; do
   [[ -f "$f" ]] || error "$f is missing"
 done
 # merge_group is pinned on both workflows and on the same branch list: an entry
-# the queue builds for either base must receive both required contexts, or it
+# the queue builds for a listed base must receive both required contexts, or it
 # sits in the queue until it times out (MAINTAINING.md, Repository rules). Its
 # activity type is pinned to checks_requested: an unpinned merge_group
 # subscribes to every activity type GitHub adds later, and both contexts would

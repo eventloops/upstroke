@@ -199,9 +199,12 @@ green; auto-merge is enabled on the repository in the same change as the queue r
 with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
 pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
 is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on
-`pull_request` and `merge_group`, each with the branch list exactly `[master]` and nothing else, so
-every pull request and every queue entry gets both contexts; `test-docs-consistency.sh` pins that
-contract, and changing it is a change to this file first.
+`pull_request` and `merge_group`, each with the branch list exactly `[master]` and nothing else. A
+branch list is matched against the base a pull request targets, so both contexts reach every pull
+request and every queue entry whose base is `master`, and a pull request targeting any other branch
+receives neither and, if they are required there, waits on checks that never arrive.
+`test-docs-consistency.sh` pins the two workflows against its own copy of that list; it does not
+read this file, so changing the contract is a change to this file and to the gate together.
 
 Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-ready-audit.sh`,
 which decides a pull request's lane from its branch prefix alone (`codex/findings-p3-*`,
