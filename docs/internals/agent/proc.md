@@ -733,6 +733,20 @@ then restores the default disposition and re-raises a terminating signal.
 and pid registration; the monitor cannot terminate or suspend the parent
 while it is nonzero.
 
+## `mod termination` › `const GUARD_POLL_SLICE_MS: libc::c_int = 250;`
+
+The guard's wait is sliced rather than open-ended, so that every slice
+can end in a `getppid` check the way `reaper_loop`'s 10 ms slice does.
+`poll` on a Darwin FIFO reports data and never the last writer's close,
+which `fn a_helper_that_has_already_exited_ends_the_acknowledgement_wait_at_end_of_file`
+measured: a conductor's death closes the guard's command and wake pipes
+without waking a guard that waits with no timeout, and on a macOS host
+that left one orphaned guard per run until the machine restarted.
+Reparenting is the liveness signal that holds on both platforms, and a
+slice is what lets the guard ask for it. The value is the cadence the
+stopping probe already ran at, so that pulse is unchanged and an idle
+guard costs four `getppid` calls a second.
+
 ## `mod termination` › `const REAPER_RESUME_STABLE_POLLS: u8 = 50;`
 
 The job-control guard briefly continues only Upstroke every 250 ms while
@@ -1265,7 +1279,7 @@ the first child-side action. Descriptor scrubbing can be long on
 high-limit hosts; no signal in that window may run host code or
 leave the only wake relay blocked.
 
-## `mod termination` › `let timeout_ms = if armed && stopping { 250 } else { -1 };`
+## `mod termination` › `let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, GUARD_POLL_SLICE_MS) };`
 
 Both parent relays and guard-directed foreground signals make a
 descriptor readable, so there is no atomic-check-to-poll window.
@@ -1274,6 +1288,12 @@ cannot run a caught handler. Periodically resume only the parent;
 its SA_SIGINFO SIGCONT handler recognizes this guard as sender,
 delivers any pending Upstroke-owned termination, or immediately
 re-stops. Agent groups remain stopped throughout.
+
+Every timeout, armed or idle, first asks whether the recorded parent is
+still this process's parent, and a guard that has been reparented ends
+there; the probe byte is written only while armed and stopping, at the
+cadence it always had. `const GUARD_POLL_SLICE_MS` above is why the
+timeout is finite at all.
 
 ## `mod termination` › `wake = false;`
 
@@ -1937,6 +1957,27 @@ descriptors are closed before the parent looks, which is the shape
 row `PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS` asks for. On Linux it
 passes before and after; the platform the defect is on is the one that
 evaluates it (§11).
+
+## `mod tests` › `fn a_guard_whose_conductor_is_gone_ends_while_its_pipes_stay_open() {`
+
+The regression test for the guard's idle wait, and the one that fails on
+the tree before it: with `poll(…, -1)` the guard was still there when the
+test's collection budget ran out and had to be killed, which its message
+reports as the status the kill produced.
+
+The fixture is the defect's own shape rather than a clock. The guard's
+recorded parent is a pid this test forked and *collected*, so `getppid`
+can never answer it again, and the test holds every command and wake
+writer open for the whole wait, so no end-of-file can end the guard and
+the reparenting check is the only thing that can. The end is observed by
+collecting the child, not by timing the guard's own work (row
+`PR125-CLOSE-SCHEDULER-BOUND-TIMING-TESTS`). A guard that does outlive
+its recorded parent is ended with SIGKILL, never by closing those
+writers: on Darwin that close is exactly what `poll` does not report, so
+closing them first would make the collection unbounded on the platform
+the defect is on. Both platforms evaluate this: holding the writers open
+withholds the hangup Linux would otherwise report, so the check under
+test is the same one on each (§11).
 
 ## `mod tests` › `fn a_reaper_refused_its_cleanup_lease_says_which_lease_and_why() {`
 

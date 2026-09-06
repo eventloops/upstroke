@@ -1308,6 +1308,7 @@ mod termination {
     const GUARD_CANCELLED: u8 = 0xc1;
     const GUARD_DISARM: u8 = 0xd1;
     const GUARD_PROBE: u8 = 0xe1;
+    const GUARD_POLL_SLICE_MS: libc::c_int = 250;
     const HANDLE_SIGINT: u8 = 1 << 0;
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
@@ -3165,13 +3166,17 @@ mod termination {
                     revents: 0,
                 },
             ];
-            let timeout_ms = if armed && stopping { 250 } else { -1 };
-            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, timeout_ms) };
+            // SAFETY: `poll_fds` is valid storage for exactly the two entries
+            // named for the duration of the call, and the timeout is finite.
+            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, GUARD_POLL_SLICE_MS) };
             if polled < 0 && !last_errno_is_interrupted() {
                 unsafe { libc::_exit(1) };
             }
-            if polled == 0 && armed && stopping {
-                if unsafe { libc::getppid() } != parent || !write_byte(probe_fd, GUARD_PROBE) {
+            if polled == 0 {
+                if unsafe { libc::getppid() } != parent {
+                    unsafe { libc::_exit(0) };
+                }
+                if armed && stopping && !write_byte(probe_fd, GUARD_PROBE) {
                     unsafe { libc::_exit(0) };
                 }
                 continue;
@@ -5232,6 +5237,82 @@ mod termination {
                 read,
                 AckRead::EndOfFile,
                 "a pipe whose only other writer has been collected did not read as closed"
+            );
+        }
+
+        #[test]
+        fn a_guard_whose_conductor_is_gone_ends_while_its_pipes_stay_open() {
+            let command = create_cloexec_pipe().expect("a guard command pipe");
+            let ack = create_cloexec_pipe().expect("a guard acknowledgement pipe");
+            let wake = create_cloexec_pipe().expect("a guard wake pipe");
+            let probe = create_cloexec_pipe().expect("a guard probe pipe");
+            // SAFETY: the forked child calls only `_exit`.
+            let departed = unsafe { libc::fork() };
+            if departed == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            assert!(
+                departed > 0,
+                "fork a stand-in conductor: {}",
+                std::io::Error::last_os_error()
+            );
+            let status = reap(departed);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the stand-in conductor did not exit cleanly: {status}"
+            );
+
+            // SAFETY: the forked child closes its parent-side descriptors and
+            // enters `guard_loop`, which uses only libc syscalls and ends in
+            // `_exit`.
+            let guard = unsafe { libc::fork() };
+            if guard == 0 {
+                close_fd(command[1]);
+                close_fd(ack[0]);
+                close_fd(wake[1]);
+                close_fd(probe[0]);
+                guard_loop(departed, command[0], ack[1], wake[0], probe[1], departed);
+            }
+            assert!(
+                guard > 0,
+                "fork a guard: {}",
+                std::io::Error::last_os_error()
+            );
+            close_fd(command[0]);
+            close_fd(ack[1]);
+            close_fd(wake[0]);
+            close_fd(probe[1]);
+
+            let mut ready = [0_u8; 5];
+            assert!(
+                read_raw_exact(ack[0], &mut ready) && ready[0] == GUARD_READY,
+                "the guard did not reach its wait: {ready:?}"
+            );
+            let ended = wait_for_lifetime_target(guard);
+            let Some(status) = ended else {
+                // SAFETY: `guard` is this test's own child and has not been
+                // collected. A guard that outlived its conductor is ended by
+                // the signal no wait can miss, never by closing the writers
+                // this test holds: on Darwin that close is what `poll` does
+                // not report, so it would leave the collection unbounded.
+                unsafe {
+                    let _ = libc::kill(guard, libc::SIGKILL);
+                }
+                let killed = reap(guard);
+                for fd in [command[1], ack[0], wake[1], probe[0]] {
+                    close_fd(fd);
+                }
+                panic!(
+                    "the guard was still waiting with its recorded parent gone and every command \
+                     and wake writer open, and had to be killed: {killed}"
+                )
+            };
+            for fd in [command[1], ack[0], wake[1], probe[0]] {
+                close_fd(fd);
+            }
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the guard did not end cleanly: {status}"
             );
         }
 
