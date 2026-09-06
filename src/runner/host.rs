@@ -176,13 +176,20 @@ impl HostRunner {
                 .map_err(|message| UpstrokeError::Refused { message });
         }
         let answer = resolve_program(program, composed, case, ProgramNaming::current());
-        resolved.insert(
-            question,
-            match &answer {
-                Ok(file) => Ok(file.clone()),
-                Err(error) => Err(error.to_string()),
-            },
-        );
+        match &answer {
+            Ok(file) => {
+                resolved.insert(question, Ok(file.clone()));
+            }
+            Err(UpstrokeError::Refused { message }) => {
+                resolved.insert(question, Err(message.clone()));
+            }
+            Err(_) => {
+                // An undetermined answer (for example a stat failure other than
+                // not-found) is not the filesystem's, so it is not memoised: the
+                // typed error reaches this caller unflattened, and a later call
+                // searches again instead of replaying a possibly-transient failure.
+            }
+        }
         answer
     }
 }
