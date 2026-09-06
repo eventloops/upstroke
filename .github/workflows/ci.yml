@@ -9,6 +9,13 @@ on:
   pull_request:
     branches: [master, codex/parallelism-design]
     types: [opened, edited, synchronize, reopened]
+  # The merge queue builds each entry on the head of its base plus the entries
+  # queued ahead of it, and lands exactly the commit these contexts passed on;
+  # a branch is never brought up to date by hand to merge (MAINTAINING.md,
+  # Repository rules). The concurrency key below is `github.ref` for this
+  # event, one queue branch per entry, so entries never cancel each other.
+  merge_group:
+    branches: [master, codex/parallelism-design]
 
 permissions:
   contents: read

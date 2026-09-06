@@ -19,8 +19,9 @@
 #       files in .github/scripts EQUALS the set the lint job invokes, both
 #       directions. An invocation from any other job does not count.
 #   C4  The workflow trigger contract is EXACTLY what the slice-PR record
-#       decided (decisions/2026-08-21-stacked-slice-prs.md): ci.yml triggers on
-#       push and pull_request, pr-policy.yml on pull_request, each with the branch
+#       decided (decisions/2026-08-21-stacked-slice-prs.md) plus the merge
+#       queue: ci.yml triggers on push, pull_request and merge_group,
+#       pr-policy.yml on pull_request and merge_group, each with the branch
 #       list [master, codex/parallelism-design] and nothing else. The two
 #       attestation workflows that record once pinned were retired with the App
 #       check (decisions/2026-08-23-retire-app-attestation.md); there is no
@@ -204,14 +205,19 @@ pin_branches() {  # pin_branches <file> <event> <expected branches line>
 for f in .github/workflows/ci.yml .github/workflows/pr-policy.yml; do
   [[ -f "$f" ]] || error "$f is missing"
 done
+# merge_group is pinned on both workflows and on the same branch list: an entry
+# the queue builds for either base must receive both required contexts, or it
+# sits in the queue until it times out (MAINTAINING.md, Repository rules).
 if [[ -f .github/workflows/ci.yml ]]; then
-  pin_events .github/workflows/ci.yml "pull_request push"
+  pin_events .github/workflows/ci.yml "merge_group pull_request push"
   pin_branches .github/workflows/ci.yml push "$slice_list"
   pin_branches .github/workflows/ci.yml pull_request "$slice_list"
+  pin_branches .github/workflows/ci.yml merge_group "$slice_list"
 fi
 if [[ -f .github/workflows/pr-policy.yml ]]; then
-  pin_events .github/workflows/pr-policy.yml "pull_request"
+  pin_events .github/workflows/pr-policy.yml "merge_group pull_request"
   pin_branches .github/workflows/pr-policy.yml pull_request "$slice_list"
+  pin_branches .github/workflows/pr-policy.yml merge_group "$slice_list"
 fi
 
 if (( failed )); then

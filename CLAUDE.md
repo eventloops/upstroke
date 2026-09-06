@@ -95,7 +95,8 @@ contexts (`upstroke-ci`, `upstroke-pr-policy`) green; one frontier review of the
 (`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage: serious
 P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in touched code and any
 finding carrying a failing test, reproduction or mutation witness are fixed whatever their label;
-everything else is fixed or logged as a tech-debt ledger row; merge commit once green. The PR body
+everything else is fixed or logged as a tech-debt ledger row; enqueue once green, and the merge
+queue lands the merge commit after both contexts pass on the entry it builds. The PR body
 must carry the six sections and the exact canonical ledger header; run `validate-pr-body.sh`
 against it locally.
 
@@ -112,6 +113,7 @@ body when it has been.
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `docs/internals/` | Internal module notes, one file per module mirroring `src/`. A module with notes carries a single `Extended notes:` pointer in its header and no other prose (§13), held both ways by `test-internals-notes.sh`. `docs/` is also the GitHub Pages source for upstroke.rs, so anything added there is published |
 | `.github/scripts/` | The 5 `test-*.sh` gates and the `validate-*` helpers they exercise |
+| `scripts/pr-ready-audit.sh` | Lane readiness audit: maintains `lane:*` and `ready-to-merge`, enqueues with `--enqueue` |
 | `reviews/` | `reviews/findings/`, the standing finding ledger, one file per finding; `reviews/FINDINGS.md`, the same ledger up to 2026-09-04, closed to new sections; historical review records moved to the private lab repository on 2026-09-04 |
 | `effects/` | The effect-governance allowlists the `src/effects/tests.rs` census enforces |
 
