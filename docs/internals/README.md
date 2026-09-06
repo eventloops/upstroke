@@ -47,6 +47,29 @@ The recognized link label is plain text or a single code span closed inside its
 brackets. The opening is a paragraph; lists, blockquotes, and code blocks do not
 supply it, even when their source contains link-like text.
 
+The link itself may take any of Markdown's usable forms: an inline destination,
+bare or in angle brackets, with an optional title, or a full, collapsed or
+shortcut reference resolved against a link reference definition elsewhere in the
+same file.
+
+```markdown
+# `src/runner/host.rs`
+
+Extended notes for [`src/runner/host.rs`][host].
+
+[host]: ../../../src/runner/host.rs
+```
+
+A definition counts only where a renderer would also read it: at block level,
+after the opening paragraph rather than above it, and outside fenced and
+indented code, HTML comments, raw HTML blocks and paragraph text. Only the
+first claim on a label decides, as it does for a reader: a definition the gate
+cannot read -- one inside a blockquote or a list, or with its destination
+wrapped onto the next line -- refuses that label rather than letting a later
+definition stand in for it. A title is separated from its destination by
+whitespace. A construct spelled outside what the gate reads is reported as a
+missing backlink; nothing passes unchecked.
+
 The repository-relative link works in a checkout and on GitHub. A separate
 `Source on GitHub` link points to the module's GitHub page for readers on
 upstroke.rs, whose published `/docs` tree does not contain `src/`.
