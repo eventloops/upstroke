@@ -633,29 +633,52 @@ impl EffectSiteId {
 // run time. Demote `pub const fn row` to `pub fn row` and the crate, its tests
 // and its generated inventory all still build; the frozen API is broken and
 // nothing says so. A compile-time contract is stated where the compiler
-// enforces it, which is here: none of this module builds unless the four
-// functions are callable in a const context over values taken from the groups'
-// const `ALL` slices.
+// enforces it, which is here: none of this module builds unless every one of
+// the functions is callable in a const context over values taken from the
+// groups' const `ALL` slices.
+//
+// Every one, and not only the four `identity` names. The walk put each site
+// through `row`, `adjacent`, `fault_row`, `scope`, `before_state` and
+// `after_effect`, and left `group`, `variant`, `module`, `observable_orders`,
+// `is_read_only`, `sub_effects`, `residue_classes`, `residue_elements` and
+// `skipped_on_fast_path` — nine more `const fn` on the same type — in the
+// state the six were repaired out of: declared `const fn`, called only from
+// ordinary code, demotable to `pub fn` with the crate still building. The
+// list below is `EffectSiteId`'s whole `const fn` surface, so a function
+// added to the type and left out of the walk is the only way back to it.
 
 /// Walk every group's `ALL` slice at compile time and put every site of it
-/// through the four `identity` functions and the residue authority.
+/// through every `const fn` [`EffectSiteId`] declares.
 ///
-/// A `while` over the slice rather than a list of variants, so the walk covers
-/// whatever `ALL` holds and cannot fall behind a group that grows one.
+/// A loop over the slice rather than a list of variants, so the walk covers
+/// whatever `ALL` holds and cannot fall behind a group that grows one. It
+/// consumes the slice through a subslice pattern rather than by index: an
+/// index panics on a bound, which §7 admits only under an `#[expect]` naming
+/// the proof, and here the pattern is the proof — a matched `[first, tail @
+/// ..]` cannot be out of bounds.
 macro_rules! const_identity_walk {
     ($($group:ident => $wrap:ident),+ $(,)?) => {
         const _: () = {
             $(
-                let mut index = 0;
-                while index < $group::ALL.len() {
-                    let site = EffectSiteId::$wrap($group::ALL[index]);
+                let mut rest: &[$group] = $group::ALL;
+                while let [first, tail @ ..] = rest {
+                    let site = EffectSiteId::$wrap(*first);
+                    let _ = site.group();
+                    let _ = site.variant();
+                    let _ = site.module();
                     let _ = site.row();
                     let _ = site.adjacent();
                     let _ = site.fault_row();
                     let _ = site.scope();
+                    let _ = site.observable_orders();
+                    let _ = site.is_read_only();
+                    let _ = site.sub_effects();
+                    let _ = site.residue_classes();
+                    let _ = site.residue_elements();
+                    let _ = site.skipped_on_fast_path();
                     let _ = site.before_state();
                     let _ = site.after_effect();
-                    index += 1;
+                    rest = tail;
                 }
             )+
         };
