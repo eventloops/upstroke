@@ -457,6 +457,8 @@ effect_free = [
     "as_str",
     "commit_record_after_error",
     "create",
+    # Delegates to the private site-taking fresh-creation implementation.
+    "create_fresh",
     "create_hooked",
     "default_private_root",
     "drop",
@@ -694,9 +696,10 @@ effect_free = [
 # `effects/allowlist.toml` row.
 #
 # `crate_path` is EMPTY for all three, because each is a private `mod`. The
-# schema says so at `src/effects/tests.rs:327` -- "the path a denied entry would
-# name this module by, or empty when the module is not reachable from outside
-# its parent (a private `mod`, or the binary crate root)" -- and
+# `ModuleClassification`'s `crate_path` contract in
+# `docs/internals/effects/tests.md` says the path is empty when the module is
+# not reachable from outside its parent, including a private `mod` or the
+# binary crate root, and
 # `src/engine/{coordinator,resume,attempt,preflight}.rs` are the tree's
 # convention. An earlier revision of this note recorded
 # `upstroke::runner::host::probe` and argued the value was harmless because the
@@ -1448,6 +1451,7 @@ not_an_effect = [
     "ENOENT",
     "EPERM",
     "ESRCH",
+    "ETXTBSY",
     "EWOULDBLOCK",
     "FD_CLOEXEC",
     "F_GETFD",
@@ -1455,6 +1459,7 @@ not_an_effect = [
     "F_GETLK",
     "F_SETFL",
     "F_SETLK",
+    "F_SETPIPE_SZ",
     "F_UNLCK",
     "F_WRLCK",
     "LOCK_EX",
@@ -1463,6 +1468,7 @@ not_an_effect = [
     "LOCK_UN",
     "O_CLOEXEC",
     "O_DIRECTORY",
+    "O_NOFOLLOW",
     "O_NONBLOCK",
     "O_RDONLY",
     "O_WRONLY",
@@ -1549,6 +1555,9 @@ not_an_effect = [
     "sigpending",
     "sigset_t",
     "sleep",
+    "suseconds_t",
     "sysconf",
+    "time_t",
     "timespec",
+    "timeval",
 ]

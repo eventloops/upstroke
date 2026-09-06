@@ -62,6 +62,13 @@ const fn supplies_credentials(role: &ExecutionRole) -> bool {
     }
 }
 
+// This runner owns both locks. `resolved` serializes each program lookup and
+// caches its success or error before releasing the guard. Concurrent callers
+// reuse that result. It is released before `hooks` is acquired; the locks never
+// nest. `hooks` gives one caller exclusive access to the mutable observer during
+// startup or an entire supervised run, so callers on one runner wait their turn.
+// Guards release on return or unwind. Poisoned locks retain their inner state;
+// child cleanup during a run belongs to the process funnel's RAII owners.
 pub struct HostRunner {
     policy: RunnerPolicy,
     digest: String,

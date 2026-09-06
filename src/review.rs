@@ -1,44 +1,7 @@
-//! Review (DESIGN.md §11.2–§11.3): read-only worker profiles judge the
-//! engine-captured diff against the task's acceptance criteria. A judgement is
-//! authoritative only when the complete trimmed answer is one `json`-labelled
-//! fence containing one verdict object; prose and examples cannot approve.
-//!
-//! Two things make this more than a second opinion from the same model: a
-//! reviewer sees the *diff* rather than the implementer's account of it
-//! (invariant 3), and its prompt is explicitly anti-sycophantic — its job is
-//! to find reasons to fail, not to agree. Unparseable output earns exactly
-//! one re-ask; after that the attempt fails, because a reviewer that cannot
-//! answer in the required shape has not reviewed anything.
-//!
-//! Everything a reviewer is shown — the diff, and any artifacts — was
-//! written by an agent, so it is quoted as data behind a fence the payload
-//! cannot close and labelled untrusted. Parsing is deliberately fail-closed:
-//! a mangled answer costs a re-ask and then a failure, and never falls back
-//! to some earlier passing-looking object in the reply.
-//!
-//! # A list of passes, not one reviewer
-//!
-//! §11.5 generalizes review "from a single pass into a **list of passes, each
-//! with a lens and a pass rule**", and §11.3's cross-vendor second opinion is
-//! the first user of that shape: on blast-radius paths a second reviewer from a
-//! different *model family* judges the same diff, and **both verdicts must
-//! pass**. [`ReviewPlan`] resolves which passes a task gets; [`Lens`] is what
-//! distinguishes them.
-//!
-//! The passes are independent on purpose. Neither reviewer is told the other's
-//! verdict — a second opinion that has already read "the first reviewer passed
-//! this" is an agreement machine, which is the same failure the anti-sycophancy
-//! instruction exists to prevent.
-//!
-//! §11.5's security lens joins [`Lens`] in v0.2, and it is **not** just another
-//! entry: its ladder dispatch differs deliberately, because a security finding
-//! that enters the retry-until-it-passes loop is a finding being laundered into
-//! a commit. It goes to an `Unblock` question instead. Nothing here should make
-//! that harder to add — which is why a lens is an enum with behaviour hanging
-//! off it rather than a bool.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+//! Extended notes: `docs/internals/review.md`
+
+// LEGACY-EFFECT: this module is in the frozen legacy section of
+// `effects/allowlist.toml`, which carries its justification.
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::fmt::Write as _;
@@ -58,27 +21,16 @@ use crate::runner::invocation::InvocationId;
 use crate::runner::{AgentId, Runner};
 use crate::util;
 
-/// Largest complete diff one review pass accepts. Silently omitting files is
-/// never a review: work above this bound is refused before model spend and must
-/// be split into a smaller task.
 pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 
-/// What one review pass is looking for, and how its artifacts are named.
-///
-/// v0.2 adds `Security` here (§11.5) — with a different ladder dispatch, since
-/// a security finding must never enter the retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Lens {
-    /// §11.2: does this change meet its acceptance criteria without breaking
-    /// anything? The pass every reviewed task gets.
     Acceptance,
-    /// §11.3: the same diff, judged independently by a different model family.
     SecondOpinion,
 }
 
 impl Lens {
-    /// Short id used in profile names, event records, and the ledger.
     pub fn name(self) -> &'static str {
         match self {
             Self::Acceptance => "review",
@@ -86,9 +38,6 @@ impl Lens {
         }
     }
 
-    /// Suffix distinguishing this pass's on-disk artifacts. The acceptance pass
-    /// keeps the bare names it has had since step 6, so a run directory reads
-    /// the same way whether or not a second opinion was configured.
     fn file_suffix(self) -> &'static str {
         match self {
             Self::Acceptance => "",
@@ -96,8 +45,6 @@ impl Lens {
         }
     }
 
-    /// Prepended to the prompt. The acceptance pass adds nothing: it *is* the
-    /// baseline the rest of the prompt already describes.
     fn preamble(self) -> &'static str {
         match self {
             Self::Acceptance => "",
@@ -114,8 +61,6 @@ impl Lens {
     }
 }
 
-/// Which agent and model a pass runs on. Plain data so the run record can carry
-/// it (§15) and a resume can honour what actually judged this run's code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassBinding {
     pub agent: String,
@@ -139,55 +84,24 @@ impl PassBinding {
     }
 }
 
-/// One resolved pass: a lens and the binding that will apply it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPass {
     pub lens: Lens,
     pub binding: PassBinding,
 }
 
-/// Which passes each task gets, resolved once before any agent is spawned.
-///
-/// Resolved up front rather than per attempt so that pre-flight can probe every
-/// agent that might judge this run (step-6 finding #10: a reviewer that cannot
-/// be built must never silently degrade the run to gates-only) and so the run
-/// record can pin what its verification standard was.
-///
-/// `second_opinion` is aligned to `plan.tasks` by index rather than keyed by
-/// task id, which is safe for the same reason `Progress` is: a resume refuses
-/// outright when the plan hash or the resolved chains moved, so the task list
-/// this was built against and the one it is read back against are the same list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewPlan {
-    /// Whether verification was deliberately enabled when this plan was
-    /// frozen. `Option` is intentional: schema-3 replay must distinguish an
-    /// old/malformed record that omitted the field from an explicit `false`.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Whether the frozen plan deliberately retained an anti-self-review
-    /// alternative. Absence of the binding is legitimate, but absence of this
-    /// marker is not: otherwise a truncated record silently weakens review.
     #[serde(default)]
     pub alternative_available: Option<bool>,
-    /// Independent wall-clock budget for each pass, including its one
-    /// verdict-format re-ask. Seconds keep the event record plain and stable.
-    /// This complete-review contract begins at event schema 3. A schema-2
-    /// binary would ignore this field *and* still truncate the prompt at 60
-    /// KiB, so allowing it to resume could accept a partial review. The schema
-    /// boundary makes that downgrade a refusal instead.
     #[serde(default)]
     pub pass_timeout_secs: Option<u64>,
-    /// `None` ⟺ `[routing] review = { enabled = false }`. Anything else that
-    /// fails to resolve is an error, never an empty plan.
     #[serde(default)]
     pub primary: Option<PassBinding>,
-    /// A different-family binding at the review tier, where this build can
-    /// reach one. Used *only* to stop a task being reviewed by the model that
-    /// wrote it; absent on a single-vendor install, which warns instead.
     #[serde(default)]
     pub alternative: Option<PassBinding>,
-    /// Per task, aligned with `plan.tasks`: the §11.3 second opinion this
-    /// task's paths asked for.
     #[serde(default)]
     pub second_opinion: Vec<Option<PassBinding>>,
 }
@@ -206,8 +120,6 @@ impl Default for ReviewPlan {
 }
 
 impl ReviewPlan {
-    /// Validate and materialize the timeout recorded for this run. A corrupt
-    /// zero must fail closed on resume rather than disabling supervision.
     pub fn pass_timeout(&self) -> Result<Duration, UpstrokeError> {
         match self.pass_timeout_secs {
             Some(0) => Err(UpstrokeError::Refused {
@@ -220,8 +132,6 @@ impl ReviewPlan {
         }
     }
 
-    /// Every agent that could be asked to judge something — the set pre-flight
-    /// must probe, deduped and stable.
     pub fn agents(&self) -> Vec<&str> {
         let mut ids: Vec<&str> = self
             .primary
@@ -235,9 +145,6 @@ impl ReviewPlan {
         ids
     }
 
-    /// Agents whose absence is fatal: everything except the opportunistic
-    /// [`Self::alternative`], which degrades to a warning (see
-    /// [`Self::drop_alternative`]).
     pub fn required_agents(&self) -> Vec<&str> {
         let mut ids: Vec<&str> = self
             .primary
@@ -250,23 +157,11 @@ impl ReviewPlan {
         ids
     }
 
-    /// Give up on the anti-self-review rebind — the alternative agent would not
-    /// probe. Reviews still happen; some may be same-model.
     pub fn drop_alternative(&mut self) {
         self.alternative = None;
         self.alternative_available = Some(false);
     }
 
-    /// Which tasks will be judged by the model that wrote them, and why nothing
-    /// prevented it — or `None` when the rebind is available or nothing is at
-    /// risk.
-    ///
-    /// Called from two places on purpose. Resolution reaches it when no
-    /// cross-family model has an adapter at all; **pre-flight reaches it again
-    /// after a probe failure drops the alternative**, which is the case that
-    /// actually happens to people. A real build always ships the Copilot
-    /// adapter, so resolution alone would never fire this — the warning would
-    /// have been dead code in every shipped binary.
     pub fn self_review_warning(
         &self,
         plan: &Plan,
@@ -307,35 +202,19 @@ impl ReviewPlan {
         ))
     }
 
-    /// The ordered passes for the task at `index`. See [`passes_for`].
     pub fn passes_for(&self, index: usize, implementer: &PassBinding) -> Vec<ReviewPass> {
         passes_for(ReviewBindings::of_plan(self, index), implementer)
     }
 }
 
-/// The three bindings pass selection actually reads, for one task.
-///
-/// **Ask for what you read.** [`passes_for`] consumes exactly `primary`,
-/// `alternative` and this task's `second_opinion` — never the enabled flag, the
-/// timeout, or the other tasks' entries. Naming that as a type is what lets one
-/// rule serve two shapes: a schema-3 [`ReviewPlan`] indexed by task position,
-/// and a schema-4 [`crate::topology::registry::FrozenTaskSpec`] that resolved
-/// its own second opinion at freeze time. The alternative was a driver-side
-/// re-derivation of the rebind rule, and `wrong_internal_assumption` is 48.3%
-/// of this project's classified findings — a second implementation of a rule
-/// with two interacting cases is exactly the shape that produces them.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewBindings<'a> {
-    /// The reviewer configured for every task in the run.
     pub primary: Option<&'a PassBinding>,
-    /// The anti-self-review fallback, where the run retained one.
     pub alternative: Option<&'a PassBinding>,
-    /// This task's §11.3 second opinion, where its paths asked for one.
     pub second_opinion: Option<&'a PassBinding>,
 }
 
 impl<'a> ReviewBindings<'a> {
-    /// The run-level plan's answer for the task at `index`.
     #[must_use]
     pub fn of_plan(plan: &'a ReviewPlan, index: usize) -> Self {
         Self {
@@ -346,21 +225,6 @@ impl<'a> ReviewBindings<'a> {
     }
 }
 
-/// The ordered passes for one task, given the binding the implementer is
-/// actually running on.
-///
-/// Two rules meet here, and the order matters:
-///
-/// 1. A task with a configured second opinion keeps its primary reviewer
-///    **unrebound**. Rebinding it would let both passes resolve to the same
-///    different-family model, and Anthropic-written code would lose its
-///    Anthropic review entirely — strictly worse than the self-review the
-///    rebind exists to prevent.
-/// 2. Otherwise the primary rebinds when it would be the *same model* that
-///    wrote the code. Exact `(agent, model)` equality, not family similarity:
-///    `claude-sonnet-5` reviewed by `claude-opus-5` is a genuine second look,
-///    and rebinding it would spend cross-vendor capacity on half the tasks in a
-///    run for no verification gain.
 #[must_use]
 pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Vec<ReviewPass> {
     {
@@ -390,22 +254,6 @@ pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Ve
     }
 }
 
-/// The lenses one task's frozen plan **obliges**, in the order it obliges them.
-///
-/// [`passes_for`]'s answer, projected to its lenses — not a second reading of
-/// its two rules. The projection is exact because the obligation is
-/// **invariant in the implementer**: the rebind of rule 2 chooses *which
-/// binding* applies the acceptance lens and never whether that lens runs, and
-/// rule 1 turns on a configured second opinion rather than on who wrote the
-/// code. So the set of lenses a record owes can be asked without knowing what
-/// ran, which is what lets the fold ask it —
-/// [`crate::events::AttemptRecord`] carries the passes and not the binding
-/// that produced them.
-///
-/// The stand-in implementer is `primary` for that reason: any value gives the
-/// same lenses, and using one that is certainly present keeps the call total.
-/// [`the_obliged_lenses_do_not_depend_on_who_implemented`] measures the
-/// invariance rather than asserting it here.
 #[must_use]
 pub fn obliged_lenses(bindings: ReviewBindings<'_>) -> Vec<Lens> {
     let Some(primary) = bindings.primary.cloned() else {
@@ -417,18 +265,6 @@ pub fn obliged_lenses(bindings: ReviewBindings<'_>) -> Vec<Lens> {
         .collect()
 }
 
-/// Resolve every task's review passes (§11.2, §11.3).
-///
-/// `has_adapter` is injected rather than read from the registry so the engine
-/// can ask about the adapters its own harness holds — which under test is not
-/// the built-in set — and so `validate` and `run` reach the same answer.
-///
-/// Failure is asymmetric, and deliberately so. An explicitly configured
-/// `second_opinion` that cannot resolve is an **error**: the operator asked for
-/// two model families on their blast-radius paths, and quietly giving them one
-/// is step-6 finding #10 all over again. The implicit anti-self-review rebind
-/// merely **warns**, because nobody asked for it and refusing would make
-/// upstroke unusable on a single-vendor install.
 pub fn plan_for(
     plan: &Plan,
     chains: &[ResolvedChain],
@@ -441,10 +277,6 @@ pub fn plan_for(
         .tasks
         .iter()
         .map(|task| {
-            // `is_some`, not a match on the one variant that exists today:
-            // §11.5 adds a security lens to this key, and a new variant should
-            // arrive as a compile error where it needs handling — not as a
-            // silently-ignored override here.
             cfg.overrides.iter().find(|ov| {
                 ov.second_opinion.is_some() && task.path_hints.iter().any(|h| ov.globs.is_match(h))
             })
@@ -452,8 +284,6 @@ pub fn plan_for(
         .collect();
 
     if !cfg.review_enabled {
-        // Contradictory config: one key says judge nothing, another says judge
-        // twice. Only an error where it would actually change what runs.
         if let Some(index) = demanded.iter().position(Option::is_some) {
             return Err(UpstrokeError::Refused {
                 message: format!(
@@ -470,17 +300,11 @@ pub fn plan_for(
         });
     }
 
-    // The same rules the router uses: a pin for the tier, else the catalog's
-    // example binding.
     let primary = match cfg.pins.iter().find(|p| p.tier == tier) {
         Some(pin) => PassBinding::new(pin.agent.clone(), pin.model.clone()),
         None => PassBinding::from_entry(catalog::example_binding(tier)),
     };
 
-    // Every binding above comes from the catalog (pins are validated against it
-    // at load), so this is belt-and-braces — but without a family there is no
-    // way to tell "different" from "same", and guessing is how a reviewer ends
-    // up quietly paired with itself.
     let primary_family = catalog::lookup(&primary.agent, &primary.model).map(|e| e.family);
     let cross = |family: Family| {
         catalog::different_family_at(tier, family, &has_adapter).map(PassBinding::from_entry)
@@ -529,40 +353,20 @@ pub fn plan_for(
         alternative,
         second_opinion,
     };
-    // The carried step-6 item, now visible: say when a task will be judged by
-    // the model that wrote it and nothing in this build can prevent it.
     if let Some(warning) = resolved.self_review_warning(plan, chains, tier) {
         warnings.push(warning);
     }
     Ok(resolved)
 }
 
-/// What a review pass reads about the task under review.
-///
-/// **Three fields, and [`ReviewCx`] used to take a whole `ir::Task` to reach
-/// them.** `materialize_prompt` — the only thing in this module's review path
-/// that touches the task at all — quotes the title, the body and the acceptance
-/// criteria, and nothing else.
-///
-/// The wider field could not be shared. The schema-4 driver holds a
-/// `FrozenTaskSpec` from the frozen registry and no `ir::Task` anywhere:
-/// synthesising one would mean inventing an id, a kind and a dependency list
-/// the reviewer never reads, and a conversion that fabricates fields is free to
-/// drift from the plan it claims to represent. Asking for what is read removes
-/// the question — the same narrowing `OpenGeneration` made for the rebuild
-/// family, and for the same reason.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewSubject<'a> {
-    /// The task's one-line title.
     pub title: &'a str,
-    /// Its body, which may be empty.
     pub body: &'a str,
-    /// Its acceptance criteria, which may be empty.
     pub acceptance: &'a [String],
 }
 
 impl<'a> ReviewSubject<'a> {
-    /// The subject of a legacy plan's task.
     #[must_use]
     pub fn of(task: &'a Task) -> Self {
         Self {
@@ -576,57 +380,24 @@ impl<'a> ReviewSubject<'a> {
 pub struct ReviewCx<'a> {
     pub adapter: &'a dyn AgentAdapter,
     pub profile: WorkerProfile,
-    /// Which pass this is (§11.5). Decides the prompt preamble and the names of
-    /// this review's artifacts on disk.
     pub lens: Lens,
     pub task: ReviewSubject<'a>,
     pub diff: &'a str,
-    /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
-    /// What the operator has already settled about this task (§12). A question
-    /// parks a task precisely because its acceptance criteria turn on a
-    /// decision the repository cannot supply, so a judge that cannot see the
-    /// answer will look for it, fail to find it, and reject the change for
-    /// having obeyed it.
     pub decisions: &'a [String],
     pub workspace: &'a Path,
-    /// Where this review's permission settings are materialized. Outside the
-    /// workspace (§15 split), so the reviewer cannot read the description of
-    /// its own sandbox.
     pub settings_dir: &'a Path,
-    /// Where the verdict transcripts land — also outside the workspace, since
-    /// they are agent-authored.
     pub reviews_dir: &'a Path,
-    /// Unique file stem for this task's review artifacts, attempt included —
-    /// step 7 reviews the same task more than once and each verdict is the
-    /// evidence for its own retry.
     pub stem: String,
     pub timeout: Duration,
 }
 
-/// The two identities one review pass can spend.
-///
-/// Two, because the packet's role set has two members for a review —
-/// `decisions.admission_and_leases.permits.invocation_identity`: "role in
-/// {worker, gate(n), **review_pass(n)**, **review_reask(n)**}". A pass that
-/// answers unparseably earns exactly one re-ask, and that re-ask is a second
-/// process with its own identity rather than a second run of the first.
-///
-/// Built by the caller rather than here, because which *form* they take is the
-/// caller's: a task's review is the attempt form and an integration
-/// transaction's is the sequence form (which has no worker).
 #[derive(Debug, Clone)]
 pub struct ReviewInvocations {
-    /// The verdict.
     pub pass: InvocationId,
-    /// The one format-only re-ask, if the verdict could not be parsed.
     pub reask: InvocationId,
 }
 
-/// What a review attempt produced. A reviewer that could not run at all is
-/// NOT a rejection of the change: the engine has to tell "the code is wrong"
-/// apart from "the judge was unavailable", or a rate-limited pool reads as a
-/// failed task and the retry ladder punishes the implementer for it.
 #[derive(Debug)]
 pub enum ReviewResult {
     Judged(Verdict),
@@ -640,21 +411,11 @@ pub enum ReviewResult {
 pub struct ReviewOutcome {
     pub result: ReviewResult,
     pub cost_usd: Option<f64>,
-    /// How many agent invocations it took (2 means the re-ask was needed).
     pub invocations: u32,
-    /// The transcript the verdict (or the give-up) actually came from.
     pub transcript: PathBuf,
 }
 
 impl ReviewPass {
-    /// The read-only profile this pass runs under. Named for its lens and its
-    /// model, so an event log and a ledger both say which judgement is whose.
-    /// Effort is a parameter rather than a field on [`PassBinding`] for a
-    /// specific reason: `passes_for` decides the §11.3 rebind by comparing a
-    /// binding with the implementer's, and a binding carrying an effort the
-    /// implementer's descriptor does not would make that comparison always
-    /// false — silently retiring the check that stops a model reviewing its own
-    /// work. The comparison is about identity; effort is not identity.
     pub fn profile(&self, effort: Effort) -> WorkerProfile {
         profile_for(
             &self.binding.agent,
@@ -665,7 +426,6 @@ impl ReviewPass {
     }
 }
 
-/// A read-only profile bound to the same rung the reviewer is configured for.
 pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> WorkerProfile {
     WorkerProfile {
         name: name.to_owned(),
@@ -697,29 +457,17 @@ fn unavailable_after_error(
     }
 }
 
-/// Run one review pass through `runner`.
-///
-/// # Errors
-///
-/// Only what makes the *evidence* unusable — an oversized or opaque diff. A
-/// reviewer that could not run is [`ReviewResult::Unavailable`], not an error:
-/// the engine has to tell "the code is wrong" from "the judge was
-/// unavailable".
 pub fn run_review(
     cx: &ReviewCx<'_>,
     runner: &dyn Runner,
     invocations: &ReviewInvocations,
 ) -> Result<ReviewOutcome, UpstrokeError> {
-    // Validate the complete evidence before permission files are written or an
-    // adapter can build/spawn a model command. An incomplete review is no
-    // review, so large tasks fail closed rather than losing early paths.
     let full_prompt = materialize_prompt(cx)?;
     let started = Instant::now();
     let reviews_dir = cx.reviews_dir;
     let suffix = cx.lens.file_suffix();
     let transcript = reviews_dir.join(format!("{}{suffix}-review.json", cx.stem));
     let mut last_path = transcript.clone();
-    // Reviewers run nothing: no gate commands, no edit tools (§20).
     let settings_path = match cx.adapter.materialize_permissions(
         &cx.profile,
         &[],
@@ -742,10 +490,6 @@ pub fn run_review(
     let mut session = None;
     for invocation in 1..=2u32 {
         let resume = (invocation > 1).then(|| session.clone()).flatten();
-        // The re-ask only gets to be terse if the reviewer's context survives.
-        // Without a session to resume it has never seen the diff, and a
-        // verdict from an agent that read nothing is worthless — so re-send
-        // the whole prompt rather than asking it to invent an answer.
         let prompt = match (invocation, &resume) {
             (1, _) => full_prompt.clone(),
             (_, Some(_)) => REASK_PROMPT.to_owned(),
@@ -755,9 +499,6 @@ pub fn run_review(
             prompt,
             profile: cx.profile.clone(),
             workspace: cx.workspace.to_path_buf(),
-            // Reviewers run nothing, so there is nothing to allow (§20). This
-            // is the same empty list handed to `materialize_permissions` above
-            // — an agent whose permissions ride on argv reads it from here.
             gate_cmds: Vec::new(),
             resume_session: resume,
             settings_path: settings_path.clone(),
@@ -789,16 +530,6 @@ pub fn run_review(
                 transcript: last_path,
             });
         }
-        // A reviewer is an agent CLI, so it is slotted and `host-v1` gives it
-        // its agent's credential location (`ExecutionRole::Review`). The
-        // workspace is the read-only candidate snapshot the caller resolved,
-        // and it is the runner that puts the process there — the adapter no
-        // longer can.
-        //
-        // The prompt still arrives the way the adapter says: `stdin_payload`
-        // is delivery policy (a CLI that takes the prompt as an argument
-        // returns nothing here), and the spec is what carries those bytes to
-        // the child.
         let request = crate::runner::review_request(
             command.stdin(cx.adapter.stdin_payload(&task_run).as_bytes().to_vec()),
             task_run.workspace.clone(),
@@ -829,9 +560,6 @@ pub fn run_review(
             reviews_dir.join(format!("{}{suffix}-review-reask.json", cx.stem))
         };
         if let Err(error) = util::write_text(&last_path, &output.stdout) {
-            // The model may already have spent tokens. Parse only to retain
-            // any spend it reported; without a durable transcript its verdict
-            // cannot be accepted.
             if let Ok(outcome) = cx.adapter.parse(&output) {
                 cost = add_cost(cost, outcome.cost_usd);
             }
@@ -859,8 +587,6 @@ pub fn run_review(
         cost = add_cost(cost, outcome.cost_usd);
         session = outcome.session_id.clone().or(session);
 
-        // A verdict is read even from a failed invocation — a reviewer that
-        // answered and then crashed still told us something.
         let answer = outcome.detail.clone().unwrap_or_default();
         if let Some(verdict) = parse_verdict(&answer) {
             return Ok(ReviewOutcome {
@@ -870,8 +596,6 @@ pub fn run_review(
                 transcript: last_path,
             });
         }
-        // The reviewer never ran properly: re-asking an exhausted pool or a
-        // hung process just spends again for the same result.
         if outcome.status != OutcomeStatus::Completed {
             return Ok(ReviewOutcome {
                 result: ReviewResult::Unavailable {
@@ -888,9 +612,6 @@ pub fn run_review(
         }
     }
 
-    // §11.2: one re-ask, then it counts as a failure. The reviewer ran and
-    // answered — it just never answered in a shape that means anything — so
-    // this is a genuine no-pass, not an outage.
     Ok(ReviewOutcome {
         result: ReviewResult::Judged(Verdict {
             pass: false,
@@ -921,8 +642,6 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
     }
     let task = cx.task;
     let mut prompt = String::new();
-    // What distinguishes this pass from the others, if anything (§11.5). It
-    // leads, because it frames everything below it.
     prompt.push_str(cx.lens.preamble());
     prompt.push_str(
         "You are reviewing one task's changes for the upstroke engine. You have READ-ONLY access: \
@@ -948,9 +667,6 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
         }
         prompt.push('\n');
     }
-    // Above the fence, and framed as instruction rather than data: unlike
-    // everything below, this came from the operator, and a criterion that
-    // reads "the policy the operator chose" is unjudgeable without it.
     if !cx.decisions.is_empty() {
         prompt.push_str(
             "The operator was asked to settle something about this task, and answered. This is a \
@@ -965,10 +681,6 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
         }
         prompt.push('\n');
     }
-    // Everything below is agent-authored: the artifacts were written by an
-    // earlier task's agent and the diff by the very agent under review. It is
-    // quoted as data, with a fence the payload cannot close, and labelled as
-    // untrusted so instructions smuggled inside it are not obeyed.
     for (name, content) in cx.artifacts {
         let fence = util::fence_for(content);
         let _ = writeln!(
@@ -1014,13 +726,6 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
     Ok(prompt)
 }
 
-/// Explain why a diff cannot receive a complete review, if it exceeds the
-/// fail-closed input limit.
-///
-/// The engine checks this before dispatch and turns it into a settled policy
-/// failure. `materialize_prompt` repeats the check as a last line of defence
-/// for direct callers, which still receive a refusal rather than a truncated
-/// review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompleteDiffError {
     Opaque,
@@ -1075,16 +780,7 @@ fn add_cost(current: Option<f64>, extra: Option<f64>) -> Option<f64> {
     }
 }
 
-/// Parse the one authoritative verdict envelope.
-///
-/// The complete trimmed reply must be exactly one `json`-labelled Markdown
-/// fence whose body is exactly one JSON object. This deliberately rejects
-/// useful-looking prose, quoted examples, bare JSON, extra fences, and trailing
-/// commentary: none of those forms proves that the reviewer meant the object
-/// as its verdict. Unparseable output earns the one §11.2 re-ask instead.
 pub fn parse_verdict(text: &str) -> Option<Verdict> {
-    // Normalise the line ending emitted by Windows CLIs, but do not otherwise
-    // rewrite the answer: the wrapper itself is part of the authority boundary.
     let normalized = text.trim().replace("\r\n", "\n");
     let candidate = normalized
         .strip_prefix("```json\n")?
@@ -1098,15 +794,11 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
 
 fn verdict_from_json(candidate: &str) -> Option<Verdict> {
     let value: Value = serde_json::from_str(candidate.trim()).ok()?;
-    // `pass` is mandatory: without it there is no verdict, only prose.
     let pass = value.get("pass")?.as_bool()?;
     Some(Verdict {
         pass,
         reasons: string_list(value.get("reasons")),
         required_changes: string_list(value.get("required_changes")),
-        // §12: the reviewer may decline to judge. Absent, or anything but a
-        // literal `true`, means it judged — escalating to a human on a
-        // malformed field would let sloppy output park tasks.
         needs_human: value
             .get("needs_human")
             .and_then(Value::as_bool)
@@ -1139,16 +831,10 @@ mod tests {
     use crate::topology::events::AttemptNumber;
     use crate::topology::registry::TaskKey;
 
-    /// The boundary these tests run on: the real host one, because a review
-    /// test that mocked the runner would stop proving that a review is a
-    /// process.
     fn host() -> HostRunner {
         HostRunner::new()
     }
 
-    /// One review pass's two identities, in the legacy engine's own scope —
-    /// task 0, attempt 1, pass 0. Written here rather than taken from a
-    /// generator so the test names what it is asserting about.
     fn review_ids() -> ReviewInvocations {
         ReviewInvocations {
             pass: InvocationId::legacy_attempt(
@@ -1166,9 +852,6 @@ mod tests {
         }
     }
 
-    /// Any adapter contact is a test failure. Used to prove evidence-size
-    /// refusal happens before permission materialization, command build, or
-    /// model spend.
     struct NeverInvokedAdapter;
 
     impl AgentAdapter for NeverInvokedAdapter {
@@ -1227,11 +910,6 @@ mod tests {
             use std::sync::atomic::Ordering;
 
             let invocation = self.builds.fetch_add(1, Ordering::SeqCst);
-            // 0.4 and 0.75 of `verdict_reask_uses_the_remaining_pass_deadline`'s
-            // 3s budget. The ratios are what the test is about and they are
-            // unchanged; only the absolute scale moved, and it moved because
-            // 0.4 of *one* second left 599ms for a process spawn. See that
-            // test for the measurement.
             let (marker, delay_ms) = if invocation == 0 {
                 ("first-unparseable", "1200")
             } else {
@@ -1501,9 +1179,6 @@ mod tests {
 
     #[test]
     fn a_mangled_final_verdict_never_falls_back_to_an_earlier_pass() {
-        // The reviewer echoes the requested shape, then fails the change but
-        // botches the JSON. Falling back to the echo would commit a rejected
-        // change; the only safe answer is None, which earns the re-ask.
         for botched in [
             r#"{"pass": "false", "reasons": ["no tests"]}"#,
             r#"{"pass": false, "reasons": ["no tests"],}"#,
@@ -1533,7 +1208,6 @@ mod tests {
 
     #[test]
     fn a_refusal_quoting_the_template_is_not_a_pass() {
-        // The old bare-JSON fallback turned this exact reply into pass=true.
         let text = "I was unable to complete this review: the diff appears truncated. For \
                     reference the required shape is {\"pass\": true, \"reasons\": [\"why you \
                     reached this verdict\"]} but I cannot fill it in honestly.";
@@ -1576,8 +1250,6 @@ mod tests {
 
     #[test]
     fn needs_human_is_read_only_from_a_literal_true() {
-        // §12's escalation channel. Absent means "I judged it"; a sloppy
-        // non-boolean must not park a task either.
         let asked = parse_verdict(
             "```json\n{\"pass\": false, \"reasons\": [\"the acceptance criteria contradict the \
              API contract\"], \"needs_human\": true}\n```",
@@ -1623,8 +1295,6 @@ mod tests {
             prompt.contains("being unsure is a fail"),
             "uncertainty is a verdict, not an escalation"
         );
-        // The schema must still be unparseable, or a model echoing it would
-        // produce an authoritative-looking verdict (step-6 finding 4).
         assert!(
             parse_verdict(&prompt).is_none(),
             "the prompt's own schema must never parse as a verdict"
@@ -1633,11 +1303,6 @@ mod tests {
 
     #[test]
     fn the_operators_answer_reaches_the_judge_as_a_decision() {
-        // §12's loop, closed. A task parks because its acceptance criteria
-        // turn on something the repository cannot settle; the worker is handed
-        // the answer and complies. A judge that never sees it goes looking for
-        // the decision, finds no trace, and rejects the change for obeying an
-        // instruction it was not shown — re-raising the same question forever.
         let task = task();
         let decisions = ["Render bare bytes when the value is not an exact multiple.".to_owned()];
         let cx = ReviewCx {
@@ -1663,12 +1328,8 @@ mod tests {
             prompt.contains("decision from a person"),
             "framed as instruction, not as agent-authored data: {prompt}"
         );
-        // It has to outrank the reviewer's own taste, or the anti-sycophancy
-        // stance above simply argues with the operator instead of the diff.
         assert!(prompt.contains("re-litigate"), "{prompt}");
 
-        // And it is the operator's answer that earns this framing, not any
-        // text near it: with nothing settled, none of it appears.
         let mut bare = cx;
         bare.decisions = &[];
         let plain = materialize_prompt(&bare).expect("prompt");
@@ -1716,8 +1377,6 @@ mod tests {
 
     #[test]
     fn broad_diffs_keep_every_file_in_the_review_prompt() {
-        // This is larger than the old 60 KiB truncation threshold but safely
-        // below the complete-review limit. Both ends must survive.
         let filler = "+let unchanged_context = 1;\n".repeat(2_500);
         let broad = format!(
             "diff --git a/first.rs b/first.rs\n+++ b/first.rs\n+FIRST_FILE_MARKER\n\
@@ -1822,7 +1481,6 @@ mod tests {
         assert!(error.to_string().contains("gitlink"), "{error}");
     }
 
-    /// A runner that writes down which identity each review process carried.
     struct RecordingRunner {
         inner: HostRunner,
         seen: std::sync::Mutex<Vec<(ExecutionRole, String)>>,
@@ -1841,13 +1499,6 @@ mod tests {
         }
     }
 
-    /// The re-ask is a second process with the packet's *other* review role.
-    ///
-    /// `decisions.admission_and_leases.permits.invocation_identity` gives a
-    /// review two role members — "{worker, gate(n), **review_pass(n)**,
-    /// **review_reask(n)**}" — so the one format-only re-ask a pass is allowed
-    /// carries `review_reask(n)`, not a second run of `review_pass(n)`. The
-    /// expected values are written from that sentence.
     #[test]
     fn the_one_format_reask_is_its_own_invocation_not_a_second_run_of_the_first() {
         let root = std::env::temp_dir().join(format!(
@@ -1869,8 +1520,6 @@ mod tests {
             settings_dir: &root,
             reviews_dir: &root,
             stem: "reask-identity".to_owned(),
-            // Generous, so the pass really performs both invocations rather
-            // than running out of clock the way the deadline test wants it to.
             timeout: Duration::from_secs(30),
         };
         let runner = RecordingRunner {
@@ -1916,23 +1565,6 @@ mod tests {
             settings_dir: &root,
             reviews_dir: &root,
             stem: "deadline".to_owned(),
-            // Three seconds, not one, and the two child delays scale with it
-            // (1200ms and 2250ms — the same 0.4 and 0.75 of the budget).
-            //
-            // The property under test is a ratio: the first invocation fits,
-            // and the re-ask does *not* fit in what the first one left. At one
-            // second that held with 599ms of slack for a process spawn —
-            // measured on an idle box, invocation 1 takes 401ms of the 1000ms
-            // — and a saturated machine eats 599ms spawning a test binary
-            // easily. When it does, the first invocation exhausts the whole
-            // budget, `run_review` returns before invocation 2, and this test
-            // fails with `invocations: 1` while asserting exactly the right
-            // thing. Observed twice under load and 41 times green idle.
-            //
-            // Scaling the clock is not weakening the assertion: the same
-            // re-ask still must not fit. Witnessed by mutation — giving the
-            // re-ask `cx.timeout` instead of the remaining budget still fails
-            // this test at the 3s scale, exactly as it did at 1s.
             timeout: Duration::from_millis(3000),
         };
 
@@ -1955,8 +1587,6 @@ mod tests {
     #[test]
     fn quoted_fences_in_the_diff_cannot_close_the_block() {
         let task = task();
-        // A markdown file whose content is itself a fenced block — the exact
-        // shape that used to break out of the reviewer's ```diff fence.
         let diff = "diff --git a/README.md b/README.md\n+++ b/README.md\n \
                     ```rust\n+fn added() {}\n ```\n";
         let cx = ReviewCx {
@@ -1974,20 +1604,14 @@ mod tests {
             timeout: Duration::from_secs(60),
         };
         let prompt = materialize_prompt(&cx).expect("prompt");
-        // The fence around the diff must be longer than any run inside it.
         assert!(prompt.contains("````diff"), "fence escalated: {prompt}");
         assert!(prompt.contains("DATA UNDER REVIEW"), "framed as untrusted");
     }
-
-    // ---------------------------------------------------------------------
-    // §11.3/§11.5: the pass list
-    // ---------------------------------------------------------------------
 
     fn binding(agent: &str, model: &str) -> PassBinding {
         PassBinding::new(agent, model)
     }
 
-    /// Primary at frontier, a reachable OpenAI alternative, one task.
     fn plan_with(second: Option<PassBinding>) -> ReviewPlan {
         ReviewPlan {
             enabled: Some(true),
@@ -2001,8 +1625,6 @@ mod tests {
 
     #[test]
     fn a_task_reviewed_by_its_own_author_rebinds_to_another_family() {
-        // The step-6 carried item: at the frontier rung both binders resolve
-        // identically, so without this the reviewer IS the implementer.
         let plan = plan_with(None);
         let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
         assert_eq!(passes.len(), 1);
@@ -2012,8 +1634,6 @@ mod tests {
 
     #[test]
     fn a_different_model_from_the_same_family_is_left_alone() {
-        // sonnet-written code judged by opus is a genuine second look. Rebinding
-        // it would spend cross-vendor capacity on most of a run for nothing.
         let plan = plan_with(None);
         let passes = plan.passes_for(0, &binding("claude-code", "claude-sonnet-5"));
         assert_eq!(passes[0].binding, binding("claude-code", "claude-opus-5"));
@@ -2021,9 +1641,6 @@ mod tests {
 
     #[test]
     fn without_an_alternative_the_primary_stands_even_when_it_wrote_the_code() {
-        // Single-vendor install: `plan_for` has already warned about this. The
-        // review still happens — refusing would make upstroke unusable without a
-        // second CLI installed.
         let mut plan = plan_with(None);
         plan.drop_alternative();
         let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
@@ -2032,9 +1649,6 @@ mod tests {
 
     #[test]
     fn a_second_opinion_adds_a_pass_and_suppresses_the_rebind() {
-        // The trap: rebinding the primary here would resolve BOTH passes to
-        // copilot/gpt-5.3-codex, and opus-written code would lose its Anthropic review
-        // entirely — strictly worse than the self-review being avoided.
         let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
         assert_eq!(passes.len(), 2, "both verdicts must pass (§11.3)");
@@ -2063,8 +1677,6 @@ mod tests {
 
     #[test]
     fn the_probe_set_separates_required_agents_from_the_optional_one() {
-        // The alternative is opportunistic, so its probe may fail without
-        // taking the run down; everything else is load-bearing.
         let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         assert_eq!(plan.agents(), ["claude-code", "copilot"]);
         assert_eq!(plan.required_agents(), ["claude-code", "copilot"]);
@@ -2103,10 +1715,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // plan_for: what each task's passes resolve to, before anything is spawned
-    // ---------------------------------------------------------------------
-
     fn scratch_config(name: &str, body: &str) -> Config {
         let dir = std::env::temp_dir().join(format!("upstroke-review-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -2116,14 +1724,6 @@ mod tests {
         crate::config::load(Some(&path), &dir, Some(&no_pools()), &mut warnings).expect("load")
     }
 
-    /// An explicit pools path with no pools in it, built once.
-    ///
-    /// A real, empty file rather than an absent one: an explicit pools path
-    /// that does not exist is a hard error, and `None` would reach for the
-    /// operator's own `~/.upstroke/pools.toml`. Created once because every caller
-    /// wants the same bytes, and rewriting one shared path from parallel tests
-    /// truncates it under a reader — `name` above is unique per test, this was
-    /// the one file they all shared.
     fn no_pools() -> std::path::PathBuf {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
@@ -2137,7 +1737,6 @@ mod tests {
         .clone()
     }
 
-    /// A one-task plan whose paths can match an override.
     fn auth_plan(cfg: &Config) -> (Plan, Vec<ResolvedChain>) {
         let mut task = task();
         task.path_hints = vec!["src/auth/login.rs".to_owned()];
@@ -2204,8 +1803,6 @@ mod tests {
 
     #[test]
     fn a_second_opinion_that_cannot_resolve_refuses_and_says_what_to_do() {
-        // Step-6 finding #10's posture. The operator asked for two families;
-        // silently giving them one is the failure that finding exists to stop.
         let cfg = scratch_config(
             "sononone.toml",
             "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
@@ -2226,8 +1823,6 @@ mod tests {
 
     #[test]
     fn a_single_vendor_build_warns_that_a_task_will_review_itself() {
-        // The visible half of the step-6 carried item: the run continues, but
-        // it says the check is weaker than it looks.
         let cfg = scratch_config(
             "selfrev.toml",
             "[routing]\nimplement = { tier = \"frontier\" }\n",
@@ -2244,7 +1839,6 @@ mod tests {
             "warnings: {warnings:?}"
         );
 
-        // With the second vendor present there is nothing to warn about.
         let mut quiet = Vec::new();
         let resolved = plan_for(&plan, &chains, &cfg, both_vendors, &mut quiet).expect("resolves");
         assert_eq!(
@@ -2256,9 +1850,6 @@ mod tests {
 
     #[test]
     fn a_task_that_never_runs_at_the_review_tier_is_not_warned_about() {
-        // Only a chain that can actually reach the reviewer's own binding is a
-        // self-review risk; warning about the rest is noise that trains people
-        // to ignore the warning that matters.
         let cfg = scratch_config(
             "lowrung.toml",
             "[routing]\nimplement = { tier = \"mid\" }\n",
@@ -2285,9 +1876,6 @@ mod tests {
 
     #[test]
     fn review_disabled_and_a_second_opinion_asked_for_is_a_contradiction() {
-        // One key says judge nothing, the other says judge twice. Picking a
-        // winner silently would be the engine deciding how much verification
-        // the operator meant.
         let cfg = scratch_config(
             "contradiction.toml",
             "[routing]\nreview = { enabled = false }\n\n\
@@ -2335,8 +1923,6 @@ mod tests {
 
     #[test]
     fn a_pinned_review_tier_still_gets_a_cross_family_partner() {
-        // A pin fixes the primary; the second opinion is chosen relative to
-        // whatever the pin landed on, not to the catalog's default.
         let cfg = scratch_config(
             "pinned.toml",
             "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5.3-codex\"\n\n\
@@ -2357,15 +1943,12 @@ mod tests {
 
     #[test]
     fn the_recorded_plan_survives_the_wire() {
-        // It rides on `run_started`, so a resume reads back exactly what the
-        // run resolved (§15).
         let mut plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         plan.pass_timeout_secs = Some(7200);
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: ReviewPlan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, plan);
 
-        // A log written before step 9 has no such field at all.
         let empty: ReviewPlan = serde_json::from_str("{}").expect("absent field defaults");
         assert_eq!(empty.pass_timeout_secs, None);
         assert_eq!(empty.enabled, None);
@@ -2416,7 +1999,6 @@ mod tests {
             prompt.contains("not told its verdict"),
             "a reviewer told the other approved stops looking"
         );
-        // Whatever the lens adds, the step-6 guards still hold.
         assert!(prompt.contains("find reasons this change should NOT be accepted"));
         assert!(prompt.contains("DATA UNDER REVIEW"));
         assert!(
@@ -2424,7 +2006,6 @@ mod tests {
             "the prompt's own schema must never parse as a verdict"
         );
 
-        // And the acceptance pass is unchanged by any of it.
         let mut plain = cx;
         plain.lens = Lens::Acceptance;
         let baseline = materialize_prompt(&plain).expect("prompt");
@@ -2450,20 +2031,6 @@ mod tests {
         );
     }
 
-    /// **The obliged lenses do not depend on who implemented the change.**
-    ///
-    /// [`obliged_lenses`] hands `passes_for` the primary binding as a stand-in
-    /// implementer, and the whole of why that is sound is that the answer does
-    /// not vary in that argument: rule 2 rebinds *who applies* the acceptance
-    /// lens and never *whether it runs*, and rule 1 turns on a configured
-    /// second opinion rather than on the author. Measured over the cross
-    /// product rather than argued, because the fold now judges a candidate's
-    /// success against this answer without having the implementer's binding to
-    /// hand.
-    ///
-    /// The implementers include the primary itself — which triggers the rebind
-    /// — and the alternative, so the case that would differ if the claim were
-    /// wrong is in the grid rather than adjacent to it.
     #[test]
     fn the_obliged_lenses_do_not_depend_on_who_implemented() {
         let primary = PassBinding::new("claude-code", "claude-opus-5");
@@ -2493,8 +2060,6 @@ mod tests {
                 Some(&alternative),
                 Some(&second),
             ),
-            // No primary is `None ⟺ review disabled`, and nothing else can
-            // resurrect a pass — not even a configured second opinion.
             ("second alone", None, None, Some(&second)),
         ];
 

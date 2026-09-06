@@ -2448,7 +2448,7 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         assert!(
             failures.iter().any(|failure| matches!(
                 failure,
-                BijectionFailure::NoFastSequenceExercised { site: named } if *named == site.name()
+                BijectionFailure::NoFastSequenceExercised { site: named } if named == site
             )),
             "{site}'s absence was substantiated by a harness that ran nothing: {failures:#?}"
         );
@@ -2488,8 +2488,8 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         assert!(
             failures.iter().any(|failure| matches!(
                 failure,
-                BijectionFailure::UnwitnessedFastSequence { site: named, sequence }
-                    if *named == site.name() && sequence == "fast/seq-2"
+                BijectionFailure::UnwitnessedFastSequence { site: named, sequence, observed: false }
+                    if named == site && sequence == "fast/seq-2"
             )),
             "{site} said nothing about a fast sequence the suite ran: {failures:#?}"
         );
@@ -2540,7 +2540,7 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
         failures.iter().any(|failure| matches!(
             failure,
             BijectionFailure::ExecutedInFastSequence { site: named, .. }
-                if *named == cherry.name()
+                if *named == cherry
         )),
         "a cherry-pick inside a fast sequence passed its own no-execution record: \
              {failures:#?}"
@@ -2556,13 +2556,50 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
             !failures.iter().any(|failure| matches!(
                 failure,
                 BijectionFailure::ExecutedInFastSequence { site: named, .. }
-                    if *named == site.name()
+                    if named == site
             )),
             "{site} was reported as executing and it did not"
         );
     }
 
-    // (f) The format refuses a record that names no sequence at all,
+    // (f) A site whose hook the harness recorded inside an exercised fast
+    // sequence the record does not name. Two observations, both from the
+    // inputs: the record says nothing about `fast/seq-2`, and the harness
+    // recorded the site's hook in it. The report carries both in one failure,
+    // so a reader learns of the observation now rather than a round later by
+    // adding the sequence to the record and reading `ExecutedInFastSequence`
+    // then. Until `ffe26ca` the `else` placement reported the gap with the
+    // observation withheld; between `ffe26ca` and `c2b6b6c` the observation
+    // was reported as a failure of its own asserting a rule `DESIGN.md` did
+    // not then contain (pass 3 on `c2b6b6c`); at `4fb81b3` the field was
+    // called `executed`, which claims more than a harness that sees only its
+    // own hook can know (pass 4 on `4fb81b3`).
+    let mut ran_unnamed = self_test_harness(host);
+    ran_unnamed.begin_fast_sequence("fast/seq-2");
+    drive(&mut ran_unnamed, cherry, host);
+    ran_unnamed.end_fast_sequence();
+    let failures = check_bijection(&inventory, &ran_unnamed, &entries, host);
+    assert!(
+        failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::UnwitnessedFastSequence { site: named, sequence, observed: true }
+                if *named == cherry && sequence == "fast/seq-2"
+        )),
+        "a cherry-pick hook inside an unnamed fast sequence was reported as a gap with the \
+             observation withheld: {failures:#?}"
+    );
+    // And no contradiction is reported, because the record made no claim
+    // about `fast/seq-2` to contradict.
+    assert!(
+        !failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::ExecutedInFastSequence { site: named, sequence }
+                if *named == cherry && sequence == "fast/seq-2"
+        )),
+        "an unnamed sequence was reported as a contradiction of the record: {failures:#?}"
+    );
+
+    // (g) The format refuses a record that names no sequence at all,
     // before the bijection is reached.
     let mut unwitnessed = no_execution_entry(skipped[0]);
     if let Evidence::NotExecuted { sequences, .. } = &mut unwitnessed.evidence {
@@ -2628,7 +2665,7 @@ fn a_fast_path_record_that_is_simply_absent_fails_like_any_other_missing_entry()
                 failures.iter().any(|failure| matches!(
                     failure,
                     BijectionFailure::MissingEntry { site: named, phase, .. }
-                        if *named == site.name() && phase == "no-execution"
+                        if named == site && *phase == EntryPhase::NoExecution
                 )),
                 "{host}: {site} has no fast-path record and the bijection did not say so: \
                      {failures:#?}"
@@ -2658,7 +2695,7 @@ fn a_fast_path_record_that_is_simply_absent_fails_like_any_other_missing_entry()
                 failures.iter().any(|failure| matches!(
                     failure,
                     BijectionFailure::MissingEntry { site: named, phase, .. }
-                        if *named == site.name() && phase == "no-execution"
+                        if named == site && *phase == EntryPhase::NoExecution
                 )),
                 "{host}: {site}'s record could be dropped alone: {failures:#?}"
             );
@@ -2677,10 +2714,10 @@ fn a_fast_path_record_that_is_simply_absent_fails_like_any_other_missing_entry()
             for failure in &failures {
                 let named = match failure {
                     BijectionFailure::MissingEntry { site, .. }
-                    | BijectionFailure::UnwitnessedFastSequence { site, .. } => site.clone(),
+                    | BijectionFailure::UnwitnessedFastSequence { site, .. } => *site,
                     other => panic!("{host}: unexpected failure {other:?}"),
                 };
-                assert_eq!(named, site.name(), "{host}: {failures:#?}");
+                assert_eq!(named, *site, "{host}: {failures:#?}");
             }
         }
     }
@@ -2721,7 +2758,7 @@ fn exactly_one_fast_path_record_is_required_and_a_second_is_refused() {
         failures.iter().any(|failure| matches!(
             failure,
             BijectionFailure::DuplicateEntry { site: named, phase, .. }
-                if *named == site.name() && phase == "no-execution"
+                if *named == site && *phase == EntryPhase::NoExecution
         )),
         "{failures:#?}"
     );
@@ -3111,7 +3148,7 @@ fn a_point_and_a_mode_are_one_coverage_coordinate_and_not_two_axes() {
     fire(&mut harness, written, kill);
     fire(&mut harness, synced, err);
     fire(&mut harness, SubEffectPoint::WrittenFull, err);
-    let unobserved: BTreeSet<String> = check_bijection(&inventory, &harness, &entries, host)
+    let unobserved: BTreeSet<HookPhase> = check_bijection(&inventory, &harness, &entries, host)
         .into_iter()
         .filter_map(|failure| match failure {
             BijectionFailure::Unobserved { phase, .. } => Some(phase),
@@ -3120,7 +3157,16 @@ fn a_point_and_a_mode_are_one_coverage_coordinate_and_not_two_axes() {
         .collect();
     assert_eq!(
         unobserved,
-        BTreeSet::from(["Written/error-return".to_owned(), "Synced/kill".to_owned()]),
+        BTreeSet::from([
+            HookPhase::Point {
+                point: written,
+                mode: err,
+            },
+            HookPhase::Point {
+                point: synced,
+                mode: kill,
+            },
+        ]),
         "the bijection did not report exactly the two coordinates that did not run"
     );
 }
@@ -3310,16 +3356,68 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     // that exists for what no hook can reach.
     let mut hook = hook_entry(site, EntryPhase::Before);
     hook.label = EvidenceLabel::RecoveryProven;
-    hook.evidence = match sound.evidence.clone() {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!("the sound entry is recovery-proven"),
-    };
+    // An assertion naming the premise rather than an `unreachable!` arm: §7
+    // denies `unreachable!` in tests too, having no Clippy allowance to take,
+    // and a test that fails its own setup says which premise failed.
+    assert!(
+        matches!(sound.evidence, Evidence::RecoveryProven { .. }),
+        "the sound entry is recovery-proven"
+    );
+    hook.evidence = sound.evidence.clone();
     let error = FaultRegistry::new()
-        .insert(hook)
+        .insert(hook.clone())
         .expect_err("a before-phase claiming recovery-proven evidence");
     assert!(
         matches!(error, RegistryError::HookClaimsRecoveryProof { .. }),
         "{error}"
+    );
+
+    // And what the bijection says about the same hand-edited document. The
+    // format's refusal is one answer; the other is that this hook phase
+    // carries nothing saying it executed, which is the question the
+    // bijection is asking. The synthetic and sampling records inside it are
+    // left unread rather than held to a residue class the entry is not
+    // about — reporting on them would be reporting on a claim nobody made,
+    // and there is no class here to say what they should have classified
+    // as.
+    let mut entries = self_test_registry(host);
+    let slot = entries
+        .iter()
+        .position(|entry| entry.key() == hook.key())
+        .expect("the self-test registry holds this site's before phase");
+    entries[slot] = hook;
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &entries,
+        host,
+    );
+    assert!(
+        failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::InvalidEntry {
+                error: RegistryError::HookClaimsRecoveryProof { .. },
+                ..
+            }
+        )),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::MissingEvidence { site: named, phase: EntryPhase::Before }
+                if *named == site
+        )),
+        "a before phase carrying recovery-proven evidence was read as evidenced: {failures:#?}"
+    );
+    assert!(
+        !failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::ResidueElementNotConstructed { .. }
+                | BijectionFailure::ResidueElementNotRecovered { .. }
+                | BijectionFailure::ResidueElementMisclassified { .. }
+        )),
+        "the records of a class the entry is not about were read anyway: {failures:#?}"
     );
 }
 
@@ -5332,7 +5430,15 @@ fn the_bijection_fails_on_every_missing_link() {
                     }
                 }
             },
-            expect: |failure| matches!(failure, BijectionFailure::Unobserved { phase, .. } if phase == "before"),
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::Unobserved {
+                        phase: HookPhase::Before,
+                        ..
+                    }
+                )
+            },
         },
         Direction {
             name: "an unobserved injection mode",
@@ -5367,7 +5473,18 @@ fn the_bijection_fails_on_every_missing_link() {
                     harness.hook(site, HookPhase::After);
                 }
             },
-            expect: |failure| matches!(failure, BijectionFailure::Unobserved { phase, .. } if phase.contains("Synced") && phase.contains("error-return")),
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::Unobserved {
+                        phase: HookPhase::Point {
+                            point: SubEffectPoint::Synced,
+                            mode: InjectionMode::ErrorReturn,
+                        },
+                        ..
+                    }
+                )
+            },
         },
         Direction {
             name: "a missing entry",
@@ -5405,7 +5522,18 @@ fn the_bijection_fails_on_every_missing_link() {
                     }
                 }
             },
-            expect: |failure| matches!(failure, BijectionFailure::MissingEvidence { .. }),
+            // The three predicates over a synthetic record are three
+            // failures and not one, so each direction below is pinned by
+            // the failure that names it. Under the one shared
+            // `MissingEvidence` these three rows expected the same value
+            // and a checker that read `constructed` three times would have
+            // satisfied all of them.
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::ResidueElementNotConstructed { .. }
+                )
+            },
         },
         Direction {
             name: "a residue element that did not recover",
@@ -5417,7 +5545,9 @@ fn the_bijection_fails_on_every_missing_link() {
                     }
                 }
             },
-            expect: |failure| matches!(failure, BijectionFailure::MissingEvidence { .. }),
+            expect: |failure| {
+                matches!(failure, BijectionFailure::ResidueElementNotRecovered { .. })
+            },
         },
         Direction {
             name: "a residue element that classified as something else",
@@ -5429,7 +5559,16 @@ fn the_bijection_fails_on_every_missing_link() {
                     }
                 }
             },
-            expect: |failure| matches!(failure, BijectionFailure::MissingEvidence { .. }),
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::ResidueElementMisclassified {
+                        classified: ObjectResidue::After,
+                        expected: ObjectResidue::Internal,
+                        ..
+                    }
+                )
+            },
         },
         Direction {
             name: "an unclassifiable sampled residue",
@@ -5472,6 +5611,41 @@ fn the_bijection_fails_on_every_missing_link() {
             expect: |failure| matches!(failure, BijectionFailure::SamplingUnaccounted { .. }),
         },
         Direction {
+            // The frontier reviewer's reproduction at `ffe26ca`. The check
+            // summed with `saturating_add`, and a saturating sum agrees with
+            // an `n` of `u32::MAX` whatever the histogram holds, so this
+            // record — one sample more than `n` accounts for — produced no
+            // `SamplingUnaccounted` and the document passed. `validate_entry`
+            // does not read these counts, so the bijection is the only check
+            // that can.
+            name: "a histogram whose saturating total equals n",
+            break_it: |_, entries| {
+                for entry in entries.iter_mut() {
+                    if let Evidence::RecoveryProven { sampling, .. } = &mut entry.evidence {
+                        sampling.n = u32::MAX;
+                        sampling.histogram = ClassHistogram {
+                            none: u32::MAX,
+                            internal: 1,
+                            after: 0,
+                        };
+                        sampling.unclassified = 0;
+                        sampling.recovered = true;
+                        break;
+                    }
+                }
+            },
+            expect: |failure| {
+                matches!(
+                    failure,
+                    BijectionFailure::SamplingUnaccounted {
+                        n: u32::MAX,
+                        counted,
+                        ..
+                    } if *counted == u64::from(u32::MAX) + 1
+                )
+            },
+        },
+        Direction {
             name: "a sampled residue that did not recover",
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
@@ -5498,7 +5672,8 @@ fn the_bijection_fails_on_every_missing_link() {
                 matches!(
                     failure,
                     BijectionFailure::MissingEntry { site, phase, .. }
-                        if site == "Object.ProposalCherryPick" && phase == "after"
+                        if *site == EffectSiteId::Object(ObjectSite::ProposalCherryPick)
+                            && *phase == EntryPhase::After
                 )
             },
         },
@@ -5519,7 +5694,7 @@ fn the_bijection_fails_on_every_missing_link() {
                 matches!(
                     failure,
                     BijectionFailure::Unobserved { site, .. }
-                        if site == "Ref.PinPrepared"
+                        if *site == EffectSiteId::Ref(RefSite::PinPrepared)
                 )
             },
         },
@@ -5553,7 +5728,7 @@ fn the_bijection_fails_on_every_missing_link() {
             direction.name
         );
     }
-    assert_eq!(directions.len(), 15, "every direction above is exercised");
+    assert_eq!(directions.len(), 16, "every direction above is exercised");
 
     // The unbroken state passes, so each direction above is the *only*
     // difference between passing and failing.
@@ -5567,6 +5742,225 @@ fn the_bijection_fails_on_every_missing_link() {
         .is_empty()
     );
     let _ = (commit_tree, append);
+}
+
+#[test]
+fn a_fast_sequence_the_harness_observed_nothing_in_is_not_an_exercised_one() {
+    // Pass 5 on `da3204f`, finding 1 (P2). `begin_fast_sequence` records a
+    // sequence the moment it is called, so a suite that begins and ends every
+    // name with no funnel in between had "fast sequences", and a record
+    // naming each of them held within all of them vacuously. With ordinary
+    // coverage satisfied outside the sequences — which is what keeps
+    // `Unobserved` from masking the hole, as it does in the Direction that
+    // builds empty sequences — `check_bijection` answered an empty vector for
+    // a run in which no exact-base integration happened. The same inference
+    // pass 4 removed from the `observed` field, one level up: exercised was
+    // being inferred from the map being non-empty.
+    let host = Host::current();
+    let inventory = self_test_inventory();
+    let entries = self_test_registry(host);
+
+    let mut hollow = HookHarness::new();
+    for sequence in FAST_SEQUENCES {
+        hollow.begin_fast_sequence(sequence);
+        hollow.end_fast_sequence();
+    }
+    for site in &inventory {
+        if !site.scope().is_claimed() {
+            continue;
+        }
+        drive(&mut hollow, *site, host);
+    }
+    assert_eq!(hollow.fast_sequences().len(), FAST_SEQUENCES.len());
+    assert!(
+        hollow
+            .fast_sequences()
+            .iter()
+            .all(|sequence| sequence.touched().is_empty()),
+        "the fixture's sequences must be empty for this test to mean anything"
+    );
+
+    let failures = check_bijection(&inventory, &hollow, &entries, host);
+    let mut empty: Vec<&str> = failures
+        .iter()
+        .filter_map(|failure| match failure {
+            BijectionFailure::EmptyFastSequence { sequence } => Some(sequence.as_str()),
+            _ => None,
+        })
+        .collect();
+    empty.sort_unstable();
+    let mut expected: Vec<&str> = FAST_SEQUENCES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        empty, expected,
+        "every empty sequence is reported once, by name: {failures:#?}"
+    );
+    // And nothing else: ordinary coverage, every record and every name are
+    // satisfied, so the empty sequences are the only thing wrong with this
+    // run — which is exactly why the check used to answer empty.
+    assert_eq!(
+        failures.len(),
+        FAST_SEQUENCES.len(),
+        "the hollow run reported something besides its empty sequences: {failures:#?}"
+    );
+}
+
+#[test]
+fn an_empty_inventory_still_checks_fast_traces_without_claiming_they_ended() {
+    let host = Host::current();
+    let mut harness = HookHarness::new();
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+
+    // The sequence is still open. EmptyFastSequence says what was observed,
+    // and must not claim that end_fast_sequence has been called.
+    harness.begin_fast_sequence("fast/open");
+    let failure = BijectionFailure::EmptyFastSequence {
+        sequence: "fast/open".to_owned(),
+    };
+    let failures = check_bijection(&[], &harness, &[], host);
+    assert_eq!(failures, [failure]);
+    assert_eq!(
+        failures
+            .first()
+            .expect("the open empty trace must report its missing observation")
+            .to_string(),
+        "the fast sequence `fast/open` has no hook observed inside it; a \
+         trace the harness saw nothing in is not an exercised fast integration"
+    );
+
+    // A hook observation satisfies the trace check even before the sequence
+    // closes. With no inventoried sites there is no ordinary coverage to add.
+    harness.hook(
+        EffectSiteId::Event(EventSite::AppendFirst),
+        HookPhase::Before,
+    );
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+    harness.end_fast_sequence();
+    assert!(check_bijection(&[], &harness, &[], host).is_empty());
+
+    harness.begin_fast_sequence("fast/closed");
+    harness.end_fast_sequence();
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [BijectionFailure::EmptyFastSequence {
+            sequence: "fast/closed".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn every_failing_residue_element_is_reported_with_its_own_element_and_predicate() {
+    // Pass 2 on `2421651`, finding 2: the three element Directions above each
+    // break `synthetic[0]` alone and match the variant alone, so a checker
+    // that reported the first bad element and stopped — the `break`
+    // `SWEEP-BIJECTION-003` removed — or one that reported a constant element,
+    // would pass all three. This is the witness those Directions are not:
+    // several distinct elements failing at once, in different predicates,
+    // one of them in two at once, and the exact set of `(variant, element)`
+    // pairs asserted — every one present, nothing else of the family.
+    let host = Host::current();
+    let cherry = EffectSiteId::Object(ObjectSite::ProposalCherryPick);
+    let elements = cherry.residue_elements();
+    assert_eq!(elements.len(), 7, "the fixture site lists seven elements");
+    let residue = EntryPhase::Residue {
+        class: ResidueClass::ObjectInternal,
+    };
+
+    let mut entries = self_test_registry(host);
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.site == cherry && entry.phase == residue)
+        .expect("the self-test registry carries the cherry-pick residue entry");
+    let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence else {
+        panic!("a residue entry carries recovery-proven evidence");
+    };
+    // Four elements broken, in the middle and at the end of the list rather
+    // than at index 0, so a checker that only ever reads the first record
+    // has nothing to report.
+    let mut broken = 0;
+    for record in synthetic.iter_mut() {
+        match record.element {
+            ResidueElement::IndexLock => {
+                record.constructed = false;
+                broken += 1;
+            }
+            ResidueElement::MergeHead => {
+                record.recovered = false;
+                broken += 1;
+            }
+            ResidueElement::SequencerState => {
+                record.classified = ObjectResidue::After;
+                broken += 1;
+            }
+            // Two predicates on one element: both are reported, separately.
+            ResidueElement::CherryPickHead => {
+                record.constructed = false;
+                record.recovered = false;
+                broken += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        broken, 4,
+        "the fixture carries the four elements this test breaks"
+    );
+
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &entries,
+        host,
+    );
+    let mut reported: Vec<(&str, ResidueElement)> = failures
+        .iter()
+        .filter_map(|failure| match failure {
+            BijectionFailure::ResidueElementNotConstructed { site, element, .. }
+                if *site == cherry =>
+            {
+                Some(("not-constructed", *element))
+            }
+            BijectionFailure::ResidueElementNotRecovered { site, element, .. }
+                if *site == cherry =>
+            {
+                Some(("not-recovered", *element))
+            }
+            BijectionFailure::ResidueElementMisclassified {
+                site,
+                element,
+                classified,
+                expected,
+                ..
+            } if *site == cherry => {
+                assert_eq!(*classified, ObjectResidue::After, "{failures:#?}");
+                assert_eq!(*expected, ObjectResidue::Internal, "{failures:#?}");
+                Some(("misclassified", *element))
+            }
+            _ => None,
+        })
+        .collect();
+    reported.sort();
+    let mut expected = vec![
+        ("not-constructed", ResidueElement::IndexLock),
+        ("not-recovered", ResidueElement::MergeHead),
+        ("misclassified", ResidueElement::SequencerState),
+        ("not-constructed", ResidueElement::CherryPickHead),
+        ("not-recovered", ResidueElement::CherryPickHead),
+    ];
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "the report did not name every failing element with its own predicate: {failures:#?}"
+    );
+    // And nothing else of the family: the three healthy elements and the
+    // sampling record produce no residue-element failure.
+    assert!(
+        !failures.iter().any(|failure| matches!(
+            failure,
+            BijectionFailure::MissingEvidence { site, .. } if *site == cherry
+        )),
+        "{failures:#?}"
+    );
 }
 
 #[test]
@@ -5784,7 +6178,7 @@ fn there_is_no_host_on_which_a_containment_point_is_unrequired() {
             hook_entry(spawn, EntryPhase::After),
         ];
         let failures = check_bijection(&[spawn], &harness, &entries, host);
-        let unobserved: Vec<&String> = failures
+        let unobserved: Vec<&HookPhase> = failures
             .iter()
             .filter_map(|failure| match failure {
                 BijectionFailure::Unobserved { phase, .. } => Some(phase),
@@ -5806,9 +6200,10 @@ fn there_is_no_host_on_which_a_containment_point_is_unrequired() {
                 continue;
             }
             assert!(
-                unobserved
-                    .iter()
-                    .any(|phase| phase.starts_with(point.name())),
+                unobserved.iter().any(|phase| matches!(
+                    phase,
+                    HookPhase::Point { point: seen, .. } if seen == point
+                )),
                 "{host} accepted a check in which {point} never executed"
             );
         }
@@ -5840,7 +6235,8 @@ fn the_bijection_over_the_whole_claimed_inventory_fails_for_this_slice() {
     assert!(
         failures.iter().any(|failure| matches!(
             failure,
-            BijectionFailure::Unobserved { site, .. } if site == "RunDir.PublishCommitRecord"
+            BijectionFailure::Unobserved { site, .. }
+                if *site == EffectSiteId::RunDir(RunDirSite::PublishCommitRecord)
         )),
         "{failures:#?}"
     );

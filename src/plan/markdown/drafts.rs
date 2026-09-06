@@ -1,25 +1,15 @@
-//! Drafts: one per task-to-be, before ids and dependencies are finalized.
-//!
-//! Two intake shapes, one output type. [`section_draft`] walks the body of a
-//! `##`/`###` section, splitting off its title, its acceptance criteria —
-//! armed by an `Acceptance:` paragraph or heading and collected through nested
-//! sub-lists — its path hints, and its annotation, whose comment spans are
-//! then cut out of the body text. [`checklist_drafts`] is the fallback for a
-//! plan with no sections: top-level `- [ ]` items and ordered `1.` steps
-//! become tasks, plain prose bullets do not.
-//!
-//! The confluence of the DAG: [`super::sections`], [`super::annotation`] and
-//! [`super::hints`] all feed it, and [`super::assemble`] consumes what it
-//! produces.
+//! Extended notes: `docs/internals/plan/markdown/drafts.md`
 
 use std::ops::Range;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-use super::annotation::{Annotation, AnnotationSink, HtmlAccumulator, strip_spans, upstroke_body};
+use super::annotation::{
+    Annotation, AnnotationSink, HtmlAccumulator, OPEN, strip_spans, upstroke_body,
+};
 use super::hints::{collect_code_hint, collect_text_hints};
-use super::md_options;
 use super::sections::{Section, is_acceptance_header, strip_trailing_colon};
+use super::{md_options, parser_source};
 
 #[derive(Default)]
 pub(super) struct Draft {
@@ -37,17 +27,22 @@ impl Draft {
 }
 
 pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {
-    let slice = &raw[section.content.clone()];
     let ctx = format!("section `{}`", section.title);
     let mut draft = Draft {
         title: section.title.clone(),
         ..Draft::default()
     };
+    let Some(slice) = raw.get(section.content.clone()) else {
+        warnings.push(format!(
+            "internal error: the body range {:?} of {ctx} is not within the plan text; the body is left empty",
+            section.content
+        ));
+        return draft;
+    };
     let mut sink = AnnotationSink::default();
-    if let Some(inline) = &section.inline_annotation {
+    for inline in &section.inline_annotations {
         sink.accept(inline, &ctx, warnings);
     }
-    // Spans of upstroke annotation comments (slice-relative), removed from body.
     let mut annotation_spans: Vec<Range<usize>> = Vec::new();
     let mut html = HtmlAccumulator::default();
 
@@ -55,23 +50,15 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
     let mut in_para = false;
     let mut heading_text = String::new();
     let mut in_heading = false;
-    // An `Acceptance:` paragraph or heading arms the next list.
     let mut armed = false;
     let mut acceptance_list_depth = 0usize;
-    // Slots in `draft.acceptance`, one per open item, so a criterion with a
-    // nested sub-list keeps both its own text and the children, in order.
     let mut item_slots: Vec<usize> = Vec::new();
 
-    for (event, range) in Parser::new_ext(slice, md_options()).into_offset_iter() {
-        // HTML accumulates across events; everything else flushes it first.
-        if let Event::Html(t) | Event::InlineHtml(t) = &event {
-            html.push(t, &range);
-        } else {
-            for (span, inner) in html.take_comments() {
-                if let Some(body) = upstroke_body(&inner) {
-                    sink.accept(body, &ctx, warnings);
-                    annotation_spans.push(span);
-                }
+    let normalized = parser_source(slice);
+    for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
+        for comment in html.observe(&event, &range, &normalized) {
+            if let Some(span) = sink.take(&comment, &ctx, warnings) {
+                annotation_spans.push(span);
             }
         }
 
@@ -97,9 +84,6 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                     armed = true;
                 }
             }
-            // Blocks that end an acceptance run; HTML comments and headings
-            // deliberately do not, so an invisible annotation between the
-            // header and its list cannot silently disarm collection.
             Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,
             Event::Start(Tag::List(_)) => {
                 if armed || acceptance_list_depth > 0 {
@@ -120,8 +104,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 item_slots.pop();
             }
             Event::Text(t) => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push_str(&t);
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
@@ -132,8 +116,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 collect_text_hints(&t, &mut draft.hints);
             }
             Event::Code(t) => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push_str(&t);
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
@@ -144,8 +128,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
                 collect_code_hint(&t, &mut draft.hints);
             }
             Event::SoftBreak | Event::HardBreak => {
-                if let Some(slot) = item_slots.last() {
-                    draft.acceptance[*slot].push(' ');
+                if let Some(criterion) = open_criterion(&item_slots, &mut draft.acceptance) {
+                    criterion.push(' ');
                 }
                 if in_para {
                     para_text.push(' ');
@@ -157,9 +141,8 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
             _ => {}
         }
     }
-    for (span, inner) in html.take_comments() {
-        if let Some(body) = upstroke_body(&inner) {
-            sink.accept(body, &ctx, warnings);
+    for comment in html.finish() {
+        if let Some(span) = sink.take(&comment, &ctx, warnings) {
             annotation_spans.push(span);
         }
     }
@@ -172,14 +155,26 @@ pub(super) fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<Str
         .collect();
     draft.ann = sink.annotation;
     annotation_spans.sort_by_key(|s| s.start);
-    draft.body = strip_spans(slice, &annotation_spans).trim().to_owned();
+    draft.body = match strip_spans(slice, &annotation_spans) {
+        Some(body) => body.trim().to_owned(),
+        None => {
+            warnings.push(format!(
+                "internal error: the annotation spans {annotation_spans:?} of {ctx} do not lie on \
+                 its text; the body keeps its annotation comments"
+            ));
+            slice.trim().to_owned()
+        }
+    };
     draft
 }
 
-/// Fallback when a plan has no `##`/`###` sections: top-level checklist items
-/// (`- [ ]` / `- [x]`) and ordered-list steps (`1.` — the common Claude Code
-/// plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
-/// would false-positive. Nested content joins the body.
+fn open_criterion<'a>(
+    item_slots: &[usize],
+    acceptance: &'a mut [String],
+) -> Option<&'a mut String> {
+    acceptance.get_mut(*item_slots.last()?)
+}
+
 pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
     let mut drafts = Vec::new();
     let mut list_depth = 0usize;
@@ -189,17 +184,35 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
     let mut top_list_ordered = false;
     let mut html = HtmlAccumulator::default();
 
-    for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
-        if let Event::Html(t) | Event::InlineHtml(t) = &event {
-            html.push(t, &range);
-        } else if let Some((_, sink)) = current.as_mut() {
-            for (_, inner) in html.take_comments() {
-                if let Some(body) = upstroke_body(&inner) {
-                    sink.accept(body, "checklist item", warnings);
+    let normalized = parser_source(raw);
+    for (event, range) in Parser::new_ext(&normalized, md_options()).into_offset_iter() {
+        for comment in html.observe(&event, &range, &normalized) {
+            match current.as_mut() {
+                Some((draft, sink)) => {
+                    sink.take(&comment, "checklist item", warnings);
+                    if !comment.terminated && upstroke_body(&comment.inner).is_some() {
+                        match raw.get(comment.span.clone()) {
+                            Some(original) => draft.body.push_str(original),
+                            None => {
+                                warnings.push(
+                                    "internal error: an unterminated annotation span is outside the plan; \
+                                     the checklist body keeps the parser's recovered text".to_owned(),
+                                );
+                                draft.body.push_str(OPEN);
+                                draft.body.push_str(&comment.inner);
+                            }
+                        }
+                        draft.body.push(' ');
+                    }
+                }
+                None => {
+                    if upstroke_body(&comment.inner).is_some() {
+                        warnings.push(
+                            "upstroke annotation outside any checklist item; ignored".to_owned(),
+                        );
+                    }
                 }
             }
-        } else {
-            let _ = html.take_comments();
         }
 
         match event {
@@ -246,7 +259,6 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                     collect_text_hints(&t, &mut draft.hints);
                 }
             }
-            // A wrapped title must not run its words together.
             Event::SoftBreak | Event::HardBreak => {
                 if let Some((draft, _)) = current.as_mut() {
                     if list_depth == 1 && item_depth == 1 {
@@ -257,6 +269,11 @@ pub(super) fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Dra
                 }
             }
             _ => {}
+        }
+    }
+    for comment in html.finish() {
+        if upstroke_body(&comment.inner).is_some() {
+            warnings.push("upstroke annotation outside any checklist item; ignored".to_owned());
         }
     }
     drafts

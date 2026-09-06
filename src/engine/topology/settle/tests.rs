@@ -1,6 +1,8 @@
+//! Extended notes: `docs/internals/engine/topology/settle/tests.md`
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -15,6 +17,7 @@ use crate::ir::{
 use crate::ladder::Next;
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::review::{PassBinding, ReviewPlan};
+use crate::rundir::scratch_tree::{self, ScratchAcquireRefusal, ScratchTree};
 use crate::rundir::{self, RunPaths};
 use crate::runner::host::{HostEnvironment, HostRunner, KeyCase};
 use crate::runner::{CommandSpec, Runner, gate_request};
@@ -34,19 +37,6 @@ use crate::topology::schema::TOPOLOGY_SCHEMA;
 
 use super::super::seams::{HarnessTopologyHooks, TopologyHooks};
 
-// -----------------------------------------------------------------------
-// Fixtures
-//
-// Written for this lane rather than shared with the fold's or the census's:
-// a settlement that explored the fixture the transition table was built
-// against would agree with it about a shape neither had questioned.
-//
-// Three tasks with **no dependencies between them**, over three disjoint
-// regions. That is what lets an eligible integration, a `ready_retry` and a
-// `ready` dispatch all be true at once, which is the only state in which
-// `eligibility_order` says anything at all.
-// -----------------------------------------------------------------------
-
 pub(crate) const ALEPH: TaskKey = TaskKey(0);
 pub(crate) const BET: TaskKey = TaskKey(1);
 pub(crate) const GIMEL: TaskKey = TaskKey(2);
@@ -63,7 +53,6 @@ pub(crate) fn label(key: TaskKey) -> &'static str {
     }
 }
 
-/// A 40-character symbolic sha, one per role, with no shared prefix.
 pub(crate) fn sha(role: &str) -> CommitSha {
     let mut value = format!("{role:z<40}");
     value.truncate(40);
@@ -109,8 +98,6 @@ pub(crate) fn plan() -> Plan {
 }
 
 fn chain(task: &str) -> ChainSummary {
-    // Two rungs for `aleph` so an escalation has somewhere to go, one for
-    // the others so the top rung is reachable in a single failure.
     let tiers = if task == "aleph" {
         vec![Tier::Mid, Tier::Frontier]
     } else {
@@ -193,11 +180,6 @@ fn run_started_unauthenticated() -> RunStarted4 {
         normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
         registry_digest: String::new(),
         path_policy: path_policy(),
-        // `max_parallel` is 3 so that the pipeline entitlement never
-        // decides an eligibility-order question: a test that ordered
-        // integration ahead of a dispatch because the *ceiling on
-        // parallelism* excluded the dispatch would prove nothing about
-        // `eligibility_order`.
         limits: TopologyLimits {
             max_parallel: 3,
             max_defers: 2,
@@ -220,17 +202,11 @@ fn run_started_unauthenticated() -> RunStarted4 {
             review: Effort::Medium,
         },
         reviews: ReviewPlan {
-            // Enabled: this fixture's successful attempts record a passed
-            // `review` pass, and a run that froze verification off obliges
-            // none. The two together were a shape production cannot write.
             enabled: Some(true),
             alternative_available: Some(false),
             pass_timeout_secs: Some(89),
             primary: Some(PassBinding::new("aleph-Mid-agent", "aleph-Mid-model")),
             alternative: None,
-            // One entry per task: the registry refuses a plan whose
-            // second-opinion list is not aligned with `plan.tasks`, and
-            // this fixture's plan has three.
             second_opinion: vec![None, None, None],
         },
     }
@@ -265,9 +241,6 @@ pub(crate) fn ev(body: TopologyEventBody) -> TopologyEvent {
     }
 }
 
-/// Apply `event`, refusing to continue if the fold does not accept it: a
-/// fixture that silently skipped an event would put every later assertion
-/// on a state nobody built.
 pub(crate) fn apply(fold: &mut TopologyFold, event: &TopologyEvent) {
     let delta = fold
         .plan_transition(event)
@@ -275,7 +248,6 @@ pub(crate) fn apply(fold: &mut TopologyFold, event: &TopologyEvent) {
     fold.apply_delta(delta);
 }
 
-/// A fold that has recorded its `run_started` and nothing else.
 pub(crate) fn started() -> TopologyFold {
     let mut fold = TopologyFold::new(inputs());
     apply(
@@ -287,13 +259,6 @@ pub(crate) fn started() -> TopologyFold {
     fold
 }
 
-/// The region an ordinary dispatch of `key` predicts.
-///
-/// The frozen hint is `src/{label}/`; the derivation trims the trailing
-/// separator, and this is the derivation rather than the hint. The two
-/// spellings are one region to `paths_overlap`, which is why the fixture
-/// could carry the wrong one until `check_dispatched` began comparing the
-/// recorded region against the derived one.
 pub(crate) fn region(key: TaskKey) -> PathSet {
     PathSet::Prefixes {
         paths: vec![GitPath::from(format!("src/{}", label(key)).as_str())],
@@ -344,14 +309,6 @@ pub(crate) fn record(attempt: u32, cost: Option<f64>) -> AttemptRecord {
     record_failing(attempt, cost, None)
 }
 
-/// A record of an attempt that failed the way `failure` says.
-///
-/// **A settlement of a failure whose record carries none is a fixture that
-/// cannot happen.** `record`'s `failure: None` means "the work was judged
-/// and accepted", and every `settle_failed` case is by definition not that.
-/// The allowance is decided from this field, so a grid that varied `Next`
-/// and left the failure fixed varied one half of a correlated pair — the
-/// class `reviews/FINDINGS.md` §4 records eleven of.
 pub(crate) fn record_failing(
     attempt: u32,
     cost: Option<f64>,
@@ -365,11 +322,6 @@ pub(crate) fn record_failing(
         resumed: false,
         duration: Duration::from_millis(3_141),
         cost_usd: cost,
-        // A success premise carries the primary pass §11.2 requires; an
-        // empty list satisfies `is_successful` vacuously and witnesses
-        // nothing about its review clause. A gate failure never reached a
-        // reviewer, so the failing variant's list is empty because it is —
-        // not for want of a fixture.
         reviews: if failure.is_none() {
             vec![ReviewRecord {
                 pass: "review".to_owned(),
@@ -406,19 +358,11 @@ pub(crate) fn question_for(key: TaskKey) -> FrozenQuestion {
     }
 }
 
-/// A `FinishedAttempt` with every field at a value of its own, so a
-/// settlement that read one field where it meant another lands somewhere
-/// this fixture does not hold.
 pub(crate) fn finished(key: TaskKey, generation: u32, attempt: u32, next: Next) -> FinishedAttempt {
     FinishedAttempt {
         key,
         generation: GenerationId(generation),
         attempt: AttemptNumber(attempt),
-        // **A failed settlement's record says failed.** This used
-        // `record(attempt, Some(0.5))`, whose `failure: None` means "the work
-        // was judged and accepted" — the very shape the comment on
-        // `record_failing` calls "a fixture that cannot happen", two hundred
-        // lines above. `check_attempt_finished` refuses it since 2026-08-27.
         record: record_failing(
             attempt,
             Some(0.5),
@@ -434,14 +378,12 @@ pub(crate) fn finished(key: TaskKey, generation: u32, attempt: u32, next: Next) 
     }
 }
 
-/// Dispatch `key` into generation `generation` and start attempt 1.
 pub(crate) fn in_flight(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
     apply(fold, &dispatch(key, generation));
     let event = attempt_started(fold, key, generation, 1);
     apply(fold, &event);
 }
 
-/// Settle `key`'s in-flight attempt through the module under test.
 pub(crate) fn settle_into(fold: &mut TopologyFold, finished: &FinishedAttempt) -> AttemptFinished4 {
     let settled = settle_failed(fold, finished).expect("the fixture settles");
     apply(
@@ -453,21 +395,11 @@ pub(crate) fn settle_into(fold: &mut TopologyFold, finished: &FinishedAttempt) -
     settled.event
 }
 
-/// Give `request` a session to resume — in **both** places the attempt
-/// carries one.
-///
-/// `FinishedAttempt` holds the id twice: on `session`, which the settlement
-/// records, and on `record.session_id`, which the ledger line reports.
-/// Production fills both from `assessed.outcome.session_id`, so they are
-/// one value there; a fixture that set only the first would build a
-/// retained settlement whose two halves name different conversations, which
-/// `check_attempt_finished` refuses.
 pub(crate) fn resuming(request: &mut FinishedAttempt, session: &SessionId) {
     request.session = Some(session.clone());
     request.record.session_id = Some(session.0.clone());
 }
 
-/// A retained generation of `key`, held by the current epoch.
 pub(crate) fn retained_generation(
     fold: &mut TopologyFold,
     key: TaskKey,
@@ -492,18 +424,6 @@ pub(crate) fn resume_event() -> TopologyEvent {
     })
 }
 
-// -----------------------------------------------------------------------
-// A verify double
-// -----------------------------------------------------------------------
-
-/// A [`WorktreeVerify`] whose answer the test fixes.
-///
-/// The seam exists because this module may name neither
-/// `std::process::Command` nor raw `std::fs`, so no test here can build the
-/// repository [`ManagedWorktrees`] is derived from. It records what it was
-/// asked, so a test can assert that the retry verified **the retained
-/// cumulative tree** rather than the base — the one distinction a double
-/// that only answered yes or no would lose.
 pub(crate) struct FixedVerify {
     answer: Result<(), VerifyFailure>,
     asked: Mutex<Vec<(Slot, Quiescence)>>,
@@ -562,7 +482,6 @@ pub(crate) fn retry_request(key: TaskKey, generation: u32) -> RetryRequest {
     }
 }
 
-/// A sleeper that records rather than sleeps.
 #[derive(Debug, Default)]
 pub(crate) struct Recorded(Mutex<Vec<Duration>>);
 
@@ -584,25 +503,11 @@ impl Sleeper for Recorded {
     }
 }
 
-// =======================================================================
-// T-FAILED
-// =======================================================================
-
-/// Every settlement the ladder can decide, mapped once.
-///
-/// A grid rather than six tests because the property is that the six
-/// answers are **different**: a mapping that collapsed two of them would
-/// pass any single-case test.
 #[test]
 fn each_ladder_decision_maps_to_its_own_settlement() {
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
 
-    // **Each decision beside the failure that produces it.** The allowance
-    // is a function of the failure, not of the decision, so a grid that
-    // varied `Next` against one fixed record would be asserting a mapping
-    // that no `next_step` can reach — and would have kept passing while
-    // `settle_failed` derived the allowance from the wrong field.
     let cases: Vec<(
         Next,
         (FailureKind, FailureOrigin),
@@ -622,23 +527,15 @@ fn each_ladder_decision_maps_to_its_own_settlement() {
             true,
         ),
         (
-            // The one deferral: an outage. `next_step` defers precisely so
-            // that a busy pool does not burn an attempt.
             Next::Defer,
             (FailureKind::RateLimited, FailureOrigin::Worker),
             SettlementTransition::Deferred {
-                // 4 recorded + this one.
                 defers: 5,
                 reason: "aleph failed its gates".to_owned(),
             },
             false,
         ),
         (
-            // **This cell is the defect this grid now catches.** A park
-            // from `NeedsHuman` spends nothing — "the code was never
-            // judged, so nothing is spent and nothing escalates" — and the
-            // settlement used to answer `true` here, because `AskHuman` is
-            // not `Defer` and that was the whole of its rule.
             Next::AskHuman(QuestionKind::Unblock),
             (FailureKind::NeedsHuman, FailureOrigin::Worker),
             SettlementTransition::Parked {
@@ -666,8 +563,6 @@ fn each_ladder_decision_maps_to_its_own_settlement() {
             settled.event.settlement,
             AttemptSettlement::Closed {
                 transition: expected.clone(),
-                // An ordinary generation that closes releases its
-                // predicted region.
                 lease: LeaseDisposition::PredictedReleased,
             },
             "{next:?} settled wrongly"
@@ -680,8 +575,6 @@ fn each_ladder_decision_maps_to_its_own_settlement() {
         );
     }
 
-    // `RetrySameRung { resume: true }` with a session is the one that does
-    // *not* close, and it is the only one that records an incarnation.
     let mut request = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
     resuming(&mut request, &SessionId("sess-aleph".to_owned()));
     let settled = settle_failed(&fold, &request).expect("settles");
@@ -693,8 +586,6 @@ fn each_ladder_decision_maps_to_its_own_settlement() {
         }
     );
 
-    // The ladder's permission without a session closes: there is nothing
-    // to resume, so the retry starts a fresh generation.
     let sessionless = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
     let settled = settle_failed(&fold, &sessionless).expect("settles");
     assert!(matches!(
@@ -706,8 +597,6 @@ fn each_ladder_decision_maps_to_its_own_settlement() {
     ));
 }
 
-/// A repair's settlement never releases the lineage lease, and the
-/// disposition is read from the fold rather than restated.
 #[test]
 fn the_lease_disposition_is_the_generations_own() {
     let mut fold = started();
@@ -717,9 +606,6 @@ fn the_lease_disposition_is_the_generations_own() {
         panic!("a failure closes");
     };
     assert_eq!(lease, LeaseDisposition::PredictedReleased);
-    // The fold is the authority: `check_lease_disposition` refuses any
-    // other answer, so the settlement applying is the assertion that this
-    // one came from `GenerationLease::expected` and not from a constant.
     apply(
         &mut fold,
         &ev(TopologyEventBody::AttemptFinished {
@@ -729,22 +615,6 @@ fn the_lease_disposition_is_the_generations_own() {
     assert_eq!(fold.task_state(BET), Some(TaskState::Failed));
 }
 
-/// **`candidate_prepared` is the successful settlement, and the fold refuses
-/// either half of the pair that used to stand in for it.**
-///
-/// Re-derived from `a_successful_settlement_promotes_the_generation_and_keeps_its_region`,
-/// which asserted that an `attempt_finished{Succeeded}` promotes the generation
-/// — the event `decisions/2026-08-12-merge-queue-execution-topology.md` says is
-/// "not also emitted for that attempt". The old test was not wrong about the
-/// build; it was a witness for a shape the record forbids, and re-deriving it
-/// against the invariant is the point of the 2026-08-27 CONFORM ruling. It was
-/// not patched to pass.
-///
-/// Three claims, because the invariant has three parts: the settlement lands on
-/// `candidate_prepared`; an `attempt_finished` that settles `succeeded` is
-/// refused whatever else is true; and a `candidate_prepared` for a generation
-/// that is *already* promoted is refused, so neither order of the old pair can
-/// be written.
 #[test]
 fn candidate_prepared_is_the_sole_successful_settlement() {
     use crate::topology::events::CandidatePrepared;
@@ -770,8 +640,6 @@ fn candidate_prepared_is_the_sole_successful_settlement() {
         },
     };
 
-    // (1) The settlement is this event. An in-flight generation reaches
-    //     `Promoting` by applying it, with no `attempt_finished` in between.
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
     apply(
@@ -794,7 +662,6 @@ fn candidate_prepared_is_the_sole_successful_settlement() {
         "the settlement recorded no candidate"
     );
 
-    // (2) An `attempt_finished` that settles `succeeded` is refused outright.
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
     let refused = fold
@@ -816,9 +683,6 @@ fn candidate_prepared_is_the_sole_successful_settlement() {
         "the refusal must say why, so a reader is not left guessing: {refused}"
     );
 
-    // (3) And the other order: a generation already promoted may not then
-    //     prepare a candidate, so a log carrying both is refused whichever
-    //     event it reaches first.
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
     apply(
@@ -838,8 +702,6 @@ fn candidate_prepared_is_the_sole_successful_settlement() {
     );
 }
 
-/// `T-FAILED.resume_action`: "rematerialize question from the event …
-/// never re-decide".
 #[test]
 fn a_question_is_read_back_from_the_event_and_not_re_decided() {
     let mut fold = started();
@@ -849,7 +711,6 @@ fn a_question_is_read_back_from_the_event_and_not_re_decided() {
     let event = settle_into(&mut fold, &request);
 
     assert_eq!(rematerialize_question(&event), Some(&question_for(GIMEL)));
-    // The fold opened exactly that question, under exactly that id.
     let open = fold.open_questions().expect("started");
     assert_eq!(open.len(), 1);
     assert_eq!(
@@ -858,9 +719,6 @@ fn a_question_is_read_back_from_the_event_and_not_re_decided() {
     );
     assert_eq!(fold.task_state(GIMEL), Some(TaskState::AwaitingInput));
 
-    // Every other settlement rematerializes nothing: a reader that
-    // answered `Some` for a non-parking settlement would write a question
-    // payload for a task nobody is waiting on.
     let mut other = started();
     in_flight(&mut other, ALEPH, 0);
     let closed = settle_failed(&other, &finished(ALEPH, 0, 1, Next::Fail)).expect("settles");
@@ -871,8 +729,6 @@ fn a_question_is_read_back_from_the_event_and_not_re_decided() {
     assert_eq!(rematerialize_question(&retained.event), None);
 }
 
-/// A park that carries no question is refused rather than settled with an
-/// invented one.
 #[test]
 fn a_park_without_a_question_is_refused() {
     let mut fold = started();
@@ -885,8 +741,6 @@ fn a_park_without_a_question_is_refused() {
     );
 }
 
-/// A settlement naming a generation that is not the open one is refused
-/// before it can be built.
 #[test]
 fn a_settlement_naming_the_wrong_generation_is_refused() {
     let mut fold = started();
@@ -902,7 +756,6 @@ fn a_settlement_naming_the_wrong_generation_is_refused() {
     assert!(format!("{error}").contains("no open generation"), "{error}");
 }
 
-/// `deferred_task_woken_by_defer_wait_elapsed_or_resume`.
 #[test]
 fn deferred_task_woken_by_defer_wait_elapsed_or_resume() {
     for wake in ["elapsed", "resume"] {
@@ -942,7 +795,6 @@ fn deferred_task_woken_by_defer_wait_elapsed_or_resume() {
     }
 }
 
-/// The backoff doubles and is capped, and progress resets it.
 #[test]
 fn the_defer_backoff_doubles_caps_and_resets() {
     let sleeper = Recorded::default();
@@ -961,12 +813,6 @@ fn the_defer_backoff_doubles_caps_and_resets() {
     );
     assert_eq!(deferral.round(), 12);
 
-    // **And what the event carries**, which is a different claim from what
-    // the accumulator holds — `reviews/FINDINGS.md` §4's "an accumulator's
-    // witness proves the accumulation and not the read", at four
-    // occurrences. `DeferWaitElapsed4.round` is documented on the wire, a
-    // frontier reviewer reads it there, and until this line nothing asserted
-    // the value a run actually writes.
     assert_eq!(
         recorded,
         (1..=12).collect::<Vec<u32>>(),
@@ -995,10 +841,8 @@ fn the_defer_backoff_doubles_caps_and_resets() {
     );
 }
 
-/// `deferred_task_does_not_block_halted_or_budget_exceeded_closure`.
 #[test]
 fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {
-    // Halted.
     let mut fold = started();
     in_flight(&mut fold, BET, 0);
     settle_into(&mut fold, &finished(BET, 0, 1, Next::Defer));
@@ -1013,7 +857,6 @@ fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {
         DerivedOutcome::Ending(RunOutcome::Halted),
         "a deferred task delayed a halted closure"
     );
-    // And the wait it is deferred behind can no longer elapse.
     let refused = fold
         .plan_transition(&ev(TopologyEventBody::DeferWaitElapsed {
             data: DeferWaitElapsed4 {
@@ -1027,7 +870,6 @@ fn deferred_task_does_not_block_halted_or_budget_exceeded_closure() {
         "{refused}"
     );
 
-    // BudgetExceeded.
     let mut fold = started();
     in_flight(&mut fold, BET, 0);
     settle_into(&mut fold, &finished(BET, 0, 1, Next::Defer));
@@ -1061,7 +903,6 @@ pub(crate) fn budget_exceeded(epoch: Epoch, key: TaskKey) -> TopologyEvent {
     })
 }
 
-/// `halting_settlement_starts_closure`.
 #[test]
 fn halting_settlement_starts_closure() {
     let mut fold = started();
@@ -1091,8 +932,6 @@ fn halting_settlement_starts_closure() {
         DerivedOutcome::Ending(RunOutcome::Halted)
     );
 
-    // A non-halting terminal failure of the same shape does not: the
-    // control that separates "a task failed" from "the run is over".
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
     settle_into(&mut fold, &finished(ALEPH, 0, 1, Next::Fail));
@@ -1103,13 +942,10 @@ fn halting_settlement_starts_closure() {
     );
 }
 
-/// `halting_drain_settlement_after_budget_exceeded_yields_halted` (ST-17).
 #[test]
 fn halting_drain_settlement_after_budget_exceeded_yields_halted() {
     let mut fold = started();
     in_flight(&mut fold, ALEPH, 0);
-    // The ceiling refused BET's next attempt; ALEPH's attempt is still in
-    // flight and drains.
     apply(&mut fold, &budget_exceeded(Epoch(0), BET));
     assert_eq!(
         fold.budget_stop().map(|stop| stop.epoch),
@@ -1129,19 +965,6 @@ fn halting_drain_settlement_after_budget_exceeded_yields_halted() {
     );
 }
 
-// =======================================================================
-// T-RETAINED
-// =======================================================================
-
-/// `retained_generation_closed_before_run_resumed`.
-///
-/// The ordering is the whole protection and this test says why: **before**
-/// recovery step (e) the fold cannot tell a fresh process from the
-/// retaining one, because `retained_incarnation == state.resumes` and a
-/// fresh process has not resumed yet. `ready_retry` is therefore *true* at
-/// that prefix, and what keeps a fresh process out of the retained session
-/// is that (e) runs before (h) and `ready_retry` is never evaluated before
-/// (h).
 #[test]
 fn retained_generation_closed_before_run_resumed() {
     let mut fold = started();
@@ -1179,11 +1002,8 @@ fn retained_generation_closed_before_run_resumed() {
         fold.ready(ALEPH),
         "T-RETAINED: the next dispatch creates a fresh generation"
     );
-    // "any attempt to recreate a Retained worktree at base" is refused:
-    // the new generation is a *new* one, at the current head.
     let next = dispatch(ALEPH, 1);
     fold.plan_transition(&next).expect("a fresh generation");
-    // Nothing is retained any more.
     assert!(
         close_retained(&fold, &GenerationCloseReason::ResumeDiscardsRetainedSession)
             .expect("no retained generations")
@@ -1191,7 +1011,6 @@ fn retained_generation_closed_before_run_resumed() {
     );
 }
 
-/// `retained_generation_closed_when_worktree_missing` (ST-11).
 #[test]
 fn retained_generation_closed_when_worktree_missing() {
     let mut fold = started();
@@ -1232,7 +1051,6 @@ fn retained_generation_closed_when_worktree_missing() {
     );
 }
 
-/// `retained_generation_closed_at_run_end` (ST-17).
 #[test]
 fn retained_generation_closed_at_run_end() {
     let mut fold = started();
@@ -1270,7 +1088,6 @@ fn retained_generation_closed_at_run_end() {
     );
 }
 
-/// A generation with an attempt in flight is not closed: `refusals[15]`.
 #[test]
 fn only_an_idle_generation_is_closed() {
     let mut fold = started();
@@ -1283,8 +1100,6 @@ fn only_an_idle_generation_is_closed() {
         .expect_err("no open generation");
     assert!(format!("{error}").contains("no open generation"), "{error}");
 
-    // An `OpenNoAttempt` generation *is* closed — the other half of the
-    // rule, so a refusal that had swallowed both would fail here.
     let mut fold = started();
     apply(&mut fold, &dispatch(BET, 0));
     let closed = close_generation(&fold, BET, run_ending(RunOutcome::Complete))
@@ -1292,11 +1107,6 @@ fn only_an_idle_generation_is_closed() {
     assert_eq!(closed.generation, GenerationId(0));
 }
 
-// =======================================================================
-// T-RETRY
-// =======================================================================
-
-/// `same_generation_retry_regates_cumulative_tree` (ST-15).
 #[test]
 fn same_generation_retry_regates_cumulative_tree() {
     let mut fold = started();
@@ -1315,9 +1125,6 @@ fn same_generation_retry_regates_cumulative_tree() {
     )
     .expect("the retaining incarnation retries in place");
 
-    // The verify asked for the *cumulative tree*, not the base. A retry
-    // verified against the base passes on a worktree that was reset, and
-    // then re-gates an empty tree as if it were the retained one.
     assert_eq!(
         worktrees.asked(),
         vec![(
@@ -1341,8 +1148,6 @@ fn same_generation_retry_regates_cumulative_tree() {
     assert_eq!(started_event.attempt, AttemptNumber(2));
     assert_eq!(started_event.resume_session, Some(session));
 
-    // The reservation bridges the selection to the append and is converted
-    // at it.
     assert!(!reservations.is_empty(), "the retry took no reservation");
     reservations
         .convert(ALEPH, ReservationKind::Retry)
@@ -1361,7 +1166,6 @@ fn same_generation_retry_regates_cumulative_tree() {
     ));
 }
 
-/// `retry_refused_after_resume`.
 #[test]
 fn retry_refused_after_resume() {
     let mut fold = started();
@@ -1399,13 +1203,6 @@ fn retry_refused_after_resume() {
     );
 }
 
-/// `retry_refused_with_stale_incarnation`.
-///
-/// Two directions, because the field has two ends. Writing it: a
-/// settlement takes `retained_incarnation` from the fold's **epoch**, so a
-/// run that has resumed once retains for `Epoch(1)`. Reading it: an
-/// `attempt_started` naming an epoch the run has moved past is refused by
-/// the fold itself, whatever a caller decided.
 #[test]
 fn retry_refused_with_stale_incarnation() {
     let mut fold = started();
@@ -1423,7 +1220,6 @@ fn retry_refused_with_stale_incarnation() {
         "the settlement wired `retained_incarnation` from something other than the epoch"
     );
 
-    // Reading it: a hand-built retry naming the previous epoch's session.
     let stale = ev(TopologyEventBody::AttemptStarted {
         data: AttemptStarted4 {
             key: ALEPH,
@@ -1441,8 +1237,6 @@ fn retry_refused_with_stale_incarnation() {
         .expect_err("the fold refuses a stale-incarnation retry");
     assert!(format!("{error}").contains("retained"), "{error}");
 
-    // And a settlement that claimed an epoch other than the fold's is
-    // refused too — the field is checked on the way in as well as out.
     let mut other = started();
     in_flight(&mut other, BET, 0);
     let forged = ev(TopologyEventBody::AttemptFinished {
@@ -1463,7 +1257,6 @@ fn retry_refused_with_stale_incarnation() {
     assert!(format!("{error}").contains("resumed 0 time(s)"), "{error}");
 }
 
-/// `retained_worktree_with_residue_closed_not_retried`.
 #[test]
 fn retained_worktree_with_residue_closed_not_retried() {
     for element in [
@@ -1494,7 +1287,6 @@ fn retained_worktree_with_residue_closed_not_retried() {
         assert_eq!(closed.reason, GenerationCloseReason::WorktreeMissing);
         assert!(reservations.balances());
 
-        // INV-06: it is closed, and it is **never recreated** at its base.
         apply(
             &mut fold,
             &ev(TopologyEventBody::GenerationClosed { data: closed }),
@@ -1503,8 +1295,6 @@ fn retained_worktree_with_residue_closed_not_retried() {
     }
 }
 
-/// A retry of a generation that is not retained-idle is refused before it
-/// takes a reservation or verifies anything.
 #[test]
 fn only_a_retained_generation_is_retried_in_place() {
     let mut fold = started();
@@ -1525,35 +1315,138 @@ fn only_a_retained_generation_is_retried_in_place() {
     assert!(reservations.balances());
 }
 
-// =======================================================================
-// The kill tests
-//
-// `Injection::Kill` is `std::process::abort()` — a real process death,
-// chosen so the claim is *what a coordinator that runs no cleanup leaves
-// on disk*. An early `return` would unwind and prove something weaker.
-// =======================================================================
+type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;
 
-static SCRATCH: AtomicU32 = AtomicU32::new(0);
+const SCRATCH_DRAWS: u32 = 3;
 
-/// A scratch directory, created through the run-directory funnel because
-/// this module may not name `std::fs`.
-fn scratch(label: &str) -> PathBuf {
-    let nth = SCRATCH.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "upstroke-pr7h-{label}-{}-{nth}",
-        std::process::id()
-    ));
-    rundir::create_public_dir(&dir, &mut rundir::NoHooks).expect("a scratch directory");
-    dir
+fn scratch(label: &str) -> ScratchTree {
+    scratch_with(scratch_tree::acquire, label)
 }
 
-/// A [`RunDirHooks`] that records into the shared harness **and** answers
-/// `Kill` at one `(site, phase)`.
-///
-/// `HookHarness::arm` takes a `SubEffectPoint`, and
-/// `RunDir.WriteQuestionPayload` exposes none — so arming its `Before`
-/// phase needs a local double. The *recording* still goes to the shared
-/// harness, or this site would contribute nothing to the coverage evidence.
+fn scratch_with(acquire: Acquire, label: &str) -> ScratchTree {
+    let parent = std::env::temp_dir();
+    let tag = format!("pr7h-{label}");
+    let mut occupied = Vec::new();
+    for _ in 0..SCRATCH_DRAWS {
+        match acquire(&parent, &tag) {
+            Ok(tree) => return tree,
+            Err(refusal @ ScratchAcquireRefusal::Occupied { .. }) => occupied.push(refusal),
+            Err(refusal) => panic!("a scratch tree for `{label}`: {refusal:?}"),
+        }
+    }
+    panic!("a scratch tree for `{label}`: {SCRATCH_DRAWS} draws refused as occupied: {occupied:?}");
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+static REFUSED_ONCE: AtomicBool = AtomicBool::new(false);
+
+static OCCUPIED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+static UNDECIDABLE_CALLS: AtomicU32 = AtomicU32::new(0);
+
+fn refuse_once_then_acquire(
+    parent: &Path,
+    tag: &str,
+) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    if REFUSED_ONCE.swap(true, Ordering::SeqCst) {
+        scratch_tree::acquire(parent, tag)
+    } else {
+        Err(ScratchAcquireRefusal::Occupied {
+            root: parent.join(tag),
+        })
+    }
+}
+
+fn always_occupied(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    let call = OCCUPIED_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(ScratchAcquireRefusal::Occupied {
+        root: parent.join(format!("{tag}-refused-{call}")),
+    })
+}
+
+fn undecidable(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {
+    UNDECIDABLE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(ScratchAcquireRefusal::Undecidable {
+        root: parent.join(tag),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    })
+}
+
+#[test]
+fn an_occupied_draw_is_drawn_again() {
+    REFUSED_ONCE.store(false, Ordering::SeqCst);
+    let tree = scratch_with(refuse_once_then_acquire, "drawn-again");
+    assert!(
+        REFUSED_ONCE.load(Ordering::SeqCst),
+        "the double never refused"
+    );
+    assert!(
+        tree.path().is_dir(),
+        "the second draw is not a tree: {}",
+        tree.path().display()
+    );
+}
+
+#[test]
+fn the_draws_are_bounded_and_every_refused_root_is_named() {
+    OCCUPIED_CALLS.store(0, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(|| scratch_with(always_occupied, "bounded"));
+    let message = panic_message(&outcome.expect_err("every draw was refused"));
+    assert_eq!(
+        OCCUPIED_CALLS.load(Ordering::SeqCst),
+        SCRATCH_DRAWS,
+        "the double was not asked exactly {SCRATCH_DRAWS} times"
+    );
+    assert!(
+        message.contains("3 draws refused as occupied"),
+        "the bound is not reported: {message}"
+    );
+    for call in 0..SCRATCH_DRAWS {
+        assert!(
+            message.contains(&format!("pr7h-bounded-refused-{call}")),
+            "refused root {call} is not named: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_undecidable_refusal_is_not_drawn_again() {
+    UNDECIDABLE_CALLS.store(0, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(|| scratch_with(undecidable, "undecidable"));
+    let message = panic_message(&outcome.expect_err("the refusal is raised"));
+    assert_eq!(
+        UNDECIDABLE_CALLS.load(Ordering::SeqCst),
+        1,
+        "an undecidable answer was asked again"
+    );
+    assert!(message.contains("Undecidable"), "{message}");
+    assert!(
+        !message.contains("draws refused"),
+        "an undecidable answer was reported as occupied: {message}"
+    );
+}
+
+#[test]
+fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {
+    let tree = scratch("reclaimed");
+    let path = tree.path().to_path_buf();
+    assert!(path.is_dir(), "the tree was created: {}", path.display());
+    drop(tree);
+    assert!(
+        scratch_tree::proves_absent(&path),
+        "the tree was not reclaimed: {}",
+        path.display()
+    );
+}
+
 struct KillAtPhase {
     inner: rundir::HarnessHooks,
     site: EffectSiteId,
@@ -1574,15 +1467,12 @@ impl crate::rundir::RunDirHooks for KillAtPhase {
     }
 }
 
-/// Append `event` through the real funnel.
 fn append(log: &mut EventLog, hooks: &mut HarnessTopologyHooks, event: &TopologyEvent) {
     let (line, _) = TopologyLine::round_trip(event).expect("the event round-trips");
     log.append_topology_hooked(line.site(), &line, hooks.events())
         .expect("the append lands");
 }
 
-/// The child of both kill tests: build a run whose settlement is durable,
-/// then die at the boundary the site names.
 #[test]
 #[ignore = "spawned as a subprocess by the T-FAILED kill tests"]
 fn settlement_kill_child() {
@@ -1620,8 +1510,6 @@ fn settlement_kill_child() {
     apply(&mut fold, &event);
 
     if which == "retained" {
-        // T-APPEND (s): the line is synced and the process dies. The
-        // settlement is durable and nothing after it was ever attempted.
         let mut request = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
         resuming(&mut request, &SessionId("sess-aleph-retained".to_owned()));
         let settled = settle_failed(&fold, &request).expect("settles");
@@ -1644,8 +1532,6 @@ fn settlement_kill_child() {
         unreachable!("the kill at Event.Append/Synced must have taken this process");
     }
 
-    // T-FAILED's boundary: the settlement is appended and the question
-    // file is not applied.
     let mut request = finished(ALEPH, 0, 1, Next::AskHuman(QuestionKind::Unblock));
     request.question = Some(question_for(ALEPH));
     let settled = settle_failed(&fold, &request).expect("settles");
@@ -1670,13 +1556,6 @@ fn settlement_kill_child() {
     unreachable!("the kill at RunDir.WriteQuestionPayload must have taken this process");
 }
 
-/// Spawn [`settlement_kill_child`] through the host Runner and wait for it
-/// to die.
-///
-/// Through the Runner rather than `std::process::Command`, which this
-/// module may not name: `Process.Spawn` is the funnel that owns process
-/// start, and a test that reached around it would be the exact bypass the
-/// denylist exists to prevent.
 fn spawn_kill_child(dir: &Path, site: &str) -> ProcessOutput {
     let exe = std::env::current_exe().expect("test executable");
     let mut base: Vec<(OsString, OsString)> = std::env::vars_os().collect();
@@ -1711,11 +1590,6 @@ fn spawn_kill_child(dir: &Path, site: &str) -> ProcessOutput {
         output.stdout,
         output.stderr
     );
-    // The `unreachable!` is what fails this test if the injection silently
-    // stopped killing — and it only fails it if the parent looks. A panic
-    // and an abort both exit non-zero, so the exit code alone cannot tell
-    // "the process died at the injection" from "the process ran past it
-    // and panicked one line later".
     assert!(
         !output.stderr.contains("must have taken this process"),
         "the child ran past the injection: {}",
@@ -1724,30 +1598,35 @@ fn spawn_kill_child(dir: &Path, site: &str) -> ProcessOutput {
     output
 }
 
-/// Every committed event of the log the child left behind.
 fn committed(dir: &Path) -> Vec<TopologyEvent> {
     let bytes = std::fs::read(dir.join("public").join("events.jsonl")).expect("the log");
     TopologyFold::parse_log(&bytes).expect("the log parses")
 }
 
-/// `kill_after_failed_settlement_rematerializes_question`.
 #[test]
 fn kill_after_failed_settlement_rematerializes_question() {
-    let dir = scratch("question");
-    let output = spawn_kill_child(&dir, "question");
+    let tree = scratch("question");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
+    let output = spawn_kill_child(dir, "question");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
     let payload = dir
         .join("public")
         .join("questions")
         .join(format!("{}.json", question_for(ALEPH).id.as_str()));
+
     assert!(
-        !payload.exists(),
+        scratch_tree::proves_absent(&payload),
         "the child wrote the question file it was killed before writing: {}{}",
         output.stdout,
         output.stderr
     );
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(
@@ -1756,11 +1635,8 @@ fn kill_after_failed_settlement_rematerializes_question() {
         );
     };
 
-    // Rematerialized from the event, byte for byte, and never re-decided.
     assert_eq!(rematerialize_question(data), Some(&question_for(ALEPH)));
 
-    // And a replay reaches the same open question, which is what makes the
-    // answer the operator already wrote answer *this* question.
     let fold = TopologyFold::replay(inputs(), &events).expect("the log replays");
     let open = fold.open_questions().expect("started");
     assert_eq!(
@@ -1770,13 +1646,18 @@ fn kill_after_failed_settlement_rematerializes_question() {
     assert_eq!(fold.task_state(ALEPH), Some(TaskState::AwaitingInput));
 }
 
-/// `retained_generation_not_continued_after_kill`.
 #[test]
 fn retained_generation_not_continued_after_kill() {
-    let dir = scratch("retained");
-    spawn_kill_child(&dir, "retained");
+    let tree = scratch("retained");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before child launch");
+    spawn_kill_child(dir, "retained");
+    let dir = tree
+        .checked_path()
+        .expect("the acquired tree is current before reading child residue");
 
-    let events = committed(&dir);
+    let events = committed(dir);
     let last = events.last().expect("the log has lines");
     let TopologyEventBody::AttemptFinished { data } = &last.body else {
         panic!(
@@ -1802,8 +1683,6 @@ fn retained_generation_not_continued_after_kill() {
         "the dead process continued the retained generation"
     );
 
-    // The fresh process: recovery step (e) closes it, and only then does
-    // the run resume. After that, nothing can retry it.
     let mut fold = TopologyFold::replay(inputs(), &events).expect("the log replays");
     let closed = close_retained(&fold, &GenerationCloseReason::ResumeDiscardsRetainedSession)
         .expect("recovery closes it");
@@ -1831,9 +1710,6 @@ fn retained_generation_not_continued_after_kill() {
     assert!(worktrees.asked().is_empty());
 }
 
-/// The container runner policy is a value this fixture never uses, and
-/// this is what says so: `run_started`'s runner is `host-v1`, so a resume
-/// carrying the container record is refused rather than folded.
 #[test]
 fn a_resume_that_moved_the_runner_is_refused() {
     let mut fold = started();
