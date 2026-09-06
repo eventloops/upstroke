@@ -30,12 +30,18 @@ branch is exercised by nothing today, live or unreachable.
 
 No live defect: the branch's own refusal message is exactly the message the preceding guard would
 already give, so removing it changes no observable behavior for any state the fold can currently
-construct. Two ways to close this, for row 39 (`src/topology/fold/tests.rs`) or a future reviewer
-to choose between: (a) build a hostile fixture that sets `candidate: Some(..)` on an `InFlight`
-generation directly (bypassing `apply`, as `src/topology/fold/tests.rs:6723`'s `open` helper already
-does for other class/candidate combinations) and assert this branch's specific message, proving it
-independently of the `InFlight` guard; or (b) remove the branch as dead code and update
-`docs/internals/topology/fold/check_candidate.md`'s INV-06 section to say the invariant is enforced
-solely by the `InFlight` guard together with `apply_candidate_prepared`'s atomic write. Left as
-defense-in-depth rather than removed here: deleting an invariant guard is a design call this file's
-own sweep should not make unreviewed.
+construct. It is the same redundancy `SWEEP-CHECK_CANDIDATE-004` turned out to be, and rests on the
+same invariant, maintained in `src/topology/fold/apply.rs` (row 29, still open): `.candidate` has
+one writer, which sets `class = Promoting` in the same statement.
+
+Two ways to close it, for a future pass to choose between. (a) Pin it the way `-004` was pinned:
+extract the guard into a function taking the generation rather than `&RunState`, and assert its
+refusal from the `#[cfg(test)]` block PR #186 added to this file — that block exists now, and
+`promoting_candidate`'s tests already build the off-invariant `GenerationFold` this would need.
+That was left undone here deliberately: the reviewer did not raise this guard, and extracting a
+third relation to reach it is more restructuring than an unraised P3 justifies on a final review
+pass. (b) Remove the branch as dead code and record in
+`docs/internals/topology/fold/check_candidate.md` that INV-06 is enforced by the `InFlight` guard
+together with `apply_candidate_prepared`'s atomic write. Kept as defence in depth rather than
+removed here: deleting an invariant guard is a design call this file's own sweep should not make
+unreviewed.
