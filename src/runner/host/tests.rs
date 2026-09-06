@@ -5741,3 +5741,23 @@ fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
     assert!(absolute.is_absolute());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn host_environment_does_not_carry_an_unexplained_clone_derive() {
+    let lines: Vec<&str> = include_str!("environment.rs").lines().collect();
+    let struct_line = lines
+        .iter()
+        .position(|line| line.contains("pub struct HostEnvironment"))
+        .expect("HostEnvironment is declared in this file");
+    let derive_line = lines[..struct_line]
+        .iter()
+        .rev()
+        .find(|line| line.trim_start().starts_with("#[derive("))
+        .expect("HostEnvironment carries a derive attribute");
+    assert!(
+        !derive_line.contains("Clone"),
+        "no call site in the tree clones a `HostEnvironment` value; a `Clone` derive here is \
+         unexplained and unused (SWEEP-HOST-ENVIRONMENT-001) unless a comment beside the derive \
+         names the owned-snapshot or cross-task-transfer semantics that require it: {derive_line}"
+    );
+}

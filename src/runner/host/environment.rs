@@ -42,7 +42,7 @@ impl KeyCase {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HostEnvironment {
     base: Vec<(OsString, OsString)>,
     case: KeyCase,
