@@ -22,12 +22,16 @@ typo and is refused naming it and the accepted seven. Before this attribute a
 misspelled header -- `[budgts]`, `[interation]`, `[runer]` -- deserialized into
 nothing: the whole section vanished, its defaults took effect (no budget
 ceiling; `on_block` interaction in CI; the host runner where the file read as
-confined) and `validate` reported a clean file. Every section reader below
-this struct already refused or named an unknown key; the top level was the one
-place a typo still deleted silently, and it deleted the largest unit
-(`SWEEP-CONFIG-PARSE-007`, closed by the sweep of `src/config/read.rs`). No
-forward-compatibility key is lost: nothing in the tree's fixtures, docs or
-examples writes a top-level key outside the seven.
+confined) and `validate` reported a clean file. A top-level typo deleted the
+largest unit a typo can delete, and this attribute closes that boundary and
+that boundary only (`SWEEP-CONFIG-PARSE-007`, closed by the sweep of
+`src/config/read.rs`). It is not the last silent drop in the file:
+`[routing.strategy]` is read through `RawStrategy`, which carries neither
+`deny_unknown_fields` nor an unknown-key collector, so a misspelled
+`spend_down_afer` there is still discarded without a word
+(`SWEEP-CONFIG-PARSE-008`, open, guarded to this file's own sweep, row 54).
+No forward-compatibility key is lost at the top level: nothing in the tree's
+fixtures, docs or examples writes a top-level key outside the seven.
 
 ## `fn a_misspelled_top_level_section_is_refused_not_dropped() {`
 
