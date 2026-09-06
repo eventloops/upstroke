@@ -343,19 +343,45 @@ impl EffectSiteId {
         }
     }
 
-    /// The dotted name.
+    /// The dotted name — the [`fmt::Display`] text, owned.
+    ///
+    /// The shape is written once, in the `Display` impl, and read back here.
+    /// It used to be written twice, as two `format!` calls of the same shape,
+    /// and only this one was under test: a `Display` writing `Group:Variant`
+    /// passes the whole scoped suite (measured at `ee5dc81f`), while every
+    /// [`BijectionFailure`] in the crate would then name its site in a
+    /// spelling the wire format refuses.
     pub fn name(self) -> String {
-        format!("{}.{}", self.group().name(), self.variant())
+        self.to_string()
     }
 
     /// The site a dotted name refers to, or an error naming what was written.
+    ///
+    /// Splits at the group separator and compares the two halves against the
+    /// static names, rather than rebuilding up to seventy dotted names and
+    /// comparing whole strings. The point is not the allocations: while this
+    /// function went through [`Self::name`], the round-trip assertion in
+    /// `a_site_name_no_group_declares_is_refused` compared `name()` with
+    /// itself and so could not fail for a change to the name's shape. The
+    /// separator is this function's own knowledge now, and that assertion is
+    /// a round trip between two independent statements of it.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownSite`], carrying the name exactly as it was written, when the
+    /// text has no group separator, names no group, or names no variant of
+    /// the group it does name.
     pub fn from_name(name: &str) -> Result<Self, UnknownSite> {
+        let unknown = || UnknownSite {
+            name: name.to_owned(),
+        };
+        let Some((group, variant)) = name.split_once('.') else {
+            return Err(unknown());
+        };
         Self::all()
             .into_iter()
-            .find(|site| site.name() == name)
-            .ok_or_else(|| UnknownSite {
-                name: name.to_owned(),
-            })
+            .find(|site| site.group().name() == group && site.variant() == variant)
+            .ok_or_else(unknown)
     }
 
     /// Whether this site exposes `point` in `mode`.
@@ -699,6 +725,9 @@ const _: () = {
     ));
 };
 
+/// The one statement of the dotted name's shape. [`EffectSiteId::name`], the
+/// `Into<String>` serde uses, and every diagnostic that interpolates a site
+/// all read it from here.
 impl fmt::Display for EffectSiteId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.group().name(), self.variant())
@@ -721,3 +750,54 @@ impl TryFrom<String> for EffectSiteId {
 
 #[cfg(test)]
 mod tests;
+
+/// The items this file itself declares, pinned here.
+///
+/// The family's shared test file is [`tests`], and everything about the group
+/// enums, the harness, the registry and the bijection belongs there. What is
+/// here is the handful of contracts that are this file's own and that the
+/// shared file did not reach: the one statement of the dotted name's shape,
+/// the const inventory count, and the residue class's `(rows, artifact)` pair.
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+
+    #[test]
+    fn the_dotted_name_has_one_authority_and_it_is_display() {
+        let site = EffectSiteId::RunDir(RunDirSite::PublishCommitRecord);
+        // The shape, written out here and not read back from `name()`.
+        assert_eq!(site.to_string(), "RunDir.PublishCommitRecord");
+        assert_eq!(site.name(), "RunDir.PublishCommitRecord");
+        assert_eq!(String::from(site), "RunDir.PublishCommitRecord");
+        // And it is one statement, over the whole inventory: `name()` and the
+        // `Into<String>` the wire format uses are both the `Display` text, so
+        // a change to the shape cannot move a diagnostic and leave the
+        // serialized name where it was, or the reverse. Until 2026-09-06
+        // `Display` was a second `format!` of its own, and writing
+        // `Group:Variant` there passed the whole scoped suite.
+        for site in EffectSiteId::all() {
+            let displayed = site.to_string();
+            assert_eq!(site.name(), displayed, "{displayed}");
+            assert_eq!(String::from(site), displayed, "{displayed}");
+            assert_eq!(
+                displayed,
+                format!("{}.{}", site.group().name(), site.variant()),
+                "{displayed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_crossing_two_real_sites_is_refused() {
+        // Both halves name something: `Object` is a group and
+        // `PublishCommitRecord` is a variant — of `RunDir`. `from_name` reads
+        // the two halves separately now, so this is the pair it could get
+        // wrong; it is refused, and the error quotes what was written.
+        assert!(EffectSiteId::from_name("Object.SnapshotCommitTree").is_ok());
+        assert!(EffectSiteId::from_name("RunDir.PublishCommitRecord").is_ok());
+        let crossed = "Object.PublishCommitRecord";
+        let error = EffectSiteId::from_name(crossed).expect_err("no group declares that pair");
+        assert_eq!(error.name, crossed);
+        assert!(error.to_string().contains(crossed), "{error}");
+    }
+}
