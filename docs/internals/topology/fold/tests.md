@@ -409,6 +409,14 @@ The one shape both arms must refuse: no failure, and the frozen
 obligation all green — which is exactly what `candidate_prepared`
 requires of the settlement that *is* a success.
 
+## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `let variant_of = |settlement: &AttemptSettlement| match settlement {`
+
+"No arm" is a claim about every variant, and the table below is a list. The
+`match` makes a new variant of `AttemptSettlement` a compile error here, and the
+assertion makes a variant silently dropped from the table a failure: removing the
+`closed` row fails this test rather than quietly narrowing the sentence in the
+title to the one arm left.
+
 ## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `accepts(&fold, &settle(ZETA, 0, 1, settlement()));`
 
 The premise: with a record that does not claim success, this
@@ -2241,6 +2249,15 @@ Every value of [`Blocker`], so the grid crosses the whole dimension.
 
 Whether a budget stop exists, and whether it belongs to this epoch.
 
+`Older` is a stop one epoch **below** the run's, which is why [`grid_state`]
+starts the run at epoch 1 rather than at 0: at epoch 0 there is no older epoch to
+put one in, and the cell used to hold a stop at `epoch + 1`, which is not what
+its name says and not the direction that can go wrong. `budget_stop_is_current`
+is an equality, and an equality has two ways to loosen; with the stop above the
+epoch only one of them was under test. Reading it as `stop.epoch <= self.epoch`
+— a stop that outlives the resume that was supposed to lift it — passed the
+whole fold suite before this cell was corrected and fails it now.
+
 ## `enum Backoff {`
 
 What is backing off, if anything.
@@ -2549,6 +2566,12 @@ Replay: the same refusal, over the wire, with a valid
 suffix behind it that a lenient reader would have gone on
 to apply.
 
+The assertion beside it counts the lines that differ from the honest trace and
+requires exactly one. It used to be `hostile.len() == trace.len() && index <
+trace.len()`, which is an arithmetic identity and a loop bound — true by
+construction, in a position that reads as a check. What it now checks is that
+the log under test is this trace with one line replaced and no other damage.
+
 ## `fn every_guarded_event_is_refused_the_same_way_live_and_on_…` › `let unguarded: BTreeSet<&'static str> = [`
 
 The sweep is over the vocabulary, not over what was remembered. The
@@ -2572,11 +2595,29 @@ would let a writer append one record and fold another — which is the
 divergence between live state and replay that INV-02 forbids, in the
 one place the two are not literally the same call.
 
+## `const ASK: fn(&TopologyFold, &TopologyEvent) -> Result<TopologyDelta, FoldError> =`
+
+The receiver, pinned as a value. This is the whole of the claim below: nothing
+`plan_transition` does can move the fold, because it takes `&TopologyFold` and
+`TopologyFold` has no interior mutability. Declaring this item `&mut` is a type
+error at this line, and giving `plan_transition` a `&mut self` receiver stops the
+crate compiling.
+
 ## `fn a_refused_transition_changes_nothing()` › `let mut fold = started();`
 
 The other half of INV-02: an invalid transition is never applied,
 which is a property of `plan_transition` being a question rather
 than an action.
+
+**The runtime half of this test could not fail, and now can.** It offered every
+kind to a fold, compared the state with the state before, and asserted equality
+— against a `&self` method, on a type with no `Cell`, `RefCell` or lock in it,
+so the compiler had already decided the answer. A comparison that never sees a
+difference is satisfied by any fold, including one whose applier does nothing.
+So the test now takes the accepted delta it asked for, applies it, and requires
+the same comparison to report a difference; making `apply_delta` inert for
+`question_raised` fails this test with 22 others, where before it failed 22.
+The claim about asking is where it belongs, in [`ASK`] above.
 
 ## `fn the_registry_digest_does_not_widen_when_a_repair_is_regi…` › `let mut fold = started();`
 

@@ -1032,7 +1032,6 @@ type SettlementArm = (&'static str, fn() -> AttemptSettlement);
 #[test]
 fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
     let base = sha("base");
-    let session = "sess-ÜNI-unsettled";
 
     let claims_success = |event: &mut TopologyEvent| {
         let data = attempt_finished_mut(event);
@@ -1054,6 +1053,20 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
             lease: LeaseDisposition::PredictedReleased,
         }),
     ];
+
+    let variant_of = |settlement: &AttemptSettlement| match settlement {
+        AttemptSettlement::Retained { .. } => "retained",
+        AttemptSettlement::Closed { .. } => "closed",
+    };
+    let mut driven: Vec<&str> = arms.iter().map(|(_, build)| variant_of(&build())).collect();
+    driven.sort_unstable();
+    driven.dedup();
+    assert_eq!(
+        driven,
+        ["closed", "retained"],
+        "the table below drives fewer than every settlement, so `no arm` is a claim about \
+         some of them"
+    );
 
     for (label, settlement) in arms {
         let mut fold = started();
@@ -1096,7 +1109,6 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
     let start = attempt_started(&fold, ZETA, 0, 1, 0);
     apply(&mut fold, &start);
     accepts(&fold, &candidate_prepared(ZETA, 0, &base));
-    let _ = session;
 }
 
 #[test]
@@ -5518,7 +5530,7 @@ fn a_wake_clears_every_waiter_in_one_delta() {
     assert_eq!(
         fold.task_state(ALPHA),
         Some(TaskState::Pending),
-        "the first deferred task woke"
+        "the first deferred task did not wake"
     );
     assert_eq!(
         fold.task_state(MID),
@@ -7212,6 +7224,7 @@ fn grid_state(
     let mut fold = started();
     fold.run = Some({
         let mut run = fold.run.take().expect("started");
+        run.epoch = Epoch(1);
         match shape {
             Shape::AllTerminal => {
                 for task in &mut run.tasks {
@@ -7288,7 +7301,7 @@ fn grid_state(
         run.budget_stop = match budget {
             Budget::None => None,
             Budget::Older => Some(BudgetStop {
-                epoch: Epoch(run.epoch.0 + 1),
+                epoch: Epoch(run.epoch.0 - 1),
                 budget: BudgetKind::Task,
             }),
             Budget::Current => Some(BudgetStop {
@@ -8416,8 +8429,15 @@ fn every_guarded_event_is_refused_the_same_way_live_and_on_a_hostile_replay() {
                 hostile.push(invalid);
                 hostile.extend_from_slice(&trace[index + 1..]);
                 assert!(
-                    hostile.len() == trace.len() && index < trace.len(),
-                    "{label}: the hostile log is the trace with one line replaced"
+                    hostile.len() == trace.len()
+                        && hostile
+                            .iter()
+                            .zip(&trace)
+                            .filter(|(written, original)| written != original)
+                            .count()
+                            == 1,
+                    "{label}: the hostile log is not the trace with exactly one line replaced, \
+                     so the perturbation is not a perturbation"
                 );
                 let parsed =
                     TopologyFold::parse_log(&wire(&hostile)).expect("the hostile log parses");
@@ -8511,18 +8531,44 @@ fn a_delta_carries_the_exact_event_it_was_checked_against() {
     }
 }
 
+const ASK: fn(&TopologyFold, &TopologyEvent) -> Result<TopologyDelta, FoldError> =
+    TopologyFold::plan_transition;
+
 #[test]
 fn a_refused_transition_changes_nothing() {
     let mut fold = started();
     merge_task(&mut fold, ALPHA, 0, 0);
     let before = fold.state().cloned();
+    let mut refused = 0_usize;
     for event in every_kind() {
-        let _ = fold.plan_transition(&event);
+        if ASK(&fold, &event).is_err() {
+            refused += 1;
+        }
     }
+    assert!(
+        refused > 1,
+        "this state has to refuse more than one kind, or the sweep asked nothing: {refused}"
+    );
     assert_eq!(
         fold.state().cloned(),
         before,
         "asking whether an event applies must not apply it"
+    );
+
+    let question = raised("q-park-Ünicode", ZETA);
+    let delta = ASK(&fold, &question).expect("a question on a pending task applies");
+    assert_eq!(
+        fold.state().cloned(),
+        before,
+        "and asking about an event that does apply must not apply it either"
+    );
+    fold.apply_delta(delta);
+    assert_ne!(
+        fold.state().cloned(),
+        before,
+        "applying the delta left the state where asking did, so the two assertions above are \
+         satisfied by a comparison that cannot see a change rather than by a reader that does \
+         not make one"
     );
 }
 
