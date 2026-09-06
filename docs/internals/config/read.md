@@ -50,6 +50,22 @@ denied type or macro fails here on its own rather than only under CI's
 is a property of the parent's attribute rather than of this file, and a
 parent's attribute can widen without this file changing.
 
+## `pub(super) fn read_repo_config(`
+
+An absent, explicit `--config` path is an error ("file not found"); an absent,
+discovered one is the normal fresh case and returns [`RawRepoConfig::default`]
+silently — the same explicit/discovered asymmetry [`read_pools`] states below
+for `--pools`. Once bytes exist, `toml::from_str` decides the rest and this
+function adds nothing to what it says: whatever `RawRepoConfig` accepts or
+refuses at the wire, this function's own contract is only the two file-absence
+branches above. What the wire refuses includes a misspelled top-level section
+name — `[budgts]`, `[interation]`, `[runer]` — which `RawRepoConfig` used to
+deserialize into nothing with no warning (`SWEEP-CONFIG-PARSE-007`, guarded to
+whichever of this file or `src/config.rs` swept first): the struct now denies
+unknown fields, the refusal names the typo and the accepted seven sections, and
+the regression through `load_captured`, on a capture built in memory, lives in
+the parent's suite beside the struct.
+
 ## `pub(super) fn read_pools(`
 
 Read `~/.upstroke/pools.toml` into typed pools (§17).
@@ -87,3 +103,59 @@ indistinguishable from "no pool" by the time it reaches the engine
 (`pool_option` maps `""` to `None`), so the attribution would vanish
 while the pool still matched for routing. Same reasoning as the
 non-empty `[[gates]]` `name`.
+
+## `fn converts_exactly(units: i64) -> bool {`
+
+An `as` narrowing needs a nearby invariant that proves the range (§5), and
+this one is *checked* rather than assumed. TOML hands `monthly_allowance` the
+whole `i64` range, and an `f64` carries 53 significant bits, so not every
+integer survives the cast: written `9223372036854775807`, an operator would
+have got `9223372036854775808` back — a ceiling nobody set. So the integer
+branch refuses, by name, any integer the cast would change, and what survives
+is the number that was written.
+
+What decides it is the span between the highest and the lowest set bit of the
+magnitude: an integer converts exactly when that span fits in the mantissa,
+whatever its size. `2^53 + 1` needs 54 bits and is refused; `2^53 + 2` and
+`10^16` (the older writer's integer spelling `design/17` names, which is
+`2^16 × 152587890625`) fit and are accepted unchanged. An earlier version of
+this check was a blanket ceiling at `2^53`, which refused those two; and the
+version before that argued the range instead of enforcing it, reasoning that a
+hand-typed spend ceiling is never that large — a claim about operators, not
+about accepted input. Both were wrong on the input the parser actually takes.
+The predicate is integer arithmetic only, so the proof of the cast does not
+itself lean on a cast; the sign is refused just below, where `i64::MIN`, exact
+though it is, fails the same check every negative value fails.
+
+The finiteness and sign check below applies uniformly to both the integer
+and float branches; for the integer branch it can only ever pass, since a
+cast from a finite `i64` is never `NaN` or infinite, and it is written once
+for both rather than duplicated per branch. The float branch takes no
+exactness check: a `toml` float is already an `f64`, so there is no conversion
+to lose anything, and `is_finite` is the whole of what it needs.
+[`connect::render::toml_number`] writes an allowance back out as an integer
+only below `2^53` and as a float otherwise; that is the writer's choice of
+spelling and is unaffected by what the reader accepts.
+
+## `fn absent(tag: &str, required: bool) -> FileSnapshot {`
+
+The absent-file tests need a snapshot whose capture found no file, and they
+build one directly rather than pointing `snapshot_file` at a path that is
+supposed not to exist. A path is only as absent as the filesystem says it is
+at the moment of the read: a fixed name can be satisfied by a leftover, and a
+per-process name can be satisfied by a leftover from an earlier process that
+was issued the same id. `FileSnapshot`'s fields are private to `src/config.rs`
+and visible here because this module is its child, and `Ok(None)` is exactly
+what `snapshot_file` records for a file that is not there, so the fixture is
+the captured state itself with no filesystem in the oracle. Reaching for `fs`
+to manage a real directory would put a governed primitive in a module that
+denies all three and takes no `effects/allowlist.toml` row.
+
+## `fn an_integer_allowance_that_converts_exactly_is_accepted_unchanged() {`
+
+The expected values are written out as float literals rather than spelled
+`written as f64`, which is the very cast under test: the expected value has to
+come from outside the code being proved. The refusal test's `i64::MAX` case is
+the value that motivated the check — it casts to `9223372036854775808.0`, one
+more than it is, and accepting it would silently store an allowance the
+operator did not write.
