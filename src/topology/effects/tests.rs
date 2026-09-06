@@ -597,7 +597,8 @@ fn every_group_enums_all_slice_lists_every_one_of_its_variants() {
             for site in all {
                 let position: usize = $slot(*site);
                 assert_eq!(
-                    all[position], *site,
+                    all.get(position),
+                    Some(site),
                     concat!(stringify!($enum), " is not at the slot it claims")
                 );
                 assert!(seen.insert(position), "two variants claim one slot");
@@ -1935,13 +1936,17 @@ fn no_execution_entry(site: EffectSiteId) -> RegistryEntry {
 /// wrote one number for four sites could not show that anything reads it.
 /// One of the four is deliberately zero: "hitting Internal is recorded but
 /// never required".
-fn sampling_for(site: EffectSiteId) -> (u32, u32) {
+///
+/// `None` for every other site, rather than an `unreachable!` arm: §7 denies
+/// that macro in tests too, having no Clippy allowance to take, and the one
+/// caller fails its own setup with a message naming the premise.
+fn sampling_for(site: EffectSiteId) -> Option<(u32, u32)> {
     match site {
-        EffectSiteId::Object(ObjectSite::CandidateCommitTree) => (61, 0),
-        EffectSiteId::Object(ObjectSite::RepairMaterialize) => (23, 4),
-        EffectSiteId::Object(ObjectSite::ProposalCherryPick) => (37, 9),
-        EffectSiteId::Worktree(WorktreeSite::AddStaging) => (19, 2),
-        other => unreachable!("the fixture drives no other residue-class site: {other}"),
+        EffectSiteId::Object(ObjectSite::CandidateCommitTree) => Some((61, 0)),
+        EffectSiteId::Object(ObjectSite::RepairMaterialize) => Some((23, 4)),
+        EffectSiteId::Object(ObjectSite::ProposalCherryPick) => Some((37, 9)),
+        EffectSiteId::Worktree(WorktreeSite::AddStaging) => Some((19, 2)),
+        _ => None,
     }
 }
 
@@ -1987,7 +1992,9 @@ fn self_test_registry(host: Host) -> Vec<RegistryEntry> {
         // registry" — and one class deliberately never hit.
         for class in site.residue_classes() {
             assert_eq!(*class, ResidueClass::ObjectInternal);
-            let (n, internal) = sampling_for(site);
+            let (n, internal) = sampling_for(site).expect(
+                "the fixture drives only the four residue-class sites `sampling_for` names",
+            );
             registry
                 .insert(residue_entry(site, n, internal))
                 .expect("residue entry");
@@ -2601,7 +2608,10 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
 
     // (g) The format refuses a record that names no sequence at all,
     // before the bijection is reached.
-    let mut unwitnessed = no_execution_entry(skipped[0]);
+    let first_skipped = *skipped
+        .first()
+        .expect("the three sites a fast sequence skips");
+    let mut unwitnessed = no_execution_entry(first_skipped);
     if let Evidence::NotExecuted { sequences, .. } = &mut unwitnessed.evidence {
         sequences.clear();
     }
@@ -3334,10 +3344,10 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     for bad in [claims_by_evidence, claims_by_label] {
         let mut entries = self_test_registry(host);
         let slot = entries
-            .iter()
-            .position(|entry| entry.key() == bad.key())
+            .iter_mut()
+            .find(|entry| entry.key() == bad.key())
             .expect("the self-test registry holds this key");
-        entries[slot] = bad;
+        *slot = bad;
         let failures = check_bijection(
             &self_test_inventory(),
             &self_test_harness(host),
@@ -3382,10 +3392,10 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     // as.
     let mut entries = self_test_registry(host);
     let slot = entries
-        .iter()
-        .position(|entry| entry.key() == hook.key())
+        .iter_mut()
+        .find(|entry| entry.key() == hook.key())
         .expect("the self-test registry holds this site's before phase");
-    entries[slot] = hook;
+    *slot = hook;
     let failures = check_bijection(
         &self_test_inventory(),
         &self_test_harness(host),
@@ -3459,14 +3469,19 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
             .map(|name| (*name).to_owned())
             .collect(),
     };
-    let recovery = match residue_entry(commit_tree, 61, 0).evidence {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!(),
-    };
-    let recovery_for_skipped = match residue_entry(skipped, 23, 4).evidence {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!(),
-    };
+    // Assertions naming the premise rather than `unreachable!` arms: §7 denies
+    // that macro in tests too, and a test that fails its own setup says which
+    // premise failed.
+    let recovery = residue_entry(commit_tree, 61, 0).evidence;
+    assert!(
+        matches!(recovery, Evidence::RecoveryProven { .. }),
+        "a residue entry carries recovery-proven evidence"
+    );
+    let recovery_for_skipped = residue_entry(skipped, 23, 4).evidence;
+    assert!(
+        matches!(recovery_for_skipped, Evidence::RecoveryProven { .. }),
+        "a residue entry carries recovery-proven evidence"
+    );
 
     let mut legal = 0;
     let mut refused = 0;
@@ -3957,10 +3972,7 @@ fn the_format_refuses_residue_and_resume_semantics_the_site_does_not_have() {
         );
         assert_eq!(
             FaultRegistry::new().insert(entry.clone()),
-            Err(match validate_entry(&entry) {
-                Err(error) => error,
-                Ok(()) => unreachable!("just refused"),
-            }),
+            Err(error),
             "{label} was accepted by the constructor"
         );
     }
@@ -4064,11 +4076,11 @@ fn the_format_refuses_residue_and_resume_semantics_the_site_does_not_have() {
         },
     ] {
         let mut entries = self_test_registry(host);
-        let position = entries
-            .iter()
-            .position(|entry| entry.site == commit_tree && entry.phase == phase)
-            .expect("the fixture carries this entry");
-        entries[position].resume_action = "do nothing".to_owned();
+        entries
+            .iter_mut()
+            .find(|entry| entry.site == commit_tree && entry.phase == phase)
+            .expect("the fixture carries this entry")
+            .resume_action = "do nothing".to_owned();
         let failures = check_bijection(
             &self_test_inventory(),
             &self_test_harness(host),
@@ -4679,7 +4691,10 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
     for site in EffectSiteId::all() {
         assert_eq!(
             site.after_effect(),
-            oracle[site.name().as_str()],
+            oracle
+                .get(site.name().as_str())
+                .copied()
+                .expect("the oracle is total over the inventory, asserted above"),
             "{site}'s after phase"
         );
     }
@@ -4703,7 +4718,10 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
     for site in EffectSiteId::all() {
         assert_eq!(
             site.before_state(),
-            before_oracle[site.name().as_str()],
+            before_oracle
+                .get(site.name().as_str())
+                .copied()
+                .expect("the oracle is total over the inventory, asserted above"),
             "{site}'s before phase"
         );
     }
@@ -5281,13 +5299,17 @@ fn the_bijection_refuses_a_hand_edited_slice_that_keys_one_coordinate_twice() {
         .iter()
         .position(|entry| entry.site == commit_tree && entry.phase == EntryPhase::After)
         .expect("the fixture carries an after-phase entry");
-    let mut second = entries[position].clone();
+    let original = entries
+        .get(position)
+        .cloned()
+        .expect("the position the search above returned");
+    let mut second = original.clone();
     second.evidence = Evidence::Executed {
         test: "st07::a-different-test".to_owned(),
         passed: false,
     };
-    assert_eq!(second.key(), entries[position].key(), "the same key");
-    assert_ne!(second, entries[position], "and a different claim");
+    assert_eq!(second.key(), original.key(), "the same key");
+    assert_ne!(second, original, "and a different claim");
     validate_entry(&second).expect("individually valid");
     entries.insert(position + 1, second.clone());
 
@@ -5517,7 +5539,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].constructed = false;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .constructed = false;
                         break;
                     }
                 }
@@ -5540,7 +5565,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].recovered = false;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .recovered = false;
                         break;
                     }
                 }
@@ -5554,7 +5582,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].classified = ObjectResidue::After;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .classified = ObjectResidue::After;
                         break;
                     }
                 }
@@ -5711,7 +5742,10 @@ fn the_bijection_fails_on_every_missing_link() {
         Direction {
             name: "an entry the format would have refused",
             break_it: |_, entries| {
-                entries[0].fault_row = FaultRow::TResume;
+                entries
+                    .first_mut()
+                    .expect("the self-test registry is not empty")
+                    .fault_row = FaultRow::TResume;
             },
             expect: |failure| matches!(failure, BijectionFailure::InvalidEntry { .. }),
         },
