@@ -628,14 +628,30 @@ mod tests {
     fn the_mode_an_operator_gave_their_pools_file_survives_a_forced_rewrite() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        const OPERATORS: u32 = 0o640;
+
         let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mode")
             .expect("acquire an isolated pools directory");
         let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
                     \"claude-code\"\nprofile = \"work\"\n";
         fs::write(&path, mine).expect("the operator's hand-written file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(&path, fs::Permissions::from_mode(OPERATORS))
             .expect("the operator restricts their own file");
+
+        let control = tree.path().join("control");
+        fs::write(&control, "what a fresh file in this directory gets")
+            .expect("a control the runner's umask decides");
+        let fresh = fs::metadata(&control)
+            .expect("read the control's mode")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_ne!(
+            fresh, OPERATORS,
+            "this assertion is only a witness where the operator's mode is not the mode a \
+             fresh file already gets under the runner's umask"
+        );
 
         assert_eq!(connect(&path, true).outcome, Wrote::Written);
 
@@ -645,8 +661,9 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "a rewrite that publishes a new inode must not widen the mode the operator set"
+            mode, OPERATORS,
+            "a rewrite that publishes a new inode must not hand back the mode the umask \
+             gives a fresh file in place of the one the operator set"
         );
     }
 
