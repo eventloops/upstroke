@@ -2125,6 +2125,51 @@ Answered once: the second answer has no open question to name.
 
 And its id is never reused for a new question either.
 
+## `fn a_continuation_is_offered_only_for_an_open_generation_no_attempt_has_used() {`
+
+[`TopologyFold::eligible_continuation`], which had no test in this file. The
+engine's selector reads it to decide whether a task with an open generation is
+continued rather than dispatched afresh, so what it returns is the generation a
+worker is about to resume into.
+
+Two things are asserted that no other test held. **The identity**: the fixture
+closes generation 0 and dispatches generation 1, so an answer of
+`GenerationId(0)` — a reader that took the first generation rather than the open
+one — is a different value from the right one. **The class filter**: in flight,
+retained-idle and promoting each get their own arm, because dropping the
+`OpenNoAttempt` filter is a change the fold suite otherwise passes.
+`src/topology/fold/tests/questions.rs` reaches this reader through `select` and
+holds the lineage-question guard; it holds neither of these.
+
+## `fn lineage_with_a_dispatched_repair(ask_about: Option<TaskKey>) -> TopologyFold {`
+
+A lineage whose repair holds an open generation, optionally with a question open
+on the root.
+
+**The question is installed through `RunState::open_question` rather than by an
+event, and the fixture proves it has to be.** Both orders are refused:
+dispatching the member after the question fails `task_dispatched` ("dispatch
+requires no outstanding lineage question or candidate for this task"), and
+raising the question after the dispatch fails `question_raised` ("settle it
+before parking its tasks"). So `eligible_continuation`'s `lineage_has_question`
+arm guards a state no legal log reaches, and the `refuse` above the hand-built
+state records that rather than leaving a reader to wonder. Building an
+unreachable cell by hand is what [`grid_state`] does, for the same reason.
+
+## `fn the_eligible_integration_candidate_is_the_first_the_queue_still_offers() {`
+
+[`TopologyFold::eligible_integration_candidate`], which had no test in this file
+either. `integration_admissible` is its `is_some()` and is asserted in seven
+places, so the *predicate* was covered and the *identity* was not: the selector
+integrates the candidate this returns, and a reader that offered the wrong one
+would have left all seven of those assertions true.
+
+The arms are its three early returns and the queue's own eligibility. The parked
+arm is the one that pins identity — with `mid` awaiting input the offer must be
+`zeta`, and the two candidates are asserted distinguishable first, so an
+either-answer reader cannot pass. Dropping the open-transaction guard is a change
+the fold suite otherwise passes.
+
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `let base = sha("base");`
 
 refusals[20], and the epoch scope that makes a resume the way back: both a

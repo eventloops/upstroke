@@ -6326,6 +6326,271 @@ fn refused_live_and_on_replay(
 }
 
 #[test]
+fn a_continuation_is_offered_only_for_an_open_generation_no_attempt_has_used() {
+    let base = sha("base");
+    assert_eq!(
+        TopologyFold::new(inputs()).eligible_continuation(ZETA),
+        None,
+        "an unstarted run holds no generation to continue"
+    );
+
+    let mut fold = started();
+    assert_eq!(
+        fold.eligible_continuation(ZETA),
+        None,
+        "a task that has never been dispatched offers nothing"
+    );
+    assert_eq!(
+        fold.eligible_continuation(TaskKey(9)),
+        None,
+        "and neither does a key this run has no entry for"
+    );
+
+    apply(&mut fold, &dispatch(ZETA, 0, &base));
+    apply(
+        &mut fold,
+        &ev(TopologyEventBody::GenerationClosed {
+            data: GenerationClosed {
+                key: ZETA,
+                generation: GenerationId(0),
+                reason: GenerationCloseReason::WorktreeMissing,
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        }),
+    );
+    apply(&mut fold, &dispatch(ZETA, 1, &base));
+    assert_eq!(
+        fold.task(ZETA).expect("zeta").generations.len(),
+        2,
+        "the task holds a closed generation before the open one, or the identity below is \
+         satisfied by reading the first"
+    );
+    assert_eq!(
+        fold.eligible_continuation(ZETA),
+        Some(GenerationId(1)),
+        "the offer is the open generation, not the first one"
+    );
+
+    let start = attempt_started(&fold, ZETA, 1, 1, 0);
+    let mut in_flight = fold.clone();
+    apply(&mut in_flight, &start);
+    assert_eq!(
+        in_flight.eligible_continuation(ZETA),
+        None,
+        "an attempt is already running in it"
+    );
+
+    let mut retained = in_flight.clone();
+    apply(
+        &mut retained,
+        &settle(
+            ZETA,
+            1,
+            1,
+            AttemptSettlement::Retained {
+                retained_session: SessionId("sess-ÜNI-continuation".to_owned()),
+                retained_incarnation: Epoch(0),
+            },
+        ),
+    );
+    assert_eq!(
+        retained.eligible_continuation(ZETA),
+        None,
+        "a retained generation is retried in place, and that is `ready_retry`'s business"
+    );
+    assert!(retained.ready_retry(ZETA), "which it does offer");
+
+    let mut promoting = in_flight;
+    apply(&mut promoting, &candidate_prepared(ZETA, 1, &base));
+    assert_eq!(
+        promoting.eligible_continuation(ZETA),
+        None,
+        "a promoting generation has produced its candidate"
+    );
+
+    let mut ending = fold.clone();
+    apply(&mut ending, &budget_exceeded(0, None));
+    assert_eq!(
+        ending.eligible_continuation(ZETA),
+        None,
+        "a run that is ending starts nothing in an open generation"
+    );
+
+    let mut poisoned = fold;
+    poisoned.poison();
+    assert_eq!(
+        poisoned.eligible_continuation(ZETA),
+        None,
+        "a poisoned fold authorises nothing"
+    );
+
+    let quiet = lineage_with_a_dispatched_repair(None);
+    assert_eq!(
+        quiet.eligible_continuation(TaskKey(3)),
+        Some(GenerationId(0)),
+        "the repair's own generation is open with no attempt"
+    );
+    let asked = lineage_with_a_dispatched_repair(Some(ALPHA));
+    assert!(
+        asked.questions_open(),
+        "the question is open on the lineage root, not on the member"
+    );
+    assert_eq!(
+        asked
+            .task(TaskKey(3))
+            .and_then(TaskFold::open)
+            .map(|g| &g.class),
+        Some(&GenerationClass::OpenNoAttempt),
+        "and the member's generation is still open with no attempt"
+    );
+    assert_eq!(
+        asked.eligible_continuation(TaskKey(3)),
+        None,
+        "a lineage with an open question continues none of its members"
+    );
+}
+
+fn lineage_with_a_dispatched_repair(ask_about: Option<TaskKey>) -> TopologyFold {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut fold = started();
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    let mut rejected = MergeRejected {
+        sequence: SequenceId(0),
+        candidate: candidate_of(ALPHA, 0),
+        rejecting_head: head.clone(),
+        disposition: RejectionDisposition::CodeRejected {
+            verification: verification_record(Verdict::Rejected),
+        },
+        repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+        lease_effect: RejectionLeaseEffect::CreatesLineage {
+            root: ALPHA,
+            paths: region(ALPHA),
+        },
+    };
+    rejected.repair.entry.deps = Vec::new();
+    rejected.repair.entry.display_deps = Vec::new();
+    for event in [
+        dispatch(ALPHA, 0, &base),
+        start,
+        candidate_prepared(ALPHA, 0, &base),
+        candidate_created(ALPHA, 0),
+        verification_started(ALPHA, 0, 0, &head, &proposal),
+        ev(TopologyEventBody::MergeRejected {
+            data: Box::new(rejected),
+        }),
+    ] {
+        apply(&mut fold, &event);
+    }
+    apply(
+        &mut fold,
+        &ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key: TaskKey(3),
+                generation: GenerationId(0),
+                base_sha: base,
+                worktree_path: "/private/workspaces/tasks/k3-g0".to_owned(),
+                lease: LeaseGrant::InheritedLineage { root: ALPHA },
+                source_candidate: Some(candidate_of(ALPHA, 0)),
+            },
+        }),
+    );
+    if let Some(key) = ask_about {
+        assert!(
+            matches!(
+                refuse(&fold, &raised("q-lineage-Ünicode", key)),
+                FoldError::InconsistentRecord { .. }
+            ),
+            "no log reaches this state, which is why it is built by hand below"
+        );
+        let mut run = fold.run.take().expect("the fixture's run has started");
+        run.open_question(
+            &question("q-lineage-Ünicode", key),
+            QuestionOrigin::Admission,
+            None,
+        );
+        fold.run = Some(run);
+    }
+    fold
+}
+
+#[test]
+fn the_eligible_integration_candidate_is_the_first_the_queue_still_offers() {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    assert_eq!(
+        TopologyFold::new(inputs()).eligible_integration_candidate(),
+        None,
+        "an unstarted run queues nothing"
+    );
+    assert_ne!(
+        candidate_of(MID, 0),
+        candidate_of(ZETA, 0),
+        "the two queued candidates have to be distinguishable, or the identity below is \
+         satisfied by either"
+    );
+
+    let mut fold = two_queued();
+    assert_eq!(
+        fold.eligible_integration_candidate(),
+        Some(&candidate_of(MID, 0)),
+        "the queue is [mid, zeta] in creation order and the offer is its head"
+    );
+    assert!(fold.integration_admissible());
+
+    let mut parked = fold.clone();
+    apply(&mut parked, &raised("q-park-Ünicode", MID));
+    assert_eq!(
+        parked.eligible_integration_candidate(),
+        Some(&candidate_of(ZETA, 0)),
+        "the head is awaiting input, so the offer is the next candidate that is not"
+    );
+
+    let mut open = fold.clone();
+    apply(
+        &mut open,
+        &verification_started(MID, 0, 0, &head, &proposal),
+    );
+    assert_eq!(
+        open.eligible_integration_candidate(),
+        None,
+        "one integration transaction runs at a time"
+    );
+    assert!(!open.integration_admissible());
+
+    let mut ending = fold.clone();
+    apply(&mut ending, &budget_exceeded(0, None));
+    assert_eq!(
+        ending.eligible_integration_candidate(),
+        None,
+        "a run that is ending starts no integration"
+    );
+
+    let mut narrow = wide_started(1);
+    queue_candidate(&mut narrow, MID, 0);
+    assert_eq!(
+        narrow.eligible_integration_candidate(),
+        Some(&candidate_of(MID, 0)),
+        "with the one entitlement free the candidate is offered"
+    );
+    apply(&mut narrow, &dispatch(ZETA, 0, &base));
+    assert_eq!(
+        narrow.eligible_integration_candidate(),
+        None,
+        "and not while that entitlement is held elsewhere"
+    );
+
+    fold.poison();
+    assert_eq!(
+        fold.eligible_integration_candidate(),
+        None,
+        "a poisoned fold authorises nothing"
+    );
+}
+
+#[test]
 fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
     for (class, events) in alpha_open_in_every_class() {
         let (fold, log) = folded(&events);
