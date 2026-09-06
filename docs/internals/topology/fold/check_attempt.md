@@ -148,8 +148,7 @@ same question.**
 
 **And the record does not claim the attempt succeeded.**
 `candidate_prepared` is the sole successful settlement
-(INV-07,
-`decisions/2026-08-12-merge-queue-execution-topology.md`),
+(INV-07, `design/26_design_merge_queue_protocol.md` §26),
 and the `Closed` arm has enforced that against the record
 since round 6. This arm did not, so the invariant held on one
 path through the door and not the other: a current-epoch
@@ -188,8 +187,8 @@ is not the half the fold enforces.
 ## `impl RunState` › `if matches!(transition, SettlementTransition::Succeeded) {`
 
 **`attempt_finished` does not settle a success.** INV-07 and
-`decisions/2026-08-12-merge-queue-execution-topology.md` say
-it outright — `candidate_prepared` is "the **sole**
+`design/26_design_merge_queue_protocol.md` §26 say it
+outright — `candidate_prepared` is "the **sole**
 successful settlement for an attempt that produces a
 candidate … `attempt_finished` is not also emitted for that
 attempt" — and this build appended both, so one attempt
