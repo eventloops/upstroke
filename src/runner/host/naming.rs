@@ -139,7 +139,7 @@ pub(super) fn resolve_program(
         message: format!(
             "the host runner cannot execute `{program}`: nothing of that name is on the PATH \
              this runner composes ({searched} director{} searched{}, as {}). The runner resolves \
-             a program name against the environment it composes (DESIGN.md:118), so the program \
+             a program name against the environment it composes (DESIGN.md §6), so the program \
              must be installed inside the boundary that executes it — on PATH for the host \
              runner, in the image for a container runner. PATH: {}",
             if searched == 1 { "y" } else { "ies" },

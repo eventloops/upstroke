@@ -152,7 +152,7 @@ The second clause of `PR4-ADAPTER-RESOLVES-ON-THE-HOST`: the adapter names
 the CLI and consults no filesystem, and the runner resolves that name
 against **the environment it composes**. `composed` is that environment —
 the one the child is about to be given — so pre-flight and the attempt
-resolve identically because they compose identically (DESIGN.md:263).
+resolve identically because they compose identically (DESIGN.md §8).
 
 One rule for every program this boundary runs. `gates::ShellKind::spec` has
 always shipped a bare `sh`, `bash`, `cmd` or `pwsh` and the three agent CLIs
@@ -161,7 +161,7 @@ now do too; a second rule for one of them is how `PR6D-001` happened.
 **What it deliberately does not search.** std's Windows fallbacks — the
 application directory, the system directory, the Windows directory, and the
 *parent* process's `PATH` — are not consulted. A runner that owns the
-environment (DESIGN.md:118) and then reaches outside it for a program is
+environment (DESIGN.md §6) and then reaches outside it for a program is
 composing one environment and resolving against another, which is the class
 of bug this function exists to close. In production the composed `PATH` is
 the coordinator process's own (`PATH` is reserved, so no overlay can move
@@ -193,7 +193,7 @@ v0.1 product already spawn, and it must not change.
 **`PR6-LANED-003`.** A `PATH` entry that does not name a location on
 its own names one *relative to a current directory*, and this
 runner's current directory is the workspace — repository content,
-under automation. DESIGN.md:398-402 is explicit that repository
+under automation. DESIGN.md §15 is explicit that repository
 content executing with this process's authority is the threat the
 container runner exists to bound; the host runner cannot bound it for
 gate code, but the *agent* is not gate code and must not become a way
@@ -208,7 +208,7 @@ the right side to fail on. The alternative is worse than it looks —
 this predicate runs against the *coordinator's* current directory
 while the child runs against the *workspace* — so a relative entry
 does not merely widen the search, it lets the runner certify one file
-and execute another, which is DESIGN.md:612 in the same breath.
+and execute another, which is DESIGN.md §21 in the same breath.
 
 `Path::is_absolute` rather than a [`ProgramNaming`] rule: like
 [`ProgramNaming::is_program`], this is a question about *this*
