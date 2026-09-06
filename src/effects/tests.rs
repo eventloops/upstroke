@@ -2172,6 +2172,11 @@ fn the_comment_blanker_models_raw_strings_and_still_blanks_comments() {
 }
 
 #[test]
+fn the_two_blankers_each_carry_their_own_contract_in_the_notes() {
+    oracles::the_notes_give_each_blanker_its_own_contract();
+}
+
+#[test]
 fn a_multi_byte_char_literal_does_not_desync_the_blanker() {
     oracles::a_multi_byte_char_literal_keeps_the_blankers_phase();
 }
