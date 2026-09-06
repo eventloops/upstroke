@@ -4112,6 +4112,31 @@ mod inherited_writer {
         }
     }
 
+    const MARKER_MARGIN: usize = 4096;
+
+    fn marker_exceeding(capacity: usize) -> String {
+        format!(
+            "{} ' $name `printf literal`",
+            "x".repeat(capacity + MARKER_MARGIN)
+        )
+    }
+
+    fn shim_script(marker: &str) -> String {
+        format!("#!/bin/sh\necho \"{marker}:$1\"\n")
+    }
+
+    #[test]
+    fn the_shim_script_exceeds_every_installed_pipe_capacity() {
+        for capacity in [4096_usize, 8 * 1024, 16 * 1024, 64 * 1024] {
+            let script = shim_script(&marker_exceeding(capacity));
+            assert!(
+                script.len() > capacity,
+                "a {capacity}-byte pipe holds the whole {}-byte script, so the shim writer never blocks",
+                script.len()
+            );
+        }
+    }
+
     #[test]
     fn marker_shims_do_not_leave_writers_in_another_threads_fork() {
         let mut helper = Command::new(std::env::current_exe().expect("the test executable"));
@@ -4176,10 +4201,15 @@ mod inherited_writer {
             .expect("open the FIFO reader before the shim writer");
         // SAFETY: reader owns a live FIFO descriptor. F_SETPIPE_SZ takes an
 
-        let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
-        assert_eq!(capacity, 4096, "bound the pipe so the script cannot fit");
-        let marker = format!("{} ' $name `printf literal`", "x".repeat(16 * 1024));
-        let expected = format!("#!/bin/sh\necho \"{marker}:$1\"\n").into_bytes();
+        let installed = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        assert!(
+            installed > 0,
+            "bound the shim pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        let capacity = usize::try_from(installed).expect("a positive installed pipe capacity");
+        let marker = marker_exceeding(capacity);
+        let expected = shim_script(&marker).into_bytes();
         let mut actual = vec![0; expected.len()];
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| marker_shim(&root.0, fifo_name, &marker));
