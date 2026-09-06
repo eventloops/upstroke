@@ -22,6 +22,22 @@ impl TopologyFold {
                 defect: defect.to_string(),
             })?;
 
+        let recorded_policy = match started.path_policy.version {
+            PathPolicyVersion::V2 => None,
+            PathPolicyVersion::V1 => Some("v1"),
+        };
+        if let Some(recorded) = recorded_policy {
+            return Err(FoldError::InconsistentRecord {
+                kind: "run_started",
+                detail: format!(
+                    "it freezes path policy `{recorded}`, and this binary derives dispatch \
+                     regions under path policy `v2`; the derivation that wrote this run's \
+                     dispatch records is not the one this binary applies, so a run recorded \
+                     under `{recorded}` cannot be replayed here"
+                ),
+            });
+        }
+
         if started.limits.max_parallel == 0 {
             return Err(FoldError::UnusableLimit {
                 limit: "max_parallel",

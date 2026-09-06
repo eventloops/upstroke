@@ -186,7 +186,7 @@ fn gate_summaries() -> Vec<GateSummary> {
 
 fn path_policy() -> PathPolicy {
     PathPolicy {
-        version: PathPolicyVersion::V1,
+        version: PathPolicyVersion::V2,
         case_fold: true,
         grammar: PathGrammar::Globset,
     }
@@ -1951,6 +1951,39 @@ fn a_run_begins_once_and_says_it_is_a_topology_run() {
 }
 
 #[test]
+fn a_run_recorded_under_an_earlier_path_policy_is_refused_rather_than_replayed_under_this_one() {
+    let under = |version: PathPolicyVersion| {
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                path_policy: PathPolicy {
+                    version,
+                    ..path_policy()
+                },
+                ..run_started()
+            }),
+        })
+    };
+
+    accepts(&TopologyFold::new(inputs()), &under(PathPolicyVersion::V2));
+
+    let error = refuse(&TopologyFold::new(inputs()), &under(PathPolicyVersion::V1));
+    let FoldError::InconsistentRecord { kind, detail } = &error else {
+        panic!("a `v1` run was refused as {error} rather than as an inconsistent record");
+    };
+    assert_eq!(*kind, "run_started");
+    for phrase in [
+        "it freezes path policy `v1`",
+        "derives dispatch regions under path policy `v2`",
+        "cannot be replayed here",
+    ] {
+        assert!(
+            detail.contains(phrase),
+            "the refusal does not say `{phrase}`: {detail}"
+        );
+    }
+}
+
+#[test]
 fn a_run_started_carries_a_runner_record_that_could_be_re_established() {
     let mut runner = container_runner();
     if let Some(image) = runner.image.as_mut() {
@@ -2778,7 +2811,7 @@ const HINT_SHAPES: &[HintShape] = &[
     HintShape {
         id: "backslash",
         hints: &[r"src\backslash\deep"],
-        derives: Some(&["src/backslash/deep"]),
+        derives: None,
     },
     HintShape {
         id: "doubled",
@@ -9087,7 +9120,11 @@ fn a_predicted_region_is_the_literal_prefix_of_every_hint() {
     }
     let mut windows = zeta.clone();
     windows.spec.path_hints = vec!["src\\Zebra\\mod.rs".to_owned()];
-    assert_eq!(predicted_region(&windows), prefixes(&["src/Zebra/mod.rs"]));
+    assert!(
+        predicted_region(&windows).is_repo_wide(),
+        "a backslash is an escape under the frozen grammar on one platform and a separator on \
+         the other, so a hint carrying one bounds nothing either way"
+    );
 }
 
 #[test]

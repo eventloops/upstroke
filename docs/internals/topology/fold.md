@@ -440,7 +440,12 @@ a leading substring, and every departure from it has to be wider than the
 hint rather than narrower — a region silently smaller than what the hint
 covers is what lets two owners of one file run at once.
 
-Three consequences, each of them a case this rule gets right and a character
+The derivation is versioned, and this is [`crate::topology::paths::PathPolicyVersion::V2`].
+`check_run_started` refuses a run frozen under any earlier version rather
+than replaying it under this one, because a run's dispatch records carry
+the regions its own version derived.
+
+Four consequences, each of them a case this rule gets right and a character
 prefix does not:
 
 * Components are taken whole, up to the first that carries `*`, `?`, `[` or
@@ -455,10 +460,16 @@ prefix does not:
 * An empty component is kept, because the comparator filters empties itself:
   `src/doubled//inner/` bounds `src/doubled//inner` byte for byte, and a
   leading or trailing separator changes no comparison.
+* Any backslash bounds nothing. The character has two readings under the
+  frozen grammar and neither is safe to guess: `globset` treats `\` as an
+  escape on Unix, so `src/foo\?bar.rs` matches the single file
+  `src/foo?bar.rs`, while on Windows it is a separator and the same hint
+  names `src/foo/?bar.rs`. A prefix taken under either reading is narrower
+  than the hint under the other, and narrower is the direction that admits
+  two owners of one file, so the derivation refuses rather than guesses.
 
-Backslashes become `/` first, so a hint written on Windows bounds the same
-region. A hint that bounds nothing after all that — no components, or every
-component globbed — is `None`.
+A hint that bounds nothing after all that — no components, every component
+globbed, a dotted component, or a backslash anywhere — is `None`.
 
 ## `mod parent_tests {`
 
@@ -470,4 +481,5 @@ contracts that are stated here and nowhere else: every [`FoldError`]
 message's fields and their distinctness, the [`TaskState`] and
 [`GenerationClass`] vocabularies, [`TaskFold::open`], and [`hint_prefix`]'s
 rule with the [`crate::topology::leases::paths_overlap`] measurement that
-says why it is that rule.
+says why it is that rule — including the backslash, whose two readings are
+each measured against the file the other reading's prefix does not overlap.

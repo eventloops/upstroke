@@ -426,6 +426,16 @@ actual changed paths replace predictions once a candidate exists, and merge
 verification remains the correctness boundary. Edits outside hints are recorded
 as plan-quality warnings rather than trusted away.
 
+The derivation is versioned by the run's frozen path policy, because a dispatch
+record durably carries the region the derivation of its own version produced and
+replay compares the two. Version `v2` takes the whole components of a hint before
+the first component carrying a glob metacharacter — `src/eng*` bounds `src`, not
+`src/eng`, which is not an ancestor of the `src/engine/mod.rs` the hint matches —
+and derives repo-wide for a hint with a `.` or `..` component or with any
+backslash, a character the frozen record does not fix as separator or as escape.
+A run whose `run_started` freezes an earlier version is refused at that event,
+rather than replayed under a derivation that did not write its records.
+
 A predicted dispatch lease is held only while its generation can still receive
 worker edits. A same-session immediate retry retains that generation, worktree,
 and lease. Parking or deferring discards the non-resumable worktree and releases

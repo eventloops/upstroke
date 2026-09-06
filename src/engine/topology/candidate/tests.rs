@@ -559,7 +559,7 @@ fn run_started(base_sha: CommitSha) -> RunStarted4 {
         normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
         registry_digest: String::new(),
         path_policy: PathPolicy {
-            version: PathPolicyVersion::V1,
+            version: PathPolicyVersion::V2,
             case_fold: true,
             grammar: PathGrammar::Globset,
         },

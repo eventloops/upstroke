@@ -26,6 +26,23 @@ refusals[5], first half: the record must name everything needed to
 re-establish the runner. The digest is not required — it is the
 manifest digest when the runtime reported one (INV-23).
 
+## `impl TopologyFold` › `let recorded_policy = match started.path_policy.version {`
+
+The frozen path policy is execution identity, so a run recorded under
+an earlier version is refused here rather than replayed under this
+one.
+
+`check_dispatched` compares a durable `LeaseGrant::Predicted` against
+the region [`crate::topology::paths`]'s current derivation produces
+from the same frozen hints, and refuses the dispatch when they differ.
+A binary that derives regions differently from the binary that wrote
+the log therefore refuses the run's own accepted events, one at a
+time, at whichever dispatch first carries a hint the two derivations
+disagree about — an unresumable run reported as a malformed record.
+The version says so once, at the event that freezes it, and the match
+is exhaustive so a later version cannot be added without deciding what
+this binary does with it.
+
 ## `impl TopologyFold` › `if started.limits.max_parallel == 0 {`
 
 The entitlement this run freezes must admit work. `max_parallel = 0`

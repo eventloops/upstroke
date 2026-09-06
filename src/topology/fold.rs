@@ -30,7 +30,7 @@ use crate::topology::events::{
     UnavailableOutcome, VerificationBasis, VerificationSource, VerificationVerdict,
 };
 use crate::topology::leases::{GenerationLease, LeaseOwner, LeaseTable};
-use crate::topology::paths::{GitPath, PathSet};
+use crate::topology::paths::{GitPath, PathPolicyVersion, PathSet};
 use crate::topology::queue::{CandidateQueue, Ineligible, QueueEntry};
 use crate::topology::registry::{Admission, FrozenLadder, TaskEntry, TaskKey, TaskRegistry};
 
@@ -657,9 +657,11 @@ fn predicted_region(entry: &TaskEntry) -> PathSet {
 
 fn hint_prefix(hint: &str) -> Option<GitPath> {
     const METACHARACTERS: [char; 4] = ['*', '?', '[', '{'];
-    let normalized = hint.replace('\\', "/");
-    let mut prefix = String::with_capacity(normalized.len());
-    for (position, component) in normalized
+    if hint.contains('\\') {
+        return None;
+    }
+    let mut prefix = String::with_capacity(hint.len());
+    for (position, component) in hint
         .split('/')
         .take_while(|component| !component.contains(METACHARACTERS))
         .enumerate()
@@ -690,7 +692,7 @@ mod parent_tests {
 
     fn policy() -> PathPolicy {
         PathPolicy {
-            version: PathPolicyVersion::V1,
+            version: PathPolicyVersion::V2,
             case_fold: false,
             grammar: PathGrammar::Globset,
         }
@@ -1076,7 +1078,7 @@ mod parent_tests {
 
     #[test]
     fn a_hint_with_no_metacharacter_is_its_own_prefix_and_a_glob_cuts_whole_components() {
-        let cases: [(&str, Option<&str>); 24] = [
+        let cases: [(&str, Option<&str>); 26] = [
             ("src/literal", Some("src/literal")),
             ("build.rs", Some("build.rs")),
             ("src/trailing/", Some("src/trailing")),
@@ -1084,14 +1086,16 @@ mod parent_tests {
             ("src/question/?.rs", Some("src/question")),
             ("src/bracket/[ab].rs", Some("src/bracket")),
             ("src/brace/{a,b}.rs", Some("src/brace")),
-            (r"src\backslash\deep", Some("src/backslash/deep")),
+            (r"src\backslash\deep", None),
             ("src/doubled//inner/", Some("src/doubled//inner")),
             ("src/\u{dc}ber/", Some("src/\u{dc}ber")),
             ("src/star*.rs", Some("src")),
             ("src/eng*", Some("src")),
             ("src/a*/b", Some("src")),
             ("src/deep/mod.rs*", Some("src/deep")),
-            (r"src\deep\mod.rs*", Some("src/deep")),
+            (r"src\deep\mod.rs*", None),
+            (r"src/foo\?bar.rs", None),
+            (r"src/foo\*", None),
             ("**/anywhere.rs", None),
             ("*.rs", None),
             ("star*.rs", None),
@@ -1135,6 +1139,39 @@ mod parent_tests {
                 &policy
             ),
             "the comparator is component-wise; a prefix cut inside a component is not an ancestor"
+        );
+    }
+
+    #[test]
+    fn a_hint_carrying_a_backslash_bounds_nothing_because_the_character_has_two_readings() {
+        let policy = policy();
+        for hint in [
+            r"src/foo\?bar.rs",
+            r"src\backslash\deep",
+            r"src\deep\mod.rs*",
+        ] {
+            assert!(hint_prefix(hint).is_none(), "`{hint}` was kept as a prefix");
+        }
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/foo"),
+                &GitPath::from("src/foo?bar.rs"),
+                &policy
+            ),
+            "the escape reading's prefix does not overlap the one file that reading matches"
+        );
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/foo/?bar.rs"),
+                &GitPath::from("src/foo?bar.rs"),
+                &policy
+            ),
+            "and the separator reading names a different region again"
+        );
+        assert_eq!(
+            hint_prefix("src/foo").as_ref().map(GitPath::as_str),
+            Some("src/foo"),
+            "the guard refuses backslashes, not every hint"
         );
     }
 

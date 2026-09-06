@@ -812,6 +812,20 @@ process still may not append.
 A record that does not claim the topology schema is not one this
 fold may interpret, whatever else it says.
 
+## `fn a_run_recorded_under_an_earlier_path_policy_is_refused_r…` › `let under = |version: PathPolicyVersion| {`
+
+Finding 1 of PR #212's frontier pass. `hint_prefix` changed which
+region a hint derives, and `check_dispatched` compares a run's durable
+`LeaseGrant::Predicted` against the region the current derivation
+produces from the same frozen hints. A binary carrying the new
+derivation therefore refuses the old log's own accepted dispatches as
+malformed records, one at a time, and an interrupted run with a
+mid-component glob becomes unresumable with no statement of why. The
+frozen `path_policy.version` is where that is said once: v2 is
+accepted, v1 is refused at the event that froze it, and both halves
+are asserted here so an implementation that refused every version
+would fail as loudly as one that accepted every version.
+
 ## `fn a_run_started_carries_a_runner_record_that_could_be_re_e…` › `let mut runner = container_runner();`
 
 refusals[5], first half, over every defect the record can exhibit —
@@ -984,10 +998,11 @@ asymmetry between the two is what the row was written about.
 
 One hint shape, and the region the contract says it derives.
 
-**Transcribed from the rule, not from the code.** The rule is "the
-plan's path hints, taken literally: a hint with no glob metacharacter is
-its own literal prefix; anything else — an absent hint list, or a hint
-whose literal prefix is empty — classifies repo-wide". Reading
+**Transcribed from the rule, not from the code.** The rule is path
+policy v2: the whole components of a hint before the first component
+carrying a glob metacharacter; anything else — an absent hint list, a
+hint that bounds no component, a dotted component, or a backslash
+anywhere in the hint — classifies repo-wide. Reading
 `predicted_region`'s body to build this table would make the grid agree
 with the derivation for the reason the derivation is right or wrong,
 which is the self-oracle shape `CODING_STANDARDS.md` names.
@@ -1027,7 +1042,12 @@ dropped, and the separator that precedes it goes with the trim.
 
 ## `HintShape {`
 
-A Windows-shaped hint names Git paths once its separators are.
+A hint carrying a backslash bounds nothing. The character is a
+separator on Windows and an escape under the frozen `globset` grammar
+on Unix, the record does not say which machine wrote the plan, and a
+prefix taken under either reading is narrower than the hint under the
+other — the direction that admits two owners of one file. Path policy
+v2 refuses rather than guesses.
 
 ## `HintShape {`
 
@@ -2738,10 +2758,10 @@ holdings, two fates, and exactly one disposition per cell.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let registry = started().registry().expect("started").clone();`
 
-`admission_and_leases.path_policy.prediction`: the literal prefix
-before the first glob metacharacter, and repo-wide for anything
-unsafe or absent — the classification that costs parallelism and
-never costs correctness.
+`admission_and_leases.path_policy.prediction`, as path policy v2
+derives it: the whole components before the first component carrying a
+glob metacharacter, and repo-wide for anything unsafe or absent — the
+classification that costs parallelism and never costs correctness.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let mut hintless = zeta.clone();`
 
@@ -2749,8 +2769,11 @@ Absent, and unsafe, both classify repo-wide.
 
 ## `fn a_predicted_region_is_the_literal_prefix_of_every_hint()` › `let mut windows = zeta.clone();`
 
-A backslash-separated hint is a Windows spelling of the same region,
-not a one-component path with a backslash in its name.
+A backslash-separated hint is a Windows spelling of one region and a
+Unix escape naming another, and nothing in the frozen record says
+which machine wrote it. Path policy v2 does not choose: any backslash
+bounds nothing, because a prefix taken under either reading is
+narrower than the hint under the other.
 
 ## `fn the_pipeline_entitlement_is_what_the_fold_derives_it_to_…` › `let base = sha("base");`
 
