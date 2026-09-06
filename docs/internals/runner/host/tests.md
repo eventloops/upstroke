@@ -2939,3 +2939,63 @@ so truncating at the first #[cfg(test)] also fails this control.
 
 And the two are the run and the resume facade, each of which then
 borrows that one runner for pre-flight and every attempt.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {`
+
+The census that holds this module's site-placed reasoning in step with the copy
+kept here. `standards/11_standards_unsafe_and_platform_code.md` requires an
+adjacent `SAFETY:` comment stating each obligation and why it holds, and
+`standards/10_standards_concurrency.md` a written protocol for shared state and
+its cleanup. Section 13 moves a module's prose into this file but says the
+reasoning another standard requires *at* a site is that standard's to place, and
+that a module with a notes file is not excused from it.
+
+PR #157 moved the prose here and left only the opening line of each block behind,
+separated from its own operation by a blank line, so a reader at the six `unsafe`
+operations in `inherited_writer` met a sentence that stopped mid-clause -- "The
+child", "a live,", "for this" -- and the `HeldFork` lifetime protocol had no site
+copy at all. `PR157-ASTRA-SITE-SAFETY` is that finding. Nothing in the diff that
+caused it touched an executable token, which is why nothing failed.
+
+The census reads this module and this file through `include_str!` and holds them
+equal in both directions: every operation carries an adjacent complete
+obligation, the multiset of site obligations equals the multiset recorded here,
+and the guard's protocol sits beside its type. Three separate mutations were run
+against it -- adjacency lost, a block shortened but left adjacent, the protocol
+deleted from the site -- and each is detected by a different assertion.
+
+It is deliberately outside the `#[cfg(target_os = "linux")]` module it censuses,
+so all three Clippy and test legs evaluate it. `include_str!` embeds the
+checked-out bytes, so a Windows checkout under `core.autocrlf` supplies `\r\n`;
+each line is stripped of a trailing `\r` and every comparison is over
+whitespace-separated words, which absorbs a rewrap of either copy as well.
+Reading at compile time also keeps the census off the runtime effect surface
+this module's allowlist row governs.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn comment_body(line: &str) -> Option<&str> {`
+
+The text of a `//` comment line, or `None` for code, a blank line, or the module
+header. Returning `None` for a blank line is what catches the separator PR #157
+left behind: a block is adjacent exactly when the line above the operation is a
+comment.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let block_ending_at = |above: usize| -> Option<String> {`
+
+The whole comment block whose last line is `above`, normalised to one line of
+words. Walking upward from the operation rather than downward from the comment is
+what makes a truncated block visible: the remnant is still a comment, but it is
+no longer the line above.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let keyword = concat!("un", "safe");`
+
+The census reads the file it lives in, so its needle must not match its own
+source. Spelling the keyword in two pieces keeps the scan from finding an
+operation inside the scanner. Comment lines are skipped before the scan, so the
+word may appear freely in the reasoning at a site.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let mut opens_at = index;`
+
+The obligation sits above the statement, and a macro or call may open that
+statement on an earlier line -- `assert_eq!(` above the `mkfifo` call. The walk
+crosses those openers and nothing else: never a blank line, and never unrelated
+code, so "adjacent" keeps its meaning.

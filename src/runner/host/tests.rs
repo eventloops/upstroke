@@ -5753,29 +5753,14 @@ fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ---------------------------------------------------------------------------
-
-/// §11 places each `SAFETY:` obligation, and §10 each concurrency protocol,
-/// beside the code it governs; §13 keeps both at the site even where a module
-/// has a notes file. Moving this module's prose to
-/// `docs/internals/runner/host/tests.md` once left only each block's opening
-/// line behind, separated from its own operation by a blank line, so a reader
-/// at the site saw a sentence that stopped mid-clause. This holds every site
-/// obligation complete, adjacent, and equal to the notes copy, both ways.
-///
-/// `include_str!` embeds the checked-out bytes, so a Windows checkout under
-/// `core.autocrlf` supplies `\r\n`. Every comparison here is over
-/// whitespace-separated words, which absorbs that and a rewrap alike.
 #[test]
 fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
     const SOURCE: &str = include_str!("tests.rs");
     const NOTES: &str = include_str!("../../../docs/internals/runner/host/tests.md");
     const PROTOCOL_ITEM: &str = "struct HeldFork {";
     const PROTOCOL_HEADING: &str = "## `struct HeldFork {`";
+    const OBLIGATION: &str = "SAFETY:";
 
-    /// The text of a `//` comment line, or `None` for code, a blank line or the
-    /// module header. `///` and `//!` are not site obligations either, but the
-    /// header is the only one this module carries above an item under census.
     fn comment_body(line: &str) -> Option<&str> {
         let rest = line.trim().strip_prefix("//")?;
         if rest.starts_with('!') {
@@ -5793,8 +5778,6 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         .map(|line| line.trim_end_matches('\r'))
         .collect();
 
-    // The whole comment block whose last line is `above`, or `None` when that
-    // line is not a comment -- which is how a blank separator is caught.
     let block_ending_at = |above: usize| -> Option<String> {
         comment_body(source.get(above)?)?;
         let mut first = above;
@@ -5815,8 +5798,6 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         Some(normalised(&block))
     };
 
-    // This census reads the file it lives in, so its needle must not match its
-    // own source: spell the keyword in two pieces.
     let keyword = concat!("un", "safe");
     let mut site_obligations: Vec<String> = Vec::new();
     for (index, line) in source.iter().enumerate() {
@@ -5827,9 +5808,6 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         {
             continue;
         }
-        // The obligation sits above the statement, which a macro or call may
-        // open on an earlier line -- `assert_eq!(`. Cross those openers and
-        // nothing else: never a blank line, never unrelated code.
         let mut opens_at = index;
         while opens_at
             .checked_sub(1)
@@ -5845,7 +5823,7 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
             );
         };
         assert!(
-            block.starts_with("SAFETY:"),
+            block.starts_with(OBLIGATION),
             "src/runner/host/tests.rs:{}: the adjacent comment is not an obligation: {block}",
             index + 1
         );
@@ -5856,8 +5834,6 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         "no operation was found to check; this census measures nothing"
     );
 
-    // The notes file repeats each obligation as a paragraph under the heading
-    // naming the code it belongs to.
     let mut notes: Vec<(&str, String)> = Vec::new();
     let mut heading = "";
     let mut paragraph: Vec<&str> = Vec::new();
@@ -5879,22 +5855,23 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         }
     }
 
-    let mut notes_obligations: Vec<String> = notes
+    let mut beside_the_code: Vec<&str> = site_obligations.iter().map(String::as_str).collect();
+    let mut in_the_notes: Vec<&str> = notes
         .iter()
-        .filter(|(_, text)| text.starts_with("SAFETY:"))
-        .map(|(_, text)| text.clone())
+        .map(|(_, text)| text.as_str())
+        .filter(|text| text.starts_with(OBLIGATION))
         .collect();
-    site_obligations.sort();
-    notes_obligations.sort();
+    beside_the_code.sort_unstable();
+    in_the_notes.sort_unstable();
     assert_eq!(
-        site_obligations, notes_obligations,
+        beside_the_code, in_the_notes,
         "the site obligations and their notes copies must agree exactly"
     );
 
     let protocol = notes
         .iter()
         .find(|(at, _)| *at == PROTOCOL_HEADING)
-        .map(|(_, text)| text)
+        .map(|(_, text)| text.as_str())
         .expect("the notes record the guard's protocol");
     let at_item = source
         .iter()
@@ -5902,7 +5879,7 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         .expect("the guard the protocol governs");
     let beside_item = at_item.checked_sub(1).and_then(block_ending_at);
     assert_eq!(
-        beside_item.as_ref(),
+        beside_item.as_deref(),
         Some(protocol),
         "the guard's protocol must sit beside the type, complete"
     );
