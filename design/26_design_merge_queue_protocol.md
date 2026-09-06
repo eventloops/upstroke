@@ -114,7 +114,9 @@ the current integration tree, supplying the original candidate patch and
 acceptance criteria to the integration reviewer while recording why the
 candidate-phase empty-diff rule does not apply. It then records `merge_prepared`
 with disposition `already_present` and
-`expected_head == proposed_sha == current integration SHA`. The normal
+`expected_head == proposed_sha == current integration SHA`. Because no commit
+was manufactured there is no proposal object to pin, so the record carries no
+prepared ref and the fold refuses one that does. The normal
 compare-and-swap is therefore a validation-only no-op, after which
 `task_merged` records the unchanged SHA. This is the only conflict-free path
 without a task commit, and the event lineage makes the reason explicit.
