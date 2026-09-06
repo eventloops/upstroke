@@ -304,6 +304,24 @@ the `p_pgrpid` the process died with; any other errno, or no record, is
 holds the fall-through honest: the record of a child nothing moved names
 this process's group, not its own.
 
+The fall-through reads that record only for this process's own dead
+child. `exited_before` must be `Ok(true)` and `pbsi_status` must be
+`SZOMB`, or the answer is `false` whatever group the record names.
+`PR173-DARWIN-FALL-THROUGH-ACCEPTS-A-LIVE-RECORD`: without those two the
+decision was `pbsi_pgid == pid` on whatever record came back, and the
+non-zero third argument of `proc_pidinfo` only ENABLES the zombie lookup
+— the call asks `proc_find` first (`bsd/kern/proc_info.c`), so it can
+answer for a live process. A child that missed containment, exited and
+was reaped by an embedding host's wildcard wait (DESIGN §15 names that
+host) leaves a pid that XNU may reuse; `getpgid` then answers `ESRCH`
+for the stranger holding it, the record is the stranger's, and a
+stranger that leads group `pid` read as containment for a child this
+process no longer has. `waitid(P_PID, ..., WNOWAIT)` answers only for
+this process's own child and the zombie it answers for pins the pid, so
+`exited_before == Ok(true)` is what a reused pid cannot produce; `SZOMB`
+is what a live record cannot. Every other platform and every other
+errno are unchanged.
+
 This is the standing macOS red `W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-
 FINGERPRINT`: `every_role_reaches_the_containment_points_of_this_platform`
 looks at the child in `child_created`, right after `spawn` returns, and a

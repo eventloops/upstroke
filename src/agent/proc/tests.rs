@@ -558,8 +558,8 @@ fn a_reaped_childs_pid_never_answers_for_its_own_group() {
 #[cfg(target_os = "macos")]
 #[test]
 fn only_this_processs_own_zombie_answers_for_its_group_after_an_esrch() {
-    const PID: libc::pid_t = 424_242;
     const PID_AS_GROUP: u32 = 424_242;
+    const PID: libc::pid_t = PID_AS_GROUP as libc::pid_t;
     const ANOTHER_GROUP: u32 = 4_242;
 
     let after_esrch = |exited_before: Result<bool, i32>,
