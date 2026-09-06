@@ -43,8 +43,8 @@ Extra mounts the boundary receives beyond the ones the runner composes.
 
 ## `#[serde(flatten)]`
 
-Everything else. Unlike `[engine]`, an unknown key here is an **error**;
-see [`read_runner`].
+Everything else. An unknown key here is an **error**, the same as an
+unknown `[engine]` key; see [`read_runner`].
 
 ## `#[derive(Debug, Deserialize)]`
 
@@ -1078,10 +1078,10 @@ the default is doing the work rather than the fixture.
 
 Every shape `[runner]` refuses, each with the reason, and each named.
 
-An unknown key is an **error** here where `[engine]` warns, and the grid
-says so out loud: a mistyped key in `[engine]` leaves a ceiling at its
-default, while `knid = "container"` leaves the run executing on the host
-while its config reads as though gate code were confined.
+An unknown key is an **error** here, the same as an unknown `[engine]`
+key, and the grid says so out loud: `knid = "container"` leaves the run
+executing on the host while its config reads as though gate code were
+confined.
 
 Second field held constant: every cell is a `[runner]` section and
 nothing else, so no cell can fail for another section's reason.
