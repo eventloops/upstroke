@@ -568,4 +568,104 @@ mod tests {
             "the accessor answered about a sequence other than the first of that name",
         );
     }
+
+    #[test]
+    fn a_site_whose_funnel_only_walked_past_a_point_was_still_touched() {
+        let point = HookPhase::Point {
+            point: SubEffectPoint::Written,
+            mode: InjectionMode::Kill,
+        };
+        let mut harness = HookHarness::new();
+        assert_eq!(harness.hook(APPEND, point), Injection::Proceed);
+
+        assert!(
+            harness.coverage().is_empty(),
+            "an unarmed point was counted as coverage: {:?}",
+            harness.coverage(),
+        );
+        assert_eq!(
+            harness.executions(),
+            0,
+            "a walk past an unarmed point was counted as an execution",
+        );
+        assert!(!harness.observed(APPEND, point));
+        assert!(
+            harness.reached_point(APPEND, SubEffectPoint::Written, InjectionMode::Kill),
+            "the funnel reached the point and the harness did not record that it had",
+        );
+        assert!(
+            harness.touched(APPEND),
+            "a site the harness reached but never observed was reported untouched",
+        );
+    }
+
+    #[test]
+    fn a_hook_phase_renders_as_the_name_a_failure_quotes_it_by() {
+        assert_eq!(HookPhase::Before.to_string(), "before");
+        assert_eq!(HookPhase::After.to_string(), "after");
+        assert_eq!(
+            HookPhase::Point {
+                point: SubEffectPoint::Written,
+                mode: InjectionMode::Kill,
+            }
+            .to_string(),
+            "Written/kill",
+        );
+        assert_eq!(
+            HookPhase::Point {
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::ErrorReturn,
+            }
+            .to_string(),
+            "IdUnread/error-return",
+        );
+        assert_eq!(HookPhase::PHASES, [HookPhase::Before, HookPhase::After]);
+    }
+
+    /// The module doc promises the parent re-exports every item here. Every
+    /// one is named through `crate::topology::effects` below, so dropping one
+    /// from the parent's `pub use` stops this build.
+    #[test]
+    fn every_item_of_this_module_is_nameable_through_the_parent_re_export() {
+        use crate::topology::effects::{
+            FastSequence as ParentSequence, HarnessError as ParentError,
+            HookHarness as ParentHarness, HookPhase as ParentPhase, Injection as ParentInjection,
+            Observation as ParentObservation,
+        };
+
+        let mut harness = ParentHarness::new();
+        harness.begin_fast_sequence("fast/parent");
+        let injection: ParentInjection = harness.hook(APPEND, ParentPhase::Before);
+        assert_eq!(injection, Injection::Proceed);
+
+        let observed: &[ParentObservation] = harness.coverage();
+        assert_eq!(
+            observed,
+            [Observation {
+                site: APPEND,
+                phase: HookPhase::Before,
+                count: 1,
+            }],
+        );
+
+        let sequences: &[ParentSequence] = harness.fast_sequences();
+        assert_eq!(
+            sequences
+                .iter()
+                .map(FastSequence::name)
+                .collect::<Vec<&str>>(),
+            ["fast/parent"],
+        );
+
+        let error: ParentError = harness
+            .arm(APPEND, SubEffectPoint::IdUnread, InjectionMode::Kill)
+            .expect_err("`Event.AppendFirst` exposes no `IdUnread` point");
+        assert_eq!(
+            error,
+            HarnessError::NoSuchPoint {
+                site: APPEND,
+                point: SubEffectPoint::IdUnread,
+            },
+        );
+    }
 }
