@@ -395,7 +395,7 @@ mod tests {
 
     fn path_policy() -> PathPolicy {
         PathPolicy {
-            version: PathPolicyVersion::V1,
+            version: PathPolicyVersion::V2,
             case_fold: true,
             grammar: PathGrammar::Globset,
         }

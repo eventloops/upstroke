@@ -86,6 +86,15 @@ pub struct Observation {
 }
 
 /// Why the harness refused to arm an injection.
+///
+/// Every field is the typed value the caller passed, the site included.
+/// `DESIGN.md` §26's "diagnostics are typed" reserves free text for a
+/// document's own words — a resume action in the fault matrix's wording, the
+/// name a suite gave a fast sequence, what a hand-edited entry wrote in the
+/// field the format refused — and an arming is a Rust call with no document
+/// in it. Rendering the site to a `String` here made the one field a caller
+/// might match on the one field it would have to parse; the message text is
+/// unchanged, because that rendering was [`EffectSiteId`]'s own `Display`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HarnessError {
     #[error(
@@ -94,7 +103,7 @@ pub enum HarnessError {
     )]
     NoSuchPoint {
         /// The site.
-        site: String,
+        site: EffectSiteId,
         /// The point that was asked for.
         point: SubEffectPoint,
     },
@@ -102,7 +111,7 @@ pub enum HarnessError {
     #[error("`{site}`'s `{point}` point does not support {mode:?} injection")]
     UnsupportedMode {
         /// The site.
-        site: String,
+        site: EffectSiteId,
         /// The point.
         point: SubEffectPoint,
         /// The mode that was asked for.
@@ -127,8 +136,16 @@ pub struct HookHarness {
     reached: Vec<Observation>,
     /// The fast integration sequences the suite exercised, in order.
     fast: Vec<FastSequence>,
-    /// The one being recorded, if a sequence is open.
-    open_fast: Option<usize>,
+    /// Whether the sequence begun last is still recording.
+    ///
+    /// The open sequence is always the last of `fast`: `begin_fast_sequence`
+    /// closes the previous one and then pushes, and nothing else adds to the
+    /// vector. A flag beside `last_mut()` says that structurally, where the
+    /// index this used to hold had to be *kept* true — and an index that went
+    /// stale would either record into the wrong sequence or be defended
+    /// against on every hook, which is a thing a reader has to check rather
+    /// than read.
+    recording: bool,
 }
 
 /// One exercised fast integration sequence, and every site its funnels ran.
@@ -159,6 +176,17 @@ impl FastSequence {
     pub fn ran(&self, site: EffectSiteId) -> bool {
         self.touched.contains(&site)
     }
+
+    /// Record that `site`'s funnel ran inside this sequence.
+    ///
+    /// Once per site, in first-execution order: a sequence answers *whether* a
+    /// site ran in it ([`Self::ran`]), and how often it ran is the harness's
+    /// count, not the trace's.
+    fn touch(&mut self, site: EffectSiteId) {
+        if !self.touched.contains(&site) {
+            self.touched.push(site);
+        }
+    }
 }
 
 impl HookHarness {
@@ -169,9 +197,23 @@ impl HookHarness {
 
     /// Arm an injection at one point of one site.
     ///
-    /// Refuses a point the site does not expose and a mode the point does not
-    /// support, so a suite cannot quietly arm a fault that no funnel will ever
-    /// consult.
+    /// Refuses a point the site does not declare and a mode that point does
+    /// not declare support for, so a suite cannot quietly arm a fault the
+    /// inventory says no funnel of that site consults.
+    ///
+    /// Which host a point exists on is deliberately not one of the refusals.
+    /// Arming is host-agnostic: [`SubEffectPoint::platform`] is read by
+    /// [`check_bijection`](crate::topology::effects::check_bijection) against
+    /// the host it is given, and a suite drives a platform's point contract
+    /// through a funnel fake on whatever host it runs — as
+    /// `every_family_of_the_harness_bundle_records_into_the_same_harness`
+    /// (`src/engine/topology/seams.rs`) does, arming a Windows-only point and
+    /// asserting the injection it returns, on every host.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::NoSuchPoint`] if `site` does not expose `point`, and
+    /// [`HarnessError::UnsupportedMode`] if `point` does not support `mode`.
     pub fn arm(
         &mut self,
         site: EffectSiteId,
@@ -179,17 +221,10 @@ impl HookHarness {
         mode: InjectionMode,
     ) -> Result<(), HarnessError> {
         if !site.sub_effects().contains(&point) {
-            return Err(HarnessError::NoSuchPoint {
-                site: site.name(),
-                point,
-            });
+            return Err(HarnessError::NoSuchPoint { site, point });
         }
         if !point.supports(mode) {
-            return Err(HarnessError::UnsupportedMode {
-                site: site.name(),
-                point,
-                mode,
-            });
+            return Err(HarnessError::UnsupportedMode { site, point, mode });
         }
         if !self.armed.contains(&(site, point, mode)) {
             self.armed.push((site, point, mode));
@@ -222,12 +257,8 @@ impl HookHarness {
     /// [`Self::reached`], which is recorded separately and is never what the
     /// bijection reads.
     pub fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
-        if let Some(open) = self.open_fast {
-            if let Some(sequence) = self.fast.get_mut(open) {
-                if !sequence.touched.contains(&site) {
-                    sequence.touched.push(site);
-                }
-            }
+        if let Some(sequence) = self.open_sequence() {
+            sequence.touch(site);
         }
         let injection = match phase {
             HookPhase::Before | HookPhase::After => Injection::Proceed,
@@ -242,8 +273,11 @@ impl HookHarness {
                 }
             }
         };
-        if let HookPhase::Point { point, mode } = phase {
-            Self::record(&mut self.reached, site, HookPhase::Point { point, mode });
+        if matches!(phase, HookPhase::Point { .. }) {
+            // The phase as given, not one rebuilt from its own fields: a
+            // rebuild is a second spelling of the coordinate that can drift
+            // from the one the injection was decided by.
+            Self::record(&mut self.reached, site, phase);
             if injection == Injection::Proceed {
                 // Reached, and nothing was injected. Recorded as reachability
                 // and as nothing else.
@@ -252,6 +286,15 @@ impl HookHarness {
         }
         Self::record(&mut self.observed, site, phase);
         injection
+    }
+
+    /// The sequence still recording, if one is open.
+    fn open_sequence(&mut self) -> Option<&mut FastSequence> {
+        if self.recording {
+            self.fast.last_mut()
+        } else {
+            None
+        }
     }
 
     fn record(into: &mut Vec<Observation>, site: EffectSiteId, phase: HookPhase) {
@@ -273,18 +316,24 @@ impl HookHarness {
     /// Everything a funnel hooks until [`Self::end_fast_sequence`] is recorded
     /// as having run inside this sequence, which is what a no-execution entry
     /// is measured against. A second `begin` closes the first.
+    /// A name is a label the suite chose and not an identity: beginning one
+    /// twice records two sequences, so a second run under a name that saw
+    /// something is still held to having seen something of its own.
     pub fn begin_fast_sequence(&mut self, name: &str) {
         self.end_fast_sequence();
         self.fast.push(FastSequence {
             name: name.to_owned(),
             touched: Vec::new(),
         });
-        self.open_fast = Some(self.fast.len() - 1);
+        self.recording = true;
     }
 
     /// Stop recording the open fast sequence, keeping what it saw.
+    ///
+    /// A no-op when none is open, and it does not end the *run*: a later
+    /// [`Self::hook`] is recorded as coverage, in no sequence.
     pub fn end_fast_sequence(&mut self) {
-        self.open_fast = None;
+        self.recording = false;
     }
 
     /// Every fast sequence the suite exercised.
@@ -292,7 +341,14 @@ impl HookHarness {
         &self.fast
     }
 
-    /// The fast sequence of this name, if the suite exercised one.
+    /// The first fast sequence recorded under this name, if there is one.
+    ///
+    /// First, because a name is a label rather than an identity: a suite that
+    /// begins one twice has two sequences and this answers about the earlier.
+    /// Anything holding a claim *to* the traces reads [`Self::fast_sequences`]
+    /// and holds it to every one of them, which is what
+    /// [`check_bijection`](crate::topology::effects::check_bijection) does with
+    /// a no-execution record; this is for a caller that has one name in hand.
     pub fn fast_sequence(&self, name: &str) -> Option<&FastSequence> {
         self.fast.iter().find(|sequence| sequence.name == name)
     }
@@ -354,7 +410,262 @@ impl HookHarness {
 
     /// How many executions in total. Zero for a harness nothing has run
     /// through, whatever it has armed.
+    ///
+    /// Saturating, as [`Self::count`] is (§5: the arithmetic is chosen). The
+    /// total was a `sum()`, which is `+`, and `overflow-checks` is on in every
+    /// profile — so a harness whose parts had saturated would have terminated
+    /// the run in the accessor that reports its coverage, where the parts it
+    /// adds up cannot. No test witnesses it: `count` reaches `u32::MAX` only
+    /// through `u32::MAX` hooks of one `(site, phase)`, and nothing else
+    /// constructs an [`Observation`] the harness will read.
     pub fn executions(&self) -> u32 {
-        self.observed.iter().map(|seen| seen.count).sum()
+        self.observed
+            .iter()
+            .fold(0, |total, seen| total.saturating_add(seen.count))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::effects::{EventSite, LockSite, ObjectSite};
+
+    /// The two sites this module's tests drive: one with two points in two
+    /// modes, and one with a single kill-only point.
+    const APPEND: EffectSiteId = EffectSiteId::Event(EventSite::AppendFirst);
+    const COMMIT_TREE: EffectSiteId = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
+
+    #[test]
+    fn an_arming_refusal_names_the_site_it_refused_by_type() {
+        let mut harness = HookHarness::new();
+
+        let error = harness
+            .arm(COMMIT_TREE, SubEffectPoint::Written, InjectionMode::Kill)
+            .expect_err("`CandidateCommitTree` exposes only `IdUnread`");
+        assert_eq!(
+            error,
+            HarnessError::NoSuchPoint {
+                site: COMMIT_TREE,
+                point: SubEffectPoint::Written,
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "`Object.CandidateCommitTree` exposes no parent-side sub-effect point `Written`; \
+             arming one would record an execution of a point that does not exist",
+        );
+
+        let error = harness
+            .arm(
+                COMMIT_TREE,
+                SubEffectPoint::IdUnread,
+                InjectionMode::ErrorReturn,
+            )
+            .expect_err("`IdUnread` is kill-only");
+        assert_eq!(
+            error,
+            HarnessError::UnsupportedMode {
+                site: COMMIT_TREE,
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::ErrorReturn,
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "`Object.CandidateCommitTree`'s `IdUnread` point does not support ErrorReturn \
+             injection",
+        );
+
+        // A refusal armed nothing, so the legal arming of the same point is
+        // still the one that fires.
+        harness
+            .arm(COMMIT_TREE, SubEffectPoint::IdUnread, InjectionMode::Kill)
+            .expect("the one point it has, in the one mode it supports");
+        assert_eq!(
+            harness.hook(
+                COMMIT_TREE,
+                HookPhase::Point {
+                    point: SubEffectPoint::IdUnread,
+                    mode: InjectionMode::Kill,
+                },
+            ),
+            Injection::Kill,
+        );
+    }
+
+    #[test]
+    fn the_open_sequence_is_the_one_begun_last_and_stops_at_the_end() {
+        let outside = EffectSiteId::Lock(LockSite::AcquireRun);
+        let mut harness = HookHarness::new();
+
+        harness.begin_fast_sequence("fast/one");
+        harness.hook(APPEND, HookPhase::Before);
+        // A second begin closes the first, and what follows belongs to the
+        // second alone.
+        harness.begin_fast_sequence("fast/two");
+        harness.hook(COMMIT_TREE, HookPhase::Before);
+        harness.end_fast_sequence();
+        // Ended: this one is coverage, recorded in no sequence at all.
+        harness.hook(outside, HookPhase::Before);
+
+        let names: Vec<&str> = harness
+            .fast_sequences()
+            .iter()
+            .map(FastSequence::name)
+            .collect();
+        assert_eq!(names, ["fast/one", "fast/two"]);
+
+        let one = harness
+            .fast_sequence("fast/one")
+            .expect("the first sequence");
+        assert_eq!(
+            one.touched(),
+            [APPEND],
+            "the second begin went on recording into the first",
+        );
+        assert!(!one.ran(COMMIT_TREE));
+
+        let two = harness
+            .fast_sequence("fast/two")
+            .expect("the second sequence");
+        assert_eq!(two.touched(), [COMMIT_TREE]);
+        assert!(
+            !two.ran(outside),
+            "a hook after `end_fast_sequence` joined the sequence it ended",
+        );
+        assert!(
+            harness.touched(outside),
+            "a hook outside every sequence is still an execution the harness saw",
+        );
+    }
+
+    #[test]
+    fn a_reused_sequence_name_is_a_second_sequence_and_not_a_return_to_the_first() {
+        let mut harness = HookHarness::new();
+        harness.begin_fast_sequence("fast");
+        harness.hook(APPEND, HookPhase::Before);
+        harness.begin_fast_sequence("fast");
+        harness.end_fast_sequence();
+
+        assert_eq!(
+            harness.fast_sequences().len(),
+            2,
+            "a reused name folded two traces into one, so the second is held to the first's \
+             observation",
+        );
+        let empty = harness
+            .fast_sequences()
+            .iter()
+            .filter(|sequence| sequence.touched().is_empty())
+            .count();
+        assert_eq!(
+            empty, 1,
+            "the second run under the name inherited an observation it did not make",
+        );
+        assert_eq!(
+            harness.fast_sequence("fast").map(FastSequence::touched),
+            Some(&[APPEND][..]),
+            "the accessor answered about a sequence other than the first of that name",
+        );
+    }
+
+    #[test]
+    fn a_site_whose_funnel_only_walked_past_a_point_was_still_touched() {
+        let point = HookPhase::Point {
+            point: SubEffectPoint::Written,
+            mode: InjectionMode::Kill,
+        };
+        let mut harness = HookHarness::new();
+        assert_eq!(harness.hook(APPEND, point), Injection::Proceed);
+
+        assert!(
+            harness.coverage().is_empty(),
+            "an unarmed point was counted as coverage: {:?}",
+            harness.coverage(),
+        );
+        assert_eq!(
+            harness.executions(),
+            0,
+            "a walk past an unarmed point was counted as an execution",
+        );
+        assert!(!harness.observed(APPEND, point));
+        assert!(
+            harness.reached_point(APPEND, SubEffectPoint::Written, InjectionMode::Kill),
+            "the funnel reached the point and the harness did not record that it had",
+        );
+        assert!(
+            harness.touched(APPEND),
+            "a site the harness reached but never observed was reported untouched",
+        );
+    }
+
+    #[test]
+    fn a_hook_phase_renders_as_the_name_a_failure_quotes_it_by() {
+        assert_eq!(HookPhase::Before.to_string(), "before");
+        assert_eq!(HookPhase::After.to_string(), "after");
+        assert_eq!(
+            HookPhase::Point {
+                point: SubEffectPoint::Written,
+                mode: InjectionMode::Kill,
+            }
+            .to_string(),
+            "Written/kill",
+        );
+        assert_eq!(
+            HookPhase::Point {
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::ErrorReturn,
+            }
+            .to_string(),
+            "IdUnread/error-return",
+        );
+        assert_eq!(HookPhase::PHASES, [HookPhase::Before, HookPhase::After]);
+    }
+
+    /// The module doc promises the parent re-exports every item here. Every
+    /// one is named through `crate::topology::effects` below, so dropping one
+    /// from the parent's `pub use` stops this build.
+    #[test]
+    fn every_item_of_this_module_is_nameable_through_the_parent_re_export() {
+        use crate::topology::effects::{
+            FastSequence as ParentSequence, HarnessError as ParentError,
+            HookHarness as ParentHarness, HookPhase as ParentPhase, Injection as ParentInjection,
+            Observation as ParentObservation,
+        };
+
+        let mut harness = ParentHarness::new();
+        harness.begin_fast_sequence("fast/parent");
+        let injection: ParentInjection = harness.hook(APPEND, ParentPhase::Before);
+        assert_eq!(injection, Injection::Proceed);
+
+        let observed: &[ParentObservation] = harness.coverage();
+        assert_eq!(
+            observed,
+            [Observation {
+                site: APPEND,
+                phase: HookPhase::Before,
+                count: 1,
+            }],
+        );
+
+        let sequences: &[ParentSequence] = harness.fast_sequences();
+        assert_eq!(
+            sequences
+                .iter()
+                .map(FastSequence::name)
+                .collect::<Vec<&str>>(),
+            ["fast/parent"],
+        );
+
+        let error: ParentError = harness
+            .arm(APPEND, SubEffectPoint::IdUnread, InjectionMode::Kill)
+            .expect_err("`Event.AppendFirst` exposes no `IdUnread` point");
+        assert_eq!(
+            error,
+            HarnessError::NoSuchPoint {
+                site: APPEND,
+                point: SubEffectPoint::IdUnread,
+            },
+        );
     }
 }

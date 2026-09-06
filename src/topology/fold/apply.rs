@@ -3,7 +3,6 @@
 use super::*;
 
 impl RunState {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn apply(&mut self, body: &TopologyEventBody, derived: &Derived) {
         match body {
             TopologyEventBody::RunStarted { .. } => {}
@@ -67,7 +66,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_resumed(&mut self, resumed: &RunResumed4) {
+    fn apply_resumed(&mut self, resumed: &RunResumed4) {
         self.epoch = Epoch(self.epoch.0.saturating_add(1));
         self.incarnation = resumed.incarnation.clone();
         self.budget_stop = None;
@@ -75,14 +74,14 @@ impl RunState {
         self.wake_backoff();
     }
 
-    pub(super) fn wake_backoff(&mut self) {
+    fn wake_backoff(&mut self) {
         self.queue.wake_deferred();
         for key in std::mem::take(&mut self.deferred_tasks) {
             self.refresh_task_state(key);
         }
     }
 
-    pub(super) fn register(&mut self, spawn: &FrozenSpawn) {
+    fn register(&mut self, spawn: &FrozenSpawn) {
         self.registry.register(spawn.entry.clone());
         self.tasks.push(TaskFold::new());
         match &spawn.admission {
@@ -98,7 +97,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
+    fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
         let (lease, region) = match &dispatched.lease {
             LeaseGrant::Predicted { paths } => (GenerationLease::Own, Some(paths.clone())),
             LeaseGrant::InheritedLineage { root } => {
@@ -126,7 +125,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_settlement(&mut self, finished: &AttemptFinished4) {
+    fn apply_settlement(&mut self, finished: &AttemptFinished4) {
         self.charge_allowance(finished.key, &finished.record);
 
         match &finished.settlement {
@@ -174,7 +173,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn record_halt(&mut self, key: TaskKey) {
+    fn record_halt(&mut self, key: TaskKey) {
         if self.halted_at.is_none() {
             self.halted_at = Some(key);
             self.halted_epoch = Some(self.epoch);
@@ -194,7 +193,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
+    fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
         let record = PreparedCandidate {
             candidate: prepared.candidate(),
             base_sha: prepared.base_sha.clone(),
@@ -206,28 +205,16 @@ impl RunState {
             generation.class = GenerationClass::Promoting;
         }
         self.charge_allowance(prepared.key, &prepared.attempt);
-        match &prepared.lease_effect {
-            CandidateLeaseEffect::ReplacesPredicted { paths } => {
-                self.leases.release(LeaseOwner::Generation {
-                    key: prepared.key,
-                    generation: prepared.generation,
-                });
-                self.leases.grant(
-                    LeaseOwner::Candidate {
-                        key: prepared.key,
-                        generation: prepared.generation,
-                    },
-                    paths.clone(),
-                );
-            }
-            CandidateLeaseEffect::WidensLineage { root, paths } => {
-                self.leases.widen_lineage(*root, paths);
-            }
-        }
+        take_candidate_region(
+            &mut self.leases,
+            &prepared.lease_effect,
+            prepared.key,
+            prepared.generation,
+        );
         self.set_state(prepared.key, TaskState::AwaitingMerge);
     }
 
-    pub(super) fn apply_candidate_created(&mut self, candidate: &CandidateRef) {
+    fn apply_candidate_created(&mut self, candidate: &CandidateRef) {
         let paths = self
             .tasks
             .get(candidate.key.index())
@@ -250,7 +237,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_verification_started(&mut self, started: &MergeVerificationStarted) {
+    fn apply_verification_started(&mut self, started: &MergeVerificationStarted) {
         self.next_sequence = self.next_sequence.saturating_add(1);
         if let Some(entry) = self
             .queue
@@ -269,10 +256,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_verification_unavailable(
-        &mut self,
-        unavailable: &MergeVerificationUnavailable,
-    ) {
+    fn apply_verification_unavailable(&mut self, unavailable: &MergeVerificationUnavailable) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
@@ -295,7 +279,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn release_transaction(&mut self) {
+    fn release_transaction(&mut self) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
@@ -307,7 +291,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
+    fn apply_merge_prepared(&mut self, prepared: &MergePrepared) {
         match prepared.disposition {
             PreparedDisposition::Fast => {
                 self.next_sequence = self.next_sequence.saturating_add(1);
@@ -324,7 +308,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
+    fn apply_merge_rejected(&mut self, rejected: &MergeRejected) {
         match rejected.disposition {
             RejectionDisposition::Conflict { .. } => {
                 self.next_sequence = self.next_sequence.saturating_add(1);
@@ -363,7 +347,7 @@ impl RunState {
         self.register(&rejected.repair);
     }
 
-    pub(super) fn apply_task_merged(&mut self, merged: &TaskMerged) {
+    fn apply_task_merged(&mut self, merged: &TaskMerged) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
@@ -385,7 +369,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn apply_answer(&mut self, answered: &QuestionAnswered4) {
+    fn apply_answer(&mut self, answered: &QuestionAnswered4) {
         self.questions.remove(&answered.question);
         match &answered.answer {
             Answer4::Answered {
@@ -409,31 +393,24 @@ impl RunState {
         let Some(task) = self.tasks.get(key.index()) else {
             return;
         };
-        if task.state.is_terminal() {
-            return;
-        }
-        let state = if self.open_question_for(key).is_some() {
-            TaskState::AwaitingInput
-        } else if self.queue.holds_task(key)
-            || self
+        let facts = VisibleFacts {
+            terminal: task.state.is_terminal(),
+            own_question: self.open_question_for(key).is_some(),
+            queued_candidate: self.queue.holds_task(key),
+            owns_transaction: self
                 .transaction
                 .as_ref()
-                .is_some_and(|transaction| transaction.candidate.key == key)
-        {
-            TaskState::AwaitingMerge
-        } else if self
-            .registry
-            .entries()
-            .iter()
-            .any(|entry| entry.lineage.is_some_and(|lineage| lineage.parent == key))
-        {
-            TaskState::AwaitingRepair
-        } else if self.deferred_tasks.contains(&key) {
-            TaskState::Deferred
-        } else {
-            TaskState::Pending
+                .is_some_and(|transaction| transaction.candidate.key == key),
+            repair_child: self
+                .registry
+                .entries()
+                .iter()
+                .any(|entry| entry.lineage.is_some_and(|lineage| lineage.parent == key)),
+            unelapsed_backoff: self.deferred_tasks.contains(&key),
         };
-        self.set_state(key, state);
+        if let Some(state) = derived_state(facts) {
+            self.set_state(key, state);
+        }
     }
 
     fn fail_lineage(&mut self, key: TaskKey) {
@@ -477,7 +454,7 @@ impl RunState {
         });
     }
 
-    pub(super) fn release_holdings_of(&mut self, key: TaskKey) {
+    fn release_holdings_of(&mut self, key: TaskKey) {
         if let Some(task) = self.tasks.get(key.index()) {
             for generation in &task.generations {
                 self.queue.remove(key, generation.id);
@@ -535,7 +512,7 @@ impl RunState {
         }
     }
 
-    pub(super) fn set_defers(&mut self, key: TaskKey, defers: u32) {
+    fn set_defers(&mut self, key: TaskKey, defers: u32) {
         if let Some(task) = self.tasks.get_mut(key.index()) {
             task.defers = defers;
         }
@@ -545,21 +522,335 @@ impl RunState {
         self.tasks.get_mut(key.index())?.open_mut()
     }
 
-    pub(super) fn close_generation(&mut self, key: TaskKey) {
+    fn close_generation(&mut self, key: TaskKey) {
         let Some(generation) = self.open_generation_mut(key) else {
             return;
         };
         let id = generation.id;
-        let releases_own_region = match generation.lease {
-            GenerationLease::Own => true,
-            GenerationLease::InheritedLineage { .. } => false,
-        };
+        let releases_region = releases_own_region(generation.lease);
         generation.class = GenerationClass::Closed;
-        if releases_own_region {
+        if releases_region {
             self.leases.release(LeaseOwner::Generation {
                 key,
                 generation: id,
             });
         }
+    }
+}
+
+fn take_candidate_region(
+    leases: &mut LeaseTable,
+    effect: &CandidateLeaseEffect,
+    key: TaskKey,
+    generation: GenerationId,
+) {
+    match effect {
+        CandidateLeaseEffect::ReplacesPredicted { paths } => {
+            leases.release(LeaseOwner::Generation { key, generation });
+            leases.grant(LeaseOwner::Candidate { key, generation }, paths.clone());
+        }
+        CandidateLeaseEffect::WidensLineage { root, paths } => {
+            leases.widen_lineage(*root, paths);
+        }
+    }
+}
+
+fn releases_own_region(lease: GenerationLease) -> bool {
+    match lease {
+        GenerationLease::Own => true,
+        GenerationLease::InheritedLineage { .. } => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleFacts {
+    terminal: bool,
+    own_question: bool,
+    queued_candidate: bool,
+    owns_transaction: bool,
+    repair_child: bool,
+    unelapsed_backoff: bool,
+}
+
+fn derived_state(facts: VisibleFacts) -> Option<TaskState> {
+    if facts.terminal {
+        return None;
+    }
+    Some(if facts.own_question {
+        TaskState::AwaitingInput
+    } else if facts.queued_candidate || facts.owns_transaction {
+        TaskState::AwaitingMerge
+    } else if facts.repair_child {
+        TaskState::AwaitingRepair
+    } else if facts.unelapsed_backoff {
+        TaskState::Deferred
+    } else {
+        TaskState::Pending
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
+
+    const KEY: TaskKey = TaskKey(2);
+    const OTHER: TaskKey = TaskKey(5);
+    const ROOT: TaskKey = TaskKey(1);
+    const GEN: GenerationId = GenerationId(0);
+
+    fn policy() -> PathPolicy {
+        PathPolicy {
+            version: PathPolicyVersion::V2,
+            case_fold: false,
+            grammar: PathGrammar::Globset,
+        }
+    }
+
+    fn region(name: &str) -> PathSet {
+        PathSet::Prefixes {
+            paths: vec![GitPath(format!("src/{name}"))],
+        }
+    }
+
+    fn quiet() -> VisibleFacts {
+        VisibleFacts {
+            terminal: false,
+            own_question: false,
+            queued_candidate: false,
+            owns_transaction: false,
+            repair_child: false,
+            unelapsed_backoff: false,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_candidate_gives_up_its_generations_region_and_holds_the_one_it_touched() {
+        let mut leases = LeaseTable::new();
+        leases.grant(
+            LeaseOwner::Generation {
+                key: KEY,
+                generation: GEN,
+            },
+            region("predicted"),
+        );
+        take_candidate_region(
+            &mut leases,
+            &CandidateLeaseEffect::ReplacesPredicted {
+                paths: region("actual"),
+            },
+            KEY,
+            GEN,
+        );
+
+        assert!(
+            !leases.holds(LeaseOwner::Generation {
+                key: KEY,
+                generation: GEN
+            }),
+            "the prediction the dispatch took is released by the candidate that replaces it"
+        );
+        assert!(leases.holds(LeaseOwner::Candidate {
+            key: KEY,
+            generation: GEN
+        }));
+        let onlooker = LeaseOwner::Generation {
+            key: OTHER,
+            generation: GEN,
+        };
+        assert!(
+            leases.overlaps_another(onlooker, &region("actual"), &policy()),
+            "the region it now holds is the one its diff touched"
+        );
+        assert!(
+            !leases.overlaps_another(onlooker, &region("predicted"), &policy()),
+            "and the prediction is no longer held by anyone"
+        );
+    }
+
+    #[test]
+    fn a_lineage_members_candidate_widens_its_lineage_and_takes_no_lease_of_its_own() {
+        let mut leases = LeaseTable::new();
+        leases.widen_lineage(ROOT, &region("root"));
+        take_candidate_region(
+            &mut leases,
+            &CandidateLeaseEffect::WidensLineage {
+                root: ROOT,
+                paths: region("repair"),
+            },
+            KEY,
+            GEN,
+        );
+
+        let lease = leases
+            .lineage(ROOT)
+            .expect("the lineage still holds a lease");
+        assert_eq!(
+            lease.paths,
+            PathSet::Prefixes {
+                paths: vec![
+                    GitPath("src/root".to_owned()),
+                    GitPath("src/repair".to_owned())
+                ]
+            },
+            "the lineage's region grows by exactly the region the repair's diff touched"
+        );
+        assert!(
+            !leases.holds(LeaseOwner::Candidate {
+                key: KEY,
+                generation: GEN
+            }),
+            "a lineage member's candidate takes no holding of its own"
+        );
+        assert!(
+            !leases.holds(LeaseOwner::Generation {
+                key: KEY,
+                generation: GEN
+            }),
+            "and releases none, because its generation inherited the lineage's"
+        );
+    }
+
+    #[test]
+    fn only_a_generation_that_holds_its_own_region_releases_one_when_it_closes() {
+        assert!(releases_own_region(GenerationLease::Own));
+        assert!(!releases_own_region(GenerationLease::InheritedLineage {
+            root: ROOT
+        }));
+    }
+
+    #[test]
+    fn a_terminal_task_keeps_the_state_it_reached() {
+        let every_other_fact = VisibleFacts {
+            terminal: true,
+            own_question: true,
+            queued_candidate: true,
+            owns_transaction: true,
+            repair_child: true,
+            unelapsed_backoff: true,
+        };
+        assert_eq!(derived_state(every_other_fact), None);
+        assert_eq!(
+            derived_state(VisibleFacts {
+                terminal: true,
+                ..quiet()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn an_open_question_of_its_own_outranks_every_other_visible_fact() {
+        let alone = VisibleFacts {
+            own_question: true,
+            ..quiet()
+        };
+        assert_eq!(derived_state(alone), Some(TaskState::AwaitingInput));
+        for (name, facts) in [
+            (
+                "a queued candidate",
+                VisibleFacts {
+                    queued_candidate: true,
+                    ..alone
+                },
+            ),
+            (
+                "an owned transaction",
+                VisibleFacts {
+                    owns_transaction: true,
+                    ..alone
+                },
+            ),
+            (
+                "a registered repair child",
+                VisibleFacts {
+                    repair_child: true,
+                    ..alone
+                },
+            ),
+            (
+                "an unelapsed backoff",
+                VisibleFacts {
+                    unelapsed_backoff: true,
+                    ..alone
+                },
+            ),
+        ] {
+            assert_eq!(
+                derived_state(facts),
+                Some(TaskState::AwaitingInput),
+                "{name} does not outrank a question the task still has of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_queued_candidate_or_an_owned_transaction_is_awaiting_merge() {
+        for (name, facts) in [
+            (
+                "queued",
+                VisibleFacts {
+                    queued_candidate: true,
+                    ..quiet()
+                },
+            ),
+            (
+                "under an integration it owns",
+                VisibleFacts {
+                    owns_transaction: true,
+                    ..quiet()
+                },
+            ),
+            (
+                "both",
+                VisibleFacts {
+                    queued_candidate: true,
+                    owns_transaction: true,
+                    ..quiet()
+                },
+            ),
+            (
+                "queued with a repair child and a backoff",
+                VisibleFacts {
+                    queued_candidate: true,
+                    repair_child: true,
+                    unelapsed_backoff: true,
+                    ..quiet()
+                },
+            ),
+        ] {
+            assert_eq!(
+                derived_state(facts),
+                Some(TaskState::AwaitingMerge),
+                "a task that is {name} is awaiting merge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repair_child_outranks_an_unelapsed_backoff_and_a_quiet_task_is_pending() {
+        assert_eq!(
+            derived_state(VisibleFacts {
+                repair_child: true,
+                unelapsed_backoff: true,
+                ..quiet()
+            }),
+            Some(TaskState::AwaitingRepair)
+        );
+        assert_eq!(
+            derived_state(VisibleFacts {
+                repair_child: true,
+                ..quiet()
+            }),
+            Some(TaskState::AwaitingRepair)
+        );
+        assert_eq!(
+            derived_state(VisibleFacts {
+                unelapsed_backoff: true,
+                ..quiet()
+            }),
+            Some(TaskState::Deferred)
+        );
+        assert_eq!(derived_state(quiet()), Some(TaskState::Pending));
     }
 }

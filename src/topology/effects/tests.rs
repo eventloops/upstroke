@@ -597,7 +597,8 @@ fn every_group_enums_all_slice_lists_every_one_of_its_variants() {
             for site in all {
                 let position: usize = $slot(*site);
                 assert_eq!(
-                    all[position], *site,
+                    all.get(position),
+                    Some(site),
                     concat!(stringify!($enum), " is not at the slot it claims")
                 );
                 assert!(seen.insert(position), "two variants claim one slot");
@@ -719,14 +720,40 @@ fn the_inventory_is_the_eleven_groups_and_every_one_of_them_has_sites() {
     // wire form ambiguous and `from_name` arbitrary.
     let names: BTreeSet<String> = sites.iter().map(|site| site.name()).collect();
     assert_eq!(names.len(), sites.len(), "two sites share a dotted name");
-    // The site's group prefix is its group's own name, not a second copy.
+    // The eleven group names, as literals. `name()` is
+    // `format!("{}.{}", group().name(), variant())`, so asserting that a
+    // dotted name starts with `group().name()` is a tautology: it holds
+    // whatever the group is called, including after a rename to `worktree`
+    // that would break every dotted name the design writes down.
+    for (group, spelling) in [
+        (FunnelGroup::Worktree, "Worktree"),
+        (FunnelGroup::Snapshot, "Snapshot"),
+        (FunnelGroup::Ref, "Ref"),
+        (FunnelGroup::Object, "Object"),
+        (FunnelGroup::RunDir, "RunDir"),
+        (FunnelGroup::Event, "Event"),
+        (FunnelGroup::Answer, "Answer"),
+        (FunnelGroup::Lock, "Lock"),
+        (FunnelGroup::Report, "Report"),
+        (FunnelGroup::Process, "Process"),
+        (FunnelGroup::Container, "Container"),
+    ] {
+        assert_eq!(group.name(), spelling, "{group:?}");
+    }
+    let spellings: BTreeSet<&str> = FunnelGroup::ALL.iter().map(|group| group.name()).collect();
+    assert_eq!(spellings.len(), 11, "two groups share a name");
+    // And every dotted name is one of those spellings, a dot, and a
+    // non-empty variant that carries no second dot -- the grammar
+    // `from_name` and the wire form both parse by.
     for site in &sites {
-        assert!(
-            site.name()
-                .starts_with(&format!("{}.", site.group().name())),
-            "{} is not named for its group",
-            site.name()
-        );
+        let name = site.name();
+        let (prefix, variant) = name
+            .split_once('.')
+            .unwrap_or_else(|| panic!("{name} is not a dotted name"));
+        assert!(spellings.contains(prefix), "{name} names no group");
+        assert_eq!(prefix, site.group().name(), "{name}");
+        assert!(!variant.is_empty(), "{name} has no variant");
+        assert!(!variant.contains('.'), "{name} has a second dot");
     }
 }
 
@@ -1108,14 +1135,39 @@ fn an_adjacency_before_a_kind_is_not_the_adjacency_after_it() {
     assert_eq!(Adjacent::None, Adjacent::None);
     assert_eq!(Adjacent::None.event(), None);
 
-    // The consequence the framework actually depends on: the two
-    // directions are the two observable orders, and they are different
-    // orders.
-    for kind in DurableEvent::ALL {
-        assert_ne!(
-            observable_orders_of(Adjacent::Before(*kind)),
-            observable_orders_of(Adjacent::After(*kind)),
-            "{kind}"
+    // The consequence the framework actually depends on, read through the
+    // production function rather than through the local restatement of it:
+    // a site ordered before its event and a site ordered after one answer
+    // different observable orders. Asserting `observable_orders_of` against
+    // itself exercises no production code at all, and passed for any
+    // `EffectSiteId::observable_orders` whatever.
+    let before_site = EffectSiteId::all()
+        .into_iter()
+        .find(|site| matches!(site.adjacent(), Adjacent::Before(_)))
+        .expect("some site is ordered before its append");
+    let after_site = EffectSiteId::all()
+        .into_iter()
+        .find(|site| matches!(site.adjacent(), Adjacent::After(_)))
+        .expect("some site is ordered after its append");
+    assert_eq!(
+        before_site.observable_orders(),
+        &[ObservableOrder::EffectBeforeEvent]
+    );
+    assert_eq!(
+        after_site.observable_orders(),
+        &[ObservableOrder::EventBeforeEffect]
+    );
+    assert_ne!(
+        before_site.observable_orders(),
+        after_site.observable_orders()
+    );
+    // And the local restatement agrees with the production reader at every
+    // site, so the helper the test above uses cannot drift away from it.
+    for site in EffectSiteId::all() {
+        assert_eq!(
+            observable_orders_of(site.adjacent()),
+            site.observable_orders(),
+            "{site}"
         );
     }
 }
@@ -1224,6 +1276,47 @@ fn only_the_legacy_event_sites_are_outside_the_claim() {
             FunnelGroup::Report
         ])
     );
+}
+
+#[test]
+fn the_claimed_inventory_is_every_site_but_the_two_legacy_ones() {
+    // `EffectSiteId::claimed()` is what every gate hands `check_bijection`,
+    // and the test above states the same fact about `scope()` by filtering
+    // `all()` itself — so nothing read the function. A `claimed()` that
+    // returned `all()` unfiltered satisfies every other use of it in this
+    // suite: a superset passes `every_external_and_process_local_row_has_at
+    // _least_one_claimed_site`, passes the `claimed().len() >= 60` floor,
+    // and adds two more failures to a check that already expects a hundred.
+    let all = EffectSiteId::all();
+    let claimed = EffectSiteId::claimed();
+    let legacy = [
+        EffectSiteId::Event(EventSite::LegacyOpenLog),
+        EffectSiteId::Event(EventSite::LegacyAppend),
+    ];
+    assert_eq!(
+        claimed.len(),
+        all.len() - legacy.len(),
+        "the claim is the inventory less exactly the legacy sites"
+    );
+    let missing: Vec<EffectSiteId> = all
+        .iter()
+        .copied()
+        .filter(|site| !claimed.contains(site))
+        .collect();
+    assert_eq!(missing, legacy.to_vec(), "{missing:?}");
+    for site in &claimed {
+        assert!(site.scope().is_claimed(), "{site}");
+        assert!(all.contains(site), "{site} is claimed and not inventoried");
+    }
+    // A filter of `all()`, not a second derivation: the survivors keep the
+    // inventory's order, so a caller that zips the two lists is not zipping
+    // two orders.
+    let filtered: Vec<EffectSiteId> = all
+        .iter()
+        .copied()
+        .filter(|site| !legacy.contains(site))
+        .collect();
+    assert_eq!(claimed, filtered);
 }
 
 #[test]
@@ -1650,6 +1743,66 @@ fn only_the_three_sites_a_fast_sequence_skips_may_record_that_they_did_not_run()
 }
 
 #[test]
+fn the_ledger_rows_hosts_and_classes_are_spelt_as_the_design_spells_them() {
+    // Three `name()` functions whose text nothing in this family compared
+    // with a literal. Every assertion elsewhere is between two enum values,
+    // and the wire forms are serde's own renames, so all three could answer
+    // anything: a `ResourceRow` mis-spelt here reaches a reader through a
+    // `RegistryError`, a `BijectionFailure` and every assertion message in
+    // this file, and the ledger it names is `decisions.resource_accounting`.
+    let rows: &[(ResourceRow, &str)] = &[
+        (ResourceRow::R9, "R9"),
+        (ResourceRow::R10, "R10"),
+        (ResourceRow::R11, "R11"),
+        (ResourceRow::R12, "R12"),
+        (ResourceRow::R17, "R17"),
+        (ResourceRow::R18, "R18"),
+        (ResourceRow::R19, "R19"),
+        (ResourceRow::R21, "R21"),
+        (ResourceRow::R22, "R22"),
+        (ResourceRow::R23, "R23"),
+        (ResourceRow::R24, "R24"),
+        (ResourceRow::R25, "R25"),
+        (ResourceRow::R26, "R26"),
+        (ResourceRow::R27, "R27"),
+        (ResourceRow::R28, "R28"),
+    ];
+    assert_eq!(rows.len(), ResourceRow::ALL.len());
+    for (row, spelling) in rows.iter().copied() {
+        assert_eq!(row.name(), spelling, "{row:?}");
+        // Display is the name and not a second spelling of it.
+        assert_eq!(row.to_string(), spelling, "{row:?}");
+    }
+    let spellings: BTreeSet<&str> = ResourceRow::ALL.iter().map(|row| row.name()).collect();
+    assert_eq!(spellings.len(), rows.len(), "two rows share an id");
+
+    // `Host` names reach a reader through every per-host assertion message in
+    // this file, and the two are the whole of the type.
+    assert_eq!(Host::Windows.name(), "windows");
+    assert_eq!(Host::Unix.name(), "unix");
+    assert_eq!(Host::Windows.to_string(), "windows");
+    assert_eq!(Host::Unix.to_string(), "unix");
+    assert_ne!(Host::Windows.name(), Host::Unix.name());
+
+    // The class's name is the classifier outcome it stands for, spelt as the
+    // packet spells it, and is what `RegistryError::ResidueClaimsExecution`
+    // and `NoSuchResidueClass` put in front of a reader. It is not the wire
+    // form, which serde renames.
+    assert_eq!(
+        ResidueClass::ObjectInternal.name(),
+        "ObjectResidue::Internal"
+    );
+    assert_eq!(
+        EntryPhase::Residue {
+            class: ResidueClass::ObjectInternal,
+        }
+        .to_string(),
+        "ObjectResidue::Internal",
+        "the entry phase displays as the class it is about"
+    );
+}
+
+#[test]
 fn a_site_name_no_group_declares_is_refused() {
     for name in [
         "RunDir.NoSuchSite",
@@ -1935,13 +2088,17 @@ fn no_execution_entry(site: EffectSiteId) -> RegistryEntry {
 /// wrote one number for four sites could not show that anything reads it.
 /// One of the four is deliberately zero: "hitting Internal is recorded but
 /// never required".
-fn sampling_for(site: EffectSiteId) -> (u32, u32) {
+///
+/// `None` for every other site, rather than an `unreachable!` arm: §7 denies
+/// that macro in tests too, having no Clippy allowance to take, and the one
+/// caller fails its own setup with a message naming the premise.
+fn sampling_for(site: EffectSiteId) -> Option<(u32, u32)> {
     match site {
-        EffectSiteId::Object(ObjectSite::CandidateCommitTree) => (61, 0),
-        EffectSiteId::Object(ObjectSite::RepairMaterialize) => (23, 4),
-        EffectSiteId::Object(ObjectSite::ProposalCherryPick) => (37, 9),
-        EffectSiteId::Worktree(WorktreeSite::AddStaging) => (19, 2),
-        other => unreachable!("the fixture drives no other residue-class site: {other}"),
+        EffectSiteId::Object(ObjectSite::CandidateCommitTree) => Some((61, 0)),
+        EffectSiteId::Object(ObjectSite::RepairMaterialize) => Some((23, 4)),
+        EffectSiteId::Object(ObjectSite::ProposalCherryPick) => Some((37, 9)),
+        EffectSiteId::Worktree(WorktreeSite::AddStaging) => Some((19, 2)),
+        _ => None,
     }
 }
 
@@ -1987,7 +2144,9 @@ fn self_test_registry(host: Host) -> Vec<RegistryEntry> {
         // registry" — and one class deliberately never hit.
         for class in site.residue_classes() {
             assert_eq!(*class, ResidueClass::ObjectInternal);
-            let (n, internal) = sampling_for(site);
+            let (n, internal) = sampling_for(site).expect(
+                "the fixture drives only the four residue-class sites `sampling_for` names",
+            );
             registry
                 .insert(residue_entry(site, n, internal))
                 .expect("residue entry");
@@ -2195,8 +2354,8 @@ const FIXTURE_SHAPES: &[(Host, FixtureShape)] = &[
             order: 3,
             fault_row: 6,
             rows: 9,
-            detail: 17,
-            resume_action: 8,
+            detail: 18,
+            resume_action: 9,
             label: 2,
             evidence_kind: 3,
             test_name: 38,
@@ -2213,8 +2372,15 @@ fn the_self_test_fixture_varies_every_field_it_reads() {
     // these is asserted to take more than one — and the ones that are
     // deliberately constant say so.
     assert_eq!(FIXTURE_SHAPES.len(), Host::ALL.len());
+    // The table is a literal, so the message prints what the fixture
+    // actually is when the two disagree: a bare `assert_eq!` on a struct of
+    // eleven numbers is otherwise a puzzle to re-derive by hand.
     for (host, expected) in FIXTURE_SHAPES.iter().copied() {
-        assert_eq!(fixture_shape(host), expected, "the {host} fixture");
+        let measured = fixture_shape(host);
+        assert_eq!(
+            measured, expected,
+            "the {host} fixture measured {measured:?}, table says {expected:?}"
+        );
     }
     // Every count above is at least two except the ones named here, so a
     // table edited to a pile of ones would not pass by being a table.
@@ -2360,20 +2526,6 @@ fn the_self_test_fixture_varies_every_field_it_reads() {
             .map(|record| record.element)
             .collect();
         assert_eq!(elements.len(), 8, "{host}: {elements:?}");
-    }
-}
-
-#[test]
-fn the_fixture_shape_table_is_measured_and_not_asserted_into_being() {
-    // The table above is a literal, so this prints what the fixture
-    // actually is when it disagrees — a bare `assert_eq!` on a struct of
-    // eleven numbers is otherwise a puzzle to re-derive by hand.
-    for (host, expected) in FIXTURE_SHAPES.iter().copied() {
-        let measured = fixture_shape(host);
-        assert_eq!(
-            measured, expected,
-            "{host} fixture measured {measured:?}, table says {expected:?}"
-        );
     }
 }
 
@@ -2601,7 +2753,10 @@ fn no_execution_evidence_holds_inside_an_exercised_fast_sequence_or_it_holds_not
 
     // (g) The format refuses a record that names no sequence at all,
     // before the bijection is reached.
-    let mut unwitnessed = no_execution_entry(skipped[0]);
+    let first_skipped = *skipped
+        .first()
+        .expect("the three sites a fast sequence skips");
+    let mut unwitnessed = no_execution_entry(first_skipped);
     if let Evidence::NotExecuted { sequences, .. } = &mut unwitnessed.evidence {
         sequences.clear();
     }
@@ -2913,6 +3068,15 @@ fn a_destructive_sites_before_entry_names_the_target_it_is_about_to_destroy() {
 
 #[test]
 fn the_harness_counts_what_the_funnel_told_it_and_answers_what_is_armed() {
+    // The domain two tests below sweep. An empty `PHASES` would make each of
+    // those loops vacuous and every assertion inside them unreachable, so the
+    // slice is pinned where it is read rather than assumed.
+    assert_eq!(
+        HookPhase::PHASES,
+        &[HookPhase::Before, HookPhase::After],
+        "the hook phases are the two the funnel calls"
+    );
+
     let site = EffectSiteId::Event(EventSite::AppendFirst);
     let written = |mode| HookPhase::Point {
         point: SubEffectPoint::Written,
@@ -3246,6 +3410,103 @@ fn an_unarmed_harness_substantiates_no_mode_however_far_the_funnels_run() {
 }
 
 #[test]
+fn a_site_a_funnel_only_reached_is_touched_and_covers_nothing() {
+    // `HookHarness::touched` answers over *both* records — what executed and
+    // what a funnel merely walked past — and only the first half was ever
+    // exercised. Every call in this suite is made after `drive`, which hooks
+    // both phases, so the reached half could be deleted and nothing would
+    // say so; `touched` is what
+    // `the_framework_self_test_round_trips_through_enums_harness_and_registry`
+    // uses to show that the three fast-path sites have coverage at all.
+    let site = EffectSiteId::Event(EventSite::AppendFirst);
+    let other = EffectSiteId::Event(EventSite::Append);
+    let phase = HookPhase::Point {
+        point: SubEffectPoint::Written,
+        mode: InjectionMode::Kill,
+    };
+
+    let mut harness = HookHarness::new();
+    assert!(!harness.touched(site));
+    // Reached, deliberately unarmed: nothing is injected and nothing is
+    // coverage.
+    assert_eq!(harness.hook(site, phase), Injection::Proceed);
+    assert!(harness.coverage().is_empty(), "{:?}", harness.coverage());
+    assert_eq!(harness.executions(), 0);
+    assert!(!harness.observed(site, phase));
+    assert_eq!(harness.count(site, phase), 0);
+    assert!(harness.reached_point(site, SubEffectPoint::Written, InjectionMode::Kill));
+    // ...and the funnel was still there, which is the question `touched`
+    // answers and the only record that can answer it here.
+    assert!(
+        harness.touched(site),
+        "a site whose funnel reached a point was reported untouched"
+    );
+    assert!(!harness.touched(other), "a site no funnel reached");
+}
+
+#[test]
+fn a_fast_sequence_is_exercised_by_any_hook_the_harness_records_in_it() {
+    // `DESIGN.md` §26: "a sequence is exercised only by what the harness
+    // observed inside it: the harness records a hook of some site while
+    // recording that sequence. This observation is the marker." *A hook*, and
+    // not an injected one: `HookHarness::hook` records the site into the open
+    // sequence before it decides whether anything fires, so a funnel that
+    // walks past an unarmed point inside a fast integration has exercised it.
+    // Every fast sequence this suite builds is driven through `drive`, which
+    // hooks `Before` first, so the marker was only ever set by a hook phase
+    // and a checker that ignored unarmed points would pass.
+    let host = Host::current();
+    let site = EffectSiteId::Event(EventSite::AppendFirst);
+    let mut harness = HookHarness::new();
+
+    harness.begin_fast_sequence("fast/only-reached");
+    assert_eq!(
+        harness.hook(
+            site,
+            HookPhase::Point {
+                point: SubEffectPoint::Written,
+                mode: InjectionMode::Kill,
+            }
+        ),
+        Injection::Proceed,
+        "the point is unarmed, so nothing is injected and nothing is coverage"
+    );
+    harness.end_fast_sequence();
+    assert!(harness.coverage().is_empty(), "{:?}", harness.coverage());
+
+    // The lookup `check_bijection` reads to tell an invented sequence name
+    // from an exercised one.
+    let sequence = harness
+        .fast_sequence("fast/only-reached")
+        .expect("the sequence the suite began");
+    assert_eq!(sequence.name(), "fast/only-reached");
+    assert_eq!(sequence.touched(), [site]);
+    assert!(sequence.ran(site));
+    assert!(!sequence.ran(EffectSiteId::Event(EventSite::Append)));
+    assert!(
+        harness.fast_sequence("fast/never-begun").is_none(),
+        "a name the suite never began is not a sequence"
+    );
+
+    // And the check agrees: this trace is not the empty one.
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [],
+        "a sequence the harness recorded a hook in was reported empty"
+    );
+    // The contrast, so the assertion above is not passing because nothing is
+    // checked: the same harness with a second sequence nothing was hooked in.
+    harness.begin_fast_sequence("fast/hollow");
+    harness.end_fast_sequence();
+    assert_eq!(
+        check_bijection(&[], &harness, &[], host),
+        [BijectionFailure::EmptyFastSequence {
+            sequence: "fast/hollow".to_owned(),
+        }]
+    );
+}
+
+#[test]
 fn the_harness_refuses_to_arm_a_point_or_mode_the_site_does_not_have() {
     let mut harness = HookHarness::new();
     let commit_tree = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
@@ -3334,10 +3595,10 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     for bad in [claims_by_evidence, claims_by_label] {
         let mut entries = self_test_registry(host);
         let slot = entries
-            .iter()
-            .position(|entry| entry.key() == bad.key())
+            .iter_mut()
+            .find(|entry| entry.key() == bad.key())
             .expect("the self-test registry holds this key");
-        entries[slot] = bad;
+        *slot = bad;
         let failures = check_bijection(
             &self_test_inventory(),
             &self_test_harness(host),
@@ -3382,10 +3643,10 @@ fn a_residue_class_entry_with_an_executed_hook_claim_is_refused() {
     // as.
     let mut entries = self_test_registry(host);
     let slot = entries
-        .iter()
-        .position(|entry| entry.key() == hook.key())
+        .iter_mut()
+        .find(|entry| entry.key() == hook.key())
         .expect("the self-test registry holds this site's before phase");
-    entries[slot] = hook;
+    *slot = hook;
     let failures = check_bijection(
         &self_test_inventory(),
         &self_test_harness(host),
@@ -3459,14 +3720,19 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
             .map(|name| (*name).to_owned())
             .collect(),
     };
-    let recovery = match residue_entry(commit_tree, 61, 0).evidence {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!(),
-    };
-    let recovery_for_skipped = match residue_entry(skipped, 23, 4).evidence {
-        evidence @ Evidence::RecoveryProven { .. } => evidence,
-        _ => unreachable!(),
-    };
+    // Assertions naming the premise rather than `unreachable!` arms: §7 denies
+    // that macro in tests too, and a test that fails its own setup says which
+    // premise failed.
+    let recovery = residue_entry(commit_tree, 61, 0).evidence;
+    assert!(
+        matches!(recovery, Evidence::RecoveryProven { .. }),
+        "a residue entry carries recovery-proven evidence"
+    );
+    let recovery_for_skipped = residue_entry(skipped, 23, 4).evidence;
+    assert!(
+        matches!(recovery_for_skipped, Evidence::RecoveryProven { .. }),
+        "a residue entry carries recovery-proven evidence"
+    );
 
     let mut legal = 0;
     let mut refused = 0;
@@ -3498,16 +3764,76 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
                     ) | (EntryPhase::NoExecution, 1, EvidenceLabel::ExecutionObserved)
                         | (EntryPhase::Residue { .. }, 2, EvidenceLabel::RecoveryProven)
                 );
+                // *Which* refusal, and not merely that there was one. The
+                // twenty-five illegal cells are refused by six different
+                // clauses, and a format that answered one refusal for every
+                // wrong cell -- or that reached the label rules before the
+                // residue clause -- satisfies `is_err()` at all twenty-five.
+                // The clauses, in the order `validate_entry` applies them: a
+                // residue class whose evidence or label claims an execution;
+                // then a phase that is not about a class carrying
+                // recovery-proven evidence; then a label that is not the one
+                // the phase requires; then a no-execution record carrying
+                // executed-hook evidence, or a hook phase carrying a
+                // not-executed record; then a label that contradicts the
+                // evidence's own shape.
+                let residue_phase = matches!(phase, EntryPhase::Residue { .. });
+                let no_execution = phase == EntryPhase::NoExecution;
+                let expected_refusal = if residue_phase
+                    && (evidence_kind == 0 || label == EvidenceLabel::ExecutionObserved)
+                {
+                    Some("residue-claims-execution")
+                } else if !residue_phase && evidence_kind == 2 {
+                    Some("hook-claims-recovery-proof")
+                } else if expected_legal {
+                    None
+                } else if label != phase.required_label() {
+                    Some("mislabelled")
+                } else if no_execution && evidence_kind == 0 {
+                    Some("no-execution-claims-hook")
+                } else if !residue_phase && evidence_kind == 1 {
+                    Some("hook-claims-no-execution")
+                } else {
+                    // A residue class, correctly labelled, carrying a
+                    // not-executed record: the label and the evidence's own
+                    // shape disagree.
+                    Some("label-contradicts-evidence")
+                };
                 let result = FaultRegistry::new().insert(entry);
                 assert_eq!(
                     result.is_ok(),
                     expected_legal,
                     "phase {phase}, evidence {evidence_kind}, label {label:?}: {result:?}"
                 );
-                if expected_legal {
-                    legal += 1;
-                } else {
-                    refused += 1;
+                match (expected_refusal, &result) {
+                    (None, Ok(())) => legal += 1,
+                    (
+                        Some("residue-claims-execution"),
+                        Err(RegistryError::ResidueClaimsExecution { .. }),
+                    )
+                    | (
+                        Some("hook-claims-recovery-proof"),
+                        Err(RegistryError::HookClaimsRecoveryProof { .. }),
+                    )
+                    | (Some("mislabelled"), Err(RegistryError::MislabelledEntry { .. }))
+                    | (
+                        Some("no-execution-claims-hook"),
+                        Err(RegistryError::NoExecutionClaimsHook { .. }),
+                    )
+                    | (
+                        Some("hook-claims-no-execution"),
+                        Err(RegistryError::HookClaimsNoExecution { .. }),
+                    )
+                    | (
+                        Some("label-contradicts-evidence"),
+                        Err(RegistryError::LabelContradictsEvidence { .. }),
+                    ) => {
+                        refused += 1;
+                    }
+                    _ => panic!(
+                        "phase {phase}, evidence {evidence_kind}, label {label:?}: expected \
+                         {expected_refusal:?}, got {result:?}"
+                    ),
                 }
             }
         }
@@ -3957,10 +4283,7 @@ fn the_format_refuses_residue_and_resume_semantics_the_site_does_not_have() {
         );
         assert_eq!(
             FaultRegistry::new().insert(entry.clone()),
-            Err(match validate_entry(&entry) {
-                Err(error) => error,
-                Ok(()) => unreachable!("just refused"),
-            }),
+            Err(error),
             "{label} was accepted by the constructor"
         );
     }
@@ -4064,11 +4387,11 @@ fn the_format_refuses_residue_and_resume_semantics_the_site_does_not_have() {
         },
     ] {
         let mut entries = self_test_registry(host);
-        let position = entries
-            .iter()
-            .position(|entry| entry.site == commit_tree && entry.phase == phase)
-            .expect("the fixture carries this entry");
-        entries[position].resume_action = "do nothing".to_owned();
+        entries
+            .iter_mut()
+            .find(|entry| entry.site == commit_tree && entry.phase == phase)
+            .expect("the fixture carries this entry")
+            .resume_action = "do nothing".to_owned();
         let failures = check_bijection(
             &self_test_inventory(),
             &self_test_harness(host),
@@ -4279,7 +4602,7 @@ const AFTER_EFFECT_ORACLE: &[(&str, AfterEffect)] = &[
     ("Answer.Ingest", AfterEffect::NoEffect),
     ("Lock.AcquireRun", AfterEffect::Referenced),
     ("Lock.AcquireWorktree", AfterEffect::Referenced),
-    ("Lock.ProbeCleanupExclusive", AfterEffect::Referenced),
+    ("Lock.ProbeCleanupExclusive", AfterEffect::MomentaryHold),
     ("Lock.Release", AfterEffect::Removed),
     ("Lock.CreateWorktreeLockFile", AfterEffect::Referenced),
     ("Lock.ObserveCleanupHold", AfterEffect::NoEffect),
@@ -4539,8 +4862,8 @@ const POINT_ORACLE: &[(
         SubEffectPoint::AmbientJobJoined,
         InjectionMode::ErrorReturn,
         OracleRows::NoRow,
-        ResidueArtifact::NoHostProcess,
-        ResumeAction::RefuseResumably,
+        ResidueArtifact::NoProcessSpawned,
+        ResumeAction::RefuseUnspawned,
     ),
     (
         SubEffectPoint::CreatedSuspended,
@@ -4679,7 +5002,10 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
     for site in EffectSiteId::all() {
         assert_eq!(
             site.after_effect(),
-            oracle[site.name().as_str()],
+            oracle
+                .get(site.name().as_str())
+                .copied()
+                .expect("the oracle is total over the inventory, asserted above"),
             "{site}'s after phase"
         );
     }
@@ -4703,7 +5029,10 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
     for site in EffectSiteId::all() {
         assert_eq!(
             site.before_state(),
-            before_oracle[site.name().as_str()],
+            before_oracle
+                .get(site.name().as_str())
+                .copied()
+                .expect("the oracle is total over the inventory, asserted above"),
             "{site}'s before phase"
         );
     }
@@ -4801,6 +5130,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
         AfterEffect::Unreferenced,
         AfterEffect::Released,
         AfterEffect::Removed,
+        AfterEffect::MomentaryHold,
     ] {
         assert!(
             EffectSiteId::all()
@@ -4836,7 +5166,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 "{point}'s residue rows at a site whose row is {probe_row}"
             );
         }
-        assert_eq!(point.residue_artifact(), artifact, "{point}'s artifact");
+        assert_eq!(
+            point.residue_artifact(mode),
+            artifact,
+            "{point}/{mode:?}'s artifact"
+        );
         assert_eq!(
             point.resume_action(mode),
             action,
@@ -4987,6 +5321,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 assert_eq!(after.artifact, ResidueArtifact::Removed, "{site}");
                 assert_eq!(after.action, ResumeAction::AdoptPerformed, "{site}");
             }
+            AfterEffect::MomentaryHold => {
+                assert!(after.rows.is_empty(), "{site}");
+                assert_eq!(after.artifact, ResidueArtifact::HoldReleased, "{site}");
+                assert_eq!(after.action, ResumeAction::RepeatProbe, "{site}");
+            }
         }
 
         for class in site.residue_classes() {
@@ -5024,7 +5363,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 );
                 assert_eq!(
                     semantics.artifact,
-                    point.residue_artifact(),
+                    point.residue_artifact(*mode),
                     "{site}/{phase}"
                 );
                 assert_eq!(
@@ -5101,7 +5440,9 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResidueArtifact::TornTailTruncated
             | ResidueArtifact::PrefixPossiblyNonDurable
             | ResidueArtifact::NoHostProcess
-            | ResidueArtifact::ReaperHeldGroup => {}
+            | ResidueArtifact::NoProcessSpawned
+            | ResidueArtifact::ReaperHeldGroup
+            | ResidueArtifact::HoldReleased => {}
         }
     }
     assert_eq!(
@@ -5123,7 +5464,9 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResumeAction::NextOpenConverges
             | ResumeAction::RefuseResumably
             | ResumeAction::AmbientHandleTerminates
-            | ResumeAction::ReaperSettlesGroup => {}
+            | ResumeAction::ReaperSettlesGroup
+            | ResumeAction::RefuseUnspawned
+            | ResumeAction::RepeatProbe => {}
         }
     }
     assert_eq!(
@@ -5281,13 +5624,17 @@ fn the_bijection_refuses_a_hand_edited_slice_that_keys_one_coordinate_twice() {
         .iter()
         .position(|entry| entry.site == commit_tree && entry.phase == EntryPhase::After)
         .expect("the fixture carries an after-phase entry");
-    let mut second = entries[position].clone();
+    let original = entries
+        .get(position)
+        .cloned()
+        .expect("the position the search above returned");
+    let mut second = original.clone();
     second.evidence = Evidence::Executed {
         test: "st07::a-different-test".to_owned(),
         passed: false,
     };
-    assert_eq!(second.key(), entries[position].key(), "the same key");
-    assert_ne!(second, entries[position], "and a different claim");
+    assert_eq!(second.key(), original.key(), "the same key");
+    assert_ne!(second, original, "and a different claim");
     validate_entry(&second).expect("individually valid");
     entries.insert(position + 1, second.clone());
 
@@ -5334,6 +5681,70 @@ fn the_bijection_refuses_a_hand_edited_slice_that_keys_one_coordinate_twice() {
         registry.insert(held),
         Err(RegistryError::DuplicateEntry { .. })
     ));
+}
+
+#[test]
+fn the_sampling_histogram_totals_its_three_counts_and_saturates() {
+    // `ClassHistogram::total` is public and this family reads it nowhere:
+    // `check_evidence` deliberately sums the three fields itself in `u64`,
+    // because a saturating `u32` sum agrees with an `n` of `u32::MAX`
+    // whatever the histogram holds — the reproduction the
+    // "a histogram whose saturating total equals n" direction carries. That
+    // makes the checker's arithmetic its own and leaves this function with no
+    // caller here at all, so its own behaviour is stated here.
+    assert_eq!(ClassHistogram::default().total(), 0);
+    assert_eq!(
+        ClassHistogram {
+            none: 3,
+            internal: 4,
+            after: 5,
+        }
+        .total(),
+        12
+    );
+    // Each field is added, and none is added twice.
+    for (histogram, total) in [
+        (
+            ClassHistogram {
+                none: 1,
+                internal: 0,
+                after: 0,
+            },
+            1,
+        ),
+        (
+            ClassHistogram {
+                none: 0,
+                internal: 1,
+                after: 0,
+            },
+            1,
+        ),
+        (
+            ClassHistogram {
+                none: 0,
+                internal: 0,
+                after: 1,
+            },
+            1,
+        ),
+    ] {
+        assert_eq!(histogram.total(), total, "{histogram:?}");
+    }
+    // Exact, not saturating: `total` sums three `u32`s in `u64`, so the
+    // boundary case that a `u32` sum answered as `u32::MAX` (wrong by one) is
+    // answered correctly. Pinned here so a return to a narrower sum fails.
+    let saturated = ClassHistogram {
+        none: u32::MAX,
+        internal: 1,
+        after: 0,
+    };
+    assert_eq!(saturated.total(), u64::from(u32::MAX) + 1);
+    assert_eq!(
+        u64::from(saturated.none) + u64::from(saturated.internal) + u64::from(saturated.after),
+        u64::from(u32::MAX) + 1,
+        "the sum that does not saturate is the one the bijection makes"
+    );
 }
 
 #[test]
@@ -5399,8 +5810,6 @@ fn the_bijection_fails_on_every_missing_link() {
     // showed the checker accepting valid input would pass for a checker
     // that accepted everything.
     let host = Host::current();
-    let commit_tree = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
-    let append = EffectSiteId::Event(EventSite::AppendFirst);
 
     let directions: &[Direction] = &[
         Direction {
@@ -5517,7 +5926,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].constructed = false;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .constructed = false;
                         break;
                     }
                 }
@@ -5540,7 +5952,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].recovered = false;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .recovered = false;
                         break;
                     }
                 }
@@ -5554,7 +5969,10 @@ fn the_bijection_fails_on_every_missing_link() {
             break_it: |_, entries| {
                 for entry in entries.iter_mut() {
                     if let Evidence::RecoveryProven { synthetic, .. } = &mut entry.evidence {
-                        synthetic[0].classified = ObjectResidue::After;
+                        synthetic
+                            .first_mut()
+                            .expect("a residue entry lists at least one element")
+                            .classified = ObjectResidue::After;
                         break;
                     }
                 }
@@ -5711,7 +6129,10 @@ fn the_bijection_fails_on_every_missing_link() {
         Direction {
             name: "an entry the format would have refused",
             break_it: |_, entries| {
-                entries[0].fault_row = FaultRow::TResume;
+                entries
+                    .first_mut()
+                    .expect("the self-test registry is not empty")
+                    .fault_row = FaultRow::TResume;
             },
             expect: |failure| matches!(failure, BijectionFailure::InvalidEntry { .. }),
         },
@@ -5741,7 +6162,90 @@ fn the_bijection_fails_on_every_missing_link() {
         )
         .is_empty()
     );
-    let _ = (commit_tree, append);
+}
+
+#[test]
+fn a_phase_bound_to_the_before_action_reports_the_before_entry_it_has_none_to_bind_to() {
+    // `check_bijection` states the resumes-as-before relation between two
+    // entries, and its third arm — there is no before-phase entry to bind to
+    // — was unwitnessed. The two arms that are witnessed both have one:
+    // `the_format_refuses_residue_and_resume_semantics_the_site_does_not_have`
+    // doctors the action and reads `ResumeActionNotBeforeAction`, and the
+    // passing fixture is the agreeing case. Delete the before entry and the
+    // coverage sweep reports it once on its own account, so the relation's
+    // own report is a *count*, not a variant: one per bound phase, plus the
+    // sweep's.
+    let host = Host::current();
+    let commit_tree = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
+    let entries = self_test_registry(host);
+    let bound = entries
+        .iter()
+        .filter(|entry| entry.site == commit_tree && entry.phase.resumes_as_before())
+        .count();
+    assert!(
+        bound >= 2,
+        "the fixture must carry more than one phase bound to the before action: {bound}"
+    );
+
+    let stripped: Vec<RegistryEntry> = entries
+        .iter()
+        .filter(|entry| !(entry.site == commit_tree && entry.phase == EntryPhase::Before))
+        .cloned()
+        .collect();
+    assert_eq!(stripped.len(), entries.len() - 1);
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &stripped,
+        host,
+    );
+    let reported = failures
+        .iter()
+        .filter(|failure| {
+            matches!(
+                failure,
+                BijectionFailure::MissingEntry {
+                    site,
+                    phase: EntryPhase::Before,
+                    ..
+                } if *site == commit_tree
+            )
+        })
+        .count();
+    assert_eq!(
+        reported,
+        bound + 1,
+        "the relation did not report the before entry each bound phase needs: {failures:#?}"
+    );
+
+    // The contrast: dropping a phase that is *not* bound to the before action
+    // is reported once, by the coverage sweep alone.
+    let without_after: Vec<RegistryEntry> = entries
+        .iter()
+        .filter(|entry| !(entry.site == commit_tree && entry.phase == EntryPhase::After))
+        .cloned()
+        .collect();
+    let failures = check_bijection(
+        &self_test_inventory(),
+        &self_test_harness(host),
+        &without_after,
+        host,
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|failure| matches!(
+                failure,
+                BijectionFailure::MissingEntry {
+                    site,
+                    phase: EntryPhase::After,
+                    ..
+                } if *site == commit_tree
+            ))
+            .count(),
+        1,
+        "{failures:#?}"
+    );
 }
 
 #[test]
