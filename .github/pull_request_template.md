@@ -16,6 +16,8 @@
 - [ ] `bash .github/scripts/test-pr-policy.sh`
 - [ ] `bash .github/scripts/test-pr-ledger-evidence.sh`
 - [ ] `bash .github/scripts/test-docs-consistency.sh`
+- [ ] `bash .github/scripts/test-internals-notes.sh`
+- [ ] `bash .github/scripts/test-pr-ready-audit.sh`
 
 Exact commands and results:
 

@@ -91,7 +91,7 @@ Read the `standards/` sections a change touches. In particular:
 
 ## How a change lands
 
-`MAINTAINING.md` is authoritative. In outline: draft PR early; the nine gates and both required
+`MAINTAINING.md` is authoritative. In outline: draft PR early; the ten gates and both required
 contexts (`upstroke-ci`, `upstroke-pr-policy`) green; one frontier review of the exact green head
 (`gpt-5.6-sol` at `max`, the verdict posted to the PR as one SHA-bound comment); triage: serious
 P1s relevant to the change are fixed and re-reviewed; a `MUST` deviation in touched code and any
