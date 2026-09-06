@@ -16,9 +16,11 @@ source, documentation, workflows, release machinery and this file.
    the two required contexts: `upstroke-ci` (formatting, Clippy on three platforms, the Linux and macOS
    test matrix, the Windows suite on its self-hosted ephemeral runner `test (winguest)`, the
    MSRV matrix, the five Bash gates) and `upstroke-pr-policy` (title, body sections, ledger). A
-   branch behind `master` is not updated by hand to merge: the merge queue builds the entry on
-   `master`'s head and runs both contexts there (step 7). Update it only when the change needs
-   what `master` gained, and then wait again.
+   branch behind `master` is not updated by hand to merge once the ruleset carries the merge
+   queue (Repository rules): the queue builds the entry on `master`'s head and runs both
+   contexts there (step 7), so update it only when the change needs what `master` gained.
+   Until the ruleset carries the queue, the up-to-date requirement stands: a branch behind
+   `master` is updated first and waits again, and the audit reports it as `behind-master`.
 4. **One frontier review pass on the green head.** Give the exact diff and head SHA to an
    independent frontier-class reviewer at `max` effort — today `gpt-5.6-sol` through `codex exec`,
    run by the owner's review driver against the pull request's own base. Allow at least 90 minutes per
