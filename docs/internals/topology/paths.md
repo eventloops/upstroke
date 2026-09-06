@@ -124,9 +124,21 @@ Whether this region is the everything region.
 The prefixes bounding this region, or `None` when it is unbounded.
 
 `Some(&[])` is a real and different answer from `None`: a task whose
-diff touched nothing has an empty region that overlaps nobody, while a
-task whose paths could not be read has an unbounded one that overlaps
-everybody.
+diff touched nothing has an empty region that overlaps no bounded
+region, while a task whose paths could not be read has an unbounded one
+that overlaps everybody.
+
+The two are not each other's complement, and the asymmetry is the point.
+[`crate::topology::leases::regions_overlap`] answers `false` for the
+empty region against any bounded one and `true` for it against
+[`PathSet::RepoWide`]: `RepoWide` overlaps it, because the safe reading
+of a region nobody could read is that it might be anywhere, and nothing
+can be excluded from a region that might be anywhere. So an empty region
+frees a task from every bounded holder and from none of the unread ones.
+`docs/internals/topology/leases.md` states the same exception from the
+comparison's own side, and
+`regions_overlap_component_wise_and_repo_wide_overlaps_everything`
+asserts both directions of it.
 
 ## `mod tests` › `fn hostile_prefixes() -> Vec<GitPath> {`
 
@@ -211,8 +223,8 @@ a default would silently pick the case-sensitive comparison.
 
 Repo-wide, empty, and non-empty are three different answers and the
 most damaging confusion is between the first two: an unbounded
-region serialized as an empty one overlaps nobody and would admit
-every task in parallel against every other.
+region serialized as an empty one overlaps no bounded region and would
+admit every task in parallel against every other.
 
 ## `fn prefixes_survive_in_the_order_and_bytes_they_were_record…` › `let bounded = PathSet::Prefixes {`
 
@@ -255,6 +267,28 @@ Round trips compare one serde implementation against itself, so a
 symmetric rename of `region`, `paths`, `repo_wide` or `prefixes`
 changes the durable format invisibly. These payloads are written by
 hand, so any such change fails here in both directions.
+
+## `fn the_notes_give_the_empty_region_the_repo_wide_exception_the_comparison_gives_it() {`
+
+`ASTRA165-004`. The `prefixes` section said an empty region overlaps
+nobody, and the wire section said an unbounded region written as an empty
+one does; `regions_overlap` has never said either, because its
+`(None, _) | (_, None)` arm answers `true` before it looks at a single
+prefix. `docs/internals/topology/leases.md` carried the exception all
+along, so the two files disagreed about the same function.
+
+A text pin and only a text pin: it asserts what these two sections must
+state and refuses each retired sentence by name. It does so only while
+`regions_overlap` still answers `true` for the empty region against
+`PathSet::RepoWide` and `false` for it against a bounded one, so the code
+fact conditions the prose — a comparison that changed its answer fails
+here with the reason rather than silently pinning a note that has become
+wrong in the other direction. The behaviour itself stays where it is
+asserted, in
+`regions_overlap_component_wise_and_repo_wide_overlaps_everything`.
+
+Matched on the prose, not on where its line breaks fall: a reflow must
+not break the pin, only a changed claim.
 
 ## `fn a_git_path_is_transparent_on_the_wire()` › `let path = GitPath::from("src/Zebra/ÜBER.rs");`
 

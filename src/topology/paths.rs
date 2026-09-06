@@ -384,6 +384,86 @@ mod tests {
     }
 
     #[test]
+    fn the_notes_give_the_empty_region_the_repo_wide_exception_the_comparison_gives_it() {
+        use crate::topology::leases::regions_overlap;
+
+        const NOTES: &str = include_str!("../../docs/internals/topology/paths.md");
+        const CONTRACT: &str = "`impl PathSet` › `pub fn prefixes(&self) -> Option<&[GitPath]> {`";
+        const WIRE: &str = "`fn the_three_regions_are_distinguishable_on_the_wire()` › `let repo_wide = PathSet::RepoWide;`";
+
+        let policy = hostile_policy();
+        let empty = PathSet::Prefixes { paths: Vec::new() };
+        let bounded = PathSet::Prefixes {
+            paths: vec![GitPath::from("src/foo")],
+        };
+
+        assert!(
+            regions_overlap(&empty, &PathSet::RepoWide, &policy)
+                && regions_overlap(&PathSet::RepoWide, &empty, &policy),
+            "these pins describe an empty region that `RepoWide` overlaps; the \
+             comparison no longer says so, so they are the wrong words for \
+             whatever it says now"
+        );
+        assert!(
+            !regions_overlap(&empty, &bounded, &policy)
+                && !regions_overlap(&bounded, &empty, &policy),
+            "these pins describe an empty region that overlaps no bounded one; \
+             the comparison no longer says so, so they are the wrong words for \
+             whatever it says now"
+        );
+
+        let section = |heading: &str| -> String {
+            NOTES
+                .split("\n## ")
+                .find(|section| section.starts_with(heading))
+                .map(|section| section.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| panic!("the notes carry no {heading:?} heading"))
+        };
+
+        for (heading, states, retired) in [
+            (
+                CONTRACT,
+                &[
+                    (
+                        "an empty region overlaps no bounded region",
+                        "overlaps no bounded region",
+                    ),
+                    (
+                        "`RepoWide` overlaps the empty region even so",
+                        "`RepoWide` overlaps it",
+                    ),
+                ][..],
+                &[("an empty region overlaps nobody at all", "overlaps nobody")][..],
+            ),
+            (
+                WIRE,
+                &[(
+                    "an unbounded region written as an empty one overlaps no bounded region",
+                    "overlaps no bounded region",
+                )][..],
+                &[("such a region overlaps nobody at all", "overlaps nobody")][..],
+            ),
+        ] {
+            let notes = section(heading);
+            for (proposition, pin) in states {
+                assert!(
+                    notes.contains(pin),
+                    "the {heading:?} section must state that {proposition}; \
+                     looked for {pin:?} in:\n{notes}"
+                );
+            }
+            for (claim, pin) in retired {
+                assert!(
+                    !notes.contains(pin),
+                    "the retired claim that {claim} must not come back — \
+                     `regions_overlap` answers `true` for the empty region \
+                     against `RepoWide`; found {pin:?} in:\n{notes}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_git_path_is_transparent_on_the_wire() {
         let path = GitPath::from("src/Zebra/ÜBER.rs");
         assert_eq!(
