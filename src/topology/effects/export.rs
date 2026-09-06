@@ -167,4 +167,17 @@ mod tests {
             "{error}"
         );
     }
+
+    /// The sweep's defect was `effect_sites_json` returning the raw
+    /// `serde_json::Error`. Binding the public call to the typed error at the
+    /// supported parent path compiles only while that signature holds.
+    #[test]
+    fn effect_sites_json_returns_the_typed_error_at_the_parent_path() {
+        let result: Result<String, crate::topology::effects::ExportError> =
+            crate::topology::effects::effect_sites_json();
+        let json = result.expect("the generated inventory serializes");
+        let parsed: Vec<EffectSiteExport> =
+            serde_json::from_str(&json).expect("the inventory round-trips");
+        assert_eq!(parsed, effect_sites());
+    }
 }
