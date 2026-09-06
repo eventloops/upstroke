@@ -1312,7 +1312,12 @@ funnel = []
 effectful = [
     "run_with",
 ]
-effectful_unnameable = []
+effectful_unnameable = [
+    # `Drop for Staged`: removes the publication's own `create_new`-owned
+    # staging file when an unwind leaves `publish_pools` before it is
+    # published or discarded. Trait-dispatched on a private type.
+    "drop",
+]
 effect_free = [
     "refused",
     "render_report",

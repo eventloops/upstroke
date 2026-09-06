@@ -8,7 +8,8 @@
 mod render;
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{AdapterSource, BuiltinAdapters, Discovery};
 use crate::capacity::{Pool, PoolKind, Source};
@@ -160,19 +161,299 @@ pub fn run_with<'a>(
     })
 }
 
-fn write_pools(path: &std::path::Path, content: &str) -> Result<(), UpstrokeError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
-            operation: "create directory",
+fn write_pools(path: &Path, content: &str) -> Result<(), UpstrokeError> {
+    publish_pools(path, content, |staged, destination| {
+        fs::rename(staged, destination)
+    })
+}
+
+fn publish_pools(
+    path: &Path,
+    content: &str,
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), UpstrokeError> {
+    let Some(named) = publication_directory(path) else {
+        return Err(UpstrokeError::Refused {
+            message: format!(
+                "`{}` is a filesystem root, not a file to write — pass --pools <path> naming \
+                 the pools file itself",
+                path.display()
+            ),
+        });
+    };
+    let created = create_directory_durably(named, util::fsync_dir)?;
+    let destination = publication_target(path)?;
+    let Some(directory) = publication_directory(&destination) else {
+        return Err(UpstrokeError::Refused {
+            message: format!(
+                "`{}` names a filesystem root, not a file to write",
+                destination.display()
+            ),
+        });
+    };
+    let inherited = destination_mode(&destination)?;
+
+    let (staged, file) =
+        Staged::create(directory.join(format!(".pools-{}.tmp", crate::ulid::ulid())))?;
+    let landed = stage(file, staged.path(), content, inherited).and_then(|()| {
+        publish(staged.path(), &destination).map_err(|source| UpstrokeError::Filesystem {
+            operation: "publish pools file",
+            path: destination.clone(),
+            source,
+        })
+    });
+    if let Err(error) = landed {
+        return Err(staged.withdraw(error));
+    }
+    staged.published();
+    util::fsync_dir(directory).map_err(|source| UpstrokeError::Filesystem {
+        operation: "flush the directory of pools file",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    flush_created_entries(&created, util::fsync_dir)
+}
+
+fn create_directory_durably(
+    directory: &Path,
+    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Vec<PathBuf>, UpstrokeError> {
+    let mut components: Vec<&Path> = directory
+        .ancestors()
+        .filter(|ancestor| ancestor.file_name().is_some())
+        .collect();
+    components.reverse();
+    let mut created = Vec::new();
+    for component in components {
+        match fs::create_dir(component) {
+            Ok(()) => {
+                created.push(component.to_path_buf());
+                let Some(parent) = publication_directory(component) else {
+                    continue;
+                };
+                flush(parent).map_err(|source| UpstrokeError::Filesystem {
+                    operation: "flush the directory of created directory",
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing =
+                    fs::metadata(component).map_err(|source| UpstrokeError::Filesystem {
+                        operation: "read the kind of directory",
+                        path: component.to_path_buf(),
+                        source,
+                    })?;
+                if !existing.is_dir() {
+                    return Err(UpstrokeError::Filesystem {
+                        operation: "create directory",
+                        path: component.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "exists and is not a directory",
+                        ),
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "create directory",
+                    path: component.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn flush_created_entries(
+    created: &[PathBuf],
+    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), UpstrokeError> {
+    for component in created.iter().rev() {
+        let Some(parent) = publication_directory(component) else {
+            continue;
+        };
+        flush(parent).map_err(|source| UpstrokeError::Filesystem {
+            operation: "flush the directory of created directory",
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    fs::write(path, content).map_err(|source| UpstrokeError::Filesystem {
-        operation: "write pools file",
-        path: path.to_path_buf(),
+    Ok(())
+}
+
+struct Staged {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl Staged {
+    fn create(path: PathBuf) -> Result<(Self, fs::File), UpstrokeError> {
+        let file = match fs::File::create_new(&path) {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "create staged pools file",
+                    path,
+                    source,
+                });
+            }
+        };
+        Ok((Staged { path, owned: true }, file))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn published(mut self) {
+        self.owned = false;
+    }
+
+    fn withdraw(mut self, error: UpstrokeError) -> UpstrokeError {
+        self.owned = false;
+        let path = std::mem::take(&mut self.path);
+        match fs::remove_file(&path) {
+            Ok(()) => error,
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
+            Err(cleanup) => UpstrokeError::Filesystem {
+                operation: "remove staged pools file",
+                path,
+                source: std::io::Error::new(
+                    cleanup.kind(),
+                    format!("{error}; and the staged file could not be removed: {cleanup}"),
+                ),
+            },
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_cleanup) => {
+                // SUPPRESSED, and only here: this arm is reached while the
+                // thread is unwinding (see the notes), where a panic would
+                // abort the process and cost the diagnosis of whatever
+                // actually failed. The destination is intact; what remains
+                // is one uniquely named `.tmp` no reader interprets.
+            }
+        }
+    }
+}
+
+const SYMLINK_FOLLOW_LIMIT: usize = 40;
+
+fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {
+    let mut current = path.to_path_buf();
+    let mut followed = 0;
+    loop {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(current);
+            }
+            Err(source) => {
+                return Err(UpstrokeError::Filesystem {
+                    operation: "read the kind of pools file",
+                    path: current,
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+        if followed == SYMLINK_FOLLOW_LIMIT {
+            return Err(UpstrokeError::Filesystem {
+                operation: "resolve the symlinked pools file",
+                path: path.to_path_buf(),
+                source: std::io::Error::other(format!(
+                    "more than {SYMLINK_FOLLOW_LIMIT} levels of symbolic links"
+                )),
+            });
+        }
+        current = named_target(&current)?;
+        followed += 1;
+    }
+}
+
+fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {
+    let named = fs::read_link(link).map_err(|source| UpstrokeError::Filesystem {
+        operation: "read the symlinked pools file",
+        path: link.to_path_buf(),
+        source,
+    })?;
+    if named.is_absolute() {
+        return Ok(named);
+    }
+    Ok(match link.parent() {
+        Some(parent) => parent.join(named),
+        None => named,
+    })
+}
+
+fn publication_directory(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        parent => parent,
+    }
+}
+
+fn destination_mode(path: &Path) -> Result<Option<fs::Permissions>, UpstrokeError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(UpstrokeError::Filesystem {
+            operation: "read the mode of pools file",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn stage(
+    mut file: fs::File,
+    staged: &Path,
+    content: &str,
+    inherited: Option<fs::Permissions>,
+) -> Result<(), UpstrokeError> {
+    apply_mode(staged, inherited)?;
+    file.write_all(content.as_bytes())
+        .map_err(|source| UpstrokeError::Filesystem {
+            operation: "write staged pools file",
+            path: staged.to_path_buf(),
+            source,
+        })?;
+    util::fsync_file(&file).map_err(|source| UpstrokeError::Filesystem {
+        operation: "flush staged pools file",
+        path: staged.to_path_buf(),
         source,
     })
+}
+
+#[cfg(unix)]
+fn apply_mode(staged: &Path, inherited: Option<fs::Permissions>) -> Result<(), UpstrokeError> {
+    let Some(permissions) = inherited else {
+        return Ok(());
+    };
+    fs::set_permissions(staged, permissions).map_err(|source| UpstrokeError::Filesystem {
+        operation: "set the mode of staged pools file",
+        path: staged.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn apply_mode(_staged: &Path, _inherited: Option<fs::Permissions>) -> Result<(), UpstrokeError> {
+    Ok(())
 }
 
 fn settings_match(existing: &str, proposed: &str) -> bool {
@@ -315,10 +596,22 @@ mod tests {
             })
         }
 
+        #[expect(
+            clippy::unreachable,
+            reason = "run_with (this file's only caller of AdapterSource) invokes only probe \
+                      and discover on an adapter; build is dead code for this fake by that \
+                      local contract"
+        )]
         fn build(&self, _run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
             unreachable!("connect never spawns an attempt")
         }
 
+        #[expect(
+            clippy::unreachable,
+            reason = "run_with (this file's only caller of AdapterSource) invokes only probe \
+                      and discover on an adapter; parse is dead code for this fake by that \
+                      local contract"
+        )]
         fn parse(&self, _out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
             unreachable!("connect never parses an attempt")
         }
@@ -367,14 +660,6 @@ mod tests {
         }
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("upstroke-connect-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch dir");
-        dir.join("pools.toml")
-    }
-
     fn connect(path: &Path, force: bool) -> ConnectReport {
         run_with(
             &ConnectOptions {
@@ -385,6 +670,497 @@ mod tests {
             ["claude-code", "copilot"],
         )
         .expect("connect runs")
+    }
+
+    /// Every name in `directory` that `publish_pools` could have staged: the
+    /// leftovers a publication that does not clean up after itself produces.
+    fn staging_files(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .expect("read the pools directory")
+            .map(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".pools-") && name.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A publication step that refuses, standing in for the rename failures a
+    /// test cannot arrange on demand: a full disk, a kill, a revoked
+    /// permission.
+    fn refuse_to_publish(_staged: &Path, _destination: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the publication step refused",
+        ))
+    }
+
+    #[test]
+    fn a_failed_publication_leaves_the_operators_file_byte_for_byte_intact() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-failed-publish")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
+                    \"claude-code\"\nprofile = \"work\"\nmonthly_allowance = 300\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+
+        let error = publish_pools(&path, "a replacement that never lands", refuse_to_publish)
+            .expect_err("the publication step refused");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "publish pools file", path: ref failed, .. }
+            if failed == &path),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the operator's file"),
+            mine,
+            "a publication that failed replaced nothing"
+        );
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "and left no staged file behind"
+        );
+    }
+
+    #[test]
+    fn an_unwinding_publication_leaves_the_operators_file_byte_for_byte_intact() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-unwind-publish")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nprofile = \"work\"\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_pools(&path, "a replacement that never lands", |_, _| {
+                panic!("the failure the operator's file has to survive")
+            })
+        }));
+
+        assert!(outcome.is_err(), "the fixture must actually unwind");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the operator's file"),
+            mine,
+            "an unwind past a publication replaced nothing"
+        );
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "and the staged file went with the unwind, not just with a return"
+        );
+    }
+
+    #[test]
+    fn a_publication_flushes_the_staged_file_and_the_directory_it_lands_in() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-barriers")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published once").expect("the publication lands");
+        let after = crate::util::barriers_on_this_thread();
+
+        assert_eq!(
+            after.file - before.file,
+            1,
+            "the staged file is flushed before the rename makes it the operator's"
+        );
+        assert_eq!(
+            after.directory - before.directory,
+            1,
+            "and the directory entry the rename created is flushed after it"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read what was published"),
+            "published once"
+        );
+    }
+
+    #[test]
+    fn a_publication_into_directories_it_creates_flushes_each_new_entry_in_its_parent() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdirs")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("made").join("here").join("pools.toml");
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published into a directory that did not exist")
+            .expect("the publication lands");
+        let after = crate::util::barriers_on_this_thread();
+
+        assert_eq!(after.file - before.file, 1);
+        assert_eq!(
+            after.directory - before.directory,
+            5,
+            "two directory entries were created (`made` in the scratch tree, `here` in `made`) \
+             and each is flushed in its parent as it is made, then `here` is flushed for the \
+             published file, then both entries are flushed again now that the file pins them"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read what was published"),
+            "published into a directory that did not exist"
+        );
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published again").expect("the second publication lands");
+        let after = crate::util::barriers_on_this_thread();
+        assert_eq!(
+            after.directory - before.directory,
+            1,
+            "nothing was created the second time, so only the published file's directory is flushed"
+        );
+    }
+
+    #[test]
+    fn each_created_directory_entry_is_flushed_in_its_parent_as_it_is_made_and_again_after_the_publication()
+     {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-order")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        let created = create_directory_durably(&here, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the directories are created");
+
+        assert_eq!(created, vec![made.clone(), here.clone()], "outermost first");
+        assert_eq!(
+            flushed,
+            vec![tree.path().to_path_buf(), made.clone()],
+            "the entry `made` is flushed in the scratch tree, then `here` in `made`, in that \
+             order; the scratch tree's own ancestors already existed and are not this call's to \
+             flush"
+        );
+        assert!(here.is_dir());
+
+        flushed.clear();
+        flush_created_entries(&created, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the entries are flushed again");
+        assert_eq!(
+            flushed,
+            vec![made.clone(), tree.path().to_path_buf()],
+            "after the publication the same two entries are flushed once more, innermost first"
+        );
+
+        flushed.clear();
+        let created = create_directory_durably(&here, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("an existing directory is accepted");
+        assert_eq!(created, Vec::<PathBuf>::new());
+        assert_eq!(
+            flushed,
+            Vec::<PathBuf>::new(),
+            "nothing was created the second time, so nothing is flushed"
+        );
+    }
+
+    #[test]
+    fn a_directory_removed_by_someone_else_between_two_creations_is_a_reported_failure() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-removed")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+
+        let error = create_directory_durably(&here, |parent| {
+            if parent == tree.path() {
+                fs::remove_dir(&made).expect("someone else removes `made` right after it is made");
+            }
+            Ok(())
+        })
+        .expect_err("`here` cannot be created inside a directory that is gone");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "create directory", path: ref failed, ref source }
+            if failed == &here && source.kind() == std::io::ErrorKind::NotFound),
+            "{error:?}"
+        );
+        assert!(
+            !made.exists(),
+            "nothing recreated what someone else removed"
+        );
+    }
+
+    #[test]
+    fn a_directory_replaced_after_its_entry_was_flushed_has_the_replacement_flushed_before_return()
+    {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-replaced")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+        let marker = made.join("theirs");
+
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        let created = create_directory_durably(&here, |parent| {
+            flushed.push(parent.to_path_buf());
+            if parent == tree.path() {
+                fs::remove_dir(&made).expect("someone else removes `made` after its flush");
+                fs::create_dir(&made).expect("and puts their own `made` in its place");
+                fs::write(&marker, "").expect("with something of theirs inside it");
+            }
+            Ok(())
+        })
+        .expect("`here` is created inside the directory someone else now owns");
+        flush_created_entries(&created, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the entries are flushed again");
+
+        assert!(
+            marker.is_file() && here.is_dir(),
+            "`here` was made inside the replacement, beside what its owner put there"
+        );
+        assert_eq!(
+            flushed,
+            vec![
+                tree.path().to_path_buf(),
+                made.clone(),
+                made.clone(),
+                tree.path().to_path_buf()
+            ],
+            "the first flush of the scratch tree covered the `made` this call made and was \
+             made stale by the replacement; the last flush of the scratch tree comes after \
+             `here` exists inside the replacement, so it is the replacement's entry it makes \
+             durable"
+        );
+    }
+
+    #[test]
+    fn the_directory_a_pools_file_is_published_into_is_openable() {
+        assert_eq!(
+            publication_directory(Path::new("pools.toml")),
+            Some(Path::new(".")),
+            "a bare relative name is published into the working directory, which `\"\"` does \
+             not name"
+        );
+        assert_eq!(
+            publication_directory(Path::new("dir/pools.toml")),
+            Some(Path::new("dir"))
+        );
+        assert_eq!(
+            publication_directory(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            None,
+            "a filesystem root names no file to publish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_pools_file_is_published_through_the_link_rather_than_over_it() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-symlink")
+            .expect("acquire an isolated pools directory");
+        let real = tree.path().join("dotfiles-pools.toml");
+        let link = tree.path().join("pools.toml");
+        fs::write(&real, "[pools.claude-code]\nprofile = \"work\"\n")
+            .expect("the file the operator keeps their configuration in");
+        std::os::unix::fs::symlink(&real, &link).expect("the operator's dotfile link");
+
+        assert_eq!(connect(&link, true).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "publishing replaced the operator's symlink with a regular file"
+        );
+        let published = fs::read_to_string(&real).expect("read the file the link names");
+        assert!(
+            published.contains("[pools.claude-code]") && published.contains("weekly = true"),
+            "the file the link names is what was rewritten:\n{published}"
+        );
+        assert_eq!(
+            fs::read_to_string(&link).expect("read through the link"),
+            published,
+            "and the link still reaches it"
+        );
+        assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_pools_symlink_publishes_the_file_it_names() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-dangling")
+            .expect("acquire an isolated pools directory");
+        let named = tree.path().join("not-there-yet.toml");
+        let link = tree.path().join("pools.toml");
+        std::os::unix::fs::symlink("not-there-yet.toml", &link)
+            .expect("a link to a file that does not exist yet");
+
+        assert_eq!(connect(&link, false).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "a dangling link is still the operator's link"
+        );
+        assert!(
+            fs::read_to_string(&named)
+                .expect("the file the link names now exists")
+                .contains("[pools.claude-code]")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_pools_symlinks_publishes_the_file_the_last_link_names() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain")
+            .expect("acquire an isolated pools directory");
+        let dotfiles = tree.path().join("dotfiles");
+        fs::create_dir(&dotfiles).expect("the directory the intermediate link lives in");
+        let link = tree.path().join("pools.toml");
+        let intermediate = dotfiles.join("intermediate.toml");
+        let named = tree.path().join("absent-final.toml");
+        std::os::unix::fs::symlink("dotfiles/intermediate.toml", &link)
+            .expect("the operator's link, to another link");
+        std::os::unix::fs::symlink("../absent-final.toml", &intermediate)
+            .expect("a relative link that only resolves against its own directory");
+
+        assert_eq!(connect(&link, false).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "the operator's link is still a link"
+        );
+        assert!(
+            fs::symlink_metadata(&intermediate)
+                .expect("read the intermediate link")
+                .file_type()
+                .is_symlink(),
+            "and so is the link it names: a one-level resolution publishes over this one"
+        );
+        let published = fs::read_to_string(&named).expect("the file the chain names now exists");
+        assert!(published.contains("[pools.claude-code]"), "{published}");
+        assert_eq!(
+            fs::read_to_string(&link).expect("read through the chain"),
+            published,
+            "and the chain still reaches it"
+        );
+        assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+    }
+
+    /// `count` links in a row, `pools.toml -> link-1 -> … -> link-<count-1>
+    /// -> final.toml`, every one relative; returns the first link and the
+    /// file the chain names, which does not exist.
+    #[cfg(unix)]
+    fn chain_of(tree: &Path, count: usize) -> (PathBuf, PathBuf) {
+        let name = |index: usize| {
+            if index == 0 {
+                "pools.toml".to_owned()
+            } else {
+                format!("link-{index}.toml")
+            }
+        };
+        for index in 0..count {
+            let target = if index + 1 == count {
+                "final.toml".to_owned()
+            } else {
+                name(index + 1)
+            };
+            std::os::unix::fs::symlink(&target, tree.join(name(index)))
+                .expect("one link of the chain");
+        }
+        (tree.join(name(0)), tree.join("final.toml"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_at_the_follow_limit_is_published_and_one_past_it_is_refused() {
+        for count in [SYMLINK_FOLLOW_LIMIT - 1, SYMLINK_FOLLOW_LIMIT] {
+            let tree =
+                crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain-limit")
+                    .expect("acquire an isolated pools directory");
+            let (link, named) = chain_of(tree.path(), count);
+
+            write_pools(&link, "published through the chain").expect("a chain the bound admits");
+
+            assert_eq!(
+                fs::read_to_string(&named).expect("the file the chain names now exists"),
+                "published through the chain",
+                "{count} links"
+            );
+            assert!(
+                fs::symlink_metadata(tree.path().join(format!("link-{}.toml", count - 1)))
+                    .expect("read the last link")
+                    .file_type()
+                    .is_symlink(),
+                "the last of {count} links is still a link"
+            );
+            assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+        }
+
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-chain-over")
+                .expect("acquire an isolated pools directory");
+        let (link, named) = chain_of(tree.path(), SYMLINK_FOLLOW_LIMIT + 1);
+
+        let error = write_pools(&link, "a replacement with no file to land on")
+            .expect_err("one link past the bound is refused");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "resolve the symlinked pools file", path: ref failed, ref source }
+            if failed == &link && source.to_string().contains("levels of symbolic links")),
+            "{error:?}"
+        );
+        assert!(!named.exists(), "nothing was published past the bound");
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "nothing was staged for a publication with no destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mode_an_operator_gave_their_pools_file_survives_a_forced_rewrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const OPERATORS: u32 = 0o740;
+
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mode")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
+                    \"claude-code\"\nprofile = \"work\"\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(OPERATORS))
+            .expect("the operator restricts their own file");
+
+        assert_eq!(connect(&path, true).outcome, Wrote::Written);
+
+        let mode = fs::metadata(&path)
+            .expect("read the mode of the rewritten file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, OPERATORS,
+            "a rewrite that publishes a new inode must not hand back the mode the umask \
+             gives a fresh file in place of the one the operator set"
+        );
     }
 
     #[test]
@@ -701,18 +1477,24 @@ mod tests {
     }
 
     #[test]
-    fn pools_write_error_names_a_failed_file_write() {
+    fn a_real_publication_failure_names_the_destination_and_removes_the_staged_file() {
         let tree =
             crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-write-error")
                 .expect("acquire an isolated pools directory");
         let path = tree.path().join("is-a-directory");
-        fs::create_dir(&path).expect("block file writing with a directory");
+        fs::create_dir(&path).expect("block publication with a directory");
         let error = write_pools(&path, "proposal").expect_err("the file path is a directory");
         assert!(
-            matches!(error, UpstrokeError::Filesystem { operation: "write pools file", path: failed, .. }
-            if failed == path)
+            matches!(error, UpstrokeError::Filesystem { operation: "publish pools file", path: ref failed, .. }
+            if failed == &path),
+            "{error:?}"
         );
         assert!(path.is_dir());
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "the real `fs::rename` failed and its staged file was removed"
+        );
     }
 
     #[test]
@@ -777,7 +1559,9 @@ mod tests {
 
     #[test]
     fn a_missing_agent_skips_its_pool_without_taking_the_others_with_it() {
-        let path = scratch("partial");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-partial")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let report = connect(&path, false);
         assert_eq!(report.outcome, Wrote::Written);
         let written = fs::read_to_string(&path).expect("file");
@@ -799,7 +1583,9 @@ mod tests {
 
     #[test]
     fn what_connect_writes_parses_back_into_the_pools_it_describes() {
-        let path = scratch("roundtrip");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-roundtrip")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         connect(&path, false);
         let mut warnings = Vec::new();
         let hermetic = path.parent().expect("parent").to_path_buf();
@@ -819,7 +1605,9 @@ mod tests {
 
     #[test]
     fn an_existing_file_that_differs_is_never_clobbered() {
-        let path = scratch("clobber");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-clobber")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
                     \"claude-code\"\nprofile = \"work\"\nmonthly_allowance = 300\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -856,7 +1644,9 @@ mod tests {
 
     #[test]
     fn operator_keys_with_toml_escapes_survive_a_force_and_read_back_unchanged() {
-        let path = scratch("escapes");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-escapes")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
                     profile = 'C:\\Users\\me\\.claude-work'\nendpoint = \"http://host/#frag \\\"q\\\"\"\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -896,7 +1686,10 @@ mod tests {
                 }),
             }],
         };
-        let path = scratch("escaped-key");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-escaped-key")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let opts = ConnectOptions {
             pools_path: Some(path.clone()),
             force: false,
@@ -927,7 +1720,10 @@ mod tests {
 
     #[test]
     fn a_file_connect_cannot_parse_carries_nothing_and_the_refusal_does_not_claim_otherwise() {
-        let path = scratch("unparseable");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-unparseable")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
                     profile = \"work\"\nthis line is not toml\n";
         fs::write(&path, mine).expect("hand-written file");
@@ -956,7 +1752,10 @@ mod tests {
 
     #[test]
     fn re_connecting_an_unchanged_machine_reports_unchanged_rather_than_a_conflict() {
-        let path = scratch("idempotent");
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-idempotent")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         connect(&path, false);
         let first = fs::read_to_string(&path).expect("file");
 
@@ -974,7 +1773,9 @@ mod tests {
 
     #[test]
     fn a_login_between_connects_updates_the_file() {
-        let path = scratch("relogin");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-relogin")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let with = |auth: AuthState| Machine {
             adapters: vec![FakeAdapter {
                 id: "claude-code",
@@ -1021,6 +1822,9 @@ mod tests {
 
     #[test]
     fn a_cli_that_lists_models_is_cross_checked_against_the_catalog() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-crosscheck")
+                .expect("acquire an isolated pools directory");
         let machine = Machine {
             adapters: vec![FakeAdapter {
                 id: "copilot",
@@ -1042,7 +1846,7 @@ mod tests {
         };
         let report = run_with(
             &ConnectOptions {
-                pools_path: Some(scratch("crosscheck")),
+                pools_path: Some(tree.path().join("pools.toml")),
                 force: false,
             },
             &machine,
@@ -1068,7 +1872,9 @@ mod tests {
                 discovery: Some(Discovery::unknown().with_note("no auth query exists")),
             }],
         };
-        let path = scratch("shape");
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-shape")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
         let report = run_with(
             &ConnectOptions {
                 pools_path: Some(path),
