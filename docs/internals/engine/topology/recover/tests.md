@@ -1822,10 +1822,10 @@ precedent warns about.
 **The settlement *is* `candidate_prepared`, so there are six events and
 not seven.** This comment required an `attempt_finished` between the pin
 and `candidate_prepared`, on the deleted settle_succeeded's own note that
-INV-07
+`INV-07`
 was "about which event records the candidate, not about which event
 settles the attempt". That reading is wrong and
-`decisions/2026-08-12-merge-queue-execution-topology.md` had already
+`design/26_design_merge_queue_protocol.md` §26 had already
 answered it: `attempt_finished` "is not also emitted for that attempt".
 Ruled CONFORM 2026-08-27, and the count below is the assertion — a build
 that re-introduced the pair puts a seventh kind back here.
@@ -1858,7 +1858,7 @@ which this fixture drives in the same step.
 **candidate_prepared — one append here, not two.** This list
 carried an `attempt_finished(succeeded)` above it; that event is
 not emitted for a candidate-producing attempt
-(`decisions/2026-08-12-merge-queue-execution-topology.md`, ruled
+(`design/26_design_merge_queue_protocol.md` §26, ruled
 CONFORM 2026-08-27), and the fold now refuses it. The count is
 part of the ordering claim.
 

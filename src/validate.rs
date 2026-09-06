@@ -376,6 +376,47 @@ mod tests {
     }
 
     #[test]
+    fn analyze_accepts_lf_crlf_and_lone_cr_plans_through_the_production_detect_path() {
+        let root = scratch_root("lonecr");
+        let mut rendered: Vec<(&str, String)> = Vec::new();
+        for (endings, newline) in [("lf", "\n"), ("crlf", "\r\n"), ("cr", "\r")] {
+            let path = root.join(format!("plan-{endings}.md"));
+            let raw = [
+                "Preamble",
+                "## Fix bug",
+                "<!-- upstroke: id=a min=frontier -->",
+                "Body line.",
+                "",
+            ]
+            .join(newline);
+            fs::write(&path, &raw).expect("the plan fixture");
+            let analysis = analyze(&opts_in(&root, path.to_str().expect("utf-8 path")))
+                .unwrap_or_else(|error| panic!("{endings} {raw:?}: {error}"));
+            assert!(
+                analysis.warnings.is_empty(),
+                "{endings}: {:?}",
+                analysis.warnings
+            );
+            assert_eq!(analysis.plan.tasks.len(), 1, "{endings}");
+            assert_eq!(analysis.plan.tasks[0].id.as_str(), "a", "{endings}");
+            assert_eq!(analysis.plan.tasks[0].body, "Body line.", "{endings}");
+            assert_eq!(
+                analysis.plan.tasks[0].min_tier,
+                Some(crate::ir::Tier::Frontier),
+                "{endings}"
+            );
+            rendered.push((endings, format!("{:?}", analysis.plan.tasks)));
+        }
+        let (first_endings, first) = &rendered[0];
+        for (endings, tasks) in &rendered[1..] {
+            assert_eq!(
+                tasks, first,
+                "{endings} must analyze as {first_endings} does"
+            );
+        }
+    }
+
+    #[test]
     fn annotation_pass2_graph_refusal_preserves_the_unknown_attribute_warning() {
         let error = analyze(&opts("fixtures/annotation-invalid-plan.md"))
             .expect_err("the duplicate task IDs must refuse validation");

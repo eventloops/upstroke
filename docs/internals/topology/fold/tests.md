@@ -354,8 +354,8 @@ settlement that reaches it.
 attempt succeeded — on either arm.**
 
 The sibling-arm witness. `candidate_prepared` is the sole successful
-settlement (INV-07,
-`decisions/2026-08-12-merge-queue-execution-topology.md`), and the
+settlement (`design/26_design_merge_queue_protocol.md` §26; `INV-07` is
+the retired packet's label for the same rule, not itself an authority), and the
 `Closed` arm has enforced that against the record since round 6. The
 `Retained` arm did not, so the invariant held on one path through the
 door and not the other: a retained settlement could carry a record with
@@ -515,6 +515,9 @@ behaves differently after a restart.
 ## `fn a_ladder_position_is_derived_by_replay_and_not_assumed()` › `for attempt in 1..=2u32 {`
 
 Rung 0, two attempts, allowance spent -> escalate onto rung 1.
+Zeta rather than alpha since PR #180: alpha's fixture ladder has one
+rung, and the fold now refuses an escalation onto a rung the frozen
+ladder lacks.
 
 ## `fn a_ladder_position_is_derived_by_replay_and_not_assumed()` › `let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");`
 
@@ -525,6 +528,26 @@ Through the wire, because a resume reads bytes.
 The two assumptions this replaces, shown wrong. A fresh process
 starts both at zero and agrees with the fold on every reading until
 a resume — which is exactly when nothing is watching.
+
+## `fn an_attempt_runs_at_the_replay_derived_rung_and_an_escalation_climbs_exactly_one() {`
+
+**An attempt runs at the rung replay says the task stands on, and an
+escalation moves that position by exactly one rung.** PR #180's
+second review (`PR180-REVIEW2-001`): `check_attempt_started` indexed
+the frozen ladder by the event's own rung and never compared it with
+`TaskFold.rung`, so a rung-0 start with rung 0's valid binding was
+accepted on a task already escalated to rung 1, and `apply_settlement`
+took whatever rung an `Escalated` settlement carried.
+
+The walk: zeta (three rungs) spends rung 0 and escalates onto rung 1;
+a start below (rung 0) and above (rung 2) the position is refused as
+`WrongRung` with the ladder position untouched, the start at the
+position applies; from rung 1 an escalation backward (0), sideways (1)
+or over a rung (3) is refused and the one onto rung 2 applies; from the
+top rung an escalation onto rung 3 is refused, because the human is
+the top rung, and a retry there is charged to rung 2's allowance. Then
+through the wire: the replayed fold holds the same position and refuses
+and accepts the same starts as the live one.
 
 ## `const CHARGE_ALLOWANCE: fn(&mut RunState, TaskKey, &AttemptRecord) = RunState::charge_all…`
 
@@ -1151,20 +1174,26 @@ refusals[11] / INV-19, one component at a time. Each case moves one
 field of an otherwise exact binding: a check that compared the whole
 record, or that compared none of it, fails on the case it skipped.
 
-## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `for rung in 0..3u32 {`
-
-The effort is the ladder's effort *for that rung's tier*, not the
-run's default and not another tier's: zeta's rungs are small, mid and
-frontier, resolving to three different efforts.
-
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);`
 
-A rung the ladder does not have.
+A rung the ladder does not have. Since PR #180 it is refused as the
+wrong rung before the ladder is indexed: the task stands on rung 0,
+and an attempt runs at the task's position.
 
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut materializing = attempt_started(&fold, ZETA, 0, 1, 0);`
 
 A repair's attempt records what its worktree was materialized from,
 and an ordinary one records nothing.
+
+## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `for rung in 0..rungs {`
+
+The effort is the ladder's effort *for that rung's tier*, not the
+run's default and not another tier's: zeta's rungs are small, mid and
+frontier, resolving to three different efforts. Walked rung by rung
+since PR #180 — an attempt is accepted only at the task's
+replay-derived position, so each rung above the first is reached by
+applying the exact start and escalating onto it — which is why this
+walk comes last: everything above it runs in generation 0 on rung 0.
 
 ## `fn an_override_is_the_binding_the_frozen_admission_authoriz…` › `let mut fold = started();`
 
@@ -1604,7 +1633,7 @@ Re-derived, not adjusted. This was
 asserted the opposite of the first claim below: that `candidate_prepared`
 is **refused** while the attempt is still running, and accepted only after
 an `attempt_finished{Succeeded}` had promoted the generation. That is the
-dual-settlement pattern `decisions/2026-08-12-merge-queue-execution-topology.md`
+dual-settlement pattern `design/26_design_merge_queue_protocol.md` §26
 forbids — "`attempt_finished` is not also emitted for that attempt" — and the
 fold was *requiring* it. Ruled CONFORM 2026-08-27.
 
