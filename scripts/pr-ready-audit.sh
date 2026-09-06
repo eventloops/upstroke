@@ -2,7 +2,7 @@
 # pr-ready-audit.sh: decide, per open pull request, whether it is ready to enqueue for merge
 # under the three-lane finding policy, and optionally maintain the lane and ready labels.
 #
-#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [--reviewer LOGIN] [PR ...]
+#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
@@ -29,14 +29,15 @@
 #   - every allowed finding has a ledger row in the body whose disposition is deferred (with a
 #     file under reviews/findings/ on the branch naming the finding id), rejected or accepted-risk
 #
-# Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than merges and
-# ledger pushes: a repair-only push the owner reads and attests under step 5, or a new change that
-# needs another pass), MANUAL (the review carries findings without ids, so rows cannot be matched
-# mechanically), and NOT-READY with the blockers listed.
+# Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than clean merges
+# and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
+# that is not git's own merge of its parents, or a new change that needs another pass), MANUAL
+# (the review is prose the audit cannot judge: findings without ids, or a severity token outside
+# the numbered findings, so a person reads it), and NOT-READY with the blockers listed.
 #
-# Only review comments posted by the trusted reviewer account count: the repository owner by
-# default, or --reviewer LOGIN. Anyone else's comment carrying the markers is ignored, so a
-# contributor cannot mint a PASS.
+# Only review comments posted by the repository owner count, and there is no override: the
+# owner is MAINTAINING's one trusted writer, and anyone else's comment carrying the markers is
+# ignored, so a contributor cannot mint a PASS.
 #
 # Limits, stated so nobody reads more into READY than it says: the audit sees severities and the
 # fields the review JSON carries. A finding whose object carries a non-empty witness,
@@ -53,14 +54,12 @@ set -euo pipefail
 apply=0
 enqueue=0
 ready_label="ready-to-merge"
-reviewer=""
 prs=()
 while (($#)); do
   case "$1" in
     --apply) apply=1 ;;
     --enqueue) apply=1; enqueue=1 ;;
     --ready-label) ready_label="$2"; shift ;;
-    --reviewer) reviewer="$2"; shift ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) prs+=("$1") ;;
   esac
@@ -68,7 +67,7 @@ while (($#)); do
 done
 
 repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
-[[ -n "$reviewer" ]] || reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
+reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
 
 if ((${#prs[@]} == 0)); then
   mapfile -t prs < <(gh pr list --repo "$repo" --state open --limit 100 --json number --jq '.[].number')
@@ -106,7 +105,7 @@ must_fix_for() {
   esac
 }
 
-# The latest review comment on a pull request posted by the trusted reviewer, or nothing.
+# The latest review comment on a pull request posted by the repository owner, or nothing.
 # `--paginate` hands `--jq` each page separately, so `last` is per page: each page yields its
 # newest match as "<created_at> <id>", the newest across pages wins by timestamp, and that one
 # comment is fetched by id. Comments arrive oldest first, so the per-page `last` is its newest.
@@ -192,9 +191,22 @@ for pr in "${prs[@]}"; do
     elif ! git merge-base --is-ancestor "$reviewed" "$head"; then
       blockers+=("reviewed-not-ancestor:${reviewed:0:7}")
     elif [[ "$reviewed" != "$head" ]]; then
+      # Every merge commit the branch added must be exactly what git produces from its two
+      # parents on its own: a merge carrying hand edits, a conflict resolution or a third parent
+      # is a new change (MAINTAINING step 5) that `--no-merges` below would otherwise hide.
+      merge_edits=""
+      for m in $(git rev-list --merges "$reviewed..$head" --not origin/master); do
+        if (($(git rev-list --parents -n 1 "$m" | wc -w) != 3)); then merge_edits="$m"; break; fi
+        if ! expected="$(git merge-tree --write-tree "$m^1" "$m^2" 2>/dev/null)"; then
+          merge_edits="$m"; break   # a conflict, or a git too old for --write-tree: fail closed
+        fi
+        [[ "$(git rev-parse "$m^{tree}")" == "$expected" ]] || { merge_edits="$m"; break; }
+      done
       # Commits master already has arrived through a merge-in; only the branch's own count.
       touched="$(git log --no-merges --name-only --format= "$reviewed..$head" --not origin/master | sort -u)"
-      if [[ -z "$touched" ]]; then
+      if [[ -n "$merge_edits" ]]; then
+        moved="merge-edits:${merge_edits:0:7}"
+      elif [[ -z "$touched" ]]; then
         moved="merges-only"
       elif ! grep -vE '^reviews/(findings/|FINDINGS\.md$)' <<< "$touched" >/dev/null; then
         moved="ledger-only"
@@ -206,8 +218,8 @@ for pr in "${prs[@]}"; do
 
   # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" ("-" for no id). The JSON
   # form is read by a JSON parser, never by regex; without one the audit fails closed. The
-  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and a P0
-  # or P1 token anywhere else in the text blocks as unparsed rather than being missed.
+  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and any
+  # severity token anywhere else in the text sends the pull request to MANUAL, PASS included.
   findings=()
   if [[ -n "$review" ]]; then
     if grep -q '"findings"' <<< "$review"; then
@@ -248,8 +260,8 @@ PY
       fi
     else
       while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
-      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[01]\b' | head -1 || true)"
-      [[ -n "$stray" ]] && blockers+=("findings-unparsed:$stray-outside-numbered-findings")
+      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
+      [[ -n "$stray" ]] && blockers+=("manual:$stray-outside-numbered-findings")
     fi
   fi
   [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
@@ -283,7 +295,7 @@ PY
         fi ;;
       rejected|accepted-risk) ;;
       fixed)
-        [[ "$moved" != "repairs" ]] && blockers+=("fixed-but-head-unmoved:$id") ;;
+        [[ "$moved" == repairs || "$moved" == merge-edits:* ]] || blockers+=("fixed-but-head-unmoved:$id") ;;
       "") blockers+=("no-row:$id") ;;
       *) blockers+=("bad-disposition:$id=$disposition") ;;
     esac
@@ -297,7 +309,7 @@ PY
   done
   if ((${#hard[@]})); then
     state=NOT-READY
-  elif [[ "$moved" == "repairs" ]]; then
+  elif [[ "$moved" == repairs || "$moved" == merge-edits:* ]]; then
     state=NEEDS-ATTEST
   elif printf '%s\n' "${blockers[@]:-}" | grep -q '^manual:'; then
     state=MANUAL
