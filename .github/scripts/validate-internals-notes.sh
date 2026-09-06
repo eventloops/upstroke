@@ -157,9 +157,10 @@ done < <(find "$notes_root" -name '*.md' 2>/dev/null | sort)
 #       URL, a same-file `#anchor`, or a relative path that exists in this
 #       repository and stays inside it. A Rustdoc item path is none of those,
 #       and no renderer keeps it: GitHub's GFM drops the link and emits the
-#       label alone, and the plain CommonMark renderer the audit used emits
-#       `<a href="crate::effects::census_domain">`, which resolves nowhere.
-#       Both were measured through `POST /markdown`. Eleven
+#       label alone, measured through `POST /markdown`, and the plain
+#       CommonMark renderer the audit ran emits
+#       `<a href="crate::effects::census_domain">`, an href that resolves
+#       nowhere. Eleven
 #       destinations of that shape were in the tree when this was written --
 #       eight spelled `crate::`, and `Self::close_and_wait`,
 #       `RunState::apply` and `std::time::Duration`, which a `crate::` search
@@ -233,8 +234,9 @@ while IFS= read -r notes; do
     }
     # One leaf block, read the way CommonMark reads inline text: backtick runs
     # pair inside the block and nowhere else, so an odd backtick in one
-    # paragraph cannot swallow the next. A whole-file scan gets three link
-    # destinations wrong for exactly that reason.
+    # paragraph cannot swallow the next. A whole-file scan misses one of the
+    # eleven destinations for exactly that reason -- events/mod.md:856, whose
+    # `](RunState::apply)` falls inside a span opened two blocks earlier.
     function scan(b, ln0,   n, i, c, j, run, k, m, closed, ch, label) {
       n = length(b)
       i = 1

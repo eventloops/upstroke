@@ -187,12 +187,14 @@ The link checks read a file the way CommonMark reads it: fenced blocks dropped,
 code spans found first, and one leaf block at a time — not one line, because a
 code span may cross one, and not the whole file, because backtick runs pair
 inside a block and an odd backtick in one paragraph would otherwise swallow the
-link in the next. That is why the forms named above can be written out here, in
-a file the gate reads, without failing it. Their fixtures cover a shortcut
-reference in the effects notes and one outside them, a reference wrapped across
-a line break, a Rustdoc destination with and without `crate::`, a destination
-that leaves the repository, external and anchor destinations, a destination
-carrying a title, and one hidden behind an odd backtick a block earlier.
+link in the next. Fenced blocks are dropped before any of that, which is why the
+retired forms can be written out here, in a file the gate reads, without failing
+it. Their fixtures cover a shortcut reference in the effects notes and one
+outside them, a reference wrapped across a line break, a Rustdoc destination
+with and without `crate::`, a destination that leaves the repository, external
+and anchor destinations, a destination carrying a title, one hidden behind an
+odd backtick a block earlier, and a wrapped prose line opening on `#[cfg(test)]`
+— which is not an ATX heading and must not split the paragraph it is inside.
 
 The gate does not check section headings, arbitrary source prose, or whether a
 note remains true. Those are review duties under §13, including its site-required
