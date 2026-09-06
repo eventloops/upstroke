@@ -1906,12 +1906,21 @@ fn charge_allowance(&mut self) {}
             ),
             (
                 "src/agent/proc.rs",
-                1,
+                0,
                 1,
                 0,
-                "the process funnel's own `Command`: `.stdin(Stdio::piped())` \
-                 is the pipe it writes the payload into, and the `.env` is the \
-                 reaper's `/bin/ps` query on macOS. Neither is a CommandSpec",
+                "the `.env` is the reaper's `/bin/ps` query on macOS; \
+                 it is a std::process::Command, not a CommandSpec",
+            ),
+            (
+                "src/agent/proc/pipe_io.rs",
+                2,
+                0,
+                2,
+                "Prepared::configure sets std::process::Command stdin once \
+                 per Unix/Windows implementation. The two literal stdin fields \
+                 construct Endpoints in Windows configure and Unix take; \
+                 they hold native Writer endpoints, not CommandSpec payloads",
             ),
             (
                 "src/engine/assembly.rs",

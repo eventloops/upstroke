@@ -1,5 +1,8 @@
 //! Extended notes: `docs/internals/agent/proc/pipe_io.md`
 
+// Allowlist placement: the funnel section of `effects/allowlist.toml`
+// registers native pipe creation, mode-setting and I/O in this module.
+
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![deny(clippy::disallowed_macros)]
 
