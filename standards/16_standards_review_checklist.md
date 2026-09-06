@@ -19,7 +19,9 @@ A reviewer and an author should be able to answer yes to each applicable item:
 - [ ] Source instruments scan their whole claimed domain and their injected controls fail.
 - [ ] Behaviour, persisted formats, events and documentation change together.
 - [ ] New abstraction and dependencies have a demonstrated purpose.
-- [ ] Lint levels change only in `[lints]`; new suppressions are `#[expect]` with a reason.
+- [ ] Lint levels change only in `[lints]`, except §2's two carve-outs: a module-level `#![deny]`
+      activating a lint `[lints]` does not yet govern, and the module-level attributes that carry
+      the `clippy.toml` `disallowed-*` census; new suppressions are `#[expect]` with a reason.
 - [ ] Ambient time, environment and randomness stay inside the funnel modules.
 - [ ] All nine §2 commands pass from the repository root.
 
