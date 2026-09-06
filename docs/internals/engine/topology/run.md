@@ -1254,7 +1254,7 @@ measurement.
 Between the pin and `candidate_prepared`, and in that order.
 **No `attempt_finished` here.** `candidate_prepared` is the sole
 successful settlement for a candidate-producing attempt —
-`decisions/2026-08-12-merge-queue-execution-topology.md`, which adds
+`design/26_design_merge_queue_protocol.md` §26, which adds
 "`attempt_finished` is not also emitted for that attempt" — and this
 path appended both until the 2026-08-27 ruling. The fold now refuses
 either half of that pair, so the omission is enforced rather than
