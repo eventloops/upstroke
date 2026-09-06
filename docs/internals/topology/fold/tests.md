@@ -125,6 +125,24 @@ meant another lands on a value this fixture does not hold.
 
 A fold that has recorded its `run_started` and nothing else.
 
+## `fn attempt_finished_mut(event: &mut TopologyEvent) -> &mut AttemptFinished4 {`
+
+The body of an `attempt_finished` a fixture has just built, for the tables that
+damage one coordinate of an otherwise valid event.
+
+These two accessors exist because §7 denies `unreachable!` in tests as well as in
+production, with no Clippy allowance to take, and the eleven sites that read
+`let ... else { unreachable!("built as an attempt_finished") }` were that
+construct. A test fails its own setup with a message naming the failed premise
+instead, which is what the panic here does, and `#[track_caller]` reports the
+fixture line rather than this one. The premise is live rather than decorative:
+handing either accessor an event of another kind panics with the kind it was
+given.
+
+## `fn candidate_prepared_mut(event: &mut TopologyEvent) -> &mut CandidatePrepared {`
+
+The same accessor for a `candidate_prepared`.
+
 ## `fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {`
 
 --- event builders ----------------------------------------------------
@@ -213,6 +231,15 @@ halves of this file agree.
 The negative half is what gives it teeth. Perturbing one field of the
 binding must be refused, or the validator is not checking the thing the
 reader produces and the positive half proves nothing.
+
+**The table varies every field of `RungBinding`, and did not always.** It ran
+`model`, `agent` and `effort` and left `tier` and `pinned` alone, so a
+comparison that dropped either of those two would have passed here.
+`matches_frozen` is whole-struct equality against `from_frozen`, so all five are
+compared today; that is a property of one expression, and this table is what
+holds it. The `assert_ne!` above the refusal is the guard the older arms did
+without: a perturbation that perturbs nothing would satisfy the loop by leaving
+the accepted binding in place.
 
 ## `fn attempt_started_resuming(`
 
@@ -381,6 +408,14 @@ the two agree rather than that each refuses something.
 The one shape both arms must refuse: no failure, and the frozen
 obligation all green — which is exactly what `candidate_prepared`
 requires of the settlement that *is* a success.
+
+## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `let variant_of = |settlement: &AttemptSettlement| match settlement {`
+
+"No arm" is a claim about every variant, and the table below is a list. The
+`match` makes a new variant of `AttemptSettlement` a compile error here, and the
+assertion makes a variant silently dropped from the table a failure: removing the
+`closed` row fails this test rather than quietly narrowing the sentence in the
+title to the one arm left.
 
 ## `fn no_attempt_finished_arm_accepts_a_record_that_claims_suc…` › `accepts(&fold, &settle(ZETA, 0, 1, settlement()));`
 
@@ -1173,6 +1208,10 @@ resume in a fresh generation is not a retry.
 refusals[11] / INV-19, one component at a time. Each case moves one
 field of an otherwise exact binding: a check that compared the whole
 record, or that compared none of it, fails on the case it skipped.
+
+`pinned` joined `agent`, `model`, `tier` and `effort` in the sweep of row 39.
+It was the one coordinate of `RungBinding` no table in this file varied, and
+`matches_frozen` ignoring it was a change the whole suite passed.
 
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);`
 
@@ -2104,11 +2143,66 @@ Answered once: the second answer has no open question to name.
 
 And its id is never reused for a new question either.
 
+## `fn a_continuation_is_offered_only_for_an_open_generation_no_attempt_has_used() {`
+
+[`TopologyFold::eligible_continuation`], which had no test in this file. The
+engine's selector reads it to decide whether a task with an open generation is
+continued rather than dispatched afresh, so what it returns is the generation a
+worker is about to resume into.
+
+Two things are asserted that no other test held. **The identity**: the fixture
+closes generation 0 and dispatches generation 1, so an answer of
+`GenerationId(0)` — a reader that took the first generation rather than the open
+one — is a different value from the right one. **The class filter**: in flight,
+retained-idle and promoting each get their own arm, because dropping the
+`OpenNoAttempt` filter is a change the fold suite otherwise passes.
+`src/topology/fold/tests/questions.rs` reaches this reader through `select` and
+holds the lineage-question guard; it holds neither of these.
+
+## `fn lineage_with_a_dispatched_repair(ask_about: Option<TaskKey>) -> TopologyFold {`
+
+A lineage whose repair holds an open generation, optionally with a question open
+on the root.
+
+**The question is installed through `RunState::open_question` rather than by an
+event, and the fixture proves it has to be.** Both orders are refused:
+dispatching the member after the question fails `task_dispatched` ("dispatch
+requires no outstanding lineage question or candidate for this task"), and
+raising the question after the dispatch fails `question_raised` ("settle it
+before parking its tasks"). So `eligible_continuation`'s `lineage_has_question`
+arm guards a state no legal log reaches, and the `refuse` above the hand-built
+state records that rather than leaving a reader to wonder. Building an
+unreachable cell by hand is what [`grid_state`] does, for the same reason.
+
+## `fn the_eligible_integration_candidate_is_the_first_the_queue_still_offers() {`
+
+[`TopologyFold::eligible_integration_candidate`], which had no test in this file
+either. `integration_admissible` is its `is_some()` and is asserted in seven
+places, so the *predicate* was covered and the *identity* was not: the selector
+integrates the candidate this returns, and a reader that offered the wrong one
+would have left all seven of those assertions true.
+
+The arms are its three early returns and the queue's own eligibility. The parked
+arm is the one that pins identity — with `mid` awaiting input the offer must be
+`zeta`, and the two candidates are asserted distinguishable first, so an
+either-answer reader cannot pass. Dropping the open-transaction guard is a change
+the fold suite otherwise passes.
+
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `let base = sha("base");`
 
-refusals[20], and the epoch scope that makes a resume the way back:
-a budget-stopped run ingests the answer after its resume, and a
-halted one never does, because `halted_at` is never cleared.
+refusals[20], and the epoch scope that makes a resume the way back: both a
+budget-stopped run and a halted one ingest the answer after their resume.
+
+**The sentence that stood here until the sweep of row 39 said the halted one
+never does, "because `halted_at` is never cleared".** `halted_at` is indeed
+never cleared, and `derived_outcome` reads it, so a resumed halted run still
+derives Halted -- but `check_question_answered` does not read it. It compares
+`halted_epoch` with the current epoch, and a resume moves the epoch, so the
+answer door reopens. The two halves of this file's own prose disagreed about
+that, the paragraph below having it right, and the test stopped one line short
+of asking: it resumed and then asserted only that `halted_at` survived.
+Replacing the guard with `self.halted_at.is_some()` -- the reading the wrong
+sentence describes -- was a change the whole fold suite passed.
 
 ## `fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_th…` › `apply(&mut halted, &resume(container_runner()));`
 
@@ -2139,6 +2233,14 @@ refusals[18]: halt and budget outrank backoff.
 
 Cleared by the resume that raises the ceiling.
 
+The halt below is the other half of that, and the asymmetry is the point:
+`check_defer_wait_elapsed` guards on `halted_at.is_some()`, which no resume
+clears, while `check_question_answered` two files away guards on
+`halted_epoch == self.epoch`, which every resume moves. So one resume reopens
+answers and leaves waits refused. Each guard is asserted after a resume here,
+because each was free to take the other's form: swapping either one for the
+other's expression left the fold suite green.
+
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `let head = sha("head");`
 
 And what it does when it is allowed: wakes every deferred task and
@@ -2166,6 +2268,15 @@ Every value of [`Blocker`], so the grid crosses the whole dimension.
 ## `enum Budget {`
 
 Whether a budget stop exists, and whether it belongs to this epoch.
+
+`Older` is a stop one epoch **below** the run's, which is why [`grid_state`]
+starts the run at epoch 1 rather than at 0: at epoch 0 there is no older epoch to
+put one in, and the cell used to hold a stop at `epoch + 1`, which is not what
+its name says and not the direction that can go wrong. `budget_stop_is_current`
+is an equality, and an equality has two ways to loosen; with the stop above the
+epoch only one of them was under test. Reading it as `stop.epoch <= self.epoch`
+— a stop that outlives the resume that was supposed to lift it — passed the
+whole fold suite before this cell was corrected and fails it now.
 
 ## `enum Backoff {`
 
@@ -2475,6 +2586,12 @@ Replay: the same refusal, over the wire, with a valid
 suffix behind it that a lenient reader would have gone on
 to apply.
 
+The assertion beside it counts the lines that differ from the honest trace and
+requires exactly one. It used to be `hostile.len() == trace.len() && index <
+trace.len()`, which is an arithmetic identity and a loop bound — true by
+construction, in a position that reads as a check. What it now checks is that
+the log under test is this trace with one line replaced and no other damage.
+
 ## `fn every_guarded_event_is_refused_the_same_way_live_and_on_…` › `let unguarded: BTreeSet<&'static str> = [`
 
 The sweep is over the vocabulary, not over what was remembered. The
@@ -2498,11 +2615,29 @@ would let a writer append one record and fold another — which is the
 divergence between live state and replay that INV-02 forbids, in the
 one place the two are not literally the same call.
 
+## `const ASK: fn(&TopologyFold, &TopologyEvent) -> Result<TopologyDelta, FoldError> =`
+
+The receiver, pinned as a value. This is the whole of the claim below: nothing
+`plan_transition` does can move the fold, because it takes `&TopologyFold` and
+`TopologyFold` has no interior mutability. Declaring this item `&mut` is a type
+error at this line, and giving `plan_transition` a `&mut self` receiver stops the
+crate compiling.
+
 ## `fn a_refused_transition_changes_nothing()` › `let mut fold = started();`
 
 The other half of INV-02: an invalid transition is never applied,
 which is a property of `plan_transition` being a question rather
 than an action.
+
+**The runtime half of this test could not fail, and now can.** It offered every
+kind to a fold, compared the state with the state before, and asserted equality
+— against a `&self` method, on a type with no `Cell`, `RefCell` or lock in it,
+so the compiler had already decided the answer. A comparison that never sees a
+difference is satisfied by any fold, including one whose applier does nothing.
+So the test now takes the accepted delta it asked for, applies it, and requires
+the same comparison to report a difference; making `apply_delta` inert for
+`question_raised` fails this test with 22 others, where before it failed 22.
+The claim about asking is where it belongs, in [`ASK`] above.
 
 ## `fn the_registry_digest_does_not_widen_when_a_repair_is_regi…` › `let mut fold = started();`
 
