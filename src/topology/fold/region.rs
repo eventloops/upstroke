@@ -8,7 +8,7 @@ pub(super) fn describe_region(paths: &PathSet) -> String {
         Some([]) => "no path at all".to_owned(),
         Some(prefixes) => prefixes
             .iter()
-            .map(|path| format!("`{}`", path.as_str()))
+            .map(|path| format!("`{path}`"))
             .collect::<Vec<_>>()
             .join(", "),
     }
@@ -48,6 +48,14 @@ pub(super) fn ordinal(index: u32) -> String {
     format!("#{index}")
 }
 
+fn disposition_name(disposition: LeaseDisposition) -> &'static str {
+    match disposition {
+        LeaseDisposition::PredictedReleased => "predicted-released",
+        LeaseDisposition::PredictedRetained => "predicted-retained",
+        LeaseDisposition::LineageHeld => "lineage-held",
+    }
+}
+
 pub(super) fn check_lease_disposition(
     kind: &'static str,
     key: TaskKey,
@@ -61,12 +69,12 @@ pub(super) fn check_lease_disposition(
     Err(FoldError::InvalidLeaseDisposition {
         kind,
         key: key.0,
-        recorded: format!("{recorded:?}"),
+        recorded: disposition_name(recorded).to_owned(),
         owner: match lease {
             GenerationLease::Own => "leaseholding",
             GenerationLease::InheritedLineage { .. } => "lineage",
         },
         fate: "closes",
-        expected: format!("{expected:?}"),
+        expected: disposition_name(expected).to_owned(),
     })
 }
