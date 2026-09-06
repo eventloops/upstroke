@@ -5246,6 +5246,11 @@ mod termination {
             let ack = create_cloexec_pipe().expect("a guard acknowledgement pipe");
             let wake = create_cloexec_pipe().expect("a guard wake pipe");
             let probe = create_cloexec_pipe().expect("a guard probe pipe");
+            // Resolved before either fork, as `spawn_guard` resolves it: the
+            // multithreaded child may call only async-signal-safe primitives.
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let open_max = libc::c_int::try_from(open_max).expect("a descriptor ceiling");
+            assert!(open_max > 0, "a descriptor ceiling: {open_max}");
             // SAFETY: the forked child calls only `_exit`.
             let departed = unsafe { libc::fork() };
             if departed == 0 {
@@ -5271,6 +5276,7 @@ mod termination {
                 close_fd(ack[0]);
                 close_fd(wake[1]);
                 close_fd(probe[0]);
+                close_inherited_fds(&[command[0], ack[1], wake[0], probe[1]], open_max);
                 guard_loop(departed, command[0], ack[1], wake[0], probe[1], departed);
             }
             assert!(

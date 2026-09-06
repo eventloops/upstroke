@@ -1979,6 +1979,12 @@ the defect is on. Both platforms evaluate this: holding the writers open
 withholds the hangup Linux would otherwise report, so the check under
 test is the same one on each (§11).
 
+The fixture guard scrubs its inherited descriptors before entering the
+loop, as `spawn_guard`'s child does. The harness runs these tests in one
+process and in parallel, so a child that kept copies of another test's
+pipe write ends would hold them open for the whole wait and withhold the
+end-of-file that test is measuring.
+
 ## `mod tests` › `fn a_reaper_refused_its_cleanup_lease_says_which_lease_and_why() {`
 
 End to end through `spawn_reaper` with a real run lock and cleanup
