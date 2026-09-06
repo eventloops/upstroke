@@ -159,31 +159,31 @@ still read what the body recorded. Production never constructs a recording
 one: [`Self::off`] holds no allocation and every `record` call on it is a
 discriminant test.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn off() -> Self {`
 
 A ledger that records nothing. What production passes.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn recording() -> Self {`
 
 A ledger that records. What a test passes.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn is_recording(&self) -> bool {`
 
 Whether this ledger records at all.
 
-## `pub fn record(&self, step: DurableStep, path: &Path, len: u64) {`
+## `impl DurabilityLedger` › `pub fn record(&self, step: DurableStep, path: &Path, len: u64) {`
 
 Append one entry.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn records(&self) -> Vec<DurableRecord> {`
 
 Everything recorded so far, in order.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn records_for(&self, path: &Path) -> Vec<DurableRecord> {`
 
 Everything recorded so far about `path`, in order.
 
-## `#[must_use]`
+## `impl DurabilityLedger` › `pub fn steps(&self) -> Vec<DurableStep> {`
 
 The steps recorded so far, in order, with their paths discarded.
 

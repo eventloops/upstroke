@@ -95,12 +95,6 @@ Settled in memory only: status is a pure read and must not write to a
 run it is merely looking at. A resume records the same settlement as
 events instead.
 
-## `let interrupted = if running {`
-
-
-
-## `let interrupted = if running {`
-
 And only for a run nothing is driving. An attempt in flight under a live
 engine has not been interrupted — it is working — so settling it here
 would report a running attempt as a failure and the whole run as halted.
@@ -144,12 +138,6 @@ nothing for minutes at a time; giving up on one would drop the
 live view mid-run. The budget exists only to release a terminal
 attached to an engine that has died, so it starts counting when
 the run's lock does not.
-
-## `let running = rundir::is_running(&status.paths.public);`
-
-
-
-## `let running = rundir::is_running(&status.paths.public);`
 
 One syscall per poll, asked plainly. This used to need a cheaper
 variant of its own, because the check waited out a contention
