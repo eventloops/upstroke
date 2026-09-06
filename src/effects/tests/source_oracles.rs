@@ -770,7 +770,9 @@ pub(super) mod oracles {
             "keeps every byte offset",
         ];
 
-        let notes = fs::read_to_string(repo_root().join(NOTES)).expect("the effects notes");
+        let notes = fs::read_to_string(repo_root().join(NOTES))
+            .expect("the effects notes")
+            .replace("\r\n", "\n");
         let deleting = notes_section(&notes, DELETING);
         let blanking = notes_section(&notes, BLANKING);
         let (deleting_in, deleting_out) = worked_example(&deleting, DELETING);

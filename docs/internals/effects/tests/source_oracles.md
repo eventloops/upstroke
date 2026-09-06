@@ -841,6 +841,12 @@ literal's. A census written from that sentence can look for a needle inside a
 literal that is no longer there, or report a line and column measured against
 an input the output is no longer aligned to.
 
+The notes are read with `\r\n` folded to `\n` first. A Windows checkout under
+`core.autocrlf` hands the file back with carriage returns, and the heading and
+fence boundaries this parser looks for are spelled with bare newlines: without
+the fold every section lookup misses and the test fails on the guest while
+passing on Linux.
+
 Prose cannot be pinned by naming the sentence it must not contain, so the
 direction of every assertion here is measured first: which helper preserves
 its input's length is computed from the helper, and the notes are then
