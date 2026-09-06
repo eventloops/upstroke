@@ -618,7 +618,21 @@ loop that consumes `Progress` in production is PR8's.
 One attempt ran, was judged, and its settlement is **durable**.
 
 The whole of the ready-dispatch branch: ceiling check, reservation,
-dispatch, the attempt through the Runner, and `attempt_finished`.
+dispatch, the attempt through the Runner, and the settlement append —
+**which append that is depends on `accepted`**.
+
+A rejected attempt ends at `attempt_finished`: `settle` builds the record,
+asks the ladder for the next step, and emits the event `settle_failed`
+shaped. An accepted attempt **never appends `attempt_finished`** — `settle`
+takes the `promote_candidate` path before it reaches any of that, and the
+branch ends at `candidate_prepared` followed by `task_candidate_created`.
+`candidate_prepared` is the sole successful settlement
+(`design/15_design_event_log_resume_run_layout.md`,
+`design/26_design_merge_queue_protocol.md` §26), it carries the attempt
+record itself, and `check_attempt_finished` refuses `Succeeded` outright, so
+a reader reconstructing a successful attempt's durable record who goes
+looking for an `attempt_finished` will not find one. `accepted` is the flag
+that says which of the two sequences was written.
 
 ## `pub enum Progress` › `key: TaskKey,`
 
