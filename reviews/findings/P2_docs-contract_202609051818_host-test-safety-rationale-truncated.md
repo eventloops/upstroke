@@ -1,4 +1,5 @@
 ---
+status: owner attention required
 id: PR157-ASTRA-SITE-SAFETY
 severity: P2
 disposition: deferred
@@ -46,3 +47,36 @@ and the `HeldFork` ownership protocol beside its type. Keep the notes copy if
 useful. Check complete comment blocks when moving prose, rather than retaining
 only their first `SAFETY:` line. This is future documentation maintenance,
 not a prerequisite repair for this review's PASS.
+
+## Owner attention required
+
+Recorded 2026-09-06T21:45Z by the parked-PR recovery workflow, task pr197 (earlier record:
+2026-09-06T09:14Z, findings-workflow task 2b802b011b29).
+
+The recovery spent its full budget -- an initial review and three repair rounds, four started
+reviews of `gpt-5.6-sol` at high effort -- and pass 4 of 4 still returned one blocking P2, so the
+pull request is parked again rather than merged. Each round repaired the previous round's finding
+in the census this pull request adds and each was confirmed fixed by the next pass; the original
+finding's repair has been recorded intact by every pass.
+
+The finding itself is fixed and proved on the branch at
+`cbd42faa60df93807602a2e8100f7624193b553a`: the six truncated `SAFETY:` blocks and the `HeldFork`
+protocol are restored complete and adjacent, no executable token of the existing module changed,
+the nine-command baseline and `test-pr-ready-audit.sh` are green at that head, both required CI
+contexts are green at it, and seventeen mutation arms each detect a different way of losing a site
+copy or misreading the module.
+
+What blocks the merge is `PR157-ASTRA-SITE-SAFETY-RECOVERY-R4-001` (P2, `correctness`), filed as
+`reviews/findings/P2_correctness_202609062143_host-test-census-trusts-macro-names.md`: the census
+classifies a keyword token by the terminal name of the macros around it, so a local `macro_rules!`
+named `stringify` that forwards its input lets a real unannotated unsafe expression evade the
+census. The recovery's three earlier rounds closed raw identifiers, Unicode identifiers and inert
+macro input; this is the fourth shape of the same class, a scanner whose notion of an operation is
+not the compiler's, and the finding file names the two repairs that would close the class (fail
+closed on a shadowed built-in name, or an explicitly anchored census with asserted boundaries).
+
+Preserved for the owner: branch `codex/findings-2b802b011b29`, worktree
+`/srv/worktrees/findings-workflow/tasks/2b802b011b29`, draft PR
+https://github.com/eventloops/upstroke/pull/197 (not closed), all six verdicts posted verbatim as
+SHA-bound comments, the audit at `/home/ubuntu/parked-pr-workflow/tasks/pr197/history.md`, and
+the mutation witnesses under `/home/ubuntu/parked-pr-workflow/tasks/pr197/evidence/`.

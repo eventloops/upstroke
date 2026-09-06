@@ -2953,3 +2953,166 @@ so truncating at the first #[cfg(test)] also fails this control.
 
 And the two are the run and the resume facade, each of which then
 borrows that one runner for pre-flight and every attempt.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {`
+
+The census that holds this module's site-placed reasoning in step with the copy
+kept here. `standards/11_standards_unsafe_and_platform_code.md` requires an
+adjacent `SAFETY:` comment stating each obligation and why it holds, and
+`standards/10_standards_concurrency.md` a written protocol for shared state and
+its cleanup. Section 13 moves a module's prose into this file but says the
+reasoning another standard requires *at* a site is that standard's to place, and
+that a module with a notes file is not excused from it.
+
+PR #157 moved the prose here and left only the opening line of each block behind,
+separated from its own operation by a blank line, so a reader at the six `unsafe`
+operations in `inherited_writer` met a sentence that stopped mid-clause -- "The
+child", "a live,", "for this" -- and the `HeldFork` lifetime protocol had no site
+copy at all. `PR157-ASTRA-SITE-SAFETY` is that finding. Nothing in the diff that
+caused it touched an executable token, which is why nothing failed.
+
+The census reads this module and this file through `include_str!` and holds them
+equal in both directions: every operation carries an adjacent complete
+obligation, the multiset of site obligations equals the multiset recorded here,
+and the guard's protocol sits beside its type. Four separate mutations were run
+against it -- adjacency lost, a block shortened but left adjacent, the protocol
+deleted from the site, the notes copy edited away from the site copy -- and each
+is detected by a different assertion.
+
+It is deliberately outside the `#[cfg(target_os = "linux")]` module it censuses,
+so all three Clippy and test legs evaluate it. `include_str!` embeds the
+checked-out bytes, so a Windows checkout under `core.autocrlf` supplies `\r\n`;
+each line is stripped of a trailing `\r` and every comparison is over
+whitespace-separated words, which absorbs a rewrap of either copy as well.
+Reading at compile time also keeps the census off the runtime effect surface
+this module's allowlist row governs.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `const KEYWORD: &str = "unsafe";`
+
+The census reads the file it lives in, and the keyword is spelled in full here
+because the scan never sees this line: string literals are blanked before the
+scan, so the constant, the fixtures the controls build, and every message that
+names the keyword are prose to it. The first census spelled the needle in two
+pieces to keep from finding itself and skipped only whole-line `//` comments,
+so a literal or a block comment containing the word was read as an operation
+with no obligation; `PR157-ASTRA-SITE-SAFETY-R2-001` is that finding, and the
+blanked view is its repair.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn comment_body(line: &str) -> Option<&str> {`
+
+The text of a `//` comment line, or `None` for code, a blank line, or the module
+header. Returning `None` for a blank line is what catches the separator PR #157
+left behind: a block is adjacent exactly when the line above the operation is a
+comment.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn block_ending_at(lines: &[&str], above: usize) -> Option<String> {`
+
+The whole comment block whose last line is `above`, normalised to one line of
+words. Walking upward from the operation rather than downward from the comment is
+what makes a truncated block visible: the remnant is still a comment, but it is
+no longer the line above. It reads the source lines, not the blanked view, so
+the obligation is compared as the reader sees it.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `const EXPRESSION_MACROS: [&str; 21] = [`
+
+A keyword token is not an operation until the census knows what the text
+around it is. The `assert_eq!(` above the `mkfifo` call is the reason this
+list exists: the block inside it is a real operation, expanded as an
+expression, and a census that skipped macro input would lose that site. These
+are the standard macros whose input is expressions; the keyword inside one of
+them is read as code. `INERT_MACROS` are the standard macros whose input is
+never expanded as code -- `stringify!`, `concat!`, `include_str!` and their
+kin -- and the keyword inside one of them is prose;
+`PR157-ASTRA-SITE-SAFETY-RECOVERY-R3-001` is the finding that
+`stringify!(unsafe)` was read as an operation. A macro on neither list is a
+boundary the census does not cross: the keyword inside it is refused with the
+macro's name, because the census cannot tell whether that macro expands its
+input, and a guess in either direction is the defect this census exists to
+refuse. An inert macro anywhere in the nest wins, since nothing inside it is
+expanded; otherwise the first unknown macro in the nest refuses.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn keyword_tokens(code: &str) -> impl Iterator<Item = usize> + '_ {`
+
+Every offset in the blanked view where the keyword is a token: an occurrence
+with no identifier-continuing character on either side, and neither `#` nor
+`'` before it. Edition 2024 admits a keyword as a raw identifier, so `r#unsafe`
+is a binding, not an operation, and a splitter that treats `#` as a delimiter
+reads it as one; `PR157-ASTRA-SITE-SAFETY-RECOVERY-R1-001` is that finding. No
+other Rust token puts `#` directly before the word: an unsafe attribute opens
+with `#[`, so it still counts. A `'` before it would be a lifetime or a label,
+which Rust refuses to name after a keyword, so that shape cannot occur in a
+module that compiles and is excluded rather than counted.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn macro_invocations(code: &str) -> Result<Vec<(&str, usize, usize)>, String> {`
+
+Every macro invocation in the blanked view as its name and the offsets of its
+token tree's delimiters: an identifier, `!`, optional whitespace and one of
+`(`, `[`, `{`, closed by the matching delimiter counted over all three kinds,
+which is reliable only because literals and comments are already blank.
+`macro_rules! name { ... }` carries the defined name between the `!` and the
+brace and is skipped over the same way. A `!` with no identifier before it --
+negation, `!=`, the never type -- names no macro. A token tree that never
+closes is a refusal, not a silent end of the scan.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn continues_an_identifier(character: char) -> bool {`
+
+What may follow or precede the keyword inside one identifier, decided without
+a Unicode table. Rust identifiers continue with `XID_Continue`, which
+`char::is_alphanumeric` does not cover: U+0301 COMBINING ACUTE ACCENT continues
+`unsafé` but is not alphanumeric, so a test on that predicate read the
+identifier as the keyword; `PR157-ASTRA-SITE-SAFETY-RECOVERY-R2-001` is that
+finding. In a module that compiles, the only characters that can stand
+directly beside a token are ASCII punctuation, ASCII alphanumerics and `_`,
+identifier characters, and Rust's whitespace, which is exactly Unicode
+`Pattern_White_Space` -- the eleven characters of the constant above -- so the
+rule is: ASCII alphanumerics and `_` continue an identifier, every other ASCII
+character does not, and every non-ASCII character does unless it is one of
+those eleven. That errs, if at all, toward not counting: a non-ASCII character
+that is neither identifier nor whitespace is a lexer error, not a token
+boundary, and the census does not run over text the compiler refused.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn site_obligations(source: &str) -> Result<Vec<String>, String> {`
+
+The scan proper, over any source text, so the controls below can run it over a
+fixture built from this module and observe a refusal as a value rather than a
+panic. The operations are located in `crate::effects::blank_comments_and_strings`'
+view of the text, which section 12 requires of a census of Rust structure: the
+blanker keeps every position and every newline and replaces comments and
+string, character, byte-string and raw-string literals with spaces, and carries
+its own fixture proof in the effects suite, so this census does not write a
+second one. The line count of the two views is asserted equal before they are
+walked side by side; each keyword token of the blanked view is then placed in
+the macro nest around it, and when it is code the obligation for its line is
+read out of the original text at the same index, where the comment still is.
+A keyword token in code position is always a construct in a module that
+compiles -- a block, `fn`, `impl`, `trait`, `extern` or the attribute form --
+so the census does not test the shape after it: a check no fixture of valid
+Rust can reach would be a seam without a witness.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let mut opens_at = index;`
+
+The obligation sits above the statement, and a macro or call may open that
+statement on an earlier line -- `assert_eq!(` above the `mkfifo` call. The walk
+crosses those openers and nothing else: it reads the blanked view, where a
+comment line or a line inside a literal is blank and so never ends with `(`,
+and it never crosses a blank line or unrelated code, so "adjacent" keeps its
+meaning.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `let lines_here = SOURCE.lines().count();`
+
+The census's own controls, section 12's positive control included, each built by
+appending to the real module so the domain is the whole file and not a
+fixture shaped to pass. The keyword inside a string literal, a raw string
+literal, a multi-line string literal, a one-line and a multi-line block comment
+and a trailing `//` comment, as a raw identifier, as the start of a longer
+identifier, followed by a combining mark or a precomposed letter that makes it
+another identifier, and inside `stringify!` and `concat!` -- alone, nested in
+`assert_eq!`, and as a whole block -- must leave the obligations exactly as
+they were; an operation appended with nothing above it -- with U+2028 LINE
+SEPARATOR, Rust whitespace that is not ASCII, between the keyword and its
+block -- must be refused at its own line number, which is also the proof that
+positions are preserved and that Rust's whitespace bounds the token; the same
+operation inside `assert_eq!` must be refused the same way; the keyword inside
+a macro on neither list must be refused with that macro's name; and an operation appended under a fresh
+`SAFETY:` line must contribute exactly that line's text, read from the source
+where the blanked view has already erased it.
