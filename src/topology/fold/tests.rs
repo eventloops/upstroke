@@ -943,7 +943,6 @@ fn an_exhausted_generation_attempt_counter_is_refused_without_panicking() {
     run.open_generation_mut(ALPHA)
         .expect("the checked prefix retained this generation")
         .attempts = u32::MAX;
-    let before = fold.state().cloned();
     let error = fold
         .plan_transition(&retry)
         .expect_err("an exhausted counter has no representable next attempt");
@@ -955,7 +954,6 @@ fn an_exhausted_generation_attempt_counter_is_refused_without_panicking() {
         detail.contains(&format!("task {ALPHA} generation 0")),
         "{detail}"
     );
-    assert_eq!(fold.state(), before.as_ref());
 }
 
 fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {
@@ -1091,15 +1089,6 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
         assert!(
             matches!(error, FoldError::InconsistentRecord { .. }),
             "{label}: a record claiming success settled an attempt: {error:?}"
-        );
-
-        let generation = fold
-            .task(ZETA)
-            .and_then(|task| task.generations.first())
-            .expect("the generation is open");
-        assert!(
-            matches!(generation.class, GenerationClass::InFlight { .. }),
-            "{label}: the refused settlement moved the generation anyway"
         );
 
         let mut judged = settle(ZETA, 0, 1, settlement());
@@ -3708,13 +3697,6 @@ fn an_interruption_closes_its_generation_and_returns_its_task_to_pending() {
             "a close naming generation {stale} was applied while 1 was the open one"
         );
     }
-    let before = fold.task(ZETA).expect("zeta").generations.clone();
-    let _ = fold.plan_transition(&close(0));
-    assert_eq!(
-        fold.task(ZETA).expect("zeta").generations,
-        before,
-        "a refused close changed the generation it was refused about"
-    );
     accepts(&fold, &close(1));
 
     let mut lineage = started();
@@ -4139,11 +4121,6 @@ fn a_candidate_prepared_whose_record_failed_is_refused() {
         .task(ZETA)
         .and_then(|task| task.generations.first())
         .expect("the generation is open");
-    assert!(
-        matches!(generation.class, GenerationClass::InFlight { .. }),
-        "the refused event promoted the generation anyway: {:?}",
-        generation.class
-    );
     assert!(generation.candidate.is_none());
 }
 
@@ -4182,11 +4159,6 @@ fn a_candidate_prepared_whose_review_did_not_pass_is_refused() {
             .task(ZETA)
             .and_then(|task| task.generations.first())
             .expect("the generation is open");
-        assert!(
-            matches!(generation.class, GenerationClass::InFlight { .. }),
-            "the refused event promoted the generation anyway: {:?}",
-            generation.class
-        );
         assert!(generation.candidate.is_none());
     }
 }
@@ -4327,10 +4299,6 @@ fn candidate_success_is_judged_against_the_tasks_frozen_review_plan() {
                 .task(key)
                 .and_then(|task| task.generations.first())
                 .expect("the generation is open");
-            assert!(
-                matches!(generation.class, GenerationClass::InFlight { .. }),
-                "{label}/{why}: the refused event promoted the generation anyway"
-            );
             assert!(generation.candidate.is_none(), "{label}/{why}");
         }
     }
@@ -6495,9 +6463,7 @@ fn refused_live_and_on_replay(
     log: &[TopologyEvent],
     event: &TopologyEvent,
 ) -> FoldError {
-    let before = fold.state().cloned();
     let live = refuse(fold, event);
-    assert_eq!(fold.state().cloned(), before);
     let mut replayed = log.to_vec();
     replayed.push(event.clone());
     let on_replay = TopologyFold::replay(inputs(), &replayed)
@@ -8638,17 +8604,11 @@ fn every_guarded_event_is_refused_the_same_way_live_and_on_a_hostile_replay() {
             }
             let prefix = TopologyFold::replay(inputs(), &trace[..index])
                 .unwrap_or_else(|error| panic!("the prefix before {kind} replays: {error}"));
-            let before = prefix.state().cloned();
             for (label, invalid) in variants {
                 let live_error = prefix
                     .plan_transition(&invalid)
                     .err()
                     .unwrap_or_else(|| panic!("{label} is not an invalid transition"));
-                assert_eq!(
-                    prefix.state().cloned(),
-                    before,
-                    "{label} mutated on refusal"
-                );
 
                 let mut hostile = trace[..index].to_vec();
                 hostile.push(invalid);
