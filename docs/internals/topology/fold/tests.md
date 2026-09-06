@@ -2709,3 +2709,11 @@ This is not a claim that a billions-record history was replayed.
 ## `an_exhausted_generation_attempt_counter_is_refused_without_panicking` › `let before = fold.state().cloned();`
 
 The independent snapshot witnesses that refusing the retry changes no state.
+
+## Question guard regression traces from PR #153
+
+The four open-generation classes refuse a bare question with identical live and replay errors. The unrelated-task control also proves refusal does not consume the question ID. Each case clones its event prefix to replay it independently; the refusal helper owns a state snapshot and replay log for comparison.
+
+Terminal tasks refuse new questions. Quiet parked tasks and repair lineages permit multiple questions; answering one preserves any remaining question and restores the state implied by the candidate or lineage. A queued candidate returns to AwaitingMerge and cannot dispatch another generation.
+
+The repair-member trace checks both an ordinary answer and a nonhalting decline, live and by replay. Decline fails both unmerged members and avoids FoldError; this is fold state evidence, not proof of operating-system process termination. The attempt settlement trace separately checks a halting decline, released lease, and accepted run_finished. These tests use the broader question contract implemented by PR #152; the earlier blanket lineage and answer-state restrictions are superseded.
