@@ -232,6 +232,15 @@ The negative half is what gives it teeth. Perturbing one field of the
 binding must be refused, or the validator is not checking the thing the
 reader produces and the positive half proves nothing.
 
+**The table varies every field of `RungBinding`, and did not always.** It ran
+`model`, `agent` and `effort` and left `tier` and `pinned` alone, so a
+comparison that dropped either of those two would have passed here.
+`matches_frozen` is whole-struct equality against `from_frozen`, so all five are
+compared today; that is a property of one expression, and this table is what
+holds it. The `assert_ne!` above the refusal is the guard the older arms did
+without: a perturbation that perturbs nothing would satisfy the loop by leaving
+the accepted binding in place.
+
 ## `fn attempt_started_resuming(`
 
 [`attempt_started`], resuming `session` — the same-generation retry a
@@ -1191,6 +1200,10 @@ resume in a fresh generation is not a retry.
 refusals[11] / INV-19, one component at a time. Each case moves one
 field of an otherwise exact binding: a check that compared the whole
 record, or that compared none of it, fails on the case it skipped.
+
+`pinned` joined `agent`, `model`, `tier` and `effort` in the sweep of row 39.
+It was the one coordinate of `RungBinding` no table in this file varied, and
+`matches_frozen` ignoring it was a change the whole suite passed.
 
 ## `fn an_attempt_runs_the_frozen_binding_or_the_validated_over…` › `let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);`
 

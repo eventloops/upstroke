@@ -601,8 +601,25 @@ fn the_frozen_rung_binding_is_what_the_validator_accepts() {
                 Effort::High
             }
         }),
+        ("tier", |b: &mut RungBinding| {
+            b.tier = if b.tier == Tier::Frontier {
+                Tier::Small
+            } else {
+                Tier::Frontier
+            }
+        }),
+        ("pinned", |b: &mut RungBinding| b.pinned = !b.pinned),
     ] {
         let mut wrong = binding.clone();
+        assert_ne!(
+            {
+                let mut probe = binding.clone();
+                mutate(&mut probe);
+                probe
+            },
+            binding,
+            "the `{label}` perturbation is not a perturbation"
+        );
         mutate(&mut wrong);
         let refused = ev(TopologyEventBody::AttemptStarted {
             data: AttemptStarted4 {
@@ -3164,13 +3181,14 @@ fn an_attempt_runs_the_frozen_binding_or_the_validated_override() {
     let exact = attempt_started(&fold, ZETA, 0, 1, 0);
     accepts(&fold, &exact);
 
-    let cases: [(&str, BreakBinding); 4] = [
+    let cases: [(&str, BreakBinding); 5] = [
         ("agent", |binding| binding.agent = "copilot".to_owned()),
         ("model", |binding| {
             binding.model = "another-model".to_owned()
         }),
         ("tier", |binding| binding.tier = Tier::Frontier),
         ("effort", |binding| binding.effort = Effort::Medium),
+        ("pinned", |binding| binding.pinned = !binding.pinned),
     ];
     for (label, break_it) in cases {
         let mut binding = frozen_binding(&fold, ZETA, 0);
