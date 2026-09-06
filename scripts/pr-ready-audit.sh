@@ -40,11 +40,13 @@
 # ignored, so a contributor cannot mint a PASS.
 #
 # Limits, stated so nobody reads more into READY than it says: the audit sees severities and the
-# fields the review JSON carries. A finding whose object carries a non-empty witness,
-# reproduction, repro, failing_test or mutation field blocks in every lane; a witness that exists
-# only in prose does not reach the audit, and the deferring implementor's row asserts there is
-# none (MAINTAINING step 5 binds them). A master merge-in is checked for leaving no branch commit
-# outside the ledger, not for a byte-identical branch diff.
+# fields the review JSON carries. A finding whose object carries a witness, reproduction, repro,
+# failing_test or mutation field that is not null, false or empty blocks in every lane, and so
+# does one whose fields name a MUST deviation (a field named mandatory/deviation/must_*, or the
+# word MUST in any string field); a witness or deviation that exists only in prose does not
+# reach the audit, and the deferring implementor's row asserts there is none (MAINTAINING step 5
+# binds them). A master merge-in is checked for being git's own merge of its parents and for
+# leaving no branch commit outside the ledger.
 #
 # Needs: bash, git (a checkout with `origin` pointing at the repository), gh (its built-in --jq
 # does all JSON work; a standalone jq is not required).
@@ -155,9 +157,12 @@ for pr in "${prs[@]}"; do
     BLOCKED) blockers+=("blocked-by-rules") ;;          # a ruleset requirement is unmet, e.g. an unresolved conversation
   esac
 
-  # Latest check runs on the head, one per required context.
-  checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" \
-    --jq '[.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)=\(.conclusion // .status)"] | join(" ")')"
+  # The newest check run per required context on the head: a re-run creates a new run with the
+  # same name, so the runs are grouped by name and the latest start wins before its conclusion
+  # is read; an older success never outranks a newer failure.
+  checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" --paginate \
+    --jq '[.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy")] | group_by(.name) | map(max_by(.started_at // "")) | map("\(.name)=\(.conclusion // .status)") | join(" ")' \
+    | tr '\n' ' ')"
   for ctx in upstroke-ci upstroke-pr-policy; do
     case " $checks " in
       *" $ctx=success "*) ;;
@@ -233,6 +238,7 @@ for pr in "${prs[@]}"; do
           [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
         done < <("$py" - "$review_file" <<'PY'
 import json, re, sys
+sys.stdout.reconfigure(newline=chr(10))  # a Windows python writes CRLF to a pipe, and bash would read the CR into the last field
 text = open(sys.argv[1], encoding="utf-8").read()
 # The verdict is the last fenced JSON object; the older bare form has no fence.
 found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
@@ -249,18 +255,28 @@ for f in verdict["findings"]:
         continue
     sev = str(f.get("severity", "")).strip()
     fid = str(f.get("id", "")).strip() or "-"
-    wit = int(any(str(f.get(k, "")).strip() for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
+    def present(v):
+        return v not in (None, False, "", [], {}) and str(v).strip() != ""
+    wit = int(any(present(f.get(k)) for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
+    # A MUST deviation is fixed whatever its label (MAINTAINING step 5): any field of the finding
+    # naming MUST as a word, or a field whose name says mandatory/deviation, marks it.
+    must = 0
+    for k, v in f.items():
+        if re.search(r"(mandatory|deviation|must_)", str(k), re.I) and present(v):
+            must = 1
+        if isinstance(v, str) and re.search(r"\bMUST\b", v):
+            must = 1
     if not re.fullmatch(r"P[0-3]", sev):
         print("ERR\tbad-severity:" + fid + "\t0")
         continue
-    print(sev + "\t" + fid + "\t" + str(wit))
+    print(sev + "\t" + fid + "\t" + str(wit + 2 * must))
 PY
 )
         rm -f "$review_file"
       fi
     else
       while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
-      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
+      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b|\bMUST\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
       [[ -n "$stray" ]] && blockers+=("manual:$stray-outside-numbered-findings")
     fi
   fi
@@ -275,7 +291,12 @@ PY
       blockers+=("findings-unparsed:$id")
       continue
     fi
-    if [[ "$wit" == 1 ]]; then
+    # wit is a bit field from the parser: 1 = a witness field is present, 2 = a MUST deviation.
+    if (( wit & 2 )); then
+      blockers+=("must-deviation:${id:-unnamed}")
+      continue
+    fi
+    if (( wit & 1 )); then
       blockers+=("witnessed:${id:-unnamed}")
       continue
     fi
@@ -330,10 +351,12 @@ PY
     if [[ "$state" == READY && "$draft" != "true" ]]; then
       [[ " $labels " != *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
       if ((enqueue)); then
-        if gh pr merge "$pr" --repo "$repo" --merge --auto >/dev/null 2>&1; then
-          echo "      enqueued #$pr"
+        # --match-head-commit binds the enqueue to the head this audit judged: a push that
+        # lands between the audit and this call makes GitHub refuse, never enqueue the newcomer.
+        if gh pr merge "$pr" --repo "$repo" --merge --auto --match-head-commit "$head" >/dev/null 2>&1; then
+          echo "      enqueued #$pr at ${head:0:7}"
         else
-          echo "      could not enqueue #$pr (already queued, or the ruleset has no merge queue yet)"
+          echo "      could not enqueue #$pr at ${head:0:7} (head moved, already queued, or the ruleset has no merge queue yet)"
         fi
       fi
     else
