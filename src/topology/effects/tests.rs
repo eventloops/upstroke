@@ -720,14 +720,40 @@ fn the_inventory_is_the_eleven_groups_and_every_one_of_them_has_sites() {
     // wire form ambiguous and `from_name` arbitrary.
     let names: BTreeSet<String> = sites.iter().map(|site| site.name()).collect();
     assert_eq!(names.len(), sites.len(), "two sites share a dotted name");
-    // The site's group prefix is its group's own name, not a second copy.
+    // The eleven group names, as literals. `name()` is
+    // `format!("{}.{}", group().name(), variant())`, so asserting that a
+    // dotted name starts with `group().name()` is a tautology: it holds
+    // whatever the group is called, including after a rename to `worktree`
+    // that would break every dotted name the design writes down.
+    for (group, spelling) in [
+        (FunnelGroup::Worktree, "Worktree"),
+        (FunnelGroup::Snapshot, "Snapshot"),
+        (FunnelGroup::Ref, "Ref"),
+        (FunnelGroup::Object, "Object"),
+        (FunnelGroup::RunDir, "RunDir"),
+        (FunnelGroup::Event, "Event"),
+        (FunnelGroup::Answer, "Answer"),
+        (FunnelGroup::Lock, "Lock"),
+        (FunnelGroup::Report, "Report"),
+        (FunnelGroup::Process, "Process"),
+        (FunnelGroup::Container, "Container"),
+    ] {
+        assert_eq!(group.name(), spelling, "{group:?}");
+    }
+    let spellings: BTreeSet<&str> = FunnelGroup::ALL.iter().map(|group| group.name()).collect();
+    assert_eq!(spellings.len(), 11, "two groups share a name");
+    // And every dotted name is one of those spellings, a dot, and a
+    // non-empty variant that carries no second dot -- the grammar
+    // `from_name` and the wire form both parse by.
     for site in &sites {
-        assert!(
-            site.name()
-                .starts_with(&format!("{}.", site.group().name())),
-            "{} is not named for its group",
-            site.name()
-        );
+        let name = site.name();
+        let (prefix, variant) = name
+            .split_once('.')
+            .unwrap_or_else(|| panic!("{name} is not a dotted name"));
+        assert!(spellings.contains(prefix), "{name} names no group");
+        assert_eq!(prefix, site.group().name(), "{name}");
+        assert!(!variant.is_empty(), "{name} has no variant");
+        assert!(!variant.contains('.'), "{name} has a second dot");
     }
 }
 
@@ -1109,14 +1135,39 @@ fn an_adjacency_before_a_kind_is_not_the_adjacency_after_it() {
     assert_eq!(Adjacent::None, Adjacent::None);
     assert_eq!(Adjacent::None.event(), None);
 
-    // The consequence the framework actually depends on: the two
-    // directions are the two observable orders, and they are different
-    // orders.
-    for kind in DurableEvent::ALL {
-        assert_ne!(
-            observable_orders_of(Adjacent::Before(*kind)),
-            observable_orders_of(Adjacent::After(*kind)),
-            "{kind}"
+    // The consequence the framework actually depends on, read through the
+    // production function rather than through the local restatement of it:
+    // a site ordered before its event and a site ordered after one answer
+    // different observable orders. Asserting `observable_orders_of` against
+    // itself exercises no production code at all, and passed for any
+    // `EffectSiteId::observable_orders` whatever.
+    let before_site = EffectSiteId::all()
+        .into_iter()
+        .find(|site| matches!(site.adjacent(), Adjacent::Before(_)))
+        .expect("some site is ordered before its append");
+    let after_site = EffectSiteId::all()
+        .into_iter()
+        .find(|site| matches!(site.adjacent(), Adjacent::After(_)))
+        .expect("some site is ordered after its append");
+    assert_eq!(
+        before_site.observable_orders(),
+        &[ObservableOrder::EffectBeforeEvent]
+    );
+    assert_eq!(
+        after_site.observable_orders(),
+        &[ObservableOrder::EventBeforeEffect]
+    );
+    assert_ne!(
+        before_site.observable_orders(),
+        after_site.observable_orders()
+    );
+    // And the local restatement agrees with the production reader at every
+    // site, so the helper the test above uses cannot drift away from it.
+    for site in EffectSiteId::all() {
+        assert_eq!(
+            observable_orders_of(site.adjacent()),
+            site.observable_orders(),
+            "{site}"
         );
     }
 }
@@ -2220,8 +2271,15 @@ fn the_self_test_fixture_varies_every_field_it_reads() {
     // these is asserted to take more than one — and the ones that are
     // deliberately constant say so.
     assert_eq!(FIXTURE_SHAPES.len(), Host::ALL.len());
+    // The table is a literal, so the message prints what the fixture
+    // actually is when the two disagree: a bare `assert_eq!` on a struct of
+    // eleven numbers is otherwise a puzzle to re-derive by hand.
     for (host, expected) in FIXTURE_SHAPES.iter().copied() {
-        assert_eq!(fixture_shape(host), expected, "the {host} fixture");
+        let measured = fixture_shape(host);
+        assert_eq!(
+            measured, expected,
+            "the {host} fixture measured {measured:?}, table says {expected:?}"
+        );
     }
     // Every count above is at least two except the ones named here, so a
     // table edited to a pile of ones would not pass by being a table.
@@ -2367,20 +2425,6 @@ fn the_self_test_fixture_varies_every_field_it_reads() {
             .map(|record| record.element)
             .collect();
         assert_eq!(elements.len(), 8, "{host}: {elements:?}");
-    }
-}
-
-#[test]
-fn the_fixture_shape_table_is_measured_and_not_asserted_into_being() {
-    // The table above is a literal, so this prints what the fixture
-    // actually is when it disagrees — a bare `assert_eq!` on a struct of
-    // eleven numbers is otherwise a puzzle to re-derive by hand.
-    for (host, expected) in FIXTURE_SHAPES.iter().copied() {
-        let measured = fixture_shape(host);
-        assert_eq!(
-            measured, expected,
-            "{host} fixture measured {measured:?}, table says {expected:?}"
-        );
     }
 }
 
@@ -2923,6 +2967,15 @@ fn a_destructive_sites_before_entry_names_the_target_it_is_about_to_destroy() {
 
 #[test]
 fn the_harness_counts_what_the_funnel_told_it_and_answers_what_is_armed() {
+    // The domain two tests below sweep. An empty `PHASES` would make each of
+    // those loops vacuous and every assertion inside them unreachable, so the
+    // slice is pinned where it is read rather than assumed.
+    assert_eq!(
+        HookPhase::PHASES,
+        &[HookPhase::Before, HookPhase::After],
+        "the hook phases are the two the funnel calls"
+    );
+
     let site = EffectSiteId::Event(EventSite::AppendFirst);
     let written = |mode| HookPhase::Point {
         point: SubEffectPoint::Written,
@@ -3513,16 +3566,50 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
                     ) | (EntryPhase::NoExecution, 1, EvidenceLabel::ExecutionObserved)
                         | (EntryPhase::Residue { .. }, 2, EvidenceLabel::RecoveryProven)
                 );
+                // *Which* refusal, and not merely that there was one. The
+                // twenty-five illegal cells are refused by three different
+                // clauses, and a format that answered one refusal for every
+                // wrong cell -- or that reached the label rules before the
+                // residue clause -- satisfies `is_err()` at all twenty-five.
+                // The clauses, in the order `validate_entry` applies them: a
+                // residue class whose evidence or label claims an execution;
+                // then a phase that is not about a class carrying
+                // recovery-proven evidence; then the label rules.
+                let residue_phase = matches!(phase, EntryPhase::Residue { .. });
+                let expected_refusal = if residue_phase
+                    && (evidence_kind == 0 || label == EvidenceLabel::ExecutionObserved)
+                {
+                    Some("residue-claims-execution")
+                } else if !residue_phase && evidence_kind == 2 {
+                    Some("hook-claims-recovery-proof")
+                } else if expected_legal {
+                    None
+                } else {
+                    Some("mislabelled")
+                };
                 let result = FaultRegistry::new().insert(entry);
                 assert_eq!(
                     result.is_ok(),
                     expected_legal,
                     "phase {phase}, evidence {evidence_kind}, label {label:?}: {result:?}"
                 );
-                if expected_legal {
-                    legal += 1;
-                } else {
-                    refused += 1;
+                match (expected_refusal, &result) {
+                    (None, Ok(())) => legal += 1,
+                    (
+                        Some("residue-claims-execution"),
+                        Err(RegistryError::ResidueClaimsExecution { .. }),
+                    )
+                    | (
+                        Some("hook-claims-recovery-proof"),
+                        Err(RegistryError::HookClaimsRecoveryProof { .. }),
+                    )
+                    | (Some("mislabelled"), Err(RegistryError::MislabelledEntry { .. })) => {
+                        refused += 1;
+                    }
+                    _ => panic!(
+                        "phase {phase}, evidence {evidence_kind}, label {label:?}: expected \
+                         {expected_refusal:?}, got {result:?}"
+                    ),
                 }
             }
         }
@@ -5421,8 +5508,6 @@ fn the_bijection_fails_on_every_missing_link() {
     // showed the checker accepting valid input would pass for a checker
     // that accepted everything.
     let host = Host::current();
-    let commit_tree = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
-    let append = EffectSiteId::Event(EventSite::AppendFirst);
 
     let directions: &[Direction] = &[
         Direction {
@@ -5775,7 +5860,6 @@ fn the_bijection_fails_on_every_missing_link() {
         )
         .is_empty()
     );
-    let _ = (commit_tree, append);
 }
 
 #[test]
