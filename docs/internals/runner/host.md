@@ -66,7 +66,7 @@ The `Host` / `host-v1` `Runner`.
 | `environment()` | The environment contract this runner composes under. |
 | `start_write_command()` | The write command's containment startup step (INV-18, host portion). Called once, **before any spawn**. On Unix there is nothing to join and it returns `Ok` having done nothing. The same step as the free `contain_write_command`, with this runner's observer attached; it calls that function rather than repeating it. **Errors:** `UpstrokeError::Refused` with a diagnostic when the ambient job cannot be created or joined. The caller refuses the write command before any effect. |
 | `shell_probe(shell, workspace, invocation)` | The `RunnerPreflight` shell probe, executed through this runner. **Errors:** `UpstrokeError::Refused` when the recorded shell cannot be spawned, is killed by the probe timeout, or does not exit 0. |
-| `program_for(program, composed)` | Which file `program` is, at **this** boundary — decided once and then remembered, at most once per `ProgramQuestion` per runner. Increments `program_resolutions` on entry; `program_searches` moves only when the filesystem is reached. **Errors:** `UpstrokeError::Refused` — `resolve_program`'s, first-hand or replayed. |
+| `program_for(program, composed)` | Which file `program` is, at **this** boundary — decided once and then remembered, at most once per `ProgramQuestion` per runner, but only when the filesystem gave a definite answer. Increments `program_resolutions` on entry; `program_searches` moves only when the filesystem is reached. **Errors:** `UpstrokeError::Refused` — `resolve_program`'s, first-hand or replayed; `UpstrokeError::Filesystem` when a candidate's `stat` failed for a reason other than not-found, first-hand only, never replayed. |
 
 **Fields.** The source keeps the lock protocol beside `HostRunner`. The runner
 owns both locks and never nests them. `resolved` serializes each lookup and caches
@@ -75,6 +75,18 @@ before `hooks` is acquired. The hooks guard covers startup or an entire supervis
 run, so a shared runner supervises one process at a time even when its callers are
 concurrent. Guards release on return or unwind; a poisoned lock retains its inner
 state. The process funnel's RAII owners handle child cleanup.
+
+**What the memo holds.** `resolved` caches only what the filesystem actually decided:
+`Ok(path)` and `resolve_program`'s `Refused` (nothing of that name found anywhere
+searched). A `Filesystem` error — a `stat` that failed for a reason other than
+not-found, so whether the program exists there is undetermined rather than
+answered — is never inserted; `program_for` returns it to that caller unflattened
+(source and `io::ErrorKind` intact) and leaves the question open for the next call
+to search again. The alternative, caching the whole `UpstrokeError` including
+`Filesystem`, was rejected: it would make a transient condition (an `EIO`, a
+briefly-unreadable mount) permanent for the runner's lifetime, and rebuilding a
+cached error from its rendered string was already flattening every variant to
+`Refused`, discarding the `#[source]` chain a caller might need.
 
 ### `ProgramQuestion`
 

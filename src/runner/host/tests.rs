@@ -5328,6 +5328,50 @@ fn a_refused_name_is_refused_identically_without_asking_the_filesystem_again() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_stat_failure_is_not_memoised_as_a_permanent_refusal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch("memo-transient");
+    let bin = root.join("bin");
+    let name = format!("upstroke-d2-{}", crate::ulid::ulid());
+    let file = shim_file_name(&name);
+    let shim = marker_shim(&bin, &file, "RECOVERED");
+    // Denying traversal into `bin` makes `fs::metadata` on the candidate fail
+    // with something other than not-found: an undetermined answer, not a
+    // finding that the program is absent.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644))
+        .expect("clear the directory's execute bit");
+
+    let runner =
+        HostRunner::new().with_environment(environment_on_path(&[&bin], Some(REAL_PATHEXT)));
+    let composed = composed(&[
+        ("PATH", path_of(&[&bin]).as_os_str()),
+        ("PATHEXT", OsStr::new(REAL_PATHEXT)),
+    ]);
+    let first = runner
+        .program_for(&name, &composed)
+        .expect_err("a denied stat is undetermined, not a resolved absence");
+    assert!(
+        matches!(first, UpstrokeError::Filesystem { .. }),
+        "an undetermined stat failure must keep its typed variant, not flatten to a refusal: \
+         {first:?}"
+    );
+
+    // The directory becomes searchable again; a transient failure must not
+    // have been cached as if it were permanent.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("restore the directory's execute bit");
+    let second = runner.program_for(&name, &composed).expect(
+        "access recovered, so the memo must search again instead of replaying the stat failure",
+    );
+    assert_eq!(second, shim);
+
+    let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn production_reaches_a_spawn_through_one_host_runner_per_run() {
     const SITES: [(&str, usize); 6] = [
