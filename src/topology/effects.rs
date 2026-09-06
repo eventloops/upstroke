@@ -444,10 +444,12 @@ impl EffectSiteId {
     ///   artifact referenced by [`Self::row`]; a commit-tree leaves an
     ///   unreferenced object; "the pruning sites' after-phase entries record
     ///   the released objects as R27 residue"; a removal that releases nothing
-    ///   leaves nothing; and a read-only observation performs no effect at all.
+    ///   leaves nothing; a momentary hold is given back before the command
+    ///   returns, so no row holds it; and a read-only observation performs no
+    ///   effect at all.
     /// * *a sub-effect point* — [`SubEffectPoint::residue_rows`],
     ///   [`SubEffectPoint::residue_artifact`] and
-    ///   [`SubEffectPoint::resume_action`], the last of which reads the mode
+    ///   [`SubEffectPoint::resume_action`], the last two of which read the mode
     ///   because the mode is half the coordinate. The rows are the point's, not
     ///   the site's: a Windows containment kill leaves no host process and so
     ///   no row, and a Unix one leaves the reaper's R28 hold rather than the
@@ -515,10 +517,15 @@ impl EffectSiteId {
                     artifact: ResidueArtifact::Removed,
                     action: ResumeAction::AdoptPerformed,
                 },
+                AfterEffect::MomentaryHold => PhaseSemantics {
+                    rows: Vec::new(),
+                    artifact: ResidueArtifact::HoldReleased,
+                    action: ResumeAction::RepeatProbe,
+                },
             },
             EntryPhase::Point { point, mode } => PhaseSemantics {
                 rows: point.residue_rows(self.row()),
-                artifact: point.residue_artifact(),
+                artifact: point.residue_artifact(mode),
                 action: point.resume_action(mode),
             },
             EntryPhase::Residue { .. } => {

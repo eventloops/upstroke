@@ -2195,8 +2195,8 @@ const FIXTURE_SHAPES: &[(Host, FixtureShape)] = &[
             order: 3,
             fault_row: 6,
             rows: 9,
-            detail: 17,
-            resume_action: 8,
+            detail: 18,
+            resume_action: 9,
             label: 2,
             evidence_kind: 3,
             test_name: 38,
@@ -4279,7 +4279,7 @@ const AFTER_EFFECT_ORACLE: &[(&str, AfterEffect)] = &[
     ("Answer.Ingest", AfterEffect::NoEffect),
     ("Lock.AcquireRun", AfterEffect::Referenced),
     ("Lock.AcquireWorktree", AfterEffect::Referenced),
-    ("Lock.ProbeCleanupExclusive", AfterEffect::Referenced),
+    ("Lock.ProbeCleanupExclusive", AfterEffect::MomentaryHold),
     ("Lock.Release", AfterEffect::Removed),
     ("Lock.CreateWorktreeLockFile", AfterEffect::Referenced),
     ("Lock.ObserveCleanupHold", AfterEffect::NoEffect),
@@ -4539,8 +4539,8 @@ const POINT_ORACLE: &[(
         SubEffectPoint::AmbientJobJoined,
         InjectionMode::ErrorReturn,
         OracleRows::NoRow,
-        ResidueArtifact::NoHostProcess,
-        ResumeAction::RefuseResumably,
+        ResidueArtifact::NoProcessSpawned,
+        ResumeAction::RefuseUnspawned,
     ),
     (
         SubEffectPoint::CreatedSuspended,
@@ -4801,6 +4801,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
         AfterEffect::Unreferenced,
         AfterEffect::Released,
         AfterEffect::Removed,
+        AfterEffect::MomentaryHold,
     ] {
         assert!(
             EffectSiteId::all()
@@ -4836,7 +4837,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 "{point}'s residue rows at a site whose row is {probe_row}"
             );
         }
-        assert_eq!(point.residue_artifact(), artifact, "{point}'s artifact");
+        assert_eq!(
+            point.residue_artifact(mode),
+            artifact,
+            "{point}/{mode:?}'s artifact"
+        );
         assert_eq!(
             point.resume_action(mode),
             action,
@@ -4987,6 +4992,11 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 assert_eq!(after.artifact, ResidueArtifact::Removed, "{site}");
                 assert_eq!(after.action, ResumeAction::AdoptPerformed, "{site}");
             }
+            AfterEffect::MomentaryHold => {
+                assert!(after.rows.is_empty(), "{site}");
+                assert_eq!(after.artifact, ResidueArtifact::HoldReleased, "{site}");
+                assert_eq!(after.action, ResumeAction::RepeatProbe, "{site}");
+            }
         }
 
         for class in site.residue_classes() {
@@ -5024,7 +5034,7 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
                 );
                 assert_eq!(
                     semantics.artifact,
-                    point.residue_artifact(),
+                    point.residue_artifact(*mode),
                     "{site}/{phase}"
                 );
                 assert_eq!(
@@ -5101,7 +5111,9 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResidueArtifact::TornTailTruncated
             | ResidueArtifact::PrefixPossiblyNonDurable
             | ResidueArtifact::NoHostProcess
-            | ResidueArtifact::ReaperHeldGroup => {}
+            | ResidueArtifact::NoProcessSpawned
+            | ResidueArtifact::ReaperHeldGroup
+            | ResidueArtifact::HoldReleased => {}
         }
     }
     assert_eq!(
@@ -5123,7 +5135,9 @@ fn the_residue_and_recovery_authority_is_exhaustive_and_says_what_the_packet_say
             | ResumeAction::NextOpenConverges
             | ResumeAction::RefuseResumably
             | ResumeAction::AmbientHandleTerminates
-            | ResumeAction::ReaperSettlesGroup => {}
+            | ResumeAction::ReaperSettlesGroup
+            | ResumeAction::RefuseUnspawned
+            | ResumeAction::RepeatProbe => {}
         }
     }
     assert_eq!(
