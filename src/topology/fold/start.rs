@@ -240,3 +240,83 @@ pub(super) fn check_ladder(key: TaskKey, ladder: &FrozenLadder) -> Result<(), Fo
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::ir::{Effort, ResolvedEffortPolicy};
+    use crate::topology::registry::FrozenRung;
+
+    const KEY: TaskKey = TaskKey(7);
+
+    fn rung(tier: Tier) -> FrozenRung {
+        FrozenRung {
+            tier,
+            agent: format!("agent-{tier}"),
+            model: format!("model-{tier}"),
+            pinned: false,
+        }
+    }
+
+    fn ladder(tiers: &[Tier], rungs: &[Tier], admission: Admission) -> FrozenLadder {
+        FrozenLadder {
+            tiers: tiers.to_vec(),
+            attempts_per: 2,
+            rungs: rungs.iter().copied().map(rung).collect(),
+            floor: tiers.first().copied(),
+            ceiling: tiers.iter().copied().max(),
+            effort: ResolvedEffortPolicy {
+                small: Effort::Low,
+                mid: Effort::XHigh,
+                frontier: Effort::Max,
+                review: Effort::Medium,
+            },
+            admission,
+        }
+    }
+
+    fn defect(ladder: &FrozenLadder) -> Option<String> {
+        match check_ladder(KEY, ladder) {
+            Err(FoldError::MalformedLadder { key, defect }) if key == KEY.0 => Some(defect),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_runnable_ladder_binds_one_rung_for_every_tier() {
+        let every = [Tier::Small, Tier::Mid, Tier::Frontier];
+        assert_eq!(
+            check_ladder(KEY, &ladder(&every, &every, Admission::Runnable)),
+            Ok(())
+        );
+
+        let short = ladder(&every, &[Tier::Small], Admission::Runnable);
+        assert_eq!(
+            defect(&short).as_deref(),
+            Some("it has 1 rung binding(s) for 3 tier(s)")
+        );
+
+        let long = ladder(
+            &[Tier::Small],
+            &[Tier::Small, Tier::Mid],
+            Admission::Runnable,
+        );
+        assert_eq!(
+            defect(&long).as_deref(),
+            Some("it has 2 rung binding(s) for 1 tier(s)")
+        );
+    }
+
+    #[test]
+    fn a_human_binding_ladder_keeps_its_tiers_and_binds_none_of_them() {
+        let waiting = ladder(
+            &[Tier::Mid, Tier::Frontier],
+            &[],
+            Admission::HumanBinding {
+                options: vec!["codex-cli".to_owned()],
+            },
+        );
+        assert_eq!(check_ladder(KEY, &waiting), Ok(()));
+    }
+}
