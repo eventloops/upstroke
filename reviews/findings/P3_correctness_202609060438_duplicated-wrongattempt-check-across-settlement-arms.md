@@ -4,7 +4,7 @@ severity: P3
 disposition: accepted-risk     # a real duplication, but de-duplicating it changes observable error-priority for a multi-defect record and is not proven regression-safe
 category: correctness
 pr: 180
-reviewed_sha: 54a8c7a2290e992ff0aa87db65fbe7cd9bfc4333
+reviewed_sha: 50bcfab07c89488e354a7183ecbddcf35f18c2cc
 location: src/topology/fold/check_attempt.rs:552-560,621-629
 provenance: pre_existing
 first_bad:

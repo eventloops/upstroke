@@ -148,9 +148,12 @@ same question.**
 
 **And the record does not claim the attempt succeeded.**
 `candidate_prepared` is the sole successful settlement
-(INV-07, `design/26_design_merge_queue_protocol.md` §26),
-and the `Closed` arm has enforced that against the record
-since round 6. This arm did not, so the invariant held on one
+(`design/26_design_merge_queue_protocol.md` §26; `INV-07` is
+the retired packet's label for the same rule, kept only because
+sibling notes and a source test still spell it, and is not
+itself an authority — no living design section defines it), and
+the `Closed` arm has enforced that against the record since
+round 6. This arm did not, so the invariant held on one
 path through the door and not the other: a current-epoch
 retained settlement could carry a record with no failure and
 every configured pass green — a record
@@ -186,8 +189,8 @@ is not the half the fold enforces.
 
 ## `impl RunState` › `if matches!(transition, SettlementTransition::Succeeded) {`
 
-**`attempt_finished` does not settle a success.** INV-07 and
-`design/26_design_merge_queue_protocol.md` §26 say it
+**`attempt_finished` does not settle a success.**
+`design/26_design_merge_queue_protocol.md` §26 says it
 outright — `candidate_prepared` is "the **sole**
 successful settlement for an attempt that produces a
 candidate … `attempt_finished` is not also emitted for that
