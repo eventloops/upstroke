@@ -519,21 +519,30 @@ fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {
     );
     let pid = child.pid();
 
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        child.close_stdin();
-        if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
-            panic!("{reason}");
-        }
-        let exited = observe_child_group(pid);
-        assert!(
-            exited.had_exited_before_the_look(),
-            "the premise: the child is an exited, unreaped zombie when it is looked at: {exited}"
-        );
-        panic!("the premise assertion the scheduling case makes fail");
-    }));
+    child.close_stdin();
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        panic!("{reason}");
+    }
+    let exited = observe_child_group(pid);
     assert!(
-        unwound.is_err(),
-        "the body must have left through a panic for this to witness anything"
+        exited.had_exited_before_the_look(),
+        "the premise: the child is an exited, unreaped zombie when it is looked at: {exited}"
+    );
+
+    const DELIBERATE: &str = "the premise assertion the scheduling case makes fail";
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owned_across_the_unwind = child;
+        panic!("{DELIBERATE}");
+    }));
+    let payload = unwound.expect_err("the body must have left through a panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied());
+    assert_eq!(
+        message,
+        Some(DELIBERATE),
+        "the body left through some other panic, so the reap this observes is not the one claimed"
     );
 
     let after = observe_child_group(pid);

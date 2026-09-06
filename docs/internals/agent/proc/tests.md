@@ -302,17 +302,36 @@ supervisor to settle anything on its behalf.
 
 The regression for `PR173-EARLY-ASSERTION-LEAKS-A-ZOMBIE`. It runs the shape of
 the two bodies above — spawn, hold on stdin, `await_exit_without_reaping`, the
-premise look — inside `catch_unwind`, and panics where the scheduling case makes
-the premise assertion fail. The claim is about what is left AFTER that unwind:
+premise look — and then panics, inside `catch_unwind` and holding the guard,
+where the scheduling case makes the premise assertion fail. The claim is about
+what is left AFTER that unwind:
 `observe_child_group(pid).exited_before` must be `Err(ECHILD)`, the answer for a
 pid this process no longer has as a child, rather than `Ok(true)`, the answer for
 an exited, unreaped zombie.
 
-MEASURED BOTH WAYS, because "the test passes" is not evidence that it detects.
-On the base the same body without the guard — the two tests' own ownership shape
-— leaves `exited_before: Ok(true)`. With the guard's `Drop` body emptied, the
-test fails on `Ok(true)`; with `wait` dropped from it and only `kill` kept, it
-fails the same way, since a killed child is a zombie until somebody reaps it.
+THE SETUP IS ESTABLISHED OUTSIDE THE `catch_unwind`, AND THE PANIC IT CATCHES IS
+IDENTIFIED. `PR173-ZOMBIE-REGRESSION-SWALLOWS-PREMISE-FAILURE`: an earlier shape
+ran the whole body inside `catch_unwind` and accepted `is_err()`, so a timed-out
+`await_exit_without_reaping` or a failed zombie premise was caught, reaped by the
+guard exactly as an intended unwind would be, and reported as a pass — the test
+went green having established nothing. §12: a missing prerequisite fails
+diagnostically rather than being read as the condition under test. So the wait
+and the premise assertion run in the test's own frame, where their failure is the
+test's failure, and the closure holds only the guard and one panic whose payload
+is compared against the message the test itself wrote. Any other panic reaching
+`catch_unwind` fails on that comparison instead of standing in for it.
+
+`let _owned_across_the_unwind = child;` is load-bearing rather than a name for
+nothing: a `move` closure captures the variables its body USES, so a closure that
+only panicked would not take the guard at all, and the child would be dropped by
+the enclosing frame after the observation instead of by the unwind.
+
+MEASURED, because "the test passes" is not evidence that it detects. On the base
+the same body without the guard — the two tests' own ownership shape — leaves
+`exited_before: Ok(true)`. With the guard's `Drop` body emptied the test fails on
+`Ok(true)`; with `wait` dropped from it and only `kill` kept it fails the same
+way, since a killed child is a zombie until somebody reaps it. With the premise
+assertion forced to fail, the test fails on the premise instead of passing.
 
 `ECHILD` is also the answer if the pid were reissued to an unrelated process
 between the reap and the look, so the assertion cannot be satisfied by a zombie
