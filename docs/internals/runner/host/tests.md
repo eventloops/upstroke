@@ -1364,7 +1364,17 @@ records the order beside it, because a set cannot tell
 `PrivateJobAssigned` (the child is still suspended) from `Resumed` (it
 is not). `child_created` is the funnel's other observation, and on Unix
 it asks the kernel whether the containment *operation* happened for
-this role rather than only its hook.
+this role rather than only its hook — as a `GroupObservation`, so the
+look carries whether the child had already exited, what `getpgid`
+answered and, on macOS, what the exited record answered. The grid's
+children are short-lived and the look comes after `spawn` returns, so
+the exited case is ordinary here, and it is the case the standing macOS
+red was (`W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-FINGERPRINT`).
+
+## `fn group_leadership(observations: &[proc::GroupObservation]) -> (Vec<bool>, String) {`
+
+The decisions and the rendered records side by side, so an assertion
+compares the former and prints the latter.
 
 ## `impl RoleWitness` › `fn handle(&self) -> Self {`
 

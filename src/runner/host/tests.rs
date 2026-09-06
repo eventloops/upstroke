@@ -2463,7 +2463,21 @@ struct RoleWitness {
     order: Arc<Mutex<Vec<SubEffectPoint>>>,
     children: Arc<Mutex<Vec<u32>>>,
     #[cfg(unix)]
-    led_own_group: Arc<Mutex<Vec<bool>>>,
+    led_own_group: Arc<Mutex<Vec<proc::GroupObservation>>>,
+}
+
+#[cfg(unix)]
+fn group_leadership(observations: &[proc::GroupObservation]) -> (Vec<bool>, String) {
+    let leads = observations
+        .iter()
+        .map(proc::GroupObservation::leads_own_group)
+        .collect();
+    let seen = observations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    (leads, seen)
 }
 
 impl RoleWitness {
@@ -2500,7 +2514,7 @@ impl SpawnHooks for RoleWitness {
         self.led_own_group
             .lock()
             .expect("groups")
-            .push(proc::child_leads_its_own_group(pid));
+            .push(proc::observe_child_group(pid));
     }
 
     #[cfg(windows)]
@@ -3114,12 +3128,15 @@ fn every_role_reaches_the_containment_points_of_this_platform() {
             "{role}: one spawn, one child"
         );
         #[cfg(unix)]
-        assert_eq!(
-            *witness.led_own_group.lock().expect("groups"),
-            vec![true],
-            "{role}: the child did not lead its own process group, so the \
-             pre-exec containment step did not run for this role"
-        );
+        {
+            let (leads, seen) = group_leadership(&witness.led_own_group.lock().expect("groups"));
+            assert_eq!(
+                leads,
+                vec![true],
+                "{role}: the child did not lead its own process group, so the \
+                 pre-exec containment step did not run for this role; observed: {seen}"
+            );
+        }
         if matches!(role, ExecutionRole::Probe(_)) {
             probe_paths.push(role.label());
         }
@@ -3309,7 +3326,7 @@ fn a_fault_armed_at_any_containment_point_stops_any_role() {
 fn the_pre_exec_containment_step_runs_in_the_forked_child() {
     #[derive(Clone, Default)]
     struct Witness {
-        led_own_group: Arc<Mutex<Vec<bool>>>,
+        led_own_group: Arc<Mutex<Vec<proc::GroupObservation>>>,
         order: Arc<Mutex<Vec<SubEffectPoint>>>,
     }
     impl proc::SpawnHooks for Witness {
@@ -3321,7 +3338,7 @@ fn the_pre_exec_containment_step_runs_in_the_forked_child() {
             self.led_own_group
                 .lock()
                 .expect("groups")
-                .push(proc::child_leads_its_own_group(pid));
+                .push(proc::observe_child_group(pid));
         }
     }
 
@@ -3349,11 +3366,12 @@ fn the_pre_exec_containment_step_runs_in_the_forked_child() {
     assert_eq!(output.code, Some(0), "{output:?}");
     let _ = std::fs::remove_dir_all(&workspace);
 
+    let (leads, seen) = group_leadership(&witness.led_own_group.lock().expect("groups"));
     assert_eq!(
-        *witness.led_own_group.lock().expect("groups"),
+        leads,
         vec![true],
         "the child did not lead its own process group, so the pre-exec \
-         closure did not run in it"
+         closure did not run in it; observed: {seen}"
     );
     assert_eq!(
         *witness.order.lock().expect("order"),
