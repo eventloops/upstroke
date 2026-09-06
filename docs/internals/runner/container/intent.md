@@ -2,7 +2,7 @@
 
 Extended notes for [`src/runner/container/intent.rs`](../../../../src/runner/container/intent.rs).
 
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/container/intent.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/runner/container/intent.rs).
 
 The code is the authority for what it does; this file is the whole of its prose, moved out of
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled

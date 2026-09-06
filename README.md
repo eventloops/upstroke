@@ -1,8 +1,8 @@
 # upstroke
 
-[![CI](https://github.com/eventloops/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/eventloops/upstroke/actions/workflows/ci.yml)
+[![CI](https://github.com/sourcemaps/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/sourcemaps/upstroke/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/upstroke.svg)](https://crates.io/crates/upstroke)
-[![license](https://img.shields.io/github/license/eventloops/upstroke.svg)](LICENSE)
+[![license](https://img.shields.io/github/license/sourcemaps/upstroke.svg)](LICENSE)
 
 A headless orchestration engine for AI coding agents. You and a frontier model design a piece of
 work; `upstroke` executes the plan unattended: it turns the plan into a dependency graph of typed
@@ -16,7 +16,7 @@ conductor, not an instrument.
 **Status.** `0.1.0` is released: the sequential conductor works end to end, passed its acceptance
 run on 2026-08-10, and has since run against a real published library. v0.2 (worktree-per-task
 parallelism, a merge queue, capacity-driven routing, more adapters) is in progress; its machinery
-is on `master`, inert by default. [See a run, start to finish →](https://eventloops.github.io/upstroke/)
+is on `master`, inert by default. [See a run, start to finish →](https://upstroke.rs/)
 
 ## Usage
 

@@ -2,14 +2,14 @@
 
 Extended notes for [`src/route.rs`](../../src/route.rs).
 
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/route.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/route.rs).
 
 The code defines current behavior. These notes preserve contracts and implementation
 history. Search each backticked heading fragment separately in the source.
 
 References below to `decisions.*` use retired v0.2 planning identifiers.
 They record implementation history and do not add current requirements.
-[DESIGN.md](https://github.com/eventloops/upstroke/blob/master/DESIGN.md#retired-records)
+[DESIGN.md](https://github.com/sourcemaps/upstroke/blob/master/DESIGN.md#retired-records)
 is the living design authority.
 
 ## Module

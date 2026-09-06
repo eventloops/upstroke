@@ -2,7 +2,7 @@
 
 Extended notes for [`src/runner/host.rs`](../../../src/runner/host.rs).
 
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/host.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/runner/host.rs).
 
 The host runner implements `host-v1`. The code is the authority for what it does.
 The source retains its pointer and the lock protocol beside `HostRunner`, as

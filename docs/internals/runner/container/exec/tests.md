@@ -2,7 +2,7 @@
 
 Extended notes for [`src/runner/container/exec/tests.rs`](../../../../../src/runner/container/exec/tests.rs).
 
-[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/container/exec/tests.rs).
+[Source on GitHub](https://github.com/sourcemaps/upstroke/blob/master/src/runner/container/exec/tests.rs).
 
 The code is the authority for what it does; this file is the whole of its prose, moved out of
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled
