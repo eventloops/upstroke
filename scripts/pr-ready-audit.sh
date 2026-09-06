@@ -2,7 +2,7 @@
 # pr-ready-audit.sh: decide, per open pull request, whether it is ready to enqueue for merge
 # under the three-lane finding policy, and optionally maintain the lane and ready labels.
 #
-#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
+#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [--reviewer LOGIN] [PR ...]
 #
 # NAME must not be a lane:* label. The ready label is advisory: it reports that this audit found
 # the head it read READY. A GitHub label is not bound to a commit, so the head is read again
@@ -18,6 +18,15 @@
 #
 # --ready-label NAME uses an existing label of that name as it is (the audit adds and removes it
 # on pull requests and never recolours or redescribes it) and creates it only when absent.
+#
+# --reviewer LOGIN, or UPSTROKE_REVIEW_AUTHOR, names the account whose review comments this audit
+# trusts. Whose word counts is a trust decision, so it is stated, not deduced. When neither is
+# given the repository's own owner is used, which is right only while the repository belongs to
+# the person who reviews it: on 2026-09-06 `upstroke` moved into the `sourcemaps` organization,
+# that field began resolving to the organization, no comment on earth is authored by an
+# organization, and every pull request silently audited as `no-review` -- READY became
+# unreachable and --enqueue enqueued nothing. It failed closed, and it failed invisibly, which is
+# why an organization owner is now refused outright rather than carried into the query.
 #
 # Lanes, decided by the branch prefix and nothing else (a lane:* label is output, never input;
 # a wrong one is corrected by --apply and reported as lane-label-mismatch):
@@ -232,6 +241,24 @@ ruleset_state() {
   echo "$strict $queue"
 }
 
+# reviewer_login OVERRIDE OWNER_LOGIN OWNER_TYPE: the account whose reviews count, or nothing and
+# a non-zero status when it cannot be settled. An explicit override always wins. Otherwise the
+# repository's owner stands in, but only when that owner is a User: an Organization owns no voice
+# and cannot have written a review, so inheriting it produces a filter that matches nothing.
+# Refusing here turns a fleet-wide silent `no-review` into one loud message at startup.
+reviewer_login() {
+  local override="$1" owner_login="$2" owner_type="$3"
+  if [[ -n "$override" ]]; then
+    printf '%s' "$override"
+    return 0
+  fi
+  if [[ "$owner_type" == "User" && -n "$owner_login" ]]; then
+    printf '%s' "$owner_login"
+    return 0
+  fi
+  return 1
+}
+
 # latest_review_id PR: the id of the newest review comment posted by the repository owner, or
 # nothing. `--paginate` hands `--jq` each page separately, so `last` is per page: each page
 # yields its newest match as "<created_at> <id>" and the newest across pages wins by timestamp.
@@ -259,6 +286,7 @@ main() {
   apply=0
   enqueue=0
   ready_label="ready-to-merge"
+  reviewer_override="${UPSTROKE_REVIEW_AUTHOR:-}"
   prs=()
   while (($#)); do
     case "$1" in
@@ -267,6 +295,9 @@ main() {
       --ready-label)
         ready_label="$2"; shift
         [[ "$ready_label" == lane:* ]] && { echo "refusing: --ready-label must not be a lane:* label" >&2; exit 2; } ;;
+      --reviewer)
+        reviewer_override="$2"; shift
+        [[ -n "$reviewer_override" ]] || { echo "refusing: --reviewer needs a login" >&2; exit 2; } ;;
       -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
       *) prs+=("$1") ;;
     esac
@@ -274,7 +305,15 @@ main() {
   done
 
   repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
-  reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
+  local owner_login owner_type
+  owner_login="$(gh api "repos/$repo" --jq .owner.login)"
+  owner_type="$(gh api "repos/$repo" --jq .owner.type)"
+  if ! reviewer="$(reviewer_login "$reviewer_override" "$owner_login" "$owner_type")"; then
+    echo "refusing: $repo is owned by $owner_login (type $owner_type), which authors no review comments." >&2
+    echo "  Name the account whose reviews count: --reviewer LOGIN, or UPSTROKE_REVIEW_AUTHOR=LOGIN." >&2
+    echo "  Without it every pull request reads no-review and nothing is ever READY." >&2
+    exit 2
+  fi
   read -r strict_up_to_date has_queue <<< "$(ruleset_state)"
 
   if ((${#prs[@]} == 0)); then
