@@ -107,6 +107,12 @@ impl RunState {
     }
 
     pub(super) fn eligible_continuation(&self, key: TaskKey) -> Option<GenerationId> {
+        // `lineage_has_question` is defence in depth here, not a live path: no legal log can
+        // produce an open generation on a task whose lineage has an open question.
+        // `check_dispatched` refuses a dispatch while the lineage question stands, and
+        // `check_question_raised` (via `check_question_can_park_lineage`) refuses a question
+        // while any lineage member still has an open generation. Kept so the two checks and
+        // this selector cannot silently drift apart.
         if self.run_is_ending() || self.lineage_has_question(key) {
             return None;
         }
