@@ -334,13 +334,186 @@ fn kill_tree(terminate_site: ProcessSite, child: &mut ProcessTree) -> Result<(),
 
 #[cfg(all(unix, test))]
 pub(crate) fn child_leads_its_own_group(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
+    observe_child_group(pid).leads_own_group()
+}
+
+#[cfg(all(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZombieGroupAnswer {
+    pub(crate) pgid: u32,
+    pub(crate) status: u32,
+}
+
+#[cfg(all(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupObservation {
+    pub(crate) pid: libc::pid_t,
+    pub(crate) exited_before: Result<bool, i32>,
+    pub(crate) group: Result<libc::pid_t, i32>,
+    #[cfg(target_os = "macos")]
+    pub(crate) zombie_group: Result<ZombieGroupAnswer, i32>,
+    pub(crate) exited_after: Result<bool, i32>,
+}
+
+#[cfg(all(unix, test))]
+impl GroupObservation {
+    pub(crate) fn leads_own_group(&self) -> bool {
+        self.group == Ok(self.pid)
+    }
+
+    pub(crate) fn had_exited_before_the_look(&self) -> bool {
+        self.exited_before == Ok(true)
+    }
+}
+
+#[cfg(all(unix, test))]
+impl std::fmt::Display for GroupObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn exited(answer: Result<bool, i32>) -> String {
+            match answer {
+                Ok(true) => "exited, unreaped".to_owned(),
+                Ok(false) => "running".to_owned(),
+                Err(errno) => format!(
+                    "waitid failed: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ),
+            }
+        }
+        write!(
+            f,
+            "pid {}: before the look {}; getpgid {}",
+            self.pid,
+            exited(self.exited_before),
+            match self.group {
+                Ok(pgid) => format!("answered {pgid}"),
+                Err(errno) => format!("failed: {}", std::io::Error::from_raw_os_error(errno)),
+            },
+        )?;
+        #[cfg(target_os = "macos")]
+        match self.zombie_group {
+            Ok(answer) => write!(
+                f,
+                "; proc_pidinfo(PROC_PIDT_SHORTBSDINFO, zombie) answered pgid {} status {}",
+                answer.pgid, answer.status
+            )?,
+            Err(errno) => write!(
+                f,
+                "; proc_pidinfo(PROC_PIDT_SHORTBSDINFO, zombie) failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            )?,
+        }
+        write!(f, "; after the look {}", exited(self.exited_after))
+    }
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn observe_child_group(pid: u32) -> GroupObservation {
+    let (Ok(signed), Ok(unsigned)) = (libc::pid_t::try_from(pid), libc::id_t::try_from(pid)) else {
+        return GroupObservation {
+            pid: -1,
+            exited_before: Err(libc::EINVAL),
+            group: Err(libc::EINVAL),
+            #[cfg(target_os = "macos")]
+            zombie_group: Err(libc::EINVAL),
+            exited_after: Err(libc::EINVAL),
+        };
     };
+    let exited_before =
+        exited_unreaped(unsigned).map_err(|error| error.raw_os_error().unwrap_or(0));
     // SAFETY: `getpgid` reads process-table state for a pid this process owns
     // as a child and has not reaped; it borrows nothing.
-    let pgid = unsafe { libc::getpgid(pid) };
-    pgid == pid
+    let pgid = unsafe { libc::getpgid(signed) };
+    let group = if pgid < 0 {
+        Err(last_errno_of_observation())
+    } else {
+        Ok(pgid)
+    };
+    #[cfg(target_os = "macos")]
+    let zombie_group = zombie_group_answer(signed);
+    let exited_after = exited_unreaped(unsigned).map_err(|error| error.raw_os_error().unwrap_or(0));
+    GroupObservation {
+        pid: signed,
+        exited_before,
+        group,
+        #[cfg(target_os = "macos")]
+        zombie_group,
+        exited_after,
+    }
+}
+
+#[cfg(all(unix, test))]
+fn last_errno_of_observation() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn zombie_group_answer(pid: libc::pid_t) -> Result<ZombieGroupAnswer, i32> {
+    // SAFETY: `proc_bsdshortinfo` is plain data for which zeroes are a valid
+    // value; the kernel writes at most the byte count passed, which is the
+    // size of the buffer it is given.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>();
+    let Ok(size_arg) = libc::c_int::try_from(size) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: `info` outlives the call and is exactly `size` bytes; the
+    // non-zero third argument asks the kernel for an exited, unreaped record.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            1,
+            (&raw mut info).cast(),
+            size_arg,
+        )
+    };
+    if read <= 0 {
+        return Err(last_errno_of_observation());
+    }
+    if read != size_arg {
+        return Err(libc::EIO);
+    }
+    Ok(ZombieGroupAnswer {
+        pgid: info.pbsi_pgid,
+        status: info.pbsi_status,
+    })
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn await_exit_without_reaping(pid: u32, budget: Duration) -> Result<(), String> {
+    let unsigned = libc::id_t::try_from(pid)
+        .map_err(|_| format!("pid {pid} cannot be represented as a Unix wait id"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let outcome = loop {
+            // SAFETY: `siginfo_t` is plain data for which zeroes are a valid value.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` outlives the call; `WNOWAIT` leaves the child
+            // waitable, so the owner's later `wait` still reaps it.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    unsigned,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                break Err(format!(
+                    "waitid(WEXITED | WNOWAIT) on {pid} failed: {error}"
+                ));
+            }
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(budget) {
+        Ok(outcome) => outcome,
+        Err(_) => Err(format!("pid {pid} had not exited within {budget:?}")),
+    }
 }
 
 mod ambient;
@@ -969,9 +1142,14 @@ mod windows_job {
 
 #[cfg(unix)]
 fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let pid = libc::id_t::try_from(child.id())
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    exited_unreaped(pid)
+}
+
+#[cfg(unix)]
+fn exited_unreaped(pid: libc::id_t) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let result = unsafe {
         libc::waitid(
             libc::P_PID,
