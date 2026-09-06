@@ -3016,12 +3016,31 @@ the obligation is compared as the reader sees it.
 ## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn names_the_keyword(statement: &str) -> bool {`
 
 Whether a blanked line carries the keyword as a token: an occurrence with no
-identifier character on either side, and no `#` before it. Edition 2024 admits
-a keyword as a raw identifier, so `r#unsafe` is a binding, not an operation,
-and a splitter that treats `#` as a delimiter reads it as one;
-`PR157-ASTRA-SITE-SAFETY-RECOVERY-R1-001` is that finding. No other Rust token
-puts `#` directly before the word: an unsafe attribute opens with `#[`, so it
-still counts.
+identifier-continuing character on either side, and neither `#` nor `'` before
+it. Edition 2024 admits a keyword as a raw identifier, so `r#unsafe` is a
+binding, not an operation, and a splitter that treats `#` as a delimiter reads
+it as one; `PR157-ASTRA-SITE-SAFETY-RECOVERY-R1-001` is that finding. No other
+Rust token puts `#` directly before the word: an unsafe attribute opens with
+`#[`, so it still counts. A `'` before it would be a lifetime or a label, which
+Rust refuses to name after a keyword, so that shape cannot occur in a module
+that compiles and is excluded rather than counted.
+
+## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn continues_an_identifier(character: char) -> bool {`
+
+What may follow or precede the keyword inside one identifier, decided without
+a Unicode table. Rust identifiers continue with `XID_Continue`, which
+`char::is_alphanumeric` does not cover: U+0301 COMBINING ACUTE ACCENT continues
+`unsafé` but is not alphanumeric, so a test on that predicate read the
+identifier as the keyword; `PR157-ASTRA-SITE-SAFETY-RECOVERY-R2-001` is that
+finding. In a module that compiles, the only characters that can stand
+directly beside a token are ASCII punctuation, ASCII alphanumerics and `_`,
+identifier characters, and Rust's whitespace, which is exactly Unicode
+`Pattern_White_Space` -- the eleven characters of the constant above -- so the
+rule is: ASCII alphanumerics and `_` continue an identifier, every other ASCII
+character does not, and every non-ASCII character does unless it is one of
+those eleven. That errs, if at all, toward not counting: a non-ASCII character
+that is neither identifier nor whitespace is a lexer error, not a token
+boundary, and the census does not run over text the compiler refused.
 
 ## `fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {` › `fn site_obligations(source: &str) -> Result<Vec<String>, String> {`
 
@@ -3051,10 +3070,13 @@ meaning.
 The census's own controls, section 12's positive control included, each built by
 appending to the real module so the domain is the whole file and not a
 fixture shaped to pass. The keyword inside a string literal, a raw string
-literal, a one-line and a multi-line block comment and a trailing `//` comment,
-as a raw identifier and as the start of a longer identifier must leave the
-obligations exactly as they were; an operation appended with
-nothing above it must be refused at its own line number, which is also the
-proof that positions are preserved; and an operation appended under a fresh
+literal, a multi-line string literal, a one-line and a multi-line block comment
+and a trailing `//` comment, as a raw identifier, as the start of a longer
+identifier, and followed by a combining mark or a precomposed letter that makes
+it another identifier must leave the obligations exactly as they were; an
+operation appended with nothing above it -- with U+2028 LINE SEPARATOR, Rust
+whitespace that is not ASCII, between the keyword and its block -- must be
+refused at its own line number, which is also the proof that positions are
+preserved and that Rust's whitespace bounds the token; and an operation appended under a fresh
 `SAFETY:` line must contribute exactly that line's text, read from the source
 where the blanked view has already erased it.

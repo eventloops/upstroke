@@ -5900,8 +5900,18 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
         Some(normalised(&block))
     }
 
+    const PATTERN_WHITE_SPACE: [char; 11] = [
+        '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{85}', '\u{200e}', '\u{200f}', '\u{2028}',
+        '\u{2029}',
+    ];
+
+    fn continues_an_identifier(character: char) -> bool {
+        character == '_'
+            || character.is_ascii_alphanumeric()
+            || !(character.is_ascii() || PATTERN_WHITE_SPACE.contains(&character))
+    }
+
     fn names_the_keyword(statement: &str) -> bool {
-        let joins = |character: char| character.is_alphanumeric() || character == '_';
         statement.match_indices(KEYWORD).any(|(at, _)| {
             let before = statement
                 .get(..at)
@@ -5909,8 +5919,9 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
             let after = statement
                 .get(at + KEYWORD.len()..)
                 .and_then(|text| text.chars().next());
-            !before.is_some_and(|character| joins(character) || character == '#')
-                && !after.is_some_and(joins)
+            !before.is_some_and(|character| {
+                continues_an_identifier(character) || matches!(character, '#' | '\'')
+            }) && !after.is_some_and(continues_an_identifier)
         })
     }
 
@@ -5970,14 +5981,14 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
 
     let lines_here = SOURCE.lines().count();
     let prose = format!(
-        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: u8 = 0; // {KEYWORD}\nfn harmless() {{\n    let r#{KEYWORD} = 0;\n    let {KEYWORD}_free = r#{KEYWORD};\n}}\n"
+        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: &str = \"\n{KEYWORD}\n\";\nconst _: u8 = 0; // {KEYWORD}\nfn harmless() {{\n    let r#{KEYWORD} = 0;\n    let {KEYWORD}_free = r#{KEYWORD};\n    let {KEYWORD}\u{301} = {KEYWORD}_free;\n    let {KEYWORD}\u{e9} = {KEYWORD}\u{301};\n    let _ = {KEYWORD}\u{e9};\n}}\n"
     );
     assert_eq!(
         site_obligations(&prose).as_deref(),
         Ok(site_obligations_here.as_slice()),
-        "the keyword in a literal, a comment or a raw identifier is prose, not an operation"
+        "the keyword in a literal, a comment or an identifier is prose, not an operation"
     );
-    let bare = format!("{SOURCE}fn injected() {{\n    let _ = {KEYWORD} {{ 0 }};\n}}\n");
+    let bare = format!("{SOURCE}fn injected() {{\n    let _ = {KEYWORD}\u{2028}{{ 0 }};\n}}\n");
     assert_eq!(
         site_obligations(&bare),
         Err(format!(
