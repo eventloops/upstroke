@@ -547,22 +547,42 @@ impl EffectSiteId {
                 artifact: point.residue_artifact(),
                 action: point.resume_action(mode),
             },
-            EntryPhase::Residue { .. } => {
-                let rows = if self.row() == ResourceRow::R27 {
-                    vec![ResourceRow::R27]
-                } else {
-                    vec![ResourceRow::R27, self.row()]
-                };
-                PhaseSemantics {
-                    artifact: if rows.len() == 1 {
-                        ResidueArtifact::ObjectsUnreferenced
+            // Read, not discarded. `ResidueClass` is a closed domain, and
+            // what follows is `ObjectInternal`'s answer and no other class's.
+            // A `..` here would hand a second class this one in silence,
+            // which is the shape this function exists to deny an entry one
+            // level up; matched, a second class does not compile until
+            // someone says what it leaves.
+            EntryPhase::Residue { class } => match class {
+                ResidueClass::ObjectInternal => {
+                    // "objects present and unreferenced, R27, with
+                    // administrative residue in the owning worktree", and
+                    // "the list never repeats a row". So there is one
+                    // question — is the administrative row a second row, or
+                    // is this site's own row R27 — and the rows and the
+                    // artifact are both answers to it. The artifact used to
+                    // be read back off `rows.len()`, which is this mechanism
+                    // inferred from its own outcome.
+                    let own = self.row();
+                    let administrative = if own == ResourceRow::R27 {
+                        None
                     } else {
-                        ResidueArtifact::ObjectsAndAdministrativeResidue
-                    },
-                    rows,
-                    action: ResumeAction::ResumeUnperformed,
+                        Some(own)
+                    };
+                    match administrative {
+                        None => PhaseSemantics {
+                            rows: vec![ResourceRow::R27],
+                            artifact: ResidueArtifact::ObjectsUnreferenced,
+                            action: ResumeAction::ResumeUnperformed,
+                        },
+                        Some(row) => PhaseSemantics {
+                            rows: vec![ResourceRow::R27, row],
+                            artifact: ResidueArtifact::ObjectsAndAdministrativeResidue,
+                            action: ResumeAction::ResumeUnperformed,
+                        },
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -799,5 +819,41 @@ mod parent_tests {
         let error = EffectSiteId::from_name(crossed).expect_err("no group declares that pair");
         assert_eq!(error.name, crossed);
         assert!(error.to_string().contains(crossed), "{error}");
+    }
+
+    #[test]
+    fn a_residue_class_names_the_administrative_row_only_where_there_is_one() {
+        let internal = EntryPhase::Residue {
+            class: ResidueClass::ObjectInternal,
+        };
+        // A site whose own row is R27: one row, and the artifact that says so.
+        let commit_tree = EffectSiteId::Object(ObjectSite::SnapshotCommitTree);
+        assert_eq!(commit_tree.row(), ResourceRow::R27);
+        assert!(commit_tree.registers(ResidueClass::ObjectInternal));
+        assert_eq!(
+            commit_tree.semantics(internal),
+            PhaseSemantics {
+                rows: vec![ResourceRow::R27],
+                artifact: ResidueArtifact::ObjectsUnreferenced,
+                action: ResumeAction::ResumeUnperformed,
+            }
+        );
+        // A site whose own row holds the administrative residue: two rows, in
+        // that order, and the other artifact.
+        let repair = EffectSiteId::Object(ObjectSite::RepairMaterialize);
+        assert_ne!(
+            repair.row(),
+            ResourceRow::R27,
+            "the two-row case needs a site whose own row is not R27"
+        );
+        assert!(repair.registers(ResidueClass::ObjectInternal));
+        assert_eq!(
+            repair.semantics(internal),
+            PhaseSemantics {
+                rows: vec![ResourceRow::R27, repair.row()],
+                artifact: ResidueArtifact::ObjectsAndAdministrativeResidue,
+                action: ResumeAction::ResumeUnperformed,
+            }
+        );
     }
 }
