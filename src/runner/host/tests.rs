@@ -2468,6 +2468,18 @@ struct RoleWitness {
 }
 
 #[cfg(unix)]
+const GROUP_OBSERVATION_MARKER: &str = "<<GROUP-OBSERVATION";
+
+// Printed on every call, not only inside a failing `assert_eq!`'s message, so
+// a `--nocapture` run of a passing grid still carries the raw
+// `proc::GroupObservation` records — including, on macOS, whatever
+// `proc_pidinfo`'s non-zero argument answered — rather than only ever
+// producing them on the (rare, on `leads_own_group`'s current predicate)
+// failing path (PR173-LIVE-RECORD-ANSWER-NEVER-PRINTED). The predicate itself
+// is unchanged by this: on macOS it accepts either a child that currently
+// leads its own group or an exited, unreaped child whose own record names
+// its own pid as leader.
+#[cfg(unix)]
 fn group_leadership(observations: &[proc::GroupObservation]) -> (Vec<bool>, String) {
     let leads = observations
         .iter()
@@ -2478,6 +2490,7 @@ fn group_leadership(observations: &[proc::GroupObservation]) -> (Vec<bool>, Stri
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" | ");
+    println!("{GROUP_OBSERVATION_MARKER} {seen}");
     (leads, seen)
 }
 
@@ -3383,6 +3396,36 @@ fn the_pre_exec_containment_step_runs_in_the_forked_child() {
             SubEffectPoint::Registered,
         ],
         "the packet's order: ReaperStarted, PreExecPgidAndRegister, Exec, Registered"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_passing_grid_prints_the_group_observation_it_promises() {
+    let exe = std::env::current_exe().expect("test executable");
+    let helper = Command::new(&exe)
+        .args([
+            "runner::host::tests::the_pre_exec_containment_step_runs_in_the_forked_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run the pre-exec containment test as a subprocess");
+    let stdout = String::from_utf8_lossy(&helper.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&helper.stderr).into_owned();
+    assert!(
+        helper.status.success(),
+        "the pre-exec containment test failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the filter matched no test, so nothing was proved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(GROUP_OBSERVATION_MARKER),
+        "a passing grid printed no observation, so the promised measurement \
+         cannot happen as described (PR173-LIVE-RECORD-ANSWER-NEVER-PRINTED):\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 }
 
