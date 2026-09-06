@@ -146,11 +146,126 @@ the other way made every re-connect a conflict resolvable only by
 
 The write boundary already names the operation and failed path.
 
-## `fn write_pools(path: &std::path::Path, content: &str) -> Result<(), UpstrokeError> {`
+## `fn write_pools(path: &Path, content: &str) -> Result<(), UpstrokeError> {`
 
 Replace the file after the caller has decided that replacement is allowed.
-This reports creation and write failures separately; it provides no atomic
-publication or durability guarantee beyond the underlying filesystem calls.
+
+**What this write guarantees (§8 asks for the words): atomic replacement, and
+durability of what it publishes.** The content goes to a staging file unique to
+this call in the destination's own directory, is flushed there, and is then
+renamed onto the destination; the directory entry is flushed after the rename.
+A reader of the pools file sees either the previous file whole or this one
+whole, never a truncated or half-written one, and every failure before the
+rename leaves the previous file byte-for-byte intact.
+
+Until PR #189 this was one `fs::write`, which opens the destination with
+truncation and writes into it. The caller had decided the file *may* be
+replaced; it had not decided the file may be **lost**, and those are different
+decisions. A kill, a full filesystem or any failure between the truncation and
+the last byte left the operator holding an empty or half-written
+`pools.toml` — the `profile`, `monthly_allowance` and `endpoint` that only they
+can supply gone, and the file no longer one `config::load` accepts. That is the
+sequence `SWEEP-CONNECT-001` names.
+
+Replacement is by rename, so the published file is a new inode. Its mode is the
+destination's, read before the staging file is filled, so an operator's
+`chmod 600` survives a rewrite — see [`apply_mode`], which is a Unix statement
+and says why it is only that.
+
+### Errors
+
+Names the operation that failed and the path it failed on: creating the
+directory, reading the destination's mode, creating, restricting, writing or
+flushing the staging file, publishing it, or flushing the directory afterwards.
+Every failure from the staging file's creation onwards removes that file, and a
+removal that itself fails is reported beside the failure that caused it.
+
+## `fn publish_pools(`
+
+[`write_pools`] over an injectable publication step.
+
+`publish` is `fs::rename` in every build. A test substitutes a step that fails,
+or that panics, because the paths taken *after* the staging file exists are the
+ones a real rename will not take on demand — a full disk, a revoked permission,
+a kill — and those are exactly the paths on which the operator's own file has to
+survive. `a_real_publication_failure_names_the_destination_and_removes_the_staged_file`
+is the same property through the real `fs::rename`, failed by publishing onto a
+directory, so the injected step is not the only evidence that the cleanup runs.
+
+The staging name is `.pools-<ULID>.tmp` in the destination's own directory:
+inside it because a rename is only atomic within one filesystem, and unique per
+call because §8 refuses a fixed temporary name that two writers can collide on.
+
+`if let Err(error) = landed` is the one cleanup point. Every *return* between
+the staging file's creation and its publication passes through it, and the file
+is this call's alone to remove — `create_new` established that. An unwind is the
+one path that does not reach it, and nothing between those two points panics; a
+`Drop` guard is what would cover it if anything ever did, and
+`SWEEP-CONNECT-002` in `reviews/findings/` carries why this file does not have
+one yet. What a killed process leaves behind is one uniquely named `.tmp` that
+no reader of the directory interprets and that the next publication cannot
+collide with.
+
+## `fn publication_directory(path: &Path) -> Option<&Path> {`
+
+The directory a destination is published into.
+
+Its parent, except that the parent of a bare relative name is `""`, which names
+the working directory to `join` and nothing at all to `create_dir_all` or
+`File::open`. `--pools pools.toml` is a spelling an operator can pass, so the
+empty parent is spelled `.` instead. `None` is a filesystem root, which names no
+file to publish and is refused rather than written to.
+
+## `fn destination_mode(path: &Path) -> Result<Option<fs::Permissions>, UpstrokeError> {`
+
+The mode to carry onto the replacement, or `None` when there is nothing at the
+destination to carry one from.
+
+Only a real absence is absence (§7): a destination whose mode cannot be read is
+not one to republish under wider permissions than the operator gave it, so a
+stat that fails for any reason other than `NotFound` refuses.
+
+## `fn stage(`
+
+Create the staging file, restrict it, fill it, and flush it.
+
+`create_new` rather than a create-or-truncate: an existing name of any kind,
+including a symlink planted in the directory, is refused instead of followed
+(§8's exclusivity rule), which is what makes the staged file this call's alone
+to publish or remove.
+
+The mode is applied before the content, not after: a file the operator had
+restricted must not exist under wider bits while it holds anything.
+
+The flush is `util::fsync_file`, before the rename rather than after it, because
+a rename publishes a *name* and §8 counts atomicity and durability separately —
+"a successful rename is not durability". The handle closes at the end of this
+function, before the caller renames or removes the name, because Windows can
+refuse both while a handle is open.
+
+## `#[cfg(unix)]`
+
+Carry the destination's mode onto the staging file, on the platform where a
+`Permissions` is the mode bits.
+
+## `#[cfg(not(unix))]`
+
+Carry nothing, deliberately.
+
+A `Permissions` off Windows' `metadata` carries only the read-only attribute.
+Setting it on the staging file would refuse the publication over a read-only
+destination *and* leave behind a `.tmp` that cannot be removed, in exchange for
+an attribute the rename does not carry anyway. A file created here takes the ACL
+its directory gives it, which is what a *new* pools file always took; carrying a
+Windows ACL across a replacement is not attempted and is not claimed.
+
+## `fn discard(staged: &Path, error: UpstrokeError) -> UpstrokeError {`
+
+Remove the staging file after a failed publication, reporting a removal that
+itself fails beside the failure that caused it.
+
+A `NotFound` is not a failure to report: it means the file this call staged is
+already gone, which is the state the removal was for.
 
 ## `fn settings_match(existing: &str, proposed: &str) -> bool {`
 

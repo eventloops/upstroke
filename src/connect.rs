@@ -8,7 +8,8 @@
 mod render;
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{AdapterSource, BuiltinAdapters, Discovery};
 use crate::capacity::{Pool, PoolKind, Source};
@@ -160,19 +161,124 @@ pub fn run_with<'a>(
     })
 }
 
-fn write_pools(path: &std::path::Path, content: &str) -> Result<(), UpstrokeError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| UpstrokeError::Filesystem {
-            operation: "create directory",
-            path: parent.to_path_buf(),
+fn write_pools(path: &Path, content: &str) -> Result<(), UpstrokeError> {
+    publish_pools(path, content, |staged, destination| {
+        fs::rename(staged, destination)
+    })
+}
+
+fn publish_pools(
+    path: &Path,
+    content: &str,
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), UpstrokeError> {
+    let Some(directory) = publication_directory(path) else {
+        return Err(UpstrokeError::Refused {
+            message: format!(
+                "`{}` is a filesystem root, not a file to write — pass --pools <path> naming \
+                 the pools file itself",
+                path.display()
+            ),
+        });
+    };
+    fs::create_dir_all(directory).map_err(|source| UpstrokeError::Filesystem {
+        operation: "create directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let inherited = destination_mode(path)?;
+
+    let staged = directory.join(format!(".pools-{}.tmp", crate::ulid::ulid()));
+    let landed = stage(&staged, content, inherited).and_then(|()| {
+        publish(&staged, path).map_err(|source| UpstrokeError::Filesystem {
+            operation: "publish pools file",
+            path: path.to_path_buf(),
             source,
-        })?;
+        })
+    });
+    if let Err(error) = landed {
+        return Err(discard(&staged, error));
     }
-    fs::write(path, content).map_err(|source| UpstrokeError::Filesystem {
-        operation: "write pools file",
-        path: path.to_path_buf(),
+    util::fsync_dir(directory).map_err(|source| UpstrokeError::Filesystem {
+        operation: "flush the directory of pools file",
+        path: directory.to_path_buf(),
         source,
     })
+}
+
+fn publication_directory(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        parent => parent,
+    }
+}
+
+fn destination_mode(path: &Path) -> Result<Option<fs::Permissions>, UpstrokeError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(UpstrokeError::Filesystem {
+            operation: "read the mode of pools file",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn stage(
+    staged: &Path,
+    content: &str,
+    inherited: Option<fs::Permissions>,
+) -> Result<(), UpstrokeError> {
+    let mut file = fs::File::create_new(staged).map_err(|source| UpstrokeError::Filesystem {
+        operation: "create staged pools file",
+        path: staged.to_path_buf(),
+        source,
+    })?;
+    apply_mode(staged, inherited)?;
+    file.write_all(content.as_bytes())
+        .map_err(|source| UpstrokeError::Filesystem {
+            operation: "write staged pools file",
+            path: staged.to_path_buf(),
+            source,
+        })?;
+    util::fsync_file(&file).map_err(|source| UpstrokeError::Filesystem {
+        operation: "flush staged pools file",
+        path: staged.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn apply_mode(staged: &Path, inherited: Option<fs::Permissions>) -> Result<(), UpstrokeError> {
+    let Some(permissions) = inherited else {
+        return Ok(());
+    };
+    fs::set_permissions(staged, permissions).map_err(|source| UpstrokeError::Filesystem {
+        operation: "set the mode of staged pools file",
+        path: staged.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn apply_mode(_staged: &Path, _inherited: Option<fs::Permissions>) -> Result<(), UpstrokeError> {
+    Ok(())
+}
+
+fn discard(staged: &Path, error: UpstrokeError) -> UpstrokeError {
+    match fs::remove_file(staged) {
+        Ok(()) => error,
+        Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => UpstrokeError::Filesystem {
+            operation: "remove staged pools file",
+            path: staged.to_path_buf(),
+            source: std::io::Error::new(
+                cleanup.kind(),
+                format!("{error}; and the staged file could not be removed: {cleanup}"),
+            ),
+        },
+    }
 }
 
 fn settings_match(existing: &str, proposed: &str) -> bool {
@@ -389,6 +495,159 @@ mod tests {
             ["claude-code", "copilot"],
         )
         .expect("connect runs")
+    }
+
+    /// Every name in `directory` that `publish_pools` could have staged: the
+    /// leftovers a publication that does not clean up after itself produces.
+    fn staging_files(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .expect("read the pools directory")
+            .map(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".pools-") && name.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A publication step that refuses, standing in for the rename failures a
+    /// test cannot arrange on demand: a full disk, a kill, a revoked
+    /// permission.
+    fn refuse_to_publish(_staged: &Path, _destination: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the publication step refused",
+        ))
+    }
+
+    #[test]
+    fn a_failed_publication_leaves_the_operators_file_byte_for_byte_intact() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-failed-publish")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
+                    \"claude-code\"\nprofile = \"work\"\nmonthly_allowance = 300\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+
+        let error = publish_pools(&path, "a replacement that never lands", refuse_to_publish)
+            .expect_err("the publication step refused");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "publish pools file", path: ref failed, .. }
+            if failed == &path),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the operator's file"),
+            mine,
+            "a publication that failed replaced nothing"
+        );
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "and left no staged file behind"
+        );
+    }
+
+    #[test]
+    fn an_unwinding_publication_leaves_the_operators_file_byte_for_byte_intact() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-unwind-publish")
+                .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nprofile = \"work\"\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_pools(&path, "a replacement that never lands", |_, _| {
+                panic!("the failure the operator's file has to survive")
+            })
+        }));
+
+        assert!(outcome.is_err(), "the fixture must actually unwind");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the operator's file"),
+            mine,
+            "an unwind past a publication replaced nothing"
+        );
+    }
+
+    #[test]
+    fn a_publication_flushes_the_staged_file_and_the_directory_it_lands_in() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-barriers")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+
+        let before = crate::util::barriers_on_this_thread();
+        write_pools(&path, "published once").expect("the publication lands");
+        let after = crate::util::barriers_on_this_thread();
+
+        assert_eq!(
+            after.file - before.file,
+            1,
+            "the staged file is flushed before the rename makes it the operator's"
+        );
+        assert_eq!(
+            after.directory - before.directory,
+            1,
+            "and the directory entry the rename created is flushed after it"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read what was published"),
+            "published once"
+        );
+    }
+
+    #[test]
+    fn the_directory_a_pools_file_is_published_into_is_openable() {
+        assert_eq!(
+            publication_directory(Path::new("pools.toml")),
+            Some(Path::new(".")),
+            "a bare relative name is published into the working directory, which `\"\"` does \
+             not name"
+        );
+        assert_eq!(
+            publication_directory(Path::new("dir/pools.toml")),
+            Some(Path::new("dir"))
+        );
+        assert_eq!(
+            publication_directory(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            None,
+            "a filesystem root names no file to publish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mode_an_operator_gave_their_pools_file_survives_a_forced_rewrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mode")
+            .expect("acquire an isolated pools directory");
+        let path = tree.path().join("pools.toml");
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
+                    \"claude-code\"\nprofile = \"work\"\n";
+        fs::write(&path, mine).expect("the operator's hand-written file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("the operator restricts their own file");
+
+        assert_eq!(connect(&path, true).outcome, Wrote::Written);
+
+        let mode = fs::metadata(&path)
+            .expect("read the mode of the rewritten file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a rewrite that publishes a new inode must not widen the mode the operator set"
+        );
     }
 
     #[test]
@@ -705,18 +964,24 @@ mod tests {
     }
 
     #[test]
-    fn pools_write_error_names_a_failed_file_write() {
+    fn a_real_publication_failure_names_the_destination_and_removes_the_staged_file() {
         let tree =
             crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-write-error")
                 .expect("acquire an isolated pools directory");
         let path = tree.path().join("is-a-directory");
-        fs::create_dir(&path).expect("block file writing with a directory");
+        fs::create_dir(&path).expect("block publication with a directory");
         let error = write_pools(&path, "proposal").expect_err("the file path is a directory");
         assert!(
-            matches!(error, UpstrokeError::Filesystem { operation: "write pools file", path: failed, .. }
-            if failed == path)
+            matches!(error, UpstrokeError::Filesystem { operation: "publish pools file", path: ref failed, .. }
+            if failed == &path),
+            "{error:?}"
         );
         assert!(path.is_dir());
+        assert_eq!(
+            staging_files(tree.path()),
+            Vec::<String>::new(),
+            "the real `fs::rename` failed and its staged file was removed"
+        );
     }
 
     #[test]
