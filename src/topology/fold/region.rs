@@ -14,16 +14,6 @@ pub(super) fn describe_region(paths: &PathSet) -> String {
     }
 }
 
-pub(super) trait GitRefName {
-    fn name(&self) -> &str;
-}
-
-impl GitRefName for GitRef {
-    fn name(&self) -> &str {
-        self.as_str()
-    }
-}
-
 pub(super) fn ineligible_detail(why: Ineligible) -> String {
     match why {
         Ineligible::AwaitingInput => "its task is parked on a question".to_owned(),

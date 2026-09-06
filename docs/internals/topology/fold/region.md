@@ -19,10 +19,6 @@ region and an unread one are different answers — [`PathSet::prefixes`] says
 so — and a refusal that rendered the first as an empty pair of brackets
 would read like a formatting accident next to `the whole repository`.
 
-## `pub(super) trait GitRefName {`
-
-A ref name, for a diagnostic that has to print an `Option<GitRef>`.
-
 ## `pub(super) fn check_lease_disposition(`
 
 refusals[14]: the disposition an event records must be the one this

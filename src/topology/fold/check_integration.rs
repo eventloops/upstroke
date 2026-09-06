@@ -1,6 +1,6 @@
 //! Extended notes: `docs/internals/topology/fold/check_integration.md`
 
-use super::region::{GitRefName, ineligible_detail, ordinal};
+use super::region::{ineligible_detail, ordinal};
 use super::*;
 
 impl RunState {
@@ -362,7 +362,7 @@ impl RunState {
                     if prepared.prepared_ref.as_ref() != Some(prepared_ref) {
                         return Err(inconsistent(format!(
                             "it pins the proposal at {:?} and the verification pinned it at `{}`",
-                            prepared.prepared_ref.as_ref().map(GitRefName::name),
+                            prepared.prepared_ref.as_ref().map(GitRef::as_str),
                             prepared_ref
                         )));
                     }
