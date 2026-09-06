@@ -21,7 +21,7 @@ A reviewer and an author should be able to answer yes to each applicable item:
 - [ ] New abstraction and dependencies have a demonstrated purpose.
 - [ ] Lint levels change only in `[lints]`; new suppressions are `#[expect]` with a reason.
 - [ ] Ambient time, environment and randomness stay inside the funnel modules.
-- [ ] All nine §2 commands pass from the repository root.
+- [ ] All ten §2 commands pass from the repository root.
 
 A finding that cites a standard names the section and says whether a mechanism or review enforces
 it. A §6 or §7 finding in an unswept file is in scope only under the activation rule in
