@@ -507,6 +507,137 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
 
 #[cfg(unix)]
 #[test]
+fn a_reaped_childs_pid_never_answers_for_its_own_group() {
+    let mut supervisor =
+        termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
+    let mut command = shell("read line; exit 0");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    supervisor.prepare(&mut command);
+    let mut child = ReapedChild::new(
+        command
+            .spawn()
+            .expect("spawn a child that holds until its stdin closes"),
+    );
+    let pid = child.pid();
+    supervisor
+        .register(pid)
+        .expect("register the child's group with the supervisor");
+
+    child.close_stdin();
+    if let Err(reason) = await_exit_without_reaping(pid, Duration::from_secs(30)) {
+        panic!("{reason}");
+    }
+    let zombie = observe_child_group(pid);
+    assert!(
+        zombie.had_exited_before_the_look() && zombie.leads_own_group(),
+        "the premise: as an exited, unreaped child this pid answers for its own group, \
+         so the reap below is the only thing that changes: {zombie}"
+    );
+
+    supervisor.finish().expect("settle the child's group");
+    let status = child.wait().expect("reap the child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let reaped = observe_child_group(pid);
+    assert_eq!(
+        reaped.exited_before,
+        Err(libc::ECHILD),
+        "the premise: the reaped pid is no longer a child of this process: {reaped}"
+    );
+    assert!(
+        !reaped.leads_own_group(),
+        "a reaped pid answered for its own group: whatever holds that pid now, this \
+         process cannot see it as its own child, so the answer is about a stranger: \
+         {reaped}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn only_this_processs_own_zombie_answers_for_its_group_after_an_esrch() {
+    const PID: libc::pid_t = 424_242;
+    const PID_AS_GROUP: u32 = 424_242;
+    const ANOTHER_GROUP: u32 = 4_242;
+
+    let after_esrch = |exited_before: Result<bool, i32>,
+                       zombie_group: Result<ZombieGroupAnswer, i32>| {
+        GroupObservation {
+            pid: PID,
+            exited_before,
+            group: Err(libc::ESRCH),
+            zombie_group,
+            exited_after: exited_before,
+        }
+    };
+    let own_group = |status: u32| {
+        Ok(ZombieGroupAnswer {
+            pgid: PID_AS_GROUP,
+            status,
+        })
+    };
+
+    let this_processs_zombie = after_esrch(Ok(true), own_group(libc::SZOMB));
+    assert!(
+        this_processs_zombie.leads_own_group(),
+        "the one case the fall-through is for: this process's own exited, unreaped \
+         child, whose zombie record names its own pid as its group: \
+         {this_processs_zombie}"
+    );
+
+    for (case, observation) in [
+        (
+            "a live process holding the pid, which `proc_pidinfo` reaches through \
+             `proc_find` before it ever consults the zombie list",
+            after_esrch(Err(libc::ECHILD), own_group(libc::SRUN)),
+        ),
+        (
+            "a zombie of some other parent holding the pid",
+            after_esrch(Err(libc::ECHILD), own_group(libc::SZOMB)),
+        ),
+        (
+            "a record that names another group",
+            after_esrch(
+                Ok(true),
+                Ok(ZombieGroupAnswer {
+                    pgid: ANOTHER_GROUP,
+                    status: libc::SZOMB,
+                }),
+            ),
+        ),
+        ("no record at all", after_esrch(Ok(true), Err(libc::ESRCH))),
+        (
+            "a running child of this process, which `getpgid` would have answered for",
+            after_esrch(Ok(false), own_group(libc::SRUN)),
+        ),
+        (
+            "a pid this process never had as a child, with no record",
+            after_esrch(Err(libc::ECHILD), Err(libc::ESRCH)),
+        ),
+    ] {
+        assert!(
+            !observation.leads_own_group(),
+            "{case} answered for its own group: {observation}"
+        );
+    }
+
+    let refused = GroupObservation {
+        pid: PID,
+        exited_before: Ok(true),
+        group: Err(libc::EPERM),
+        zombie_group: own_group(libc::SZOMB),
+        exited_after: Ok(true),
+    };
+    assert!(
+        !refused.leads_own_group(),
+        "only `ESRCH` falls through to the exited record: {refused}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_premise_that_fails_before_the_reap_leaves_no_zombie() {
     let mut command = shell("read line; exit 0");
     command
