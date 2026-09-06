@@ -173,10 +173,12 @@ at that commit, and every backticked regression or guard identifier must occur i
 Bind rows to the first integrated commit, never to a lane commit that was later cherry-picked.
 Change a validator and its fixtures in the same pull request as any schema change.
 
-Slices of a long-running design land as pull requests into their integration branch (today
-`codex/parallelism-design`) under the same steps; the integration branch's own pull request into
-`master` is reviewed once more, on the head that merges. Merge commits only, everywhere: a rewrite
-orphans every ledger row bound to a replaced SHA.
+Slices of a long-running design land as pull requests into their integration branch under the same
+steps; the integration branch's own pull request into `master` is reviewed once more, on the head
+that merges. There is no integration branch today: the parallel-execution design's
+`codex/parallelism-design` was deleted once its slices had landed, so standing another one up means
+adding its name to both workflows' branch lists and to the gate that pins them in one change.
+Merge commits only, everywhere: a rewrite orphans every ledger row bound to a replaced SHA.
 
 ## Repository rules
 
@@ -197,9 +199,8 @@ green; auto-merge is enabled on the repository in the same change as the queue r
 with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
 pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
 is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on
-`pull_request` and `merge_group`, each with the branch list exactly `[master,
-codex/parallelism-design]` and nothing else, so slice pull requests into the integration branch
-and queue entries for either base get both contexts; `test-docs-consistency.sh` pins that
+`pull_request` and `merge_group`, each with the branch list exactly `[master]` and nothing else, so
+every pull request and every queue entry gets both contexts; `test-docs-consistency.sh` pins that
 contract, and changing it is a change to this file first.
 
 Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-ready-audit.sh`,

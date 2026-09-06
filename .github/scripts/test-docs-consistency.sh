@@ -18,11 +18,10 @@
 #   C3  CLAUDE.md's gate-count claim equals the tree, and the set of test-*.sh
 #       files in .github/scripts EQUALS the set the lint job invokes, both
 #       directions. An invocation from any other job does not count.
-#   C4  The workflow trigger contract is EXACTLY what the slice-PR record
-#       decided (decisions/2026-08-21-stacked-slice-prs.md) plus the merge
-#       queue: ci.yml triggers on push, pull_request and merge_group,
-#       pr-policy.yml on pull_request and merge_group, each with the branch
-#       list [master, codex/parallelism-design] and nothing else, and
+#   C4  The workflow trigger contract is EXACTLY what MAINTAINING.md's
+#       Repository rules state, plus the merge queue: ci.yml triggers on push,
+#       pull_request and merge_group, pr-policy.yml on pull_request and
+#       merge_group, each with the branch list [master] and nothing else, and
 #       merge_group with the activity type [checks_requested] only. The two
 #       attestation workflows that record once pinned were retired with the App
 #       check (decisions/2026-08-23-retire-app-attestation.md); there is no
@@ -188,13 +187,14 @@ fi
 # --- C4. the trigger contract, pinned exactly --------------------------------
 # MUT-CI-PR-BRANCH-MASKED: each event's own block, never the whole file.
 # MUT-MASTER-TRIGGERS-REMOVED: requiring the integration branch to be present
-# let master be removed; the branch list is compared for exact equality.
-# MUT-INVALIDATOR-MASTER-REMOVED: forbidding the integration-branch name is not
-# pinning master; the invalidator's filter is compared for exact equality too.
-# The event set of every workflow is pinned as well, so a trigger cannot be
-# added or removed from the slice path unnoticed.
-# decisions/2026-08-21-stacked-slice-prs.md
-slice_list='branches: [master, codex/parallelism-design]'
+# let master be removed; the branch list is compared for exact equality, which
+# is what keeps a second base from being added unnoticed now that the list is
+# master alone. MUT-INVALIDATOR-MASTER-REMOVED: forbidding the
+# integration-branch name is not pinning master; the invalidator's filter is
+# compared for exact equality too. The event set of every workflow is pinned as
+# well, so a trigger cannot be added or removed unnoticed.
+# MAINTAINING.md, Repository rules
+branch_list='branches: [master]'
 pin_events() {  # pin_events <file> <expected events, sorted, space separated>
   local f="$1" want="$2" got
   got="$(events "$f" | sort | tr '\n' ' ' | sed -E 's/ +$//')"
@@ -225,15 +225,15 @@ done
 merge_group_types='types: [checks_requested]'
 if [[ -f .github/workflows/ci.yml ]]; then
   pin_events .github/workflows/ci.yml "merge_group pull_request push"
-  pin_branches .github/workflows/ci.yml push "$slice_list"
-  pin_branches .github/workflows/ci.yml pull_request "$slice_list"
-  pin_branches .github/workflows/ci.yml merge_group "$slice_list"
+  pin_branches .github/workflows/ci.yml push "$branch_list"
+  pin_branches .github/workflows/ci.yml pull_request "$branch_list"
+  pin_branches .github/workflows/ci.yml merge_group "$branch_list"
   pin_types .github/workflows/ci.yml merge_group "$merge_group_types"
 fi
 if [[ -f .github/workflows/pr-policy.yml ]]; then
   pin_events .github/workflows/pr-policy.yml "merge_group pull_request"
-  pin_branches .github/workflows/pr-policy.yml pull_request "$slice_list"
-  pin_branches .github/workflows/pr-policy.yml merge_group "$slice_list"
+  pin_branches .github/workflows/pr-policy.yml pull_request "$branch_list"
+  pin_branches .github/workflows/pr-policy.yml merge_group "$branch_list"
   pin_types .github/workflows/pr-policy.yml merge_group "$merge_group_types"
 fi
 

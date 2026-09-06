@@ -1,13 +1,15 @@
 name: CI
 
 on:
-  # The integration branch for the parallel-execution design receives slice
-  # pull requests and is tested on every merge into it; each slice head gets
-  # a single-reviewer frontier review. decisions/2026-08-21-stacked-slice-prs.md
+  # `master` is the only base. The parallel-execution design's integration
+  # branch, `codex/parallelism-design`, was deleted once its slices had landed;
+  # standing another one up means adding its name to every branch list here and
+  # in pr-policy.yml, and to the gate that pins them, in one change
+  # (MAINTAINING.md, Repository rules).
   push:
-    branches: [master, codex/parallelism-design]
+    branches: [master]
   pull_request:
-    branches: [master, codex/parallelism-design]
+    branches: [master]
     types: [opened, edited, synchronize, reopened]
   # The merge queue builds each entry on the head of its base plus the entries
   # queued ahead of it, and lands exactly the commit these contexts passed on;
@@ -16,7 +18,7 @@ on:
   # event, one queue branch per entry, so entries never cancel each other.
   merge_group:
     types: [checks_requested]
-    branches: [master, codex/parallelism-design]
+    branches: [master]
 
 permissions:
   contents: read
