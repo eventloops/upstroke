@@ -512,9 +512,12 @@ bodies below that need a child which will not exit until they say so.
 ## `enum ControlEnd {`
 
 How the control's worker ended, joined and printed in the report: the child
-exited (`waitid` answered), the owner cancelled it, or `waitid` failed with an
-errno. Three variants rather than `Result<(), i32>` because the second is the
-one the repair makes possible and the tests assert on it by name.
+exited (`waitid` answered), the owner cancelled it, `waitid` failed with an
+errno, or the worker could not unblock its own cancel signal and never entered
+the wait. Named variants rather than `Result<(), i32>` because the second is
+the one the repair makes possible and the tests assert on it by name, and the
+fourth is a worker outcome rather than a panic, so the owner joins and reports
+it like the others.
 
 ## `extern "C" fn interrupt_only(_signal: libc::c_int) {}`
 
@@ -574,6 +577,25 @@ On the budget the handle is handed BACK, with the reason, exactly as
 not delivered to an interruptibly sleeping thread for the whole budget, which
 is not a state the kernel reaches; it is reported rather than reasoned away.
 
+## `fn unblock_in_this_thread(signal: libc::c_int) -> Result<(), i32> {`
+
+`EXIT-WAITER-CONTROL-INHERITS-BLOCKED-CANCEL-SIGNAL`, recovery review 1 of
+PR #179. A new thread inherits the signal mask of the thread that spawned it,
+and a mask that blocks the cancel signal leaves `pthread_kill`'s signal
+PENDING: the handler never runs, `waitid` never returns `EINTR`, and the join
+spends its whole budget. Cancellation would then depend on ambient process
+state — the mask the test binary was started with, or the mask of whichever
+body's thread happened to start the control — which §12 forbids. So the worker
+unblocks the signal in its OWN mask first, the way the production signal
+monitor unblocks `SIGCONT` for itself (`prepare_monitor_signal_mask`). A
+thread's mask is its own: nothing else's changes.
+
+## `fn this_thread_blocks(signal: libc::c_int) -> Result<bool, i32> {`
+
+Reads the calling thread's mask without changing it (`pthread_sigmask` with a
+null new set), for the regression below to check that starting a control left
+the starter's mask alone.
+
 ## `struct ControlWaiter {`
 
 The positive control's waiter, the child it waits on, the signal that cancels
@@ -599,6 +621,11 @@ A failure to start is returned, not panicked: the child is already owned by a
 `ReapedChild` at that point, and returning lets the caller name what failed
 while the guard still settles the child. Installing the handler is part of
 starting, so a control that could not be made cancellable never runs.
+
+The worker's first act is to unblock the cancel signal in its own mask
+(`unblock_in_this_thread`); a failure there is returned as
+`ControlEnd::CancelSignalBlocked` before any `waitid`, so the owner's join
+reports it rather than waiting on a worker that could never be interrupted.
 
 The worker's loop retries `EINTR` unless the flag is set, so an unrelated
 interruption — none is expected, but the loop does not assume it — puts it
@@ -671,6 +698,22 @@ MEASURED. With the signal not sent, with the flag never set, with the flag
 never read, or with the handler installed with `SA_RESTART`, this body fails
 at its 30-second bound: the worker stays in `waitid` until its child dies,
 which nothing in the body does for it.
+
+## `fn a_control_started_with_the_cancel_signal_blocked_is_still_cancelled_within_its_bound() {`
+
+The regression for `EXIT-WAITER-CONTROL-INHERITS-BLOCKED-CANCEL-SIGNAL`. A
+starter thread blocks the cancel signal in its own mask and starts the control
+from there, so the worker inherits a mask under which the signal would only
+ever be pending; the starter also reports whether its own mask is still
+blocking the signal afterwards, which it must be. The body then joins the
+worker exactly as the previous test does, within the bound and with
+`Cancelled` as the outcome. The starter is joined through `join_within`, so
+that wait is bounded too.
+
+MEASURED. With the worker's `unblock_in_this_thread` call removed, this body
+fails at its 30-second bound with the signal pending and the worker still in
+`waitid`; the other three control bodies, whose starter has an empty mask, do
+not notice.
 
 ## `fn an_unwind_through_a_body_that_owns_a_control_leaves_no_waiter_and_no_zombie() {`
 
