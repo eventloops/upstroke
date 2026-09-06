@@ -5911,18 +5911,129 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
             || !(character.is_ascii() || PATTERN_WHITE_SPACE.contains(&character))
     }
 
-    fn names_the_keyword(statement: &str) -> bool {
-        statement.match_indices(KEYWORD).any(|(at, _)| {
-            let before = statement
-                .get(..at)
-                .and_then(|text| text.chars().next_back());
-            let after = statement
-                .get(at + KEYWORD.len()..)
-                .and_then(|text| text.chars().next());
-            !before.is_some_and(|character| {
-                continues_an_identifier(character) || matches!(character, '#' | '\'')
-            }) && !after.is_some_and(continues_an_identifier)
-        })
+    const EXPRESSION_MACROS: [&str; 21] = [
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "dbg",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "eprint",
+        "eprintln",
+        "format",
+        "format_args",
+        "matches",
+        "panic",
+        "print",
+        "println",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "vec",
+        "write",
+        "writeln",
+    ];
+
+    const INERT_MACROS: [&str; 12] = [
+        "cfg",
+        "column",
+        "concat",
+        "env",
+        "file",
+        "include",
+        "include_bytes",
+        "include_str",
+        "line",
+        "module_path",
+        "option_env",
+        "stringify",
+    ];
+
+    fn line_of(code: &str, at: usize) -> usize {
+        code.get(..at).map_or(0, |text| text.matches('\n').count())
+    }
+
+    fn whitespace_run(text: &str) -> usize {
+        text.chars()
+            .take_while(|character| PATTERN_WHITE_SPACE.contains(character))
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    fn identifier_run(text: &str) -> usize {
+        text.chars()
+            .take_while(|character| continues_an_identifier(*character))
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    fn keyword_tokens(code: &str) -> impl Iterator<Item = usize> + '_ {
+        code.match_indices(KEYWORD)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                let before = code.get(..at).and_then(|text| text.chars().next_back());
+                let after = code
+                    .get(at + KEYWORD.len()..)
+                    .and_then(|text| text.chars().next());
+                !before.is_some_and(|character| {
+                    continues_an_identifier(character) || matches!(character, '#' | '\'')
+                }) && !after.is_some_and(continues_an_identifier)
+            })
+    }
+
+    fn matching_close(code: &str, open: usize) -> Option<usize> {
+        let mut depth = 0_usize;
+        for (offset, character) in code.get(open..)?.char_indices() {
+            match character {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn macro_invocations(code: &str) -> Result<Vec<(&str, usize, usize)>, String> {
+        let mut found = Vec::new();
+        for (bang, _) in code.match_indices('!') {
+            let head = code.get(..bang).unwrap_or_default();
+            let name_start = head
+                .char_indices()
+                .rev()
+                .take_while(|(_, character)| continues_an_identifier(*character))
+                .last()
+                .map_or(bang, |(start, _)| start);
+            let name = head.get(name_start..).unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let mut open = bang + 1;
+            open += whitespace_run(code.get(open..).unwrap_or_default());
+            if name == "macro_rules" {
+                open += identifier_run(code.get(open..).unwrap_or_default());
+                open += whitespace_run(code.get(open..).unwrap_or_default());
+            }
+            if !matches!(
+                code.get(open..).and_then(|text| text.chars().next()),
+                Some('(' | '[' | '{')
+            ) {
+                continue;
+            }
+            let Some(close) = matching_close(code, open) else {
+                return Err(format!(
+                    "{}: `{name}!` opens a token tree that never closes",
+                    line_of(code, bang) + 1
+                ));
+            };
+            found.push((name, open, close));
+        }
+        Ok(found)
     }
 
     fn site_obligations(source: &str) -> Result<Vec<String>, String> {
@@ -5939,10 +6050,26 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
                 lines.len()
             ));
         }
+        let invocations = macro_invocations(&blanked)?;
         let mut obligations = Vec::new();
-        for (index, statement) in code.iter().enumerate() {
-            if !names_the_keyword(statement) {
+        for at in keyword_tokens(&blanked) {
+            let index = line_of(&blanked, at);
+            let enclosing: Vec<&str> = invocations
+                .iter()
+                .filter(|(_, open, close)| *open < at && at < *close)
+                .map(|(name, _, _)| *name)
+                .collect();
+            if enclosing.iter().any(|name| INERT_MACROS.contains(name)) {
                 continue;
+            }
+            if let Some(opaque) = enclosing
+                .iter()
+                .find(|name| !EXPRESSION_MACROS.contains(name))
+            {
+                return Err(format!(
+                    "{}: `{opaque}!` carries the keyword and the census cannot see inside it",
+                    index + 1
+                ));
             }
             let mut opens_at = index;
             while opens_at
@@ -5981,12 +6108,12 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
 
     let lines_here = SOURCE.lines().count();
     let prose = format!(
-        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: &str = \"\n{KEYWORD}\n\";\nconst _: u8 = 0; // {KEYWORD}\nfn harmless() {{\n    let r#{KEYWORD} = 0;\n    let {KEYWORD}_free = r#{KEYWORD};\n    let {KEYWORD}\u{301} = {KEYWORD}_free;\n    let {KEYWORD}\u{e9} = {KEYWORD}\u{301};\n    let _ = {KEYWORD}\u{e9};\n}}\n"
+        "{SOURCE}const _: &str = \"{KEYWORD}\";\n/* {KEYWORD} */\nconst _: &str = r#\"{KEYWORD}\"#;\n/*\n {KEYWORD}\n*/\nconst _: &str = \"\n{KEYWORD}\n\";\nconst _: u8 = 0; // {KEYWORD}\nfn harmless() {{\n    let r#{KEYWORD} = 0;\n    let {KEYWORD}_free = r#{KEYWORD};\n    let {KEYWORD}\u{301} = {KEYWORD}_free;\n    let {KEYWORD}\u{e9} = {KEYWORD}\u{301};\n    let _ = {KEYWORD}\u{e9};\n}}\nconst _: &str = stringify!({KEYWORD});\nconst _: &str = concat!(stringify!({KEYWORD} {{ 0 }}), \"\");\nfn inert() {{\n    assert_eq!(stringify!({KEYWORD}), \"\");\n}}\n"
     );
     assert_eq!(
         site_obligations(&prose).as_deref(),
         Ok(site_obligations_here.as_slice()),
-        "the keyword in a literal, a comment or an identifier is prose, not an operation"
+        "the keyword in a literal, a comment, an identifier or inert macro input is prose, not an operation"
     );
     let bare = format!("{SOURCE}fn injected() {{\n    let _ = {KEYWORD}\u{2028}{{ 0 }};\n}}\n");
     assert_eq!(
@@ -5996,6 +6123,25 @@ fn every_site_obligation_is_complete_and_agrees_with_its_notes_copy() {
             lines_here + 2
         )),
         "an operation with nothing above it is refused at its own line"
+    );
+    let bare_in_macro =
+        format!("{SOURCE}fn injected() {{\n    assert_eq!({KEYWORD} {{ 0 }}, 0);\n}}\n");
+    assert_eq!(
+        site_obligations(&bare_in_macro),
+        Err(format!(
+            "{}: the operation carries no adjacent obligation",
+            lines_here + 2
+        )),
+        "an operation inside an expression macro is an operation"
+    );
+    let opaque = format!("{SOURCE}fn injected() {{\n    opaque_macro!({KEYWORD} {{ 0 }});\n}}\n");
+    assert_eq!(
+        site_obligations(&opaque),
+        Err(format!(
+            "{}: `opaque_macro!` carries the keyword and the census cannot see inside it",
+            lines_here + 2
+        )),
+        "the keyword inside a macro the census does not know is refused, not guessed"
     );
     let obliged = format!(
         "{SOURCE}// {OBLIGATION} injected obligation, read from the source, not the blanked view.\nconst _: u8 = {KEYWORD} {{ 0 }};\n"
