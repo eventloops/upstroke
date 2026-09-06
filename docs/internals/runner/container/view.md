@@ -335,9 +335,13 @@ to remove the intent, and admission would proceed over R19 residue that
 nothing will ever reclaim, because the record naming it is gone.
 `super::racing_removal` retries and then fails if every attempt still reports
 an error. It gives a delete-pending name another chance to disappear without
-treating access denial as success. The fixed attempt bound can still expire
-before a transient refusal clears; [reviews/FINDINGS.md §43](../../../../reviews/FINDINGS.md)
-records the Windows case. A protected view remains an error.
+treating access denial as success. The bound used to be sixty-four yields,
+which a winner descheduled between marking the name and closing its handle
+outlasted; [reviews/FINDINGS.md §43](../../../../reviews/FINDINGS.md) records
+the first Windows sighting and `PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`
+the measured cause. The later attempts now sleep, on the schedule
+`super::racing_pause` and its constants state. A protected view remains an
+error.
 
 ## `fn project(`
 

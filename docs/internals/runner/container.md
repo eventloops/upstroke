@@ -291,13 +291,129 @@ it", and tolerating `PermissionDenied` outright would silently treat a
 genuinely protected path as reclaimed.
 
 So the question asked is the **outcome**, not the errno: retry, and believe
-the failure only once the path has stopped changing under it. Delete-pending
-clears when the winner's own call returns, so this is a handoff rather than a
-wait, and [`std::thread::yield_now`] is what it costs.
+the failure only once the path has stopped changing under it.
+
+**How long the loser has to wait is a scheduling quantity, not a filesystem
+one**, and that is what the pause schedule below answers. Measured on the
+Windows guest (Server 2025 build 26100, NTFS, Rust 1.97.1) against std's own
+`remove_dir_all` sequence: the name becomes delete-pending the moment the
+winner's `SetFileInformationByHandle(FileDispositionInfoEx, POSIX)` returns,
+and it is unlinked only when the winner **closes** that handle. Between those
+two calls every `CreateFileW` of the name — the first thing every
+`remove_dir_all` attempt does — answers `ERROR_ACCESS_DENIED`, and the window
+is exactly as long as the winner takes to reach its close. A winner running
+on another processor that is preempted there, or whose vCPU the hypervisor
+has taken, holds the name delete-pending for a quantum or more.
+`std::thread::yield_now` is `SwitchToThread`: it cedes **this** processor
+to a ready thread, which does nothing for a winner that is not runnable
+here, so sixty-four yields span about a quarter of a millisecond and the
+loser refuses with the winner's handle still open. That is
+`PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`: the failing operation
+was the loser's `CreateFileW`, the error was `STATUS_DELETE_PENDING`
+rendered as os error 5, and the sixty-four attempts were exhausted in less
+time than a scheduler tick.
+
+The ordinary handoff is still microseconds — across 256 native two-remover
+pairs, 512 callers, 234 losers saw `ERROR_ACCESS_DENIED`: 209 once and then `NotFound`,
+21 twice and then `NotFound`, 4 once and then their own success — so the
+first [`RACING_YIELD_ATTEMPTS`] failures keep the yield, and the failures
+after them sleep [`RACING_SLEEP`] apiece. A sleep gives up the processor for
+a scheduler tick, which is the unit the winner's stall is measured in. The
+pause sits strictly **between** attempts: after the last failure there is
+nothing left to observe, so nothing sleeps, and a winner that closes after
+the final attempt is met by the next census rather than by a stale answer.
 
 Bounded rather than timed, for the reason [`TERMINATION_OBSERVATIONS`] is: a
 wait with no bound turns "this path cannot be removed" into "this write
-command never returns".
+command never returns". A path that is still refusing after every attempt
+is reported as the error it last gave, never as absent: the census then
+keeps the intent that names the view, and the next write command's census
+reclaims both once the name has gone.
+`runner::container::tests::windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_intent`
+holds the name delete-pending through the whole budget and asserts exactly
+that;
+`runner::container::tests::windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends`
+stalls a winner between the two calls for longer than the yields reach and
+asserts the loser converges once the stall ends. On the yield-only loop the
+second fails with the CI failure's own text after sixty-four failed attempts
+in a few milliseconds, and the first refuses before its budget could have
+been spent. Both order the winner's close against an observed attempt through
+[`note_racing_attempt`], not against a clock.
+
+## `pub const RACING_YIELD_ATTEMPTS: usize = 16;`
+
+How many failed attempts of [`RACING_ACCESS_ATTEMPTS`] only yield before
+the loop starts sleeping.
+
+Sixteen covers every interleaving the two-remover measurement produced —
+the longest run of non-`NotFound` answers on an unloaded guest was two, and
+under sixteen competing threads pinned to two processors it was nine — so
+the ordinary handoff still costs microseconds and nothing sleeps unless the
+winner has genuinely stopped making progress.
+
+## `pub const RACING_SLEEP: Duration = Duration::from_millis(10);`
+
+How long each attempt after [`RACING_YIELD_ATTEMPTS`] sleeps.
+
+Ten milliseconds is about one scheduler tick, so the loser reacts within a
+tick or two of the winner's close, and the forty-seven that fit between the
+sixty-four attempts bound a permanently refusing path's cost at half a second
+to three quarters of one before the refusal. That is paid once, on an error path that blocks
+admission, and it is what buys tolerance of a winner stalled for a Windows
+Server quantum.
+
+## `enum RacingPause {`
+
+What follows a failed attempt: a yield, a sleep of [`RACING_SLEEP`], or
+nothing because the attempt was the last. A value rather than two branches so
+the schedule can be asked about without being performed, and reported through
+[`note_racing_attempt`] as what was decided.
+
+## `fn racing_pause_after(failed: usize) -> RacingPause {`
+
+The schedule, pure: `Done` at and past [`RACING_ACCESS_ATTEMPTS`], `Yield`
+through [`RACING_YIELD_ATTEMPTS`], `Sleep` between. Separate from the
+performer so
+`tests::the_racing_pause_is_sixteen_yields_then_forty_seven_sleeps_and_nothing_after_the_last`
+can pin the whole sequence on every platform, including that no pause follows
+the last failure — pass 1 found a sleep there, dead time in which a winner's
+close went unobserved.
+
+## `fn racing_pause(failed: usize) {`
+
+The pause after the `failed`th failed attempt of [`racing_removal`] and
+[`read_racing`]: decide with [`racing_pause_after`], report through
+[`note_racing_attempt`], then perform through [`racing_yield`] or
+[`racing_sleep`]. Report before perform, so a test's observer runs after the
+attempt has returned and before its pause — the point at which a controlled
+winner closes.
+
+## `fn racing_yield() {`
+
+`std::thread::yield_now`, behind a name so the `#[cfg(test)]` twin can record
+that the performer asked for a yield before it yields. With [`racing_sleep`],
+the second half of the seam: the decision says what should follow a failure,
+these say what did.
+
+## `fn racing_sleep(duration: Duration) {`
+
+`std::thread::sleep`, behind a name for the same reason as [`racing_yield`].
+
+Not `workspace_manager::remove_tree_once_handles_close`'s schedule, which
+waits for a *dying process* to close its handles and sleeps twenty-five
+milliseconds forty times over. This is still a handoff between two live
+reclaimers; the sleep exists only because the winner's remaining step can
+be descheduled, and the budget is an order of magnitude smaller.
+
+## `fn note_racing_attempt(_failed: usize, _pause: RacingPause) {}`
+
+The `#[cfg(not(test))]` half of a seam that exists for one reason: nothing
+outside the loop can see an *attempt*, and the native Windows tests have to
+order a winner's close against one rather than against a clock (§10: a sleep
+may supplement a concurrency test but cannot be its only oracle). The
+`#[cfg(test)]` twin forwards to `tests::note_racing_attempt`, which runs an
+observer the test installed on the calling thread after the failed attempt
+has already returned. The shape is `workspace_manager::note_removal_attempt`'s.
 
 ## `pub fn write_intent(`
 
@@ -750,7 +866,9 @@ Read one record back, answering `None` when it went away under the read.
 The read half of [`RACING_ACCESS_ATTEMPTS`]: on Windows a file another
 process is deleting answers `PermissionDenied` until that delete completes,
 so "is it gone?" is a question about the outcome and not about the first
-errno. A record that is present and unreadable is still an error, after the
+errno. The delete completes when the deleting handle closes, which is the
+scheduling event [`racing_pause`] waits out, so the two loops share its
+schedule. A record that is present and unreadable is still an error, after the
 bound — silently skipping one would let a census admit over a container whose
 ownership evidence it could not read.
 
