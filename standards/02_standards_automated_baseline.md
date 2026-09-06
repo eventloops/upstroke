@@ -14,7 +14,7 @@ bash .github/scripts/test-docs-consistency.sh
 bash .github/scripts/test-internals-notes.sh
 ```
 
-CI splits the nine across jobs: `lint` runs rustfmt, Clippy and the five Bash gates; `test` runs
+CI splits the nine across jobs: `lint` runs rustfmt, Clippy and the six Bash gates; `test` runs
 the suite on Linux and macOS, and `test (winguest)` runs it on Windows on a self-hosted ephemeral
 runner; `msrv` runs the locked check on all three; `lint (windows)` runs Clippy natively and builds
 every target as the hosted Windows compile witness; `lint (macos)` runs Clippy natively;

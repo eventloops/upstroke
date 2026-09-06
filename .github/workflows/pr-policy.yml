@@ -10,13 +10,26 @@ on:
   pull_request:
     branches: [master, codex/parallelism-design]
     types: [opened, edited, synchronize, reopened, ready_for_review]
+  # A merge-queue entry carries no pull-request payload; the step below reads
+  # the pull request's number out of the queue ref and its title, body and
+  # head from the API, and checks the entry merges that head, so the same
+  # validators judge the live body at the moment the entry is checked. A body
+  # edit after that reaches the pull request's own run, not the entry: the
+  # window is the entry's build time, and it is the same window today's path
+  # has between the last pull-request run and the merge. The ruleset requires
+  # this context on the entry too.
+  merge_group:
+    types: [checks_requested]
+    branches: [master, codex/parallelism-design]
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: pr-policy-${{ github.event.pull_request.number }}
+  # One group per pull request, or per queue entry: `github.ref` is the entry's
+  # own queue branch on `merge_group`, where the pull-request number is unset.
+  group: pr-policy-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -30,12 +43,49 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate title, evidence sections, and finding ledger
+      # On `pull_request` the payload is the title and body at the moment of the
+      # event, which is exactly what the validators must judge. On `merge_group`
+      # there is no payload: the queue ref is
+      # `refs/heads/gh-readonly-queue/<base>/pr-<number>-<base sha>`, and the
+      # pull request's live title, body and head come from the API. The head SHA
+      # handed to the ledger validator is the pull request's own head in both
+      # cases; the queue commit merges it, so every row bound to it resolves.
+      - name: Resolve the pull request under review
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         run: |
-          printf '%s\n' "$PR_BODY" | bash .github/scripts/validate-pr-body.sh "$PR_TITLE"
-          printf '%s\n' "$PR_BODY" | bash .github/scripts/validate-pr-ledger-evidence.sh \
-            "${{ github.event.pull_request.head.sha }}"
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            [[ "$QUEUE_REF" =~ /pr-([0-9]+)-[0-9a-f]{40}$ ]] \
+              || { echo "unrecognised merge-group ref: $QUEUE_REF" >&2; exit 1; }
+            PR_NUMBER="${BASH_REMATCH[1]}"
+            gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title > "$RUNNER_TEMP/pr-title"
+            gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/pr-body"
+            gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid > "$RUNNER_TEMP/pr-head"
+            # The entry is a merge commit whose second parent is the pull
+            # request's head; the API's head must be that commit, or the body
+            # being judged belongs to a head the entry does not carry.
+            entry_head="$(git rev-parse --verify --quiet HEAD^2 || true)"
+            api_head="$(tr -d '[:space:]' < "$RUNNER_TEMP/pr-head")"
+            [[ -n "$entry_head" && "$entry_head" == "$api_head" ]] \
+              || { echo "pr-head-not-in-entry: the entry merges ${entry_head:-<no second parent>}, the pull request's head is $api_head" >&2; exit 1; }
+          else
+            printf '%s' "$PR_TITLE" > "$RUNNER_TEMP/pr-title"
+            printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body"
+            printf '%s' "$PR_HEAD" > "$RUNNER_TEMP/pr-head"
+          fi
+          [[ -s "$RUNNER_TEMP/pr-head" ]] || { echo "no head SHA for pull request $PR_NUMBER" >&2; exit 1; }
+
+      - name: Validate title, evidence sections, and finding ledger
+        shell: bash
+        run: |
+          title="$(cat "$RUNNER_TEMP/pr-title")"
+          head="$(tr -d '[:space:]' < "$RUNNER_TEMP/pr-head")"
+          { cat "$RUNNER_TEMP/pr-body"; printf '\n'; } | bash .github/scripts/validate-pr-body.sh "$title"
+          { cat "$RUNNER_TEMP/pr-body"; printf '\n'; } | bash .github/scripts/validate-pr-ledger-evidence.sh "$head"
