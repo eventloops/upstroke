@@ -62,7 +62,7 @@ candidate-producing attempt and is what promotes the generation.
 **This described the other shape** — `check_candidate_prepared` requiring
 `Promoting`, and an `attempt_finished(succeeded)` between the pin and
 `candidate_prepared` to produce it. That requirement *forced* the dual
-settlement `decisions/2026-08-12-merge-queue-execution-topology.md` forbids,
+settlement `design/26_design_merge_queue_protocol.md` §26 forbids,
 and the 2026-08-27 CONFORM ruling reversed it: the fold now requires the
 generation to be **in flight**, because this event settles it.
 

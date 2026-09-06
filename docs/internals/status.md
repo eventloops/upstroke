@@ -217,10 +217,12 @@ the record says rather than folded into a halt or a silence.
 
 The record production writes for a rejected review carries both the
 pass's `Failed` outcome and a `ReviewFailed` failure whose reason is
-`review failed: …` (`engine::attempt::evaluate_review`); an unavailable
-reviewer carries `Unavailable` and a `ReviewUnavailable` failure. The
-line names the pass and the model beside the reason on that shape — the
-one a run produces — and not only on a record with the outcome alone.
+`review failed: …`; an unavailable reviewer carries `Unavailable` and a
+failure that `engine::attempt::review_failure` maps from the reviewer's
+outcome status: rate-limited to `RateLimited`, a timeout to `Timeout`,
+and any other unavailability to `ReviewUnavailable`. The line names the
+pass and the model beside the reason on that shape — the one a run
+produces — and not only on a record with the outcome alone.
 
 ## `let gates = describe(&finished(`
 

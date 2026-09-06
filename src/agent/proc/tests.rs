@@ -302,7 +302,7 @@ fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
 
     let supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "sleep 60"])
         .stdin(Stdio::null())
@@ -404,7 +404,7 @@ impl Drop for ReapedChild {
 fn an_exited_but_unreaped_child_still_answers_for_its_own_group() {
     let mut supervisor =
         termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
@@ -461,7 +461,7 @@ fn a_child_left_in_this_processs_group_never_answers_for_its_own() {
         this_group > 0,
         "this process has no readable group: {this_group}"
     );
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(Path::new("/bin/sh"));
     command
         .args(["-c", "read line; exit 0"])
         .stdin(Stdio::piped())
@@ -3664,4 +3664,54 @@ fn a_reaped_child_makes_the_racing_kill_error_irrelevant() {
         Ok(()),
     );
     assert!(matches!(error, UpstrokeError::Agent { message } if message == "startup refused"));
+}
+
+/// `PR156-ASTRA-EXIT-DESTRUCTORS`. The kill-hook rationale used to justify
+/// [`super::hooks::apply`]'s `abort` by saying that `panic!` and
+/// `std::process::exit` "both run destructors". Only the first does:
+/// `std::process::exit` runs no stack destructors on any thread, and what
+/// separates it from `abort` is the process-exit handlers it still runs, not
+/// destructors. Pin the corrected distinction so the three deaths keep their
+/// separate reasons; `src/export.rs` pins design sentences the same way.
+#[test]
+fn the_kill_hook_rationale_separates_unwinding_exit_handlers_and_abort() {
+    const NOTES: &str = include_str!("../../../docs/internals/agent/proc/hooks.md");
+
+    let rationale = NOTES
+        .split("\n## ")
+        .find(|section| section.starts_with("`pub(super) fn apply("))
+        .expect("the notes carry the `apply` heading the kill rationale sits under");
+    // Match on the prose, not on where its line breaks fall: a reflow must not
+    // break the pin, only a changed claim.
+    let rationale = rationale.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for (proposition, pin) in [
+        (
+            "panic unwinds and runs its stack destructors",
+            "`panic!` unwinds",
+        ),
+        (
+            "process::exit runs no stack destructors",
+            "runs **no** stack destructors",
+        ),
+        (
+            "process::exit is separated from abort by exit handlers, not destructors",
+            "process-exit handlers",
+        ),
+        (
+            "abort runs neither unwinding nor an exit handler",
+            "no clean-up is performed and no destructors run",
+        ),
+    ] {
+        assert!(
+            rationale.contains(pin),
+            "the kill rationale must state that {proposition}; looked for {pin:?} in:\n{rationale}"
+        );
+    }
+
+    assert!(
+        !rationale.contains("both of those run destructors"),
+        "the retired claim that `panic!` and `std::process::exit` both run \
+         destructors must not come back:\n{rationale}"
+    );
 }

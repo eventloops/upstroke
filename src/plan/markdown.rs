@@ -28,7 +28,8 @@ impl PlanAdapter for MarkdownPlanAdapter {
     }
 
     fn sniff(&self, raw: &str) -> bool {
-        raw.lines().any(|l| {
+        let source = parser_source(raw);
+        source.lines().any(|l| {
             let t = l.trim_start();
             t.starts_with('#') || t.starts_with("- [") || is_ordered_item(t)
         })
@@ -293,6 +294,19 @@ mod tests {
         assert_eq!(
             ids,
             ["fix-the-parser", "fix-the-parser-2", "fix-the-parser-3"]
+        );
+    }
+
+    #[test]
+    fn an_explicit_id_is_reserved_before_an_earlier_draft_derives_a_colliding_slug() {
+        let raw = "## Fix X\n\n## Second\n<!-- upstroke: id=fix-x -->\n";
+        let tasks = parse(raw).plan.tasks;
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["fix-x-2", "fix-x"],
+            "the later draft's explicit id must win `fix-x`; the earlier, \
+             untitled-in-annotation draft derives around it"
         );
     }
 

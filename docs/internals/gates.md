@@ -35,7 +35,7 @@ command *means*: `command` below hands the same string to a different
 interpreter per variant, and `cmd = "true"` is an always-pass builtin under
 `sh` while being neither a `cmd.exe` builtin nor a PATH program. A record
 carrying the command without the shell would describe a gate nobody can
-reproduce. The wire form matches [`parse`](ShellKind::parse), so config and
+reproduce. The wire form matches [`parse`](../../src/gates.rs), so config and
 log spell a shell the same way.
 
 ## `impl ShellKind` › `pub fn resolves_via_path(self) -> bool {`

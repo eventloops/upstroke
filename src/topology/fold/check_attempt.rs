@@ -406,6 +406,16 @@ impl RunState {
             });
         }
 
+        if started.rung != task.rung {
+            return Err(FoldError::WrongRung {
+                kind: KIND,
+                key: started.key.0,
+                attempt: started.attempt.0,
+                rung: started.rung,
+                detail: format!("the task stands on rung {}", task.rung),
+            });
+        }
+
         let mismatch = |detail: String| FoldError::BindingMismatch {
             key: started.key.0,
             attempt: started.attempt.0,
@@ -630,6 +640,34 @@ impl RunState {
                 check_lease_disposition(KIND, finished.key, generation.lease, *lease)?;
                 if let SettlementTransition::Parked { question } = transition {
                     self.check_new_question(KIND, question, finished.key)?;
+                }
+                if let SettlementTransition::Escalated { rung } = transition {
+                    let rungs = self.entry(KIND, finished.key)?.ladder.rungs.len();
+                    let next = task
+                        .rung
+                        .checked_add(1)
+                        .filter(|next| usize::try_from(*next).is_ok_and(|next| next < rungs));
+                    if next != Some(*rung) {
+                        return Err(FoldError::WrongRung {
+                            kind: KIND,
+                            key: finished.key.0,
+                            attempt: finished.attempt.0,
+                            rung: *rung,
+                            detail: match next {
+                                Some(next) => format!(
+                                    "the task stands on rung {} of a ladder with {rungs} \
+                                     rung(s), so it escalates onto rung {next}",
+                                    task.rung
+                                ),
+                                None => format!(
+                                    "the task stands on rung {} of a ladder with {rungs} \
+                                     rung(s), so there is no rung to escalate onto and the \
+                                     human is the top rung",
+                                    task.rung
+                                ),
+                            },
+                        });
+                    }
                 }
             }
         }

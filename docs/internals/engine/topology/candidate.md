@@ -65,7 +65,7 @@ is `candidate_prepared` itself.
 **This said `attempt_finished(succeeded)` is appended between the pin and
 `candidate_prepared`, "which is what makes the generation `Promoting`".** It
 is not, and since the 2026-08-27 CONFORM ruling the fold refuses that event:
-`decisions/2026-08-12-merge-queue-execution-topology.md` makes
+`design/26_design_merge_queue_protocol.md` §26 makes
 `candidate_prepared` the sole successful settlement for a candidate-producing
 attempt and adds that `attempt_finished` "is not also emitted for that
 attempt". `apply_candidate_prepared` is what promotes the generation.

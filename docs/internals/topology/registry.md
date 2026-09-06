@@ -272,7 +272,7 @@ The id namespace merge repairs are generated into.
 ## `const REPAIR_INDEX_WIDTH: usize = 4;`
 
 Zero-padded width of a repair's lineage index
-(`decisions/2026-08-12-merge-queue-execution-topology.md`: `merge-fix-0001-<task>`).
+(`design/26_design_merge_queue_protocol.md` §26: `merge-fix-0001-<task>`).
 
 ## `pub fn repair_display_id(lineage_index: u32, root: &TaskId) -> String {`
 
