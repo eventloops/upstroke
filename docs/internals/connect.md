@@ -167,10 +167,19 @@ the last byte left the operator holding an empty or half-written
 can supply gone, and the file no longer one `config::load` accepts. That is the
 sequence `SWEEP-CONNECT-001` names.
 
-Replacement is by rename, so the published file is a new inode. Its mode is the
-destination's, read before the staging file is filled, so an operator's
-`chmod 600` survives a rewrite — see [`apply_mode`], which is a Unix statement
-and says why it is only that.
+Replacement is by rename, so the published file is a new inode. Two things
+follow, and both are handled rather than discovered later.
+
+Its mode is the destination's, read before the staging file is filled, so an
+operator's `chmod 600` survives a rewrite — see [`apply_mode`], which is a Unix
+statement and says why it is only that.
+
+And a rename replaces the *name*, so a `pools.toml` that is a **symlink** — the
+shape every dotfile manager gives a configuration file it tracks — would be
+replaced by a regular file, leaving the operator's real file behind with stale
+contents and their link gone. `fs::write` wrote *through* such a link. So does
+this: [`publication_target`] resolves the destination first, and what is staged
+and renamed is the file the link names.
 
 ### Errors
 
@@ -205,6 +214,36 @@ one path that does not reach it, and nothing between those two points panics; a
 one yet. What a killed process leaves behind is one uniquely named `.tmp` that
 no reader of the directory interprets and that the next publication cannot
 collide with.
+
+## `fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {`
+
+The file a publication actually replaces: the destination, or — when the
+destination is a symlink — what that link resolves to.
+
+A rename replaces a name. Without this, `upstroke connect --force` over a
+symlinked `pools.toml` would leave a regular file where the operator's link was
+and their real file untouched and stale, and it would do it silently. `fs::write`
+followed the link, and so does this.
+
+`canonicalize` resolves the whole chain. A link that resolves to nothing is not
+an error here: [`named_target`] takes the name it holds, which is the path
+`fs::write` would have created through it, so a dangling link is filled in
+rather than replaced. Only a real `NotFound` on the destination itself is
+absence (§7); anything else the stat refuses is reported rather than treated as
+"no link here".
+
+The directory that is *created* is still the one the operator named, never one
+behind a link: `create_dir_all` runs before this resolution, on `path`'s own
+parent, so a `--pools` whose parent is a regular file still reports a failed
+directory creation naming that parent, and a link into a directory that does
+not exist fails at the staging file rather than quietly building a tree
+somewhere else.
+
+## `fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {`
+
+The path a dangling link names, resolved against the link's own directory when
+it is relative — which is how the kernel resolves it, and how `fs::write`
+through that link would have.
 
 ## `fn publication_directory(path: &Path) -> Option<&Path> {`
 

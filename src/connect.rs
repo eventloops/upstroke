@@ -172,7 +172,7 @@ fn publish_pools(
     content: &str,
     publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), UpstrokeError> {
-    let Some(directory) = publication_directory(path) else {
+    let Some(named) = publication_directory(path) else {
         return Err(UpstrokeError::Refused {
             message: format!(
                 "`{}` is a filesystem root, not a file to write — pass --pools <path> naming \
@@ -181,18 +181,27 @@ fn publish_pools(
             ),
         });
     };
-    fs::create_dir_all(directory).map_err(|source| UpstrokeError::Filesystem {
+    fs::create_dir_all(named).map_err(|source| UpstrokeError::Filesystem {
         operation: "create directory",
-        path: directory.to_path_buf(),
+        path: named.to_path_buf(),
         source,
     })?;
-    let inherited = destination_mode(path)?;
+    let destination = publication_target(path)?;
+    let Some(directory) = publication_directory(&destination) else {
+        return Err(UpstrokeError::Refused {
+            message: format!(
+                "`{}` names a filesystem root, not a file to write",
+                destination.display()
+            ),
+        });
+    };
+    let inherited = destination_mode(&destination)?;
 
     let staged = directory.join(format!(".pools-{}.tmp", crate::ulid::ulid()));
     let landed = stage(&staged, content, inherited).and_then(|()| {
-        publish(&staged, path).map_err(|source| UpstrokeError::Filesystem {
+        publish(&staged, &destination).map_err(|source| UpstrokeError::Filesystem {
             operation: "publish pools file",
-            path: path.to_path_buf(),
+            path: destination.clone(),
             source,
         })
     });
@@ -203,6 +212,49 @@ fn publish_pools(
         operation: "flush the directory of pools file",
         path: directory.to_path_buf(),
         source,
+    })
+}
+
+fn publication_target(path: &Path) -> Result<PathBuf, UpstrokeError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(path.to_path_buf());
+        }
+        Err(source) => {
+            return Err(UpstrokeError::Filesystem {
+                operation: "read the kind of pools file",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => named_target(path),
+        Err(source) => Err(UpstrokeError::Filesystem {
+            operation: "resolve the symlinked pools file",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn named_target(link: &Path) -> Result<PathBuf, UpstrokeError> {
+    let named = fs::read_link(link).map_err(|source| UpstrokeError::Filesystem {
+        operation: "read the symlinked pools file",
+        path: link.to_path_buf(),
+        source,
+    })?;
+    if named.is_absolute() {
+        return Ok(named);
+    }
+    Ok(match link.parent() {
+        Some(parent) => parent.join(named),
+        None => named,
     })
 }
 
@@ -620,6 +672,65 @@ mod tests {
             publication_directory(Path::new(std::path::MAIN_SEPARATOR_STR)),
             None,
             "a filesystem root names no file to publish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_pools_file_is_published_through_the_link_rather_than_over_it() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-symlink")
+            .expect("acquire an isolated pools directory");
+        let real = tree.path().join("dotfiles-pools.toml");
+        let link = tree.path().join("pools.toml");
+        fs::write(&real, "[pools.claude-code]\nprofile = \"work\"\n")
+            .expect("the file the operator keeps their configuration in");
+        std::os::unix::fs::symlink(&real, &link).expect("the operator's dotfile link");
+
+        assert_eq!(connect(&link, true).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "publishing replaced the operator's symlink with a regular file"
+        );
+        let published = fs::read_to_string(&real).expect("read the file the link names");
+        assert!(
+            published.contains("[pools.claude-code]") && published.contains("weekly = true"),
+            "the file the link names is what was rewritten:\n{published}"
+        );
+        assert_eq!(
+            fs::read_to_string(&link).expect("read through the link"),
+            published,
+            "and the link still reaches it"
+        );
+        assert_eq!(staging_files(tree.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_pools_symlink_publishes_the_file_it_names() {
+        let tree = crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-dangling")
+            .expect("acquire an isolated pools directory");
+        let named = tree.path().join("not-there-yet.toml");
+        let link = tree.path().join("pools.toml");
+        std::os::unix::fs::symlink("not-there-yet.toml", &link)
+            .expect("a link to a file that does not exist yet");
+
+        assert_eq!(connect(&link, false).outcome, Wrote::Written);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("read the link")
+                .file_type()
+                .is_symlink(),
+            "a dangling link is still the operator's link"
+        );
+        assert!(
+            fs::read_to_string(&named)
+                .expect("the file the link names now exists")
+                .contains("[pools.claude-code]")
         );
     }
 
