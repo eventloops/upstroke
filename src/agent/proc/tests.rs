@@ -864,6 +864,7 @@ enum ControlEnd {
     ChildExited,
     Cancelled,
     Failed(i32),
+    CancelSignalBlocked(i32),
 }
 
 #[cfg(target_os = "linux")]
@@ -944,6 +945,47 @@ fn interrupt_until_joined<T>(
 }
 
 #[cfg(target_os = "linux")]
+fn unblock_in_this_thread(signal: libc::c_int) -> Result<(), i32> {
+    // SAFETY: `sigset_t` is plain data for which zeroes are a valid value;
+    // the set is emptied and filled before it is handed to the kernel, and a
+    // null old-set asks `pthread_sigmask` to record nothing. The mask is
+    // per-thread, so only the calling thread's is changed.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, signal) != 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL));
+        }
+        match libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) {
+            0 => Ok(()),
+            errno => Err(errno),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn this_thread_blocks(signal: libc::c_int) -> Result<bool, i32> {
+    // SAFETY: `sigset_t` is plain data for which zeroes are a valid value; a
+    // null new-set asks `pthread_sigmask` only to report the current mask,
+    // which it writes into `current` before `sigismember` reads it.
+    unsafe {
+        let mut current: libc::sigset_t = std::mem::zeroed();
+        let asked = libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+        if asked != 0 {
+            return Err(asked);
+        }
+        match libc::sigismember(&current, signal) {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct ControlWaiter {
     child: ReapedChild,
     signal: libc::c_int,
@@ -967,6 +1009,9 @@ impl ControlWaiter {
         let handle = thread::Builder::new()
             .name("exit-waiter-census-control".to_owned())
             .spawn(move || {
+                if let Err(errno) = unblock_in_this_thread(signal) {
+                    return ControlEnd::CancelSignalBlocked(errno);
+                }
                 loop {
                     // SAFETY: `siginfo_t` is plain data for which zeroes are a valid value.
                     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -1160,6 +1205,73 @@ fn a_control_waiter_is_joined_without_its_child_exiting() {
         .expect("settle the control after its worker is gone");
     assert!(settled.contains("already been joined"), "{settled}");
     assert!(settled.contains("reaped"), "{settled}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_control_started_with_the_cancel_signal_blocked_is_still_cancelled_within_its_bound() {
+    let signal = control_cancel_signal().expect("the cancel handler is installed");
+    let starter = thread::Builder::new()
+        .name("exit-waiter-control-starter".to_owned())
+        .spawn(move || -> Result<(ControlWaiter, bool), String> {
+            // SAFETY: `sigset_t` is plain data for which zeroes are a valid
+            // value; the set is emptied and filled before the kernel sees it,
+            // and the mask changed is this starter thread's own.
+            let blocked = unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set) == 0
+                    && libc::sigaddset(&mut set, signal) == 0
+                    && libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) == 0
+            };
+            if !blocked {
+                return Err("the starter could not block the cancel signal".to_owned());
+            }
+            let control = ControlWaiter::start()?;
+            let still_blocked = this_thread_blocks(signal)
+                .map_err(|errno| format!("the starter could not read its own mask: {errno}"))?;
+            Ok((control, still_blocked))
+        })
+        .expect("spawn the starter thread");
+    let started = join_within(starter, EXIT_WAIT_BUDGET)
+        .unwrap_or_else(|_| panic!("the starter thread did not finish within {EXIT_WAIT_BUDGET:?}"))
+        .expect("the starter thread did not panic");
+    let (mut control, still_blocked) = started.expect("start a control from a blocked thread");
+    assert!(
+        still_blocked,
+        "starting the control changed the starter's own signal mask, which is not its to change"
+    );
+    let pid = control.pid();
+
+    let deadline = Instant::now() + EXIT_WAIT_BUDGET;
+    loop {
+        let census = waiters_on(pid).expect("read the waiter census");
+        if !census.waiters.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the control's `waitid` on pid {pid} never became visible: {census}"
+        );
+        thread::sleep(JOIN_PROBE_INTERVAL);
+    }
+
+    let began = Instant::now();
+    let joined = control.join_worker().expect(
+        "EXIT-WAITER-CONTROL-INHERITS-BLOCKED-CANCEL-SIGNAL: a worker that inherited a mask \
+         blocking the cancel signal must unblock it itself and still be joinable",
+    );
+    let waited = began.elapsed();
+    assert!(
+        joined.contains("Cancelled"),
+        "the worker was joined because it was cancelled: {joined}"
+    );
+    assert!(
+        waited < EXIT_WAIT_BUDGET,
+        "the join took {waited:?}, which is the budget and not a cancellation: {joined}"
+    );
+    control
+        .settle()
+        .expect("settle the control after its worker is gone");
 }
 
 #[cfg(target_os = "linux")]
