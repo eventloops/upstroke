@@ -13,8 +13,8 @@
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
-# so the caller states the priority; with no arguments it walks `gh pr list` order, newest first,
-# which is not a priority. It implies --apply.
+# so the caller states the priority; with no arguments it walks the open pull requests in the
+# API's order, which is not a priority. It implies --apply.
 #
 # --ready-label NAME uses an existing label of that name as it is (the audit adds and removes it
 # on pull requests and never recolours or redescribes it) and creates it only when absent.
@@ -25,15 +25,22 @@
 #   lane:findings-p1p2   codex/findings-*      must fix P0-P2; P3 may be filed and deferred
 #   lane:feature         everything else       must fix P0-P1; P2-P3 may be filed and deferred
 #
-# A pull request is READY when all of these hold on its current head:
-#   - not a draft; GitHub reports it mergeable (DIRTY, UNKNOWN and BLOCKED all fail closed)
-#   - the latest `upstroke-ci` and `upstroke-pr-policy` check runs on the head succeeded
-#   - the latest review comment (either the `Reviewed head:` workflow form or the
-#     `<!-- upstroke-frontier-review -->` form) reviewed the head itself, or a commit the head
-#     differs from only by clean merge commits (git's own merge of the two parents, the branch
-#     diff byte-identical before and after, and no gate edited by the pull request) and pushes
-#     confined to reviews/findings/ or reviews/FINDINGS.md (MAINTAINING step 5 keeps the review
-#     across both)
+# A pull request is READY when all of these hold on its current head and base:
+#   - not a draft; GitHub reports it mergeable: DIRTY, UNKNOWN and BLOCKED fail closed, and
+#     BEHIND fails closed while the default-branch ruleset requires an up-to-date branch (the
+#     ruleset is read; once the merge queue replaces that requirement, BEHIND is what the queue
+#     exists to handle and no longer blocks)
+#   - the newest `upstroke-ci` and `upstroke-pr-policy` check runs on the head succeeded
+#   - the latest review comment by the repository owner (the `Reviewed head:` workflow form with
+#     its fenced JSON verdict, or the `<!-- upstroke-frontier-review -->` prose form) reviewed
+#     the head itself, or a commit the head differs from only by clean merge commits (git's own
+#     merge of the two parents, the branch diff byte-identical before and after, and no gate
+#     edited by the pull request) and pushes confined to reviews/findings/ or reviews/FINDINGS.md
+#     (MAINTAINING step 5 keeps the review across both)
+#   - the review is against the pull request's own base: the workflow form's base commit must
+#     lie on the current base branch (and, for a base other than master, not on master), and no
+#     base change is recorded on the pull request after the review was posted; the prose form
+#     records no base, so it counts only on a master-based pull request
 #   - no finding in that review has a severity the lane must fix
 #   - every allowed finding has a ledger row in the body whose disposition is deferred, with
 #     exactly one file under reviews/findings/ on the branch whose YAML frontmatter (the block
@@ -56,38 +63,144 @@
 # does one whose fields name a MUST deviation (a field named mandatory/deviation/must_*, or the
 # word MUST in any string field); a witness or deviation that exists only in prose does not
 # reach the audit, and the deferring implementor's row asserts there is none (MAINTAINING step 5
-# binds them). A master merge-in is checked on step 5's terms: git's own merge of its parents,
-# the branch diff byte-identical before and after, no gate edited by the pull request, and no
-# branch commit outside the ledger.
+# binds them). A merge-in is checked on step 5's terms: git's own merge of its parents, the
+# branch diff byte-identical before and after, no gate edited by the pull request, and no branch
+# commit outside the ledger.
+#
+# The pure parts (lane, severity sets, the two review parsers, the frontmatter id match, the
+# newest-check-run choice, the ledger-row parse) are functions, exercised by
+# .github/scripts/test-pr-ready-audit.sh; sourcing this file with PR_READY_AUDIT_LIBRARY=1
+# defines them without running the audit.
 #
 # Needs: bash, git (a checkout with `origin` pointing at the repository), gh (its built-in --jq
-# does all JSON work; a standalone jq is not required).
+# does the API-side JSON work), and python3 or python for the verdict JSON; without a python
+# the JSON form fails closed.
 
 set -euo pipefail
 
-apply=0
-enqueue=0
-ready_label="ready-to-merge"
-prs=()
-while (($#)); do
+# ---- pure helpers -------------------------------------------------------------------------------
+
+lane_for() {
   case "$1" in
-    --apply) apply=1 ;;
-    --enqueue) apply=1; enqueue=1 ;;
-    --ready-label)
-      ready_label="$2"; shift
-      [[ "$ready_label" == lane:* ]] && { echo "refusing: --ready-label must not be a lane:* label" >&2; exit 2; } ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
-    *) prs+=("$1") ;;
+    codex/findings-p3-*) echo findings-p3 ;;
+    codex/findings-*) echo findings-p1p2 ;;
+    *) echo feature ;;
   esac
-  shift
-done
+}
 
-repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
-reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
+must_fix_for() {
+  case "$1" in
+    findings-p3) echo "P0 P1 P2 P3" ;;
+    findings-p1p2) echo "P0 P1 P2" ;;
+    feature) echo "P0 P1" ;;
+  esac
+}
 
-if ((${#prs[@]} == 0)); then
-  mapfile -t prs < <(gh api "repos/$repo/pulls?state=open&per_page=100" --paginate --jq '.[].number')
-fi
+# review_kind FILE: "json" when the comment carries a fenced ```json verdict (or the older bare
+# role_understanding object), "prose" otherwise. A prose review that merely quotes JSON is prose.
+review_kind() {
+  if grep -qE '^```json|"role_understanding"' "$1"; then echo json; else echo prose; fi
+}
+
+# parse_verdict_json FILE: the workflow form. Prints tab-separated lines:
+#   META <reviewed_sha> <verdict> <base_sha>     identity of the one object the findings come from
+#   STRAY <tokens> 0                            severity or MUST tokens found outside that object
+#   <severity> <id or -> <bits>                 one per finding; bits: 1 = witness field, 2 = MUST
+#   ERR <reason> 0                              an object or finding the parser cannot judge
+parse_verdict_json() {
+  local py
+  py="$(command -v python3 || command -v python || true)"
+  if [[ -z "$py" ]]; then
+    printf 'ERR\tno-python\t0\n'
+    return 0
+  fi
+  "$py" - "$1" <<'PY'
+import json, re, sys
+sys.stdout.reconfigure(newline=chr(10))  # a Windows python writes CRLF to a pipe, and bash would read the CR into the last field
+text = open(sys.argv[1], encoding="utf-8").read()
+# The verdict is the last fenced JSON object; the older bare form has no fence.
+found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
+try:
+    verdict = json.loads(found[-1]) if found else None
+except ValueError:
+    verdict = None
+if not isinstance(verdict, dict) or not isinstance(verdict.get("findings"), list):
+    print("ERR\tunparsed\t0")
+    sys.exit(0)
+# Identity, verdict, base and findings from this one object. Anything in the comment outside the
+# object that looks like a finding is for a person, not for the parser.
+print("META\t" + str(verdict.get("reviewed_sha", "")).strip() + "\t" + str(verdict.get("verdict", "")).strip() + "\t" + (str(verdict.get("base_sha", "")).strip() or "-"))
+outside = text.replace(found[-1], "")
+stray = sorted(set(re.findall(r"\b(?:P[0-3]|MUST)\b", outside)))
+if stray:
+    print("STRAY\t" + "/".join(stray) + "\t0")
+def present(v):
+    return v not in (None, False, "", [], {}) and str(v).strip() != ""
+for f in verdict["findings"]:
+    if not isinstance(f, dict):
+        print("ERR\tunparsed\t0")
+        continue
+    sev = str(f.get("severity", "")).strip()
+    fid = str(f.get("id", "")).strip() or "-"
+    wit = int(any(present(f.get(k)) for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
+    # A MUST deviation is fixed whatever its label (MAINTAINING step 5): any field of the finding
+    # naming MUST as a word, or a field whose name says mandatory/deviation, marks it.
+    must = 0
+    for k, v in f.items():
+        if re.search(r"(mandatory|deviation|must_)", str(k), re.I) and present(v):
+            must = 1
+        if isinstance(v, str) and re.search(r"\bMUST\b", v):
+            must = 1
+    if not re.fullmatch(r"P[0-3]", sev):
+        print("ERR\tbad-severity:" + fid + "\t0")
+        continue
+    print(sev + "\t" + fid + "\t" + str(wit + 2 * must))
+PY
+}
+
+# parse_prose_review FILE: the frontier form, read conservatively. Prints the same shape:
+#   META <head from the marker or Reviewed-head line> <last VERDICT> -
+#   <severity> - 0     one per numbered "N. **P<n>" finding
+#   STRAY <tokens> 0   any P0-P3 or MUST token outside the numbered findings, PASS included
+parse_prose_review() {
+  local f="$1" head verdict stray
+  head="$(grep -oE '(head=|Reviewed head: )[0-9a-f]{40}' "$f" | head -1 | grep -oE '[0-9a-f]{40}' || true)"
+  verdict="$(grep -oE 'VERDICT:\**:? *[A-Z_]+' "$f" | tail -1 | grep -oE '[A-Z_]+$' || true)"
+  printf 'META\t%s\t%s\t-\n' "$head" "$verdict"
+  grep -oE '^[0-9]+\. \*\*P[0-3]' "$f" | grep -oE 'P[0-3]' | sed 's/$/\t-\t0/' || true
+  stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' "$f" | grep -oE '\bP[0-3]\b|\bMUST\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
+  [[ -n "$stray" ]] && printf 'STRAY\t%s\t0\n' "$stray"
+  return 0
+}
+
+# frontmatter_has_id ID: reads a finding file on stdin and succeeds only when its YAML
+# frontmatter, the block between the opening `---` on line 1 and the next `---`, carries the
+# line `id: ID` (README: the id lives in the frontmatter, not the name). The same line in prose
+# or a code block further down is not a frontmatter id. The id is a fixed string, whole line.
+frontmatter_has_id() {
+  awk 'NR == 1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }' | grep -qxF "id: $1"
+}
+
+# newest_per_name: reads "name<TAB>id<TAB>conclusion-or-status" lines, one per check run across
+# every page, and prints "name=value " for the highest id per name. GitHub assigns check-run
+# ids in creation order, so the highest id is the newest run whether or not it ever started.
+newest_per_name() {
+  sort -t $'\t' -k1,1 -k2,2n | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }'
+}
+
+# ledger_rows_from_body: reads a pull-request body on stdin and prints one line per ledger row,
+# "ID<TAB>severity<TAB>sha-or-location<TAB>disposition".
+ledger_rows_from_body() {
+  awk -F'|' '
+    /^## Review finding ledger/ { inledger = 1; next }
+    /^## / { inledger = 0 }
+    inledger && /^\|/ && $2 !~ /^ *ID *$/ && $2 !~ /^-+$/ && $2 !~ /None yet/ {
+      gsub(/^ +| +$/, "", $2); gsub(/^ +| +$/, "", $3); gsub(/^ +| +$/, "", $4); gsub(/^ +| +$/, "", $10)
+      print $2 "\t" $3 "\t" $4 "\t" $10
+    }'
+}
+
+# ---- GitHub-facing helpers ----------------------------------------------------------------------
 
 # Creates a label only when the repository has none of that name: an existing label, including
 # one handed in as --ready-label, keeps its colour and description.
@@ -104,61 +217,93 @@ ensure_labels() {
   create "$ready_label" 5319e7 "audit passed: enqueue for merge"
 }
 
-lane_for() {
-  local branch="$1"
-  case "$branch" in
-    codex/findings-p3-*) echo findings-p3 ;;
-    codex/findings-*) echo findings-p1p2 ;;
-    *) echo feature ;;
-  esac
+# ruleset_state: prints "<strict> <queue>", 1 or 0 each: whether an active branch ruleset still
+# requires an up-to-date branch, and whether one carries the merge-queue rule. Every active
+# branch ruleset is read, which over-approximates on the safe side.
+ruleset_state() {
+  local strict=0 queue=0 id rules
+  for id in $(gh api "repos/$repo/rulesets?targets=branch" --jq '.[] | select(.enforcement == "active") | .id'); do
+    rules="$(gh api "repos/$repo/rulesets/$id" --jq '.rules[] | "\(.type)=\(.parameters.strict_required_status_checks_policy // "")"')"
+    grep -q '^merge_queue=' <<< "$rules" && queue=1
+    grep -q '^required_status_checks=true$' <<< "$rules" && strict=1
+  done
+  echo "$strict $queue"
 }
 
-must_fix_for() {
-  case "$1" in
-    findings-p3) echo "P0 P1 P2 P3" ;;
-    findings-p1p2) echo "P0 P1 P2" ;;
-    feature) echo "P0 P1" ;;
-  esac
-}
-
-# The latest review comment on a pull request posted by the repository owner, or nothing.
-# `--paginate` hands `--jq` each page separately, so `last` is per page: each page yields its
-# newest match as "<created_at> <id>", the newest across pages wins by timestamp, and that one
-# comment is fetched by id. Comments arrive oldest first, so the per-page `last` is its newest.
-latest_review() {
-  local id
-  id="$(gh api "repos/$repo/issues/$1/comments?per_page=100" --paginate \
+# latest_review_id PR: the id of the newest review comment posted by the repository owner, or
+# nothing. `--paginate` hands `--jq` each page separately, so `last` is per page: each page
+# yields its newest match as "<created_at> <id>" and the newest across pages wins by timestamp.
+latest_review_id() {
+  gh api "repos/$repo/issues/$1/comments?per_page=100" --paginate \
     --jq "[.[] | select(.user.login == \"$reviewer\") | select(.body | test(\"<!-- upstroke-frontier-review|Reviewed head: [0-9a-f]{40}\"))] | last | select(. != null) | \"\(.created_at) \(.id)\"" \
-    | sort | tail -1 | awk '{print $2}')"
-  [[ -n "$id" ]] && gh api "repos/$repo/issues/comments/$id" --jq '.body'
+    | sort | tail -1 | awk '{print $2}'
   return 0
 }
 
-# Ledger rows from the body: "ID<TAB>severity<TAB>sha-or-location<TAB>disposition" per row.
-ledger_rows() {
-  gh pr view "$1" --repo "$repo" --json body --jq .body | awk -F'|' '
-    /^## Review finding ledger/ { inledger = 1; next }
-    /^## / { inledger = 0 }
-    inledger && /^\|/ && $2 !~ /^ *ID *$/ && $2 !~ /^-+$/ && $2 !~ /None yet/ {
-      gsub(/^ +| +$/, "", $2); gsub(/^ +| +$/, "", $3); gsub(/^ +| +$/, "", $4); gsub(/^ +| +$/, "", $10)
-      print $2 "\t" $3 "\t" $4 "\t" $10
-    }'
+# retargeted_after PR ISO-TIME: succeeds when the pull request's base was changed after that
+# moment, which a review posted before it cannot have seen.
+retargeted_after() {
+  local when
+  for when in $(gh api "repos/$repo/issues/$1/timeline?per_page=100" --paginate \
+      --jq '.[] | select(.event == "base_ref_changed") | .created_at'); do
+    [[ "$when" > "$2" ]] && return 0
+  done
+  return 1
 }
 
-if ((apply)); then ensure_labels; fi
+# ---- the audit ----------------------------------------------------------------------------------
 
-printf '%-5s %-14s %-8s %-13s %s\n' PR LANE HEAD STATE DETAIL
-for pr in "${prs[@]}"; do
+main() {
+  apply=0
+  enqueue=0
+  ready_label="ready-to-merge"
+  prs=()
+  while (($#)); do
+    case "$1" in
+      --apply) apply=1 ;;
+      --enqueue) apply=1; enqueue=1 ;;
+      --ready-label)
+        ready_label="$2"; shift
+        [[ "$ready_label" == lane:* ]] && { echo "refusing: --ready-label must not be a lane:* label" >&2; exit 2; } ;;
+      -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+      *) prs+=("$1") ;;
+    esac
+    shift
+  done
+
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+  reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
+  read -r strict_up_to_date has_queue <<< "$(ruleset_state)"
+
+  if ((${#prs[@]} == 0)); then
+    mapfile -t prs < <(gh api "repos/$repo/pulls?state=open&per_page=100" --paginate --jq '.[].number')
+  fi
+  if ((apply)); then ensure_labels; fi
+
+  printf '%-5s %-14s %-8s %-13s %s\n' PR LANE HEAD STATE DETAIL
+  local pr
+  for pr in "${prs[@]}"; do
+    audit_one "$pr"
+  done
+}
+
+audit_one() {
+  local pr="$1"
+  local meta branch head draft merge_state labels base base_oid attempt
   # GitHub computes mergeability lazily and answers UNKNOWN until it has; asking again after a
   # pause usually settles it, and an UNKNOWN that survives three asks fails closed below.
   for attempt in 1 2 3; do
-    meta="$(gh pr view "$pr" --repo "$repo" \
-      --json headRefName,headRefOid,isDraft,mergeStateStatus,labels \
-      --jq '[.headRefName, .headRefOid, (.isDraft|tostring), .mergeStateStatus, ([.labels[].name]|join(" "))] | @tsv')"
-    IFS=$'\t' read -r branch head draft merge_state labels <<< "$meta"
+    # One field per line, read with mapfile: a tab-separated read would collapse an empty field
+    # (no labels) and shift every field after it.
+    mapfile -t meta < <(gh pr view "$pr" --repo "$repo" \
+      --json headRefName,headRefOid,isDraft,mergeStateStatus,labels,baseRefName,baseRefOid \
+      --jq '.headRefName, .headRefOid, (.isDraft|tostring), .mergeStateStatus, ([.labels[].name]|join(" ")), .baseRefName, .baseRefOid')
+    branch="${meta[0]:-}"; head="${meta[1]:-}"; draft="${meta[2]:-}"; merge_state="${meta[3]:-}"
+    labels="${meta[4]:-}"; base="${meta[5]:-}"; base_oid="${meta[6]:-}"
     [[ "$merge_state" == UNKNOWN && $attempt -lt 3 ]] || break
     sleep 3
   done
+  local lane must_fix state
   lane="$(lane_for "$branch")"
   must_fix="$(must_fix_for "$lane")"
   blockers=()
@@ -169,18 +314,16 @@ for pr in "${prs[@]}"; do
     DIRTY) blockers+=("conflicts") ;;
     UNKNOWN|"") blockers+=("mergeability-unknown") ;;   # GitHub has not computed it yet
     BLOCKED) blockers+=("blocked-by-rules") ;;          # a ruleset requirement is unmet, e.g. an unresolved conversation
-    BEHIND) blockers+=("behind-master") ;;              # reported only while the ruleset requires an up-to-date branch
+    BEHIND)                                             # out of date: a blocker only while the ruleset demands an update
+      ((strict_up_to_date)) && blockers+=("behind-base:ruleset-requires-up-to-date") ;;
   esac
 
-  # The newest check run per required context on the head: a re-run creates a new run with the
-  # same name, so every matching run from every page is listed with its id, which GitHub assigns
-  # in creation order, and the highest id per name is the one whose conclusion or status is
-  # read. A run that never started still has an id, so it is ordered by when it was created,
-  # not by a stand-in date. `--paginate` runs the jq filter per page, so the selection happens
-  # here in the shell, over all pages, not in jq.
+  # The newest check run per required context on the head, chosen across every page in the
+  # shell (`--paginate` runs the jq filter per page).
+  local checks ctx
   checks="$(gh api "repos/$repo/commits/$head/check-runs?per_page=100" --paginate \
     --jq '.check_runs[] | select(.name == "upstroke-ci" or .name == "upstroke-pr-policy") | "\(.name)\t\(.id)\t\(.conclusion // .status)"' \
-    | sort -t $'\t' -k1,1 -k2,2n | awk -F'\t' '{ last[$1] = $3 } END { for (n in last) printf "%s=%s ", n, last[n] }')"
+    | newest_per_name)"
   for ctx in upstroke-ci upstroke-pr-policy; do
     case " $checks " in
       *" $ctx=success "*) ;;
@@ -189,113 +332,62 @@ for pr in "${prs[@]}"; do
     esac
   done
 
-  review="$(latest_review "$pr")"
-  if [[ -z "$review" ]]; then
-    blockers+=("no-review")
-    reviewed=""
-    verdict=""
-  else
-    # The frontier (prose) form: one marker line carries the head, and the last VERDICT line is
-    # the verdict. The workflow (JSON) form is read below by the parser, which hands back the
-    # head and verdict of the same object whose findings it lists, so the three never come from
-    # different parts of one comment.
-    reviewed="$(grep -oE '(head=|Reviewed head: )[0-9a-f]{40}' <<< "$review" | head -1 | grep -oE '[0-9a-f]{40}' || true)"
-    verdict="$(grep -oE 'VERDICT:\**:? *[A-Z_]+' <<< "$review" | tail -1 | grep -oE '[A-Z_]+$' || true)"
-  fi
-
-  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" ("-" for no id). The JSON
-  # form is read by a JSON parser, never by regex; without one the audit fails closed. The
-  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and any
-  # severity token anywhere else in the text sends the pull request to MANUAL, PASS included.
+  # The latest owner review: its posting time, its kind, and its parse.
+  local review_id review_at review_file kind reviewed="" verdict="" review_base="-"
   findings=()
-  if [[ -n "$review" ]]; then
-    # The workflow form is a fenced ```json verdict (or the older bare role_understanding
-    # object); a prose review that merely quotes JSON stays prose.
-    if grep -qE '^```json|"role_understanding"' <<< "$review"; then
-      py="$(command -v python3 || command -v python || true)"
-      if [[ -z "$py" ]]; then
-        blockers+=("findings-unparsed:no-python")
-      else
-        review_file="$(mktemp)"
-        printf '%s' "$review" > "$review_file"
-        while IFS=$'\t' read -r sev id wit; do
-          if [[ "$sev" == META ]]; then
-            reviewed="$id"; verdict="$wit"      # the same object the findings come from
-            continue
-          fi
-          if [[ "$sev" == STRAY ]]; then
-            blockers+=("manual:$id-outside-the-verdict-object")
-            continue
-          fi
-          [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
-        done < <("$py" - "$review_file" <<'PY'
-import json, re, sys
-sys.stdout.reconfigure(newline=chr(10))  # a Windows python writes CRLF to a pipe, and bash would read the CR into the last field
-text = open(sys.argv[1], encoding="utf-8").read()
-# The verdict is the last fenced JSON object; the older bare form has no fence.
-found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
-try:
-    verdict = json.loads(found[-1]) if found else None
-except ValueError:
-    verdict = None
-if not isinstance(verdict, dict) or not isinstance(verdict.get("findings"), list):
-    print("ERR\tunparsed\t0")
-    sys.exit(0)
-# Identity, verdict and findings from this one object. Anything in the comment outside the
-# object that looks like a finding is for a person, not for the parser.
-print("META\t" + str(verdict.get("reviewed_sha", "")).strip() + "\t" + str(verdict.get("verdict", "")).strip())
-outside = text.replace(found[-1], "")
-stray = sorted(set(re.findall(r"\b(?:P[0-3]|MUST)\b", outside)))
-if stray:
-    print("STRAY\t" + "/".join(stray) + "\t0")
-for f in verdict["findings"]:
-    if not isinstance(f, dict):
-        print("ERR\tunparsed\t0")
-        continue
-    sev = str(f.get("severity", "")).strip()
-    fid = str(f.get("id", "")).strip() or "-"
-    def present(v):
-        return v not in (None, False, "", [], {}) and str(v).strip() != ""
-    wit = int(any(present(f.get(k)) for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
-    # A MUST deviation is fixed whatever its label (MAINTAINING step 5): any field of the finding
-    # naming MUST as a word, or a field whose name says mandatory/deviation, marks it.
-    must = 0
-    for k, v in f.items():
-        if re.search(r"(mandatory|deviation|must_)", str(k), re.I) and present(v):
-            must = 1
-        if isinstance(v, str) and re.search(r"\bMUST\b", v):
-            must = 1
-    if not re.fullmatch(r"P[0-3]", sev):
-        print("ERR\tbad-severity:" + fid + "\t0")
-        continue
-    print(sev + "\t" + fid + "\t" + str(wit + 2 * must))
-PY
-)
-        rm -f "$review_file"
-      fi
-    else
-      while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
-      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b|\bMUST\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
-      [[ -n "$stray" ]] && blockers+=("manual:$stray-outside-numbered-findings")
-    fi
-  fi
-  if [[ -n "$review" ]]; then
+  review_id="$(latest_review_id "$pr")"
+  if [[ -z "$review_id" ]]; then
+    blockers+=("no-review")
+  else
+    review_at="$(gh api "repos/$repo/issues/comments/$review_id" --jq '.created_at')"
+    review_file="$(mktemp)"
+    gh api "repos/$repo/issues/comments/$review_id" --jq '.body' > "$review_file"
+    kind="$(review_kind "$review_file")"
+    local sev id wit
+    while IFS=$'\t' read -r sev id wit extra; do
+      case "$sev" in
+        META) reviewed="$id"; verdict="$wit"; review_base="${extra:-"-"}" ;;
+        STRAY) blockers+=("manual:$id-outside-the-$([[ "$kind" == json ]] && echo verdict-object || echo numbered-findings)") ;;
+        "") ;;
+        *) findings+=("$sev"$'\t'"$id"$'\t'"$wit") ;;
+      esac
+    done < <(if [[ "$kind" == json ]]; then parse_verdict_json "$review_file"; else parse_prose_review "$review_file"; fi)
+    rm -f "$review_file"
+
     case "$verdict" in
       PASS|CHANGES_REQUIRED) ;;
       "") blockers+=("no-verdict") ;;
       *) blockers+=("verdict:$verdict") ;;
     esac
     [[ "$lane" == findings-p3 && "$verdict" != PASS ]] && blockers+=("verdict-not-pass")
-  fi
-  [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
-  [[ "$verdict" == CHANGES_REQUIRED && ${#findings[@]} -eq 0 ]] && blockers+=("findings-unparsed:changes-required-lists-none")
+    [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
+    [[ "$verdict" == CHANGES_REQUIRED && ${#findings[@]} -eq 0 ]] && blockers+=("findings-unparsed:changes-required-lists-none")
 
-  # Head movement since the reviewed commit.
+    # The review must be against this pull request's own base (MAINTAINING step 4): a base
+    # changed after the review was posted is a diff the review never saw, and the workflow
+    # form's base commit must lie on the current base branch (and, off master, not on master,
+    # since the integration branch carries master's history too).
+    if retargeted_after "$pr" "$review_at"; then
+      blockers+=("retargeted-after-review")
+    fi
+  fi
+
+  # Head movement since the reviewed commit, and the base the review was made against.
   moved=""
   if [[ -n "$reviewed" ]]; then
     # refs/pull/N/head is the head whatever repository it lives in; a fork's branch is not on
     # origin, so fetching by branch name would leave the head and the reviewed commit unknown.
-    git fetch -q origin "refs/pull/$pr/head" master 2>/dev/null || true
+    git fetch -q origin "refs/pull/$pr/head" "$base" master 2>/dev/null || true
+    if [[ "$review_base" != "-" ]]; then
+      if ! git cat-file -e "$review_base^{commit}" 2>/dev/null \
+        || ! git merge-base --is-ancestor "$review_base" "origin/$base"; then
+        blockers+=("review-base-not-on-$base:${review_base:0:7}")
+      elif [[ "$base" != master ]] && git merge-base --is-ancestor "$review_base" origin/master; then
+        blockers+=("review-base-on-master-not-$base:${review_base:0:7}")
+      fi
+    elif [[ "$base" != master ]]; then
+      blockers+=("manual:review-records-no-base-and-base-is-$base")
+    fi
     if ! git cat-file -e "$reviewed^{commit}" 2>/dev/null; then
       blockers+=("reviewed-sha-unknown:${reviewed:0:7}")
     elif ! git merge-base --is-ancestor "$reviewed" "$head"; then
@@ -306,8 +398,8 @@ PY
       # resolution or a third parent is a new change that `--no-merges` below would hide), the
       # branch's diff against its base is byte-identical before and after the merge, and the pull
       # request edits no gate. Anything wider is reviewed again.
-      merge_edits=""
-      merges="$(git rev-list --merges "$reviewed..$head" --not origin/master)"
+      local merge_edits="" merges m expected before after touched
+      merges="$(git rev-list --merges "$reviewed..$head" --not "origin/$base")"
       for m in $merges; do
         if (($(git rev-list --parents -n 1 "$m" | wc -w) != 3)); then merge_edits="$m"; break; fi
         if ! expected="$(git merge-tree --write-tree "$m^1" "$m^2" 2>/dev/null)"; then
@@ -321,11 +413,11 @@ PY
         [[ "$before" == "$after" ]] || { merge_edits="$m"; break; }
       done
       if [[ -n "$merges" && -z "$merge_edits" ]] \
-        && git diff --name-only "origin/master...$head" -- .github/workflows .github/scripts | grep -q .; then
+        && git diff --name-only "origin/$base...$head" -- .github/workflows .github/scripts | grep -q .; then
         blockers+=("review-stale:gate-edit-with-merge-in")   # step 5: no exemption for a gate-editing pull request
       fi
-      # Commits master already has arrived through a merge-in; only the branch's own count.
-      touched="$(git log --no-merges --name-only --format= "$reviewed..$head" --not origin/master | sort -u)"
+      # Commits the base already has arrived through a merge-in; only the branch's own count.
+      touched="$(git log --no-merges --name-only --format= "$reviewed..$head" --not "origin/$base" | sort -u)"
       if [[ -n "$merge_edits" ]]; then
         moved="merge-edits:${merge_edits:0:7}"
       elif [[ -z "$touched" ]]; then
@@ -338,8 +430,8 @@ PY
     fi
   fi
 
-
-  rows="$(ledger_rows "$pr")"
+  local rows f disposition nfiles cand
+  rows="$(gh pr view "$pr" --repo "$repo" --json body --jq .body | ledger_rows_from_body)"
   for f in "${findings[@]}"; do
     IFS=$'\t' read -r sev id wit <<< "$f"
     [[ "$id" == "-" ]] && id=""   # "-" stands in for "no id": a tab-separated read collapses empty fields
@@ -367,16 +459,9 @@ PY
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
       deferred)   # the lane rule: an allowed finding is filed and deferred, one file per finding
-        # The file is the one whose YAML frontmatter, the block between the opening `---` on
-        # line 1 and the next `---`, carries the line `id: <this id>` (README: the id lives in
-        # the frontmatter, not the name). Only that block is read: the same line in prose or a
-        # code block further down is not a frontmatter id. The id is matched as a fixed string
-        # and a whole line, never as a pattern, and a miss is a blocker, not an exit.
         nfiles=0
         for cand in $(git grep -l -F -e "id: $id" "$head" -- 'reviews/findings/*.md' 2>/dev/null | sed 's/^[^:]*://' || true); do
-          if git show "$head:$cand" 2>/dev/null \
-            | awk 'NR == 1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }' \
-            | grep -qxF "id: $id"; then nfiles=$((nfiles + 1)); fi
+          if git show "$head:$cand" 2>/dev/null | frontmatter_has_id "$id"; then nfiles=$((nfiles + 1)); fi
         done
         case "$nfiles" in
           1) ;;
@@ -393,7 +478,7 @@ PY
 
   # Hard blockers decide first; a repair push only matters once nothing else stands in the way.
   # A draft is NOT-READY: READY means enqueueable as it stands.
-  hard=()
+  local hard=() b
   for b in "${blockers[@]:-}"; do
     [[ -n "$b" && "$b" != manual:* ]] && hard+=("$b")
   done
@@ -405,7 +490,9 @@ PY
     state=MANUAL
   fi
 
+  local detail l
   detail="verdict=${verdict:-none} reviewed=${reviewed:0:7}${moved:+ moved=$moved}"
+  [[ "$base" != master ]] && detail+=" base=$base"
   for l in lane:feature lane:findings-p1p2 lane:findings-p3; do
     [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && detail+=" lane-label-mismatch=$l"
   done
@@ -423,6 +510,7 @@ PY
     # move is removed; that narrows the window, it cannot close it. The act that is bound to the
     # audited head is the enqueue, through --match-head-commit, and nothing may treat the label
     # alone as permission to merge.
+    local now after_write
     if [[ "$state" == READY ]]; then
       now="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
       if [[ "$now" != "$head" ]]; then
@@ -430,16 +518,16 @@ PY
         state=HEAD-MOVED
       fi
     fi
-    if [[ "$state" == READY && "$draft" != "true" ]]; then
+    if [[ "$state" == READY ]]; then
       [[ " $labels " != *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
-      after="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
-      if [[ "$after" != "$head" ]]; then
+      after_write="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
+      if [[ "$after_write" != "$head" ]]; then
         gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
-        echo "      head moved to ${after:0:7} while labelling ${head:0:7}: label removed, not enqueued"
+        echo "      head moved to ${after_write:0:7} while labelling ${head:0:7}: label removed, not enqueued"
         state=HEAD-MOVED
       fi
     fi
-    if [[ "$state" == READY && "$draft" != "true" ]]; then
+    if [[ "$state" == READY ]]; then
       if ((enqueue)); then
         # --match-head-commit binds the enqueue to the head this audit judged: a push that
         # lands between the audit and this call makes GitHub refuse, never enqueue the newcomer.
@@ -453,4 +541,9 @@ PY
       [[ " $labels " == *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
     fi
   fi
-done
+  return 0
+}
+
+if [[ "${PR_READY_AUDIT_LIBRARY:-0}" != 1 ]]; then
+  main "$@"
+fi
