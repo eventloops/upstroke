@@ -3765,15 +3765,20 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
                         | (EntryPhase::Residue { .. }, 2, EvidenceLabel::RecoveryProven)
                 );
                 // *Which* refusal, and not merely that there was one. The
-                // twenty-five illegal cells are refused by three different
+                // twenty-five illegal cells are refused by six different
                 // clauses, and a format that answered one refusal for every
                 // wrong cell -- or that reached the label rules before the
                 // residue clause -- satisfies `is_err()` at all twenty-five.
                 // The clauses, in the order `validate_entry` applies them: a
                 // residue class whose evidence or label claims an execution;
                 // then a phase that is not about a class carrying
-                // recovery-proven evidence; then the label rules.
+                // recovery-proven evidence; then a label that is not the one
+                // the phase requires; then a no-execution record carrying
+                // executed-hook evidence, or a hook phase carrying a
+                // not-executed record; then a label that contradicts the
+                // evidence's own shape.
                 let residue_phase = matches!(phase, EntryPhase::Residue { .. });
+                let no_execution = phase == EntryPhase::NoExecution;
                 let expected_refusal = if residue_phase
                     && (evidence_kind == 0 || label == EvidenceLabel::ExecutionObserved)
                 {
@@ -3782,8 +3787,17 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
                     Some("hook-claims-recovery-proof")
                 } else if expected_legal {
                     None
-                } else {
+                } else if label != phase.required_label() {
                     Some("mislabelled")
+                } else if no_execution && evidence_kind == 0 {
+                    Some("no-execution-claims-hook")
+                } else if !residue_phase && evidence_kind == 1 {
+                    Some("hook-claims-no-execution")
+                } else {
+                    // A residue class, correctly labelled, carrying a
+                    // not-executed record: the label and the evidence's own
+                    // shape disagree.
+                    Some("label-contradicts-evidence")
                 };
                 let result = FaultRegistry::new().insert(entry);
                 assert_eq!(
@@ -3801,7 +3815,19 @@ fn the_format_admits_exactly_one_evidence_shape_and_label_per_phase_kind() {
                         Some("hook-claims-recovery-proof"),
                         Err(RegistryError::HookClaimsRecoveryProof { .. }),
                     )
-                    | (Some("mislabelled"), Err(RegistryError::MislabelledEntry { .. })) => {
+                    | (Some("mislabelled"), Err(RegistryError::MislabelledEntry { .. }))
+                    | (
+                        Some("no-execution-claims-hook"),
+                        Err(RegistryError::NoExecutionClaimsHook { .. }),
+                    )
+                    | (
+                        Some("hook-claims-no-execution"),
+                        Err(RegistryError::HookClaimsNoExecution { .. }),
+                    )
+                    | (
+                        Some("label-contradicts-evidence"),
+                        Err(RegistryError::LabelContradictsEvidence { .. }),
+                    ) => {
                         refused += 1;
                     }
                     _ => panic!(
