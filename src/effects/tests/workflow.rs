@@ -652,7 +652,8 @@ pub(super) fn ci_test_windows_job_complaints(doc: &Yaml) -> Vec<String> {
             "[test-windows-runner] `{TEST_WINDOWS_JOB}` runs on {:?}, not exactly the label \
              set {expected_labels:?}. A scalar here is a hosted runner, a subset is any \
              self-hosted Windows machine the account registers, and the pinned set names the \
-             curated image.",
+             curated image and the lane expression that keeps queue builds off the \
+             pull-request guest.",
             field(job, "runs-on")
         ));
     }
@@ -1519,7 +1520,7 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  Every step still matches character for character; only the machine, and \
                  with it the twelve minutes, changed.",
         job: Some("test-windows"),
-        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        anchor: "    runs-on: [self-hosted, windows, \"${{ github.event_name == 'merge_group' && 'winguest-queue' || 'winguest' }}\"]\n",
         replacement: "    runs-on: windows-latest\n",
         refused_as: "test-windows-runner",
     },
@@ -1529,8 +1530,18 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  the account ever registers satisfies; the curated image is named by the \
                  label this drops",
         job: Some("test-windows"),
-        anchor: "    runs-on: [self-hosted, windows, winguest]\n",
+        anchor: "    runs-on: [self-hosted, windows, \"${{ github.event_name == 'merge_group' && 'winguest-queue' || 'winguest' }}\"]\n",
         replacement: "    runs-on: [self-hosted, windows]\n",
+        refused_as: "test-windows-runner",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-WINDOWS-LANE-COLLAPSED",
+        escape: "the lane expression replaced by the plain `winguest` label. Every run still \
+                 lands on a curated guest, but a merge-queue entry now queues behind whatever \
+                 pull-request build holds that guest, and the second guest idles.",
+        job: Some("test-windows"),
+        anchor: "    runs-on: [self-hosted, windows, \"${{ github.event_name == 'merge_group' && 'winguest-queue' || 'winguest' }}\"]\n",
+        replacement: "    runs-on: [self-hosted, windows, winguest]\n",
         refused_as: "test-windows-runner",
     },
     WorkflowEscape {

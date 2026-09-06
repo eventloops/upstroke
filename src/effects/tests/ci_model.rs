@@ -61,7 +61,12 @@ pub(super) const ACTION_INPUTS: [(&str, &[&str]); 3] = [
 pub(super) const TOOLCHAIN_COMPONENTS: [&str; 2] = ["clippy", "rustfmt, clippy"];
 
 pub(super) const TEST_WINDOWS_JOB: &str = "test-windows";
-pub(super) const TEST_WINDOWS_LABELS: [&str; 3] = ["self-hosted", "windows", "winguest"];
+/// The third `runs-on:` label picks the lane: a merge-queue entry goes to the `winguest-queue`
+/// guest, every other event to `winguest`, so a queue build never waits behind a pull-request
+/// build on the one guest. Both guests boot the same golden image.
+pub(super) const TEST_WINDOWS_LANE: &str =
+    "${{ github.event_name == 'merge_group' && 'winguest-queue' || 'winguest' }}";
+pub(super) const TEST_WINDOWS_LABELS: [&str; 3] = ["self-hosted", "windows", TEST_WINDOWS_LANE];
 
 pub(super) const SELF_HOSTED_TEST_PLATFORM: &str = "windows-latest";
 
