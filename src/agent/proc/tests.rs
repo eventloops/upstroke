@@ -430,10 +430,11 @@ impl Drop for ReapedChild {
             return;
         }
         if let Err(failure) = self.settle() {
-            assert!(
-                std::thread::panicking(),
-                "a child was abandoned and nothing else had failed: {failure}"
-            );
+            if std::thread::panicking() {
+                println!("child cleanup during an unwind: {failure}");
+            } else {
+                panic!("a child was abandoned and nothing else had failed: {failure}");
+            }
         }
     }
 }
@@ -858,9 +859,99 @@ fn child_held_on_its_stdin(what: &str) -> ReapedChild {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum ControlEnd {
+    ChildExited,
+    Cancelled,
+    Failed(i32),
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn interrupt_only(_signal: libc::c_int) {}
+
+#[cfg(target_os = "linux")]
+static CONTROL_CANCEL_HANDLER: std::sync::OnceLock<Result<libc::c_int, String>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn control_cancel_signal() -> Result<libc::c_int, String> {
+    CONTROL_CANCEL_HANDLER
+        .get_or_init(|| {
+            let signal = libc::SIGRTMIN();
+            // SAFETY: `interrupt_only` has the C ABI and an empty body, so it is
+            // async-signal-safe; `sa_flags` deliberately omits `SA_RESTART`, so a
+            // `waitid` this signal lands in returns `EINTR` instead of restarting;
+            // the mask is emptied before the struct is handed to the kernel.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = interrupt_only as *const () as libc::sighandler_t;
+                action.sa_flags = 0;
+                if libc::sigemptyset(&mut action.sa_mask) != 0
+                    || libc::sigaction(signal, &action, std::ptr::null_mut()) != 0
+                {
+                    return Err(format!(
+                        "installing the control cancel handler for signal {signal}: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            Ok(signal)
+        })
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn interrupt_until_joined<T>(
+    mut handle: thread::JoinHandle<T>,
+    signal: libc::c_int,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: Duration,
+) -> Result<thread::Result<T>, (thread::JoinHandle<T>, String)> {
+    use std::os::unix::thread::JoinHandleExt;
+
+    // Protocol (§10): `cancel` is written here and read by the worker after
+    // every `EINTR`; a signal is sent on every probe until the worker has
+    // finished, so a signal that lands between the worker's flag check and
+    // its next `waitid` is followed by another that lands inside it.
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let began = Instant::now();
+    loop {
+        // SAFETY: the handle is still held, so the `pthread_t` it names has not
+        // been joined and cannot have been reused; a worker that has already
+        // finished answers `ESRCH` or 0, and neither is acted on.
+        let sent = unsafe { libc::pthread_kill(handle.as_pthread_t(), signal) };
+        if sent != 0 && sent != libc::ESRCH {
+            return Err((
+                handle,
+                format!(
+                    "pthread_kill({signal}) on the worker failed: {}",
+                    std::io::Error::from_raw_os_error(sent)
+                ),
+            ));
+        }
+        let remaining = budget.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
+            return Err((
+                handle,
+                format!("the worker was still unfinished after {budget:?} of signals"),
+            ));
+        }
+        match join_within(handle, remaining.min(JOIN_PROBE_INTERVAL)) {
+            Ok(outcome) => return Ok(outcome),
+            Err(unfinished) => handle = unfinished,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct ControlWaiter {
     child: ReapedChild,
-    handle: Option<thread::JoinHandle<Result<(), i32>>>,
+    signal: libc::c_int,
+    // Shared with the worker (§6): the flag must be readable by the worker
+    // after every `EINTR` and writable by the owner while the worker is
+    // blocked, and each side can outlive the other's last use of it.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<ControlEnd>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -870,6 +961,9 @@ impl ControlWaiter {
         let pid = child.pid();
         let unsigned = libc::id_t::try_from(pid)
             .map_err(|_| format!("the control pid {pid} is not a Unix wait id"))?;
+        let signal = control_cancel_signal()?;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
         let handle = thread::Builder::new()
             .name("exit-waiter-census-control".to_owned())
             .spawn(move || {
@@ -887,19 +981,24 @@ impl ControlWaiter {
                         )
                     };
                     if result == 0 {
-                        break Ok(());
+                        break ControlEnd::ChildExited;
                     }
                     let errno = std::io::Error::last_os_error()
                         .raw_os_error()
                         .unwrap_or(libc::EIO);
                     if errno != libc::EINTR {
-                        break Err(errno);
+                        break ControlEnd::Failed(errno);
+                    }
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break ControlEnd::Cancelled;
                     }
                 }
             })
             .map_err(|error| format!("the control waiter could not be started: {error}"))?;
         Ok(Self {
             child,
+            signal,
+            cancel,
             handle: Some(handle),
         })
     }
@@ -908,25 +1007,30 @@ impl ControlWaiter {
         self.child.pid()
     }
 
-    fn settle(&mut self) -> Result<String, String> {
+    fn join_worker(&mut self) -> Result<String, String> {
         let Some(handle) = self.handle.take() else {
-            return Ok("the control waiter had already been settled".to_owned());
+            return Ok("the control waiter had already been joined".to_owned());
         };
+        match interrupt_until_joined(handle, self.signal, &self.cancel, EXIT_WAIT_BUDGET) {
+            Ok(Ok(end)) => Ok(format!("the control waiter ended with {end:?}")),
+            Ok(Err(_)) => Err("the control waiter panicked".to_owned()),
+            Err((unfinished, reason)) => {
+                self.handle = Some(unfinished);
+                Err(format!(
+                    "the control waiter could not be joined and is still held: {reason}"
+                ))
+            }
+        }
+    }
+
+    fn settle(&mut self) -> Result<String, String> {
+        let worker = self.join_worker();
         let reaped = self.child.settle();
-        let child_settled = reaped.is_ok();
-        let child = reaped.unwrap_or_else(|failure| failure);
-        match join_within(handle, EXIT_WAIT_BUDGET) {
-            Ok(Ok(outcome)) if child_settled => Ok(format!(
-                "the control waiter ended with {outcome:?}; {child}"
-            )),
-            Ok(Ok(outcome)) => Err(format!(
-                "the control waiter ended with {outcome:?}, but {child}"
-            )),
-            Ok(Err(_)) => Err(format!("the control waiter panicked; {child}")),
-            Err(_) => Err(format!(
-                "the control waiter was still in `waitid` after {EXIT_WAIT_BUDGET:?}, so its \
-                 handle is reported rather than joined without a bound; {child}"
-            )),
+        match (worker, reaped) {
+            (Ok(worker), Ok(child)) => Ok(format!("{worker}; {child}")),
+            (Ok(worker), Err(child)) => Err(format!("{worker}, but {child}")),
+            (Err(worker), Ok(child)) => Err(format!("{worker}; {child}")),
+            (Err(worker), Err(child)) => Err(format!("{worker}; and {child}")),
         }
     }
 }
@@ -938,10 +1042,11 @@ impl Drop for ControlWaiter {
             return;
         }
         if let Err(failure) = self.settle() {
-            assert!(
-                std::thread::panicking(),
-                "the control waiter was abandoned and nothing else had failed: {failure}"
-            );
+            if std::thread::panicking() {
+                println!("control waiter cleanup during an unwind: {failure}");
+            } else {
+                panic!("the control waiter was abandoned and nothing else had failed: {failure}");
+            }
         }
     }
 }
@@ -1004,6 +1109,106 @@ fn a_timed_out_exit_wait_leaves_no_thread_of_this_process_waiting_on_the_child()
     wedged
         .settle()
         .expect("settle the child the wait timed out on");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_control_waiter_is_joined_without_its_child_exiting() {
+    let mut control = ControlWaiter::start().expect("start the control waiter");
+    let pid = control.pid();
+    let unsigned = libc::id_t::try_from(pid).expect("the control pid is a Unix wait id");
+
+    let deadline = Instant::now() + EXIT_WAIT_BUDGET;
+    loop {
+        let census = waiters_on(pid).expect("read the waiter census");
+        if !census.waiters.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the control's `waitid` on pid {pid} never became visible: {census}"
+        );
+        thread::sleep(JOIN_PROBE_INTERVAL);
+    }
+
+    let began = Instant::now();
+    let joined = control
+        .join_worker()
+        .expect("EXIT-WAITER-CONTROL-DETACHED-ON-FAILURE: the control waiter must be joinable");
+    let waited = began.elapsed();
+    assert!(
+        joined.contains("Cancelled"),
+        "the worker was joined because it was cancelled, not because its child went away: {joined}"
+    );
+    assert!(
+        waited < EXIT_WAIT_BUDGET,
+        "the join took {waited:?}, which is the budget and not a cancellation: {joined}"
+    );
+    assert!(
+        !exited_unreaped(unsigned).expect("ask whether the child has exited"),
+        "the child was still alive and unexited when its waiter was joined, so nothing about \
+         the child ended that wait"
+    );
+    let after = waiters_on(pid).expect("read the waiter census after the join");
+    assert!(
+        after.waiters.is_empty(),
+        "the worker was joined, so nothing may still be waiting on pid {pid}: {after}"
+    );
+
+    let settled = control
+        .settle()
+        .expect("settle the control after its worker is gone");
+    assert!(settled.contains("already been joined"), "{settled}");
+    assert!(settled.contains("reaped"), "{settled}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwind_through_a_body_that_owns_a_control_leaves_no_waiter_and_no_zombie() {
+    let control = ControlWaiter::start().expect("start the control waiter");
+    let pid = control.pid();
+
+    let deadline = Instant::now() + EXIT_WAIT_BUDGET;
+    loop {
+        let census = waiters_on(pid).expect("read the waiter census");
+        if !census.waiters.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the control's `waitid` on pid {pid} never became visible: {census}"
+        );
+        thread::sleep(JOIN_PROBE_INTERVAL);
+    }
+
+    const DELIBERATE: &str = "the census read this body makes fail while its control is live";
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owned_across_the_unwind = control;
+        panic!("{DELIBERATE}");
+    }));
+    let payload = unwound.expect_err("the body must have left through a panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied());
+    assert_eq!(
+        message,
+        Some(DELIBERATE),
+        "the body left through some other panic, so the cleanup this observes is not the one claimed"
+    );
+
+    let after = waiters_on(pid).expect("read the waiter census after the unwind");
+    assert!(
+        after.waiters.is_empty(),
+        "EXIT-WAITER-CONTROL-DETACHED-ON-FAILURE: the body unwound and left this process still \
+         waiting on pid {pid}: {after}"
+    );
+    let reaped = observe_child_group(pid);
+    assert_eq!(
+        reaped.exited_before,
+        Err(libc::ECHILD),
+        "the control's child outlived the body that owned it as an unreaped zombie: {reaped}"
+    );
 }
 
 #[cfg(target_os = "linux")]
