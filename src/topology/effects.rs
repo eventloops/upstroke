@@ -385,6 +385,15 @@ impl EffectSiteId {
     }
 
     /// Whether this site exposes `point` in `mode`.
+    ///
+    /// Two questions and not three: the point's platform is deliberately not
+    /// one of them. A registry document written on one host is validated on
+    /// the other, so an entry for a Windows containment point is well formed
+    /// everywhere and `RegistryError::NoSuchPoint` must not fire on a
+    /// document that is exactly right. Where the host does decide something
+    /// it decides coverage rather than validity, and that question is asked
+    /// by [`SubEffectPoint::platform`] through [`Platform::required_on`]
+    /// inside [`check_bijection`].
     pub fn exposes(self, point: SubEffectPoint, mode: InjectionMode) -> bool {
         self.sub_effects().contains(&point) && point.supports(mode)
     }
@@ -485,6 +494,15 @@ impl EffectSiteId {
     ///   administrative row to name. "resume action equal to the before-phase
     ///   action".
     /// * *no-execution* — nothing ran.
+    ///
+    /// Total over every `(site, phase)` pair, including the pairs the site
+    /// does not have — a point it does not expose, a class it does not
+    /// register, a no-execution record it may not carry. Those are refused by
+    /// [`validate_entry`], which asks [`Self::exposes`],
+    /// [`Self::registers`] and [`Self::skipped_on_fast_path`] itself; a
+    /// partial table here would be a second place for the same refusal to be
+    /// decided, and the two could disagree. What this function answers is
+    /// what a coordinate *would* leave, not whether the coordinate exists.
     pub fn semantics(self, phase: EntryPhase) -> PhaseSemantics {
         match phase {
             // The recovery is `ResumeUnperformed` for all three
@@ -703,8 +721,12 @@ const_identity_walk! {
 /// compile time.
 ///
 /// `EffectSiteId::all()` is a `Vec` and cannot be one; this is the const half
-/// of the same count, and `the_generated_inventory_describes_every_site_and_invents_none`
-/// asserts the two agree.
+/// of the same count, and
+/// `parent_tests::the_const_inventory_count_is_the_length_of_the_inventory`
+/// asserts the two agree. It named
+/// `the_generated_inventory_describes_every_site_and_invents_none` until
+/// 2026-09-06; that test compares the export's length with `all()`'s and with
+/// the literal seventy, and reads this constant nowhere.
 pub const INVENTORY_SIZE: usize = WorktreeSite::ALL.len()
     + SnapshotSite::ALL.len()
     + RefSite::ALL.len()
@@ -842,6 +864,18 @@ mod parent_tests {
         let error = EffectSiteId::from_name(crossed).expect_err("no group declares that pair");
         assert_eq!(error.name, crossed);
         assert!(error.to_string().contains(crossed), "{error}");
+    }
+
+    #[test]
+    fn the_const_inventory_count_is_the_length_of_the_inventory() {
+        // The two halves of one count. `INVENTORY_SIZE` sums the groups' `ALL`
+        // slices at compile time and `all()` concatenates the same slices at
+        // run time, and each is its own hand-written list of eleven groups: a
+        // group dropped from one of them alone is this assertion failing.
+        assert_eq!(EffectSiteId::all().len(), INVENTORY_SIZE);
+        // The downstream `const` declaration `identity` promises, read as a
+        // value so the promise is a test and not only a compile.
+        assert_eq!(CANDIDATE_COMMIT_TREE_ROW, ResourceRow::R27);
     }
 
     #[test]
