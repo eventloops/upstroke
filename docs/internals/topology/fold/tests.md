@@ -2111,6 +2111,16 @@ derives Halted.
 A resume starts a new epoch without one, and the next breach belongs
 to that epoch rather than the old one.
 
+## `fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_r…` › `accepts(&fold, &breach(12.5, 12.5));`
+
+The producer's own boundary. `Ceiling::breach` stops the run when the
+spend has reached the ceiling, so the equal pair is a breach and the
+pair a cent short of it is not, and the fold refuses the second rather
+than recording a stop the record does not support. The unordered and
+unbounded pairs are the other half: `NaN` compares false against every
+ceiling, so an ordering test alone would accept them, and it is the
+finiteness refusal that names what is wrong with them.
+
 ## `fn a_wait_never_elapses_under_a_halt_or_a_budget_stop()` › `let base = sha("base");`
 
 refusals[18]: halt and budget outrank backoff.

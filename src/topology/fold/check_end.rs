@@ -202,6 +202,26 @@ impl RunState {
         exceeded: &BudgetExceeded4,
     ) -> Result<(), FoldError> {
         const KIND: &str = "budget_exceeded";
+        if !exceeded.limit_usd.is_finite() || !exceeded.spent_usd.is_finite() {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "it records a `{}` ceiling of {} and a spend of {}, and a budget is a finite \
+                     number of dollars",
+                    exceeded.budget, exceeded.limit_usd, exceeded.spent_usd
+                ),
+            });
+        }
+        if exceeded.spent_usd < exceeded.limit_usd {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "it stops the run for a `{}` ceiling of {} that its own recorded spend of {} \
+                     has not reached",
+                    exceeded.budget, exceeded.limit_usd, exceeded.spent_usd
+                ),
+            });
+        }
         if let Some(key) = exceeded.key {
             self.entry(KIND, key)?;
         }

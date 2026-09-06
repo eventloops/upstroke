@@ -6710,6 +6710,54 @@ fn a_budget_stop_belongs_to_the_epoch_that_hit_the_ceiling() {
 }
 
 #[test]
+fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_reached() {
+    let fold = started();
+    let breach = |limit_usd: f64, spent_usd: f64| {
+        ev(TopologyEventBody::BudgetExceeded {
+            data: BudgetExceeded4 {
+                epoch: Epoch(0),
+                budget: BudgetKind::Run,
+                limit_usd,
+                spent_usd,
+                key: Some(ZETA),
+            },
+        })
+    };
+
+    accepts(&fold, &breach(12.5, 13.75));
+    accepts(&fold, &breach(12.5, 12.5));
+
+    let FoldError::InconsistentRecord { kind, detail } = refuse(&fold, &breach(12.5, 12.49)) else {
+        panic!("a stop for a ceiling its own spend has not reached is refused as one");
+    };
+    assert_eq!(kind, "budget_exceeded");
+    assert_eq!(
+        detail,
+        "it stops the run for a `run_usd` ceiling of 12.5 that its own recorded spend of 12.49 \
+         has not reached"
+    );
+
+    for (label, limit_usd, spent_usd) in [
+        ("an unordered spend", 12.5_f64, f64::NAN),
+        ("an unordered ceiling", f64::NAN, 13.75),
+        ("an unbounded ceiling", f64::INFINITY, 13.75),
+        ("an unbounded spend", 12.5, f64::INFINITY),
+    ] {
+        let FoldError::InconsistentRecord { kind, detail } =
+            refuse(&fold, &breach(limit_usd, spent_usd))
+        else {
+            panic!("{label} is refused as an inconsistent record");
+        };
+        assert_eq!(kind, "budget_exceeded");
+        assert!(
+            detail.contains("a budget is a finite number of dollars"),
+            "{label}: {detail}"
+        );
+    }
+}
+
+
+#[test]
 fn a_wait_never_elapses_under_a_halt_or_a_budget_stop() {
     let base = sha("base");
     let elapsed = ev(TopologyEventBody::DeferWaitElapsed {
