@@ -22,6 +22,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::error::UpstrokeError;
 use crate::topology::effects::{ContainerSite, EffectSiteId, HookHarness, HookPhase, Injection};
@@ -200,6 +201,53 @@ impl GitView for DisposableDirView {
 }
 
 pub const RACING_ACCESS_ATTEMPTS: usize = 64;
+
+pub const RACING_YIELD_ATTEMPTS: usize = 16;
+
+pub const RACING_SLEEP: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RacingPause {
+    Yield,
+    Sleep,
+    Done,
+}
+
+fn racing_pause_after(failed: usize) -> RacingPause {
+    if failed >= RACING_ACCESS_ATTEMPTS {
+        RacingPause::Done
+    } else if failed <= RACING_YIELD_ATTEMPTS {
+        RacingPause::Yield
+    } else {
+        RacingPause::Sleep
+    }
+}
+
+fn racing_pause(failed: usize) {
+    let pause = racing_pause_after(failed);
+    note_racing_attempt(failed, pause);
+    match pause {
+        RacingPause::Yield => racing_yield(),
+        RacingPause::Sleep => racing_sleep(RACING_SLEEP),
+        RacingPause::Done => {}
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_racing_attempt(_failed: usize, _pause: RacingPause) {}
+
+#[cfg(not(test))]
+#[inline]
+fn racing_yield() {
+    std::thread::yield_now();
+}
+
+#[cfg(not(test))]
+#[inline]
+fn racing_sleep(duration: Duration) {
+    std::thread::sleep(duration);
+}
 
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -614,7 +662,7 @@ pub fn read_intent(path: &Path) -> Result<ContainerIntent, UpstrokeError> {
 
 fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
     let mut last = None;
-    for _ in 0..RACING_ACCESS_ATTEMPTS {
+    for attempt in 0..RACING_ACCESS_ATTEMPTS {
         match read_intent(path) {
             Ok(record) => return Ok(Some(record)),
             Err(UpstrokeError::Io { source, .. })
@@ -624,7 +672,7 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
             }
             Err(UpstrokeError::Io { source, .. }) => {
                 last = Some(source);
-                std::thread::yield_now();
+                racing_pause(attempt + 1);
             }
             Err(other) => return Err(other),
         }
@@ -777,13 +825,13 @@ fn racing_removal(
     mut remove: impl FnMut() -> Result<(), std::io::Error>,
 ) -> Result<bool, UpstrokeError> {
     let mut last = None;
-    for _ in 0..RACING_ACCESS_ATTEMPTS {
+    for attempt in 0..RACING_ACCESS_ATTEMPTS {
         match remove() {
             Ok(()) => return Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
                 last = Some(error);
-                std::thread::yield_now();
+                racing_pause(attempt + 1);
             }
         }
     }
@@ -1253,3 +1301,23 @@ impl DockerCli {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[inline]
+fn note_racing_attempt(failed: usize, pause: RacingPause) {
+    tests::note_racing_attempt(failed, pause);
+}
+
+#[cfg(test)]
+#[inline]
+fn racing_yield() {
+    tests::note_racing_performed(tests::RacingPerformed::Yielded);
+    std::thread::yield_now();
+}
+
+#[cfg(test)]
+#[inline]
+fn racing_sleep(duration: Duration) {
+    tests::note_racing_performed(tests::RacingPerformed::Slept(duration));
+    std::thread::sleep(duration);
+}

@@ -2025,6 +2025,181 @@ only the parent's permissions move.
 Running as root, or on a filesystem that ignores the mode. Restore
 and say so rather than asserting something that is not true here.
 
+## `pub(super) enum RacingPerformed {`
+
+What the performer asked of the thread: a yield, or a sleep of a stated
+length. Recorded by `super::racing_yield` and `super::racing_sleep`'s
+`#[cfg(test)]` twins before they call std, so a test sees the request the
+production `match` dispatched, not the decision it was handed.
+
+## `pub(super) fn note_racing_performed(performed: RacingPerformed) {`
+
+Append `(after, performed)` to this thread's performed log, where `after` is
+the failure count the last decision was reported for. This is the oracle pass
+3 asked for: the decided schedule says what should follow each failure, and
+this says what the performer actually requested, so a `match` arm that sleeps
+where it should yield, or sleeps after `Done`, is a mismatch here whatever
+the clock says. Four mutations were run natively against it — yield-only, the
+terminal arm removed, the `Done` arm sleeping, the `Yield` arm sleeping — and
+every one fails at `assert_every_pause_was_performed_as_decided`.
+
+## `pub(super) fn note_racing_attempt(failed: usize, pause: RacingPause) {`
+
+The `#[cfg(test)]` half of the decision seam in `super::racing_pause`: append
+`(failed, pause, now)` to this thread's schedule, and run whichever observer
+this thread installed. `try_borrow_mut` so an observer that itself removes
+something is a no-op here rather than a panic inside production code. The
+thread-local logs, the `RacingObservation` guard whose `Drop` uninstalls the
+observer and the `observe_racing_attempts` installer are
+`workspace_manager::fixture`'s shape. The timestamp feeds
+`assert_every_sleep_was_slept`, which is supplementary: the gap between two
+consecutive reports on one thread contains the pause, the next filesystem
+call and any descheduling, so it can only say a sleep was *at least* slept,
+never that the performer was what slept.
+
+## `fn expected_racing_schedule(failures: usize) -> Vec<(usize, RacingPause)> {`
+
+The pause schedule as the contract states it, written as three explicit
+ranges rather than as a copy of `racing_pause_after`: a yield after each of
+the first `RACING_YIELD_ATTEMPTS` failures, a sleep after each failure from
+there to one short of `RACING_ACCESS_ATTEMPTS`, and nothing after the last.
+Truncated to the first `failures` entries for a loser that converged early.
+
+## `fn the_racing_pause_is_sixteen_yields_then_forty_seven_sleeps_and_nothing_after_the_last() {`
+
+The schedule pinned on every platform, against `racing_pause_after` directly:
+the whole sequence, its counts spelled as the numbers 16, 47 and 1 so a
+constant that moves is visible here, that the last entry is `Done`, and that
+anything past the bound is `Done` too. This is the guard for pass 1's finding
+that a sleep ran after the final failure: remove the terminal arm and the
+sixty-fourth entry becomes `Sleep`, which this fails on Linux before any
+Windows run is needed.
+
+What it does not pin is the performer's dispatch; that is
+`assert_every_pause_was_performed_as_decided`'s, through the
+`racing_yield`/`racing_sleep` twins, and it needs no clock.
+
+## `fn windows_posix_delete_pending(path: &Path) -> fs::File {`
+
+Put `path` into the state the loser of a Windows removal race sees while the
+winner is stalled: **delete-pending, name still present**.
+
+std's `remove_dir_all` ends by reopening the root relative to its listing
+handle with `DELETE`, setting `FileDispositionInfoEx` with
+`FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`, and closing that handle;
+`DeleteFileW` does the same three things to a file. The name is unlinked by
+the close, not by the disposition call — measured on the Windows guest against
+a raw replay of exactly that sequence: between the two calls a `CreateFileW`
+of the name answers `ERROR_ACCESS_DENIED`, and the instant the delete handle
+closes it answers `ERROR_FILE_NOT_FOUND`. This helper reproduces the state,
+not the call sequence: one open with `DELETE`, one disposition call, and the
+returned handle *is* the winner's delete handle, so dropping it is the winner
+reaching its close.
+
+The premise is asserted with the same open `remove_dir_all` makes first, not
+with `symlink_metadata`: that one falls back to `FindFirstFileExW`, which
+still lists a delete-pending name and would report the premise met while the
+open that matters had never been tried.
+
+The `unsafe` is one `SetFileInformationByHandle` on a handle this function
+owns, with a fully initialised `FILE_DISPOSITION_INFO_EX` and its size — the
+call's documented contract, and the whole of the SAFETY obligation.
+
+## `fn windows_stalled_removal_budget() -> std::time::Duration {`
+
+How long `racing_removal` sleeps in total before it believes a refusal:
+`RACING_SLEEP` for each failure after `RACING_YIELD_ATTEMPTS` except the last,
+which no attempt follows. Module-scope rather than a number restated in each
+test, for the reason `workspace_manager::ATTEMPTS` gives: the control has to
+reason about the budget in the units that produce it, or a budget cut in half
+passes a test that only asserted "it waited".
+
+## `const WINDOWS_RELEASE_AFTER_FAILURES: usize = super::RACING_YIELD_ATTEMPTS + 4;`
+
+The failed attempt after which the stalled winner closes: past the yields, so
+the loser is in the sleeping part of its budget when the close lands, and far
+enough past them that the release is not on the boundary.
+
+## `fn windows_stall_then_release(pending: fs::File, work: impl FnOnce()) -> Vec<(usize, RacingPause)> {`
+
+Run `work` on this thread as the loser, with the winner's delete handle held
+in `pending` and released **from the loser's own observer** the moment the
+loser reports its `WINDOWS_RELEASE_AFTER_FAILURES`th failure. There is no
+second thread and no clock: the observer runs after that attempt has returned
+and before its pause, so the close is ordered against an attempt by
+construction, the attempt after it finds the name gone, and nothing can be
+preempted into a different order. Pass 2 showed the earlier closer thread had
+two races of its own — a loser that had not yet started, and a closer
+preempted between its timeout and its close — and a detached thread on unwind;
+none of those exist here.
+
+Returns the loser's schedule, after checking that every pause the schedule
+decided was the one the performer requested, and, supplementarily, that
+every sleep with a following attempt was at least slept.
+
+## `fn windows_assert_converged_through_the_wait(tag: &str, schedule: &[(usize, RacingPause)]) {`
+
+The one fact that says the convergence came through the wait: the loser's
+schedule is exactly the expected schedule's first
+`WINDOWS_RELEASE_AFTER_FAILURES` entries — sixteen yields, then sleeps up to
+and including the failure the release followed — so the loser failed until
+the close, on the documented pauses, and the attempt after it converged.
+
+## `fn windows_a_view_whose_remover_stalls_delete_pending_converges_once_the_stall_ends() {`
+
+`PR154-WINDOWS-CENSUS-VIEW-REMOVAL-ACCESS-DENIED`, forced. The census race
+that failed on the Windows CI leg lost sixty-four yields in a fraction of a
+millisecond to a winner that had marked the view delete-pending and not yet
+closed its handle. Here the winner is [`windows_posix_delete_pending`], its
+close is the loser's own twentieth failure, and the loser is the real
+`discard` of both views through the one `racing_removal`.
+
+On the yield-only loop this fails at
+`assert_every_pause_was_performed_as_decided`: the schedule says failures
+17 to 20 are followed by sleeps and the performer requested yields. The
+schedule oracle alone would not see that mutation, because the decision seam
+reports what the loop decided rather than what it did; the performed log is
+what reports the doing. On the repaired loop the discard returns `Ok` on the
+attempt after the release.
+
+Second field held constant: the same empty view the census seeds, the same
+release rule; only which `GitView` discards it moves.
+
+## `fn windows_a_view_held_delete_pending_past_the_budget_refuses_and_keeps_the_intent() {`
+
+The fail-closed half of the same repair, at the reclaim boundary: a view held
+delete-pending through the **whole** budget still refuses, and the refusal
+carries the native error, comes after exactly the schedule, keeps the intent,
+and records no discard.
+
+The things a longer wait could have broken. It must still be bounded, so the
+refusal has to arrive, after exactly the sixty-four-entry schedule ending in
+`Done`, with every pause performed as decided and nothing requested after the
+last, and within ten times the sleep budget —
+generous enough for a starved runner and small enough to catch a loop that
+never returns. It must not arrive early, so the lower time bound is the sleep
+budget itself. And it must not be read as absence: `reclaim` stops at
+`UnmountGitView`, so `RemoveIntent` never runs and the record that names the
+residue survives for the next census — which the second half demonstrates by
+dropping the handle and reclaiming, at which point view and intent both go.
+
+Second field held constant: one launched container, one intent, one view;
+only whether the winner's handle ever closes moves.
+
+## `fn windows_an_intent_whose_remover_stalls_delete_pending_is_read_and_removed_once_the_stall_ends() {`
+
+The same forced stall on the **intent file**, which is the other path the
+census race has refused on: PR #152's run 34001739777 named
+`containers/<name>.intent` with the same os error 5. Both loops that meet it
+are exercised: `read_racing`, through `list_intents`, is the census
+discovering records while another reclaimer is mid-delete, and
+`racing_removal`, through `remove_intent`, is two reclaimers on one record.
+Each gets the release rule above; discovery must answer with the record
+absent rather than refuse, and removal must converge.
+
+Second field held constant: one record, written the same way for both halves;
+only which loop meets the stall moves.
+
 ## `fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {`
 
 ---------------------------------------------------------------------------
