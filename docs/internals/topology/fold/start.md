@@ -41,7 +41,7 @@ before it is stored, not when something tries to climb it.
 Everything after run_started
 -----------------------------------------------------------------------
 
-## `impl TopologyFold` › `if let Some(outcome) = run.finished.clone() {`
+## `impl TopologyFold` › `if let Some(outcome) = run.finished.as_ref() {`
 
 refusals[21]: a Complete or Halted run is finalized and then refused,
 never continued. A Parked or BudgetExceeded run continues, and the

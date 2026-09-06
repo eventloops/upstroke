@@ -52,98 +52,94 @@ impl TopologyFold {
         Ok(registry)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn check_started_run(
         &self,
         run: &RunState,
         event: &TopologyEvent,
         kind: &'static str,
     ) -> Result<TopologyDelta, FoldError> {
-        if let Some(outcome) = run.finished.clone() {
-            match outcome {
-                RunOutcome::Complete | RunOutcome::Halted => {
-                    return Err(FoldError::RunIsOver {
-                        kind,
-                        outcome: outcome_name(&outcome),
-                    });
-                }
+        if let Some(outcome) = run.finished.as_ref() {
+            let continues = match outcome {
+                RunOutcome::Complete | RunOutcome::Halted => false,
                 RunOutcome::Parked | RunOutcome::BudgetExceeded => {
-                    if !matches!(event.body, TopologyEventBody::RunResumed { .. }) {
-                        return Err(FoldError::RunIsOver {
-                            kind,
-                            outcome: outcome_name(&outcome),
-                        });
-                    }
+                    matches!(event.body, TopologyEventBody::RunResumed { .. })
                 }
+            };
+            if !continues {
+                return Err(FoldError::RunIsOver {
+                    kind,
+                    outcome: outcome_name(outcome),
+                });
             }
         }
 
-        match &event.body {
+        let derived = match &event.body {
             TopologyEventBody::RunStarted { .. } => Err(FoldError::AlreadyStarted),
-            TopologyEventBody::RunResumed { data } => run
-                .check_run_resumed(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskSpawned { data } => run
-                .check_task_spawned(&data.spawn)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskDispatched { data } => run
-                .check_dispatched(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptStarted { data } => run
-                .check_attempt_started(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptFinished { data } => run
-                .check_attempt_finished(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptInterrupted { data } => run
-                .check_attempt_interrupted(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::GenerationClosed { data } => run
-                .check_generation_closed(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::DeferWaitElapsed { .. } => run
-                .check_defer_wait_elapsed()
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::CandidatePrepared { data } => run
-                .check_candidate_prepared(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskCandidateCreated { data } => run
-                .check_candidate_created(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergeVerificationStarted { data } => run
-                .check_verification_started(data)
-                .map(|()| self.delta(event, Derived::None)),
+            TopologyEventBody::RunResumed { data } => {
+                run.check_run_resumed(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskSpawned { data } => {
+                run.check_task_spawned(&data.spawn).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskDispatched { data } => {
+                run.check_dispatched(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptStarted { data } => {
+                run.check_attempt_started(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptFinished { data } => {
+                run.check_attempt_finished(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptInterrupted { data } => {
+                run.check_attempt_interrupted(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::GenerationClosed { data } => {
+                run.check_generation_closed(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::DeferWaitElapsed { .. } => {
+                run.check_defer_wait_elapsed().map(|()| Derived::None)
+            }
+            TopologyEventBody::CandidatePrepared { data } => {
+                run.check_candidate_prepared(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskCandidateCreated { data } => {
+                run.check_candidate_created(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::MergeVerificationStarted { data } => {
+                run.check_verification_started(data).map(|()| Derived::None)
+            }
             TopologyEventBody::MergeVerificationUnavailable { data } => run
                 .check_verification_unavailable(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
             TopologyEventBody::MergeVerificationInterrupted { data } => run
                 .check_verification_interrupted(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergePrepared { data } => run
-                .check_merge_prepared(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergeRejected { data } => run
-                .check_merge_rejected(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskMerged { data } => run
-                .check_task_merged(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
+            TopologyEventBody::MergePrepared { data } => {
+                run.check_merge_prepared(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::MergeRejected { data } => {
+                run.check_merge_rejected(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskMerged { data } => {
+                run.check_task_merged(data).map(|()| Derived::None)
+            }
             TopologyEventBody::QuestionRaised { data } => run
                 .check_question_raised(&data.question)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::QuestionAnswered { data } => run
-                .check_question_answered(data)
-                .map(|origin| self.delta(event, Derived::Answer(origin))),
-            TopologyEventBody::BudgetExceeded { data } => run
-                .check_budget_exceeded(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::RunFinished { data } => run
-                .check_run_finished(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
+            TopologyEventBody::QuestionAnswered { data } => {
+                run.check_question_answered(data).map(Derived::Answer)
+            }
+            TopologyEventBody::BudgetExceeded { data } => {
+                run.check_budget_exceeded(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::RunFinished { data } => {
+                run.check_run_finished(data).map(|()| Derived::None)
+            }
             TopologyEventBody::CapacitySnapshot { .. }
             | TopologyEventBody::PoolExhausted { .. }
-            | TopologyEventBody::DesignDefect { .. } => Ok(self.delta(event, Derived::None)),
-        }
+            | TopologyEventBody::DesignDefect { .. } => Ok(Derived::None),
+        };
+        derived.map(|derived| self.delta(event, derived))
     }
 
     pub fn derived_outcome(&self) -> DerivedOutcome {
