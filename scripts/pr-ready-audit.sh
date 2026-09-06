@@ -35,9 +35,10 @@
 #     confined to reviews/findings/ or reviews/FINDINGS.md (MAINTAINING step 5 keeps the review
 #     across both)
 #   - no finding in that review has a severity the lane must fix
-#   - every allowed finding has a ledger row in the body whose disposition is deferred or
-#     accepted-risk (each with exactly one file under reviews/findings/ on the branch whose
-#     `id:` frontmatter is the finding id, since both leave it open) or rejected
+#   - every allowed finding has a ledger row in the body whose disposition is deferred, with
+#     exactly one file under reviews/findings/ on the branch whose `id:` frontmatter is the
+#     finding id; a rejected or accepted-risk row is the owner's call and sends the pull request
+#     to MANUAL
 #
 # Other states: NEEDS-ATTEST (the head moved past the reviewed commit by more than clean merges
 # and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
@@ -168,6 +169,7 @@ for pr in "${prs[@]}"; do
     DIRTY) blockers+=("conflicts") ;;
     UNKNOWN|"") blockers+=("mergeability-unknown") ;;   # GitHub has not computed it yet
     BLOCKED) blockers+=("blocked-by-rules") ;;          # a ruleset requirement is unmet, e.g. an unresolved conversation
+    BEHIND) blockers+=("behind-master") ;;              # reported only while the ruleset requires an up-to-date branch
   esac
 
   # The newest check run per required context on the head: a re-run creates a new run with the
@@ -191,8 +193,91 @@ for pr in "${prs[@]}"; do
     reviewed=""
     verdict=""
   else
+    # The frontier (prose) form: one marker line carries the head, and the last VERDICT line is
+    # the verdict. The workflow (JSON) form is read below by the parser, which hands back the
+    # head and verdict of the same object whose findings it lists, so the three never come from
+    # different parts of one comment.
     reviewed="$(grep -oE '(head=|Reviewed head: )[0-9a-f]{40}' <<< "$review" | head -1 | grep -oE '[0-9a-f]{40}' || true)"
-    verdict="$(grep -oE '("verdict": ?"|VERDICT:\**:? *)[A-Z_]+' <<< "$review" | head -1 | grep -oE '[A-Z_]+$' || true)"
+    verdict="$(grep -oE 'VERDICT:\**:? *[A-Z_]+' <<< "$review" | tail -1 | grep -oE '[A-Z_]+$' || true)"
+  fi
+
+  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" ("-" for no id). The JSON
+  # form is read by a JSON parser, never by regex; without one the audit fails closed. The
+  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and any
+  # severity token anywhere else in the text sends the pull request to MANUAL, PASS included.
+  findings=()
+  if [[ -n "$review" ]]; then
+    # The workflow form is a fenced ```json verdict (or the older bare role_understanding
+    # object); a prose review that merely quotes JSON stays prose.
+    if grep -qE '^```json|"role_understanding"' <<< "$review"; then
+      py="$(command -v python3 || command -v python || true)"
+      if [[ -z "$py" ]]; then
+        blockers+=("findings-unparsed:no-python")
+      else
+        review_file="$(mktemp)"
+        printf '%s' "$review" > "$review_file"
+        while IFS=$'\t' read -r sev id wit; do
+          if [[ "$sev" == META ]]; then
+            reviewed="$id"; verdict="$wit"      # the same object the findings come from
+            continue
+          fi
+          if [[ "$sev" == STRAY ]]; then
+            blockers+=("manual:$id-outside-the-verdict-object")
+            continue
+          fi
+          [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
+        done < <("$py" - "$review_file" <<'PY'
+import json, re, sys
+sys.stdout.reconfigure(newline=chr(10))  # a Windows python writes CRLF to a pipe, and bash would read the CR into the last field
+text = open(sys.argv[1], encoding="utf-8").read()
+# The verdict is the last fenced JSON object; the older bare form has no fence.
+found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
+try:
+    verdict = json.loads(found[-1]) if found else None
+except ValueError:
+    verdict = None
+if not isinstance(verdict, dict) or not isinstance(verdict.get("findings"), list):
+    print("ERR\tunparsed\t0")
+    sys.exit(0)
+# Identity, verdict and findings from this one object. Anything in the comment outside the
+# object that looks like a finding is for a person, not for the parser.
+print("META\t" + str(verdict.get("reviewed_sha", "")).strip() + "\t" + str(verdict.get("verdict", "")).strip())
+outside = text.replace(found[-1], "")
+stray = sorted(set(re.findall(r"\b(?:P[0-3]|MUST)\b", outside)))
+if stray:
+    print("STRAY\t" + "/".join(stray) + "\t0")
+for f in verdict["findings"]:
+    if not isinstance(f, dict):
+        print("ERR\tunparsed\t0")
+        continue
+    sev = str(f.get("severity", "")).strip()
+    fid = str(f.get("id", "")).strip() or "-"
+    def present(v):
+        return v not in (None, False, "", [], {}) and str(v).strip() != ""
+    wit = int(any(present(f.get(k)) for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
+    # A MUST deviation is fixed whatever its label (MAINTAINING step 5): any field of the finding
+    # naming MUST as a word, or a field whose name says mandatory/deviation, marks it.
+    must = 0
+    for k, v in f.items():
+        if re.search(r"(mandatory|deviation|must_)", str(k), re.I) and present(v):
+            must = 1
+        if isinstance(v, str) and re.search(r"\bMUST\b", v):
+            must = 1
+    if not re.fullmatch(r"P[0-3]", sev):
+        print("ERR\tbad-severity:" + fid + "\t0")
+        continue
+    print(sev + "\t" + fid + "\t" + str(wit + 2 * must))
+PY
+)
+        rm -f "$review_file"
+      fi
+    else
+      while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
+      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b|\bMUST\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
+      [[ -n "$stray" ]] && blockers+=("manual:$stray-outside-numbered-findings")
+    fi
+  fi
+  if [[ -n "$review" ]]; then
     case "$verdict" in
       PASS|CHANGES_REQUIRED) ;;
       "") blockers+=("no-verdict") ;;
@@ -200,6 +285,8 @@ for pr in "${prs[@]}"; do
     esac
     [[ "$lane" == findings-p3 && "$verdict" != PASS ]] && blockers+=("verdict-not-pass")
   fi
+  [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
+  [[ "$verdict" == CHANGES_REQUIRED && ${#findings[@]} -eq 0 ]] && blockers+=("findings-unparsed:changes-required-lists-none")
 
   # Head movement since the reviewed commit.
   moved=""
@@ -247,67 +334,6 @@ for pr in "${prs[@]}"; do
     fi
   fi
 
-  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" ("-" for no id). The JSON
-  # form is read by a JSON parser, never by regex; without one the audit fails closed. The
-  # frontier form is prose, read conservatively: numbered "N. **P<n>" findings are taken, and any
-  # severity token anywhere else in the text sends the pull request to MANUAL, PASS included.
-  findings=()
-  if [[ -n "$review" ]]; then
-    if grep -q '"findings"' <<< "$review"; then
-      py="$(command -v python3 || command -v python || true)"
-      if [[ -z "$py" ]]; then
-        blockers+=("findings-unparsed:no-python")
-      else
-        review_file="$(mktemp)"
-        printf '%s' "$review" > "$review_file"
-        while IFS=$'\t' read -r sev id wit; do
-          [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
-        done < <("$py" - "$review_file" <<'PY'
-import json, re, sys
-sys.stdout.reconfigure(newline=chr(10))  # a Windows python writes CRLF to a pipe, and bash would read the CR into the last field
-text = open(sys.argv[1], encoding="utf-8").read()
-# The verdict is the last fenced JSON object; the older bare form has no fence.
-found = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S) or re.findall(r"(\{\"role_understanding.*\})", text, re.S)
-try:
-    verdict = json.loads(found[-1]) if found else None
-except ValueError:
-    verdict = None
-if not isinstance(verdict, dict) or not isinstance(verdict.get("findings"), list):
-    print("ERR\tunparsed\t0")
-    sys.exit(0)
-for f in verdict["findings"]:
-    if not isinstance(f, dict):
-        print("ERR\tunparsed\t0")
-        continue
-    sev = str(f.get("severity", "")).strip()
-    fid = str(f.get("id", "")).strip() or "-"
-    def present(v):
-        return v not in (None, False, "", [], {}) and str(v).strip() != ""
-    wit = int(any(present(f.get(k)) for k in ("witness", "reproduction", "repro", "failing_test", "mutation", "mutation_witness")))
-    # A MUST deviation is fixed whatever its label (MAINTAINING step 5): any field of the finding
-    # naming MUST as a word, or a field whose name says mandatory/deviation, marks it.
-    must = 0
-    for k, v in f.items():
-        if re.search(r"(mandatory|deviation|must_)", str(k), re.I) and present(v):
-            must = 1
-        if isinstance(v, str) and re.search(r"\bMUST\b", v):
-            must = 1
-    if not re.fullmatch(r"P[0-3]", sev):
-        print("ERR\tbad-severity:" + fid + "\t0")
-        continue
-    print(sev + "\t" + fid + "\t" + str(wit + 2 * must))
-PY
-)
-        rm -f "$review_file"
-      fi
-    else
-      while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
-      stray="$(grep -vE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE '\bP[0-3]\b|\bMUST\b' | sort -u | tr '\n' '/' | sed 's#/$##' || true)"
-      [[ -n "$stray" ]] && blockers+=("manual:$stray-outside-numbered-findings")
-    fi
-  fi
-  [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
-  [[ "$verdict" == CHANGES_REQUIRED && ${#findings[@]} -eq 0 ]] && blockers+=("findings-unparsed:changes-required-lists-none")
 
   rows="$(ledger_rows "$pr")"
   for f in "${findings[@]}"; do
@@ -336,7 +362,7 @@ PY
     fi
     disposition="$(awk -F'\t' -v id="$id" '$1 == id { print $4; exit }' <<< "$rows")"
     case "$disposition" in
-      deferred|accepted-risk)   # both leave the finding open, and an open finding has its file
+      deferred)   # the lane rule: an allowed finding is filed and deferred, one file per finding
         # The file is the one with a frontmatter line that is exactly `id: <this id>` (README:
         # the id lives in the frontmatter, not the name); an id merely mentioned elsewhere is not
         # a file. The id is matched as a fixed string and a whole line, never as a pattern, and a
@@ -350,7 +376,7 @@ PY
           0) blockers+=("no-file:$id") ;;
           *) blockers+=("duplicate-file:$id") ;;
         esac ;;
-      rejected) ;;
+      rejected|accepted-risk) blockers+=("manual:disposition-$disposition:$id") ;;   # the owner's call, not the audit's
       fixed)
         [[ "$moved" == repairs || "$moved" == merge-edits:* ]] || blockers+=("fixed-but-head-unmoved:$id") ;;
       "") blockers+=("no-row:$id") ;;
