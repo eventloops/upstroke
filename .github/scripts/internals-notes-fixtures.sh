@@ -193,8 +193,12 @@ printf '[Source][mod]\n\n    code line\n[mod]: %s\n' "$link" > "$tree/$notes"
 check 0 definition_after_an_indented_code_block_resolves
 
 fixture capacity
-printf '[Source][mod]\n\n[mod]:\n\n[mod]: %s\n' "$link" > "$tree/$notes"
-check 0 a_definition_whose_destination_wraps_is_not_read
+printf '[Source][mod]\n# Heading\n[mod]: %s\n' "$link" > "$tree/$notes"
+check 0 an_atx_heading_ends_the_paragraph_before_a_definition
+
+fixture capacity
+printf '[Source][mod]\n<!-- c -->\n[mod]: %s\n' "$link" > "$tree/$notes"
+check 0 an_html_comment_block_ends_the_paragraph_before_a_definition
 
 # A reference resolves only against a definition a reader's renderer would
 # also see. Code, comments, containers and paragraph text supply none, and a
@@ -247,5 +251,52 @@ done
 fixture capacity
 printf '[mod]: %s\n\n[mod]: %s\n' "$link" "$link" > "$tree/$notes"
 check 1 a_definition_cannot_open_the_file
+
+# Only the first claim on a label decides, so a definition the renderer reads
+# and this parser does not must refuse the label, never defer to a later one.
+
+for context in wrapped_definition quoted_definition_shadow listed_definition_shadow; do
+  fixture capacity
+  case "$context" in
+    wrapped_definition)        printf '[Source][mod]\n\n[mod]:\n  ../../src/missing.rs\n\n[mod]: %s\n' "$link" ;;
+    quoted_definition_shadow)  printf '[Source][mod]\n\n> [mod]: ../../src/missing.rs\n\n[mod]: %s\n' "$link" ;;
+    listed_definition_shadow)  printf '[Source][mod]\n\n- [mod]: ../../src/missing.rs\n\n[mod]: %s\n' "$link" ;;
+  esac > "$tree/$notes"
+  check 1 "${context}_refuses_its_label"
+done
+
+fixture capacity
+printf '[Source][mod]\n\n[mod]:\n\n[mod]: %s\n' "$link" > "$tree/$notes"
+check 1 a_wrapped_definition_refuses_its_label
+
+# Paragraph text is not a block boundary. An inline comment and a bare hash
+# leave the paragraph open, so what follows is continuation, not a definition.
+
+for context in inline_comment_in_prose hash_without_a_space seventh_level_hashes; do
+  fixture capacity
+  case "$context" in
+    inline_comment_in_prose) printf '[Source][mod]\nprose <!--x-->\n[mod]: %s\n' "$link" ;;
+    hash_without_a_space)    printf '[Source][mod]\n#not a heading\n[mod]: %s\n' "$link" ;;
+    seventh_level_hashes)    printf '[Source][mod]\n####### not a heading\n[mod]: %s\n' "$link" ;;
+  esac > "$tree/$notes"
+  check 1 "${context}_does_not_end_the_paragraph"
+done
+
+fixture capacity
+printf '[Source][mod]\n\n<script>\n\n[mod]: %s\n</script>\n' "$link" > "$tree/$notes"
+check 1 a_raw_html_block_supplies_no_definition
+
+# A title is separated from its destination by whitespace, and parentheses
+# straight after a bare destination belong to the destination.
+
+for context in angle_destination_then_title bare_destination_with_parentheses definition_destination_then_title; do
+  fixture capacity
+  case "$context" in
+    angle_destination_then_title)     printf '[Source](<%s>"the module")\n' "$link" ;;
+    bare_destination_with_parentheses) printf '[Source](%s(the module))\n' "$link" ;;
+    definition_destination_then_title) printf '[Source][mod]\n\n[mod]: <%s>"the module"\n' "$link" ;;
+  esac > "$tree/$notes"
+  check 1 "${context}_is_not_a_backlink"
+done
 
 echo "internals notes fixtures: $cases cases passed"

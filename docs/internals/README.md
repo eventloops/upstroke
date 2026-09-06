@@ -62,9 +62,13 @@ Extended notes for [`src/runner/host.rs`][host].
 
 A definition counts only where a renderer would also read it: at block level,
 after the opening paragraph rather than above it, and outside fenced and
-indented code, HTML comments, blockquotes, lists and paragraph text. A
-construct spelled outside what the gate reads is reported as a missing
-backlink; nothing passes unchecked.
+indented code, HTML comments, raw HTML blocks and paragraph text. Only the
+first claim on a label decides, as it does for a reader: a definition the gate
+cannot read -- one inside a blockquote or a list, or with its destination
+wrapped onto the next line -- refuses that label rather than letting a later
+definition stand in for it. A title is separated from its destination by
+whitespace. A construct spelled outside what the gate reads is reported as a
+missing backlink; nothing passes unchecked.
 
 The repository-relative link works in a checkout and on GitHub. A separate
 `Source on GitHub` link points to the module's GitHub page for readers on
