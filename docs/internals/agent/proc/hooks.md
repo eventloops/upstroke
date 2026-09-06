@@ -81,11 +81,28 @@ What production passes: nothing is armed and nothing is recorded.
 
 Do what a hook answered.
 
-[`Injection::Kill`] aborts. Not `panic!` and not `std::process::exit`:
-the whole claim under test is that a coordinator which dies **without
-running any cleanup** still leaves no host process, and both of those run
-destructors — including the one that closes the very job handle whose
-close-on-death is the mechanism.
+[`Injection::Kill`] aborts. Not `panic!` and not `std::process::exit`: the
+whole claim under test is that a coordinator which dies **without running
+any cleanup** still leaves no host process, and the three deaths differ in
+exactly the cleanup they run.
+
+`panic!` unwinds. The panicking thread's stack destructors run — including
+the one that closes the very job handle whose close-on-death is the
+mechanism — so the coordinator would be dismantling its own containment on
+the way out, which is the opposite of the death being modelled.
+
+`std::process::exit` runs **no** stack destructors, on its own stack or on
+any other thread's; an earlier wording here said that it ran them, and that
+was wrong. It is still not this death, because it is the *orderly* exit: it
+hands the code to the platform's normal shutdown, which runs the
+process-exit handlers registered with it (`atexit` on a glibc target).
+Registered handlers are cleanup, and which of them a given platform runs is
+not something this claim should have to depend on.
+
+`std::process::abort` runs neither. Termination is abrupt: no clean-up is
+performed and no destructors run, so whatever becomes of the child after it
+is the operating system's doing and not ours — which is exactly what the
+containment claim asserts.
 
 ## `fn apply_io`
 
