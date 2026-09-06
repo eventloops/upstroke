@@ -37,6 +37,20 @@ one that authority froze at that index.
 
 --- budget_exceeded ---------------------------------------------------
 
+## `pub(super) fn check_budget_exceeded(` › `if !exceeded.limit_usd.is_finite() || !exceeded.spent_usd.is_finite() {`
+
+A record that denies its own breach is refused before it is measured
+against the fold. `DESIGN.md` §17 refuses "a budget ceiling that is not
+a positive finite number of dollars" at load, and the one producer of
+this event -- `Ceiling::breach` in `src/engine/topology/select.rs` --
+emits it exactly when the recorded spend has reached the recorded
+ceiling. So numbers that cannot be ordered, or a spend that has not
+reached the ceiling it is stopping the run for, are a record no run
+wrote. The fold keeps neither amount -- `budget_stop` carries the epoch
+and the budget kind alone -- so this is the only point at which the two
+are read at all, and a stop recorded here is a stop the log has to
+justify with its own numbers.
+
 ## `impl RunState` › `pub(super) fn check_run_finished(&self, finished: &RunFinished4) -> Result<(), FoldError>…`
 
 --- run_finished ------------------------------------------------------

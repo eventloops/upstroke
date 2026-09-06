@@ -30,7 +30,7 @@ use crate::topology::events::{
     UnavailableOutcome, VerificationBasis, VerificationSource, VerificationVerdict,
 };
 use crate::topology::leases::{GenerationLease, LeaseOwner, LeaseTable};
-use crate::topology::paths::{GitPath, PathSet};
+use crate::topology::paths::{GitPath, PathPolicyVersion, PathSet};
 use crate::topology::queue::{CandidateQueue, Ineligible, QueueEntry};
 use crate::topology::registry::{Admission, FrozenLadder, TaskEntry, TaskKey, TaskRegistry};
 
@@ -56,6 +56,14 @@ pub enum FoldError {
 
     #[error("the run's runner record is unusable: {defect}")]
     IncompleteRunner { defect: String },
+
+    #[error(
+        "this `run_started` records `{limit} = {value}`; a run whose entitlement admits no work \
+         can neither dispatch nor end, and the limits this event freezes are what every later \
+         event is folded against, so the limit is refused here rather than at the first task \
+         that cannot be started"
+    )]
+    UnusableLimit { limit: &'static str, value: u32 },
 
     #[error(
         "this incarnation established a different runner from the one the run started with: the \
@@ -535,16 +543,16 @@ impl TopologyFold {
 
     pub fn apply_delta(&mut self, delta: TopologyDelta) {
         let TopologyDelta { event, derived } = delta;
-        if let (TopologyEventBody::RunStarted { data }, Derived::Registry(registry)) =
-            (&event.body, &derived)
-        {
-            self.run = Some(RunState::start(data.clone(), (**registry).clone()));
-            return;
+        match (event.body, derived) {
+            (TopologyEventBody::RunStarted { data }, Derived::Registry(registry)) => {
+                self.run = Some(RunState::start(data, *registry));
+            }
+            (body, derived) => {
+                if let Some(run) = self.run.as_mut() {
+                    run.apply(&body, &derived);
+                }
+            }
         }
-        let Some(run) = self.run.as_mut() else {
-            return;
-        };
-        run.apply(&event.body, &derived);
     }
 
     fn delta(&self, event: &TopologyEvent, derived: Derived) -> TopologyDelta {
@@ -639,19 +647,642 @@ fn predicted_region(entry: &TaskEntry) -> PathSet {
     }
     let mut paths = Vec::with_capacity(entry.spec.path_hints.len());
     for hint in &entry.spec.path_hints {
-        let literal: String = hint
-            .replace('\\', "/")
-            .chars()
-            .take_while(|character| !matches!(character, '*' | '?' | '[' | '{'))
-            .collect();
-        let trimmed = literal.trim_end_matches('/');
-        if trimmed.is_empty() {
+        let Some(prefix) = hint_prefix(hint) else {
             return PathSet::RepoWide;
-        }
-        paths.push(GitPath(trimmed.to_owned()));
+        };
+        paths.push(prefix);
     }
     PathSet::Prefixes { paths }
 }
 
+fn hint_prefix(hint: &str) -> Option<GitPath> {
+    const METACHARACTERS: [char; 4] = ['*', '?', '[', '{'];
+    if hint.contains('\\') {
+        return None;
+    }
+    let mut prefix = String::with_capacity(hint.len());
+    for (position, component) in hint
+        .split('/')
+        .take_while(|component| !component.contains(METACHARACTERS))
+        .enumerate()
+    {
+        if matches!(component, "." | "..") {
+            return None;
+        }
+        if position > 0 {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+    }
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(GitPath(trimmed.to_owned()))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+    use crate::topology::leases::paths_overlap;
+    use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
+
+    fn policy() -> PathPolicy {
+        PathPolicy {
+            version: PathPolicyVersion::V2,
+            case_fold: false,
+            grammar: PathGrammar::Globset,
+        }
+    }
+
+    fn generation(id: u32, class: GenerationClass) -> GenerationFold {
+        GenerationFold {
+            id: GenerationId(id),
+            class,
+            base_sha: CommitSha(format!("base-{id}")),
+            lease: GenerationLease::Own,
+            attempts: 0,
+            candidate: None,
+        }
+    }
+
+    fn variant_name(error: &FoldError) -> &'static str {
+        match error {
+            FoldError::NotStarted { .. } => "NotStarted",
+            FoldError::AlreadyStarted => "AlreadyStarted",
+            FoldError::NotTopologySchema { .. } => "NotTopologySchema",
+            FoldError::IncompleteRunner { .. } => "IncompleteRunner",
+            FoldError::UnusableLimit { .. } => "UnusableLimit",
+            FoldError::RunnerMoved { .. } => "RunnerMoved",
+            FoldError::DigestMismatch { .. } => "DigestMismatch",
+            FoldError::RegistryUnbuildable { .. } => "RegistryUnbuildable",
+            FoldError::MalformedLadder { .. } => "MalformedLadder",
+            FoldError::UnknownKey { .. } => "UnknownKey",
+            FoldError::NonDenseKey { .. } => "NonDenseKey",
+            FoldError::MalformedEntry { .. } => "MalformedEntry",
+            FoldError::WrongTaskState { .. } => "WrongTaskState",
+            FoldError::NotTheOpenGeneration { .. } => "NotTheOpenGeneration",
+            FoldError::WrongAttempt { .. } => "WrongAttempt",
+            FoldError::WrongRung { .. } => "WrongRung",
+            FoldError::StaleIncarnation { .. } => "StaleIncarnation",
+            FoldError::BindingMismatch { .. } => "BindingMismatch",
+            FoldError::InvalidLeaseDisposition { .. } => "InvalidLeaseDisposition",
+            FoldError::NonDenseSequence { .. } => "NonDenseSequence",
+            FoldError::WrongSequence { .. } => "WrongSequence",
+            FoldError::TransactionAlreadyOpen { .. } => "TransactionAlreadyOpen",
+            FoldError::NotFirstEligible { .. } => "NotFirstEligible",
+            FoldError::InconsistentRecord { .. } => "InconsistentRecord",
+            FoldError::InvalidSatisfies { .. } => "InvalidSatisfies",
+            FoldError::InvalidDefers { .. } => "InvalidDefers",
+            FoldError::UnanswerableQuestion { .. } => "UnanswerableQuestion",
+            FoldError::WrongQuestion { .. } => "WrongQuestion",
+            FoldError::RunEnding { .. } => "RunEnding",
+            FoldError::RunIsOver { .. } => "RunIsOver",
+            FoldError::OutcomeMismatch { .. } => "OutcomeMismatch",
+            FoldError::Poisoned => "Poisoned",
+            FoldError::RewrittenLog { .. } => "RewrittenLog",
+        }
+    }
+
+    fn refusals() -> Vec<(FoldError, Vec<String>)> {
+        vec![
+            (
+                FoldError::NotStarted { kind: "kind-01" },
+                vec!["kind-01".to_owned()],
+            ),
+            (FoldError::AlreadyStarted, Vec::new()),
+            (
+                FoldError::NotTopologySchema { schema: 902 },
+                vec!["902".to_owned()],
+            ),
+            (
+                FoldError::IncompleteRunner {
+                    defect: "defect-03".to_owned(),
+                },
+                vec!["defect-03".to_owned()],
+            ),
+            (
+                FoldError::UnusableLimit {
+                    limit: "limit-32",
+                    value: 932,
+                },
+                vec!["limit-32".to_owned(), "932".to_owned()],
+            ),
+            (
+                FoldError::RunnerMoved {
+                    field: "field-04".to_owned(),
+                },
+                vec!["field-04".to_owned()],
+            ),
+            (
+                FoldError::DigestMismatch {
+                    what: "what-05",
+                    recorded: "recorded-05".to_owned(),
+                    actual: "actual-05".to_owned(),
+                },
+                vec![
+                    "what-05".to_owned(),
+                    "recorded-05".to_owned(),
+                    "actual-05".to_owned(),
+                ],
+            ),
+            (
+                FoldError::RegistryUnbuildable {
+                    detail: "detail-06".to_owned(),
+                },
+                vec!["detail-06".to_owned()],
+            ),
+            (
+                FoldError::MalformedLadder {
+                    key: 907,
+                    defect: "defect-07".to_owned(),
+                },
+                vec!["907".to_owned(), "defect-07".to_owned()],
+            ),
+            (
+                FoldError::UnknownKey {
+                    kind: "kind-08",
+                    key: 908,
+                },
+                vec!["kind-08".to_owned(), "908".to_owned()],
+            ),
+            (
+                FoldError::NonDenseKey {
+                    kind: "kind-09",
+                    key: 909,
+                    len: 709,
+                },
+                vec!["kind-09".to_owned(), "909".to_owned(), "709".to_owned()],
+            ),
+            (
+                FoldError::MalformedEntry {
+                    kind: "kind-10",
+                    key: 910,
+                    detail: "detail-10".to_owned(),
+                },
+                vec![
+                    "kind-10".to_owned(),
+                    "910".to_owned(),
+                    "detail-10".to_owned(),
+                ],
+            ),
+            (
+                FoldError::WrongTaskState {
+                    kind: "kind-11",
+                    key: 911,
+                    state: "state-11",
+                    expected: "expected-11",
+                },
+                vec![
+                    "kind-11".to_owned(),
+                    "911".to_owned(),
+                    "state-11".to_owned(),
+                    "expected-11".to_owned(),
+                ],
+            ),
+            (
+                FoldError::NotTheOpenGeneration {
+                    kind: "kind-12",
+                    key: 912,
+                    generation: 712,
+                    detail: "detail-12".to_owned(),
+                },
+                vec![
+                    "kind-12".to_owned(),
+                    "912".to_owned(),
+                    "712".to_owned(),
+                    "detail-12".to_owned(),
+                ],
+            ),
+            (
+                FoldError::WrongAttempt {
+                    kind: "kind-13",
+                    key: 913,
+                    generation: 713,
+                    attempt: 513,
+                    expected: "expected-13".to_owned(),
+                },
+                vec![
+                    "kind-13".to_owned(),
+                    "913".to_owned(),
+                    "713".to_owned(),
+                    "513".to_owned(),
+                    "expected-13".to_owned(),
+                ],
+            ),
+            (
+                FoldError::WrongRung {
+                    kind: "kind-14",
+                    key: 914,
+                    attempt: 714,
+                    rung: 514,
+                    detail: "detail-14".to_owned(),
+                },
+                vec![
+                    "kind-14".to_owned(),
+                    "914".to_owned(),
+                    "714".to_owned(),
+                    "514".to_owned(),
+                    "detail-14".to_owned(),
+                ],
+            ),
+            (
+                FoldError::StaleIncarnation {
+                    key: 915,
+                    attempt: 715,
+                    detail: "detail-15".to_owned(),
+                },
+                vec!["915".to_owned(), "715".to_owned(), "detail-15".to_owned()],
+            ),
+            (
+                FoldError::BindingMismatch {
+                    key: 916,
+                    attempt: 716,
+                    detail: "detail-16".to_owned(),
+                },
+                vec!["916".to_owned(), "716".to_owned(), "detail-16".to_owned()],
+            ),
+            (
+                FoldError::InvalidLeaseDisposition {
+                    kind: "kind-17",
+                    key: 917,
+                    recorded: "recorded-17".to_owned(),
+                    owner: "owner-17",
+                    fate: "fate-17",
+                    expected: "expected-17".to_owned(),
+                },
+                vec![
+                    "kind-17".to_owned(),
+                    "917".to_owned(),
+                    "recorded-17".to_owned(),
+                    "owner-17".to_owned(),
+                    "fate-17".to_owned(),
+                    "expected-17".to_owned(),
+                ],
+            ),
+            (
+                FoldError::NonDenseSequence {
+                    kind: "kind-18",
+                    sequence: 918,
+                    next: 718,
+                },
+                vec!["kind-18".to_owned(), "918".to_owned(), "718".to_owned()],
+            ),
+            (
+                FoldError::WrongSequence {
+                    kind: "kind-19",
+                    sequence: 919,
+                    open: "open-19".to_owned(),
+                },
+                vec!["kind-19".to_owned(), "919".to_owned(), "open-19".to_owned()],
+            ),
+            (
+                FoldError::TransactionAlreadyOpen {
+                    kind: "kind-20",
+                    sequence: 920,
+                    open: 720,
+                },
+                vec!["kind-20".to_owned(), "920".to_owned(), "720".to_owned()],
+            ),
+            (
+                FoldError::NotFirstEligible {
+                    kind: "kind-21",
+                    key: 921,
+                    generation: 721,
+                    detail: "detail-21".to_owned(),
+                },
+                vec![
+                    "kind-21".to_owned(),
+                    "921".to_owned(),
+                    "721".to_owned(),
+                    "detail-21".to_owned(),
+                ],
+            ),
+            (
+                FoldError::InconsistentRecord {
+                    kind: "kind-22",
+                    detail: "detail-22".to_owned(),
+                },
+                vec!["kind-22".to_owned(), "detail-22".to_owned()],
+            ),
+            (
+                FoldError::InvalidSatisfies {
+                    kind: "kind-23",
+                    recorded: vec![923],
+                    derived: vec![723],
+                },
+                vec!["kind-23".to_owned(), "923".to_owned(), "723".to_owned()],
+            ),
+            (
+                FoldError::InvalidDefers {
+                    defers: 924,
+                    detail: "detail-24".to_owned(),
+                },
+                vec!["924".to_owned(), "detail-24".to_owned()],
+            ),
+            (
+                FoldError::UnanswerableQuestion {
+                    kind: "kind-25",
+                    detail: "detail-25".to_owned(),
+                },
+                vec!["kind-25".to_owned(), "detail-25".to_owned()],
+            ),
+            (
+                FoldError::WrongQuestion {
+                    kind: "kind-26",
+                    question: "question-26".to_owned(),
+                    detail: "detail-26".to_owned(),
+                },
+                vec![
+                    "kind-26".to_owned(),
+                    "question-26".to_owned(),
+                    "detail-26".to_owned(),
+                ],
+            ),
+            (
+                FoldError::RunEnding {
+                    kind: "kind-27",
+                    what: "what-27",
+                },
+                vec!["kind-27".to_owned(), "what-27".to_owned()],
+            ),
+            (
+                FoldError::RunIsOver {
+                    kind: "kind-28",
+                    outcome: "outcome-28",
+                },
+                vec!["kind-28".to_owned(), "outcome-28".to_owned()],
+            ),
+            (
+                FoldError::OutcomeMismatch {
+                    recorded: "recorded-29",
+                    derived: "derived-29".to_owned(),
+                },
+                vec!["recorded-29".to_owned(), "derived-29".to_owned()],
+            ),
+            (FoldError::Poisoned, Vec::new()),
+            (
+                FoldError::RewrittenLog {
+                    line: 931,
+                    detail: "detail-31".to_owned(),
+                },
+                vec!["931".to_owned(), "detail-31".to_owned()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_refusal_names_the_record_it_refused_and_the_value_it_disagreed_with() {
+        let refusals = refusals();
+        assert_eq!(
+            refusals.len(),
+            33,
+            "the sample list is one refusal per `FoldError` variant; `variant_name` is exhaustive, \
+             so a new variant cannot compile without an arm there and a sample here"
+        );
+        let named: BTreeSet<&'static str> = refusals
+            .iter()
+            .map(|(error, _)| variant_name(error))
+            .collect();
+        assert_eq!(
+            named.len(),
+            refusals.len(),
+            "two samples name one variant, so some variant is unmeasured"
+        );
+
+        let mut rendered: BTreeSet<String> = BTreeSet::new();
+        for (error, fields) in &refusals {
+            let message = error.to_string();
+            assert!(
+                !message.is_empty(),
+                "{} renders nothing",
+                variant_name(error)
+            );
+            for field in fields {
+                assert!(
+                    message.contains(field.as_str()),
+                    "{} drops `{field}` from its message: {message}",
+                    variant_name(error)
+                );
+            }
+            assert!(
+                rendered.insert(message.clone()),
+                "{} reports what another refusal reports: {message}",
+                variant_name(error)
+            );
+        }
+    }
+
+    #[test]
+    fn a_hint_with_no_metacharacter_is_its_own_prefix_and_a_glob_cuts_whole_components() {
+        let cases: [(&str, Option<&str>); 26] = [
+            ("src/literal", Some("src/literal")),
+            ("build.rs", Some("build.rs")),
+            ("src/trailing/", Some("src/trailing")),
+            ("src/star/*.rs", Some("src/star")),
+            ("src/question/?.rs", Some("src/question")),
+            ("src/bracket/[ab].rs", Some("src/bracket")),
+            ("src/brace/{a,b}.rs", Some("src/brace")),
+            (r"src\backslash\deep", None),
+            ("src/doubled//inner/", Some("src/doubled//inner")),
+            ("src/\u{dc}ber/", Some("src/\u{dc}ber")),
+            ("src/star*.rs", Some("src")),
+            ("src/eng*", Some("src")),
+            ("src/a*/b", Some("src")),
+            ("src/deep/mod.rs*", Some("src/deep")),
+            (r"src\deep\mod.rs*", None),
+            (r"src/foo\?bar.rs", None),
+            (r"src/foo\*", None),
+            ("**/anywhere.rs", None),
+            ("*.rs", None),
+            ("star*.rs", None),
+            ("{a,b}/c", None),
+            ("", None),
+            ("/", None),
+            ("src/./alpha", None),
+            ("src/../src/alpha", None),
+            ("./src/alpha", None),
+        ];
+        for (hint, expected) in cases {
+            assert_eq!(
+                hint_prefix(hint).as_ref().map(GitPath::as_str),
+                expected,
+                "`{hint}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_prefix_overlaps_every_path_its_hint_can_match() {
+        let policy = policy();
+        let covered: [(&str, &str); 5] = [
+            ("src/eng*", "src/engine/mod.rs"),
+            ("src/star*.rs", "src/starship.rs"),
+            ("src/a*/b", "src/alpha/b"),
+            ("src/deep/mod.rs*", "src/deep/mod.rs.bak"),
+            ("src/star/*.rs", "src/star/one.rs"),
+        ];
+        for (hint, matched) in covered {
+            let prefix = hint_prefix(hint).expect("the hint bounds a region");
+            assert!(
+                paths_overlap(&prefix, &GitPath::from(matched), &policy),
+                "`{hint}` derives `{prefix}`, which does not overlap `{matched}` it matches"
+            );
+        }
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/eng"),
+                &GitPath::from("src/engine/mod.rs"),
+                &policy
+            ),
+            "the comparator is component-wise; a prefix cut inside a component is not an ancestor"
+        );
+    }
+
+    #[test]
+    fn a_hint_carrying_a_backslash_bounds_nothing_because_the_character_has_two_readings() {
+        let policy = policy();
+        for hint in [
+            r"src/foo\?bar.rs",
+            r"src\backslash\deep",
+            r"src\deep\mod.rs*",
+        ] {
+            assert!(hint_prefix(hint).is_none(), "`{hint}` was kept as a prefix");
+        }
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/foo"),
+                &GitPath::from("src/foo?bar.rs"),
+                &policy
+            ),
+            "the escape reading's prefix does not overlap the one file that reading matches"
+        );
+        assert!(
+            !paths_overlap(
+                &GitPath::from("src/foo/?bar.rs"),
+                &GitPath::from("src/foo?bar.rs"),
+                &policy
+            ),
+            "and the separator reading names a different region again"
+        );
+        assert_eq!(
+            hint_prefix("src/foo").as_ref().map(GitPath::as_str),
+            Some("src/foo"),
+            "the guard refuses backslashes, not every hint"
+        );
+    }
+
+    #[test]
+    fn a_hint_whose_prefix_has_a_dot_component_bounds_nothing_it_can_be_compared_against() {
+        let policy = policy();
+        for spelling in ["src/./alpha", "src/../src/alpha", "./src/alpha", "../alpha"] {
+            assert!(
+                hint_prefix(spelling).is_none(),
+                "`{spelling}` was kept as a prefix"
+            );
+            assert!(
+                !paths_overlap(
+                    &GitPath::from(spelling),
+                    &GitPath::from("src/alpha"),
+                    &policy
+                ),
+                "`{spelling}` would have been a second spelling the comparator does not match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_state_and_a_generation_class_each_name_themselves_distinctly() {
+        let states = [
+            (TaskState::Pending, "pending", false),
+            (TaskState::AwaitingMerge, "awaiting merge", false),
+            (TaskState::AwaitingRepair, "awaiting repair", false),
+            (TaskState::AwaitingInput, "awaiting input", false),
+            (TaskState::Deferred, "deferred", false),
+            (TaskState::Merged, "merged", true),
+            (TaskState::Failed, "failed", true),
+        ];
+        let mut names: BTreeSet<&'static str> = BTreeSet::new();
+        for (state, name, terminal) in states {
+            assert_eq!(state.name(), name, "{state:?}");
+            assert_eq!(state.is_terminal(), terminal, "{state:?}");
+            assert!(names.insert(name), "`{name}` names two states");
+        }
+        assert_eq!(names.len(), 7);
+
+        let classes = [
+            (GenerationClass::OpenNoAttempt, "open with no attempt", true),
+            (
+                GenerationClass::InFlight {
+                    attempt: AttemptNumber(1),
+                },
+                "in flight",
+                true,
+            ),
+            (
+                GenerationClass::RetainedIdle {
+                    session: SessionId("s".to_owned()),
+                    incarnation: Epoch(0),
+                },
+                "retained idle",
+                false,
+            ),
+            (GenerationClass::Promoting, "promoting", true),
+            (GenerationClass::Closed, "closed", false),
+        ];
+        let mut class_names: BTreeSet<&'static str> = BTreeSet::new();
+        for (class, name, holds) in classes {
+            assert_eq!(class.name(), name, "{class:?}");
+            assert_eq!(class.holds_pipeline(), holds, "{class:?}");
+            assert_eq!(
+                class.blocks_run_end(),
+                class != GenerationClass::Closed,
+                "{class:?}"
+            );
+            assert!(class_names.insert(name), "`{name}` names two classes");
+        }
+        assert_eq!(class_names.len(), 5);
+    }
+
+    #[test]
+    fn a_tasks_open_generation_is_the_one_that_is_not_closed() {
+        let mut task = TaskFold::new();
+        assert_eq!(task.state, TaskState::Pending);
+        assert_eq!(task.defers, 0);
+        assert_eq!(task.rung, 0);
+        assert_eq!(task.attempts_on_rung, 0);
+        assert!(task.open().is_none(), "a task with no generation has none");
+
+        task.generations
+            .push(generation(0, GenerationClass::Closed));
+        assert!(
+            task.open().is_none(),
+            "a closed generation is not the open one"
+        );
+
+        task.generations
+            .push(generation(1, GenerationClass::Promoting));
+        assert_eq!(
+            task.open().map(|generation| generation.id),
+            Some(GenerationId(1))
+        );
+        task.generations
+            .push(generation(2, GenerationClass::Closed));
+        assert_eq!(
+            task.open().map(|generation| generation.id),
+            Some(GenerationId(1)),
+            "the open one is found past a closed one and before a later closed one"
+        );
+
+        let opened = task.open_mut().expect("the open generation");
+        assert_eq!(opened.id, GenerationId(1));
+        opened.class = GenerationClass::Closed;
+        assert!(
+            task.open().is_none(),
+            "closing the last open generation leaves none"
+        );
+    }
+}

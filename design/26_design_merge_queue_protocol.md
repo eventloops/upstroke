@@ -114,7 +114,9 @@ the current integration tree, supplying the original candidate patch and
 acceptance criteria to the integration reviewer while recording why the
 candidate-phase empty-diff rule does not apply. It then records `merge_prepared`
 with disposition `already_present` and
-`expected_head == proposed_sha == current integration SHA`. The normal
+`expected_head == proposed_sha == current integration SHA`. Because no commit
+was manufactured there is no proposal object to pin, so the record carries no
+prepared ref and the fold refuses one that does. The normal
 compare-and-swap is therefore a validation-only no-op, after which
 `task_merged` records the unchanged SHA. This is the only conflict-free path
 without a task commit, and the event lineage makes the reason explicit.
@@ -424,6 +426,16 @@ actual changed paths replace predictions once a candidate exists, and merge
 verification remains the correctness boundary. Edits outside hints are recorded
 as plan-quality warnings rather than trusted away.
 
+The derivation is versioned by the run's frozen path policy, because a dispatch
+record durably carries the region the derivation of its own version produced and
+replay compares the two. Version `v2` takes the whole components of a hint before
+the first component carrying a glob metacharacter — `src/eng*` bounds `src`, not
+`src/eng`, which is not an ancestor of the `src/engine/mod.rs` the hint matches —
+and derives repo-wide for a hint with a `.` or `..` component or with any
+backslash, a character the frozen record does not fix as separator or as escape.
+A run whose `run_started` freezes an earlier version is refused at that event,
+rather than replayed under a derivation that did not write its records.
+
 A predicted dispatch lease is held only while its generation can still receive
 worker edits. A same-session immediate retry retains that generation, worktree,
 and lease. Parking or deferring discards the non-resumable worktree and releases
@@ -441,6 +453,36 @@ by the combined unknown cost of admitted processes. The ledger must state that
 bound honestly; operators requiring the narrowest stop use `max_parallel = 1`
 until providers expose pre-authorizable envelopes. Concurrency must not turn the
 existing reported-spend ceiling into a falsely exact guarantee.
+
+#### Frozen limits: an entitlement that admits work
+
+Added 2026-09-06 under §13's same-change rule; not part of the verbatim record above. It records
+what the fold enforces about the three controls at the event that freezes them.
+
+`run_started` freezes the limits, and every later event is folded against the values it recorded;
+no other event restates them, so a run's entitlement is fixed at its first event for its life. The
+active-pipeline limit must admit at least one pipeline. A run recording `max_parallel = 0` is
+entitled to nothing: no dispatch, retry or integration is ever structurally admissible, no state it
+can reach carries an outcome to derive, and no `run_finished` can therefore end it — the log folds
+to a state with no exit. The fold refuses that `run_started` rather than accepting such a log. The
+other two limits carry no such floor, because each gates a branch that still answers at zero: at
+`max_defers = 0` every integration outage parks rather than defers, and at `max_merge_repairs = 0`
+a rejection spawns a human-required repair reporting that same zero.
+
+#### Frozen ladders: a floor binds the chain start
+
+Added 2026-09-06 under §13's same-change rule; not part of the verbatim record above. It records
+what the fold refuses at the boundary where a recorded ladder enters its state.
+
+A floor clips where a chain starts, and §10.5 has a merge repair's `min_tier = mid` intersected
+with the run's frozen hard pins and ceilings rather than overriding them. The router implements
+the clip, so no chain it produces holds a tier beneath its floor. A recorded ladder, however, is
+whatever the log says: its floor and its tier list are copied from the run record independently
+and neither is derived from the other. A frozen ladder whose first tier is below its recorded
+floor is therefore refused where every other malformation of a ladder is — before it is stored,
+not when something tries to climb it. Without that refusal the floor binds nothing once the run
+is recorded: a ladder's position starts at its first rung, and an attempt validated against that
+rung runs at a tier the run recorded as forbidden.
 
 #### Verification contract: the effect-site bijection
 

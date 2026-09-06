@@ -2,6 +2,8 @@
 
 Extended notes for [`src/runner/container/env.rs`](../../../../src/runner/container/env.rs).
 
+[Source on GitHub](https://github.com/eventloops/upstroke/blob/master/src/runner/container/env.rs).
+
 The code is the authority for what it does; this file is the whole of its prose, moved out of
 the source verbatim. Each section is headed by the line of code the comment sat above, spelled
 as it is in the source, so the heading is the grep string that finds the code.
@@ -507,9 +509,9 @@ the role would be varying two fields and calling it one.
 The reserved set is **one** enumeration, and it is `host-v1`'s.
 
 The expected table is written independently of `reserved_keys()`, so the
-comparison can detect changes to the host enumeration. [DESIGN.md §8](../../../../design/08_design_trait_surface.md)
+comparison can detect changes to the host enumeration. [DESIGN.md §8](https://github.com/eventloops/upstroke/blob/master/design/08_design_trait_surface.md)
 supplies the runner contract for role-scoped `HOME`, `PATH`, and credential
-locations. The credential-profile sketch in [src/capacity.rs](../../../../src/capacity.rs)
+locations. The credential-profile sketch in [src/capacity.rs](https://github.com/eventloops/upstroke/blob/master/src/capacity.rs)
 names `COPILOT_HOME` and `CLAUDE_CONFIG_DIR`; follow that module's Extended
 notes pointer when present. The table has a separate `CODEX_HOME` entry for
 the Codex fixture.

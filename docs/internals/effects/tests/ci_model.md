@@ -133,7 +133,7 @@ Measured, `MUT-WINDOWS-WITNESS-FLOOR-DROPPED` and
 
 ## `pub(super) const FMT_GATE: &str = "cargo fmt --check";`
 
-The formatter gate and the five shell gates the `lint` job runs from the
+The formatter gate and the six shell gates the `lint` job runs from the
 repository root, character for character.
 
 ## `pub(super) const GATE_SCRIPTS: [&str; 8] = [`
