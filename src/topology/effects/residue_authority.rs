@@ -1205,12 +1205,191 @@ impl SubEffectPoint {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fmt::Debug;
 
     use super::{
-        AfterEffect, BeforeState, InjectionMode, LockSite, ResidueArtifact, ResidueElement,
-        ResumeAction, SubEffectPoint,
+        AfterEffect, BeforeState, EvidenceLabel, InjectionMode, LockSite, ObjectResidue,
+        ObservableOrder, ResidueArtifact, ResidueClass, ResidueElement, ResumeAction,
+        SubEffectPoint,
     };
     use crate::topology::effects::{EffectSiteId, EntryPhase};
+
+    /// The chain a successor function walks, from `seed` until it answers
+    /// `None` or the walk exceeds `bound`.
+    ///
+    /// The bound is what makes a cycle a failing test rather than a hang: a
+    /// successor edited into a loop returns a chain longer than `ALL` and the
+    /// comparison fails, where an unbounded walk would never return.
+    fn chain<T: Copy + PartialEq + Debug>(
+        seed: T,
+        successor: impl Fn(T) -> Option<T>,
+        bound: usize,
+    ) -> Vec<T> {
+        let mut walked = vec![seed];
+        while let Some(next) = walked.last().copied().and_then(&successor) {
+            walked.push(next);
+            if walked.len() > bound {
+                break;
+            }
+        }
+        walked
+    }
+
+    #[test]
+    fn every_all_constant_lists_its_whole_enum_in_declaration_order() {
+        // `ALL` is the domain five censuses claim: the distinct-detail and
+        // distinct-action checks in `topology::effects::tests`, the
+        // element-classification loop there and in `workspace_manager::tests`,
+        // and the codomain assertion. A hand-kept list can lose a variant
+        // silently — every one of those censuses then measures a truncated
+        // domain and passes, which §12 names as proving nothing about the
+        // whole. Each successor below is an exhaustive match, so a variant
+        // added to any of these enums does not compile until someone says
+        // where in the order it belongs, and the comparison then fails until
+        // `ALL` carries it.
+        assert_eq!(
+            chain(
+                ObjectResidue::None,
+                |value| match value {
+                    ObjectResidue::None => Some(ObjectResidue::Internal),
+                    ObjectResidue::Internal => Some(ObjectResidue::After),
+                    ObjectResidue::After => None,
+                },
+                ObjectResidue::ALL.len(),
+            ),
+            ObjectResidue::ALL,
+            "`ObjectResidue::ALL` is not the classifier's whole codomain"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueClass::ObjectInternal,
+                |value| match value {
+                    ResidueClass::ObjectInternal => None,
+                },
+                ResidueClass::ALL.len(),
+            ),
+            ResidueClass::ALL,
+            "`ResidueClass::ALL` is not every registrable class"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueElement::UnreferencedObject,
+                |value| match value {
+                    ResidueElement::UnreferencedObject => Some(ResidueElement::TemporaryObjectFile),
+                    ResidueElement::TemporaryObjectFile => Some(ResidueElement::IndexLock),
+                    ResidueElement::IndexLock => Some(ResidueElement::CherryPickHead),
+                    ResidueElement::CherryPickHead => Some(ResidueElement::MergeHead),
+                    ResidueElement::MergeHead => Some(ResidueElement::MergeMsg),
+                    ResidueElement::MergeMsg => Some(ResidueElement::OrigHead),
+                    ResidueElement::OrigHead => Some(ResidueElement::SequencerState),
+                    ResidueElement::SequencerState =>
+                        Some(ResidueElement::RegisteredUnpopulatedWorktree),
+                    ResidueElement::RegisteredUnpopulatedWorktree => None,
+                },
+                ResidueElement::ALL.len(),
+            ),
+            ResidueElement::ALL,
+            "`ResidueElement::ALL` is not every element the classifier recognises"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueArtifact::Nothing,
+                |value| match value {
+                    ResidueArtifact::Nothing => Some(ResidueArtifact::TargetIntact),
+                    ResidueArtifact::TargetIntact => Some(ResidueArtifact::PrecursorDurable),
+                    ResidueArtifact::PrecursorDurable => Some(ResidueArtifact::NotReached),
+                    ResidueArtifact::NotReached => Some(ResidueArtifact::NoEffectPerformed),
+                    ResidueArtifact::NoEffectPerformed => Some(ResidueArtifact::Referenced),
+                    ResidueArtifact::Referenced => Some(ResidueArtifact::Unreferenced),
+                    ResidueArtifact::Unreferenced => Some(ResidueArtifact::Released),
+                    ResidueArtifact::Released => Some(ResidueArtifact::Removed),
+                    ResidueArtifact::Removed => Some(ResidueArtifact::IdNotRecorded),
+                    ResidueArtifact::IdNotRecorded => Some(ResidueArtifact::ObjectsUnreferenced),
+                    ResidueArtifact::ObjectsUnreferenced =>
+                        Some(ResidueArtifact::ObjectsAndAdministrativeResidue),
+                    ResidueArtifact::ObjectsAndAdministrativeResidue =>
+                        Some(ResidueArtifact::UnsyncedBytes),
+                    ResidueArtifact::UnsyncedBytes => Some(ResidueArtifact::UnsyncedLine),
+                    ResidueArtifact::UnsyncedLine => Some(ResidueArtifact::SyncedLine),
+                    ResidueArtifact::SyncedLine => Some(ResidueArtifact::LogCreated),
+                    ResidueArtifact::LogCreated => Some(ResidueArtifact::TornTailTruncated),
+                    ResidueArtifact::TornTailTruncated =>
+                        Some(ResidueArtifact::PrefixPossiblyNonDurable),
+                    ResidueArtifact::PrefixPossiblyNonDurable =>
+                        Some(ResidueArtifact::NoHostProcess),
+                    ResidueArtifact::NoHostProcess => Some(ResidueArtifact::NoProcessSpawned),
+                    ResidueArtifact::NoProcessSpawned => Some(ResidueArtifact::ReaperHeldGroup),
+                    ResidueArtifact::ReaperHeldGroup => Some(ResidueArtifact::HoldReleased),
+                    ResidueArtifact::HoldReleased => None,
+                },
+                ResidueArtifact::ALL.len(),
+            ),
+            ResidueArtifact::ALL,
+            "`ResidueArtifact::ALL` is not every artifact"
+        );
+
+        assert_eq!(
+            chain(
+                ResumeAction::ResumeUnperformed,
+                |value| match value {
+                    ResumeAction::ResumeUnperformed => Some(ResumeAction::NotExecuted),
+                    ResumeAction::NotExecuted => Some(ResumeAction::AdoptPerformed),
+                    ResumeAction::AdoptPerformed => Some(ResumeAction::ReclaimReleased),
+                    ResumeAction::ReclaimReleased => Some(ResumeAction::RepeatObservation),
+                    ResumeAction::RepeatObservation => Some(ResumeAction::AppendErrorProtocol),
+                    ResumeAction::AppendErrorProtocol => Some(ResumeAction::NextOpenConverges),
+                    ResumeAction::NextOpenConverges => Some(ResumeAction::RefuseResumably),
+                    ResumeAction::RefuseResumably => Some(ResumeAction::AmbientHandleTerminates),
+                    ResumeAction::AmbientHandleTerminates => Some(ResumeAction::ReaperSettlesGroup),
+                    ResumeAction::ReaperSettlesGroup => Some(ResumeAction::RefuseUnspawned),
+                    ResumeAction::RefuseUnspawned => Some(ResumeAction::RepeatProbe),
+                    ResumeAction::RepeatProbe => None,
+                },
+                ResumeAction::ALL.len(),
+            ),
+            ResumeAction::ALL,
+            "`ResumeAction::ALL` is not every action"
+        );
+
+        // The other two enums of the vocabulary carry no `ALL`, and their
+        // censuses name their variants directly; this test would be claiming
+        // more than it checks if either grew one unnoticed.
+        assert_eq!(
+            [
+                EvidenceLabel::ExecutionObserved,
+                EvidenceLabel::RecoveryProven
+            ]
+            .len(),
+            2
+        );
+        assert_eq!(
+            [
+                ObservableOrder::EffectBeforeEvent,
+                ObservableOrder::EventBeforeEffect
+            ]
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn every_artifact_and_action_displays_the_words_the_format_compares() {
+        // `validate_entry` compares an entry's text with `detail()` and
+        // `text()`. `Display` exists so a diagnostic can quote the same words;
+        // one that wrote anything else would give a reader a second wording of
+        // a claim the format decides by equality.
+        for artifact in ResidueArtifact::ALL {
+            assert_eq!(artifact.to_string(), artifact.detail(), "{artifact:?}");
+            assert!(!artifact.detail().trim().is_empty(), "{artifact:?}");
+        }
+        for action in ResumeAction::ALL {
+            assert_eq!(action.to_string(), action.text(), "{action:?}");
+            assert!(!action.text().trim().is_empty(), "{action:?}");
+        }
+    }
 
     #[test]
     fn every_residue_element_displays_the_spelling_serde_writes() {
