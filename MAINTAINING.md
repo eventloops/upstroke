@@ -63,11 +63,12 @@ source, documentation, workflows, release machinery and this file.
    head differs from the reviewed head, list the delta commits and what verified each. Re-run
    `validate-pr-body.sh` from the default branch against the live title and body.
 7. **Enqueue for merge** (`gh pr merge --merge --auto`, or the audit's `--enqueue`) once every
-   conversation is resolved and both contexts are green on the head being merged. The merge queue
-   builds a merge commit of that head onto `master`'s head plus any entry ahead of it, requires
-   both contexts on that commit, and lands exactly the commit they passed on; an entry whose
-   contexts fail leaves the queue and the pull request says why. Enqueueing is the owner's
-   attestation that the evidence is real and the
+   conversation is resolved and both contexts are green on the head being merged. With the
+   merge-queue rule in the ruleset (Repository rules), the queue builds a merge commit of that
+   head onto `master`'s head plus any entry ahead of it, requires both contexts on that commit,
+   and lands exactly the commit they passed on; an entry whose contexts fail leaves the queue and
+   the pull request says why. Enqueueing is the owner's attestation that the evidence is real and
+   the
    merged head is accounted for: reviewed directly, or separated from the reviewed SHA only by the
    deltas step 5 allows. The owner may delegate the merge, in writing, to the agent doing the work
    on a pull request that has reached this state; the delegation is disclosed in the body. Never
@@ -176,13 +177,15 @@ orphans every ledger row bound to a replaced SHA.
 ## Repository rules
 
 The default-branch ruleset requires a pull request, `upstroke-ci` and `upstroke-pr-policy` on
-the current head, resolved conversations, merge commits only, and the merge queue: every merge
+the current head, resolved conversations, and merge commits only; it blocks deletion and
+non-fast-forward updates and has no bypass actor. The merge-queue contract is this: every merge
 goes through the queue, which builds each entry on `master`'s head plus the entries ahead of it,
-requires both contexts on that entry, and lands exactly the commit they passed on. A branch is
-therefore never required to be up to date on its own; the up-to-date requirement the ruleset once
-carried is retired with the queue, since the queue supplies the same guarantee on every entry
-without a fresh pull-request run per merge. The ruleset blocks deletion and non-fast-forward
-updates and has no bypass actor. A tag ruleset on `refs/tags/v*` blocks updates and deletions
+requires both contexts on that entry, and lands exactly the commit they passed on, so a branch is
+never required to be up to date on its own. The workflows and the audit below implement that
+contract; the ruleset adopts it as the owner's act once the contract is on `master`, by adding
+the merge-queue rule and removing the up-to-date requirement the queue makes redundant. Until
+then `merge_group` never fires, the up-to-date requirement stands, and step 7's enqueue is an
+auto-merge that waits on the head's own contexts. A tag ruleset on `refs/tags/v*` blocks updates and deletions
 with no bypass. Required-check names are API: to rename one, land the replacement, observe it on a
 pull request, update the ruleset, then remove the old requirement. The workflow trigger contract
 is fixed too: `ci.yml` runs on `push`, `pull_request` and `merge_group`, and `pr-policy.yml` on
@@ -192,8 +195,9 @@ and queue entries for either base get both contexts; `test-docs-consistency.sh` 
 contract, and changing it is a change to this file first.
 
 Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-ready-audit.sh`,
-which decides a pull request's lane from its branch prefix (`codex/findings-p3-*`,
-`codex/findings-*`, everything else), keeps the `lane:*` and `ready-to-merge` labels current, and
+which decides a pull request's lane from its branch prefix alone (`codex/findings-p3-*`,
+`codex/findings-*`, everything else), counts only the owner's review comments, keeps the `lane:*`
+and `ready-to-merge` labels current (a label is its output, never its input), and
 with `--enqueue` adds each ready, un-drafted pull request to the queue in the order given. The
 P3 findings lane is ready only on a `PASS`; the P1/P2 findings lane fixes P0–P2 and files P3;
 feature and sweep work fixes P0–P1 and files P2 and P3, one file per finding under

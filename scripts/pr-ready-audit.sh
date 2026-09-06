@@ -2,13 +2,14 @@
 # pr-ready-audit.sh: decide, per open pull request, whether it is ready to enqueue for merge
 # under the three-lane finding policy, and optionally maintain the lane and ready labels.
 #
-#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
+#   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [--reviewer LOGIN] [PR ...]
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY,
 # un-drafted pull request to the merge queue (`gh pr merge --merge --auto`) in the order listed,
 # which is the priority order; it implies --apply.
 #
-# Lanes, decided by an existing lane:* label first and the branch prefix otherwise:
+# Lanes, decided by the branch prefix and nothing else (a lane:* label is output, never input;
+# a wrong one is corrected by --apply and reported as lane-label-mismatch):
 #   lane:findings-p3     codex/findings-p3-*   must fix everything; ready only on a PASS verdict
 #   lane:findings-p1p2   codex/findings-*      must fix P0-P2; P3 may be filed and deferred
 #   lane:feature         everything else       must fix P0-P1; P2-P3 may be filed and deferred
@@ -29,6 +30,17 @@
 # needs another pass), MANUAL (the review carries findings without ids, so rows cannot be matched
 # mechanically), and NOT-READY with the blockers listed.
 #
+# Only review comments posted by the trusted reviewer account count: the repository owner by
+# default, or --reviewer LOGIN. Anyone else's comment carrying the markers is ignored, so a
+# contributor cannot mint a PASS.
+#
+# Limits, stated so nobody reads more into READY than it says: the audit sees severities and the
+# fields the review JSON carries. A finding whose object carries a non-empty witness,
+# reproduction, repro, failing_test or mutation field blocks in every lane; a witness that exists
+# only in prose does not reach the audit, and the deferring implementor's row asserts there is
+# none (MAINTAINING step 5 binds them). A master merge-in is checked for leaving no branch commit
+# outside the ledger, not for a byte-identical branch diff.
+#
 # Needs: bash, git (a checkout with `origin` pointing at the repository), gh (its built-in --jq
 # does all JSON work; a standalone jq is not required).
 
@@ -37,12 +49,14 @@ set -euo pipefail
 apply=0
 enqueue=0
 ready_label="ready-to-merge"
+reviewer=""
 prs=()
 while (($#)); do
   case "$1" in
     --apply) apply=1 ;;
     --enqueue) apply=1; enqueue=1 ;;
     --ready-label) ready_label="$2"; shift ;;
+    --reviewer) reviewer="$2"; shift ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) prs+=("$1") ;;
   esac
@@ -50,6 +64,7 @@ while (($#)); do
 done
 
 repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+[[ -n "$reviewer" ]] || reviewer="$(gh repo view "$repo" --json owner --jq .owner.login)"
 
 if ((${#prs[@]} == 0)); then
   mapfile -t prs < <(gh pr list --repo "$repo" --state open --limit 100 --json number --jq '.[].number')
@@ -67,12 +82,7 @@ ensure_labels() {
 }
 
 lane_for() {
-  local branch="$1" labels="$2"
-  case " $labels " in
-    *" lane:findings-p3 "*) echo findings-p3; return ;;
-    *" lane:findings-p1p2 "*) echo findings-p1p2; return ;;
-    *" lane:feature "*) echo feature; return ;;
-  esac
+  local branch="$1"
   case "$branch" in
     codex/findings-p3-*) echo findings-p3 ;;
     codex/findings-*) echo findings-p1p2 ;;
@@ -88,10 +98,10 @@ must_fix_for() {
   esac
 }
 
-# The latest review comment on a pull request, or nothing.
+# The latest review comment on a pull request posted by the trusted reviewer, or nothing.
 latest_review() {
   gh api "repos/$repo/issues/$1/comments" --paginate \
-    --jq '[.[] | select(.body | test("<!-- upstroke-frontier-review|Reviewed head: [0-9a-f]{40}"))] | last | .body // empty'
+    --jq "[.[] | select(.user.login == \"$reviewer\") | select(.body | test(\"<!-- upstroke-frontier-review|Reviewed head: [0-9a-f]{40}\"))] | last | .body // empty"
 }
 
 # Ledger rows from the body: "ID<TAB>severity<TAB>sha-or-location<TAB>disposition" per row.
@@ -113,7 +123,7 @@ for pr in "${prs[@]}"; do
     --json headRefName,headRefOid,isDraft,mergeStateStatus,labels \
     --jq '[.headRefName, .headRefOid, (.isDraft|tostring), .mergeStateStatus, ([.labels[].name]|join(" "))] | @tsv')"
   IFS=$'\t' read -r branch head draft merge_state labels <<< "$meta"
-  lane="$(lane_for "$branch" "$labels")"
+  lane="$(lane_for "$branch")"
   must_fix="$(must_fix_for "$lane")"
   blockers=()
   state=READY
@@ -140,7 +150,12 @@ for pr in "${prs[@]}"; do
   else
     reviewed="$(grep -oE '(head=|Reviewed head: )[0-9a-f]{40}' <<< "$review" | head -1 | grep -oE '[0-9a-f]{40}' || true)"
     verdict="$(grep -oE '("verdict": ?"|VERDICT:\**:? *)[A-Z_]+' <<< "$review" | head -1 | grep -oE '[A-Z_]+$' || true)"
-    [[ -z "$verdict" ]] && blockers+=("no-verdict")
+    case "$verdict" in
+      PASS|CHANGES_REQUIRED) ;;
+      "") blockers+=("no-verdict") ;;
+      *) blockers+=("verdict:$verdict") ;;
+    esac
+    [[ "$lane" == findings-p3 && "$verdict" != PASS ]] && blockers+=("verdict-not-pass")
   fi
 
   # Head movement since the reviewed commit.
@@ -164,23 +179,36 @@ for pr in "${prs[@]}"; do
     fi
   fi
 
-  # Findings in the latest review, as "severity<TAB>id" (id empty for the frontier form).
+  # Findings in the latest review, as "severity<TAB>id<TAB>witnessed" (id empty for the
+  # frontier form). One finding object per line, so a witness field is read from its own object.
   findings=()
   if [[ -n "$review" ]]; then
     if grep -q '"findings"' <<< "$review"; then
-      while IFS=$'\t' read -r sev id; do
-        [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id")
-      done < <(grep -oE '"(id|severity)": ?"[^"]+"' <<< "$review" | sed -E 's/"(id|severity)": ?"([^"]+)"/\1=\2/' | awk -F= '
-        $1 == "id" { id = $2 }
-        $1 == "severity" { print $2 "\t" id; id = "" }')
+      while IFS=$'\t' read -r sev id wit; do
+        [[ -n "$sev" ]] && findings+=("$sev"$'\t'"$id"$'\t'"$wit")
+      done < <(grep -oE '"findings": ?\[.*' <<< "$review" | sed -E 's/\},\{/}\n{/g' | awk '
+        {
+          sev = ""; id = ""; wit = 0
+          if (match($0, /"severity": ?"P[0-3]"/)) sev = substr($0, RSTART + RLENGTH - 3, 2)
+          if (match($0, /"id": ?"[^"]+"/)) { id = substr($0, RSTART, RLENGTH); sub(/^"id": ?"/, "", id); sub(/"$/, "", id) }
+          if ($0 ~ /"(witness|reproduction|repro|failing_test|mutation|mutation_witness)": ?"[^"]+"/) wit = 1
+          if (id == "") id = "-"
+          if (sev != "") print sev "\t" id "\t" wit
+        }')
     else
-      while read -r sev; do findings+=("$sev"$'\t'); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
+      while read -r sev; do findings+=("$sev"$'\t'-$'\t'0); done < <(grep -oE '^[0-9]+\. \*\*P[0-3]' <<< "$review" | grep -oE 'P[0-3]')
     fi
   fi
+  [[ "$verdict" == PASS && ${#findings[@]} -gt 0 ]] && blockers+=("pass-with-findings")
 
   rows="$(ledger_rows "$pr")"
   for f in "${findings[@]}"; do
-    IFS=$'\t' read -r sev id <<< "$f"
+    IFS=$'\t' read -r sev id wit <<< "$f"
+    [[ "$id" == "-" ]] && id=""   # "-" stands in for "no id": a tab-separated read collapses empty fields
+    if [[ "$wit" == 1 ]]; then
+      blockers+=("witnessed:${id:-unnamed}")
+      continue
+    fi
     if [[ " $must_fix " == *" $sev "* ]]; then
       blockers+=("open-$sev:${id:-unnamed}")
       continue
@@ -218,6 +246,9 @@ for pr in "${prs[@]}"; do
   fi
 
   detail="verdict=${verdict:-none} reviewed=${reviewed:0:7}${moved:+ moved=$moved}"
+  for l in lane:feature lane:findings-p1p2 lane:findings-p3; do
+    [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && detail+=" lane-label-mismatch=$l"
+  done
   ((${#blockers[@]})) && detail+=" blockers=$(IFS=,; echo "${blockers[*]}")"
   printf '%-5s %-14s %-8s %-13s %s\n' "#$pr" "$lane" "${head:0:7}" "$state" "$detail"
 

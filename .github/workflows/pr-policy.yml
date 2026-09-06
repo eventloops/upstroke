@@ -12,8 +12,12 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   # A merge-queue entry carries no pull-request payload; the step below reads
   # the pull request's number out of the queue ref and its title, body and
-  # head from the API, so the same validators judge the same body the entry
-  # was enqueued with. The ruleset requires this context on the entry too.
+  # head from the API, and checks the entry merges that head, so the same
+  # validators judge the live body at the moment the entry is checked. A body
+  # edit after that reaches the pull request's own run, not the entry: the
+  # window is the entry's build time, and it is the same window today's path
+  # has between the last pull-request run and the merge. The ruleset requires
+  # this context on the entry too.
   merge_group:
     branches: [master, codex/parallelism-design]
 
@@ -63,6 +67,13 @@ jobs:
             gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title > "$RUNNER_TEMP/pr-title"
             gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/pr-body"
             gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid > "$RUNNER_TEMP/pr-head"
+            # The entry is a merge commit whose second parent is the pull
+            # request's head; the API's head must be that commit, or the body
+            # being judged belongs to a head the entry does not carry.
+            entry_head="$(git rev-parse --verify --quiet HEAD^2 || true)"
+            api_head="$(tr -d '[:space:]' < "$RUNNER_TEMP/pr-head")"
+            [[ -n "$entry_head" && "$entry_head" == "$api_head" ]] \
+              || { echo "pr-head-not-in-entry: the entry merges ${entry_head:-<no second parent>}, the pull request's head is $api_head" >&2; exit 1; }
           else
             printf '%s' "$PR_TITLE" > "$RUNNER_TEMP/pr-title"
             printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body"
