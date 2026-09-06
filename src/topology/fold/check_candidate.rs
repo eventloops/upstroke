@@ -25,16 +25,7 @@ impl RunState {
                 ),
             });
         }
-        if generation.candidate.is_some() {
-            return Err(FoldError::NotTheOpenGeneration {
-                kind: CANDIDATE_PREPARED,
-                key: prepared.key.0,
-                generation: prepared.generation.0,
-                detail: "the generation has already prepared a candidate, and one generation \
-                         prepares at most one"
-                    .to_owned(),
-            });
-        }
+        refuse_repeated_candidate(generation, prepared.key, prepared.generation)?;
         if !prepared.attempt.is_successful() {
             return Err(FoldError::InconsistentRecord {
                 kind: CANDIDATE_PREPARED,
@@ -189,6 +180,24 @@ fn check_lease_effect(
     Ok(())
 }
 
+fn refuse_repeated_candidate(
+    generation: &GenerationFold,
+    key: TaskKey,
+    generation_id: GenerationId,
+) -> Result<(), FoldError> {
+    if generation.candidate.is_some() {
+        return Err(FoldError::NotTheOpenGeneration {
+            kind: CANDIDATE_PREPARED,
+            key: key.0,
+            generation: generation_id.0,
+            detail: "the generation has already prepared a candidate, and one generation \
+                     prepares at most one"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn promoting_candidate(generation: &GenerationFold) -> Option<&PreparedCandidate> {
     match &generation.candidate {
         Some(prepared) if generation.class == GenerationClass::Promoting => Some(prepared),
@@ -323,6 +332,42 @@ mod tests {
         assert_eq!(
             refusal(&by_an_ordinary_task),
             Some((CANDIDATE_PREPARED, MISMATCHED_PAIRING))
+        );
+    }
+
+    #[test]
+    fn a_generation_that_already_prepared_a_candidate_is_refused() {
+        let held = generation(
+            GenerationClass::InFlight {
+                attempt: AttemptNumber(1),
+            },
+            Some(prepared()),
+        );
+        let refused = refuse_repeated_candidate(&held, ROOT, GenerationId(3));
+        assert_eq!(
+            refused,
+            Err(FoldError::NotTheOpenGeneration {
+                kind: CANDIDATE_PREPARED,
+                key: ROOT.0,
+                generation: 3,
+                detail: "the generation has already prepared a candidate, and one generation \
+                         prepares at most one"
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_generation_with_no_candidate_yet_is_not_refused() {
+        let held = generation(
+            GenerationClass::InFlight {
+                attempt: AttemptNumber(1),
+            },
+            None,
+        );
+        assert_eq!(
+            refuse_repeated_candidate(&held, ROOT, GenerationId(3)),
+            Ok(())
         );
     }
 

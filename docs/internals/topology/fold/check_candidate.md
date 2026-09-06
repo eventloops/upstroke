@@ -24,7 +24,7 @@ moved here, a `Promoting` generation means that record was appended
 anyway, and the arm above already refuses it; this refuses the other
 half of the same shape, so neither order can produce two settlements.
 
-## `impl RunState` › `if generation.candidate.is_some() {`
+## `impl RunState` › `refuse_repeated_candidate(generation, prepared.key, prepared.generation)?;`
 
 INV-06: "at most one candidate per generation", enforced_by "fold
 refuses a second candidate for a generation". Refused here, before
@@ -130,6 +130,23 @@ the argument was a seam nothing held. One caller and one kind means
 the constant belongs to the module, and `check_candidate_prepared`
 spells the same name.
 
+## `fn refuse_repeated_candidate(`
+
+Extracted from `check_candidate_prepared` so INV-06 can be pinned directly, the way
+`SWEEP-CHECK_CANDIDATE-004`'s `promoting_candidate` conjunct below was: taking the generation
+rather than `&RunState` lets this module's own test block reach it without the
+`RunStarted4`/plan/chain/registry-digest fixture that lives in the sibling `tests.rs` (queue row
+39, out of this sweep's reach).
+
+Review pass 1 of PR #186 raised the surviving mutation here (replacing the condition with
+`false`) as `SWEEP-CHECK_CANDIDATE-002`. It is redundant against the fold's own apply path for
+the same reason `-004` is: `generation.candidate` has one writer, `apply_candidate_prepared`,
+which sets it and `class = Promoting` in the same statement, so a freshly-dispatched generation
+this function is reached for is always `candidate: None`; the preceding `InFlight` guard already
+refuses every other state. Kept as defence in depth rather than removed — deleting an invariant
+guard is a design call this module's own sweep does not make unreviewed — and now pinned directly
+in this file's test block instead of surviving unexercised.
+
 ## `fn promoting_candidate(`
 
 Which prepared candidate, if any, a generation may promote: the one it
@@ -160,12 +177,11 @@ reach.
 
 ## `#[cfg(test)] mod tests`
 
-Tests for the two functions above, in this file rather than in
-`src/topology/fold/tests.rs` where the rest of the fold's tests live.
-Both checkers take `&RunState`, whose construction needs the
-`RunStarted4`, plan, chain and registry-digest fixture that sibling
-file builds; that file is queue row 39 and the sweep that added these
-tests could not edit it. The two relations were extracted so they
+Tests for `check_lease_effect`, `refuse_repeated_candidate` and `promoting_candidate`, in this
+file rather than in `src/topology/fold/tests.rs` where the rest of the fold's tests live. The two
+checker methods on `impl RunState` take `&RunState`, whose construction needs the `RunStarted4`,
+plan, chain and registry-digest fixture that sibling file builds; that file is queue row 39 and
+the sweep that added these tests could not edit it. The three relations were extracted so they
 could be reached with values instead.
 
 Each test asserts the refusal's `kind` and its whole `detail`, not the

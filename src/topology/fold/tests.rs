@@ -1261,15 +1261,15 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
 
     for attempt in 1..=2u32 {
         for event in [
-            dispatch(ALPHA, attempt - 1, &base),
-            attempt_started(&live, ALPHA, attempt - 1, 1, 0),
+            dispatch(ZETA, attempt - 1, &base),
+            attempt_started(&live, ZETA, attempt - 1, 1, 0),
         ] {
             apply(&mut live, &event);
             trace.push(event);
         }
         let last = attempt == 2;
         let settlement = settle(
-            ALPHA,
+            ZETA,
             attempt - 1,
             1,
             AttemptSettlement::Closed {
@@ -1285,7 +1285,7 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
         trace.push(settlement);
     }
 
-    let task = live.task(ALPHA).expect("registered");
+    let task = live.task(ZETA).expect("registered");
     assert_eq!(task.rung, 1, "the escalation did not move the task's rung");
     assert_eq!(
         task.attempts_on_rung, 0,
@@ -1300,7 +1300,7 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
 
     let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
     let replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
-    let after = replayed.task(ALPHA).expect("registered");
+    let after = replayed.task(ZETA).expect("registered");
     assert_eq!(
         (after.rung, after.attempts_on_rung),
         (task.rung, task.attempts_on_rung),
@@ -1309,6 +1309,175 @@ fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
     );
 
     assert_ne!(0, after.rung, "a process-local rung tally reads zero here");
+}
+
+#[test]
+fn an_attempt_runs_at_the_replay_derived_rung_and_an_escalation_climbs_exactly_one() {
+    let base = sha("base");
+    let mut live = started();
+    let mut trace = vec![run_started_event()];
+
+    for (generation, transition) in [
+        (0, SettlementTransition::Retry),
+        (1, SettlementTransition::Escalated { rung: 1 }),
+    ] {
+        for event in [
+            dispatch(ZETA, generation, &base),
+            attempt_started(&live, ZETA, generation, 1, 0),
+            settle(
+                ZETA,
+                generation,
+                1,
+                AttemptSettlement::Closed {
+                    transition,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut live, &event);
+            trace.push(event);
+        }
+    }
+    let position = |fold: &TopologyFold| {
+        let task = fold.task(ZETA).expect("registered");
+        (task.rung, task.attempts_on_rung)
+    };
+    assert_eq!(position(&live), (1, 0), "the escalation put zeta on rung 1");
+
+    let dispatched = dispatch(ZETA, 2, &base);
+    apply(&mut live, &dispatched);
+    trace.push(dispatched);
+
+    for (label, rung) in [("below", 0), ("above", 2)] {
+        let start = attempt_started(&live, ZETA, 2, 1, rung);
+        let refused = refuse(&live, &start);
+        assert!(
+            matches!(
+                refused,
+                FoldError::WrongRung {
+                    kind: "attempt_started",
+                    key,
+                    attempt: 1,
+                    rung: refused_rung,
+                    ..
+                } if key == ZETA.0 && refused_rung == rung
+            ),
+            "a start {label} the task's rung, carrying rung {rung}'s own frozen binding, \
+             was refused as `{refused}` rather than as the wrong rung"
+        );
+        assert_eq!(
+            position(&live),
+            (1, 0),
+            "a refused start {label} the rung moved the ladder position"
+        );
+    }
+
+    let at_position = attempt_started(&live, ZETA, 2, 1, 1);
+    apply(&mut live, &at_position);
+    trace.push(at_position);
+
+    let escalate = |rung: u32| {
+        settle(
+            ZETA,
+            2,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Escalated { rung },
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        )
+    };
+    for (label, rung) in [("backward", 0), ("sideways", 1), ("skipping a rung", 3)] {
+        let refused = refuse(&live, &escalate(rung));
+        assert!(
+            matches!(
+                refused,
+                FoldError::WrongRung {
+                    kind: "attempt_finished",
+                    key,
+                    attempt: 1,
+                    rung: refused_rung,
+                    ..
+                } if key == ZETA.0 && refused_rung == rung
+            ),
+            "an escalation {label} onto rung {rung} was refused as `{refused}` rather than \
+             as the wrong rung"
+        );
+    }
+    let one_up = escalate(2);
+    apply(&mut live, &one_up);
+    trace.push(one_up);
+    assert_eq!(
+        position(&live),
+        (2, 0),
+        "the escalation onto the next rung did not move the task there"
+    );
+
+    for event in [
+        dispatch(ZETA, 3, &base),
+        attempt_started(&live, ZETA, 3, 1, 2),
+    ] {
+        apply(&mut live, &event);
+        trace.push(event);
+    }
+    let off_the_top = settle(
+        ZETA,
+        3,
+        1,
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Escalated { rung: 3 },
+            lease: LeaseDisposition::PredictedReleased,
+        },
+    );
+    assert!(
+        matches!(
+            refuse(&live, &off_the_top),
+            FoldError::WrongRung {
+                kind: "attempt_finished",
+                rung: 3,
+                ..
+            }
+        ),
+        "zeta's ladder has three rungs and the human is the top one, so nothing escalates \
+         onto rung 3"
+    );
+    let retried = settle(
+        ZETA,
+        3,
+        1,
+        AttemptSettlement::Closed {
+            transition: SettlementTransition::Retry,
+            lease: LeaseDisposition::PredictedReleased,
+        },
+    );
+    apply(&mut live, &retried);
+    trace.push(retried);
+    assert_eq!(
+        position(&live),
+        (2, 1),
+        "the failure on rung 2 was not charged to rung 2's allowance"
+    );
+
+    let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
+    let mut replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
+    assert_eq!(
+        position(&replayed),
+        position(&live),
+        "the ladder position did not survive the process that wrote it"
+    );
+    for fold in [&mut live, &mut replayed] {
+        apply(fold, &dispatch(ZETA, 4, &base));
+        for rung in [0, 1] {
+            assert!(
+                matches!(
+                    refuse(fold, &attempt_started(fold, ZETA, 4, 1, rung)),
+                    FoldError::WrongRung { rung: refused, .. } if refused == rung
+                ),
+                "a start on rung {rung} was accepted while the log holds rung 2"
+            );
+        }
+        accepts(fold, &attempt_started(fold, ZETA, 4, 1, 2));
+    }
 }
 
 const CHARGE_ALLOWANCE: fn(&mut RunState, TaskKey, &AttemptRecord) = RunState::charge_allowance;
@@ -3017,10 +3186,45 @@ fn an_attempt_runs_the_frozen_binding_or_the_validated_override() {
         );
     }
 
-    for rung in 0..3u32 {
-        accepts(&fold, &attempt_started(&fold, ZETA, 0, 1, rung));
+    let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);
+    if let TopologyEventBody::AttemptStarted { data } = &mut off_the_end.body {
+        data.rung = 9;
+    }
+    assert!(matches!(
+        refuse(&fold, &off_the_end),
+        FoldError::WrongRung { rung: 9, .. }
+    ));
+
+    let mut materializing = attempt_started(&fold, ZETA, 0, 1, 0);
+    if let TopologyEventBody::AttemptStarted { data } = &mut materializing.body {
+        data.materialization_observed = Some(Materialization::Clean);
+    }
+    assert!(matches!(
+        refuse(&fold, &materializing),
+        FoldError::MalformedEntry { key: 0, .. }
+    ));
+
+    let rungs = u32::try_from(
+        fold.registry()
+            .expect("started")
+            .get(ZETA)
+            .expect("zeta")
+            .ladder
+            .rungs
+            .len(),
+    )
+    .expect("a small fixture ladder");
+    assert_eq!(rungs, 3, "zeta's fixture ladder has three rungs to walk");
+    for rung in 0..rungs {
+        let generation = rung;
+        accepts(&fold, &attempt_started(&fold, ZETA, generation, 1, rung));
         let entry = fold.registry().expect("started").get(ZETA).expect("zeta");
-        let tier = entry.ladder.rungs[rung as usize].tier;
+        let tier = entry
+            .ladder
+            .rungs
+            .get(rung as usize)
+            .expect("the walk stays on the ladder")
+            .tier;
         let mut wrong_effort = frozen_binding(&fold, ZETA, rung as usize);
         wrong_effort.effort = entry.ladder.effort.review;
         assert_ne!(
@@ -3031,7 +3235,7 @@ fn an_attempt_runs_the_frozen_binding_or_the_validated_override() {
         let event = ev(TopologyEventBody::AttemptStarted {
             data: AttemptStarted4 {
                 key: ZETA,
-                generation: GenerationId(0),
+                generation: GenerationId(generation),
                 attempt: AttemptNumber(1),
                 rung,
                 binding: wrong_effort,
@@ -3044,25 +3248,24 @@ fn an_attempt_runs_the_frozen_binding_or_the_validated_override() {
             refuse(&fold, &event),
             FoldError::BindingMismatch { .. }
         ));
+        if rung + 1 < rungs {
+            let climb = attempt_started(&fold, ZETA, generation, 1, rung);
+            apply(&mut fold, &climb);
+            apply(
+                &mut fold,
+                &settle(
+                    ZETA,
+                    generation,
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Escalated { rung: rung + 1 },
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            );
+            apply(&mut fold, &dispatch(ZETA, generation + 1, &base));
+        }
     }
-
-    let mut off_the_end = attempt_started(&fold, ZETA, 0, 1, 0);
-    if let TopologyEventBody::AttemptStarted { data } = &mut off_the_end.body {
-        data.rung = 9;
-    }
-    assert!(matches!(
-        refuse(&fold, &off_the_end),
-        FoldError::BindingMismatch { .. }
-    ));
-
-    let mut materializing = attempt_started(&fold, ZETA, 0, 1, 0);
-    if let TopologyEventBody::AttemptStarted { data } = &mut materializing.body {
-        data.materialization_observed = Some(Materialization::Clean);
-    }
-    assert!(matches!(
-        refuse(&fold, &materializing),
-        FoldError::MalformedEntry { key: 0, .. }
-    ));
 }
 
 #[test]
