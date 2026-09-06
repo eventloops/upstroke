@@ -8515,7 +8515,7 @@ fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         );
         assert_eq!(
             record.histogram.total(),
-            SAMPLING_N,
+            u64::from(SAMPLING_N),
             "every sample is accounted for by exactly one class"
         );
         assert_eq!(

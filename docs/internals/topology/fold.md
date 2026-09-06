@@ -252,13 +252,13 @@ including outstanding questions, queued work and unelapsed backoff.
 
 ## `pub enum QuestionOrigin` › `VerificationPark,`
 
-A verification could not be run. An answer returns the task to awaiting
-merge, to be re-verified under a new sequence.
+A verification could not be run. Its queued candidate remains available
+for verification under a new sequence after the lineage's last answer.
 
 ## `pub enum QuestionOrigin` › `Admission,`
 
-An attempt parked, or a repair's admission is gated. An answer returns
-the task to pending.
+An attempt parked, a repair's admission is gated, or a bare question was
+raised. The origin alone does not determine the task's next state.
 
 ## `pub struct OpenQuestion {`
 
@@ -304,6 +304,11 @@ these tests live/replay agreement for the event trace being compared.
 ## `pub struct RunState` › `seen_questions: BTreeSet<QuestionId>,`
 
 Every question id this log has used, open or not: an id is never reused.
+
+## `pub struct RunState` › `deferred_tasks: BTreeSet<TaskKey>,`
+
+Execution backoff still owed, including tasks parked on questions.
+Accepted settlements add keys; elapsed waits and resume clear them.
 
 ## `pub struct RunState` › `halted_epoch: Option<Epoch>,`
 
@@ -352,7 +357,7 @@ authenticated against the recorded digest.
 
 ## `enum Derived` › `Answer(QuestionOrigin),`
 
-Where an answered question returns its task to.
+The checked question's origin, retained before application removes it.
 
 ## `pub struct TopologyFold {`
 
@@ -418,25 +423,63 @@ The pipeline entitlement this state holds.
 
 The region an ordinary dispatch of this entry would predict.
 
-The plan's path hints, taken literally: a hint with no glob metacharacter is
-its own literal prefix. Anything else — an absent hint list, or a hint whose
-literal prefix is empty — classifies repo-wide, which overlaps everything.
+One [`hint_prefix`] per frozen path hint. An absent hint list, or one hint
+that bounds nothing, classifies the whole entry repo-wide, which overlaps
+everything.
 
-## `open_mut` › `VerificationPark,`
+## `fn hint_prefix(hint: &str) -> Option<GitPath> {`
 
-A verification could not be run. Its queued candidate remains available
-for verification under a new sequence after the lineage's last answer.
+The bounded prefix one path hint predicts, or `None` for repo-wide.
 
-## `open_mut` › `Admission,`
+`DESIGN.md` §26 states the contract: dispatch leases "use normalized non-glob
+prefixes from `path_hints`; prefix ancestor/descendant pairs overlap, and an
+absent or repo-wide hint takes a global lease", deliberately conservative.
+[`crate::topology::leases::paths_overlap`] compares two paths **component by
+component**, so the prefix has to be an ancestor in that sense and not merely
+a leading substring, and every departure from it has to be wider than the
+hint rather than narrower — a region silently smaller than what the hint
+covers is what lets two owners of one file run at once.
 
-An attempt parked, a repair's admission is gated, or a bare question was
-raised. The origin alone does not determine the task's next state.
+The derivation is versioned, and this is [`crate::topology::paths::PathPolicyVersion::V2`].
+`check_run_started` refuses a run frozen under any earlier version rather
+than replaying it under this one, because a run's dispatch records carry
+the regions its own version derived.
 
-## `open_mut` › `deferred_tasks: BTreeSet<TaskKey>,`
+Four consequences, each of them a case this rule gets right and a character
+prefix does not:
 
-Execution backoff still owed, including tasks parked on questions.
-Accepted settlements add keys; elapsed waits and resume clear them.
+* Components are taken whole, up to the first that carries `*`, `?`, `[` or
+  `{`. A metacharacter inside a component drops that component: `src/eng*`
+  bounds `src`, not `src/eng`, which is not an ancestor of the
+  `src/engine/mod.rs` the hint matches.
+* A `.` or `..` component bounds nothing. The comparator does not equate
+  `src/./alpha` with `src/alpha`, so keeping the dotted spelling would be a
+  second spelling of one region that never overlaps its first.
+  `src/workspace_manager/parsers.rs` refuses the same shapes on the actual
+  paths, for the same reason.
+* An empty component is kept, because the comparator filters empties itself:
+  `src/doubled//inner/` bounds `src/doubled//inner` byte for byte, and a
+  leading or trailing separator changes no comparison.
+* Any backslash bounds nothing. The character has two readings under the
+  frozen grammar and neither is safe to guess: `globset` treats `\` as an
+  escape on Unix, so `src/foo\?bar.rs` matches the single file
+  `src/foo?bar.rs`, while on Windows it is a separator and the same hint
+  names `src/foo/?bar.rs`. A prefix taken under either reading is narrower
+  than the hint under the other, and narrower is the direction that admits
+  two owners of one file, so the derivation refuses rather than guesses.
 
-## `event` › `Answer(QuestionOrigin),`
+A hint that bounds nothing after all that — no components, every component
+globbed, a dotted component, or a backslash anywhere — is `None`.
 
-The checked question's origin, retained before application removes it.
+## `mod parent_tests {`
+
+The tests for the items this file itself holds.
+
+`src/topology/fold/tests.rs` is the `fold` family's shared suite and reaches
+these items through the checkers; this module is the parent's own, for the
+contracts that are stated here and nowhere else: every [`FoldError`]
+message's fields and their distinctness, the [`TaskState`] and
+[`GenerationClass`] vocabularies, [`TaskFold::open`], and [`hint_prefix`]'s
+rule with the [`crate::topology::leases::paths_overlap`] measurement that
+says why it is that rule — including the backslash, whose two readings are
+each measured against the file the other reading's prefix does not overlap.

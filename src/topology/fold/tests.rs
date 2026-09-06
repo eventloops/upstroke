@@ -25,6 +25,10 @@ use crate::topology::registry::{FrozenReviews, FrozenRung, FrozenTaskSpec, Linea
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
 #[cfg(test)]
+mod outcome;
+#[cfg(test)]
+mod predicates;
+#[cfg(test)]
 mod questions;
 
 const RUN_ID: &str = "01FOLD0000000000000000000A";
@@ -117,9 +121,14 @@ fn plan() -> Plan {
 }
 
 fn chain(task: &str) -> ChainSummary {
+    // A chain starts at or above its task's `min_tier`: `src/route.rs`'s
+    // `raise_start` retains only the tiers at or above the floor, so `mid`,
+    // whose plan entry records `min_tier = Some(Tier::Mid)`, cannot carry a
+    // `Small` rung. `check_ladder` refuses a recorded ladder that does.
     let tiers = match task {
         "zeta" => vec![Tier::Small, Tier::Mid, Tier::Frontier],
         "alpha" => vec![Tier::Mid],
+        "mid" => vec![Tier::Mid, Tier::Frontier],
         _ => vec![Tier::Small, Tier::Frontier],
     };
     ChainSummary {
@@ -177,7 +186,7 @@ fn gate_summaries() -> Vec<GateSummary> {
 
 fn path_policy() -> PathPolicy {
     PathPolicy {
-        version: PathPolicyVersion::V1,
+        version: PathPolicyVersion::V2,
         case_fold: true,
         grammar: PathGrammar::Globset,
     }
@@ -429,6 +438,28 @@ fn accepts(fold: &TopologyFold, event: &TopologyEvent) {
     }
 }
 
+#[track_caller]
+fn attempt_finished_mut(event: &mut TopologyEvent) -> &mut AttemptFinished4 {
+    match &mut event.body {
+        TopologyEventBody::AttemptFinished { data } => data,
+        other => panic!(
+            "the fixture builds an `attempt_finished`, and this is a `{}`",
+            other.kind()
+        ),
+    }
+}
+
+#[track_caller]
+fn candidate_prepared_mut(event: &mut TopologyEvent) -> &mut CandidatePrepared {
+    match &mut event.body {
+        TopologyEventBody::CandidatePrepared { data } => data,
+        other => panic!(
+            "the fixture builds a `candidate_prepared`, and this is a `{}`",
+            other.kind()
+        ),
+    }
+}
+
 fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {
     ReviewRecord {
         pass: pass.to_owned(),
@@ -579,8 +610,25 @@ fn the_frozen_rung_binding_is_what_the_validator_accepts() {
                 Effort::High
             }
         }),
+        ("tier", |b: &mut RungBinding| {
+            b.tier = if b.tier == Tier::Frontier {
+                Tier::Small
+            } else {
+                Tier::Frontier
+            }
+        }),
+        ("pinned", |b: &mut RungBinding| b.pinned = !b.pinned),
     ] {
         let mut wrong = binding.clone();
+        assert_ne!(
+            {
+                let mut probe = binding.clone();
+                mutate(&mut probe);
+                probe
+            },
+            binding,
+            "the `{label}` perturbation is not a perturbation"
+        );
         mutate(&mut wrong);
         let refused = ev(TopologyEventBody::AttemptStarted {
             data: AttemptStarted4 {
@@ -934,9 +982,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     accepts(&fold, &retain(ZETA, 1, session, Epoch(0)));
 
     let mut wrong_attempt = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_attempt.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_attempt);
     data.record.attempt = 2;
     assert!(
         matches!(
@@ -947,9 +993,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut wrong_session = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_session.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_session);
     data.record.session_id = Some("sess-somebody-elses".to_owned());
     let error = refuse(&fold, &wrong_session);
     assert!(
@@ -958,9 +1002,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut sessionless = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut sessionless.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut sessionless);
     data.record.session_id = None;
     let error = refuse(&fold, &sessionless);
     assert!(
@@ -969,9 +1011,7 @@ fn a_retained_settlement_binds_its_envelope_to_its_record() {
     );
 
     let mut wrong_generation = retain(ZETA, 1, session, Epoch(0));
-    let TopologyEventBody::AttemptFinished { data } = &mut wrong_generation.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut wrong_generation);
     data.generation = GenerationId(1);
     assert!(
         matches!(
@@ -1001,12 +1041,9 @@ type SettlementArm = (&'static str, fn() -> AttemptSettlement);
 #[test]
 fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
     let base = sha("base");
-    let session = "sess-ÜNI-unsettled";
 
     let claims_success = |event: &mut TopologyEvent| {
-        let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(event);
         data.record.failure = None;
         data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
         assert!(
@@ -1025,6 +1062,20 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
             lease: LeaseDisposition::PredictedReleased,
         }),
     ];
+
+    let variant_of = |settlement: &AttemptSettlement| match settlement {
+        AttemptSettlement::Retained { .. } => "retained",
+        AttemptSettlement::Closed { .. } => "closed",
+    };
+    let mut driven: Vec<&str> = arms.iter().map(|(_, build)| variant_of(&build())).collect();
+    driven.sort_unstable();
+    driven.dedup();
+    assert_eq!(
+        driven,
+        ["closed", "retained"],
+        "the table below drives fewer than every settlement, so `no arm` is a claim about \
+         some of them"
+    );
 
     for (label, settlement) in arms {
         let mut fold = started();
@@ -1052,9 +1103,7 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
         );
 
         let mut judged = settle(ZETA, 0, 1, settlement());
-        let TopologyEventBody::AttemptFinished { data } = &mut judged.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(&mut judged);
         data.record.failure = None;
         data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Failed)];
         assert!(
@@ -1069,7 +1118,6 @@ fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
     let start = attempt_started(&fold, ZETA, 0, 1, 0);
     apply(&mut fold, &start);
     accepts(&fold, &candidate_prepared(ZETA, 0, &base));
-    let _ = session;
 }
 
 #[test]
@@ -1903,6 +1951,39 @@ fn a_run_begins_once_and_says_it_is_a_topology_run() {
 }
 
 #[test]
+fn a_run_recorded_under_an_earlier_path_policy_is_refused_rather_than_replayed_under_this_one() {
+    let under = |version: PathPolicyVersion| {
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                path_policy: PathPolicy {
+                    version,
+                    ..path_policy()
+                },
+                ..run_started()
+            }),
+        })
+    };
+
+    accepts(&TopologyFold::new(inputs()), &under(PathPolicyVersion::V2));
+
+    let error = refuse(&TopologyFold::new(inputs()), &under(PathPolicyVersion::V1));
+    let FoldError::InconsistentRecord { kind, detail } = &error else {
+        panic!("a `v1` run was refused as {error} rather than as an inconsistent record");
+    };
+    assert_eq!(*kind, "run_started");
+    for phrase in [
+        "it freezes path policy `v1`",
+        "derives dispatch regions under path policy `v2`",
+        "cannot be replayed here",
+    ] {
+        assert!(
+            detail.contains(phrase),
+            "the refusal does not say `{phrase}`: {detail}"
+        );
+    }
+}
+
+#[test]
 fn a_run_started_carries_a_runner_record_that_could_be_re_established() {
     let mut runner = container_runner();
     if let Some(image) = runner.image.as_mut() {
@@ -1955,6 +2036,76 @@ fn a_run_started_carries_a_runner_record_that_could_be_re_established() {
         assert!(
             messages.insert(defect.clone()),
             "the {label} case reports what another case reports: {defect}"
+        );
+    }
+}
+
+#[test]
+fn a_run_started_freezes_an_entitlement_that_admits_work() {
+    let frozen = run_started().limits;
+    let with_limits = |limits: TopologyLimits| {
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                limits,
+                ..run_started()
+            }),
+        })
+    };
+
+    assert_eq!(
+        refuse(
+            &TopologyFold::new(inputs()),
+            &with_limits(TopologyLimits {
+                max_parallel: 0,
+                ..frozen
+            })
+        ),
+        FoldError::UnusableLimit {
+            limit: "max_parallel",
+            value: 0,
+        }
+    );
+
+    // The refusal is of an entitlement that admits nothing, not of the digit
+    // zero: `max_parallel` is the only limit with an unfoldable value. Measured
+    // on this fixture, a run started at each of the three below is
+    // `structurally_admissible` and derives `NotEnding`, because the other two
+    // limits gate a branch that still answers at zero -- every outage parks
+    // rather than defers, and a rejection must spawn a repair reporting the
+    // same zero.
+    for (label, limits) in [
+        (
+            "one task at a time",
+            TopologyLimits {
+                max_parallel: 1,
+                ..frozen
+            },
+        ),
+        (
+            "no automatic deferral",
+            TopologyLimits {
+                max_defers: 0,
+                ..frozen
+            },
+        ),
+        (
+            "no automatic repair",
+            TopologyLimits {
+                max_merge_repairs: 0,
+                ..frozen
+            },
+        ),
+    ] {
+        let mut fold = TopologyFold::new(inputs());
+        apply(&mut fold, &with_limits(limits));
+        assert!(
+            fold.structurally_admissible(),
+            "a run recording {label} admits work"
+        );
+        assert_eq!(
+            fold.derived_outcome(),
+            DerivedOutcome::NotEnding,
+            "a run recording {label} has an outcome to derive"
         );
     }
 }
@@ -2199,12 +2350,20 @@ fn both_recorded_digests_are_checked_against_the_frozen_inputs() {
 
 #[test]
 fn a_malformed_ladder_is_refused_before_it_is_stored() {
-    let cases: [(&str, BreakFrozenInputs); 3] = [
+    let cases: [(&str, BreakFrozenInputs); 4] = [
         ("floor above ceiling", |plan, chain| {
             plan.tasks[ZETA.index()].min_tier = Some(Tier::Frontier);
             chain.tiers = vec![Tier::Small, Tier::Mid];
             chain.bindings = Some(bindings_for(&chain.tiers));
         }),
+        (
+            "a floor above the tier the chain starts at",
+            |plan, chain| {
+                plan.tasks[ZETA.index()].min_tier = Some(Tier::Mid);
+                chain.tiers = vec![Tier::Small, Tier::Mid, Tier::Frontier];
+                chain.bindings = Some(bindings_for(&chain.tiers));
+            },
+        ),
         ("tiers that do not escalate", |_, chain| {
             chain.tiers = vec![Tier::Mid, Tier::Small, Tier::Frontier];
             chain.bindings = Some(bindings_for(&chain.tiers));
@@ -2228,11 +2387,19 @@ fn a_malformed_ladder_is_refused_before_it_is_stored() {
         );
     }
 
-    let spawn_cases: [(&str, BreakLadder); 8] = [
+    let spawn_cases: [(&str, BreakLadder); 9] = [
         ("floor above ceiling", |ladder| {
             ladder.tiers = vec![Tier::Mid];
             ladder.rungs = rungs_for(&ladder.tiers);
             ladder.ceiling = Some(Tier::Mid);
+            ladder.floor = Some(Tier::Frontier);
+        }),
+        // DESIGN §26: a repair's `mid` floor is a floor inside the frozen
+        // constraints, so the repair's own first attempt may not run beneath
+        // it. `TaskFold.rung` starts at 0 and `check_attempt_started`
+        // validates the attempt against `rungs[0]`, so a `task_spawned` this
+        // check let through is a repair running one tier below its floor.
+        ("a floor above the tier the chain starts at", |ladder| {
             ladder.floor = Some(Tier::Frontier);
         }),
         ("tiers that do not escalate", |ladder| {
@@ -2644,7 +2811,7 @@ const HINT_SHAPES: &[HintShape] = &[
     HintShape {
         id: "backslash",
         hints: &[r"src\backslash\deep"],
-        derives: Some(&["src/backslash/deep"]),
+        derives: None,
     },
     HintShape {
         id: "doubled",
@@ -3154,13 +3321,14 @@ fn an_attempt_runs_the_frozen_binding_or_the_validated_override() {
     let exact = attempt_started(&fold, ZETA, 0, 1, 0);
     accepts(&fold, &exact);
 
-    let cases: [(&str, BreakBinding); 4] = [
+    let cases: [(&str, BreakBinding); 5] = [
         ("agent", |binding| binding.agent = "copilot".to_owned()),
         ("model", |binding| {
             binding.model = "another-model".to_owned()
         }),
         ("tier", |binding| binding.tier = Tier::Frontier),
         ("effort", |binding| binding.effort = Effort::Medium),
+        ("pinned", |binding| binding.pinned = !binding.pinned),
     ];
     for (label, break_it) in cases {
         let mut binding = frozen_binding(&fold, ZETA, 0);
@@ -3389,6 +3557,56 @@ fn an_override_is_the_binding_the_frozen_admission_authorized_and_no_other() {
         ),
         FoldError::WrongQuestion { .. }
     ));
+}
+
+#[test]
+fn an_answer_may_not_take_an_option_its_admission_authorized_no_binding_for() {
+    let mut fold = started();
+    merge_task(&mut fold, ALPHA, 0, 0);
+    let mut spawn = repair_spawn(BETA, ALPHA, ALPHA);
+    let options = vec!["  Codex-CLI  ".to_owned(), "copilot".to_owned()];
+    clip_to_human_binding(&mut spawn, options.clone());
+    apply(&mut fold, &spawn_event(spawn));
+
+    let offered = question("q-binding-Ünicode", BETA).options.len();
+    assert_eq!(
+        (offered, options.len()),
+        (3, 2),
+        "the fixture under test offers more options than it authorizes bindings for"
+    );
+
+    let beyond = |binding_override| {
+        answered(
+            BETA,
+            "q-binding-Ünicode",
+            Answer4::Answered {
+                option_index: 2,
+                binding_override,
+            },
+        )
+    };
+
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(None)) else {
+        panic!("an option the question offers is not refused for being out of range");
+    };
+    assert_eq!(
+        detail,
+        "asked for a binding and this answer names none, so its task has no binding to run"
+    );
+
+    let override_at_two = BindingOverride {
+        key: BETA,
+        question: QuestionId::from("q-binding-Ünicode"),
+        option_index: 2,
+        agent: "claude-code".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        effort: Effort::XHigh,
+    };
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(Some(override_at_two)))
+    else {
+        panic!("an override at an option no binding was authorized for is refused as one");
+    };
+    assert_eq!(detail, "authorized 2 binding(s) and this chose 2");
 }
 
 #[test]
@@ -3899,9 +4117,7 @@ fn a_candidate_prepared_whose_record_failed_is_refused() {
     accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
     let mut failed = candidate_prepared(ZETA, 0, &base);
-    let TopologyEventBody::CandidatePrepared { data } = &mut failed.body else {
-        unreachable!("built as a candidate_prepared")
-    };
+    let data = candidate_prepared_mut(&mut failed);
     data.attempt.failure = Some(crate::events::FailureRecord {
         kind: crate::ladder::FailureKind::GateFailed,
         origin: crate::ladder::FailureOrigin::Worker,
@@ -3943,9 +4159,7 @@ fn a_candidate_prepared_whose_review_did_not_pass_is_refused() {
         accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
         let mut judged = candidate_prepared(ZETA, 0, &base);
-        let TopologyEventBody::CandidatePrepared { data } = &mut judged.body else {
-            unreachable!("built as a candidate_prepared")
-        };
+        let data = candidate_prepared_mut(&mut judged);
         assert!(data.attempt.failure.is_none());
         data.attempt
             .reviews
@@ -4019,9 +4233,7 @@ fn prepared_with_passes(
     passes: &[(&str, ReviewPassOutcome)],
 ) -> TopologyEvent {
     let mut event = candidate_prepared(key, 0, base);
-    let TopologyEventBody::CandidatePrepared { data } = &mut event.body else {
-        unreachable!("built as a candidate_prepared")
-    };
+    let data = candidate_prepared_mut(&mut event);
     data.attempt.reviews = passes
         .iter()
         .map(|(pass, outcome)| review_pass(pass, *outcome))
@@ -4241,9 +4453,7 @@ fn an_attempt_finished_whose_record_says_success_is_refused() {
     accepts(&fold, &settle(ZETA, 0, 1, closed()));
 
     let mut lying = settle(ZETA, 0, 1, closed());
-    let TopologyEventBody::AttemptFinished { data } = &mut lying.body else {
-        unreachable!("built as an attempt_finished")
-    };
+    let data = attempt_finished_mut(&mut lying);
     *data.record = attempt_record(1);
     assert!(data.record.is_successful());
 
@@ -4277,9 +4487,7 @@ fn an_attempt_finished_whose_record_names_another_attempt_is_refused() {
 
     for named in [0, 2, 9] {
         let mut misattributed = settle(ZETA, 0, 1, closed());
-        let TopologyEventBody::AttemptFinished { data } = &mut misattributed.body else {
-            unreachable!("built as an attempt_finished")
-        };
+        let data = attempt_finished_mut(&mut misattributed);
         data.record.attempt = named;
 
         let error = refuse(&fold, &misattributed);
@@ -5500,7 +5708,7 @@ fn a_wake_clears_every_waiter_in_one_delta() {
     assert_eq!(
         fold.task_state(ALPHA),
         Some(TaskState::Pending),
-        "the first deferred task woke"
+        "the first deferred task did not wake"
     );
     assert_eq!(
         fold.task_state(MID),
@@ -6308,6 +6516,271 @@ fn refused_live_and_on_replay(
 }
 
 #[test]
+fn a_continuation_is_offered_only_for_an_open_generation_no_attempt_has_used() {
+    let base = sha("base");
+    assert_eq!(
+        TopologyFold::new(inputs()).eligible_continuation(ZETA),
+        None,
+        "an unstarted run holds no generation to continue"
+    );
+
+    let mut fold = started();
+    assert_eq!(
+        fold.eligible_continuation(ZETA),
+        None,
+        "a task that has never been dispatched offers nothing"
+    );
+    assert_eq!(
+        fold.eligible_continuation(TaskKey(9)),
+        None,
+        "and neither does a key this run has no entry for"
+    );
+
+    apply(&mut fold, &dispatch(ZETA, 0, &base));
+    apply(
+        &mut fold,
+        &ev(TopologyEventBody::GenerationClosed {
+            data: GenerationClosed {
+                key: ZETA,
+                generation: GenerationId(0),
+                reason: GenerationCloseReason::WorktreeMissing,
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        }),
+    );
+    apply(&mut fold, &dispatch(ZETA, 1, &base));
+    assert_eq!(
+        fold.task(ZETA).expect("zeta").generations.len(),
+        2,
+        "the task holds a closed generation before the open one, or the identity below is \
+         satisfied by reading the first"
+    );
+    assert_eq!(
+        fold.eligible_continuation(ZETA),
+        Some(GenerationId(1)),
+        "the offer is the open generation, not the first one"
+    );
+
+    let start = attempt_started(&fold, ZETA, 1, 1, 0);
+    let mut in_flight = fold.clone();
+    apply(&mut in_flight, &start);
+    assert_eq!(
+        in_flight.eligible_continuation(ZETA),
+        None,
+        "an attempt is already running in it"
+    );
+
+    let mut retained = in_flight.clone();
+    apply(
+        &mut retained,
+        &settle(
+            ZETA,
+            1,
+            1,
+            AttemptSettlement::Retained {
+                retained_session: SessionId("sess-ÜNI-continuation".to_owned()),
+                retained_incarnation: Epoch(0),
+            },
+        ),
+    );
+    assert_eq!(
+        retained.eligible_continuation(ZETA),
+        None,
+        "a retained generation is retried in place, and that is `ready_retry`'s business"
+    );
+    assert!(retained.ready_retry(ZETA), "which it does offer");
+
+    let mut promoting = in_flight;
+    apply(&mut promoting, &candidate_prepared(ZETA, 1, &base));
+    assert_eq!(
+        promoting.eligible_continuation(ZETA),
+        None,
+        "a promoting generation has produced its candidate"
+    );
+
+    let mut ending = fold.clone();
+    apply(&mut ending, &budget_exceeded(0, None));
+    assert_eq!(
+        ending.eligible_continuation(ZETA),
+        None,
+        "a run that is ending starts nothing in an open generation"
+    );
+
+    let mut poisoned = fold;
+    poisoned.poison();
+    assert_eq!(
+        poisoned.eligible_continuation(ZETA),
+        None,
+        "a poisoned fold authorises nothing"
+    );
+
+    let quiet = lineage_with_a_dispatched_repair(None);
+    assert_eq!(
+        quiet.eligible_continuation(TaskKey(3)),
+        Some(GenerationId(0)),
+        "the repair's own generation is open with no attempt"
+    );
+    let asked = lineage_with_a_dispatched_repair(Some(ALPHA));
+    assert!(
+        asked.questions_open(),
+        "the question is open on the lineage root, not on the member"
+    );
+    assert_eq!(
+        asked
+            .task(TaskKey(3))
+            .and_then(TaskFold::open)
+            .map(|g| &g.class),
+        Some(&GenerationClass::OpenNoAttempt),
+        "and the member's generation is still open with no attempt"
+    );
+    assert_eq!(
+        asked.eligible_continuation(TaskKey(3)),
+        None,
+        "a lineage with an open question continues none of its members"
+    );
+}
+
+fn lineage_with_a_dispatched_repair(ask_about: Option<TaskKey>) -> TopologyFold {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    let mut fold = started();
+    let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+    let mut rejected = MergeRejected {
+        sequence: SequenceId(0),
+        candidate: candidate_of(ALPHA, 0),
+        rejecting_head: head.clone(),
+        disposition: RejectionDisposition::CodeRejected {
+            verification: verification_record(Verdict::Rejected),
+        },
+        repair: repair_spawn(TaskKey(3), ALPHA, ALPHA),
+        lease_effect: RejectionLeaseEffect::CreatesLineage {
+            root: ALPHA,
+            paths: region(ALPHA),
+        },
+    };
+    rejected.repair.entry.deps = Vec::new();
+    rejected.repair.entry.display_deps = Vec::new();
+    for event in [
+        dispatch(ALPHA, 0, &base),
+        start,
+        candidate_prepared(ALPHA, 0, &base),
+        candidate_created(ALPHA, 0),
+        verification_started(ALPHA, 0, 0, &head, &proposal),
+        ev(TopologyEventBody::MergeRejected {
+            data: Box::new(rejected),
+        }),
+    ] {
+        apply(&mut fold, &event);
+    }
+    apply(
+        &mut fold,
+        &ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key: TaskKey(3),
+                generation: GenerationId(0),
+                base_sha: base,
+                worktree_path: "/private/workspaces/tasks/k3-g0".to_owned(),
+                lease: LeaseGrant::InheritedLineage { root: ALPHA },
+                source_candidate: Some(candidate_of(ALPHA, 0)),
+            },
+        }),
+    );
+    if let Some(key) = ask_about {
+        assert!(
+            matches!(
+                refuse(&fold, &raised("q-lineage-Ünicode", key)),
+                FoldError::InconsistentRecord { .. }
+            ),
+            "no log reaches this state, which is why it is built by hand below"
+        );
+        let mut run = fold.run.take().expect("the fixture's run has started");
+        run.open_question(
+            &question("q-lineage-Ünicode", key),
+            QuestionOrigin::Admission,
+            None,
+        );
+        fold.run = Some(run);
+    }
+    fold
+}
+
+#[test]
+fn the_eligible_integration_candidate_is_the_first_the_queue_still_offers() {
+    let base = sha("base");
+    let head = sha("head");
+    let proposal = sha("proposal");
+    assert_eq!(
+        TopologyFold::new(inputs()).eligible_integration_candidate(),
+        None,
+        "an unstarted run queues nothing"
+    );
+    assert_ne!(
+        candidate_of(MID, 0),
+        candidate_of(ZETA, 0),
+        "the two queued candidates have to be distinguishable, or the identity below is \
+         satisfied by either"
+    );
+
+    let mut fold = two_queued();
+    assert_eq!(
+        fold.eligible_integration_candidate(),
+        Some(&candidate_of(MID, 0)),
+        "the queue is [mid, zeta] in creation order and the offer is its head"
+    );
+    assert!(fold.integration_admissible());
+
+    let mut parked = fold.clone();
+    apply(&mut parked, &raised("q-park-Ünicode", MID));
+    assert_eq!(
+        parked.eligible_integration_candidate(),
+        Some(&candidate_of(ZETA, 0)),
+        "the head is awaiting input, so the offer is the next candidate that is not"
+    );
+
+    let mut open = fold.clone();
+    apply(
+        &mut open,
+        &verification_started(MID, 0, 0, &head, &proposal),
+    );
+    assert_eq!(
+        open.eligible_integration_candidate(),
+        None,
+        "one integration transaction runs at a time"
+    );
+    assert!(!open.integration_admissible());
+
+    let mut ending = fold.clone();
+    apply(&mut ending, &budget_exceeded(0, None));
+    assert_eq!(
+        ending.eligible_integration_candidate(),
+        None,
+        "a run that is ending starts no integration"
+    );
+
+    let mut narrow = wide_started(1);
+    queue_candidate(&mut narrow, MID, 0);
+    assert_eq!(
+        narrow.eligible_integration_candidate(),
+        Some(&candidate_of(MID, 0)),
+        "with the one entitlement free the candidate is offered"
+    );
+    apply(&mut narrow, &dispatch(ZETA, 0, &base));
+    assert_eq!(
+        narrow.eligible_integration_candidate(),
+        None,
+        "and not while that entitlement is held elsewhere"
+    );
+
+    fold.poison();
+    assert_eq!(
+        fold.eligible_integration_candidate(),
+        None,
+        "a poisoned fold authorises nothing"
+    );
+}
+
+#[test]
 fn a_bare_question_is_refused_while_its_task_holds_an_open_generation() {
     for (class, events) in alpha_open_in_every_class() {
         let (fold, log) = folded(&events);
@@ -6667,6 +7140,24 @@ fn an_answer_is_refused_after_a_halt_or_a_budget_stop_in_the_same_epoch() {
     );
     apply(&mut halted, &resume(container_runner()));
     assert_eq!(halted.halted_at(), Some(ALPHA));
+    assert_eq!(halted.epoch(), Some(Epoch(1)));
+    accepts(&halted, &answer);
+    assert_eq!(
+        refuse(
+            &halted,
+            &ev(TopologyEventBody::DeferWaitElapsed {
+                data: DeferWaitElapsed4 {
+                    waited_ms: 30_000,
+                    round: 1,
+                },
+            })
+        ),
+        FoldError::RunEnding {
+            kind: "defer_wait_elapsed",
+            what: "a halting settlement",
+        },
+        "the resume that reopened the answer door also reopened the wait's"
+    );
 }
 
 fn budget_exceeded(epoch: u32, key: Option<TaskKey>) -> TopologyEvent {
@@ -6707,6 +7198,53 @@ fn a_budget_stop_belongs_to_the_epoch_that_hit_the_ceiling() {
         FoldError::InconsistentRecord { .. }
     ));
     accepts(&fold, &budget_exceeded(1, None));
+}
+
+#[test]
+fn a_budget_stop_records_a_ceiling_its_own_recorded_spend_reached() {
+    let fold = started();
+    let breach = |limit_usd: f64, spent_usd: f64| {
+        ev(TopologyEventBody::BudgetExceeded {
+            data: BudgetExceeded4 {
+                epoch: Epoch(0),
+                budget: BudgetKind::Run,
+                limit_usd,
+                spent_usd,
+                key: Some(ZETA),
+            },
+        })
+    };
+
+    accepts(&fold, &breach(12.5, 13.75));
+    accepts(&fold, &breach(12.5, 12.5));
+
+    let FoldError::InconsistentRecord { kind, detail } = refuse(&fold, &breach(12.5, 12.49)) else {
+        panic!("a stop for a ceiling its own spend has not reached is refused as one");
+    };
+    assert_eq!(kind, "budget_exceeded");
+    assert_eq!(
+        detail,
+        "it stops the run for a `run_usd` ceiling of 12.5 that its own recorded spend of 12.49 \
+         has not reached"
+    );
+
+    for (label, limit_usd, spent_usd) in [
+        ("an unordered spend", 12.5_f64, f64::NAN),
+        ("an unordered ceiling", f64::NAN, 13.75),
+        ("an unbounded ceiling", f64::INFINITY, 13.75),
+        ("an unbounded spend", 12.5, f64::INFINITY),
+    ] {
+        let FoldError::InconsistentRecord { kind, detail } =
+            refuse(&fold, &breach(limit_usd, spent_usd))
+        else {
+            panic!("{label} is refused as an inconsistent record");
+        };
+        assert_eq!(kind, "budget_exceeded");
+        assert!(
+            detail.contains("a budget is a finite number of dollars"),
+            "{label}: {detail}"
+        );
+    }
 }
 
 #[test]
@@ -6782,6 +7320,16 @@ fn a_wait_never_elapses_under_a_halt_or_a_budget_stop() {
             kind: "defer_wait_elapsed",
             what: "a halting settlement",
         }
+    );
+    apply(&mut halted, &resume(container_runner()));
+    assert_eq!(halted.epoch(), Some(Epoch(1)));
+    assert_eq!(
+        refuse(&halted, &elapsed),
+        FoldError::RunEnding {
+            kind: "defer_wait_elapsed",
+            what: "a halting settlement",
+        },
+        "a resume raised the ceiling a budget stop was against and it did the same to a halt"
     );
 
     let head = sha("head");
@@ -6901,6 +7449,7 @@ fn grid_state(
     let mut fold = started();
     fold.run = Some({
         let mut run = fold.run.take().expect("started");
+        run.epoch = Epoch(1);
         match shape {
             Shape::AllTerminal => {
                 for task in &mut run.tasks {
@@ -6977,7 +7526,7 @@ fn grid_state(
         run.budget_stop = match budget {
             Budget::None => None,
             Budget::Older => Some(BudgetStop {
-                epoch: Epoch(run.epoch.0 + 1),
+                epoch: Epoch(run.epoch.0 - 1),
                 budget: BudgetKind::Task,
             }),
             Budget::Current => Some(BudgetStop {
@@ -8105,8 +8654,15 @@ fn every_guarded_event_is_refused_the_same_way_live_and_on_a_hostile_replay() {
                 hostile.push(invalid);
                 hostile.extend_from_slice(&trace[index + 1..]);
                 assert!(
-                    hostile.len() == trace.len() && index < trace.len(),
-                    "{label}: the hostile log is the trace with one line replaced"
+                    hostile.len() == trace.len()
+                        && hostile
+                            .iter()
+                            .zip(&trace)
+                            .filter(|(written, original)| written != original)
+                            .count()
+                            == 1,
+                    "{label}: the hostile log is not the trace with exactly one line replaced, \
+                     so the perturbation is not a perturbation"
                 );
                 let parsed =
                     TopologyFold::parse_log(&wire(&hostile)).expect("the hostile log parses");
@@ -8200,18 +8756,44 @@ fn a_delta_carries_the_exact_event_it_was_checked_against() {
     }
 }
 
+const ASK: fn(&TopologyFold, &TopologyEvent) -> Result<TopologyDelta, FoldError> =
+    TopologyFold::plan_transition;
+
 #[test]
 fn a_refused_transition_changes_nothing() {
     let mut fold = started();
     merge_task(&mut fold, ALPHA, 0, 0);
     let before = fold.state().cloned();
+    let mut refused = 0_usize;
     for event in every_kind() {
-        let _ = fold.plan_transition(&event);
+        if ASK(&fold, &event).is_err() {
+            refused += 1;
+        }
     }
+    assert!(
+        refused > 1,
+        "this state has to refuse more than one kind, or the sweep asked nothing: {refused}"
+    );
     assert_eq!(
         fold.state().cloned(),
         before,
         "asking whether an event applies must not apply it"
+    );
+
+    let question = raised("q-park-Ünicode", ZETA);
+    let delta = ASK(&fold, &question).expect("a question on a pending task applies");
+    assert_eq!(
+        fold.state().cloned(),
+        before,
+        "and asking about an event that does apply must not apply it either"
+    );
+    fold.apply_delta(delta);
+    assert_ne!(
+        fold.state().cloned(),
+        before,
+        "applying the delta left the state where asking did, so the two assertions above are \
+         satisfied by a comparison that cannot see a change rather than by a reader that does \
+         not make one"
     );
 }
 
@@ -8538,7 +9120,11 @@ fn a_predicted_region_is_the_literal_prefix_of_every_hint() {
     }
     let mut windows = zeta.clone();
     windows.spec.path_hints = vec!["src\\Zebra\\mod.rs".to_owned()];
-    assert_eq!(predicted_region(&windows), prefixes(&["src/Zebra/mod.rs"]));
+    assert!(
+        predicted_region(&windows).is_repo_wide(),
+        "a backslash is an escape under the frozen grammar on one platform and a separator on \
+         the other, so a hint carrying one bounds nothing either way"
+    );
 }
 
 #[test]

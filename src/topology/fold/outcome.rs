@@ -33,8 +33,9 @@ impl RunState {
     }
 
     pub(super) fn structurally_admissible(&self) -> bool {
-        (0..self.tasks.len())
-            .map(|index| TaskKey(u32::try_from(index).unwrap_or(u32::MAX)))
+        let keys = u32::try_from(self.tasks.len()).unwrap_or(u32::MAX);
+        (0..keys)
+            .map(TaskKey)
             .any(|key| self.ready(key) || self.ready_retry(key))
             || self.integration_admissible()
     }
@@ -57,29 +58,29 @@ impl RunState {
                 .transaction
                 .as_ref()
                 .is_none_or(|open| open.candidate.key != key)
-            && self.dispatch_lease_check(key, entry)
+            && self.dispatch_lease_check(key, entry, task)
             && self.pipeline_reservable()
             && !self.run_is_ending()
     }
 
-    pub(super) fn dispatch_lease_check(&self, key: TaskKey, entry: &TaskEntry) -> bool {
+    pub(super) fn dispatch_lease_check(
+        &self,
+        key: TaskKey,
+        entry: &TaskEntry,
+        task: &TaskFold,
+    ) -> bool {
         if entry.lineage.is_some() {
             return true;
         }
-        let predicted = predicted_region(entry);
+        let Ok(generation) = u32::try_from(task.generations.len()) else {
+            return false;
+        };
         !self.leases.overlaps_another(
             LeaseOwner::Generation {
                 key,
-                generation: GenerationId(
-                    u32::try_from(
-                        self.tasks
-                            .get(key.index())
-                            .map_or(0, |task| task.generations.len()),
-                    )
-                    .unwrap_or(u32::MAX),
-                ),
+                generation: GenerationId(generation),
             },
-            &predicted,
+            &predicted_region(entry),
             &self.started.path_policy,
         )
     }
@@ -155,34 +156,35 @@ impl RunState {
         let blocked = self.blocked_tasks();
         self.tasks.iter().enumerate().all(|(index, task)| {
             task.state.is_terminal()
-                || (task.state == TaskState::Pending && blocked.contains(&index))
+                || (task.state == TaskState::Pending
+                    && u32::try_from(index).is_ok_and(|key| blocked.contains(&TaskKey(key))))
         }) && self.queue.is_empty()
             && !self.leases.any_candidate_or_lineage()
     }
 
-    pub(super) fn blocked_tasks(&self) -> BTreeSet<usize> {
+    pub(super) fn blocked_tasks(&self) -> BTreeSet<TaskKey> {
         let mut blocked = BTreeSet::new();
         loop {
             let mut grew = false;
             for (index, task) in self.tasks.iter().enumerate() {
-                if task.state != TaskState::Pending || blocked.contains(&index) {
+                let Ok(key) = u32::try_from(index).map(TaskKey) else {
+                    continue;
+                };
+                if task.state != TaskState::Pending || blocked.contains(&key) {
                     continue;
                 }
-                let Some(entry) = self
-                    .registry
-                    .get(TaskKey(u32::try_from(index).unwrap_or(u32::MAX)))
-                else {
+                let Some(entry) = self.registry.get(key) else {
                     continue;
                 };
                 let poisoned = entry.deps.iter().any(|dep| {
-                    blocked.contains(&dep.index())
+                    blocked.contains(dep)
                         || self
                             .tasks
                             .get(dep.index())
                             .is_some_and(|dep| dep.state == TaskState::Failed)
                 });
                 if poisoned {
-                    blocked.insert(index);
+                    blocked.insert(key);
                     grew = true;
                 }
             }
