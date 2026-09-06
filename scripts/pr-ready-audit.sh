@@ -4,12 +4,32 @@
 #
 #   scripts/pr-ready-audit.sh [--apply] [--enqueue] [--ready-label NAME] [PR ...]
 #
-# NAME must not be a lane:* label. The ready label is advisory: it reports that this audit found
-# the head it read READY. A GitHub label is not bound to a commit, so the head is read again
-# before the label is written and again after, and a label written across a push is removed
-# (HEAD-MOVED); that narrows the race, it cannot close it. The act bound to the audited head is
-# the enqueue, through `gh pr merge --match-head-commit`, and the base is read again just before
-# it (BASE-MOVED); nothing may treat the label alone as permission to merge.
+# NAME must not be a lane:* label. The ready label is advisory and is never permission: it says
+# that this audit found the head and base it read READY, nothing more. No tooling may read it as
+# leave to merge, and this audit never reads it back as input to any decision -- it is written,
+# reconciled and removed, and never consulted. A GitHub label is not bound to a commit, so the
+# pull request's identity (its head and its base, read together in one call) is read again before
+# the label is written and again after it, and the label is reconciled against the state the run
+# ends on: a label this run wrote across a push or a retarget is taken back (HEAD-MOVED,
+# BASE-MOVED).
+#
+# The act bound to the audited head is the enqueue, and it is the GraphQL `enqueuePullRequest`
+# mutation with `expectedHeadOid`, not `gh pr merge --merge --auto`: that command MERGES a pull
+# request whose base carries no merge-queue rule and which is already mergeable, so a retarget
+# between the audit's last confirmation and the call would land an unreviewed diff outright.
+# `enqueuePullRequest` can only queue, and fails without merging when the base has no queue.
+#
+# Nothing in that API binds the enqueue to the base, so the base is bound here: the head, the base
+# ref and the retarget timeline are confirmed immediately before the call, the queue entry is read
+# back afterwards and must hold the audited head, and the base and timeline are confirmed once
+# more. Anything that fails is withdrawn with `dequeuePullRequest`, and the withdrawal is
+# confirmed by reading the state back -- `gh pr merge --disable-auto` exits successfully on a
+# queued pull request having removed nothing, so no exit status is evidence here. Evidence that
+# cannot be read is UNCONFIRMED, never agreement.
+#
+# What is left is the interval between that final confirmation and the queue's own merge, which no
+# client can close; a retarget landing there is a `base_ref_changed` event after the review, which
+# the next audit reports as `retargeted-after-review`.
 #
 # --apply maintains the lane:* and ready label on each pull request. --enqueue adds every READY
 # pull request to the merge queue (`gh pr merge --merge --auto`) in the order the arguments give,
@@ -53,7 +73,12 @@
 # and ledger pushes: a repair-only push the owner reads and attests under step 5, a merge commit
 # that is not git's own merge of its parents, or a new change that needs another pass), MANUAL
 # (the review is prose the audit cannot judge: findings without ids, or a severity token outside
-# the numbered findings, so a person reads it), and NOT-READY with the blockers listed.
+# the numbered findings, so a person reads it), and NOT-READY with the blockers listed. With
+# --apply a READY pull request can still end HEAD-MOVED or BASE-MOVED (its head or its base moved
+# between the audit's read and one of the writes, so it is neither labelled nor enqueued, and a
+# label this run had already written is taken back), or UNCONFIRMED (an identity, timeline or
+# queue-state read failed, or a queue entry could not be confirmed present, absent or withdrawn;
+# every one of those fails closed on the same terms as a move).
 #
 # Only review comments posted by the repository owner count, and there is no override: the
 # owner is MAINTAINING's one trusted writer, and anyone else's comment carrying the markers is
@@ -70,7 +95,9 @@
 # commit outside the ledger.
 #
 # The pure parts (lane, severity sets, the two review parsers, the frontmatter id match, the
-# newest-check-run choice, the ledger-row parse) are functions, exercised by
+# newest-check-run choice, the ledger-row parse, the identity-drift comparison and the state it
+# implies) are functions, and so is the whole write sequence, which touches gh and no git and is
+# driven against a fake `gh` on PATH; all of it is exercised by
 # .github/scripts/test-pr-ready-audit.sh; sourcing this file with PR_READY_AUDIT_LIBRARY=1
 # defines them without running the audit.
 #
@@ -202,6 +229,33 @@ ledger_rows_from_body() {
     }'
 }
 
+# identity_drift WANT_HEAD WANT_BASE OBSERVED: what has moved between the head and base this audit
+# judged and the pair a later read observed, as one token, or nothing when the two agree. OBSERVED
+# is `pr_identity`'s "<headRefOid> <baseRefName>" (a ref name cannot contain a space, so the split
+# is exact). An empty or malformed observation is drift, not agreement: a re-read that failed must
+# not read as confirmation.
+identity_drift() {
+  local want_head="$1" want_base="$2" observed="$3" got_head got_base
+  if [[ "$observed" != *" "* ]]; then printf 'unconfirmed:re-read-failed'; return 0; fi
+  got_head="${observed%% *}"
+  got_base="${observed#* }"
+  if [[ -z "$got_head" || -z "$got_base" ]]; then printf 'unconfirmed:re-read-failed'; return 0; fi
+  if [[ "$got_head" != "$want_head" ]]; then printf 'head-moved:%s' "${got_head:0:7}"; return 0; fi
+  if [[ "$got_base" != "$want_base" ]]; then printf 'base-moved:%s' "$got_base"; return 0; fi
+  return 0
+}
+
+# drift_state DRIFT: the state a drift token leaves the pull request in. A token this function does
+# not recognise is UNCONFIRMED, not READY: an audit that cannot name what moved has confirmed
+# nothing.
+drift_state() {
+  case "$1" in
+    head-moved:*) echo HEAD-MOVED ;;
+    base-moved:*) echo BASE-MOVED ;;
+    *) echo UNCONFIRMED ;;
+  esac
+}
+
 # ---- GitHub-facing helpers ----------------------------------------------------------------------
 
 # Creates a label only when the repository has none of that name: an existing label, including
@@ -242,15 +296,222 @@ latest_review_id() {
   return 0
 }
 
-# retargeted_after PR ISO-TIME: succeeds when the pull request's base was changed after that
-# moment, which a review posted before it cannot have seen.
-retargeted_after() {
-  local when
-  for when in $(gh api "repos/$repo/issues/$1/timeline?per_page=100" --paginate \
-      --jq '.[] | select(.event == "base_ref_changed") | .created_at'); do
-    [[ "$when" > "$2" ]] && return 0
+# retarget_status PR ISO-TIME: "retargeted" when the pull request's base was changed after that
+# moment (which a review posted before it cannot have seen), "none" when the timeline was read and
+# holds no such change, and "unknown" when the timeline could not be read. The three are kept
+# apart deliberately: an unread timeline is not an absent retarget, and every caller here treats
+# "unknown" as a reason to stop rather than as agreement. `--paginate` fails the whole call when
+# any page fails, so a partial read cannot be reported as "none".
+retarget_status() {
+  local out when
+  if ! out="$(gh api "repos/$repo/issues/$1/timeline?per_page=100" --paginate \
+      --jq '.[] | select(.event == "base_ref_changed") | .created_at' 2>/dev/null)"; then
+    echo unknown
+    return 0
+  fi
+  for when in $out; do
+    [[ "$when" > "$2" ]] && { echo retargeted; return 0; }
   done
-  return 1
+  echo none
+}
+
+# pr_identity PR: the pull request's mutable identity, "<headRefOid> <baseRefName>", read in one
+# call so the head and the base are one observation rather than two moments. Prints nothing when
+# the read fails; identity_drift treats that as drift.
+pr_identity() {
+  gh pr view "$1" --repo "$repo" --json headRefOid,baseRefName \
+    --jq '"\(.headRefOid) \(.baseRefName)"' 2>/dev/null || true
+}
+
+# pr_node PR: the pull request's GraphQL node id, or nothing when the read fails.
+pr_node() {
+  gh pr view "$1" --repo "$repo" --json id --jq .id 2>/dev/null || true
+}
+
+# pr_queue_state PR: what the pull request's merge automation actually is right now, as
+# "<queued|not-queued|unknown> <auto|no-auto|unknown> <the queued commit, or ->", read in one
+# query so the three agree. An unreadable answer is "unknown unknown -", never "not-queued": no
+# caller here may read a failed request as evidence that nothing is queued.
+pr_queue_state() {
+  local out
+  out="$(gh api graphql -f owner="${repo%%/*}" -f name="${repo##*/}" -F number="$1" -f query='
+    query($owner:String!,$name:String!,$number:Int!) {
+      repository(owner:$owner,name:$name) {
+        pullRequest(number:$number) {
+          isInMergeQueue
+          autoMergeRequest { enabledAt }
+          mergeQueueEntry { headCommit { oid } }
+        }
+      }
+    }' --jq '.data.repository.pullRequest
+      | "\(if .isInMergeQueue then "queued" else "not-queued" end) \(if .autoMergeRequest then "auto" else "no-auto" end) \(.mergeQueueEntry.headCommit.oid // "-")"' 2>/dev/null)" || out=""
+  if [[ -z "$out" ]]; then printf 'unknown unknown -'; else printf '%s' "$out"; fi
+}
+
+# enqueue_pr PR NODE HEAD: put the pull request in its base branch's merge queue, and nothing
+# else. `enqueuePullRequest` is enqueue-only and `expectedHeadOid` binds it to the head this audit
+# judged. `gh pr merge --merge --auto` is deliberately not used here: when the base carries no
+# merge-queue rule and the pull request is already mergeable, that command merges it there and
+# then, so a retarget landing between this audit's last confirmation and the call would land an
+# unreviewed diff outright instead of queueing it, with no later check able to undo it. This
+# mutation has no such fallback -- it fails, merging nothing, when the base carries no queue.
+enqueue_pr() {
+  gh api graphql -f pr="$2" -f oid="$3" -f query='
+    mutation($pr:ID!,$oid:GitObjectID!) {
+      enqueuePullRequest(input:{pullRequestId:$pr,expectedHeadOid:$oid}) {
+        mergeQueueEntry { id }
+      }
+    }' >/dev/null 2>&1
+}
+
+# dequeue_pr PR NODE: take the pull request back out, and succeed only when it is out.
+# `dequeuePullRequest` acts on the queue entry itself. `gh pr merge --disable-auto` does not: on a
+# queued pull request it exits successfully having removed nothing, so it is called here only to
+# clear a pending auto-merge, and neither call's exit status is the evidence. The state is read
+# back afterwards, and that read is what this function reports.
+dequeue_pr() {
+  gh api graphql -f pr="$2" -f query='
+    mutation($pr:ID!) { dequeuePullRequest(input:{id:$pr}) { clientMutationId } }' >/dev/null 2>&1 || true
+  gh pr merge "$1" --repo "$repo" --disable-auto >/dev/null 2>&1 || true
+  local q_state q_auto q_head
+  read -r q_state q_auto q_head <<< "$(pr_queue_state "$1")"
+  [[ "$q_state" == not-queued && "$q_auto" == no-auto ]]
+}
+
+# base_drift PR HEAD BASE REVIEW_AT: the drift token for everything that can have moved under this
+# audit -- the head, the base ref name, and a retarget recorded after the review -- or nothing when
+# all three are confirmed unchanged. Timeline evidence that could not be read is `unconfirmed:`,
+# not agreement.
+base_drift() {
+  local drift
+  drift="$(identity_drift "$2" "$3" "$(pr_identity "$1")")"
+  if [[ -z "$drift" ]]; then
+    case "$(retarget_status "$1" "$4")" in
+      retargeted) drift="base-moved:retargeted" ;;
+      unknown) drift="unconfirmed:retarget-timeline-unreadable" ;;
+    esac
+  fi
+  printf '%s' "$drift"
+}
+
+# maintain_labels_and_enqueue PR LANE HEAD BASE STATE LABELS REVIEW_AT
+#
+# Everything --apply writes, in one sequence: the lane label, then the ready label, then the
+# enqueue. HEAD, BASE and LABELS are what the audit read and judged; REVIEW_AT is the review
+# comment's timestamp. It talks to gh and not to git, so it is driven whole against a fake `gh`
+# by .github/scripts/test-pr-ready-audit.sh.
+#
+# Every write is bracketed by a read of the pull request's identity, and the base is checked
+# wherever the head is: a retarget changes the diff exactly as a push does. The ready label is
+# reconciled against the state this run ENDS on, so a label this run wrote and then found stale
+# is taken back -- reconciling against the labels read before the write would leave it standing.
+#
+# The enqueue is `enqueuePullRequest`, which can only queue, bound to the head by
+# `expectedHeadOid`; the base is bound by confirming it immediately before the call, by reading
+# the queue entry back afterwards and requiring it to hold this head, and by confirming the base
+# and the retarget timeline again after the call. A queue entry that fails any of those is
+# withdrawn with `dequeuePullRequest` and the withdrawal is CONFIRMED by reading the state back:
+# no exit status is taken as evidence of anything. Evidence that cannot be read is UNCONFIRMED
+# everywhere, never agreement.
+#
+# The residue is the interval between that final confirmation and the queue's own merge, which no
+# client can close; a retarget landing there is a base change recorded after the review, which the
+# next audit reports as `retargeted-after-review`.
+maintain_labels_and_enqueue() {
+  local pr="$1" lane="$2" head="$3" base="$4" state="$5" labels="$6" review_at="$7"
+  local l drift wrote_ready=0
+
+  for l in lane:feature lane:findings-p1p2 lane:findings-p3; do
+    [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$l" >/dev/null
+  done
+  [[ " $labels " != *" lane:$lane "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "lane:$lane" >/dev/null
+
+  # Before the label: the label names no commit, so what it reports is only as good as the last
+  # look at the pull request.
+  if [[ "$state" == READY ]]; then
+    drift="$(identity_drift "$head" "$base" "$(pr_identity "$pr")")"
+    if [[ -n "$drift" ]]; then
+      echo "      $drift since the audit read ${head:0:7} on $base: not labelled, not enqueued"
+      state="$(drift_state "$drift")"
+    fi
+  fi
+
+  # After it: a push or a retarget that lands during the write leaves a label describing neither.
+  if [[ "$state" == READY ]]; then
+    if [[ " $labels " != *" $ready_label "* ]]; then
+      gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
+      wrote_ready=1
+    fi
+    drift="$(identity_drift "$head" "$base" "$(pr_identity "$pr")")"
+    if [[ -n "$drift" ]]; then
+      echo "      $drift while labelling ${head:0:7} on $base: not enqueued"
+      state="$(drift_state "$drift")"
+    fi
+  fi
+
+  # The node id the queue mutations address. Without it there is no enqueue and no withdrawal, so
+  # it is read before anything is queued rather than being needed for the first time afterwards.
+  local node=""
+  if [[ "$state" == READY ]] && ((enqueue)); then
+    node="$(pr_node "$pr")"
+    if [[ -z "$node" ]]; then
+      echo "      #$pr's node id could not be read: not enqueued"
+      state=UNCONFIRMED
+    fi
+  fi
+
+  # Before the enqueue: the timeline as well as the ref name, since a retarget away and back
+  # leaves the name it started with, and an unreadable timeline is not an absent retarget.
+  if [[ "$state" == READY ]] && ((enqueue)); then
+    drift="$(base_drift "$pr" "$head" "$base" "$review_at")"
+    if [[ -n "$drift" ]]; then
+      echo "      $drift since the audit read ${head:0:7} on $base: not enqueued"
+      state="$(drift_state "$drift")"
+    fi
+  fi
+
+  if [[ "$state" == READY ]] && ((enqueue)); then
+    if enqueue_pr "$pr" "$node" "$head"; then
+      # What was queued is read back, not assumed: the entry must exist and must hold this head,
+      # and the base and the timeline must still be what the audit judged.
+      local q_state q_auto q_head
+      drift="$(base_drift "$pr" "$head" "$base" "$review_at")"
+      if [[ -z "$drift" ]]; then
+        read -r q_state q_auto q_head <<< "$(pr_queue_state "$pr")"
+        case "$q_state" in
+          queued) [[ "$q_head" == "$head" ]] || drift="head-moved:${q_head:0:7}" ;;
+          not-queued) drift="unconfirmed:enqueue-left-no-entry" ;;
+          *) drift="unconfirmed:queue-state-unreadable" ;;
+        esac
+      fi
+      if [[ -z "$drift" ]]; then
+        echo "      enqueued #$pr at ${head:0:7} on $base"
+      elif dequeue_pr "$pr" "$node"; then
+        echo "      $drift after enqueuing ${head:0:7}: withdrawn, and the withdrawal read back"
+        state="$(drift_state "$drift")"
+      else
+        echo "      $drift after enqueuing ${head:0:7}: the withdrawal could NOT be confirmed; #$pr may still be queued"
+        state="$(drift_state "$drift")"
+      fi
+    else
+      # A refused enqueue is not a claim about anything: the mutation refuses an already-queued
+      # pull request, a head that has moved past expectedHeadOid, and a base with no merge queue
+      # alike. The state is read so the line says which, and nothing is withdrawn here -- a pull
+      # request already in the queue was put there by someone, and taking it out is not this
+      # branch's business.
+      local r_state r_auto r_head
+      read -r r_state r_auto r_head <<< "$(pr_queue_state "$pr")"
+      echo "      could not enqueue #$pr at ${head:0:7} on $base (it is $r_state, auto-merge $r_auto, entry ${r_head:0:7})"
+    fi
+  fi
+
+  # The ready label follows the state this run ends on, including a label this run wrote itself.
+  if [[ "$state" != READY ]] \
+    && { ((wrote_ready)) || [[ " $labels " == *" $ready_label "* ]]; }; then
+    gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
+    echo "      $ready_label removed from #$pr: the audit ends $state"
+  fi
+  return 0
 }
 
 # ---- the audit ----------------------------------------------------------------------------------
@@ -369,9 +630,10 @@ audit_one() {
     # changed after the review was posted is a diff the review never saw, and the workflow
     # form's base commit must lie on the current base branch (and, off master, not on master,
     # since the integration branch carries master's history too).
-    if retargeted_after "$pr" "$review_at"; then
-      blockers+=("retargeted-after-review")
-    fi
+    case "$(retarget_status "$pr" "$review_at")" in
+      retargeted) blockers+=("retargeted-after-review") ;;
+      unknown) blockers+=("retarget-timeline-unreadable") ;;
+    esac
   fi
 
   # Head movement since the reviewed commit, and the base the review was made against.
@@ -506,62 +768,7 @@ audit_one() {
   printf '%-5s %-14s %-8s %-13s %s\n' "#$pr" "$lane" "${head:0:7}" "$state" "$detail"
 
   if ((apply)); then
-    for l in lane:feature lane:findings-p1p2 lane:findings-p3; do
-      [[ "$l" != "lane:$lane" && " $labels " == *" $l "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$l" >/dev/null
-    done
-    [[ " $labels " != *" lane:$lane "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "lane:$lane" >/dev/null
-    # The ready label is a report of this audit at $head, not an authorisation: GitHub labels are
-    # not bound to a commit, so a push can always land between the audit and the label write.
-    # The head is read again before the write and again after it, and a label written across a
-    # move is removed; that narrows the window, it cannot close it. The act that is bound to the
-    # audited head is the enqueue, through --match-head-commit, and nothing may treat the label
-    # alone as permission to merge.
-    local now after_write
-    if [[ "$state" == READY ]]; then
-      now="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
-      if [[ "$now" != "$head" ]]; then
-        echo "      head moved to ${now:0:7} since the audit read ${head:0:7}: not labelled, not enqueued"
-        state=HEAD-MOVED
-      fi
-    fi
-    if [[ "$state" == READY ]]; then
-      [[ " $labels " != *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --add-label "$ready_label" >/dev/null
-      after_write="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
-      if [[ "$after_write" != "$head" ]]; then
-        gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
-        echo "      head moved to ${after_write:0:7} while labelling ${head:0:7}: label removed, not enqueued"
-        state=HEAD-MOVED
-      fi
-    fi
-    if [[ "$state" == READY ]]; then
-      if ((enqueue)); then
-        # The base is read again and the timeline re-checked just before the call: a base changed
-        # since the audit is a different diff, and --match-head-commit binds only the head. That
-        # narrows the base window to the call itself; a retarget after the enqueue lands in the
-        # queue on the new base with both contexts re-run there but without a review of that
-        # diff, and it is visible on the pull request's timeline as a base change after the
-        # review, which the next audit reports.
-        local base_now
-        base_now="$(gh pr view "$pr" --repo "$repo" --json baseRefName --jq .baseRefName)"
-        if [[ "$base_now" != "$base" ]] || retargeted_after "$pr" "$review_at"; then
-          echo "      base changed since the audit read $base: not enqueued"
-          state=BASE-MOVED
-        fi
-      fi
-    fi
-    if [[ "$state" == READY ]]; then
-      if ((enqueue)); then
-        # --match-head-commit binds the enqueue to the head this audit judged: a push that
-        # lands between the audit and this call makes GitHub refuse, never enqueue the newcomer.
-        if gh pr merge "$pr" --repo "$repo" --merge --auto --match-head-commit "$head" >/dev/null 2>&1; then
-          echo "      enqueued #$pr at ${head:0:7}"
-        else
-          echo "      could not enqueue #$pr at ${head:0:7} (head moved, already queued, or the ruleset has no merge queue yet)"
-        fi
-      fi
-    else
-      [[ " $labels " == *" $ready_label "* ]] && gh pr edit "$pr" --repo "$repo" --remove-label "$ready_label" >/dev/null
-    fi
+    maintain_labels_and_enqueue "$pr" "$lane" "$head" "$base" "$state" "$labels" "${review_at:-}"
   fi
   return 0
 }

@@ -206,10 +206,19 @@ Readiness to enqueue is the lane rule of 2026-09-06, audited by `scripts/pr-read
 which decides a pull request's lane from its branch prefix alone (`codex/findings-p3-*`,
 `codex/findings-*`, everything else), counts only the owner's review comments, keeps the `lane:*`
 and `ready-to-merge` labels current (a label is its output, never its input, and
-`ready-to-merge` is advisory: it reports the audit's verdict on the head it read, while the act
-bound to that head is the enqueue itself, which names the commit), and with `--enqueue` adds
-each ready pull request to the queue in the order its arguments give, so the caller states the
-priority. The
+`ready-to-merge` is advisory and never permission: no tooling may read it as leave to merge, it
+reports only the head and base the audit read, and a label the audit wrote is taken back when a
+re-read finds either has moved), and with `--enqueue` adds each ready pull request to the queue
+in the order its arguments give, so the caller states the priority. That enqueue is the GraphQL
+`enqueuePullRequest` mutation, which can only queue and fails without merging when the base
+carries no queue — `gh pr merge --merge --auto` would instead merge a mergeable pull request
+outright there — and `expectedHeadOid` binds it to the audited head. The base is bound by the
+audit: the base ref and the retarget timeline are confirmed immediately before the call and again
+after it, the queue entry is read back and must hold the audited head, and anything that fails is
+withdrawn with `dequeuePullRequest` and the withdrawal confirmed by reading the state back.
+Evidence that cannot be read is never agreement. What no client can close is the interval between
+that final confirmation and the queue's own merge; a retarget landing there is a base change
+recorded after the review, which the next audit reports. The
 P3 findings lane is ready only on a `PASS`; the P1/P2 findings lane fixes P0–P2 and files P3;
 feature and sweep work fixes P0–P1 and files P2 and P3, one file per finding under
 `reviews/findings/` with a `deferred` ledger row. A witnessed defect or a `MUST` deviation is
