@@ -163,10 +163,19 @@ pub struct ClassHistogram {
 
 impl ClassHistogram {
     /// How many samples the histogram accounts for.
-    pub const fn total(self) -> u32 {
-        self.none
-            .saturating_add(self.internal)
-            .saturating_add(self.after)
+    ///
+    /// Widened rather than saturated, because the answer is compared with a
+    /// claimed sample count and a saturating sum agrees with a claim it should
+    /// refuse: `{ none: u32::MAX, internal: 1, after: 0 }` accounts for one
+    /// sample more than `u32::MAX` and a `u32` sum said `u32::MAX`. Three
+    /// `u32`s cannot overflow a `u64`, so this is exact for every value of the
+    /// three fields and has no failure case to report.
+    pub const fn total(self) -> u64 {
+        // Widening casts, and the only reason they are casts rather than
+        // `u64::from`: the conversion trait is not const-callable on the MSRV
+        // and this stays a `const fn`. Every `u32` is a `u64`, so none of the
+        // three loses a bit, and their sum is at most 3 * (2^32 - 1).
+        self.none as u64 + self.internal as u64 + self.after as u64
     }
 }
 
@@ -302,6 +311,41 @@ pub enum RegistryError {
         found: EvidenceLabel,
         /// The label its phase requires.
         required: EvidenceLabel,
+    },
+
+    #[error(
+        "`{site}`'s `{phase}` entry is labelled {label:?} and carries {evidence:?} evidence; the \
+         label is the evidence's own shape and the two cannot disagree"
+    )]
+    LabelContradictsEvidence {
+        /// The site.
+        site: String,
+        /// The phase.
+        phase: String,
+        /// The label the entry carried.
+        label: EvidenceLabel,
+        /// The label its evidence's shape implies.
+        evidence: EvidenceLabel,
+    },
+
+    #[error(
+        "`{site}`'s no-execution record carries executed-hook evidence: the record asserts that \
+         this site did not run and the evidence names a test that watched a hook of it run"
+    )]
+    NoExecutionClaimsHook {
+        /// The site.
+        site: String,
+    },
+
+    #[error(
+        "`{site}`'s `{phase}` entry carries a not-executed record; a hook phase's evidence is the \
+         execution the harness observed, and only the no-execution record asserts an absence"
+    )]
+    HookClaimsNoExecution {
+        /// The site.
+        site: String,
+        /// The phase.
+        phase: String,
     },
 
     #[error("`{site}` records fault row {found} but the site's row is {expected}")]
@@ -476,7 +520,18 @@ impl FaultRegistry {
     }
 
     /// Add an entry, or say why it is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`validate_entry`] refuses the entry with, or
+    /// [`RegistryError::DuplicateEntry`] when this registry already holds an
+    /// entry at the same `(site, phase, order)` key. A refused entry is not
+    /// stored.
     pub fn insert(&mut self, entry: RegistryEntry) -> Result<(), RegistryError> {
+        // Propagated as it is: `validate_entry` is this function's format
+        // rule, its error already names the site, the phase and the field it
+        // refused, and `insert` knows nothing about the entry that the
+        // refusal does not already carry.
         validate_entry(&entry)?;
         if self.entries.iter().any(|held| held.key() == entry.key()) {
             return Err(RegistryError::DuplicateEntry {
@@ -524,6 +579,18 @@ impl FaultRegistry {
 /// hand-edited between a gate and a review never went through `insert`, and
 /// "the bijection check fails on a residue-class entry claiming executed-hook
 /// evidence" has to be true of that document too.
+///
+/// # Errors
+///
+/// Returns the first [`RegistryError`] the entry breaks, in this order: the
+/// fault-matrix row, the observable order, a no-execution record at a site the
+/// fast path does not skip, a coordinate the site does not have, the site's own
+/// residue rows, resume action and residue detail, the label the phase and the
+/// evidence each require, the pairing of phase kind with evidence kind, and
+/// last what the evidence itself must name. One error, not a list: `insert`
+/// stores nothing, so there is no partial acceptance for a caller to reason
+/// about, and the ordering is from the coordinate outwards so that the refusal
+/// a reader gets is about a coordinate that exists.
 pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
     let site = entry.site;
     let name = site.name();
@@ -557,6 +624,35 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
         return Err(RegistryError::NoExecutionNotSkipped { site: name });
     }
 
+    // Whether the site has this coordinate at all, before anything quotes
+    // what a fault at it leaves. `semantics` answers for a point from the
+    // point's own table and for a residue class without reading the class,
+    // so it answers for a coordinate the site does not have as readily as
+    // for one it does: checked in the other order, an entry naming a point
+    // this site does not expose was refused with `WrongResidueRows` quoting
+    // "this site's `{phase}` leaves ..." for a phase this site has no such
+    // phase of. The existence question is the one that has an answer.
+    match entry.phase {
+        EntryPhase::Point { point, mode } => {
+            if !site.exposes(point, mode) {
+                return Err(RegistryError::NoSuchPoint {
+                    site: name,
+                    point,
+                    mode,
+                });
+            }
+        }
+        EntryPhase::Residue { class } => {
+            if !site.registers(class) {
+                return Err(RegistryError::NoSuchResidueClass {
+                    site: name,
+                    class: class.name(),
+                });
+            }
+        }
+        EntryPhase::Before | EntryPhase::After | EntryPhase::NoExecution => {}
+    }
+
     // The expected residue and the tabled recovery are the site's own
     // semantics, not the entry's opinion of them. Without this an otherwise
     // complete entry can name an unrelated row — or none — describe residue
@@ -566,6 +662,12 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
     //
     // All three come from one call, so they cannot be checked against two
     // tables that disagree.
+    //
+    // §6: the four refusals below clone the entry's own words into the error.
+    // The error outlives this borrow of `entry` and is what quotes the
+    // document back to a reader, so an owned snapshot is the semantics — not a
+    // borrow-checker workaround. `expected` is the authority's answer and is
+    // moved or `&'static`, never cloned.
     let semantics = site.semantics(entry.phase);
     if entry.expected_residue.rows != semantics.rows {
         return Err(RegistryError::WrongResidueRows {
@@ -598,27 +700,6 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
         });
     }
 
-    match entry.phase {
-        EntryPhase::Point { point, mode } => {
-            if !site.exposes(point, mode) {
-                return Err(RegistryError::NoSuchPoint {
-                    site: name,
-                    point,
-                    mode,
-                });
-            }
-        }
-        EntryPhase::Residue { class } => {
-            if !site.registers(class) {
-                return Err(RegistryError::NoSuchResidueClass {
-                    site: name,
-                    class: class.name(),
-                });
-            }
-        }
-        EntryPhase::Before | EntryPhase::After | EntryPhase::NoExecution => {}
-    }
-
     // The load-bearing refusal, stated first and stated by itself: a residue
     // class is not a hook, and an entry that claims one executed is refused
     // whatever else about it is well-formed.
@@ -646,36 +727,40 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
             required: entry.phase.required_label(),
         });
     }
+    // A different proposition from the one above, and it needs its own
+    // variant to say so: the phase requires one label and the evidence's own
+    // shape implies another. Reported as `MislabelledEntry` this read "is
+    // labelled recovery-proven but its phase requires execution-observed" —
+    // false, because the check above has just established that the phase
+    // requires what the entry carries. The only pairing that reaches here is a
+    // residue class carrying a not-executed record.
     if entry.label != entry.evidence.label() {
-        return Err(RegistryError::MislabelledEntry {
+        return Err(RegistryError::LabelContradictsEvidence {
             site: name,
             phase: entry.phase.to_string(),
-            found: entry.label,
-            required: entry.evidence.label(),
+            label: entry.label,
+            evidence: entry.evidence.label(),
         });
     }
 
     // The two evidence shapes that are legal for a hook entry are legal only
     // for the phase kind that matches them: `NoExecution` records that nothing
-    // ran, and a before/after/point entry records that something did.
+    // ran, and a before/after/point entry records that something did. Neither
+    // is a labelling mistake — both entries carry the one label their phase
+    // and their evidence agree on — so neither is `MislabelledEntry`, which
+    // reported them as "labelled execution-observed but its phase requires
+    // execution-observed" and named no defect at all.
     match (&entry.phase, &entry.evidence) {
         (EntryPhase::NoExecution, Evidence::Executed { .. }) => {
-            return Err(RegistryError::MislabelledEntry {
-                site: name,
-                phase: entry.phase.to_string(),
-                found: EvidenceLabel::ExecutionObserved,
-                required: EvidenceLabel::ExecutionObserved,
-            });
+            return Err(RegistryError::NoExecutionClaimsHook { site: name });
         }
         (
             EntryPhase::Before | EntryPhase::After | EntryPhase::Point { .. },
             Evidence::NotExecuted { .. },
         ) => {
-            return Err(RegistryError::MislabelledEntry {
+            return Err(RegistryError::HookClaimsNoExecution {
                 site: name,
                 phase: entry.phase.to_string(),
-                found: EvidenceLabel::ExecutionObserved,
-                required: EvidenceLabel::ExecutionObserved,
             });
         }
         _ => {}
@@ -724,4 +809,281 @@ pub fn validate_entry(entry: &RegistryEntry) -> Result<(), RegistryError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::effects::{EventSite, ObjectSite};
+
+    /// The site's own order, or none where it has none.
+    fn order_of(site: EffectSiteId) -> Option<ObservableOrder> {
+        site.observable_orders().first().copied()
+    }
+
+    /// A sound entry, built from the site's own semantics.
+    ///
+    /// The semantics are this fixture's *preconditions*, not its oracle: every
+    /// test below first asserts that the entry as built is accepted, then
+    /// changes exactly one field and asserts which refusal that one change
+    /// produces. What is under test is the refusal, and the refusal is a
+    /// different function from the authority the fixture reads.
+    fn sound(site: EffectSiteId, phase: EntryPhase) -> RegistryEntry {
+        let semantics = site.semantics(phase);
+        RegistryEntry {
+            site,
+            phase,
+            order: if phase == EntryPhase::NoExecution {
+                None
+            } else {
+                order_of(site)
+            },
+            fault_row: site.fault_row(),
+            expected_residue: ExpectedResidue {
+                rows: semantics.rows,
+                detail: semantics.artifact.detail().to_owned(),
+            },
+            resume_action: semantics.action.text().to_owned(),
+            label: phase.required_label(),
+            evidence: match phase {
+                EntryPhase::Residue { .. } => Evidence::RecoveryProven {
+                    synthetic: site
+                        .residue_elements()
+                        .iter()
+                        .map(|element| SyntheticRecord {
+                            element: *element,
+                            constructed: true,
+                            classified: ObjectResidue::Internal,
+                            recovered: true,
+                        })
+                        .collect(),
+                    sampling: SamplingRecord {
+                        n: 4,
+                        histogram: ClassHistogram {
+                            none: 2,
+                            internal: 1,
+                            after: 1,
+                        },
+                        unclassified: 0,
+                        recovered: true,
+                    },
+                },
+                EntryPhase::NoExecution => Evidence::NotExecuted {
+                    test: "registry::tests::fixture".to_owned(),
+                    passed: true,
+                    sequences: vec!["fast/seq-0".to_owned()],
+                },
+                EntryPhase::Before | EntryPhase::After | EntryPhase::Point { .. } => {
+                    Evidence::Executed {
+                        test: "registry::tests::fixture".to_owned(),
+                        passed: true,
+                    }
+                }
+            },
+        }
+    }
+
+    /// A site whose commit-tree object work registers the internal class and
+    /// which exposes exactly one sub-effect point.
+    const COMMIT_TREE: EffectSiteId = EffectSiteId::Object(ObjectSite::CandidateCommitTree);
+    /// A site the fast integration path skips, and the only kind that may
+    /// carry a no-execution record.
+    const CHERRY_PICK: EffectSiteId = EffectSiteId::Object(ObjectSite::ProposalCherryPick);
+    /// A site with no sub-effect point and no residue class.
+    const APPEND: EffectSiteId = EffectSiteId::Event(EventSite::Append);
+
+    const INTERNAL: EntryPhase = EntryPhase::Residue {
+        class: ResidueClass::ObjectInternal,
+    };
+
+    #[test]
+    fn an_entry_labelled_for_anything_but_its_phase_names_both_labels() {
+        let mut entry = sound(COMMIT_TREE, EntryPhase::Before);
+        validate_entry(&entry).expect("the fixture is a sound before entry");
+        entry.label = EvidenceLabel::RecoveryProven;
+
+        let error = validate_entry(&entry).expect_err("a hook phase is observed by execution");
+        assert_eq!(
+            error,
+            RegistryError::MislabelledEntry {
+                site: COMMIT_TREE.name(),
+                phase: "before".to_owned(),
+                found: EvidenceLabel::RecoveryProven,
+                required: EvidenceLabel::ExecutionObserved,
+            },
+            "the refusal has to name the label carried and the label required"
+        );
+    }
+
+    #[test]
+    fn a_residue_entry_whose_evidence_is_a_not_executed_record_is_the_two_disagreeing() {
+        let mut entry = sound(COMMIT_TREE, INTERNAL);
+        validate_entry(&entry).expect("the fixture is a sound residue-class entry");
+        entry.evidence = Evidence::NotExecuted {
+            test: "registry::tests::contradiction".to_owned(),
+            passed: true,
+            sequences: vec!["fast/seq-0".to_owned()],
+        };
+
+        let error = validate_entry(&entry).expect_err("the label and the evidence disagree");
+        assert_eq!(
+            error,
+            RegistryError::LabelContradictsEvidence {
+                site: COMMIT_TREE.name(),
+                phase: INTERNAL.to_string(),
+                label: EvidenceLabel::RecoveryProven,
+                evidence: EvidenceLabel::ExecutionObserved,
+            },
+            "the refusal has to name the label the entry carried and the one its evidence implies"
+        );
+        // The proposition the old `MislabelledEntry` spelling asserted here was
+        // false: this entry's label is exactly what its phase requires, and the
+        // check above has already established that.
+        assert_eq!(entry.label, entry.phase.required_label());
+        assert!(
+            !error.to_string().contains("phase requires"),
+            "a refusal must not say the phase requires a label it does not: {error}"
+        );
+    }
+
+    #[test]
+    fn a_no_execution_record_carrying_executed_hook_evidence_is_refused() {
+        let mut entry = sound(CHERRY_PICK, EntryPhase::NoExecution);
+        validate_entry(&entry).expect("the fixture is a sound no-execution record");
+        entry.evidence = Evidence::Executed {
+            test: "registry::tests::watched_it_run".to_owned(),
+            passed: true,
+        };
+
+        let error = validate_entry(&entry)
+            .expect_err("a record of not running may not name a hook that did");
+        assert_eq!(
+            error,
+            RegistryError::NoExecutionClaimsHook {
+                site: CHERRY_PICK.name(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hook_phase_carrying_a_not_executed_record_is_refused() {
+        for phase in [
+            EntryPhase::Before,
+            EntryPhase::After,
+            EntryPhase::Point {
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::Kill,
+            },
+        ] {
+            let mut entry = sound(COMMIT_TREE, phase);
+            validate_entry(&entry).expect("the fixture is a sound hook entry");
+            entry.evidence = Evidence::NotExecuted {
+                test: "registry::tests::absence".to_owned(),
+                passed: true,
+                sequences: vec!["fast/seq-0".to_owned()],
+            };
+
+            let error = validate_entry(&entry)
+                .expect_err("only the no-execution record asserts an absence");
+            assert_eq!(
+                error,
+                RegistryError::HookClaimsNoExecution {
+                    site: COMMIT_TREE.name(),
+                    phase: phase.to_string(),
+                },
+                "{phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_point_the_site_does_not_expose_is_refused_before_its_semantics_are_quoted() {
+        let phase = EntryPhase::Point {
+            point: SubEffectPoint::Written,
+            mode: InjectionMode::Kill,
+        };
+        assert!(
+            !COMMIT_TREE.exposes(SubEffectPoint::Written, InjectionMode::Kill),
+            "the fixture needs a point this site does not expose"
+        );
+        let mut entry = sound(COMMIT_TREE, phase);
+        entry.expected_residue.detail = "some durable state or other".to_owned();
+
+        assert_eq!(
+            validate_entry(&entry).expect_err("no such point"),
+            RegistryError::NoSuchPoint {
+                site: COMMIT_TREE.name(),
+                point: SubEffectPoint::Written,
+                mode: InjectionMode::Kill,
+            },
+            "a coordinate the site does not have has no semantics to quote back"
+        );
+    }
+
+    #[test]
+    fn a_residue_class_the_site_does_not_register_is_refused_before_its_semantics_are_quoted() {
+        assert!(
+            !APPEND.registers(ResidueClass::ObjectInternal),
+            "the fixture needs a site that registers no class"
+        );
+        let mut entry = sound(APPEND, INTERNAL);
+        entry.expected_residue.rows = Vec::new();
+
+        assert_eq!(
+            validate_entry(&entry).expect_err("no such class"),
+            RegistryError::NoSuchResidueClass {
+                site: APPEND.name(),
+                class: ResidueClass::ObjectInternal.name(),
+            },
+            "a class the site does not register has no residue rows to quote back"
+        );
+    }
+
+    #[test]
+    fn the_histogram_totals_every_sample_it_holds_without_saturating() {
+        let histogram = ClassHistogram {
+            none: u32::MAX,
+            internal: 1,
+            after: 0,
+        };
+        assert_eq!(
+            histogram.total(),
+            u64::from(u32::MAX) + 1,
+            "a saturating sum answers u32::MAX here and agrees with an n it should refuse"
+        );
+        assert_eq!(ClassHistogram::default().total(), 0);
+        assert_eq!(
+            ClassHistogram {
+                none: 2,
+                internal: 1,
+                after: 1,
+            }
+            .total(),
+            4
+        );
+    }
+
+    #[test]
+    fn every_entry_phase_displays_the_spelling_its_refusals_are_read_in() {
+        assert_eq!(EntryPhase::Before.to_string(), "before");
+        assert_eq!(EntryPhase::After.to_string(), "after");
+        assert_eq!(EntryPhase::NoExecution.to_string(), "no-execution");
+        assert_eq!(INTERNAL.to_string(), "ObjectResidue::Internal");
+        assert_eq!(
+            EntryPhase::Point {
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::Kill,
+            }
+            .to_string(),
+            format!("{}/kill", SubEffectPoint::IdUnread)
+        );
+        assert_eq!(
+            EntryPhase::Point {
+                point: SubEffectPoint::IdUnread,
+                mode: InjectionMode::ErrorReturn,
+            }
+            .to_string(),
+            format!("{}/error-return", SubEffectPoint::IdUnread)
+        );
+    }
 }

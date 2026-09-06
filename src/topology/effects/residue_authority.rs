@@ -145,6 +145,36 @@ impl ResidueElement {
             | Self::RegisteredUnpopulatedWorktree => ObjectResidue::Internal,
         }
     }
+
+    /// The element's name, spelled the way the wire form spells it.
+    ///
+    /// The vocabulary owns its own operator spelling. `SWEEP-WORKTREE-008`
+    /// recorded the alternative: `worktree.rs`'s `Residue(element)` displays
+    /// `{element:?}`, and `bijection.rs` writes `{element:?}` into three of its
+    /// failures, so the words an operator reads are the derive's rather than
+    /// chosen ones. Matching `#[serde(rename_all = "snake_case")]` means the
+    /// name in a message and the name in a document are one name;
+    /// `every_residue_element_displays_the_spelling_serde_writes` holds them
+    /// together rather than leaving the two spellings free to drift.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::UnreferencedObject => "unreferenced_object",
+            Self::TemporaryObjectFile => "temporary_object_file",
+            Self::IndexLock => "index_lock",
+            Self::CherryPickHead => "cherry_pick_head",
+            Self::MergeHead => "merge_head",
+            Self::MergeMsg => "merge_msg",
+            Self::OrigHead => "orig_head",
+            Self::SequencerState => "sequencer_state",
+            Self::RegisteredUnpopulatedWorktree => "registered_unpopulated_worktree",
+        }
+    }
+}
+
+impl fmt::Display for ResidueElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_name())
+    }
 }
 
 /// How an entry's evidence was obtained.
@@ -247,9 +277,10 @@ pub enum BeforeState {
 /// every site the same after-phase: an effect that publishes something leaves
 /// it referenced by the site's own row, a commit-tree leaves an object nothing
 /// references, "the pruning sites' after-phase entries record the released
-/// objects as R27 residue", and a removal that releases nothing leaves the row
-/// that accounted for what it removed holding nothing. One `vec![self.row()]`
-/// answers all five the same way and is wrong for four of them.
+/// objects as R27 residue", a removal that releases nothing leaves the row
+/// that accounted for what it removed holding nothing, and a momentary hold is
+/// given back before the command returns. One `vec![self.row()]`
+/// answers all six the same way and is wrong for five of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AfterEffect {
@@ -266,6 +297,15 @@ pub enum AfterEffect {
     /// The removal is durable and released no object: the row that accounted
     /// for what it removed holds nothing.
     Removed,
+    /// The site took a hold and gave it back before it returned, so no row is
+    /// left holding it and a resume repeats the probe.
+    ///
+    /// Distinct from [`Self::NoEffect`], which is the read-only claim: this
+    /// site does perform an effect (it creates the lock file it probes) and is
+    /// classified `is_read_only() == false`. Distinct from [`Self::Referenced`]
+    /// because the hold is deliberately not retained — see
+    /// [`LockSite::after_effect`].
+    MomentaryHold,
 }
 
 /// The concrete artifacts a fault at one `(site, phase)` leaves, in the fault
@@ -321,10 +361,22 @@ pub enum ResidueArtifact {
     TornTailTruncated,
     /// `Event.OpenLog`'s `SyncPrefix` point.
     PrefixPossiblyNonDurable,
-    /// A Windows containment point.
+    /// A Windows containment point a coordinator kill leaves.
     NoHostProcess,
+    /// The Windows ambient join's *error* contract: the refusal precedes the
+    /// join, so nothing was spawned and nothing was terminated.
+    ///
+    /// A separate artifact from [`Self::NoHostProcess`] because the two modes
+    /// are at different states. `agent::proc::ambient::join_ambient_job_with`
+    /// applies the error-return hook *before* `join()` and the kill hook
+    /// *after* it, and refuses with "No process was spawned": no handle closes
+    /// and the kernel terminates nothing. `NoHostProcess`'s own words name a
+    /// mechanism that did not run.
+    NoProcessSpawned,
     /// A Unix containment point.
     ReaperHeldGroup,
+    /// A momentary hold the site took and gave back before it returned.
+    HoldReleased,
 }
 
 impl ResidueArtifact {
@@ -349,7 +401,9 @@ impl ResidueArtifact {
         Self::TornTailTruncated,
         Self::PrefixPossiblyNonDurable,
         Self::NoHostProcess,
+        Self::NoProcessSpawned,
         Self::ReaperHeldGroup,
+        Self::HoldReleased,
     ];
 
     /// The words an entry's `expected_residue.detail` must carry.
@@ -402,8 +456,16 @@ impl ResidueArtifact {
                 "no host process: the ambient handle closes and the kernel terminates the stub or \
                  tree"
             }
+            Self::NoProcessSpawned => {
+                "no host process: the refusal precedes the ambient join, so nothing was spawned \
+                 and nothing was terminated"
+            }
             Self::ReaperHeldGroup => {
                 "a process group the reaper settles while holding its shared cleanup hold, R28"
+            }
+            Self::HoldReleased => {
+                "the momentary hold was taken and given back before the command returned, so no \
+                 row is left holding it"
             }
         }
     }
@@ -448,6 +510,16 @@ pub enum ResumeAction {
     AmbientHandleTerminates,
     /// A Unix containment point: the reaper settles the group.
     ReaperSettlesGroup,
+    /// The Windows ambient join's error contract: the write command refuses
+    /// before any process exists.
+    ///
+    /// Not [`Self::RefuseResumably`], whose words are the event log's — "the
+    /// next open repeats the barrier" is the stable-prefix barrier, and a job
+    /// object has no open and no barrier.
+    RefuseUnspawned,
+    /// A momentary hold: it was given back before the command returned, and a
+    /// resume repeats the probe.
+    RepeatProbe,
 }
 
 impl ResumeAction {
@@ -463,6 +535,8 @@ impl ResumeAction {
         Self::RefuseResumably,
         Self::AmbientHandleTerminates,
         Self::ReaperSettlesGroup,
+        Self::RefuseUnspawned,
+        Self::RepeatProbe,
     ];
 
     /// The words an entry's `resume_action` must carry.
@@ -498,6 +572,14 @@ impl ResumeAction {
             }
             Self::ReaperSettlesGroup => {
                 "nothing to resume: the reaper settles the group while holding its cleanup hold"
+            }
+            Self::RefuseUnspawned => {
+                "nothing to resume: the write command refuses before the ambient join, and no \
+                 process was spawned"
+            }
+            Self::RepeatProbe => {
+                "nothing to resume: the momentary hold was given back before the command \
+                 returned, and the probe is repeated"
             }
         }
     }
@@ -870,12 +952,26 @@ impl LockSite {
     ///
     /// A hold is process-local OS state the row accounts for while it is held;
     /// `Release` ends it and releases no object.
+    ///
+    /// `ProbeCleanupExclusive` is the one site of the group that ends its own
+    /// hold. `rundir`'s `cleanup::take` takes `LOCK_EX | LOCK_NB` and then
+    /// `LOCK_UN` before it returns, and says why in its own words — "Do not
+    /// retain the lock in the conductor: arbitrary forked children would
+    /// inherit its open file description and recreate the false-liveness
+    /// window" — returning a lease that is a path and no hold. R17 is "the
+    /// coordinator's own lock holds (**OS lock state only**)", so after this
+    /// site's after hook R17 holds nothing of what the probe took, and a
+    /// resume cannot "adopt the completed effect": a new process holds no
+    /// cleanup lock and re-probes. `AcquireRun` and `AcquireWorktree` are the
+    /// contrast that makes this a site distinction and not an argument about
+    /// locks in general — each retains its `File` for the lifetime of the
+    /// guard, so R17 does hold their hold at their after hook.
     pub const fn after_effect(self) -> AfterEffect {
         match self {
-            Self::AcquireRun
-            | Self::AcquireWorktree
-            | Self::ProbeCleanupExclusive
-            | Self::CreateWorktreeLockFile => AfterEffect::Referenced,
+            Self::AcquireRun | Self::AcquireWorktree | Self::CreateWorktreeLockFile => {
+                AfterEffect::Referenced
+            }
+            Self::ProbeCleanupExclusive => AfterEffect::MomentaryHold,
             Self::Release => AfterEffect::Removed,
             Self::ObserveCleanupHold => AfterEffect::NoEffect,
         }
@@ -1018,8 +1114,21 @@ impl SubEffectPoint {
         }
     }
 
-    /// The artifacts a fault at this point leaves.
-    pub const fn residue_artifact(self) -> ResidueArtifact {
+    /// The artifacts a fault at this point in this mode leaves.
+    ///
+    /// The mode is half the coordinate here for the same reason it is half of
+    /// [`Self::resume_action`]'s, and this half was left behind: every point
+    /// but one leaves the same durable shape whichever way the fault arrives —
+    /// an `Err` injected *at* `Create` still created the log, and a partial
+    /// write is a partial write however it ended — but `AmbientJobJoined` does
+    /// not. `agent::proc::ambient::join_ambient_job_with` applies the
+    /// error-return hook **before** `join()` and the kill hook **after** it, so
+    /// a kill leaves the ambient handle to close and the kernel to terminate
+    /// the stub or tree, while an `Err` refuses with "No process was spawned"
+    /// and terminates nothing. One artifact for both gave the error-return
+    /// coordinate a kill's mechanism, which is the same contradiction between
+    /// an entry's two halves that [`Self::residue_rows`] was written to end.
+    pub const fn residue_artifact(self, mode: InjectionMode) -> ResidueArtifact {
         match self {
             Self::IdUnread => ResidueArtifact::IdNotRecorded,
             Self::Written => ResidueArtifact::UnsyncedBytes,
@@ -1028,10 +1137,13 @@ impl SubEffectPoint {
             Self::Create => ResidueArtifact::LogCreated,
             Self::TruncateTornTail => ResidueArtifact::TornTailTruncated,
             Self::SyncPrefix => ResidueArtifact::PrefixPossiblyNonDurable,
-            Self::AmbientJobJoined
-            | Self::CreatedSuspended
-            | Self::PrivateJobAssigned
-            | Self::Resumed => ResidueArtifact::NoHostProcess,
+            Self::AmbientJobJoined => match mode {
+                InjectionMode::Kill => ResidueArtifact::NoHostProcess,
+                InjectionMode::ErrorReturn => ResidueArtifact::NoProcessSpawned,
+            },
+            Self::CreatedSuspended | Self::PrivateJobAssigned | Self::Resumed => {
+                ResidueArtifact::NoHostProcess
+            }
             Self::ReaperStarted | Self::PreExecPgidAndRegister | Self::Exec | Self::Registered => {
                 ResidueArtifact::ReaperHeldGroup
             }
@@ -1070,10 +1182,15 @@ impl SubEffectPoint {
             // for both modes, and the packet says so of both.
             Self::SyncPrefix => ResumeAction::RefuseResumably,
             // "Spawn.AmbientJobJoined (once per process at startup; failure
-            // refuses the write command)".
+            // refuses the write command)". The refusal is not
+            // `RefuseResumably`: that action's words end "the next open repeats
+            // the barrier", which is the event log's stable-prefix barrier, and
+            // an ambient join has neither an open nor a barrier. What it does
+            // have is its own refusal, `AMBIENT_REFUSAL_PREFIX` + "No process
+            // was spawned".
             Self::AmbientJobJoined => match mode {
                 InjectionMode::Kill => ResumeAction::AmbientHandleTerminates,
-                InjectionMode::ErrorReturn => ResumeAction::RefuseResumably,
+                InjectionMode::ErrorReturn => ResumeAction::RefuseUnspawned,
             },
             Self::CreatedSuspended | Self::PrivateJobAssigned | Self::Resumed => {
                 ResumeAction::AmbientHandleTerminates
@@ -1082,5 +1199,373 @@ impl SubEffectPoint {
                 ResumeAction::ReaperSettlesGroup
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fmt::Debug;
+
+    use super::{
+        AfterEffect, BeforeState, EvidenceLabel, InjectionMode, LockSite, ObjectResidue,
+        ObservableOrder, ResidueArtifact, ResidueClass, ResidueElement, ResumeAction,
+        SubEffectPoint,
+    };
+    use crate::topology::effects::{EffectSiteId, EntryPhase};
+
+    /// The chain a successor function walks, from `seed` until it answers
+    /// `None` or the walk exceeds `bound`.
+    ///
+    /// The bound is what makes a cycle a failing test rather than a hang: a
+    /// successor edited into a loop returns a chain longer than `ALL` and the
+    /// comparison fails, where an unbounded walk would never return.
+    fn chain<T: Copy + PartialEq + Debug>(
+        seed: T,
+        successor: impl Fn(T) -> Option<T>,
+        bound: usize,
+    ) -> Vec<T> {
+        let mut walked = vec![seed];
+        while let Some(next) = walked.last().copied().and_then(&successor) {
+            walked.push(next);
+            if walked.len() > bound {
+                break;
+            }
+        }
+        walked
+    }
+
+    #[test]
+    fn every_all_constant_lists_its_whole_enum_in_declaration_order() {
+        // `ALL` is the domain five censuses claim: the distinct-detail and
+        // distinct-action checks in `topology::effects::tests`, the
+        // element-classification loop there and in `workspace_manager::tests`,
+        // and the codomain assertion. A hand-kept list can lose a variant
+        // silently — every one of those censuses then measures a truncated
+        // domain and passes, which §12 names as proving nothing about the
+        // whole. Each successor below is an exhaustive match, so a variant
+        // added to any of these enums does not compile until someone says
+        // where in the order it belongs, and the comparison then fails until
+        // `ALL` carries it.
+        assert_eq!(
+            chain(
+                ObjectResidue::None,
+                |value| match value {
+                    ObjectResidue::None => Some(ObjectResidue::Internal),
+                    ObjectResidue::Internal => Some(ObjectResidue::After),
+                    ObjectResidue::After => None,
+                },
+                ObjectResidue::ALL.len(),
+            ),
+            ObjectResidue::ALL,
+            "`ObjectResidue::ALL` is not the classifier's whole codomain"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueClass::ObjectInternal,
+                |value| match value {
+                    ResidueClass::ObjectInternal => None,
+                },
+                ResidueClass::ALL.len(),
+            ),
+            ResidueClass::ALL,
+            "`ResidueClass::ALL` is not every registrable class"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueElement::UnreferencedObject,
+                |value| match value {
+                    ResidueElement::UnreferencedObject => Some(ResidueElement::TemporaryObjectFile),
+                    ResidueElement::TemporaryObjectFile => Some(ResidueElement::IndexLock),
+                    ResidueElement::IndexLock => Some(ResidueElement::CherryPickHead),
+                    ResidueElement::CherryPickHead => Some(ResidueElement::MergeHead),
+                    ResidueElement::MergeHead => Some(ResidueElement::MergeMsg),
+                    ResidueElement::MergeMsg => Some(ResidueElement::OrigHead),
+                    ResidueElement::OrigHead => Some(ResidueElement::SequencerState),
+                    ResidueElement::SequencerState =>
+                        Some(ResidueElement::RegisteredUnpopulatedWorktree),
+                    ResidueElement::RegisteredUnpopulatedWorktree => None,
+                },
+                ResidueElement::ALL.len(),
+            ),
+            ResidueElement::ALL,
+            "`ResidueElement::ALL` is not every element the classifier recognises"
+        );
+
+        assert_eq!(
+            chain(
+                ResidueArtifact::Nothing,
+                |value| match value {
+                    ResidueArtifact::Nothing => Some(ResidueArtifact::TargetIntact),
+                    ResidueArtifact::TargetIntact => Some(ResidueArtifact::PrecursorDurable),
+                    ResidueArtifact::PrecursorDurable => Some(ResidueArtifact::NotReached),
+                    ResidueArtifact::NotReached => Some(ResidueArtifact::NoEffectPerformed),
+                    ResidueArtifact::NoEffectPerformed => Some(ResidueArtifact::Referenced),
+                    ResidueArtifact::Referenced => Some(ResidueArtifact::Unreferenced),
+                    ResidueArtifact::Unreferenced => Some(ResidueArtifact::Released),
+                    ResidueArtifact::Released => Some(ResidueArtifact::Removed),
+                    ResidueArtifact::Removed => Some(ResidueArtifact::IdNotRecorded),
+                    ResidueArtifact::IdNotRecorded => Some(ResidueArtifact::ObjectsUnreferenced),
+                    ResidueArtifact::ObjectsUnreferenced =>
+                        Some(ResidueArtifact::ObjectsAndAdministrativeResidue),
+                    ResidueArtifact::ObjectsAndAdministrativeResidue =>
+                        Some(ResidueArtifact::UnsyncedBytes),
+                    ResidueArtifact::UnsyncedBytes => Some(ResidueArtifact::UnsyncedLine),
+                    ResidueArtifact::UnsyncedLine => Some(ResidueArtifact::SyncedLine),
+                    ResidueArtifact::SyncedLine => Some(ResidueArtifact::LogCreated),
+                    ResidueArtifact::LogCreated => Some(ResidueArtifact::TornTailTruncated),
+                    ResidueArtifact::TornTailTruncated =>
+                        Some(ResidueArtifact::PrefixPossiblyNonDurable),
+                    ResidueArtifact::PrefixPossiblyNonDurable =>
+                        Some(ResidueArtifact::NoHostProcess),
+                    ResidueArtifact::NoHostProcess => Some(ResidueArtifact::NoProcessSpawned),
+                    ResidueArtifact::NoProcessSpawned => Some(ResidueArtifact::ReaperHeldGroup),
+                    ResidueArtifact::ReaperHeldGroup => Some(ResidueArtifact::HoldReleased),
+                    ResidueArtifact::HoldReleased => None,
+                },
+                ResidueArtifact::ALL.len(),
+            ),
+            ResidueArtifact::ALL,
+            "`ResidueArtifact::ALL` is not every artifact"
+        );
+
+        assert_eq!(
+            chain(
+                ResumeAction::ResumeUnperformed,
+                |value| match value {
+                    ResumeAction::ResumeUnperformed => Some(ResumeAction::NotExecuted),
+                    ResumeAction::NotExecuted => Some(ResumeAction::AdoptPerformed),
+                    ResumeAction::AdoptPerformed => Some(ResumeAction::ReclaimReleased),
+                    ResumeAction::ReclaimReleased => Some(ResumeAction::RepeatObservation),
+                    ResumeAction::RepeatObservation => Some(ResumeAction::AppendErrorProtocol),
+                    ResumeAction::AppendErrorProtocol => Some(ResumeAction::NextOpenConverges),
+                    ResumeAction::NextOpenConverges => Some(ResumeAction::RefuseResumably),
+                    ResumeAction::RefuseResumably => Some(ResumeAction::AmbientHandleTerminates),
+                    ResumeAction::AmbientHandleTerminates => Some(ResumeAction::ReaperSettlesGroup),
+                    ResumeAction::ReaperSettlesGroup => Some(ResumeAction::RefuseUnspawned),
+                    ResumeAction::RefuseUnspawned => Some(ResumeAction::RepeatProbe),
+                    ResumeAction::RepeatProbe => None,
+                },
+                ResumeAction::ALL.len(),
+            ),
+            ResumeAction::ALL,
+            "`ResumeAction::ALL` is not every action"
+        );
+
+        // The other two enums of the vocabulary carry no `ALL`, and their
+        // censuses name their variants directly; this test would be claiming
+        // more than it checks if either grew one unnoticed.
+        assert_eq!(
+            [
+                EvidenceLabel::ExecutionObserved,
+                EvidenceLabel::RecoveryProven
+            ]
+            .len(),
+            2
+        );
+        assert_eq!(
+            [
+                ObservableOrder::EffectBeforeEvent,
+                ObservableOrder::EventBeforeEffect
+            ]
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn every_artifact_and_action_displays_the_words_the_format_compares() {
+        // `validate_entry` compares an entry's text with `detail()` and
+        // `text()`. `Display` exists so a diagnostic can quote the same words;
+        // one that wrote anything else would give a reader a second wording of
+        // a claim the format decides by equality.
+        for artifact in ResidueArtifact::ALL {
+            assert_eq!(artifact.to_string(), artifact.detail(), "{artifact:?}");
+            assert!(!artifact.detail().trim().is_empty(), "{artifact:?}");
+        }
+        for action in ResumeAction::ALL {
+            assert_eq!(action.to_string(), action.text(), "{action:?}");
+            assert!(!action.text().trim().is_empty(), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn every_residue_element_displays_the_spelling_serde_writes() {
+        // The spelling in an operator message and the spelling in a document
+        // are one spelling, and this is what keeps them one: a `wire_name` arm
+        // edited away from its serde name fails here rather than surfacing as
+        // two vocabularies for one element.
+        for element in ResidueElement::ALL {
+            let wire = serde_json::to_string(element).expect("a fieldless enum serializes");
+            assert_eq!(wire, format!("\"{element}\""), "{element:?}");
+        }
+        let spellings: BTreeSet<String> = ResidueElement::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            spellings.len(),
+            ResidueElement::ALL.len(),
+            "one spelling for two elements is not a spelling: {spellings:?}"
+        );
+        // And it is not the derive's, which is what the operator messages in
+        // `workspace_manager::worktree` and `topology::effects::bijection`
+        // still carry (`SWEEP-WORKTREE-008`).
+        assert_ne!(
+            ResidueElement::IndexLock.to_string(),
+            format!("{:?}", ResidueElement::IndexLock)
+        );
+    }
+
+    #[test]
+    fn the_ambient_join_answers_a_different_residue_and_recovery_in_each_mode() {
+        let point = SubEffectPoint::AmbientJobJoined;
+        // `join_ambient_job_with` applies the error-return hook before
+        // `join()` and the kill hook after it, so the two modes are at
+        // different states and cannot share one residue.
+        assert_eq!(
+            point.residue_artifact(InjectionMode::Kill),
+            ResidueArtifact::NoHostProcess
+        );
+        assert_eq!(
+            point.residue_artifact(InjectionMode::ErrorReturn),
+            ResidueArtifact::NoProcessSpawned
+        );
+        // The kill's words name a mechanism the refusal does not run, which is
+        // what made one artifact for both a false claim at the error-return
+        // coordinate rather than a merely coarse one.
+        assert!(
+            ResidueArtifact::NoHostProcess
+                .detail()
+                .contains("the kernel terminates")
+        );
+        assert!(
+            !ResidueArtifact::NoProcessSpawned
+                .detail()
+                .contains("the kernel terminates")
+        );
+        assert!(
+            ResidueArtifact::NoProcessSpawned
+                .detail()
+                .contains("nothing was spawned")
+        );
+
+        assert_eq!(
+            point.resume_action(InjectionMode::Kill),
+            ResumeAction::AmbientHandleTerminates
+        );
+        assert_eq!(
+            point.resume_action(InjectionMode::ErrorReturn),
+            ResumeAction::RefuseUnspawned
+        );
+        // And the recovery is not the event log's refusal: that one ends at a
+        // barrier an ambient join has not got.
+        assert!(
+            ResumeAction::RefuseResumably
+                .text()
+                .contains("the next open repeats the barrier")
+        );
+        assert!(!ResumeAction::RefuseUnspawned.text().contains("barrier"));
+
+        // The split is this point's, not a blanket change: every other point
+        // leaves the same durable shape whichever way the fault arrives.
+        for other in SubEffectPoint::ALL
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != point)
+        {
+            assert_eq!(
+                other.residue_artifact(InjectionMode::Kill),
+                other.residue_artifact(InjectionMode::ErrorReturn),
+                "{other}"
+            );
+        }
+
+        // Through the parent, which is where an entry meets the authority.
+        let spawn = EffectSiteId::Process(crate::topology::effects::ProcessSite::Spawn);
+        let refused = spawn.semantics(EntryPhase::Point {
+            point,
+            mode: InjectionMode::ErrorReturn,
+        });
+        assert!(refused.rows.is_empty());
+        assert_eq!(refused.artifact, ResidueArtifact::NoProcessSpawned);
+        assert_eq!(refused.action, ResumeAction::RefuseUnspawned);
+    }
+
+    #[test]
+    fn the_cleanup_probe_gives_its_hold_back_and_leaves_no_row_holding_it() {
+        // `rundir`'s `cleanup::take` takes `LOCK_EX | LOCK_NB` and then
+        // `LOCK_UN` before it returns, deliberately; R17 is OS lock state
+        // only, so nothing of what the probe took survives its own after hook
+        // and no resume can adopt it.
+        assert_eq!(
+            LockSite::ProbeCleanupExclusive.after_effect(),
+            AfterEffect::MomentaryHold
+        );
+        let after =
+            EffectSiteId::Lock(LockSite::ProbeCleanupExclusive).semantics(EntryPhase::After);
+        assert!(
+            after.rows.is_empty(),
+            "the released hold is held by no row: {:?}",
+            after.rows
+        );
+        assert_eq!(after.artifact, ResidueArtifact::HoldReleased);
+        assert_eq!(after.action, ResumeAction::RepeatProbe);
+
+        // It is the only site of the group that gives its hold back. The two
+        // acquisitions retain their `File` for the guard's lifetime, so R17
+        // does hold theirs at their own after hook, and the lock-file creation
+        // leaves a file that outlives every run.
+        for retained in [
+            LockSite::AcquireRun,
+            LockSite::AcquireWorktree,
+            LockSite::CreateWorktreeLockFile,
+        ] {
+            assert_eq!(
+                retained.after_effect(),
+                AfterEffect::Referenced,
+                "{}",
+                retained.name()
+            );
+            assert_eq!(
+                EffectSiteId::Lock(retained)
+                    .semantics(EntryPhase::After)
+                    .rows,
+                vec![retained.row()],
+                "{}",
+                retained.name()
+            );
+        }
+        assert_eq!(LockSite::Release.after_effect(), AfterEffect::Removed);
+        assert_eq!(
+            LockSite::ObserveCleanupHold.after_effect(),
+            AfterEffect::NoEffect
+        );
+
+        // Not the read-only claim: the probe creates the lock file it probes,
+        // and the group's one read-only site is the hold observation.
+        assert!(!LockSite::ProbeCleanupExclusive.is_read_only());
+        assert!(LockSite::ObserveCleanupHold.is_read_only());
+        // Its before phase is unchanged: the probe requires no earlier
+        // artifact of its own.
+        assert_eq!(
+            LockSite::ProbeCleanupExclusive.before_state(),
+            BeforeState::Absent
+        );
+        // The words are its own, and neither the publication's nor the
+        // removal's.
+        assert!(
+            ResidueArtifact::HoldReleased
+                .detail()
+                .contains("given back")
+        );
+        assert!(!ResidueArtifact::Referenced.detail().contains("given back"));
+        assert!(
+            ResumeAction::RepeatProbe
+                .text()
+                .contains("the probe is repeated")
+        );
     }
 }
