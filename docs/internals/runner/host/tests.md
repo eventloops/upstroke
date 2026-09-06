@@ -2134,7 +2134,10 @@ capacity is smaller than its script. `F_SETPIPE_SZ` rounds a request up to the
 page size and reports the capacity it installed, so the 4096-byte request
 installs 65536 on a 64 KiB-page kernel. `marker_exceeding` sizes the payload
 from that reported capacity, plus `MARKER_MARGIN`, rather than from the
-request. A payload fixed at 16 KiB instead both fails an exact-equality check
+request. The margin is headroom over the capacity, not decoration: the oracle
+drains one byte before the fork, so the script has to exceed the pipe by more
+than the bytes drained for the writer to still be blocked when the fork
+happens. A payload fixed at 16 KiB instead both fails an exact-equality check
 on the return value and, without it, fits such a pipe whole: the writer would
 finish before the fork and the witness would observe nothing. That is
 `PR162-ASTRA-PAGE-SIZE`. `the_shim_script_exceeds_every_installed_pipe_capacity`
