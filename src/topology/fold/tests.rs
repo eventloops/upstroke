@@ -3392,6 +3392,56 @@ fn an_override_is_the_binding_the_frozen_admission_authorized_and_no_other() {
 }
 
 #[test]
+fn an_answer_may_not_take_an_option_its_admission_authorized_no_binding_for() {
+    let mut fold = started();
+    merge_task(&mut fold, ALPHA, 0, 0);
+    let mut spawn = repair_spawn(BETA, ALPHA, ALPHA);
+    let options = vec!["  Codex-CLI  ".to_owned(), "copilot".to_owned()];
+    clip_to_human_binding(&mut spawn, options.clone());
+    apply(&mut fold, &spawn_event(spawn));
+
+    let offered = question("q-binding-Ünicode", BETA).options.len();
+    assert_eq!(
+        (offered, options.len()),
+        (3, 2),
+        "the fixture under test offers more options than it authorizes bindings for"
+    );
+
+    let beyond = |binding_override| {
+        answered(
+            BETA,
+            "q-binding-Ünicode",
+            Answer4::Answered {
+                option_index: 2,
+                binding_override,
+            },
+        )
+    };
+
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(None)) else {
+        panic!("an option the question offers is not refused for being out of range");
+    };
+    assert_eq!(
+        detail,
+        "asked for a binding and this answer names none, so its task has no binding to run"
+    );
+
+    let override_at_two = BindingOverride {
+        key: BETA,
+        question: QuestionId::from("q-binding-Ünicode"),
+        option_index: 2,
+        agent: "claude-code".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        effort: Effort::XHigh,
+    };
+    let FoldError::WrongQuestion { detail, .. } = refuse(&fold, &beyond(Some(override_at_two)))
+    else {
+        panic!("an override at an option no binding was authorized for is refused as one");
+    };
+    assert_eq!(detail, "authorized 2 binding(s) and this chose 2");
+}
+
+#[test]
 fn an_interruption_closes_its_generation_and_returns_its_task_to_pending() {
     let base = sha("base");
     let mut fold = started();
