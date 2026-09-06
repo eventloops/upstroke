@@ -368,8 +368,16 @@ impl fmt::Display for DurableEvent {
 ///
 /// The value decides [`EffectSiteId::observable_orders`](crate::topology::effects::EffectSiteId::observable_orders), which is what the
 /// registry's order axis ranges over.
+///
+/// The wire form is the externally tagged enum: `{"before": "<tag>"}`,
+/// `{"after": "<tag>"}`, or `"none"`. That representation is what refuses a
+/// second key and an undeclared one. A `deny_unknown_fields` was carried here
+/// and did nothing — a newtype or unit variant has no field to deny on —
+/// measured by removing it and seeing every refusal in
+/// `tests::an_adjacency_round_trips_and_refuses_a_second_key_or_an_unknown_one`
+/// still hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum Adjacent {
     /// The effect precedes this append.
     Before(DurableEvent),
