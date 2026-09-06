@@ -39,6 +39,12 @@ Each of the three fixtures used to deserialize into nothing: the whole
 section vanished and its defaults took effect while `validate` reported a
 clean file (`SWEEP-CONFIG-PARSE-007`). The test is witnessed against removing
 the attribute above: without it the load succeeds and the section is dropped.
+The capture is built in memory -- a `FileSnapshot` holding the bytes, the
+state `snapshot_file` records for a file it has read -- and goes through
+`load_captured`, the same path `load` takes once its capture exists, so no
+temporary file, directory or cleanup is part of the oracle (§12): the suite's
+`scratch` helper writes predictable per-process paths with no owning guard,
+and a regression added by a sweep does not lean on it.
 
 ## `gates: Option<toml::Value>,`
 

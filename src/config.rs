@@ -983,26 +983,21 @@ mod tests {
 
     #[test]
     fn a_misspelled_top_level_section_is_refused_not_dropped() {
-        for (name, body, typo) in [
-            (
-                "misspelled-budgets.toml",
-                "[budgts]\nrun_usd = 15.0\n",
-                "budgts",
-            ),
-            (
-                "misspelled-interaction.toml",
-                "[interation]\nmode = \"never\"\n",
-                "interation",
-            ),
-            (
-                "misspelled-runner.toml",
-                "[runer]\nkind = \"container\"\n",
-                "runer",
-            ),
+        for (body, typo) in [
+            ("[budgts]\nrun_usd = 15.0\n", "budgts"),
+            ("[interation]\nmode = \"never\"\n", "interation"),
+            ("[runer]\nkind = \"container\"\n", "runer"),
         ] {
-            let path = scratch(name, body);
+            let captured = CapturedConfig {
+                repo: FileSnapshot {
+                    path: PathBuf::from("upstroke.toml"),
+                    required: true,
+                    content: Ok(Some(body.as_bytes().to_vec())),
+                },
+                pools: None,
+            };
             let mut warnings = Vec::new();
-            let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            let err = load_captured(&captured, EngineLimits::Fresh, &mut warnings)
                 .expect_err("an unknown top-level section is a typo, not silence");
             assert!(matches!(err, UpstrokeError::Config { .. }), "{typo}: {err}");
             let message = err.to_string();
