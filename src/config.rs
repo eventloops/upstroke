@@ -24,6 +24,7 @@ use crate::topology::events::RunnerKind;
 use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
@@ -978,6 +979,48 @@ mod tests {
         let err = load(Some(&absent), &hermetic(), Some(&missing()), &mut warnings)
             .expect_err("missing --config errors");
         assert!(matches!(err, UpstrokeError::Config { .. }));
+    }
+
+    #[test]
+    fn a_misspelled_top_level_section_is_refused_not_dropped() {
+        // Each of these used to deserialize into nothing: the whole section vanished and its
+        // defaults took effect while `validate` reported a clean file (SWEEP-CONFIG-PARSE-007).
+        for (name, body, typo) in [
+            (
+                "misspelled-budgets.toml",
+                "[budgts]\nrun_usd = 15.0\n",
+                "budgts",
+            ),
+            (
+                "misspelled-interaction.toml",
+                "[interation]\nmode = \"never\"\n",
+                "interation",
+            ),
+            (
+                "misspelled-runner.toml",
+                "[runer]\nkind = \"container\"\n",
+                "runer",
+            ),
+        ] {
+            let path = scratch(name, body);
+            let mut warnings = Vec::new();
+            let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+                .expect_err("an unknown top-level section is a typo, not silence");
+            assert!(matches!(err, UpstrokeError::Config { .. }), "{typo}: {err}");
+            let message = err.to_string();
+            assert!(
+                message.contains(typo),
+                "the refusal names the misspelled section: {message}"
+            );
+            assert!(
+                message.contains("`runner`") && message.contains("`budgets`"),
+                "the refusal lists the accepted sections: {message}"
+            );
+            assert!(
+                warnings.is_empty(),
+                "{typo}: this is a refusal, not a degraded warning"
+            );
+        }
     }
 
     #[test]

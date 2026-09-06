@@ -58,11 +58,12 @@ silently — the same explicit/discovered asymmetry [`read_pools`] states below
 for `--pools`. Once bytes exist, `toml::from_str` decides the rest and this
 function adds nothing to what it says: whatever `RawRepoConfig` accepts or
 refuses at the wire, this function's own contract is only the two file-absence
-branches above. `RawRepoConfig` itself still accepts a misspelled top-level
-section name — `[budgts]`, `[interation]`, `[runer]` — silently, deserializing
-it into nothing with no warning (`SWEEP-CONFIG-PARSE-007`, open, guarded to
-whichever of this file or `src/config.rs` sweeps that struct's definition;
-untouched here, since the fix lives in that struct, outside this file).
+branches above. What the wire refuses includes a misspelled top-level section
+name — `[budgts]`, `[interation]`, `[runer]` — which `RawRepoConfig` used to
+deserialize into nothing with no warning (`SWEEP-CONFIG-PARSE-007`, guarded to
+whichever of this file or `src/config.rs` swept first): the struct now denies
+unknown fields, the refusal names the typo and the accepted seven sections, and
+the regression through `load` lives in the parent's suite beside the struct.
 
 ## `pub(super) fn read_pools(`
 

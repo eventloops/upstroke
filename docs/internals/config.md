@@ -14,6 +14,21 @@ LEGACY-EFFECT: this module is in the **frozen legacy section** of
 `effects/allowlist.toml`, which carries its justification and the condition
 under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 
+## `#[serde(deny_unknown_fields)]`
+
+The top level of `upstroke.toml`. Its seven fields are exactly the sections
+`design/17` documents for the repo-level file, so an unknown section name is a
+typo and is refused naming it and the accepted seven. Before this attribute a
+misspelled header -- `[budgts]`, `[interation]`, `[runer]` -- deserialized into
+nothing: the whole section vanished, its defaults took effect (no budget
+ceiling; `on_block` interaction in CI; the host runner where the file read as
+confined) and `validate` reported a clean file. Every section reader below
+this struct already refused or named an unknown key; the top level was the one
+place a typo still deleted silently, and it deleted the largest unit
+(`SWEEP-CONFIG-PARSE-007`, closed by the sweep of `src/config/read.rs`). No
+forward-compatibility key is lost: nothing in the tree's fixtures, docs or
+examples writes a top-level key outside the seven.
+
 ## `gates: Option<toml::Value>,`
 
 Parsed as raw values so shape mistakes get actionable messages instead
