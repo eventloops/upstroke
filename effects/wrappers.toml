@@ -1047,12 +1047,24 @@ effectful = []
 effectful_unnameable = []
 effect_free = [
     "active_processes_with",
+    # The test-only group oracle and its lifecycle record. `observe_child_group`
+    # asks `waitid` with `WNOWAIT`, `getpgid` and on macOS `proc_pidinfo`,
+    # every one a read of process-table state that reaps, signals and moves
+    # nothing; `await_exit_without_reaping` blocks in the same `WNOWAIT` wait
+    # on a helper thread and leaves the child for its owner to reap. The rest
+    # read the record.
+    "await_exit_without_reaping",
     "child_leads_its_own_group",
     "deref",
     "deref_mut",
+    "exit_answer",
+    "fmt",
+    "had_exited_before_the_look",
+    "leads_own_group",
     # A pure decision over a memoised `Result`: it clones a message or returns
     # `Ok`, and touches nothing.
     "memoised_outcome",
+    "observe_child_group",
     "terminate_and_wait",
     "terminate_and_wait_with",
 ]

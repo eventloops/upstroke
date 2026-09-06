@@ -255,17 +255,94 @@ running, and keep the pipes open.
 
 ## `pub(crate) fn child_leads_its_own_group(pid: u32) -> bool {`
 
-Whether `pid` leads its own Unix process group.
+Whether `pid` leads its own Unix process group: the decision of one
+`observe_child_group` record, for callers that want only the answer.
 
 The independent witness that `Spawn.PreExecPgidAndRegister`'s operation ran
-in the forked child. Asks the kernel, not this crate: `getpgid(pid) == pid`
-is true exactly when the pre-exec closure's `setpgid(0, 0)` ran. A child
-that has exited but not been reaped still answers, because its pid is
-pinned by the zombie.
+in the forked child. Asks the kernel, not this crate: the child leads its
+own group exactly when the pre-exec closure's `setpgid(0, 0)` ran, and a
+process's group at death is the group it was given before `exec`, because
+neither `sh` nor this test binary moves itself afterwards.
 
 Test-only on purpose: as a production guard it could only ever *withhold*
 the point, never add information (see the comment at the injection
 coordinate).
+
+## `pub(crate) struct GroupObservation {`
+
+One look at a child's process group, with the lifecycle around it, so a
+false answer carries its own explanation. In order taken: `exited_before`
+(`waitid` with `WEXITED | WNOHANG | WNOWAIT`, the supervisor loop's own
+question, which reaps nothing), `group` (`getpgid`, or the errno it failed
+with), on macOS `zombie_group` (`proc_pidinfo` with
+`PROC_PIDT_SHORTBSDINFO` and the non-zero argument that asks for an
+exited, unreaped record, or its errno), then `exited_after`. `Display`
+renders the whole record, and every assertion that used to print
+`[false]` prints it.
+
+### `pub(crate) fn leads_own_group(&self) -> bool {`
+
+`getpgid` answered: it leads its group when the answer is its own pid. On
+XNU an exited, unreaped child does not answer: `proc_exit` moves the
+process onto the zombie list and marks it invisible to `proc_find`, which
+`getpgid` uses, so the call fails with `ESRCH` while the pid is still
+pinned by the zombie. Linux keeps answering for a zombie. Measured on
+the runner CI uses (macOS 26, `macos-26-arm64` image 20260831.0337.3,
+run 34001563243, job 101401235904, at `65d3df5`): "pid 16222: before the
+look exited, unreaped; getpgid failed: No such process (os error 3);
+proc_pidinfo(PROC_PIDT_SHORTBSDINFO, zombie) answered pgid 16222 status
+5; after the look exited, unreaped" — status 5 is `SZOMB`. So on macOS
+alone, `ESRCH` falls through to the exited record, whose `pbsi_pgid` is
+the `p_pgrpid` the process died with; any other errno, or no record, is
+`false`. `a_child_left_in_this_processs_group_never_answers_for_its_own`
+holds the fall-through honest: the record of a child nothing moved names
+this process's group, not its own.
+
+This is the standing macOS red `W2-MACOS-HOST-CONTAINMENT-ROLE-GROUP-
+FINGERPRINT`: `every_role_reaches_the_containment_points_of_this_platform`
+looks at the child in `child_created`, right after `spawn` returns, and a
+child that has already run to exit by then read as "not leading its own
+group" — every sighting on one of the three roles whose child is this test
+binary running no test, none on the two whose child is `sh -c 'exit 0'`.
+The observation was wrong, not the containment: the pre-exec `setpgid`
+had run, or `spawn` would have returned `Err`.
+
+### `pub(crate) fn had_exited_before_the_look(&self) -> bool {`
+
+Whether the child was already an exited, unreaped zombie when `group` was
+asked. A test that wants to witness the exited case asserts this first, so
+a child that outlived the look cannot pass it for the wrong reason.
+
+## `pub(crate) fn observe_child_group(pid: u32) -> GroupObservation {`
+
+Takes the record above, in the order its fields are listed. A pid that no
+`pid_t` or `id_t` can carry yields a record of `EINVAL`s with pid `-1`,
+which leads nothing.
+
+## `fn zombie_group_answer(pid: libc::pid_t) -> Result<ZombieGroupAnswer, i32> {`
+
+The macOS exited-record query. The non-zero third argument of
+`proc_pidinfo` is what `group_has_non_zombie_members` already passes: it
+selects `proc_find_zombref`, which finds a process that has started
+exiting and not yet been reaped. A short read is `EIO`, a failed one its
+errno.
+
+## `pub(crate) fn await_exit_without_reaping(pid: u32, budget: Duration) -> Result<(), String> {`
+
+Blocks until the child has exited, leaving it a zombie for its owner to
+reap: `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a helper thread, the
+result handed back over a channel with `recv_timeout(budget)`. The exit
+itself is the signal, so no test sleeps to guess at it; the budget bounds
+a wedged child, not a healthy one. On a timeout the thread stays in its
+wait until the caller kills and reaps the child, which ends it with
+`ECHILD`; its `send` then finds no receiver, and that discarded result is
+the whole of its failure path. The one caller of that path kills, waits
+and panics with the budget.
+
+## `fn exited_unreaped(pid: libc::id_t) -> std::io::Result<bool> {`
+
+The body `child_exited_unreaped` had, by pid, so the supervisor loop and
+`observe_child_group` ask the kernel the same question the same way.
 
 ## `mod ambient;`
 
