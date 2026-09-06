@@ -9,7 +9,8 @@ as it is in the source, so the heading is the grep string that finds the code.
 ## Module
 
 `host-v1`'s environment contract: the platform's name rule, and the
-composition of base, reserved values and overlay (DESIGN.md:258-264).
+composition of base, reserved values and overlay
+(`design/08_design_trait_surface.md:57-63`).
 
 The vocabulary this composes over -- `RESERVED_ALWAYS`,
 `CREDENTIAL_LOCATIONS`, [`reserved_keys`] and [`supplies_credentials`] --
@@ -95,9 +96,10 @@ A reserved key the base does not carry is **not** supplied: setting an
 absent variable to the empty string is a different environment from not
 setting it, and several CLIs read "set but empty" as an instruction.
 
-DESIGN.md:259-262 — "the host runner starts from the Upstroke environment
-and the container runner from the image environment; **each** supplies
-role-scoped `HOME`, `PATH`, and credential locations" — resolved for
+`design/08_design_trait_surface.md:57-63` — "the host runner starts from the
+Upstroke environment and the container runner from the image environment;
+each supplies role-scoped `HOME`, `PATH`, and credential locations" —
+resolved for
 `host-v1` as follows, and the split is deliberate:
 
 * **credential locations are role-scoped**, by
@@ -111,9 +113,9 @@ role-scoped `HOME`, `PATH`, and credential locations" — resolved for
   from live passages — three of them, each forbidding a different part
   of a per-role value:
 
-  1. DESIGN.md:263 — "Probe and execution compose the **same** base,
-     mounts, reserved values, and overlay, so pre-flight certifies the
-     environment that will actually spend." `probe(<agent>)`,
+  1. `design/08_design_trait_surface.md:61-62` — "Probe and execution
+     compose the **same** base, mounts, reserved values, and overlay, so
+     pre-flight certifies the environment that will actually spend." `probe(<agent>)`,
      `implement` and `review` are the probe and the execution that
      sentence pairs; a `HOME` differing across them would make
      pre-flight certify an environment the attempt never runs in.
@@ -153,7 +155,8 @@ setting it, and several CLIs read "set but empty" as an instruction.
 
 ## `impl HostEnvironment` › `pub fn compose(`
 
-Base, then reserved values, then overlay — DESIGN.md:263's own order
+Base, then reserved values, then overlay —
+`design/08_design_trait_surface.md:61-62`'s own order
 ("the same base, mounts, reserved values, and overlay").
 
 The base's own copies of the **reserved** keys are dropped before the
