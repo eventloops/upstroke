@@ -230,24 +230,45 @@ What a killed process leaves behind is still one uniquely named `.tmp` that no
 reader of the directory interprets and that the next publication cannot collide
 with; no guard runs in a process that is gone.
 
-## `fn create_directory_durably(directory: &Path) -> Result<(), UpstrokeError> {`
+## `fn create_directory_durably(`
 
-`create_dir_all`, with the durability `create_dir_all` does not give. A new
-directory is a new entry in its parent, and an entry that has not been flushed
-is one a power loss can take back — together with everything published inside
-it, however carefully that was flushed. So the missing suffix of the path is
-found first (walking up until a component exists; a component that is there
-but is not a directory is left for `create_dir_all` to refuse, naming the
-directory the operator asked for), the directories are created by the one
-primitive, and then each created component's parent is flushed, outermost
-first, so that by the time the destination directory itself is flushed after
-the rename every entry above it is on disk too. Pass 1 of the recovery review
-(`SWEEP-CONNECT-009`) found the first `connect` into a `~/.upstroke/` that did
-not exist claiming a durability it had only for the file.
+`create_dir_all`, with the durability `create_dir_all` does not give, and with
+ownership decided by the primitive rather than by a look beforehand.
 
-The walk stops at `.` or a root, which always exist. A race — another process
-creating the same directory between the walk and `create_dir_all` — costs one
-flush of an entry that was already there, never a missing one.
+A new directory is a new entry in its parent, and an entry that has not been
+flushed is one a power loss can take back — together with everything published
+inside it, however carefully that was flushed. So every component of the path
+that has a name (a root, a prefix and `.` have none and are never created) is
+created in turn, outermost first, with `create_dir` rather than `create_dir_all`:
+`create_dir` answers *this call made this entry* or `AlreadyExists`, and only an
+entry this call made is flushed in its parent, immediately, before the next
+component is attempted. Pass 1 of the recovery review (`SWEEP-CONNECT-009`)
+found the first `connect` into a `~/.upstroke/` that did not exist claiming a
+durability it had only for the file; pass 2 (`SWEEP-CONNECT-012`) found the
+first repair deciding what it had created from a scan made *before*
+`create_dir_all`, which a concurrent removal between the two turned into an
+unflushed recreation — check-then-act against shared filesystem state, which
+§10 forbids. Nothing is inferred now: the flush follows the create's own `Ok`.
+
+The two interleavings that shared state admits have defined outcomes, each
+pinned by a test that runs the other party inside the flush step, which is the
+one point between two creations: another process removing a component this
+call just made makes the next `create_dir` fail with `NotFound`, reported as a
+failed directory creation naming the component that could not be made; another
+process removing and recreating it makes that component theirs — `create_dir`
+says so by refusing to make it twice — and this call flushes only the entries
+it made, which is §8's ownership rule ("removes only what this operation can
+prove it owns") applied to flushing. An `AlreadyExists` whose occupant is not a
+directory is refused naming that component, so a `--pools` whose parent is a
+regular file still reports the failed directory creation naming that parent.
+
+The flush is a parameter (`util::fsync_dir` in production, the one call site
+in [`publish_pools`]) so a test can record *which* entries were flushed and in
+what order rather than counting them; the count through the real barrier is
+witnessed separately by
+`a_publication_into_directories_it_creates_flushes_each_new_entry_in_its_parent`,
+which runs `write_pools` end to end, so a call site handing in a no-op is
+caught there.
 
 ## `struct Staged {`
 

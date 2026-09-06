@@ -181,7 +181,7 @@ fn publish_pools(
             ),
         });
     };
-    create_directory_durably(named)?;
+    create_directory_durably(named, util::fsync_dir)?;
     let destination = publication_target(path)?;
     let Some(directory) = publication_directory(&destination) else {
         return Err(UpstrokeError::Refused {
@@ -213,42 +213,53 @@ fn publish_pools(
     })
 }
 
-fn create_directory_durably(directory: &Path) -> Result<(), UpstrokeError> {
-    let mut missing: Vec<PathBuf> = Vec::new();
-    let mut probe = directory;
-    loop {
-        match fs::metadata(probe) {
-            Ok(_) => break,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(probe.to_path_buf());
+fn create_directory_durably(
+    directory: &Path,
+    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), UpstrokeError> {
+    let mut components: Vec<&Path> = directory
+        .ancestors()
+        .filter(|ancestor| ancestor.file_name().is_some())
+        .collect();
+    components.reverse();
+    for component in components {
+        match fs::create_dir(component) {
+            Ok(()) => {
+                let Some(parent) = publication_directory(component) else {
+                    continue;
+                };
+                flush(parent).map_err(|source| UpstrokeError::Filesystem {
+                    operation: "flush the directory of created directory",
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing =
+                    fs::metadata(component).map_err(|source| UpstrokeError::Filesystem {
+                        operation: "read the kind of directory",
+                        path: component.to_path_buf(),
+                        source,
+                    })?;
+                if !existing.is_dir() {
+                    return Err(UpstrokeError::Filesystem {
+                        operation: "create directory",
+                        path: component.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "exists and is not a directory",
+                        ),
+                    });
+                }
             }
             Err(source) => {
                 return Err(UpstrokeError::Filesystem {
-                    operation: "read the kind of directory",
-                    path: probe.to_path_buf(),
+                    operation: "create directory",
+                    path: component.to_path_buf(),
                     source,
                 });
             }
         }
-        match publication_directory(probe) {
-            Some(parent) if parent != probe => probe = parent,
-            _ => break,
-        }
-    }
-    fs::create_dir_all(directory).map_err(|source| UpstrokeError::Filesystem {
-        operation: "create directory",
-        path: directory.to_path_buf(),
-        source,
-    })?;
-    for created in missing.iter().rev() {
-        let Some(parent) = publication_directory(created) else {
-            continue;
-        };
-        util::fsync_dir(parent).map_err(|source| UpstrokeError::Filesystem {
-            operation: "flush the directory of created directory",
-            path: parent.to_path_buf(),
-            source,
-        })?;
     }
     Ok(())
 }
@@ -783,6 +794,100 @@ mod tests {
             after.directory - before.directory,
             1,
             "nothing was created the second time, so only the published file's directory is flushed"
+        );
+    }
+
+    #[test]
+    fn each_created_directory_entry_is_flushed_in_its_parent_outermost_first_and_nothing_else_is() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-order")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        create_directory_durably(&here, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("the directories are created");
+
+        assert_eq!(
+            flushed,
+            vec![tree.path().to_path_buf(), made.clone()],
+            "the entry `made` is flushed in the scratch tree, then `here` in `made`, in that \
+             order; the scratch tree's own ancestors already existed and are not this call's to \
+             flush"
+        );
+        assert!(here.is_dir());
+
+        flushed.clear();
+        create_directory_durably(&here, |parent| {
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("an existing directory is accepted");
+        assert_eq!(
+            flushed,
+            Vec::<PathBuf>::new(),
+            "nothing was created the second time, so nothing is flushed"
+        );
+    }
+
+    #[test]
+    fn a_directory_removed_by_someone_else_between_two_creations_is_a_reported_failure() {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-removed")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+
+        let error = create_directory_durably(&here, |parent| {
+            if parent == tree.path() {
+                fs::remove_dir(&made).expect("someone else removes `made` right after it is made");
+            }
+            Ok(())
+        })
+        .expect_err("`here` cannot be created inside a directory that is gone");
+
+        assert!(
+            matches!(error, UpstrokeError::Filesystem { operation: "create directory", path: ref failed, ref source }
+            if failed == &here && source.kind() == std::io::ErrorKind::NotFound),
+            "{error:?}"
+        );
+        assert!(
+            !made.exists(),
+            "nothing recreated what someone else removed"
+        );
+    }
+
+    #[test]
+    fn a_directory_replaced_by_someone_else_between_two_creations_is_used_and_only_this_calls_entries_are_flushed()
+     {
+        let tree =
+            crate::rundir::scratch_tree::acquire(&std::env::temp_dir(), "connect-mkdir-replaced")
+                .expect("acquire an isolated pools directory");
+        let made = tree.path().join("made");
+        let here = made.join("here");
+
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        create_directory_durably(&here, |parent| {
+            if parent == tree.path() {
+                fs::remove_dir(&made).expect("someone else removes `made`");
+                fs::create_dir(&made).expect("and puts their own `made` in its place");
+            }
+            flushed.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("`here` is created inside the directory someone else now owns");
+
+        assert!(here.is_dir());
+        assert_eq!(
+            flushed,
+            vec![tree.path().to_path_buf(), made.clone()],
+            "this call flushed the `made` it created and the `here` it created; the `made` \
+             someone else recreated is theirs to flush, and `create_dir` said so by refusing \
+             to create it twice"
         );
     }
 
