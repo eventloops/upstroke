@@ -52,98 +52,94 @@ impl TopologyFold {
         Ok(registry)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn check_started_run(
         &self,
         run: &RunState,
         event: &TopologyEvent,
         kind: &'static str,
     ) -> Result<TopologyDelta, FoldError> {
-        if let Some(outcome) = run.finished.clone() {
-            match outcome {
-                RunOutcome::Complete | RunOutcome::Halted => {
-                    return Err(FoldError::RunIsOver {
-                        kind,
-                        outcome: outcome_name(&outcome),
-                    });
-                }
+        if let Some(outcome) = run.finished.as_ref() {
+            let continues = match outcome {
+                RunOutcome::Complete | RunOutcome::Halted => false,
                 RunOutcome::Parked | RunOutcome::BudgetExceeded => {
-                    if !matches!(event.body, TopologyEventBody::RunResumed { .. }) {
-                        return Err(FoldError::RunIsOver {
-                            kind,
-                            outcome: outcome_name(&outcome),
-                        });
-                    }
+                    matches!(event.body, TopologyEventBody::RunResumed { .. })
                 }
+            };
+            if !continues {
+                return Err(FoldError::RunIsOver {
+                    kind,
+                    outcome: outcome_name(outcome),
+                });
             }
         }
 
-        match &event.body {
+        let derived = match &event.body {
             TopologyEventBody::RunStarted { .. } => Err(FoldError::AlreadyStarted),
-            TopologyEventBody::RunResumed { data } => run
-                .check_run_resumed(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskSpawned { data } => run
-                .check_task_spawned(&data.spawn)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskDispatched { data } => run
-                .check_dispatched(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptStarted { data } => run
-                .check_attempt_started(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptFinished { data } => run
-                .check_attempt_finished(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::AttemptInterrupted { data } => run
-                .check_attempt_interrupted(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::GenerationClosed { data } => run
-                .check_generation_closed(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::DeferWaitElapsed { .. } => run
-                .check_defer_wait_elapsed()
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::CandidatePrepared { data } => run
-                .check_candidate_prepared(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskCandidateCreated { data } => run
-                .check_candidate_created(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergeVerificationStarted { data } => run
-                .check_verification_started(data)
-                .map(|()| self.delta(event, Derived::None)),
+            TopologyEventBody::RunResumed { data } => {
+                run.check_run_resumed(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskSpawned { data } => {
+                run.check_task_spawned(&data.spawn).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskDispatched { data } => {
+                run.check_dispatched(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptStarted { data } => {
+                run.check_attempt_started(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptFinished { data } => {
+                run.check_attempt_finished(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::AttemptInterrupted { data } => {
+                run.check_attempt_interrupted(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::GenerationClosed { data } => {
+                run.check_generation_closed(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::DeferWaitElapsed { .. } => {
+                run.check_defer_wait_elapsed().map(|()| Derived::None)
+            }
+            TopologyEventBody::CandidatePrepared { data } => {
+                run.check_candidate_prepared(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskCandidateCreated { data } => {
+                run.check_candidate_created(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::MergeVerificationStarted { data } => {
+                run.check_verification_started(data).map(|()| Derived::None)
+            }
             TopologyEventBody::MergeVerificationUnavailable { data } => run
                 .check_verification_unavailable(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
             TopologyEventBody::MergeVerificationInterrupted { data } => run
                 .check_verification_interrupted(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergePrepared { data } => run
-                .check_merge_prepared(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::MergeRejected { data } => run
-                .check_merge_rejected(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::TaskMerged { data } => run
-                .check_task_merged(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
+            TopologyEventBody::MergePrepared { data } => {
+                run.check_merge_prepared(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::MergeRejected { data } => {
+                run.check_merge_rejected(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::TaskMerged { data } => {
+                run.check_task_merged(data).map(|()| Derived::None)
+            }
             TopologyEventBody::QuestionRaised { data } => run
                 .check_question_raised(&data.question)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::QuestionAnswered { data } => run
-                .check_question_answered(data)
-                .map(|origin| self.delta(event, Derived::Answer(origin))),
-            TopologyEventBody::BudgetExceeded { data } => run
-                .check_budget_exceeded(data)
-                .map(|()| self.delta(event, Derived::None)),
-            TopologyEventBody::RunFinished { data } => run
-                .check_run_finished(data)
-                .map(|()| self.delta(event, Derived::None)),
+                .map(|()| Derived::None),
+            TopologyEventBody::QuestionAnswered { data } => {
+                run.check_question_answered(data).map(Derived::Answer)
+            }
+            TopologyEventBody::BudgetExceeded { data } => {
+                run.check_budget_exceeded(data).map(|()| Derived::None)
+            }
+            TopologyEventBody::RunFinished { data } => {
+                run.check_run_finished(data).map(|()| Derived::None)
+            }
             TopologyEventBody::CapacitySnapshot { .. }
             | TopologyEventBody::PoolExhausted { .. }
-            | TopologyEventBody::DesignDefect { .. } => Ok(self.delta(event, Derived::None)),
-        }
+            | TopologyEventBody::DesignDefect { .. } => Ok(Derived::None),
+        };
+        derived.map(|derived| self.delta(event, derived))
     }
 
     pub fn derived_outcome(&self) -> DerivedOutcome {
@@ -177,23 +173,19 @@ pub(super) fn check_ladder(key: TaskKey, ladder: &FrozenLadder) -> Result<(), Fo
             "it allows 0 attempts per rung, so no attempt is ever permitted".to_owned(),
         ));
     }
-    let mut previous: Option<Tier> = None;
-    for tier in &ladder.tiers {
-        if let Some(previous) = previous {
-            if *tier <= previous {
-                return Err(malformed(format!(
-                    "its tiers are recorded as `{}`, which does not escalate: `{tier}` does not \
-                     outrank `{previous}`",
-                    ladder
-                        .tiers
-                        .iter()
-                        .map(Tier::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
+    for (previous, tier) in ladder.tiers.iter().zip(ladder.tiers.iter().skip(1)) {
+        if tier <= previous {
+            return Err(malformed(format!(
+                "its tiers are recorded as `{}`, which does not escalate: `{tier}` does not \
+                 outrank `{previous}`",
+                ladder
+                    .tiers
+                    .iter()
+                    .map(Tier::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        previous = Some(*tier);
     }
     if ladder.ceiling != ladder.tiers.iter().copied().max() {
         return Err(malformed(format!(
@@ -247,4 +239,84 @@ pub(super) fn check_ladder(key: TaskKey, ladder: &FrozenLadder) -> Result<(), Fo
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::ir::{Effort, ResolvedEffortPolicy};
+    use crate::topology::registry::FrozenRung;
+
+    const KEY: TaskKey = TaskKey(7);
+
+    fn rung(tier: Tier) -> FrozenRung {
+        FrozenRung {
+            tier,
+            agent: format!("agent-{tier}"),
+            model: format!("model-{tier}"),
+            pinned: false,
+        }
+    }
+
+    fn ladder(tiers: &[Tier], rungs: &[Tier], admission: Admission) -> FrozenLadder {
+        FrozenLadder {
+            tiers: tiers.to_vec(),
+            attempts_per: 2,
+            rungs: rungs.iter().copied().map(rung).collect(),
+            floor: tiers.first().copied(),
+            ceiling: tiers.iter().copied().max(),
+            effort: ResolvedEffortPolicy {
+                small: Effort::Low,
+                mid: Effort::XHigh,
+                frontier: Effort::Max,
+                review: Effort::Medium,
+            },
+            admission,
+        }
+    }
+
+    fn defect(ladder: &FrozenLadder) -> Option<String> {
+        match check_ladder(KEY, ladder) {
+            Err(FoldError::MalformedLadder { key, defect }) if key == KEY.0 => Some(defect),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_runnable_ladder_binds_one_rung_for_every_tier() {
+        let every = [Tier::Small, Tier::Mid, Tier::Frontier];
+        assert_eq!(
+            check_ladder(KEY, &ladder(&every, &every, Admission::Runnable)),
+            Ok(())
+        );
+
+        let short = ladder(&every, &[Tier::Small], Admission::Runnable);
+        assert_eq!(
+            defect(&short).as_deref(),
+            Some("it has 1 rung binding(s) for 3 tier(s)")
+        );
+
+        let long = ladder(
+            &[Tier::Small],
+            &[Tier::Small, Tier::Mid],
+            Admission::Runnable,
+        );
+        assert_eq!(
+            defect(&long).as_deref(),
+            Some("it has 2 rung binding(s) for 1 tier(s)")
+        );
+    }
+
+    #[test]
+    fn a_human_binding_ladder_keeps_its_tiers_and_binds_none_of_them() {
+        let waiting = ladder(
+            &[Tier::Mid, Tier::Frontier],
+            &[],
+            Admission::HumanBinding {
+                options: vec!["codex-cli".to_owned()],
+            },
+        );
+        assert_eq!(check_ladder(KEY, &waiting), Ok(()));
+    }
 }
