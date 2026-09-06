@@ -457,6 +457,8 @@ effect_free = [
     "as_str",
     "commit_record_after_error",
     "create",
+    # Delegates to the private site-taking fresh-creation implementation.
+    "create_fresh",
     "create_hooked",
     "default_private_root",
     "drop",
@@ -1466,6 +1468,7 @@ not_an_effect = [
     "LOCK_UN",
     "O_CLOEXEC",
     "O_DIRECTORY",
+    "O_NOFOLLOW",
     "O_NONBLOCK",
     "O_RDONLY",
     "O_WRONLY",

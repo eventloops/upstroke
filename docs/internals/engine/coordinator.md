@@ -727,3 +727,13 @@ The figure itself is quoted with the ledger's own `?` honesty: a run whose
 Copilot attempts report nothing has a reported total that is a floor, and
 presenting a floor as a total is how someone approves a number they did not
 actually see.
+
+## `run_harness_inner_with_id` › `path: plan_path.clone(),`
+
+The returned error owns its diagnostic path independently
+of this function's local plan path.
+
+## `run_harness_inner_with_id` › `let started = events::RunStarted {`
+
+The event owns a durable snapshot of identities, the plan hash and
+review policy while the live run retains its independent values.

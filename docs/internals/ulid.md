@@ -8,10 +8,11 @@ as it is in the source, so the heading is the grep string that finds the code.
 
 ## Module
 
-ULID generation (§15: `run-id = ULID`). Std-only: 48-bit millisecond
-timestamp plus 80 pseudo-random bits from a splitmix64 stream seeded from
-time, process id, and a monotonic per-process nonce. Uniqueness against
-ourselves is the requirement — nothing cryptographic.
+ULID generation (§15: `run-id = ULID`). A 48-bit millisecond timestamp and
+80 bits of SHA-256 over a domain tag, time, process id and per-process nonce.
+The inputs have separate fixed-width encodings, so a pid bit cannot cancel
+a nonce bit before hashing. These deterministic names are not secrets or
+proof of ownership. Filesystem callers must reserve new roots exclusively.
 
 ## `static NONCE: AtomicU64 = AtomicU64::new(0);`
 
@@ -66,31 +67,22 @@ The millisecond of the first call in the recording below, and an
 unremarkable clock reading for the boundary rows to hold fixed while
 they push some other part to its edge.
 
-## `mod tests` › `const RECORDED_FROM_THE_AMBIENT_WRAPPER: &[Vector] = &[`
+## `const HASH_CONSTRUCTION_VECTORS: &[Vector] = &[`
 
-Recorded from the **pre-extraction** `ulid()`, at
-3db8e5be004dd26eb4503948c849d21db14915c2, where this construction was
-still inline in the wrapper and `ulid_from_parts` did not exist. A
-harness called that wrapper in three fresh processes, which fixes all
-three parts of each call after the fact: the nonce is the call index,
-because `NONCE` starts at zero and the wrapper reserves one per call;
-the pid is the harness process's own; and `now_ms` is recoverable from
-the first ten characters of the id that came back. So these are the old
-wrapper's own outputs, and the extraction is what they hold to account —
-not this module measured against itself.
+The inputs were recorded by the old ambient-wrapper extraction. The
+outputs here use the new construction, computed independently with
+Python's hashlib.sha256 and big-endian integer encoding. They pin the
+domain tag, field widths, digest prefix and Crockford encoding. The old
+splitmix outputs remain in git history, not a compatibility promise for
+newly generated ids.
 
-Eighteen were recorded and checked out of tree; the six kept here are
-the executable ones, two per process, and they are what this test set
-proves. The other twelve are not in the repository and no test reads
-them.
-
-## `mod tests` › `const PARTS_AT_THEIR_BOUNDARIES: &[Vector] = &[`
+## `const PARTS_AT_THEIR_BOUNDARIES: &[Vector] = &[`
 
 The edges of each part's range, which no ambient sample reaches: a clock
 at zero, at the last millisecond the field can print, and at the first
-one past it; a pid at the top of its type; and the nonce rotation at the
-two places it carries bits across the top of the word. Computed by an
-implementation of splitmix64 and Crockford base32 written independently
+one past it; a pid at the top of its type; and high nonce bits retained
+from the former construction's boundary inputs. Computed by an
+implementation using hashlib.sha256 and Crockford base32 independently
 of this module and validated first against every row above.
 
 ## `mod tests` › `fn take_sampled_parts() -> Option<(u64, u32, u64)> {`
@@ -139,3 +131,7 @@ leading characters, and the eighty bits under them still tell the two
 milliseconds apart. This asserts that width, not the mask that spells
 it out — `<< 80` into a `u128` discards bit 48 and above by itself, so
 dropping the mask entirely would change no output.
+
+## `ulid_from_parts` › `CROCKFORD`
+
+The mask is at most 31 and CROCKFORD has exactly 32 entries.

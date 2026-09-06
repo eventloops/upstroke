@@ -436,10 +436,40 @@ chosen so the claim is *what a coordinator that runs no cleanup leaves
 on disk*. An early `return` would unwind and prove something weaker.
 =======================================================================
 
-## `fn scratch(label: &str) -> PathBuf {`
+## `fn scratch(label: &str) -> ScratchTree {`
 
-A scratch directory, created through the run-directory funnel because
-this module may not name `std::fs`.
+A scratch tree for one kill test: [`scratch_tree::acquire`]'s exclusive,
+ULID-named root, reclaimed when the guard drops.
+
+Through the run directory's own test allocator because this module may
+not name `std::fs`, and through *that* allocator because of what the
+fixture it replaces did. It named the root by `std::process::id()` and a
+counter, created it with `create_dir_all`, and never removed it. A
+process id is unique only among live processes; Windows reissues one
+within hours, and the `test (winguest)` image carried one leftover pair
+per harness that had ever run on it. A harness that drew a leftover's id
+was handed the dead harness's directory, its kill child appended a
+second run to the log the dead child had left, and `replay` refused the
+second `RunStarted`: both kill tests red together, at their `the log
+replays` expectations, with every earlier assertion passing.
+
+The root is created with one exclusive `create_dir`: a name occupied at
+acquisition is refused. The guard retains the original directory handle;
+the parent checks its identity before launching the child and reading the
+residue, and reclaim checks independently before removal. A replacement
+after one of those observations remains a check-to-use interval.
+The name is a tag and a deterministic ULID. A dead harness's name can
+recur if the clock, pid and nonce repeat, and knowledge of those inputs
+permits computing names ahead of allocation. [`scratch_with`] draws again
+on `Occupied`, up to [`SCRATCH_DRAWS`] times, and never on
+`Undecidable`, which is not a collision.
+
+The guard reclaims the tree on return and on unwind: the **child** still
+dies without cleanup, which is the claim the kill tests make, and the
+**parent** removes what it left once the assertions have read it. What
+this family leaves behind is an aborted parent's tree, which ran no
+`Drop`, or a tree whose removal the filesystem refused — a panic on the
+normal path, a report while unwinding, and the tree stays either way.
 
 ## `struct KillAtPhase {`
 
@@ -519,3 +549,83 @@ the run resume. After that, nothing can retry it.
 The container runner policy is a value this fixture never uses, and
 this is what says so: `run_started`'s runner is `host-v1`, so a resume
 carrying the container record is refused rather than folded.
+
+## `type Acquire = fn(&Path, &str) -> Result<ScratchTree, ScratchAcquireRefusal>;`
+
+How a scratch tree is acquired: [`scratch_tree::acquire`] in every test,
+and a double in the witnesses of [`scratch_with`]'s own policy.
+
+## `const SCRATCH_DRAWS: u32 = 3;`
+
+How many names [`scratch_with`] draws before it gives up.
+
+Each occupied name is preserved and the fixture asks for another. The
+bound prevents an exhausted or deliberately preoccupied namespace from
+keeping a test alive indefinitely; it does not promise eventual success.
+
+## `fn scratch_with(acquire: Acquire, label: &str) -> ScratchTree {`
+
+[`scratch`] over an injectable acquisition, which is what lets the
+policy below be witnessed without arranging a real collision: the double
+supplies the refusal, and the assertion is about what this function does
+with it. The real refusal is the allocator's, witnessed where it lives
+and by the launcher reproduction PR #149 records.
+
+## `fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {`
+
+The payload of a caught panic, as a string.
+
+## `static REFUSED_ONCE: AtomicBool = AtomicBool::new(false);`
+
+Whether [`refuse_once_then_acquire`] has refused yet.
+
+## `static OCCUPIED_CALLS: AtomicU32 = AtomicU32::new(0);`
+
+How many times [`always_occupied`] has been asked.
+
+## `static UNDECIDABLE_CALLS: AtomicU32 = AtomicU32::new(0);`
+
+How many times [`undecidable`] has been asked.
+
+## `fn refuse_once_then_acquire(`
+
+An acquisition that answers `Occupied` to its first call and is the real
+allocator after that.
+
+## `fn always_occupied(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {`
+
+An acquisition that answers `Occupied` to every call, each time with a
+root of its own, so a report that names every refused root can be told
+from one that names the last root three times.
+
+## `fn undecidable(parent: &Path, tag: &str) -> Result<ScratchTree, ScratchAcquireRefusal> {`
+
+An acquisition whose answer is not a collision, counting its calls.
+
+## `fn an_occupied_draw_is_drawn_again() {`
+
+An occupied name is drawn again, and the second draw is a live tree.
+
+## `fn the_draws_are_bounded_and_every_refused_root_is_named() {`
+
+The draws are bounded — exactly [`SCRATCH_DRAWS`] acquisitions, counted
+at the double — and the refusal past the bound names each distinct root
+it met, so a collision that is not a coincidence reads as what it is.
+
+## `fn an_undecidable_refusal_is_not_drawn_again() {`
+
+`Undecidable` is not a collision and is not drawn again: the double is
+asked exactly once.
+
+## `fn a_kill_tests_scratch_tree_is_reclaimed_when_its_guard_drops() {`
+
+The fixture hands back the guard, and the guard reclaims: nothing is at
+the tree's path once it drops. The kill tests hold it through their
+assertions, so their residue is read and then removed. Absence is
+[`scratch_tree::proves_absent`]'s `NotFound`, not `Path::exists`'s
+`false`, which a stat the filesystem refused to answer would also give.
+
+## `kill_after_failed_settlement_rematerializes_question` › `assert!(`
+
+Absence proved, not assumed: `Path::exists` answers `false` to a stat
+the filesystem refused as well as to `NotFound`.
