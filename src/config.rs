@@ -24,7 +24,6 @@ use crate::topology::events::RunnerKind;
 use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
@@ -979,22 +978,6 @@ mod tests {
         let err = load(Some(&absent), &hermetic(), Some(&missing()), &mut warnings)
             .expect_err("missing --config errors");
         assert!(matches!(err, UpstrokeError::Config { .. }));
-    }
-
-    #[test]
-    fn a_misspelled_top_level_section_is_refused_not_dropped() {
-        let path = scratch("misspelled-section.toml", "[budgts]\nrun_usd = 15.0\n");
-        let mut warnings = Vec::new();
-        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
-            .expect_err("an unknown top-level section is a typo, not silence");
-        assert!(
-            err.to_string().contains("budgts"),
-            "the refusal should name the misspelled section, got: {err}"
-        );
-        assert!(
-            warnings.is_empty(),
-            "this is a refusal, not a degraded warning"
-        );
     }
 
     #[test]

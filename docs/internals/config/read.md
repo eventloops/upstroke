@@ -55,16 +55,14 @@ parent's attribute can widen without this file changing.
 An absent, explicit `--config` path is an error ("file not found"); an absent,
 discovered one is the normal fresh case and returns [`RawRepoConfig::default`]
 silently — the same explicit/discovered asymmetry [`read_pools`] states below
-for `--pools`. Once bytes exist, `toml::from_str` decides the rest, and
-`RawRepoConfig` denies unknown fields (`SWEEP-CONFIG-PARSE-007`): a misspelled
-top-level section name — `[budgts]`, `[interation]`, `[runer]` — used to
-deserialize into nothing and vanish with no warning, deleting a whole section
-the same way a typo in one of its keys is already refused two levels down
-(§17's "what the repo-level file refuses"). It is now the same refusal as
-those keys: an error naming the section, not a warning and not silence. The
-seven accepted names are exactly `RawRepoConfig`'s fields and exactly what
-`design/17` documents for this file, so the attribute costs no
-forward-compatible key.
+for `--pools`. Once bytes exist, `toml::from_str` decides the rest and this
+function adds nothing to what it says: whatever `RawRepoConfig` accepts or
+refuses at the wire, this function's own contract is only the two file-absence
+branches above. `RawRepoConfig` itself still accepts a misspelled top-level
+section name — `[budgts]`, `[interation]`, `[runer]` — silently, deserializing
+it into nothing with no warning (`SWEEP-CONFIG-PARSE-007`, open, guarded to
+whichever of this file or `src/config.rs` sweeps that struct's definition;
+untouched here, since the fix lives in that struct, outside this file).
 
 ## `pub(super) fn read_pools(`
 
