@@ -22,6 +22,13 @@ impl TopologyFold {
                 defect: defect.to_string(),
             })?;
 
+        if started.limits.max_parallel == 0 {
+            return Err(FoldError::UnusableLimit {
+                limit: "max_parallel",
+                value: started.limits.max_parallel,
+            });
+        }
+
         if started.normalized_plan_digest != self.inputs.normalized_plan_digest {
             return Err(FoldError::DigestMismatch {
                 what: "normalized plan",
@@ -168,6 +175,14 @@ pub(super) fn check_ladder(key: TaskKey, ladder: &FrozenLadder) -> Result<(), Fo
             )));
         }
     }
+    if let (Some(floor), Some(start)) = (ladder.floor, ladder.tiers.first().copied()) {
+        if floor > start {
+            return Err(malformed(format!(
+                "its floor is `{floor}` and its chain starts at `{start}`, so its first attempt \
+                 runs below the floor the run recorded"
+            )));
+        }
+    }
     if ladder.attempts_per == 0 {
         return Err(malformed(
             "it allows 0 attempts per rung, so no attempt is ever permitted".to_owned(),
@@ -305,6 +320,44 @@ mod tests {
         assert_eq!(
             defect(&long).as_deref(),
             Some("it has 2 rung binding(s) for 1 tier(s)")
+        );
+    }
+
+    #[test]
+    fn a_ladder_may_not_start_below_its_recorded_floor() {
+        // The floor clips the chain start: `design/07` writes `min_tier` as
+        // "clips the chain start (binding)", `design/10` §2 has an override
+        // truncating the chain start, and `design/26` has a repair's `mid`
+        // floor intersected with the frozen pin and maximum. `src/route.rs`'s
+        // `raise_start` implements the clip, so no router-produced chain holds
+        // a tier below its floor -- but `TaskRegistry::frozen_ladder` copies
+        // `task.min_tier` into `floor` and the recorded tiers into `tiers`
+        // and compares neither with the other, so a recorded ladder that does
+        // is exactly what this boundary exists to catch.
+        let every = [Tier::Small, Tier::Mid, Tier::Frontier];
+
+        let at_the_floor = FrozenLadder {
+            floor: Some(Tier::Small),
+            ..ladder(&every, &every, Admission::Runnable)
+        };
+        assert_eq!(check_ladder(KEY, &at_the_floor), Ok(()));
+
+        let above_the_floor = FrozenLadder {
+            floor: Some(Tier::Mid),
+            ..ladder(&[Tier::Frontier], &[Tier::Frontier], Admission::Runnable)
+        };
+        assert_eq!(check_ladder(KEY, &above_the_floor), Ok(()));
+
+        let below_the_floor = FrozenLadder {
+            floor: Some(Tier::Mid),
+            ..ladder(&every, &every, Admission::Runnable)
+        };
+        assert_eq!(
+            defect(&below_the_floor).as_deref(),
+            Some(
+                "its floor is `mid` and its chain starts at `small`, so its first attempt runs \
+                 below the floor the run recorded"
+            )
         );
     }
 
