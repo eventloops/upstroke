@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# The pure parts of scripts/pr-ready-audit.sh, exercised against fixtures: the lane and its
-# severity set, the two review parsers (the workflow's fenced JSON verdict and the frontier
-# prose form), the frontmatter id match, the newest-check-run choice and the ledger-row parse.
-# Everything that talks to GitHub or git is out of scope here; the audit's behaviour on a live
-# pull request is observed on the pull request.
+# scripts/pr-ready-audit.sh, exercised against fixtures: the pure parts (the lane and its
+# severity set, the two review parsers -- the workflow's fenced JSON verdict and the frontier
+# prose form --, the frontmatter id match, the newest-check-run choice, the ledger-row parse and
+# the identity-drift comparison), and the write sequence, which touches gh and no git and so runs
+# whole against a fake `gh` on PATH that logs every call. What talks to git is still out of scope
+# here; the audit's behaviour on a live pull request is observed on the pull request.
 #
 # Each case names the defect it exists to catch, so a green run says what it proved:
 #   MUT-LANE-LABEL-INPUT         the lane came from a label, not the branch prefix
@@ -22,6 +23,14 @@
 #   MUT-CHECK-RUN-FIRST-SUCCESS  an older success outranked a newer failure
 #   MUT-CHECK-RUN-UNSTARTED      an unstarted run was ordered by a stand-in date, not its id
 #   MUT-LEDGER-HEADER-AS-ROW     the header or separator line parsed as a row
+#   MUT-DRIFT-BASE-IGNORED       a moved base compared equal to the base the audit judged
+#   MUT-DRIFT-UNREAD-IS-AGREE    a failed re-read of the identity read as agreement
+#   MUT-DRIFT-STATE-DEFAULT-OK   an unrecognised drift token left the pull request READY
+#   MUT-LABEL-BASE-UNCHECKED     the base was not re-read before the ready label was written
+#   MUT-LABEL-NOT-RECONCILED     a ready label this run wrote survived the run ending not-READY
+#   MUT-ENQUEUE-BASE-UNBOUND     nothing was read after the enqueue, so a retarget stood
+#   MUT-ENQUEUE-NOT-WITHDRAWN    a drifted enqueue was reported and left in the queue
+#   MUT-RETARGET-BEFORE-ENQUEUE  a base_ref_changed after the review did not stop the enqueue
 set -euo pipefail
 export PATH="/usr/bin:/bin:$PATH"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,6 +172,112 @@ got="$(ledger_rows_from_body < "$tmp/body.md" | tr '\t' '|')"
 want='A-DEFERRABLE|P3|4ad962f / src/x.rs:1|deferred
 B-FIXED|P2|4ad962f / src/y.rs:2|fixed'
 expect MUT-LEDGER-HEADER-AS-ROW "$got" "$want"
+
+# --- the identity comparison -------------------------------------------------------------------
+expect MUT-DRIFT-BASE-IGNORED "$(identity_drift head1 master "head1 master")" ""
+expect MUT-DRIFT-BASE-IGNORED "$(identity_drift head1 master "head1 release")" "base-moved:release"
+expect MUT-DRIFT-BASE-IGNORED "$(identity_drift head1 master "head2xxxxxxx master")" "head-moved:head2xx"
+expect MUT-DRIFT-UNREAD-IS-AGREE "$(identity_drift head1 master "")" "unconfirmed:re-read-failed"
+expect MUT-DRIFT-UNREAD-IS-AGREE "$(identity_drift head1 master "head1")" "unconfirmed:re-read-failed"
+expect MUT-DRIFT-UNREAD-IS-AGREE "$(identity_drift head1 master " master")" "unconfirmed:re-read-failed"
+expect MUT-DRIFT-STATE-DEFAULT-OK "$(drift_state head-moved:head2)" HEAD-MOVED
+expect MUT-DRIFT-STATE-DEFAULT-OK "$(drift_state base-moved:release)" BASE-MOVED
+expect MUT-DRIFT-STATE-DEFAULT-OK "$(drift_state unconfirmed:re-read-failed)" UNCONFIRMED
+expect MUT-DRIFT-STATE-DEFAULT-OK "$(drift_state "")" UNCONFIRMED
+
+# --- the write sequence, driven against a fake gh ----------------------------------------------
+# maintain_labels_and_enqueue talks to gh and not to git, so the order of its reads and writes is
+# observable here: the fake logs every call, answers `pr view` from the next line of $GH_IDENTITY
+# (the last line repeating once it runs out) and the timeline from $GH_TIMELINE, and fails any
+# call whose argument list contains $GH_FAIL.
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$GH_LOG"
+if [[ -n "${GH_FAIL:-}" && "$*" == *"$GH_FAIL"* ]]; then exit 1; fi
+case "$1" in
+  pr)
+    if [[ "$2" == view ]]; then
+      n="$(grep -c '^pr view' "$GH_LOG")"
+      total="$(wc -l < "$GH_IDENTITY")"
+      ((n > total)) && n="$total"
+      sed -n "${n}p" "$GH_IDENTITY"
+    fi ;;
+  api) cat "$GH_TIMELINE" ;;
+esac
+exit 0
+GH
+chmod +x "$tmp/bin/gh"
+
+repo="o/r"
+ready_label="ready-to-merge"
+review_at="2026-09-06T10:00:00Z"
+export GH_LOG="$tmp/gh.log" GH_IDENTITY="$tmp/identity" GH_TIMELINE="$tmp/timeline" GH_FAIL=""
+
+# writes IDENTITY TIMELINE STATE LABELS ENQUEUE: runs the sequence and prints its gh calls, one
+# per line, with the constant parts of each call dropped.
+writes() {
+  : > "$GH_LOG"
+  printf '%s\n' "$1" > "$GH_IDENTITY"
+  printf '%s' "$2" > "$GH_TIMELINE"
+  enqueue="$5"
+  PATH="$tmp/bin:$PATH" maintain_labels_and_enqueue 9 findings-p1p2 head1 master "$3" "$4" "$review_at" > "$tmp/said" 2>&1
+  sed -e 's/^pr view .*/view/' -e 's/^api .*timeline.*/timeline/' \
+      -e 's/^pr edit 9 --repo o\/r //' -e 's/^pr merge 9 --repo o\/r //' "$GH_LOG" | tr '\n' ' '
+}
+
+steady='head1 master'
+# The whole sequence on a pull request nothing touches: lane label, identity, ready label,
+# identity, identity and timeline before the enqueue, identity and timeline after it.
+got="$(writes "$steady
+$steady
+$steady
+$steady" "" READY "" 1)"
+expect MUT-ENQUEUE-BASE-UNBOUND "$got" \
+  "--add-label lane:findings-p1p2 view --add-label ready-to-merge view view timeline --merge --auto --match-head-commit head1 view timeline "
+
+# The base moved between the audit's read and the label write: neither labelled nor enqueued.
+got="$(writes "head1 release" "" READY "" 1)"
+expect MUT-LABEL-BASE-UNCHECKED "$got" "--add-label lane:findings-p1p2 view "
+
+# The base moved after the label was written: the label this run wrote is taken back, and the
+# reconciliation is against the state the run ends on, not the labels it started from.
+got="$(writes "$steady
+$steady
+head1 release" "" READY "" 1)"
+expect MUT-LABEL-NOT-RECONCILED "$got" \
+  "--add-label lane:findings-p1p2 view --add-label ready-to-merge view view --remove-label ready-to-merge "
+
+# A retarget recorded after the review, with the ref name unchanged: read off the timeline before
+# the enqueue, so nothing is queued.
+got="$(writes "$steady" "2026-09-06T11:00:00Z" READY "" 1)"
+expect MUT-RETARGET-BEFORE-ENQUEUE "$got" \
+  "--add-label lane:findings-p1p2 view --add-label ready-to-merge view view timeline --remove-label ready-to-merge "
+
+# The base moved after the enqueue call: --match-head-commit never bound it, so the enqueue is
+# withdrawn with --disable-auto and the label goes with it.
+got="$(writes "$steady
+$steady
+$steady
+head1 release" "" READY "" 1)"
+expect MUT-ENQUEUE-NOT-WITHDRAWN "$got" \
+  "--add-label lane:findings-p1p2 view --add-label ready-to-merge view view timeline --merge --auto --match-head-commit head1 view --disable-auto --remove-label ready-to-merge "
+
+# A re-read that fails is drift, not agreement.
+GH_FAIL="--json headRefOid"
+got="$(writes "$steady" "" READY "" 1)"
+expect MUT-DRIFT-UNREAD-IS-AGREE "$got" "--add-label lane:findings-p1p2 view "
+GH_FAIL=""
+
+# Not READY on entry: the lane label is still maintained and a standing ready label is removed.
+got="$(writes "$steady" "" NOT-READY "lane:findings-p1p2 ready-to-merge" 1)"
+expect MUT-LABEL-NOT-RECONCILED "$got" "--remove-label ready-to-merge "
+
+# Without --enqueue the sequence still labels, and still brackets the write with a re-read.
+got="$(writes "$steady" "" READY "" 0)"
+expect MUT-LABEL-BASE-UNCHECKED "$got" \
+  "--add-label lane:findings-p1p2 view --add-label ready-to-merge view "
 
 if ((failed)); then
   echo "test-pr-ready-audit: FAILED" >&2
