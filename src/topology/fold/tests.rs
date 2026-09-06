@@ -9613,3 +9613,88 @@ fn a_quiet_lineage_member_accepts_questions_and_decline_settles_the_lineage() {
         assert_eq!(after.state(), replayed.state());
     }
 }
+
+#[test]
+fn a_decline_clears_the_execution_backoff_of_the_lineage_member_holding_it() {
+    let base = sha("base");
+    let mut fold = started();
+    merge_task(&mut fold, ALPHA, 0, 0);
+    merge_task(&mut fold, ZETA, 0, 1);
+    merge_task(&mut fold, MID, 0, 2);
+
+    apply(
+        &mut fold,
+        &spawn_event(repair_spawn(TaskKey(3), ALPHA, ALPHA)),
+    );
+    apply(
+        &mut fold,
+        &ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key: TaskKey(3),
+                generation: GenerationId(0),
+                base_sha: base,
+                worktree_path: "/private/workspaces/tasks/k3-g0".to_owned(),
+                lease: LeaseGrant::InheritedLineage { root: ALPHA },
+                source_candidate: Some(candidate_of(ALPHA, 0)),
+            },
+        }),
+    );
+    let repair_start = ev(TopologyEventBody::AttemptStarted {
+        data: AttemptStarted4 {
+            key: TaskKey(3),
+            generation: GenerationId(0),
+            attempt: AttemptNumber(1),
+            rung: 0,
+            binding: frozen_binding(&fold, TaskKey(3), 0),
+            pool: None,
+            resume_session: None,
+            materialization_observed: Some(Materialization::Clean),
+        },
+    });
+    apply(&mut fold, &repair_start);
+    apply(
+        &mut fold,
+        &settle(
+            TaskKey(3),
+            0,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Deferred {
+                    defers: 1,
+                    reason: "  the pool is down  ".to_owned(),
+                },
+                lease: LeaseDisposition::LineageHeld,
+            },
+        ),
+    );
+    assert_eq!(fold.task_state(TaskKey(3)), Some(TaskState::Deferred));
+    assert!(
+        fold.backoff_pending(),
+        "a lineage member settled Deferred is what backoff_pending reports"
+    );
+    assert_eq!(fold.derived_outcome(), DerivedOutcome::NotEnding);
+
+    apply(&mut fold, &raised("q-backoff-decline-Ünicode", TaskKey(3)));
+    apply(
+        &mut fold,
+        &answered(
+            TaskKey(3),
+            "q-backoff-decline-Ünicode",
+            Answer4::Declined {
+                decline_halts_run: false,
+            },
+        ),
+    );
+
+    assert_eq!(fold.task_state(TaskKey(3)), Some(TaskState::Failed));
+    assert!(
+        !fold.backoff_pending(),
+        "the decline that fails this lineage did not clear its member's execution backoff"
+    );
+    assert_eq!(
+        fold.derived_outcome(),
+        DerivedOutcome::Ending(RunOutcome::Complete),
+        "a cleared backoff is what lets the run reach its ending outcome instead of `NotEnding`"
+    );
+    accepts(&fold, &run_finished(RunOutcome::Complete, None));
+}
